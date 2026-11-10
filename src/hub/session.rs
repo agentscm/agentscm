@@ -762,7 +762,7 @@ async fn announce_with<T: Send + 'static>(
         {
             Ok(found) => pulls = found,
             Err(error) => {
-                eprintln!("hub: pull requests for a session touch: {error}");
+                crate::hub::error_envelope::log_internal(&error);
                 unknown = Some(advice::unknown("pull requests could not be read"));
             }
         }
@@ -813,6 +813,7 @@ static DENIED: AtomicU64 = AtomicU64::new(0);
 static REPEATED: AtomicU64 = AtomicU64::new(0);
 static RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 static FAIL_OPEN: AtomicU64 = AtomicU64::new(0);
+static UNDECLARED: AtomicU64 = AtomicU64::new(0);
 const LATENCIES: usize = 1024;
 /// Milliseconds of the last `LATENCIES` hook requests.
 static HOOK_MS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
@@ -834,6 +835,11 @@ fn count(counter: &AtomicU64, when: bool) {
 /// A hook answered "coordination unknown" (and so let the edit through).
 pub(super) fn count_fail_open() {
     count(&FAIL_OPEN, true);
+}
+
+/// A session was told once to declare its Work (`WORK_UNDECLARED`), refused or noted.
+pub(super) fn count_undeclared() {
+    count(&UNDECLARED, true);
 }
 
 pub(super) fn record_hook_ms(ms: u32) {
@@ -859,6 +865,7 @@ pub(super) fn coordination() -> Value {
     let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     json!({"denied": load(&DENIED), "repeated": load(&REPEATED),
         "rate_limited": load(&RATE_LIMITED), "fail_open": load(&FAIL_OPEN),
+        "undeclared": load(&UNDECLARED),
         "hook_p95_ms": p95.map_or(0, |index| times[index])})
 }
 
@@ -897,7 +904,7 @@ pub async fn duplicates_for(
     let pulls = open_pulls(state, host, &principal.repository, principal.repository_id)
         .await
         .unwrap_or_else(|error| {
-            eprintln!("hub: open pull requests for a start: {error}");
+            crate::hub::error_envelope::log_internal(&error);
             Vec::new()
         });
     let same: Vec<&WorkItem> = current
@@ -942,7 +949,7 @@ pub async fn status_for(
     parts.push(match others_for(state, principal, own).await {
         Ok(others) => others,
         Err(error) => {
-            eprintln!("hub: other agents for a status: {error}");
+            crate::hub::error_envelope::log_internal(&error);
             advice::unknown("other agents could not be listed")
         }
     });
@@ -956,7 +963,7 @@ pub async fn status_for(
     {
         Ok(pulls) => parts.push(advice::pulls(&pulls)),
         Err(error) => {
-            eprintln!("hub: open pull requests for a status: {error}");
+            crate::hub::error_envelope::log_internal(&error);
             parts.push(advice::unknown("pull requests could not be read"));
         }
     }

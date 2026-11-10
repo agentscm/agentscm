@@ -4537,7 +4537,7 @@ async fn task_http_and_mcp_distinguish_invalid_claims_from_unavailable_journal()
             Some(json!({"operation":"claim","subject":native.subject,"claim":unknown.clone()})),
         )
         .await;
-    assert_eq!(invalid_http, (400, json!({"error":"invalid_request"})));
+    crate::assert_hub_error!(invalid_http, (400, json!({"error":"invalid_request"})));
     let invalid_mcp = env
         .request(
             Method::POST,
@@ -4573,7 +4573,7 @@ async fn task_http_and_mcp_distinguish_invalid_claims_from_unavailable_journal()
             Some(json!({"operation":"claim","subject":native.subject,"claim":claim_input(&task,&executor,"unavailable-http")})),
         )
         .await;
-    assert_eq!(unavailable_http, (503, json!({"error":"unavailable"})));
+    crate::assert_hub_error!(unavailable_http, (503, json!({"error":"unavailable"})));
     let unavailable_mcp = env
         .request(
             Method::POST,
@@ -4919,7 +4919,7 @@ async fn http_queue_is_exact_idempotent_scoped_and_cancellable_with_retained_rea
     );
     let mut stale = request.clone();
     stale["expected_generation"] = json!(0);
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(
             Method::POST,
             &path,
@@ -4958,7 +4958,7 @@ async fn http_queue_is_exact_idempotent_scoped_and_cancellable_with_retained_rea
     );
     let mut collision = request;
     collision["profile_id"] = json!("different-profile");
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(
             Method::POST,
             &path,
@@ -5021,7 +5021,7 @@ async fn http_queue_is_exact_idempotent_scoped_and_cancellable_with_retained_rea
     );
     let cancel_path = format!("{REPO}/runs/{run_id}/cancel");
     let mut cancel = json!({"request_id":"cancel-http","expected_generation":0});
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(
             Method::POST,
             &cancel_path,
@@ -5060,7 +5060,7 @@ async fn http_queue_is_exact_idempotent_scoped_and_cancellable_with_retained_rea
         (200, cancelled)
     );
     cancel["expected_generation"] = json!(999);
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(
             Method::POST,
             &cancel_path,
@@ -5204,7 +5204,7 @@ async fn http_native_actions_require_explicit_human_roles_exact_subject_and_nati
         );
         let mut stale = body;
         stale["expected_generation"] = json!(0);
-        assert_eq!(
+        crate::assert_hub_error!(
             env.request(
                 Method::POST,
                 path,
@@ -5785,7 +5785,7 @@ async fn source_only_native_receipt_allows_explicit_http_approval_and_landing_af
         (&integrate_path, original_integration.clone()),
     ] {
         body["request_id"] = json!("new-request-old-generation");
-        assert_eq!(
+        crate::assert_hub_error!(
             env.request(
                 Method::POST,
                 path,
@@ -5995,7 +5995,7 @@ async fn exact_queue_retry_survives_membership_regrant_but_new_old_generation_re
     );
     let mut changed = request.clone();
     changed["subject"]["change_version"] = json!(99);
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(
             Method::POST,
             &path,
@@ -6009,7 +6009,7 @@ async fn exact_queue_retry_survives_membership_regrant_but_new_old_generation_re
     );
     let mut new = request.clone();
     new["request_id"] = json!("new-queue-old-generation");
-    assert_eq!(
+    crate::assert_hub_error!(
         env.request(Method::POST, &path, Some(&member), csrf, None, Some(new))
             .await,
         (409, json!({"error":"generation_conflict"}))

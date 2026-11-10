@@ -12,6 +12,8 @@ mod fake_docker;
 mod fake_github;
 #[path = "../support/fake_gitlab.rs"]
 mod fake_gitlab;
+#[path = "common/hub_error_assert.rs"]
+mod hub_error_assert;
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
 #[cfg(unix)]
@@ -51,6 +53,8 @@ mod checks;
 mod cli;
 #[cfg(unix)]
 mod client_completion;
+#[cfg(unix)]
+mod client_replies;
 #[cfg(unix)]
 mod client_status;
 #[cfg(unix)]
@@ -102,6 +106,8 @@ mod guided_cli;
 #[cfg(unix)]
 mod guided_service;
 #[cfg(unix)]
+mod harness_coverage;
+#[cfg(unix)]
 mod history;
 mod hook_cli;
 mod hook_end_to_end;
@@ -128,6 +134,8 @@ mod hub_change_record_migration;
 mod hub_coordination;
 #[cfg(unix)]
 mod hub_devices;
+#[cfg(unix)]
+mod hub_digest;
 #[cfg(unix)]
 mod hub_external_runs;
 #[cfg(unix)]

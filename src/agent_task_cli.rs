@@ -703,10 +703,10 @@ impl Client {
 fn decode_status_result(
     result: Value,
 ) -> std::result::Result<Option<agentscm::skill_workflow::TaskAttemptView>, RemoteFailure> {
-    serde_json::from_value(result).map_err(|_| {
-        RemoteFailure::Uncertain(Error::Invalid(
-            "authenticated task status has invalid shape".into(),
-        ))
+    agentscm::hub::reply::decode(&result).map_err(|error| {
+        RemoteFailure::Uncertain(Error::Invalid(format!(
+            "authenticated task status: {error}"
+        )))
     })
 }
 
@@ -772,8 +772,8 @@ async fn response_json(
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| {
-        RemoteFailure::Uncertain(Error::Invalid("agent-task response is invalid JSON".into()))
+    agentscm::hub::reply::decode_slice(&bytes).map_err(|error| {
+        RemoteFailure::Uncertain(Error::Invalid(format!("agent-task response: {error}")))
     })
 }
 

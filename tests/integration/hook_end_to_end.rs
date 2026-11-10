@@ -57,6 +57,23 @@ fn cursor_hook(hub: &str, repo: &str, secret: &str, payload: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// Exactly what the generated Claude Code hook sends for an edit: bearer header, the repository
+/// guard, and the raw PreToolUse payload (no project-root header; the hub uses the payload's cwd).
+async fn claude_edit(hub: &str, secret: &str) -> Value {
+    let reply = reqwest::Client::new()
+        .post(format!("{hub}/v1/hub/hook/claude?repo={REPO}"))
+        .bearer_auth(secret)
+        .header("content-type", "application/json")
+        .body(fixture("claude-PreToolUse-Edit"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    serde_json::from_slice(&reply).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claude_http_hook_then_a_cursor_hook_on_the_same_file_gets_a_stop() {
     let dir = TempDir::new().unwrap();
@@ -72,20 +89,10 @@ async fn a_claude_http_hook_then_a_cursor_hook_on_the_same_file_gets_a_stop() {
     tokio::spawn(async move { axum::serve(listener, app).await });
     let (claude, cursor) = (token(&*store, 1), token(&*store, 2));
 
-    // Exactly what the generated Claude Code hook sends: bearer header, the repository guard,
-    // and the raw PreToolUse payload (no project-root header; the hub uses the payload's cwd).
-    let reply = reqwest::Client::new()
-        .post(format!("{hub}/v1/hub/hook/claude?repo={REPO}"))
-        .bearer_auth(&claude)
-        .header("content-type", "application/json")
-        .body(fixture("claude-PreToolUse-Edit"))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    // The session declared no Work: its first edit is refused once, and the repeat passes.
+    let refused = claude_edit(&hub, &claude).await;
+    assert!(refused.to_string().contains("WORK_UNDECLARED"), "{refused}");
+    let reply = claude_edit(&hub, &claude).await;
     assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
 
     let (hub_url, secret, payload) = (hub.clone(), cursor.clone(), fixture("cursor-postToolUse"));

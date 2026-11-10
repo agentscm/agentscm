@@ -212,6 +212,8 @@ pub struct Pull {
     pub head_repo: Option<Option<i64>>,
     /// Overrides `base.repo.id`, which is otherwise the repository's own.
     pub base_repo_id: Option<i64>,
+    /// Label names, reported as `labels: [{"name": …}]`.
+    pub labels: Vec<String>,
 }
 
 impl Pull {
@@ -235,6 +237,7 @@ impl Pull {
             body: String::new(),
             head_repo: None,
             base_repo_id: None,
+            labels: Vec::new(),
         }
     }
 }
@@ -347,10 +350,13 @@ pub struct FakeState {
     pub users: HashMap<String, (String, i64, BTreeSet<i64>)>,
     /// The first entry whose `path_contains` matches a request is consumed and answered.
     pub fail: VecDeque<Failure>,
+    /// Repository permission by login, for `collaborators/{login}/permission`; others are 404.
+    pub collaborator_permissions: HashMap<String, String>,
     /// Answer the actions and deployments lists with 200 and an empty object, no array.
     pub arrayless_external_lists: bool,
     /// Answer every GET whose path contains this with 200 and an empty object, no array.
     pub arrayless_path: Option<String>,
+    pub arrayless_query: Option<String>,
     /// Store the next created comment, then answer 502 with no body.
     pub lose_next_comment_reply: bool,
     pub requests: Vec<Request>,
@@ -372,6 +378,8 @@ pub struct FakeState {
     pub reject_status_contexts: HashMap<String, u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
+    /// Move the base after the repository has recorded this many statuses.
+    pub advance_base_after_status_count: Option<(usize, String)>,
     /// Leave `head.repo` and `base.repo` out of pull request JSON.
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
@@ -716,6 +724,7 @@ fn pull_json(ctx: &Ctx, repo: &Repo, p: &Pull) -> Value {
         "head": {"ref": p.head_ref, "sha": p.head_sha, "repo": head_repo},
         "base": {"ref": p.base_ref, "sha": repo.branches.iter().find(|b| b.name == p.base_ref).map(|b| &b.sha), "repo": repo_ref(p.base_repo_id.unwrap_or(repo.id))},
         "user": {"login": p.author_login, "id": p.author_id},
+        "labels": p.labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
         "updated_at": p.updated_at,
         "html_url": format!("{}/{}/pull/{}", ctx.base, repo.full_name, p.number),
     })
@@ -1014,6 +1023,15 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
     if let Some(path) = &state.arrayless_path
         && method == Method::GET
         && uri.path().contains(path.as_str())
+    {
+        return json_reply(200, json!({}));
+    }
+
+    if method == Method::GET
+        && state
+            .arrayless_query
+            .as_ref()
+            .is_some_and(|path| path_and_query.contains(path))
     {
         return json_reply(200, json!({}));
     }
@@ -1445,8 +1463,39 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .get(&(id, sha.to_string()))
                         .cloned()
                         .unwrap_or_default();
+                    let total = rows.len();
                     let (page, link) = paginate(ctx, uri, &query, rows);
-                    reply(200, &link, Some(json!({"check_runs":page})))
+                    reply(
+                        200,
+                        &link,
+                        Some(json!({"total_count": total, "check_runs": page})),
+                    )
+                }
+                (&Method::GET, ["collaborators", login, "permission"]) => {
+                    match state.collaborator_permissions.get(*login) {
+                        Some(permission) => json_reply(200, json!({"permission": permission})),
+                        None => not_found(),
+                    }
+                }
+                (&Method::GET, ["commits", sha, "status"]) => {
+                    let repo = &state.repos[&id];
+                    let mut seen = std::collections::BTreeSet::new();
+                    let latest: Vec<Value> = repo
+                        .statuses
+                        .iter()
+                        .rev()
+                        .filter(|(at, v)| at == sha && seen.insert(v["context"].to_string()))
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    let state = if latest.iter().any(|v| v["state"] != "success") {
+                        "pending"
+                    } else {
+                        "success"
+                    };
+                    json_reply(
+                        200,
+                        json!({"state": state, "total_count": latest.len(), "statuses": latest}),
+                    )
                 }
                 (&Method::GET, ["commits", sha, "statuses"]) => {
                     let repo = &state.repos[&id];
@@ -1502,6 +1551,28 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .record_status(sha, status.clone(), &creator);
                     if let Some(tip) = state.advance_base_after_status.take() {
                         state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
+                    }
+                    if state
+                        .advance_base_after_status_count
+                        .as_ref()
+                        .is_some_and(|(count, _)| state.repos[&id].statuses.len() == *count)
+                    {
+                        let (_, tip) = state.advance_base_after_status_count.take().unwrap();
+                        let repo = state.repos.get_mut(&id).unwrap();
+                        repo.branches[0].sha = tip.clone();
+                        if let Some(dir) = &repo.git {
+                            git(
+                                dir,
+                                &[
+                                    "update-ref",
+                                    &format!("refs/heads/{}", repo.branches[0].name),
+                                    &tip,
+                                ],
+                                &[],
+                                None,
+                            )
+                            .unwrap();
+                        }
                     }
                     if std::mem::take(&mut state.lose_next_status_reply) {
                         return reply(502, &[], None);

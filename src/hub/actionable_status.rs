@@ -577,7 +577,7 @@ fn read_scoped(
         actions.retain(|a| a.kind != "directed_request");
     }
     let (conflicts, conflict_limits, conflict_evidence_digest) =
-        conflicts::read(store, principal, now)?;
+        conflicts::read(store, principal, reader, &items, now)?;
     actions.extend(conflicts);
     limits.extend(conflict_limits);
     let (checks, check_limits, check_evidence_digest) =
@@ -585,6 +585,7 @@ fn read_scoped(
     actions.extend(checks);
     limits.extend(check_limits);
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
+    actions.extend(waiting_actions(setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -710,7 +711,7 @@ fn setup_actions(
                     work_ids,
                     recipients: vec![viewer.clone()],
                     action: format!(
-                        "Your agent {} {}. {}",
+                        "Your {} {}. {}",
                         crate::hub::advice::sanitize(&problem.agent, 64),
                         problem.reason.what(),
                         problem.reason.next_action()
@@ -722,6 +723,86 @@ fn setup_actions(
             })
             .collect(),
     )
+}
+
+/// The viewer's own sessions that stopped for them: a permission prompt or a question always
+/// needs them; the end of a turn only while that session leads unfinished Work, since a finished
+/// chat left open is not waiting on anyone. Paused Work counts: a host that stops an idle session
+/// ends it, which pauses its Work, and the resumed session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
+/// version the time the wait began. Answering stays in the session.
+fn waiting_actions(
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    now: i64,
+) -> Result<Vec<StatusAction>> {
+    use crate::hub::session_waiting::WaitReason;
+    let viewer = StatusRecipient {
+        kind: RecipientKind::Person,
+        owner: Some(principal.owner.id.clone()),
+        login: Some(principal.owner.login.clone()),
+        agent: None,
+    };
+    let mut actions = Vec::new();
+    for wait in setup.waiting().owned(principal, now)? {
+        let led = items
+            .values()
+            .filter(|i| {
+                i.lead_token == wait.token
+                    && i.lead_session == wait.session
+                    && matches!(
+                        i.state,
+                        WorkState::Active | WorkState::Blocked | WorkState::Paused
+                    )
+            })
+            .collect::<Vec<_>>();
+        if wait.reason == WaitReason::Idle && led.is_empty() {
+            continue;
+        }
+        // By brand ("your Claude Code"); a generated `client-<hex>` label is never shown.
+        let who = match wait.agent.as_str() {
+            "" | "generic" => crate::hub::advice::agent_name(&wait.name),
+            agent => crate::hub::advice::agent_name(agent),
+        };
+        let on = led
+            .first()
+            .map(|i| format!(" on “{}”", crate::hub::advice::sanitize(&i.title, 80)))
+            .unwrap_or_default();
+        let asker = if wait.subagent {
+            " A subagent asked; the whole session waits on your answer."
+        } else {
+            ""
+        };
+        // Only this person sees it, so their own agent's words can say what it needs.
+        let asks = wait
+            .asks
+            .as_deref()
+            .map(|text| {
+                let label = match wait.reason {
+                    WaitReason::Permission => "The prompt is for",
+                    WaitReason::Question => "It asks",
+                    WaitReason::Idle => "Its last message ends",
+                };
+                format!(" {label}: “{text}”.")
+            })
+            .unwrap_or_default();
+        actions.push(StatusAction {
+            id: format!("waiting:{}:{}", wait.reason.code(), wait.key),
+            kind: "session_waiting".into(),
+            work_ids: led.iter().map(|i| i.id.clone()).collect(),
+            recipients: vec![viewer.clone()],
+            needs_you: true,
+            action: format!(
+                "Your {} {}{on}.{asks}{asker} Answer it in that session; the Hub cannot answer it for you.",
+                crate::hub::advice::sanitize(&who, 64),
+                wait.reason.what(),
+            ),
+            updated_seq: 0,
+            semantic_version: Some(wait.since.to_string()),
+            limits: vec![],
+        });
+    }
+    Ok(actions)
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -1772,7 +1853,31 @@ mod tests {
             Some("quiet-session"),
             observations.epoch(),
         );
-        let status = super::read(store, &observations, &viewer, now).unwrap();
+        // Observations stamp the wall clock, and a read leaves out rows stamped after its time.
+        let read_at = crate::hub::store::unix_now();
+        // Right after MCP verifies, an unseen edit hook is not yet a problem.
+        let early = super::read(store, &observations, &viewer, read_at).unwrap();
+        assert!(
+            !early
+                .actions
+                .iter()
+                .any(|a| a.id.starts_with("setup:edit_hook_unverified:"))
+        );
+        let status = super::read(
+            store,
+            &observations,
+            &viewer,
+            read_at + crate::hub::setup_attention::EDIT_HOOK_GRACE_SECONDS,
+        )
+        .unwrap();
+        assert!(
+            status
+                .actions
+                .iter()
+                .filter(|a| a.kind == "agent_setup")
+                .all(|a| a.action.starts_with("Your Claude Code ")),
+            "needs-you text names the agent by brand"
+        );
         let mut setup_rows = status
             .actions
             .iter()
@@ -1918,6 +2023,163 @@ mod tests {
     #[test]
     fn setup_problems_reach_only_their_owner_on_postgres() {
         on_postgres(setup_contract);
+    }
+
+    /// A session waiting for its person reaches only that person, after the grace: a prompt or
+    /// question always, the end of a turn only while the session leads unfinished Work.
+    fn waiting_contract(store: &dyn Store) {
+        use crate::hub::onboarding::Observations;
+        use crate::hub::session_waiting::{GRACE_SECONDS, WaitReason};
+        let now = crate::hub::store::unix_now();
+        let person = |user_id: i64, login: &str| {
+            store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap()
+        };
+        let token = |user: &crate::hub::store::User, name: &str| {
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, name, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(&person(601, "viewer"), "viewer-laptop");
+        let other = token(&person(602, "other"), "other-laptop");
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "fix-login", "title": "Fix login", "session": "working",
+            "scope": ["src/login.rs"]
+        }))
+        .unwrap();
+        let work = store
+            .work_start(&viewer.token_id, &request, now)
+            .unwrap()
+            .item;
+        let observations = Observations::default();
+        let wait = |who: &Principal, session: &str, reason, at| {
+            observations
+                .waiting()
+                .record(who, session, session, "claude", reason, None, None, at)
+                .unwrap();
+        };
+        let waits = |who: &Principal, at| {
+            super::read(store, &observations, who, at)
+                .unwrap()
+                .actions
+                .into_iter()
+                .filter(|a| a.kind == "session_waiting")
+                .collect::<Vec<_>>()
+        };
+        let earlier = now - GRACE_SECONDS;
+        wait(&viewer, "working", WaitReason::Idle, earlier);
+        wait(&viewer, "chatting", WaitReason::Idle, earlier);
+        wait(&viewer, "asking", WaitReason::Permission, earlier);
+        wait(&viewer, "fresh", WaitReason::Question, now);
+        wait(&other, "theirs", WaitReason::Permission, earlier);
+        let mine = waits(&viewer, now);
+        // The open chat with no Work, the fresh question and the other person's prompt are not here.
+        assert_eq!(mine.len(), 2, "{mine:?}");
+        assert!(mine.iter().all(|a| {
+            a.needs_you
+                && a.recipients.len() == 1
+                && a.recipients[0].owner.as_deref() == Some(viewer.owner.id.as_str())
+                && a.semantic_version.as_deref() == Some(earlier.to_string().as_str())
+                && a.action
+                    .ends_with("Answer it in that session; the Hub cannot answer it for you.")
+        }));
+        let idle = mine
+            .iter()
+            .find(|a| a.id.starts_with("waiting:idle:"))
+            .unwrap();
+        assert_eq!(idle.work_ids, vec![work.id.clone()]);
+        assert!(
+            idle.action
+                .starts_with("Your Claude Code finished its turn"),
+            "{}",
+            idle.action
+        );
+        assert!(idle.action.contains("on “Fix login”"), "{}", idle.action);
+        let asking = mine
+            .iter()
+            .find(|a| a.id.starts_with("waiting:permission:"))
+            .unwrap();
+        assert!(asking.work_ids.is_empty());
+        assert!(
+            !asking.id.contains("asking"),
+            "the session ID is not exposed"
+        );
+        let status = super::read(store, &observations, &viewer, now).unwrap();
+        assert!(status.counts.needs_you >= 2);
+        assert!(super::render_text(&status).contains("for your permission to use a tool"));
+        assert_eq!(waits(&other, now).len(), 1);
+        // Ending the wait removes it, and the attention digest moves with it.
+        observations
+            .waiting()
+            .clear(&viewer.token_id, "asking", None, false);
+        let after = super::read(store, &observations, &viewer, now).unwrap();
+        assert_eq!(waits(&viewer, now).len(), 1);
+        assert_ne!(after.digest, status.digest);
+        // A host that stops the idle session ends it, which pauses its Work. When the session
+        // resumes and stops for its person again, that wait still reaches them, with what it asks.
+        assert!(
+            store
+                .end_session_pausing(&viewer.token_id, Some("working"), "hook:claude", now)
+                .unwrap()
+                .paused
+        );
+        observations
+            .waiting()
+            .record(
+                &viewer,
+                "working",
+                "working",
+                "claude",
+                WaitReason::Idle,
+                None,
+                Some("Should I force-push the rebased branch?\u{7}"),
+                earlier,
+            )
+            .unwrap();
+        let resumed = waits(&viewer, now);
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert_eq!(resumed[0].work_ids, vec![work.id.clone()]);
+        assert!(
+            resumed[0].action.contains(
+                "Its last message ends: “Should I force-push the rebased branch?”. Answer it"
+            ),
+            "{}",
+            resumed[0].action
+        );
+        // The other person never sees it.
+        assert!(
+            waits(&other, now)
+                .iter()
+                .all(|a| !a.action.contains("force-push"))
+        );
+    }
+
+    #[test]
+    fn sqlite_waiting_sessions_reach_only_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        waiting_contract(&*store);
+    }
+
+    #[test]
+    fn waiting_sessions_reach_only_their_owner_on_postgres() {
+        on_postgres(waiting_contract);
     }
 
     #[test]
@@ -2249,7 +2511,8 @@ mod tests {
     fn failed_checks_and_stopped_gates_reach_their_owner_on_postgres() {
         on_postgres(checks_contract);
     }
-    /// Runs one contract in its own disposable schema.
+    /// Runs one contract in a disposable schema of its own disposable database. The store's
+    /// advisory locks are database-wide, so a shared database would make parallel tests wait.
     fn on_postgres(contract: fn(&dyn Store)) {
         let Ok(base) = std::env::var("AGENTSCM_TEST_DATABASE_URL") else {
             eprintln!("skipping PostgreSQL status conformance: AGENTSCM_TEST_DATABASE_URL unset");
@@ -2266,26 +2529,32 @@ mod tests {
         );
         let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
         admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .unwrap();
-        struct Schema {
+            .batch_execute(&format!("CREATE DATABASE {schema}"))
+            .expect("the test role must be able to create databases");
+        struct Database {
             admin: postgres::Client,
             name: String,
         }
-        impl Drop for Schema {
+        impl Drop for Database {
             fn drop(&mut self) {
                 let _ = self
                     .admin
-                    .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.name));
+                    .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
             }
         }
-        let _schema = Schema {
+        let _database = Database {
             admin,
             name: schema.clone(),
         };
-        let separator = if base.contains('?') { '&' } else { '?' };
+        let mut database = reqwest::Url::parse(&base).unwrap();
+        database.set_path(&format!("/{schema}"));
+        postgres::Client::connect(database.as_str(), postgres::NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .unwrap();
+        let separator = if database.query().is_some() { '&' } else { '?' };
         let url = format!(
-            "{base}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
+            "{database}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
         );
         let store = store::open(&url).unwrap();
         contract(&*store);

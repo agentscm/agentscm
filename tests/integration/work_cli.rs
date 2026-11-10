@@ -143,6 +143,20 @@ impl Client {
         self.request("start", request)
     }
 
+    fn why(&self, directory: &std::path::Path, target: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["why", target])
+            .current_dir(directory)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.config.path())
+            .env("XDG_CONFIG_HOME", self.config.path())
+            .env("AGENTSCM_HUB_URL", &self.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &self.token_file)
+            .output()
+            .unwrap()
+    }
+
     fn checkpoint(&self, request: &str) -> Output {
         self.request("checkpoint", request)
     }
@@ -637,6 +651,111 @@ fn catchup_read_does_not_acknowledge_until_the_exact_delivery_is_marked_reviewed
     assert_eq!(retry.status, CatchupAckStatus::AlreadyAcknowledged);
 }
 
+/// `agentscm why` turns a line and a path into commits with local Git, asks the Hub about each
+/// and about the path from the repository root, and refuses a target that is neither.
+#[test]
+fn why_resolves_a_line_and_a_path_through_git_then_asks_the_hub() {
+    let hub = Hub::start();
+    let client = hub.client(19, "why");
+    let started = client.start(r#"{"request_key":"why-cli","title":"Explain why.rs","session":"why-cli","scope":["src/why.rs"]}"#);
+    assert!(started.status.success(), "{started:?}");
+    let repository = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir(repository.path().join("src")).unwrap();
+    std::fs::write(repository.path().join("src/why.rs"), "fn why() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "why"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    let line = client.why(&repository.path().join("src"), "why.rs:1");
+    assert!(line.status.success(), "{line:?}");
+    let line: serde_json::Value = serde_json::from_slice(&line.stdout).unwrap();
+    assert_eq!(line["commits"], serde_json::json!([commit]));
+    assert_eq!(line["path"], "src/why.rs");
+    assert_eq!(line["answers"][0]["known"], false, "{line}");
+    assert_eq!(
+        line["answers"][1]["work"][0]["title"], "Explain why.rs",
+        "{line}"
+    );
+
+    let root = client.why(repository.path(), ".");
+    assert!(root.status.success(), "{root:?}");
+    let root: serde_json::Value = serde_json::from_slice(&root.stdout).unwrap();
+    assert_eq!(root["path"], serde_json::Value::Null);
+    assert_eq!(root["commits"], serde_json::json!([commit]));
+
+    // An absolute path names the same file.
+    let absolute = repository.path().join("src/why.rs");
+    let absolute = client.why(repository.path(), &format!("{}:1", absolute.display()));
+    assert!(absolute.status.success(), "{absolute:?}");
+    let absolute: serde_json::Value = serde_json::from_slice(&absolute.stdout).unwrap();
+    assert_eq!(absolute["path"], "src/why.rs");
+    assert_eq!(absolute["commits"], serde_json::json!([commit]));
+
+    // A line from a merged branch also names the merge that brought it in, not a merge of the
+    // main line into the branch.
+    let main = git(&["symbolic-ref", "--short", "HEAD"]).trim().to_owned();
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        repository.path().join("src/why.rs"),
+        "fn why() {}\nfn because() {}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "feature"]);
+    let feature = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    git(&["checkout", "-q", &main]);
+    std::fs::write(repository.path().join("other.txt"), "x\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "main moves"]);
+    git(&["checkout", "-q", "feature"]);
+    git(&["merge", "-q", "--no-ff", "-m", "sync main", &main]);
+    git(&["checkout", "-q", &main]);
+    git(&["merge", "-q", "--no-ff", "-m", "merge feature", "feature"]);
+    let merge = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let merged = client.why(repository.path(), "src/why.rs:2");
+    assert!(merged.status.success(), "{merged:?}");
+    let merged: serde_json::Value = serde_json::from_slice(&merged.stdout).unwrap();
+    assert_eq!(
+        merged["commits"],
+        serde_json::json!([feature, merge]),
+        "{merged}"
+    );
+
+    // A squash merge leaves one new commit on the main line and no merge: the line names it.
+    git(&["checkout", "-q", "-b", "squashed"]);
+    std::fs::write(
+        repository.path().join("src/why.rs"),
+        "fn why() {}\nfn because() {}\nfn so() {}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "branch work"]);
+    git(&["checkout", "-q", &main]);
+    git(&["merge", "-q", "--squash", "squashed"]);
+    git(&["commit", "-q", "-m", "squash merge"]);
+    let squash = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let squashed = client.why(repository.path(), "src/why.rs:3");
+    assert!(squashed.status.success(), "{squashed:?}");
+    let squashed: serde_json::Value = serde_json::from_slice(&squashed.stdout).unwrap();
+    assert_eq!(
+        squashed["commits"],
+        serde_json::json!([squash]),
+        "{squashed}"
+    );
+
+    let unknown = client.why(repository.path(), "no-such-target");
+    assert!(!unknown.status.success(), "{unknown:?}");
+}
+
 #[test]
 fn preflight_reports_missing_source_without_creating_work() {
     use agentscm::hub::work_preflight::{
@@ -739,7 +858,11 @@ fn reconcile_cli_prints_the_report_and_fails_for_unknown_work() {
 
     let missing = run("wrk_00000000000000000000000000000001");
     let error = cli_error(&missing);
-    assert_eq!(error["error"], "invalid: hub error 404", "{error}");
+    assert_eq!(
+        (error["code"].as_str(), error["error_kind"].as_str()),
+        (Some("not_found"), Some("nonexistent")),
+        "{error}"
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn git_path() -> PathBuf {
@@ -961,4 +961,267 @@ fn branch_advisory_skips_own_status_without_changing_full_collision_scan() {
         .map(|path| PathBuf::from(path).canonicalize().unwrap())
         .collect();
     assert!(checked.contains(&repo.canonicalize().unwrap()));
+}
+
+/// Runs git as `author`, with author and committer dates `hours_ago` hours before now.
+fn git_as(repo: &Path, author: &str, hours_ago: u64, args: &[&str]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let date = format!("{} +0000", now - hours_ago * 3600);
+    let email = format!("user.email={author}@example.invalid");
+    let out = Command::new(git_path())
+        .current_dir(repo)
+        .args(["-c", "user.name=t", "-c", &email])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}");
+}
+
+/// Commits `text` to `file` on the current branch as `author`, `hours_ago` hours before now.
+fn land(repo: &Path, author: &str, hours_ago: u64, file: &str, text: &str) {
+    let path = repo.join(file);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+    git_as(repo, author, hours_ago, &["add", "."]);
+    git_as(repo, author, hours_ago, &["commit", "-qm", file]);
+}
+
+fn history_repo(root: &Path) -> PathBuf {
+    let repo = root.join("history");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    repo
+}
+
+fn history(repo: &Path, days: &str) -> Value {
+    let out = run(repo, &["--history", days]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    value["history"].clone()
+}
+
+/// Commits, authors, overlaps and files.
+fn totals(report: &Value) -> (u64, u64, u64, u64) {
+    let number = |key: &str| report[key].as_u64().unwrap();
+    (
+        number("commits"),
+        number("authors"),
+        number("overlaps"),
+        number("files"),
+    )
+}
+
+fn history_text(repo: &Path, days: &str) -> String {
+    let out = run(repo, &["--history", days, "--text"]);
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn history_finds_no_overlap_when_authors_change_different_files() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 30, "src/a.rs", "1\n");
+    land(&repo, "bob", 20, "src/b.rs", "1\n");
+    // The same author changing a file again is not an overlap.
+    land(&repo, "alice", 10, "src/a.rs", "2\n");
+    let report = history(&repo, "30");
+    assert_eq!(report["profile"], "agentscm-git-collisions-history/v1");
+    assert_eq!(report["base"]["name"], "main");
+    assert_eq!(totals(&report), (3, 2, 0, 0));
+    assert_eq!(report["directories"], json!([]));
+    assert_eq!(report["lower_bound"], true);
+    assert_eq!(report["shallow"], false);
+    let text = history_text(&repo, "30");
+    assert!(
+        text.starts_with(
+            "Read 3 commits by 2 authors on main from the last 30 days · No overlaps found\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Lower bound: a squash or rebase merge"),
+        "{text}"
+    );
+}
+
+#[test]
+fn history_counts_an_overlap_under_its_top_directory() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 200, "src/hub/a.rs", "1\n");
+    // Ten hours after another author's change: an overlap.
+    land(&repo, "bob", 190, "src/hub/a.rs", "2\n");
+    // Ninety hours after the last change by anyone else: outside the 72-hour window.
+    land(&repo, "carol", 100, "src/hub/a.rs", "3\n");
+    let report = history(&repo, "30");
+    assert_eq!(report["window_hours"], 72);
+    assert_eq!(totals(&report), (3, 3, 1, 1));
+    assert_eq!(
+        report["directories"],
+        json!([{"directory": "src", "overlaps": 1, "files": 1}])
+    );
+    let text = history_text(&repo, "30");
+    assert!(
+        text.contains(
+            " · at least 1 overlap in 1 file\n\nBy top directory:\n  src   1 overlap in 1 file\n"
+        ),
+        "{text}"
+    );
+
+    // A file outside any directory is counted under (root); a second change by the first
+    // author after another author's is a second overlap on the same file.
+    land(&repo, "alice", 50, "README.md", "1\n");
+    land(&repo, "bob", 40, "README.md", "2\n");
+    land(&repo, "alice", 30, "README.md", "3\n");
+    let report = history(&repo, "30");
+    assert_eq!(
+        report["directories"],
+        json!([
+            {"directory": "(root)", "overlaps": 2, "files": 1},
+            {"directory": "src", "overlaps": 1, "files": 1}
+        ])
+    );
+    assert_eq!(totals(&report), (6, 3, 3, 2));
+}
+
+#[test]
+fn history_sees_a_squash_merge_only_as_one_commit_when_it_landed() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 240, "lib/f", "a\n");
+    // Bob works on the same file five and ten hours after alice, on a branch.
+    git(&repo, &["checkout", "-q", "-b", "bob-work"]);
+    land(&repo, "bob", 235, "lib/f", "a\nb1\n");
+    land(&repo, "bob", 230, "lib/f", "a\nb1\nb2\n");
+    // The squash lands 140 hours after alice's change, so the overlap in flight is not seen.
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["merge", "-q", "--squash", "bob-work"]);
+    git_as(&repo, "bob", 100, &["commit", "-qm", "squash bob-work"]);
+    let hidden = history(&repo, "30");
+    assert_eq!(totals(&hidden), (2, 2, 0, 0));
+    // A second squash that lands ten hours after the first is counted.
+    git(&repo, &["checkout", "-q", "-b", "carol-work"]);
+    land(&repo, "carol", 95, "lib/f", "a\nb1\nb2\nc\n");
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["merge", "-q", "--squash", "carol-work"]);
+    git_as(&repo, "carol", 90, &["commit", "-qm", "squash carol-work"]);
+    let seen = history(&repo, "30");
+    assert_eq!(totals(&seen), (3, 3, 1, 1));
+    assert_eq!(
+        seen["directories"],
+        json!([{"directory": "lib", "overlaps": 1, "files": 1}])
+    );
+}
+
+#[test]
+fn history_with_a_single_author_finds_no_overlaps() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 30, "src/a.rs", "1\n");
+    land(&repo, "alice", 20, "src/a.rs", "2\n");
+    // The same email in another letter case is the same author.
+    land(&repo, "Alice", 10, "src/a.rs", "3\n");
+    let report = history(&repo, "7");
+    assert_eq!(totals(&report), (3, 1, 0, 0));
+    assert!(history_text(&repo, "7").starts_with(
+        "Read 3 commits by 1 author on main from the last 7 days · No overlaps found\n"
+    ));
+}
+
+#[test]
+fn history_of_an_empty_period_reads_no_commits() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    // Two authors, one hour apart, a hundred days ago.
+    land(&repo, "alice", 2401, "src/a.rs", "1\n");
+    land(&repo, "bob", 2400, "src/a.rs", "2\n");
+    let report = history(&repo, "30");
+    assert_eq!(totals(&report), (0, 0, 0, 0));
+    assert_eq!(report["directories"], json!([]));
+    assert_eq!(
+        history_text(&repo, "30"),
+        "No commits reached main in the last 30 days; nothing to count.\n"
+    );
+    // A longer period reads them.
+    assert_eq!(history(&repo, "365")["overlaps"], 1);
+    assert_eq!(
+        history_text(&repo, "1"),
+        "No commits reached main in the last 1 day; nothing to count.\n"
+    );
+}
+
+#[test]
+fn history_rejects_zero_days_branch_scan_flags_and_a_bad_base() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 1, "a", "1\n");
+    for args in [
+        &["--history", "0"][..],
+        &["--history", "soon"],
+        &["--history", "7", "--worktrees"],
+        &["--history", "7", "--refs", "main"],
+        &["--history", "7", "--include-merged"],
+        &["--history", "7", "--merge-order"],
+    ] {
+        let out = run(&repo, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+    let out = run(
+        &repo,
+        &["--history", "7", "--text", "--base", "no-such-ref"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("no-such-ref does not resolve to a commit") && err.trim().lines().count() == 1,
+        "{err}"
+    );
+}
+
+/// Every file under `dir` with its length and modification time.
+fn files_under(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(next).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else {
+                found.push((entry.path(), meta.len(), meta.modified().unwrap()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn history_writes_nothing_to_the_repository() {
+    let dir = TempDir::new().unwrap();
+    let repo = history_repo(dir.path());
+    land(&repo, "alice", 2, "a", "1\n");
+    land(&repo, "bob", 1, "a", "2\n");
+    let before = files_under(&repo);
+    assert_eq!(totals(&history(&repo, "7")), (2, 2, 1, 1));
+    assert_eq!(files_under(&repo), before);
 }

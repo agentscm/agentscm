@@ -138,6 +138,10 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   checkout every 5 minutes, and never waits for it. Renewal mints a new token, saves it under the
   client lifecycle lock by compare-and-swap on `connections.json` (the token file is outside the
   checkout), and only then revokes the old token, so a failure part way leaves a working token. A
+  The new token file is written durably (temporary file, fsync, rename, directory fsync) before
+  `connections.json` points at it. Two hook processes can both mint; the one that finds a newer,
+  not-yet-due token saved when it takes the lock revokes its own surplus token and reports the
+  checkout renewed, not failed. A
   running MCP server picks up the renewed token at its next request. A laptop asleep for days
   renews at the first hook call after waking.
 - A pre-existing 30-day token (no `device_id`) is renewed the same way once the computer has a
@@ -174,7 +178,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   client lifecycle lock, revalidation of root, origin and `connections.json`, token file under the
   config directory. It **never installs agent files into the checkout** (no `.mcp.json`,
   `.claude/…`, `.git/info/exclude` edits); the user-level plugin that ran the hook keeps working.
-  The agent's context gets one line: `AgentSCM: coordinating on owner/repo`.
+  The agent's context gets one line: `AgentSCM: coordinating on owner/repo at <Hub>`.
 - A refusal is recorded for the checkout and shown in the agent's context and the menu bar app.
 
 ## Revocation and administration

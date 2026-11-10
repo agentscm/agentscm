@@ -49,6 +49,7 @@ function WorkCard({ item }: { item: WorkItem }) {
       <h3 className="work-title">
         <WorkLink id={item.id}>{item.title}</WorkLink>
       </h3>
+      {item.description && <p className="work-description">{item.description}</p>}
       <div className="work-owner">
         <Avatar name={l.agent} size={28} />
         <span>

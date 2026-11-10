@@ -23,6 +23,9 @@ use serde_json::json;
 use crate::agent_task_cli::{public_hex, read_signing_key, validate_private_directory_metadata};
 use crate::client_cli::read_token;
 
+#[path = "local_validation_migrate.rs"]
+mod migrate;
+
 const MAX_INPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// Comment pages (of 100) read when looking for an earlier post.
 const MAX_COMMENT_PAGES: u32 = 10;
@@ -44,6 +47,10 @@ pub enum LocalValidationCommand {
     Verify(VerifyArgs),
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
+    /// Submit retained evidence to an explicitly selected Hub; never falls back to a forge.
+    Submit(SubmitArgs),
+    /// Archive signed legacy GitHub comments to a Hub; cleanup requires --delete-legacy.
+    Migrate(migrate::MigrateArgs),
     /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
     /// signed attestation comments; with policy `exempt_paths`, a pull request that changes only
     /// exempt paths passes without one. Exit 0 when all were handled, 1 on any error or unread input,
@@ -83,6 +90,25 @@ pub struct ReconcileArgs {
     /// Link recorded on each status.
     #[arg(long)]
     target_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SubmitArgs {
+    #[arg(long)]
+    state_dir: PathBuf,
+    /// Retained envelope SHA-256; repeat to submit several requirements together.
+    #[arg(long, required = true)]
+    attestation: Vec<String>,
+    #[arg(long)]
+    hub_url: String,
+    /// Connected Hub repository id (rep_...).
+    #[arg(long)]
+    repository_id: String,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    proposal: i64,
+    /// Absolute owner-private file containing a writable repository agent token.
+    #[arg(long)]
+    token_file: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -210,6 +236,8 @@ pub async fn run(command: LocalValidationCommand) -> Result<i32> {
         }
         LocalValidationCommand::Verify(args) => verify(args),
         LocalValidationCommand::Post(args) => post(args).await,
+        LocalValidationCommand::Submit(args) => submit(args).await,
+        LocalValidationCommand::Migrate(args) => migrate::run(args).await,
         LocalValidationCommand::Reconcile(args) => reconcile(args).await,
     }
 }
@@ -729,4 +757,128 @@ async fn post(args: PostArgs) -> Result<i32> {
     )?;
     println!("{receipt}");
     Ok(0)
+}
+
+/// Pending is retained before transport. Lost responses retry the same canonical bundle;
+/// the Hub returns the original receipt, and no forge publication is attempted here.
+async fn submit(args: SubmitArgs) -> Result<i32> {
+    let receipt = submit_retained(args).await?;
+    println!("{}", serde_json::to_string(&receipt)?);
+    Ok(0)
+}
+
+async fn submit_retained(
+    args: SubmitArgs,
+) -> Result<agentscm::hub::validation_evidence::ValidationEvidenceReceipt> {
+    use agentscm::hub::forge_http;
+    use agentscm::hub::validation_evidence::ValidationEvidenceReceipt;
+    use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
+    private_state_dir(&args.state_dir)?;
+    if !args.token_file.is_absolute() {
+        return Err(Error::Invalid("--token-file must be absolute".into()));
+    }
+    if args.repository_id.len() != 36
+        || !args.repository_id.starts_with("rep_")
+        || !args.repository_id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::Invalid("invalid Hub repository id".into()));
+    }
+    let base = forge_http::check_base_url(&args.hub_url)
+        .map_err(|_| Error::Invalid("invalid Hub URL".into()))?;
+    let token = read_token(&args.token_file)?;
+    if args.attestation.is_empty()
+        || args.attestation.len() > agentscm::local_validation::bundle::MAX_BUNDLE_ENTRIES
+    {
+        return Err(Error::Limit("invalid Hub submission entry count".into()));
+    }
+    let mut entries = Vec::new();
+    for sha in &args.attestation {
+        let (envelope, record) = read_retained(&args.state_dir, sha)?;
+        entries.push(EvidencePairV1::new(&envelope, &record));
+    }
+    let bytes = ValidationBundleV1 {
+        version: 1,
+        entries,
+    }
+    .to_bytes()?;
+    let digest = agentscm::store::digest(&bytes);
+    // Include destination in the local receipt identity: evidence may be sent to multiple Hubs.
+    let destination = agentscm::store::digest(
+        format!("{base}/{}/{}", args.repository_id, args.proposal).as_bytes(),
+    );
+    let name = format!("{digest}.{destination}.hub");
+    retain_submission(&args.state_dir, &format!("{name}.bundle.json"), &bytes)?;
+    retain_submission(
+        &args.state_dir,
+        &format!("{name}.pending.json"),
+        &serde_json::to_vec(&json!({
+            "bundle_sha256": digest, "repository": args.repository_id, "proposal": args.proposal,
+            "state": "pending", "destination_sha256": destination
+        }))?,
+    )?;
+    let client =
+        forge_http::client().map_err(|_| Error::Invalid("could not create Hub client".into()))?;
+    let (status, body) = forge_http::send(
+        client
+            .post(format!(
+                "{base}/v1/hub/repos/{}/validation-evidence/{}",
+                args.repository_id, args.proposal
+            ))
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(bytes),
+        16 * 1024,
+    )
+    .await
+    .map_err(|_| {
+        Error::Invalid(
+            "Hub submission unavailable; retained pending submission can be retried".into(),
+        )
+    })?;
+    if status != 200 {
+        return Err(Error::Invalid(format!(
+            "Hub submission refused (HTTP {status}); retained pending submission can be retried"
+        )));
+    }
+    let receipt: ValidationEvidenceReceipt = agentscm::hub::reply::decode(&body).map_err(|_| {
+        Error::Invalid("invalid Hub submission receipt; retry retained submission".into())
+    })?;
+    if receipt.repository != args.repository_id
+        || receipt.proposal != args.proposal
+        || receipt.bundle_sha256 != digest
+        || receipt.generation <= 0
+        || receipt.state != "received_unverified"
+    {
+        return Err(Error::Invalid(
+            "Hub receipt does not match submission".into(),
+        ));
+    }
+    retain_submission(
+        &args.state_dir,
+        &format!("{name}.received.json"),
+        &serde_json::to_vec(&receipt)?,
+    )?;
+    match fs::remove_file(args.state_dir.join(format!("{name}.pending.json"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    File::open(&args.state_dir)?.sync_all()?;
+    Ok(receipt)
+}
+
+// Unique temporary names allow simultaneous deterministic retries without deleting another
+// process's temporary file. The final rename is atomic and each durable file is complete.
+fn retain_submission(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".hub-submit-")
+        .tempfile_in(dir)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(dir.join(name))
+        .map_err(|e| Error::Io(e.error))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }

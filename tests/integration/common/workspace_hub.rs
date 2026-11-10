@@ -310,7 +310,8 @@ impl Env {
         }
         let response = request.send().await.unwrap();
         let status = response.status().as_u16();
-        let text = response.text().await.unwrap();
+        // Each refusal carries its own error reference; blank it so equal refusals compare equal.
+        let text = crate::hub_error_assert::blank_references(&response.text().await.unwrap());
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
     pub(super) async fn session(&self, cookie: &str) -> Value {

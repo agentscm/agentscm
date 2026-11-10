@@ -2475,35 +2475,77 @@ impl LocalSpool {
         media: ArtifactMediaV1,
         retention: RetentionClassV1,
     ) -> Result<ArtifactRefV1> {
-        let size_bytes = u64::try_from(bytes.len())
-            .map_err(|_| CaptureError::Limit("artifact size is out of range".into()))?;
-        if size_bytes > self.limits.max_artifact_bytes {
-            return Err(CaptureError::Limit(format!(
-                "local artifact exceeds {} bytes",
-                self.limits.max_artifact_bytes
-            )));
+        let mut retained = self.retain_artifacts(&[bytes], media, retention)?;
+        Ok(retained.remove(0))
+    }
+
+    /// Retains every item, taking the lock and checking the quota once for the items not yet
+    /// retained. Fails without writing any of them when they do not fit.
+    pub fn retain_artifacts(
+        &self,
+        items: &[&[u8]],
+        media: ArtifactMediaV1,
+        retention: RetentionClassV1,
+    ) -> Result<Vec<ArtifactRefV1>> {
+        let mut references = Vec::with_capacity(items.len());
+        for bytes in items {
+            let size_bytes = u64::try_from(bytes.len())
+                .map_err(|_| CaptureError::Limit("artifact size is out of range".into()))?;
+            if size_bytes > self.limits.max_artifact_bytes {
+                return Err(CaptureError::Limit(format!(
+                    "local artifact exceeds {} bytes",
+                    self.limits.max_artifact_bytes
+                )));
+            }
+            references.push(ArtifactRefV1 {
+                digest: sha256(bytes),
+                size_bytes,
+                media,
+                retention,
+                availability: ContentAvailabilityV1::Local,
+            });
         }
-        let digest = sha256(bytes);
-        let path = self.root.join("artifacts").join(&digest);
-        let _lock = self.lock()?;
-        if path.exists() {
-            let existing = read_bounded(&path, self.limits.max_artifact_bytes)?;
-            if existing != bytes {
+        let artifacts = self.root.join("artifacts");
+        // Artifacts are installed by rename and never rewritten, so one already retained is
+        // verified without the lock; a source snapshot retains hundreds per hook.
+        let verify = |path: &Path, bytes: &[u8]| -> Result<()> {
+            if read_bounded(path, self.limits.max_artifact_bytes)? != bytes {
                 return Err(CaptureError::Conflict(
                     "local artifact digest collides with different bytes".into(),
                 ));
             }
-        } else {
-            self.reserve_artifact(bytes.len() as u64, 1)?;
-            atomic_write(&path, bytes)?;
+            Ok(())
+        };
+        let mut missing = Vec::new();
+        for (bytes, reference) in items.iter().zip(&references) {
+            let path = artifacts.join(&reference.digest);
+            if path.exists() {
+                verify(&path, bytes)?;
+            } else {
+                missing.push((path, *bytes));
+            }
         }
-        Ok(ArtifactRefV1 {
-            digest,
-            size_bytes,
-            media,
-            retention,
-            availability: ContentAvailabilityV1::Local,
-        })
+        if missing.is_empty() {
+            return Ok(references);
+        }
+        let _lock = self.lock()?;
+        let mut new = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (path, bytes) in missing {
+            if path.exists() {
+                verify(&path, bytes)?;
+            } else if seen.insert(path.clone()) {
+                new.push((path, bytes));
+            }
+        }
+        if !new.is_empty() {
+            let total = new.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            self.reserve_artifact(total, new.len())?;
+            for (path, bytes) in &new {
+                atomic_write(path, bytes)?;
+            }
+        }
+        Ok(references)
     }
 
     /// Returns a non-retained reference for a failed local retention attempt. This keeps content
@@ -3676,7 +3718,9 @@ impl LocalSpool {
                 "spool_v4_identity_mismatch: capture spool identity commit changed".into(),
             ));
         }
-        validate_private_authority_layout(directory, true)?;
+        // Opening the spool checks every retained file; each lock re-checks the root and its
+        // directories only. Rescanning every file per lock made one hook O(locks x files).
+        validate_private_authority_layout(directory, false)?;
         Ok(())
     }
 
@@ -7436,8 +7480,16 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
     usage_with_outbox(root).map(|(records, bytes, _)| (records, bytes))
 }
 
+// Counts quota scans, so a test can check how often a batch scans the spool.
+#[cfg(test)]
+thread_local! {
+    static USAGE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Physical usage plus the outbox entry count, an upper bound on outstanding action starts.
 fn usage_with_outbox(root: &Path) -> Result<(usize, u64, usize)> {
+    #[cfg(test)]
+    USAGE_SCANS.with(|scans| scans.set(scans.get() + 1));
     let mut records = 0usize;
     let mut bytes = 0u64;
     let mut outbox = 0usize;
@@ -7578,6 +7630,43 @@ fn appended_root_record(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_of_new_files_checks_the_quota_once_and_retained_files_not_at_all() {
+        // A quota check stats every retained file, so checking once per new file made one hook's
+        // source snapshot cost new files x spool files.
+        let temp = tempfile::tempdir().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let scans = || USAGE_SCANS.with(std::cell::Cell::get);
+        let items: Vec<Vec<u8>> = (0..500).map(|n| format!("file {n}").into_bytes()).collect();
+        let items: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
+        let before = scans();
+        let retained = spool
+            .retain_artifacts(&items, ArtifactMediaV1::Binary, RetentionClassV1::WorkLocal)
+            .unwrap();
+        assert_eq!(scans() - before, 1);
+        assert_eq!(retained.len(), 500);
+        assert_eq!(spool.read_artifact(&retained[7]).unwrap(), b"file 7");
+        // Already retained, and repeated within one batch: no quota check, one file each.
+        let before = scans();
+        spool
+            .retain_artifacts(
+                &[items[3], items[3]],
+                ArtifactMediaV1::Binary,
+                RetentionClassV1::WorkLocal,
+            )
+            .unwrap();
+        assert_eq!(scans(), before);
+        let again = spool
+            .retain_artifacts(
+                &[b"new", b"new"],
+                ArtifactMediaV1::Binary,
+                RetentionClassV1::WorkLocal,
+            )
+            .unwrap();
+        assert_eq!(again[0], again[1]);
+        assert_eq!(spool.read_artifact(&again[0]).unwrap(), b"new");
+    }
     use crate::change_record::GapReasonV1;
 
     fn export_anchors(parent: &Path) -> Vec<PathBuf> {

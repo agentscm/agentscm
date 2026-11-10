@@ -402,20 +402,24 @@ pub(super) async fn reconcile_active(
         match observe_readiness(state, api, conn, repo, token, target).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
-                "hub: merge queue readiness for {} {target}: {detail}",
-                repo.full_name
-            ),
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
+                crate::hub::error_envelope::log_internal(&format!(
+                    "hub: merge queue readiness for {} {target}: {detail}",
+                    repo.full_name
+                ))
+            }
         }
     }
     for row in rows {
         match reconcile_group(state, conn, repo, token, &row).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
-                "hub: merge group check for {}#{}: {detail}",
-                repo.full_name, row.pr_number
-            ),
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
+                crate::hub::error_envelope::log_internal(&format!(
+                    "hub: merge group check for {}#{}: {detail}",
+                    repo.full_name, row.pr_number
+                ))
+            }
         }
     }
     Ok(())
@@ -707,10 +711,10 @@ async fn post_group(
         }
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
         Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-            eprintln!(
+            crate::hub::error_envelope::log_internal(&format!(
                 "hub: merge group check post for {}#{}: {detail}",
                 repo.full_name, row.pr_number
-            );
+            ));
             return Ok(());
         }
     };

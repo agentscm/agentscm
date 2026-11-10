@@ -929,3 +929,403 @@ fn selected_cli_evidence_round_trips_and_tampering_is_rejected() {
     fs::write(&body, comment::render(&envelope, &record).unwrap()).unwrap();
     assert_ne!(f.verify(&body, "repo-1").0, 0);
 }
+
+#[test]
+fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
+    let f = ok_fixture();
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let token = f.root().join("hub-token");
+    fs::write(&token, "synthetic-hub-secret").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let repo = format!("rep_{}", "1".repeat(32));
+    // Drop the response after reading the complete request, twice: each retry must submit
+    // the exact same body and retain a retryable pending journal without exposing secrets.
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        bodies.push(request[end + 4..].to_vec());
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(bodies[0], bodies[1]);
+    });
+    for _ in 0..2 {
+        let out = f.cli(&[
+            "submit",
+            "--state-dir",
+            f.state().to_str().unwrap(),
+            "--attestation",
+            &sha,
+            "--hub-url",
+            &base,
+            "--repository-id",
+            &repo,
+            "--proposal",
+            "1",
+            "--token-file",
+            token.to_str().unwrap(),
+        ]);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-hub-secret"));
+    }
+    server.join().unwrap();
+    let pending = fs::read_dir(f.state())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".pending.json"))
+        .count();
+    assert_eq!(pending, 1);
+}
+
+#[derive(Clone)]
+struct MigrationFake {
+    state: std::sync::Arc<std::sync::Mutex<MigrationState>>,
+}
+struct MigrationState {
+    other_body: Option<String>,
+    login: String,
+    registry: Vec<u8>,
+    body: Option<String>,
+    author: String,
+    scenario: &'static str,
+    bundle: Option<Value>,
+    events: Vec<String>,
+}
+async fn migration_reply(
+    axum::extract::State(fake): axum::extract::State<MigrationFake>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use serde_json::json;
+    let mut s = fake.state.lock().unwrap();
+    let path = uri.path();
+    let mut status = 200;
+    let value = if path == "/repos/acme/widget" {
+        json!({"full_name":"acme/widget", "default_branch":"main"})
+    } else if path == "/repos/acme/widget/git/ref/heads/main" {
+        json!({"ref":"refs/heads/main", "object":{"sha":"a".repeat(40)}})
+    } else if path.contains("/contents/") {
+        assert!(
+            uri.query()
+                .unwrap()
+                .contains(&format!("ref={}", "a".repeat(40)))
+        );
+        json!({"type":"file", "encoding":"base64", "size":s.registry.len(), "content":STANDARD.encode(&s.registry)})
+    } else if path == "/user" {
+        json!({"id":7, "login":s.login})
+    } else if path == "/repos/acme/widget/issues/1/comments" {
+        s.events.push("discover".into());
+        let mut values = s.body.as_ref().map(|body| vec![json!({"id":42,"body":body,"user":{"login":s.author}}),
+            json!({"id":43,"body":"<!-- agentscm-validation-summary:v1 untouched -->","user":{"login":"app[bot]"}})])
+            .unwrap_or_default();
+        if let Some(body) = &s.other_body {
+            values.push(json!({"id":44,"body":body,"user":{"login":"other"}}));
+        }
+        if s.scenario == "quoted" {
+            values.push(json!({"id":45,"body":"A discussion quoting <!-- agentscm-local-validation:v1 example -->", "user":{"login":"reader"}}));
+        }
+        if s.scenario == "second_refused" {
+            let mut second = values[0].clone();
+            second["id"] = json!(44);
+            values.push(second);
+        }
+        if s.scenario == "malformed" {
+            json!({"unexpected":"object"})
+        } else {
+            json!(values)
+        }
+    } else if path == "/repos/acme/widget/issues/comments/44" {
+        assert_eq!(s.scenario, "mixed");
+        if method == axum::http::Method::DELETE {
+            assert_eq!(s.login, "other");
+            assert!(s.events.iter().any(|e| e == "readback"));
+            s.events.push("delete".into());
+            s.other_body = None;
+            status = 204;
+            json!({})
+        } else if let Some(body) = &s.other_body {
+            json!({"id":44,"user":{"login":"other"},"body":body})
+        } else {
+            status = 404;
+            json!({})
+        }
+    } else if path == "/repos/acme/widget/issues/comments/42" {
+        if method == axum::http::Method::DELETE {
+            assert!(
+                s.events.iter().any(|e| e == "readback"),
+                "delete before durable readback"
+            );
+            s.events.push("delete".into());
+            s.body = None;
+            if s.scenario == "lost" {
+                status = 500;
+            } else {
+                status = 204;
+            }
+            json!({})
+        } else {
+            s.events.push("live".into());
+            if let Some(body) = &s.body {
+                json!({"id":42, "user":{"login":s.author}, "body": if s.scenario == "changed" {format!("{body}\nedited")} else {body.clone()}})
+            } else {
+                status = 404;
+                json!({})
+            }
+        }
+    } else if path.ends_with("/validation-evidence/1") && method == axum::http::Method::POST {
+        s.events.push("archive".into());
+        if s.scenario == "refused"
+            || (s.scenario == "second_refused"
+                && s.events.iter().filter(|e| *e == "archive").count() == 2)
+        {
+            status = 403;
+            json!({})
+        } else {
+            let bundle =
+                agentscm::local_validation::bundle::ValidationBundleV1::from_slice(&body).unwrap();
+            let digest = agentscm::store::digest(&bundle.to_bytes().unwrap());
+            let value = serde_json::from_slice(&body).unwrap();
+            if let Some(old) = &s.bundle {
+                assert_eq!(old, &value);
+            }
+            s.bundle = Some(value);
+            if s.scenario == "archive_lost"
+                && s.events.iter().filter(|e| *e == "archive").count() == 1
+            {
+                status = 500;
+            }
+            json!({"repository":format!("rep_{}","1".repeat(32)), "proposal":1,"generation":1,
+                "bundle_sha256":digest,"received_at":1,"received_by":"synthetic","state":"received_unverified"})
+        }
+    } else if path.ends_with("/validation-evidence/1/1") {
+        s.events.push("readback".into());
+        s.bundle.clone().unwrap()
+    } else {
+        panic!("unexpected migration request {method} {uri}")
+    };
+    let mut reply = (
+        axum::http::StatusCode::from_u16(status).unwrap(),
+        axum::Json(value),
+    )
+        .into_response();
+    if s.scenario == "truncated" && path == "/repos/acme/widget/issues/1/comments" {
+        reply.headers_mut().insert(
+            "link",
+            "<http://127.0.0.1/comments?page=31>; rel=\"next\""
+                .parse()
+                .unwrap(),
+        );
+    }
+    reply
+}
+
+async fn migration_case(scenario: &'static str, expected_success: bool) {
+    let f = ok_fixture();
+    for name in ["registry.json", "policy.json"] {
+        let path = f.root().join(name);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["repository"] = serde_json::json!("github.com/acme/widget");
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let envelope_path = f.state().join(format!("{sha}.envelope.json"));
+    let mut envelope = fs::read(envelope_path).unwrap();
+    if scenario == "forged" {
+        let mut value: Value = serde_json::from_slice(&envelope).unwrap();
+        value["signature_hex"] = serde_json::json!("0".repeat(128));
+        envelope = serde_json::to_vec(&value).unwrap();
+    }
+    if matches!(scenario, "otherkind" | "otherrequirement") {
+        let mut parsed = agentscm::evidence::EvidenceEnvelope::from_slice(&envelope).unwrap();
+        if scenario == "otherkind" {
+            parsed.payload.check_kind = "model_review/v1".into();
+        } else {
+            parsed.payload.requirement_id = "other-requirement".into();
+        }
+        envelope = serde_json::to_vec(
+            &agentscm::evidence::sign_evidence(parsed.payload, &SigningKey::from_bytes(&[7; 32]))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let record = fs::read(f.state().join(format!("{sha}.record.json"))).unwrap();
+    let fake = MigrationFake {
+        state: std::sync::Arc::new(std::sync::Mutex::new(MigrationState {
+            other_body: (scenario == "mixed").then(|| comment::render(&envelope, &record).unwrap()),
+            login: "synthetic".into(),
+            registry: fs::read(f.root().join("registry.json")).unwrap(),
+            body: Some(comment::render(&envelope, &record).unwrap()),
+            author: if scenario == "foreign" {
+                "other"
+            } else {
+                "synthetic"
+            }
+            .into(),
+            scenario,
+            bundle: None,
+            events: Vec::new(),
+        })),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new()
+        .fallback(migration_reply)
+        .with_state(fake.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let token_path = f.root().join("migration-token");
+    fs::write(&token_path, "synthetic-migration-secret").unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let task_fake = fake.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let run = || {
+            f.cli(&[
+                "migrate",
+                "--state-dir",
+                f.state().to_str().unwrap(),
+                "--github-repo",
+                "acme/widget",
+                "--proposal",
+                "1",
+                "--github-token-file",
+                token_path.to_str().unwrap(),
+                "--hub-token-file",
+                token_path.to_str().unwrap(),
+                "--hub-url",
+                &base,
+                "--repository-id",
+                &format!("rep_{}", "1".repeat(32)),
+                "--api-url",
+                &base,
+                "--delete-legacy",
+            ])
+        };
+        let first = run();
+        let first = if scenario == "mixed" {
+            assert!(!first.status.success());
+            assert!(String::from_utf8_lossy(&first.stderr).contains("1 legacy comments remain"));
+            {
+                let mut state = task_fake.state.lock().unwrap();
+                assert!(state.body.is_none());
+                assert!(state.other_body.is_some());
+                assert_eq!(state.events.iter().filter(|e| *e == "archive").count(), 2);
+                state.login = "other".into();
+            }
+            run()
+        } else if scenario == "archive_lost" {
+            assert!(!first.status.success());
+            run()
+        } else {
+            first
+        };
+        if expected_success {
+            assert!(
+                first.status.success(),
+                "{}",
+                String::from_utf8_lossy(&first.stderr)
+            );
+            let again = run();
+            assert!(
+                again.status.success(),
+                "{}",
+                String::from_utf8_lossy(&again.stderr)
+            );
+            let journals: Vec<_> = fs::read_dir(f.state())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("migration-")
+                })
+                .collect();
+            assert_eq!(journals.len(), if scenario == "mixed" { 2 } else { 1 });
+            for path in journals {
+                let journal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert!(
+                    journal["comment_id"] == 42
+                        || (scenario == "mixed" && journal["comment_id"] == 44)
+                );
+                assert_eq!(journal["state"], "deleted_or_absent");
+            }
+        }
+        first
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        out.status.success(),
+        expected_success,
+        "scenario {scenario}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-migration-secret"));
+    let state = fake.state.lock().unwrap();
+    if expected_success {
+        assert_eq!(
+            state.events.iter().filter(|e| *e == "delete").count(),
+            if scenario == "mixed" { 2 } else { 1 }
+        );
+    } else {
+        assert!(!state.events.iter().any(|e| e == "delete"));
+        assert!(state.body.is_some());
+    }
+    server.abort();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_archives_before_cleanup_and_retries_lost_delete_reply() {
+    migration_case("ok", true).await;
+    migration_case("lost", true).await;
+    migration_case("archive_lost", true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_refuses_destructive_effects_for_unsafe_or_incomplete_inputs() {
+    for scenario in [
+        "changed",
+        "foreign",
+        "forged",
+        "otherkind",
+        "otherrequirement",
+        "second_refused",
+        "refused",
+        "truncated",
+        "malformed",
+    ] {
+        migration_case(scenario, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_allows_each_author_to_clean_up_and_ignores_quoted_markers() {
+    migration_case("mixed", true).await;
+    migration_case("quoted", true).await;
+}
