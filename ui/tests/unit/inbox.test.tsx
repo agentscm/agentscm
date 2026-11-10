@@ -117,6 +117,15 @@ describe('Inbox', () => {
     expect(screen.getByRole('heading', { level: 2, name: /Sam’s Copilot|sam’s Copilot/i }).textContent).toContain('wants to start “Round invoice totals per currency”')
   })
 
+  it('shows a reply given through Slack as the person\'s, marked from Slack', async () => {
+    hub([{ ...forMe, status: 'responded', updated_seq: 15, responses: [{ id: `crs_${'1'.repeat(32)}`, operation_id: 'op-1', target_work_id: wid('a'), responder: MARIA, target_generation: 1, kind: 'propose_split', note: 'I take tax', via: 'slack', created_at: now - 100, seq: 15 }] }])
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await screen.findAllByText('Round invoice totals per currency')
+    const rows = within(timeline()).getAllByRole('listitem').map((r) => r.textContent ?? '')
+    expect(rows.some((r) => r.includes('You, as your Claude Code proposed a scope split · from Slack') && r.includes('I take tax'))).toBe(true)
+    expect(rows.some((r) => r.startsWith('Your Claude Code proposed'))).toBe(false)
+  })
+
   it('keeps the typed note when the choice changes, and sends it with the CSRF token', async () => {
     hub([forMe], [], (call) =>
       json({ ...forMe, status: 'responded', updated_seq: 15, responses: [{ id: `crs_${'2'.repeat(32)}`, operation_id: String(call.body!['operation_id']), target_work_id: wid('a'), responder: MARIA, target_generation: 1, kind: call.body!['kind'], note: call.body!['note'], via: 'hub', created_at: now, seq: 15 }] }),

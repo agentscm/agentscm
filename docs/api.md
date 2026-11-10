@@ -52,11 +52,14 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 
 | Route | Effect |
 |---|---|
-| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"` |
+| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps) |
 | `POST /v1/hub/session/coordination/withdraw` | Close a request whose requesting agent is gone, for the agent that leads the target Work; recorded with `via: "hub"` |
-| `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent |
+| `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent; through a connected app, recorded as `answered_via_slack` |
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
+
+A coordination response's `via` is `"hub"` (the web sign-in), `"slack"` (a connected app with
+that `via`) or absent (the agent answered itself).
 
 ### Hand-off pickups
 
@@ -81,6 +84,25 @@ by one of the same person's agent tokens in the same repository, before expiry, 
 "work_id", "at"}`: the agent token's name, the session the start named, the Work it claimed and
 the Unix time. Another person's agent using the same key never picks it up. A start that the
 preflight or a conflict refused does not count.
+
+## Hub: connected apps
+
+An app registered in `AGENTSCM_HUB_APPS_FILE` connects to one person's account; see
+[Connected apps](hub.md#connected-apps) for the config, the flow and the limits. Every route
+here is 404 when no app is registered.
+
+| Route | Caller | Effect |
+|---|---|---|
+| `GET /v1/hub/apps/authorize?client_id&redirect_uri&state&code_challenge&code_challenge_method=S256` | Browser | The approval page (HTML), or the sign-in that returns to it; an error page, never a redirect, for an unknown app, a different redirect or no PKCE |
+| `POST /v1/hub/apps/authorize` | Browser: web sign-in plus a `csrf` form field | `decision=allow`: 303 to `redirect_uri?code&state` (code single use, 60 s). `decision=deny`: 303 to `redirect_uri?error=access_denied&state`. 403 page on a CSRF or sign-in failure, 429 page past 8 waiting codes |
+| `POST /v1/hub/apps/token` | The app (form or JSON) | `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `client_secret`, `code_verifier` → `{"credential", "device": {"id", "name"}, "owner": {"provider", "host", "user_id", "login"}}`. 400 `invalid_request`, `invalid_client` or `invalid_grant` |
+
+The credential (`Authorization: Bearer <credential>`) works on `GET` and `DELETE /v1/hub/device`,
+`GET /v1/hub/device/repositories`, `POST /v1/hub/device/tokens` with `"read_only": true` (403
+`app_read_only` otherwise), and `POST /v1/hub/session/coordination/reply` and
+`POST /v1/hub/session/handoff/answer`, where it acts for its person with the app's `via`. Other
+computer routes are 403 `app_not_allowed`; every other route is 401. It is listed in
+`GET /v1/hub/devices` with `"app": {"id", "name"}`.
 
 ## Hub: Work recovery
 
@@ -565,6 +587,10 @@ Registered codes:
 | `user_disabled` | 403 | no | `ask_owner` |
 | `too_many_logins` | 429 | yes | `wait` |
 | `device_revoked` | 403 | no | `sign_in` |
+| `app_not_allowed` | 403 | no | `none` |
+| `app_read_only` | 403 | no | `provide_field` |
+| `invalid_client` | 400 | no | `contact_operator` |
+| `invalid_grant` | 400 | no | `sign_in` |
 | `promise_conflict` | 409 | no | `inspect_work` |
 | `too_many_publications` | 429 | no | `contact_operator` |
 | `already_connected` | 409 | no | `none` |
