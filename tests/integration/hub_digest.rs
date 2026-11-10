@@ -383,7 +383,10 @@ async fn call(
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
     let bytes = response.bytes().await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
