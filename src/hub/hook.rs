@@ -795,11 +795,24 @@ impl Call {
                     })
                     .await
                     .and_then(|session| {
-                        state.onboarding.waiting().record(
+                        let waiting = state.onboarding.waiting();
+                        let agent = self.via.strip_prefix("hook:").unwrap_or("");
+                        // The host's notice says only that a dialog is on screen: it must not
+                        // replace the wait that says whose dialog it is and what it asks.
+                        if self.prompt_shown {
+                            return waiting.notice(
+                                &principal,
+                                &native,
+                                &session,
+                                agent,
+                                unix_now(),
+                            );
+                        }
+                        waiting.record(
                             &principal,
                             &native,
                             &session,
-                            self.via.strip_prefix("hook:").unwrap_or(""),
+                            agent,
                             reason,
                             self.asker.as_deref(),
                             self.asks.as_deref(),
