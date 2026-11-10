@@ -5380,3 +5380,63 @@ fn an_agent_installed_after_setup_is_named_until_a_later_run_sets_it_up() {
     let said = check();
     assert!(!said.contains("no AgentSCM setup was found"), "{said}");
 }
+
+/// The check commands find a linked worktree's connection the way hooks do: the main clone's.
+/// A separate clone has none, and a connection whose folder is gone is listed as such.
+#[test]
+fn check_commands_use_the_main_clones_connection_in_a_linked_worktree() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions", "--agent", "cursor"]),
+    ));
+    machine.git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let linked = machine.home.path().join("linked");
+    machine.git(
+        repo.path(),
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    let main = repo.path().canonicalize().unwrap();
+    let says = format!("This worktree uses the connection of {}.", main.display());
+    for args in [
+        &["--no-telemetry", "client", "check"][..],
+        &["--no-telemetry", "client", "status", "--root", "."],
+        &["--no-telemetry", "client", "reporting", "status"],
+        &["--no-telemetry", "client", "doctor", "--agent", "cursor"],
+    ] {
+        let output = machine.run(&linked, args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains(&says), "{args:?}: {err}");
+    }
+    // The main clone itself is not told it is a worktree.
+    let output = machine.run(repo.path(), &["--no-telemetry", "client", "check"]);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("This worktree"));
+
+    // A separate clone of the same repository has no connection to borrow.
+    let other = machine.repo();
+    let refused = machine.run(other.path(), &["--no-telemetry", "client", "check"]);
+    assert!(!refused.status.success());
+    assert!(
+        format!("{refused:?}").contains("no client connection"),
+        "{refused:?}"
+    );
+
+    // A connection whose folder is gone says so, with the command that removes it.
+    let listed =
+        |machine: &Machine| ok(&machine.run(&linked, &["--no-telemetry", "client", "list"]));
+    assert!(!listed(&machine).contains("folder is gone"));
+    let gone = machine.config().join("connections.json");
+    let saved = std::fs::read_to_string(&gone).unwrap();
+    std::fs::write(
+        &gone,
+        saved.replace(main.to_str().unwrap(), "/nonexistent/agentscm-gone"),
+    )
+    .unwrap();
+    assert!(listed(&machine).contains("folder is gone; remove with"));
+}

@@ -270,7 +270,7 @@ async fn status(args: StatusArgs) -> Result<()> {
     let root = args
         .root
         .as_deref()
-        .map(|root| selected_root(Some(root)))
+        .map(|root| connected_root(Some(root)))
         .transpose()?;
     let snapshot = crate::client_status::snapshot_for(args.check, root.as_deref()).await?;
     if args.json {
@@ -617,6 +617,24 @@ fn integration_replacement_if(
 fn selected_root(given: Option<&Path>) -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     canonical_root(given.unwrap_or(&cwd))
+}
+
+/// The root whose saved connection serves the selected checkout, found as hooks and the MCP
+/// server find it: a linked worktree without a connection of its own uses its main checkout's.
+/// Says so on standard error when that is another folder.
+fn connected_root(given: Option<&Path>) -> Result<PathBuf> {
+    let root = selected_root(given)?;
+    let connections = load()?;
+    match crate::client_config::connection_for_checkout(&connections, &root) {
+        Some((connection, _)) if connection.root != root => {
+            eprintln!(
+                "This worktree uses the connection of {}.",
+                connection.root.display()
+            );
+            Ok(connection.root.clone())
+        }
+        _ => Ok(root),
+    }
 }
 
 /// Lexically absolute path for local removal. It does not require a live checkout or resolve
@@ -1380,7 +1398,13 @@ async fn connect_inner(
     };
     let hub = match args.hub.as_deref() {
         Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
-        None => crate::hub_cli::default_hub()?,
+        // A checkout that is already connected keeps its Hub, however many are signed in.
+        None => crate::hub_cli::default_hub_or(
+            load()?
+                .into_iter()
+                .find(|connection| connection.root == root)
+                .map(|connection| connection.hub),
+        )?,
     };
     let supplied_token = match args.token_file {
         Some(path) => {
@@ -1626,7 +1650,7 @@ fn reporting(command: ReportingCommand) -> Result<()> {
         ReportingCommand::Off(args) => (args, Some(false)),
         ReportingCommand::Status(args) => (args, None),
     };
-    let root = selected_root(args.root.as_deref())?;
+    let root = connected_root(args.root.as_deref())?;
     let connection = load()?
         .into_iter()
         .find(|connection| connection.root == root)
@@ -1678,8 +1702,10 @@ fn list() -> Result<()> {
             connection.token_file.display(),
             if is_current(&connection) {
                 "checkout binding current"
-            } else {
+            } else if connection.root.exists() {
                 "checkout binding stale"
+            } else {
+                "folder is gone; remove with `agentscm client remove --root` and this path"
             },
             match (
                 connection.owned_token_id.as_deref(),
@@ -1771,7 +1797,7 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
 }
 
 async fn check(args: RootArgs) -> Result<()> {
-    let root = selected_root(args.root.as_deref())?;
+    let root = connected_root(args.root.as_deref())?;
     let connection = load()?
         .into_iter()
         .find(|connection| connection.root == root)
@@ -1844,7 +1870,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             "session must be the native session ID, 1-128 bytes without controls",
         ));
     }
-    let root = selected_root(args.checkout.root.as_deref())?;
+    let root = connected_root(args.checkout.root.as_deref())?;
     let connection = load()?.into_iter().find(|saved| saved.root == root)
         .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub; complete forge sign-in when prompted."))?;
     let name = match (args.agent.as_deref(), connection.agents.as_slice()) {

@@ -188,9 +188,13 @@ What the prompt relies on, checked against the help output of `agentscm client s
 - `client status --check` asks the Hub and prints one block for every connected checkout on this
   computer, which is why the prompt asks for this clone's block. `client check` verifies this
   clone's connection only.
-- Run in a linked worktree, `client check` and `client status --root .` report no connection,
-  although the hooks and the MCP server there use the main clone's. Step 1 therefore passes the
-  main clone as `--root`.
+- In a linked worktree that has no connection of its own, `client check`, `client doctor`,
+  `client status --root` and `client reporting` use the main clone's connection, as the hooks
+  and the MCP server there do, and say `This worktree uses the connection of <main clone>.`
+  `client setup` run in a worktree connects that worktree separately, so step 1 passes the main
+  clone as `--root`.
+- `client setup` without `--hub` in a clone that is already connected uses that clone's Hub,
+  even when this computer is signed in to several.
 - The edit in step 6 must use the agent's own file-edit tool: a shell write runs no edit hook.
   Cursor's hook reports the edit just after it is made.
 - A client with no hooks (anything but the five agents above) cannot pass step 6. Connect it
