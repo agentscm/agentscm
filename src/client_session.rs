@@ -192,7 +192,8 @@ const ROUTE_KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 *
 
 /// The file-name part for `session`'s route in one repository.
 fn route_tag(session: &str, hub: &str, repo: &str) -> String {
-    tag(&format!("{session}\0{hub}\0{repo}"))
+    // Repository names compare without case elsewhere (`same_repository`).
+    tag(&format!("{session}\0{hub}\0{}", repo.to_ascii_lowercase()))
 }
 
 /// The text of one route record, when it is readable.
@@ -215,7 +216,7 @@ pub(crate) fn route_of(config: &Path, session: &str, hub: &str, repo: &str) -> O
     let root = PathBuf::from(record["root"].as_str()?);
     (record["session"].as_str()? == session
         && record["hub"].as_str()? == hub
-        && record["repo"].as_str()? == repo
+        && record["repo"].as_str()?.eq_ignore_ascii_case(repo)
         && root.is_absolute())
     .then_some(root)
 }
