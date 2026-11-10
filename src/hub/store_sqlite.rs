@@ -133,7 +133,7 @@ use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
     WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
-use super::{HubError, Result};
+use super::{HubError, Result, store_sql};
 use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
@@ -9516,7 +9516,7 @@ impl Store for SqliteStore {
         Ok(self
             .conn()
             .query_row(
-                "SELECT value FROM hub_settings WHERE key = ?1",
+                &store_sql::sqlite(store_sql::GET_SETTING),
                 params![key],
                 |row| row.get(0),
             )
@@ -9525,8 +9525,7 @@ impl Store for SqliteStore {
 
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4",
+            &store_sql::sqlite(store_sql::SET_SETTING),
             params![key, value, unix_now(), actor],
         )?;
         Ok(())
@@ -9535,12 +9534,11 @@ impl Store for SqliteStore {
     fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (key) DO NOTHING",
+            &store_sql::sqlite(store_sql::CREATE_SETTING),
             params![key, value, unix_now(), actor],
         )?;
         Ok(conn.query_row(
-            "SELECT value FROM hub_settings WHERE key = ?1",
+            &store_sql::sqlite(store_sql::GET_SETTING),
             params![key],
             |row| row.get(0),
         )?)
