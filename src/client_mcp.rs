@@ -484,7 +484,8 @@ impl Client {
             name: None,
             ancestors: None,
             own_session: None,
-            session_tools: session_tools(&agentscm::hub::mcp::agent_tools()),
+            // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
+            session_tools: session_tools(&agentscm::hub::mcp::all_agent_tools()),
         })
     }
 
@@ -613,7 +614,7 @@ impl Client {
         if method == "tools/list"
             && let Some(tools) = reply.pointer_mut("/result/tools")
         {
-            self.session_tools = session_tools(tools);
+            self.session_tools.extend(session_tools(tools));
             with_root(tools);
         }
         // A call that left the default repository says so: a later call about the same Work
@@ -1401,6 +1402,11 @@ mod tests {
             assert_eq!(session(&mut hooked, json!({"task": "t"})), Value::Null);
             client_session::record_under(&records, &host, "native-1").unwrap();
             assert_eq!(session(&mut hooked, json!({"task": "t"})), "native-1");
+            // An opt-in tool the default list leaves out, called by name, gets the session too.
+            let mut transitions = json!({"method": "tools/call",
+                "params": {"name": "agentscm_work_transitions", "arguments": {}}});
+            hooked.prepare(&mut transitions, None).unwrap();
+            assert_eq!(transitions["params"]["arguments"]["session"], "native-1");
             // A session the agent names itself stands, and a tool that takes none gets none.
             assert_eq!(
                 session(&mut hooked, json!({"task": "t", "session": "mine"})),

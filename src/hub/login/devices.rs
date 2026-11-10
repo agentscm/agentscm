@@ -932,7 +932,7 @@ async fn agent_repositories_route(
     agent_repositories(&state, &principal).await.map(Json)
 }
 
-/// The repositories on this Hub the token's owner can read now, each with its current unfinished
+/// The repositories on the person's forge host the token's owner can read now, each with its current unfinished
 /// Work in brief, as the owner may see it. Every repository is checked with the forge as the All
 /// repositories page checks it, but without its role cache, because this read returns Work
 /// details. Repositories the forge could not answer for are counted in `unchecked`, never named,
