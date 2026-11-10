@@ -147,6 +147,12 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .with_sync(github)
         .with_skill_workflows(workflows)
         .with_shared_conversation_retention_days(config.shared_conversation_retention_days)?;
+    // Read once, here: a bad file stops the Hub from starting, as a bad apps file does.
+    let lookup = |name: &str| std::env::var(name).ok();
+    state.context_source = super::context_source::load(&lookup)?.map(std::sync::Arc::new);
+    if state.context_source.is_some() {
+        eprintln!("context source: registered");
+    }
     // The waits sessions reported to the previous process are gone: a session that has not
     // called since reads as not known to wait, never as quiet. So are their subagents.
     state.onboarding.waiting().lost_before(unix_now());
