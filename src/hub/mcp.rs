@@ -2204,6 +2204,7 @@ async fn call_inner(
                 Detail::Full => args.limit.unwrap_or(super::work::MAX_WORK_PAGE),
                 Detail::Compact => super::work::MAX_WORK_PAGE,
             },
+            after: page.after.clone(),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();

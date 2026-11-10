@@ -3460,17 +3460,20 @@ fn listed(fixture: &Fixture, token: &str, limit: usize, now: i64) -> (Vec<String
         .work_overview(
             token,
             &WorkOverviewQuery {
-                recent_since: None,
                 limit,
+                ..Default::default()
             },
             now,
         )
         .unwrap();
-    (
-        overview.current.into_iter().map(|item| item.id).collect(),
-        overview.settled_count,
-        overview.current_complete,
-    )
+    // Sorted: these cases ask which Work is listed. `hub_work` pins the order, newest first.
+    let mut ids = overview
+        .current
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    (ids, overview.settled_count, overview.current_complete)
 }
 
 fn briefing_ids(fixture: &Fixture, token: &str, now: i64) -> Vec<String> {
@@ -3803,9 +3806,10 @@ fn the_limit_counts_only_visible_items_and_paging_skips_hidden_ones(fixture: &Fi
         visible.push(item.id);
     }
     visible.sort();
+    // All five started in one second, so the page of two is the two greatest ids.
     assert_eq!(
         listed(fixture, &reader, 2, t0 + 500),
-        (visible[..2].to_vec(), 0, false)
+        (visible[3..].to_vec(), 0, false)
     );
     let (first, settled, complete) = listed(fixture, &reader, 1, t0 + 500);
     assert_eq!((first.len(), settled, complete), (1, 0, false));

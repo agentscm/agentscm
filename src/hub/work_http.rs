@@ -601,6 +601,7 @@ async fn overview(
         limit: params
             .limit
             .unwrap_or_else(|| WorkOverviewQuery::default().limit),
+        after: params.after,
     };
     let store = state.store.clone();
     let token = principal.token_id.clone();
@@ -630,6 +631,7 @@ async fn overview(
 struct OverviewParams {
     recent_since: Option<i64>,
     limit: Option<usize>,
+    after: Option<String>,
     operational: Option<u8>,
 }
 
