@@ -52,6 +52,11 @@ impl Hub {
 
     /// An agent token of person `id` for `repository`.
     async fn secret(&self, id: i64, repository: (&'static str, i64)) -> String {
+        self.secret_as(id, format!("person{id}"), repository).await
+    }
+
+    /// An agent token of person `id`, whom the forge calls `login`, for `repository`.
+    async fn secret_as(&self, id: i64, login: String, repository: (&'static str, i64)) -> String {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let identity = ForgeIdentity {
@@ -59,9 +64,7 @@ impl Hub {
                 host: "github.com".into(),
                 user_id: id,
             };
-            let owner = store
-                .upsert_user(&identity, &format!("person{id}"))
-                .unwrap();
+            let owner = store.upsert_user(&identity, &login).unwrap();
             let (name, repository_id) = repository;
             let (_, secret, _) = mint_bound_agent_token(
                 &*store,
@@ -108,7 +111,7 @@ impl Hub {
 
     /// The text of one `agentscm_start` reply.
     async fn start_work(&self, secret: &str, session: &str, started_by: Option<&str>) -> String {
-        // Named by a few characters of the ID: the whole ID must appear in no reply.
+        // Named by a few characters of the ID: the whole ID must reach nobody but its own person.
         let label = &session[..4];
         let mut arguments = json!({"task": format!("task {label}"),
             "request_key": format!("key-{label}"), "session": session,
@@ -192,11 +195,11 @@ async fn scenario(hub: Hub) {
         "{looped}"
     );
 
-    // Both repositories name the session alike and say who started it; neither shows an id.
+    // Both repositories name the session alike and say who started it. `session` is what the
+    // reader's Work replies call that session: its ID for their own, so they can tell which
+    // session leads their task, and its key for anyone else's, whose ID is never shown.
     let (widgets, text) = hub.sessions(&alice, WIDGETS).await;
-    for id in [PARENT, CHILD, BOBS] {
-        assert!(!text.contains(id), "{text}");
-    }
+    assert!(!text.contains(BOBS), "{text}");
     let parent = widgets
         .iter()
         .find(|s| s["owner"]["login"] == "person1" && s["started_by"].is_null())
@@ -204,9 +207,19 @@ async fn scenario(hub: Hub) {
     assert!(hex16(&parent["name"]), "{parent}");
     let child = started(&widgets, &parent["name"]);
     assert!(hex16(&child["name"]) && child["name"] != parent["name"]);
-    let (other, text) = hub.sessions(&alice_other, OTHER).await;
-    assert!(!text.contains(CHILD), "{text}");
+    assert_eq!(
+        (&parent["session"], &child["session"]),
+        (&json!(PARENT), &json!(CHILD))
+    );
+    assert!(accepted.contains(CHILD), "{accepted}");
+    let theirs = widgets
+        .iter()
+        .find(|s| s["owner"]["login"] == "person2")
+        .unwrap();
+    assert_eq!(theirs["session"], theirs["key"]);
+    let (other, _) = hub.sessions(&alice_other, OTHER).await;
     assert_eq!(other.len(), 1);
+    assert_eq!(other[0]["session"], CHILD);
     assert_eq!(
         (&other[0]["name"], &other[0]["started_by"]),
         (&child["name"], &parent["name"])
@@ -261,14 +274,24 @@ async fn scenario(hub: Hub) {
     })
     .await
     .unwrap();
-    // Another person sees who started whom, and Bob's own session belongs to no one.
-    let (seen, _) = hub.sessions(&bob, WIDGETS).await;
+    // Another person sees who started whom and none of Alice's IDs, and Bob's own session
+    // belongs to no one.
+    let (seen, text) = hub.sessions(&bob, WIDGETS).await;
+    assert!(!text.contains(PARENT) && !text.contains(CHILD), "{text}");
     assert_eq!(started(&seen, &parent["name"])["name"], child["name"]);
+    assert_eq!(started(&seen, &parent["name"])["session"], child["key"]);
     let bobs = seen
         .iter()
         .find(|s| s["owner"]["login"] == "person2")
         .unwrap();
     assert!(hex16(&bobs["name"]) && bobs["started_by"].is_null());
+    assert_eq!(bobs["session"], BOBS);
+    // Whose a session is goes by the person, not the login: someone the forge now calls by
+    // Alice's old login, which the Hub still has for her, gets none of her IDs.
+    let namesake = hub.secret_as(3, "person1".into(), WIDGETS).await;
+    let (seen, text) = hub.sessions(&namesake, WIDGETS).await;
+    assert!(!text.contains(PARENT) && !text.contains(CHILD), "{text}");
+    assert_eq!(started(&seen, &parent["name"])["session"], child["key"]);
     // A session under a name its client chose has no name, and no hook call can be matched to
     // it: its subagents are not known, which is not none.
     hub.hook(&bob, "main", "SessionStart", json!({"source": "startup"}))
