@@ -38,6 +38,7 @@ dependencies = [
  "toml_edit",
  "tower-service",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

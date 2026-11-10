@@ -904,8 +904,10 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
         json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
             "permissionDecision": "deny", "permissionDecisionReason": reason}})
     );
+    // The one-time request names the caller's own session, for its start call; the holder is
+    // named only by its digest. Both fixtures share one session id.
     assert!(
-        !reason.contains(&raw_session) && !reason.contains("agent,"),
+        !warn_once_part(&reason).contains(&raw_session) && !reason.contains("agent,"),
         "{reason}"
     );
     // The same edit again goes through, quietly.
