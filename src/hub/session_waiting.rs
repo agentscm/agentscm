@@ -8,8 +8,9 @@
 //! restart, after which a waiting session reads as not known rather than not waiting. The only
 //! text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
 //! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
-//! shown to that session's own person alone. No prompt, tool input or transcript is kept, and
-//! nothing here can answer the prompt: the person answers in the session.
+//! shown to that session's own person alone. No prompt, tool input or transcript is kept here,
+//! and this table cannot answer a prompt. A permission wait may have a pending request in
+//! `permission_answer`, which lets that person allow or deny it once from the Hub.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 

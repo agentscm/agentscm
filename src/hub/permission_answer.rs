@@ -32,6 +32,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
 use super::advice::invisible;
+use super::coordination_http::{not_your_agent, owns_agent};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
 use super::session_waiting::{GRACE_SECONDS, Waiting, wait_key};
@@ -194,11 +195,6 @@ fn conflict(reason: &str, message: &str) -> ApiError {
         .with_field("reason", json!(reason))
 }
 
-fn not_your_agent() -> ApiError {
-    ApiError::new(StatusCode::FORBIDDEN, "not_your_agent")
-        .with_message("That agent is not yours, or it is no longer connected")
-}
-
 impl From<Refusal> for ApiError {
     fn from(refusal: Refusal) -> Self {
         match refusal {
@@ -306,13 +302,6 @@ fn plain_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
 
-fn random_id() -> Outcome<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|_| HubError::Unavailable("random source unavailable".into()))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
 impl Requests {
     fn lock(&self) -> Outcome<std::sync::MutexGuard<'_, Inner>> {
         Ok(self.inner.lock().map_err(|_| HubError::Busy)?)
@@ -416,7 +405,7 @@ impl Requests {
             .prompts
             .get(&(principal.token_id.clone(), session.clone()))
             .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
-        let id = random_id()?;
+        let id = super::login::random_hex()?;
         let state = if confirmed {
             Phase::Pending
         } else {
@@ -591,7 +580,6 @@ impl Requests {
     }
 
     /// Whether the person can answer the wait with this item key from the Hub now.
-    #[allow(dead_code)] // The Needs-you item reads it once `waiting_actions` is wired to it.
     pub(super) fn answerable(&self, waiting: &Waiting, key: &str, now: i64) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
@@ -831,7 +819,7 @@ async fn answer(
     let store = state.store.clone();
     let owner = user.id.clone();
     blocking(&state, move || {
-        if super::coordination_http::owns_agent(&*store, &owner, &token, unix_now())? {
+        if owns_agent(&*store, &owner, &token, unix_now())? {
             Ok(())
         } else {
             Err(HubError::Unauthorized)
@@ -908,7 +896,7 @@ mod tests {
         now: i64,
     ) {
         waiting
-            .record(who, native, native, "claude", reason, asker, now)
+            .record(who, native, native, "claude", reason, asker, None, now)
             .unwrap();
     }
 
@@ -941,7 +929,14 @@ mod tests {
             register(&mine, "s", None),
             Err(Refusal::NotWaiting)
         ));
-        wait(&waiting, &mine, "s", WaitReason::Permission, Some("sub"), 1_001);
+        wait(
+            &waiting,
+            &mine,
+            "s",
+            WaitReason::Permission,
+            Some("sub"),
+            1_001,
+        );
         assert!(matches!(
             register(&mine, "s", None),
             Err(Refusal::NotWaiting)
@@ -1004,7 +999,14 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..=MAX_PER_TOKEN {
             let session = format!("s{n}");
-            wait(&waiting, &mine, &session, WaitReason::Permission, None, 1_000);
+            wait(
+                &waiting,
+                &mine,
+                &session,
+                WaitReason::Permission,
+                None,
+                1_000,
+            );
             let at = 1_001 + i64::try_from(n).unwrap();
             ids.push(
                 requests
@@ -1028,7 +1030,14 @@ mod tests {
             let who = principal(&format!("tok_{t}"), "usr_x", "acme/widgets");
             for n in 0..MAX_PER_TOKEN {
                 let session = format!("c{n}");
-                wait(&waiting, &who, &session, WaitReason::Permission, None, 1_000);
+                wait(
+                    &waiting,
+                    &who,
+                    &session,
+                    WaitReason::Permission,
+                    None,
+                    1_000,
+                );
                 let outcome =
                     requests.register(&waiting, &who, registration(&session, None, HASH), 1_200);
                 if matches!(outcome, Err(Refusal::Busy)) {
@@ -1089,10 +1098,7 @@ mod tests {
             requests.check(&waiting, "tok_a", &id, OTHER_HASH, 1_003),
             None
         );
-        assert_eq!(
-            requests.check(&waiting, "tok_a", "nope", HASH, 1_003),
-            None
-        );
+        assert_eq!(requests.check(&waiting, "tok_a", "nope", HASH, 1_003), None);
     }
 
     #[tokio::test]
@@ -1158,7 +1164,14 @@ mod tests {
             .register(&waiting, &mine, registration("s", None, OTHER_HASH), 1_061)
             .unwrap()
             .0;
-        wait(&waiting, &mine, "s", WaitReason::Permission, Some("sub"), 1_062);
+        wait(
+            &waiting,
+            &mine,
+            "s",
+            WaitReason::Permission,
+            Some("sub"),
+            1_062,
+        );
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, OTHER_HASH, 1_063),
             Some(Phase::Ended(Ended::SessionMovedOn))
@@ -1200,7 +1213,12 @@ mod tests {
         wait(&waiting, &mine, "t", WaitReason::Permission, None, 2_000);
         requests.confirm("tok_a", "t", 2_001);
         let early = requests
-            .register(&waiting, &mine, registration("t", None, HASH), 2_001 + CONFIRM_SLACK_SECONDS)
+            .register(
+                &waiting,
+                &mine,
+                registration("t", None, HASH),
+                2_001 + CONFIRM_SLACK_SECONDS,
+            )
             .unwrap();
         assert_eq!(early.1, Phase::Pending);
         wait(&waiting, &mine, "u", WaitReason::Permission, None, 3_000);
@@ -1291,13 +1309,9 @@ mod tests {
         requests.confirm("tok_b", "s", 1_001);
         let mut cut = registration("s", None, HASH);
         cut.complete = false;
-        let cut_id = requests
-            .register(&waiting, &theirs, cut, 1_002)
-            .unwrap()
-            .0;
-        let on_cut = |decision| {
-            requests.answer(&waiting, "usr_me", Some(7), &cut_id, decision, 1_010)
-        };
+        let cut_id = requests.register(&waiting, &theirs, cut, 1_002).unwrap().0;
+        let on_cut =
+            |decision| requests.answer(&waiting, "usr_me", Some(7), &cut_id, decision, 1_010);
         assert!(matches!(on_cut(Decision::Allow), Err(Refusal::Invalid(_))));
         assert!(matches!(on_cut(Decision::Deny), Ok(Decision::Deny)));
     }
@@ -1382,7 +1396,10 @@ mod tests {
             .answer(&waiting, "usr_me", Some(7), &id, Decision::Deny, at)
             .unwrap();
         let shown = requests.list(&waiting, "usr_me", Some(7), at).unwrap();
-        assert_eq!((shown[0].state, shown[0].decision), ("answered", Some("deny")));
+        assert_eq!(
+            (shown[0].state, shown[0].decision),
+            ("answered", Some("deny"))
+        );
         assert!(!requests.answerable(&waiting, &wait_key("tok_a", "s"), at));
         // The hook stopped polling: stale, so hidden.
         let id = requests
@@ -1390,7 +1407,13 @@ mod tests {
             .unwrap()
             .0;
         requests.confirm("tok_a", "s", at);
-        assert_eq!(requests.list(&waiting, "usr_me", Some(7), at).unwrap().len(), 2);
+        assert_eq!(
+            requests
+                .list(&waiting, "usr_me", Some(7), at)
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(
             requests
                 .list(&waiting, "usr_me", Some(7), at + HOOK_GONE_SECONDS)

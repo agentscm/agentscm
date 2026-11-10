@@ -439,6 +439,7 @@ fn expectations() -> Vec<(&'static str, Expect)> {
         // A wait is reported and never answered: the prompt or question still goes to the person.
         ("claude-PreToolUse-AskUserQuestion", Empty),
         ("claude-Notification", Empty),
+        ("claude-PermissionRequest", Empty),
         ("claude-Stop", Empty),
         ("claude-SessionEnd", Empty),
         ("codex-SessionStart", Context(CLAUDE_CONTEXT)),
@@ -1368,4 +1369,75 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
         "tool_name":"Bash", "tool_input":{"command":"cargo test"}, "cwd":"/work/acme-widgets"});
     assert_eq!(hub.hook("claude", &lead, &bash), json!({}));
     assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}
+
+/// The hook's side of answering a permission prompt from the Hub. A request needs its session's
+/// permission wait, is offered only once the host's own notification confirms a prompt is on
+/// screen, and ends when the session moves on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permission_request_needs_its_wait_and_the_hosts_notice_and_ends_with_the_wait() {
+    let mut hub = Hub::start().await;
+    let (secret, other) = (hub.agent(), hub.agent());
+    let prompt = fixture("claude-PermissionRequest");
+    let session = prompt["session_id"].clone();
+    let hash = "a".repeat(64);
+    let register = json!({"session": session, "tool": "Bash", "display": "cargo publish",
+        "complete": true, "input_hash": hash});
+    let call = |route: &str, secret: &str, body: &Value| {
+        hub.post(
+            &format!("/v1/hub/permission/{route}"),
+            Some(secret),
+            body.to_string().as_bytes(),
+        )
+    };
+    // No permission wait yet, so there is nothing to answer.
+    let (status, refused) = call("register", &secret, &register);
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("not_waiting")),
+        "{refused}"
+    );
+    hub.hook("claude", &secret, &prompt);
+    // Another token has no such wait; a bad hash and a field the Hub does not take are refused.
+    assert_eq!(call("register", &other, &register).0, 409);
+    let mut bad = register.clone();
+    bad["input_hash"] = json!("short");
+    assert_eq!(call("register", &secret, &bad).0, 400);
+    let mut extra = register.clone();
+    extra["tool_input"] = json!({"command": "cargo publish"});
+    assert_eq!(call("register", &secret, &extra).0, 400);
+
+    let (status, made) = call("register", &secret, &register);
+    assert_eq!(status, 200, "{made}");
+    assert_eq!(made["state"], "unconfirmed", "{made}");
+    assert_eq!(made["input_hash"], json!(hash));
+    let id = made["request_id"].clone();
+    let poll = json!({"request_id": id, "input_hash": hash, "wait_seconds": 0});
+    let state = |secret: &str| {
+        let (status, polled) = call("poll", secret, &poll);
+        (status, polled["state"].as_str().map(str::to_owned))
+    };
+    assert_eq!(state(&secret), (200, Some("unconfirmed".into())));
+    // Only the token that registered it reads it; anything else looks unknown.
+    assert_eq!(state(&other).0, 404);
+    let mut wrong = poll.clone();
+    wrong["input_hash"] = json!("b".repeat(64));
+    assert_eq!(call("poll", &secret, &wrong).0, 404);
+    // The host's own notification says the prompt is on screen.
+    hub.hook("claude", &secret, &fixture("claude-Notification"));
+    assert_eq!(state(&secret), (200, Some("pending".into())));
+    // The same registration again is the same request.
+    assert_eq!(call("register", &secret, &register).1["request_id"], id);
+    // The person's routes take a web sign-in, never an agent token.
+    let answer = json!({"repository": REPO, "request_id": id, "decision": "allow"});
+    let answered = hub.post(
+        "/v1/hub/session/permissions/answer",
+        Some(&secret),
+        answer.to_string().as_bytes(),
+    );
+    assert_eq!(answered.0, 401, "{}", answered.1);
+    // The tool ran, so it was answered in the session: the wait ends and the request with it.
+    let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
+    hub.hook("claude", &secret, &ran);
+    assert_eq!(state(&secret), (200, Some("ended".into())));
 }

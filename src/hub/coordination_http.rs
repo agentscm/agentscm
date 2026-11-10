@@ -51,6 +51,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/session/handoff/ask", post(person_ask))
         .merge(super::pickup::routes())
         .merge(super::dismissals::routes())
+        .merge(super::permission_answer::routes())
         .merge(super::agent_messages::routes())
         .merge(super::conversation_sharing::routes())
 }
@@ -235,13 +236,18 @@ fn person_error(error: HubError) -> ApiError {
     }
 }
 
-fn not_your_agent() -> ApiError {
+pub(super) fn not_your_agent() -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, "not_your_agent")
         .with_message("That agent is not yours, or it is no longer connected")
 }
 
 /// Whether `token` is an active agent token of `owner` that can act (not read-only).
-fn owns_agent(store: &dyn super::Store, owner: &str, token: &str, now: i64) -> Result<bool> {
+pub(super) fn owns_agent(
+    store: &dyn super::Store,
+    owner: &str,
+    token: &str,
+    now: i64,
+) -> Result<bool> {
     Ok(store
         .list_agent_tokens(owner)?
         .iter()
