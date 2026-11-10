@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+use super::catchup::{CatchupMergeObservation, CatchupRepositoryScope};
 use super::connection::Observation;
 use super::http::{ApiError, Reader, blocking};
 use super::intent::scope;
@@ -91,6 +92,21 @@ pub async fn read(
         // described as exhaustive, including when an unknown catalog entry was skipped.
         let runs = super::skills::views(&*store, &principal.repository, None, None, RUN_SCAN)?;
         let mut result = project(&principal.repository, &request, &rows, &overview, &runs)?;
+        if result["availability"] == "not_observed" {
+            // A closed PR's open-state observation is forgotten; its provider merge fact is kept.
+            let merges = store.catchup_merges_for_pull(
+                &CatchupRepositoryScope {
+                    provider: principal.owner.identity.provider.clone(),
+                    host: repo.host.clone(),
+                    repository: repo.full_name.clone(),
+                    repository_id: Some(repo.repository_id),
+                },
+                request.number,
+            )?;
+            if !merges.is_empty() {
+                result = merged(result["coverage"].take(), &merges);
+            }
+        }
         if result["coverage"].is_object() {
             result["coverage"]["last_sync_partial"] = json!(sync.last_pr_sync_partial(&repo.id));
         }
@@ -122,6 +138,30 @@ pub async fn read(
         ));
     }
     Ok(value)
+}
+
+/// Provider-confirmed merge facts for a PR whose open-state context the Hub no longer keeps.
+fn merged(coverage: Value, merges: &[CatchupMergeObservation]) -> Value {
+    let merges_complete = merges.len() < 17;
+    let merges: Vec<_> = merges
+        .iter()
+        .take(MAX_ITEMS)
+        .map(|merge| {
+            json!({
+                "merge_commit": merge.merge_commit, "head_commit": merge.head_commit,
+                "base": short(&merge.base), "branch": short(&merge.branch),
+                "merged_at": merge.occurred_at, "observed_at": merge.observed_at,
+                "paths": merge.paths.iter().take(MAX_PATHS).map(|p| short(p)).collect::<Vec<_>>(),
+                "paths_omitted": merge.paths.len().saturating_sub(MAX_PATHS),
+                "paths_complete": merge.paths_complete,
+            })
+        })
+        .collect();
+    json!({"version": 1, "availability": "merged", "merges": merges,
+        "merges_complete": merges_complete,
+        // Dropped when the PR closed; workflows linked to it remain under their own reads.
+        "not_retained": ["pull_request", "pull_request_overlaps", "work_overlaps", "provider_evidence"],
+        "coverage": coverage})
 }
 
 fn valid_sha(value: &str) -> bool {
