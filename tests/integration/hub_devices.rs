@@ -4581,13 +4581,59 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
     let late = made["request_id"].clone();
     agent("/v1/hub/hook/claude", shown.clone()).await;
-    agent("/v1/hub/hook/claude", ran).await;
+    agent("/v1/hub/hook/claude", ran.clone()).await;
     let (status, refused) =
         page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
     assert_eq!(
         (status, refused["reason"].as_str()),
         (409, Some("answered_in_session"))
     );
+
+    // A hook that offers one of the session's own choices and passes a typed reason on: what
+    // the person picks or types is what that hook's poll hears, and nothing else is added.
+    let offering = |hash: &str| {
+        let mut body = register(hash, true);
+        body["takes_reason"] = json!(true);
+        body["choices"] = json!([{"label": "Allow, and do not ask again for this",
+            "saves": "the rule Bash(cargo publish), for this session only"}]);
+        body
+    };
+    let heard = |id: &Value, hash: &str| {
+        let poll = json!({"request_id": id, "input_hash": hash.repeat(64), "wait_seconds": 0});
+        agent("/v1/hub/permission/poll", poll)
+    };
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("e")).await;
+    let chosen = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut pick = answer(&chosen, "allow");
+    pick["reason"] = json!("because");
+    let unfit = page_post(&env, &alice, true, PERMISSION_ANSWER, pick.clone()).await;
+    assert_eq!(unfit.0, 400, "{}", unfit.1);
+    pick.as_object_mut().unwrap().remove("reason");
+    pick["choice"] = json!("0");
+    let picked = page_post(&env, &alice, true, PERMISSION_ANSWER, pick).await;
+    assert_eq!(picked.0, 200, "{}", picked.1);
+    let (_, polled) = heard(&chosen, "e").await;
+    assert_eq!(
+        (&polled["decision"], &polled["choice"], polled.get("reason")),
+        (&json!("allow"), &json!(0), None)
+    );
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("f")).await;
+    let denied = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut no = answer(&denied, "deny");
+    no["reason"] = json!("use the staging key");
+    let said = page_post(&env, &alice, true, PERMISSION_ANSWER, no).await;
+    assert_eq!(said.0, 200, "{}", said.1);
+    let (_, polled) = heard(&denied, "f").await;
+    assert_eq!(
+        (&polled["decision"], &polled["reason"], polled.get("choice")),
+        (&json!("deny"), &json!("use the staging key"), None)
+    );
+    agent("/v1/hub/hook/claude", ran).await;
 
     // A person no longer answers for an agent whose token was revoked.
     agent("/v1/hub/hook/claude", prompt).await;

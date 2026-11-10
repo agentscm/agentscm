@@ -9,8 +9,8 @@
 //! text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
 //! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
 //! shown to that session's own person alone. No prompt, tool input or transcript is kept here,
-//! and this table cannot answer a prompt. A permission wait may have a pending request in
-//! `permission_answer`, which lets that person allow or deny it once from the Hub.
+//! and this table cannot answer a prompt. A wait at a permission prompt or a question may have a
+//! pending request in `permission_answer`, which lets that person answer it from the Hub.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -156,7 +156,8 @@ impl Waiting {
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
     /// the subagent `asker` when the host names one, with `asks` saying what for when the hook
     /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`; a repeat by
-    /// the same asker that says nothing (the host's notice after its own prompt) keeps the older.
+    /// the same asker that says nothing (the host's notice after its own prompt) keeps the older,
+    /// and leaves a question a question.
     #[allow(clippy::too_many_arguments)] // The fields of one hook report.
     pub(super) fn record(
         &self,
@@ -175,6 +176,19 @@ impl Waiting {
         let mut rows = self.0.lock().map_err(|_| HubError::Busy)?;
         rows.retain(|_, row| row.current(now));
         let key = (principal.token_id.clone(), native.to_owned());
+        // The host's notice that a dialog is on screen arrives as a permission prompt that says
+        // nothing, also when the dialog is a question. That is the wait already on record.
+        // shortcut: any permission report that says nothing is taken for the notice. A real
+        // prompt follows a tool call, which ends the question first; pass the notice down from
+        // the hook route if a prompt ever follows a question with no call between.
+        if reason == WaitReason::Permission
+            && asks.is_none()
+            && rows.get(&key).is_some_and(|row| {
+                row.reason == WaitReason::Question && row.asker.as_deref() == asker
+            })
+        {
+            return Ok(());
+        }
         if !rows.contains_key(&key) {
             let mine = |row: &Row| row.principal.owner.id == principal.owner.id;
             if rows.values().filter(|row| mine(row)).count() >= MAX_OWNER_ROWS {
@@ -257,19 +271,20 @@ impl Waiting {
         }
     }
 
-    /// The start and asking subagent of the current permission wait of `native`, or `None` when
-    /// it is gone, replaced by another kind of wait, or too old. A pending answer is valid only
-    /// while this still returns what it was made for.
-    pub(super) fn permission_wait(
+    /// The start, asking subagent and kind of the current wait of `native` at a dialog (a
+    /// permission prompt or a question), or `None` when it is gone, replaced by another kind of
+    /// wait, or too old. A pending answer is valid only while this still returns what it was
+    /// made for.
+    pub(super) fn dialog_wait(
         &self,
         token: &str,
         native: &str,
         now: i64,
-    ) -> Option<(i64, Option<String>)> {
+    ) -> Option<(i64, Option<String>, WaitReason)> {
         let rows = self.0.lock().ok()?;
         let row = rows.get(&(token.to_owned(), native.to_owned()))?;
-        (row.current(now) && row.reason == WaitReason::Permission)
-            .then(|| (row.since, row.asker.clone()))
+        let dialog = matches!(row.reason, WaitReason::Permission | WaitReason::Question);
+        (row.current(now) && dialog).then(|| (row.since, row.asker.clone(), row.reason))
     }
 
     /// The waits of `viewer`'s own sessions in the repository `viewer` reads that have lasted at
@@ -427,6 +442,36 @@ mod tests {
         );
         // Another asker's prompt is another question.
         assert_eq!(record(Some("sub"), None, 1_020), None);
+    }
+
+    #[test]
+    fn the_hosts_notice_leaves_a_question_a_question() {
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        let record = |reason, asks, now| {
+            waiting
+                .record(&mine, "s", "s", "claude", reason, None, asks, now)
+                .unwrap();
+            waiting.dialog_wait("tok_a", "s", now)
+        };
+        let question = Some((1_000, None, WaitReason::Question));
+        assert_eq!(
+            record(WaitReason::Question, Some("Which color?"), 1_000),
+            question
+        );
+        // The notice names a permission prompt and says nothing: same wait, same start.
+        assert_eq!(record(WaitReason::Permission, None, 1_006), question);
+        assert_eq!(
+            waiting.owned(&mine, 2_000).unwrap()[0].asks.as_deref(),
+            Some("Which color?")
+        );
+        // A permission prompt that says what it is for is a new wait, and the end of a turn is
+        // no dialog at all.
+        assert_eq!(
+            record(WaitReason::Permission, Some("Push the branch"), 1_010),
+            Some((1_010, None, WaitReason::Permission))
+        );
+        assert_eq!(record(WaitReason::Idle, None, 1_020), None);
     }
 
     #[test]
