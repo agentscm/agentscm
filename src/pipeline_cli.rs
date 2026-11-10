@@ -360,12 +360,20 @@ async fn observe(
             .map_err(|_| Error::Invalid("forge client configuration".into()))?;
         ForgeApi::Gitlab(&gitlab)
     };
-    if let Some(number) = proposal {
-        return observe_one(api, &token, &config, journal, number, delivery).await;
+    let mut observed = if let Some(number) = proposal {
+        observe_one(api, &token, &config, journal, number, delivery).await?
+    } else {
+        serde_json::to_value(
+            pipeline_rules::poll_merges(api, &token, &config.repository(), journal, now()).await?,
+        )?
+    };
+    // Statuses go out after observation, so a run accepted now shows pending at once.
+    // Observation has already committed; a reporting failure must not hide its output.
+    match pipeline_rules::report_results(api, &token, &config.repository(), journal).await {
+        Ok(reports) => observed["reports"] = json!(reports),
+        Err(error) => observed["reports_error"] = json!(error.to_string()),
     }
-    Ok(serde_json::to_value(
-        pipeline_rules::poll_merges(api, &token, &config.repository(), journal, now()).await?,
-    )?)
+    Ok(observed)
 }
 
 fn pickup(
@@ -439,7 +447,7 @@ pub async fn run(data: &Path, command: PipelineCommand) -> Result<Value> {
                 None
             };
             Ok(
-                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?,"unevaluated":journal.unevaluated(64)?,"quarantined":journal.quarantined()?}),
+                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?,"unevaluated":journal.unevaluated(64)?,"quarantined":journal.quarantined()?,"unposted_reports":journal.report_failures(64)?}),
             )
         }
         PipelineCommand::Preview {
