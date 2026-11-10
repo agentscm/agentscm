@@ -63,6 +63,10 @@ with omissions. Each existing overlap/workflow list has an 8 KiB budget. Text su
 The serialized response cannot exceed 48 KiB. A missing PR is `not_observed`,
 not a claim that the PR does not exist. It retains coverage flags, including
 known last-sync gaps and whether the retained PR scan reached its limit.
+A PR the Hub saw merge is `merged`: its open-state context (the PR, overlaps and
+provider evidence, listed in `not_retained`) is dropped at close, and `merges` holds
+the retained provider merge facts (merge and head commits, base, branch, times and
+up to four paths), with `merges_complete` false when more may exist.
 
 Provider collection runs under the existing repository sync lock, including when
 its PR list returns 304. It rotates through at most two open PRs per round. Each
