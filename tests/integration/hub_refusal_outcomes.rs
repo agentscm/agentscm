@@ -182,8 +182,8 @@ fn a_hold_renewed_past_its_cap_keeps_the_refusal_live_and_its_grant_settles_it(d
     hold(&*store, &alice, &[], T0 + 1000);
     let refused_at = T0 + HOLD_CAP_SECONDS - 300;
     assert!(edit(&*store, &bob, "s", &["a.rs"], refused_at));
-    // Past the cap, Alice's next touch keeps a.rs under a new hold id.
-    hold(&*store, &alice, &[], T0 + HOLD_CAP_SECONDS + 1);
+    // The hold lapses at its cap; Alice's next edit of a.rs keeps it under a new hold id.
+    hold(&*store, &alice, &["a.rs"], T0 + HOLD_CAP_SECONDS + 1);
     let renewed = metrics(&*store, &alice, T0 + HOLD_CAP_SECONDS + 2);
     assert_eq!(
         renewed.issues.contested_edits.refusals.pending, 1,

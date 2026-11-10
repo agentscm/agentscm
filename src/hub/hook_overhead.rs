@@ -368,6 +368,7 @@ pub async fn flush(state: &super::HubState) {
         // The store call never ran (no free permit): nothing was written.
         Err(_) => (BTreeSet::new(), 0),
     };
+    let left = unwritten < taken.len();
     let again = {
         let mut guard = pending();
         let pending = guard.get_or_insert_with(Pending::default);
@@ -383,7 +384,8 @@ pub async fn flush(state: &super::HubState) {
                 add_to(&mut pending.unverified, MAX_UNVERIFIED, key, &sample);
             }
         }
-        !pending.unverified.is_empty() && pending.scheduled.insert(store_id)
+        // Totals a failed write put back are retried by the timer, not left for the next call.
+        (left || !pending.unverified.is_empty()) && pending.scheduled.insert(store_id)
     };
     if again {
         schedule_flush(state);
