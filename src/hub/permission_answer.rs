@@ -41,7 +41,7 @@ use super::advice::invisible;
 use super::coordination_http::{not_your_agent, owns_agent};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
-use super::session_waiting::{GRACE_SECONDS, WaitReason, Waiting, wait_key};
+use super::session_waiting::{WaitReason, Waiting, wait_key};
 use super::store::{Principal, unix_now, validate_repository};
 use super::{HubError, HubState};
 
@@ -961,8 +961,10 @@ impl Requests {
         Ok(row.token.clone())
     }
 
-    /// The pending and answered requests of `owner` in one repository whose wait has lasted the
-    /// grace, oldest first. Unconfirmed requests are never listed.
+    /// The pending and answered requests of `owner` in one repository, oldest first. This is the
+    /// list a person answers from, so a request is on it as soon as the host confirms its prompt
+    /// is on screen; the wait's first minute holds back only the notice in their status.
+    /// Unconfirmed requests are never listed.
     pub(super) fn list(
         &self,
         waiting: &Waiting,
@@ -985,9 +987,6 @@ impl Requests {
             let Some(since) = row.attached(waiting, now) else {
                 continue;
             };
-            if now - since < GRACE_SECONDS {
-                continue;
-            }
             out.push(Listed {
                 item_id: format!("waiting:{}:{}", row.kind.code(), row.item_key),
                 request_id: id.clone(),
@@ -1375,7 +1374,7 @@ async fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::session_waiting::WaitReason;
+    use crate::hub::session_waiting::GRACE_SECONDS;
     use crate::hub::store::{ForgeIdentity, User};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1963,18 +1962,21 @@ mod tests {
     }
 
     #[test]
-    fn the_list_shows_only_the_owners_confirmed_requests_in_one_repository_after_the_grace() {
+    fn the_list_shows_only_the_owners_confirmed_requests_in_one_repository() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         let id = pending(&requests, &waiting, &mine);
         let at = 1_000 + GRACE_SECONDS;
-        // Inside the grace nothing shows.
-        assert!(
+        // The list is where a person answers, so a confirmed request is on it within the
+        // wait's first minute, before their status mentions the wait.
+        assert_eq!(
             requests
-                .list(&waiting, "usr_me", Some(7), at - 1)
+                .list(&waiting, "usr_me", Some(7), 1_010)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
+        assert!(waiting.owned(&mine, 1_010).unwrap().is_empty());
         // Another person, another repository: nothing.
         assert!(
             requests

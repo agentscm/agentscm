@@ -4534,10 +4534,20 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     );
     let always = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "always")).await;
     assert_eq!(always.0, 400);
-    // The list is the person's own, and shows a request only after the wait's first minute.
+    // The list is the person's own, and it is where they answer: the request is on it as soon
+    // as the host has confirmed the prompt, within the wait's first minute.
     let list = format!("{PERMISSIONS}?repository={REPO}");
-    let listed = with_cookie(&env.hub, Method::GET, &list, &alice.cookie, None).await;
-    assert_eq!(listed, (200, json!({"requests": []})));
+    let (status, listed) = with_cookie(&env.hub, Method::GET, &list, &alice.cookie, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        (
+            &listed["requests"][0]["request_id"],
+            &listed["requests"][0]["state"]
+        ),
+        (&id, &json!("pending"))
+    );
+    let theirs = with_cookie(&env.hub, Method::GET, &list, &bob.cookie, None).await;
+    assert_eq!(theirs, (200, json!({"requests": []})));
 
     // Alice allows it once: the hook's poll hears exactly that, and the answer cannot be changed.
     let (status, done) =
