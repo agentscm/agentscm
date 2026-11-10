@@ -1863,6 +1863,18 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
     if let Some(asks) = wait_asks(payload) {
         out.insert("asks".into(), json!(asks));
     }
+    // Whether the turn asked its person anything is judged here, where the whole last message
+    // is: the excerpt above is only its end. Only the answer leaves, and none for a stop that
+    // background work will resume.
+    if payload["hook_event_name"] == "Stop"
+        && !resumes_itself(payload)
+        && let Some(message) = payload["last_assistant_message"]
+            .as_str()
+            .and_then(redacted_line)
+    {
+        let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&message);
+        out.insert("asked_nothing".into(), json!(nothing));
+    }
     if let Some(subagent) = started_subagent(payload) {
         out.insert("subagent".into(), subagent);
     }
@@ -1906,6 +1918,15 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
     Ok(Value::Object(out))
 }
 
+/// A stop that background work will resume. It is not a wait, so nothing of its message is
+/// read, judged or sent.
+fn resumes_itself(payload: &Value) -> bool {
+    payload["background_tasks"]
+        .as_array()
+        .is_some_and(|tasks| !tasks.is_empty())
+        || payload["background_tasks"].as_u64().is_some_and(|n| n > 0)
+}
+
 /// The most of a wait's text that leaves the machine, in characters.
 const ASKS_CHARS: usize = 400;
 
@@ -1914,12 +1935,10 @@ const ASKS_CHARS: usize = 400;
 /// a permission prompt is for. One line, secrets redacted, and cut to its last [`ASKS_CHARS`]
 /// characters, where a closing question sits. A stop that background work will resume sends none.
 fn wait_asks(payload: &Value) -> Option<String> {
-    let busy = payload["background_tasks"]
-        .as_array()
-        .is_some_and(|tasks| !tasks.is_empty())
-        || payload["background_tasks"].as_u64().is_some_and(|n| n > 0);
     let text = match payload["hook_event_name"].as_str()? {
-        "Stop" if !busy => payload["last_assistant_message"].as_str()?.to_owned(),
+        "Stop" if !resumes_itself(payload) => {
+            payload["last_assistant_message"].as_str()?.to_owned()
+        }
         "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
             payload["tool_input"]["questions"]
                 .as_array()?
@@ -2614,6 +2633,20 @@ mod tests {
         );
         assert!(!asks.contains("ghp_abc") && !asks.contains('\n'), "{asks}");
         assert_eq!(asks.chars().count(), ASKS_CHARS + 1);
+        // The whole message is judged here and only the answer leaves. An ask before the cut
+        // counts, a report that asks nothing says so, and no message is no answer.
+        let judged = |message: String| {
+            let stop =
+                json!({"hook_event_name":"Stop","session_id":"s","last_assistant_message":message});
+            sanitized_codex(&stop, Some(&[])).unwrap()["asked_nothing"].clone()
+        };
+        let report = "The fix is merged and the tests pass for both stores. ".repeat(12);
+        assert_eq!(judged(report.clone()), true);
+        assert_eq!(
+            judged(format!("It is your call whether to delete them. {report}")),
+            false
+        );
+        assert_eq!(judged("  ".into()), Value::Null);
 
         let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
             "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});

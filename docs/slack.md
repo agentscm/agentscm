@@ -10,7 +10,7 @@ Only real asks reach a person. Agents get every coordination warning in their ow
 
 | Moment | When | Who gets a direct message |
 |---|---|---|
-| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace), or for more than five minutes when it only finished its turn. This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
+| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace), or for more than five minutes when it only finished its turn. A turn whose last message ends asking nothing is not a wait and sends nothing. This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
 | Work enters `blocked` | The shared status first observes a personal blocker; experimental, requires `reminders.enabled`. | The lead agent's person named by the shared status, with an **Open Hub** link to `#work/<id>`. |
 | Work enters `handover` | The shared status first observes a handover with an unresolved blocker; experimental, requires `reminders.enabled`. | The work owner's person named by the shared status, not necessarily the current lead's person, with an **Open Hub** link to `#work/<id>`. |
 
