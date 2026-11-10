@@ -4334,11 +4334,56 @@ fn pickup_in(
 }
 
 /// `named` is false when the caller named no session and `start.session` was resolved for it.
+/// A start, with the session's provisional Work out of its way: a lead start takes over the paths
+/// that Work already edited and supersedes it once it claims Work.
 fn start_in(
     tx: &Transaction<'_>,
     who: &WorkWho,
     start: &WorkStart,
     named: bool,
+    now: i64,
+) -> Result<WorkStartResult> {
+    let provisional = if start.role == WorkRole::Lead && !who.read_only {
+        unfinished_for_session(tx, who, &start.session, now)?.filter(WorkItem::is_provisional)
+    } else {
+        None
+    };
+    let Some(provisional) = provisional else {
+        return claim_in(tx, who, start, named, None, now);
+    };
+    let mut moved = start.clone();
+    for path in &provisional.scope {
+        if !moved.scope.contains(path) {
+            moved.scope.push(path.clone());
+        }
+    }
+    let start = if moved.validate(who).is_ok() {
+        &moved
+    } else {
+        start
+    };
+    let result = claim_in(tx, who, start, named, Some(&provisional.id), now)?;
+    if result.conflict.is_none() && result.item.id != provisional.id {
+        let by = result.item.id.clone();
+        provisional::end(
+            tx,
+            who,
+            provisional,
+            provisional::Ending::Superseded(&by),
+            now,
+        )?;
+    }
+    Ok(result)
+}
+
+/// A start of `start`, where `provisional` names the session's provisional Work, which does not
+/// count as the goal the session already leads.
+fn claim_in(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    named: bool,
+    provisional: Option<&str>,
     now: i64,
 ) -> Result<WorkStartResult> {
     if who.read_only {
@@ -4649,6 +4694,7 @@ fn start_in(
         // A session leads one active or blocked goal, so it pauses or ends that one first.
         if let Some(current) = unfinished_for_session(tx, who, &start.session, now)?
             && current.id != item.id
+            && Some(current.id.as_str()) != provisional
         {
             return Ok(WorkStartResult {
                 reclaimed: Vec::new(),
@@ -4768,7 +4814,9 @@ fn start_in(
     if start.work_id.is_some() {
         return Err(HubError::Invalid("unknown work item".into()));
     }
-    if let Some(item) = unfinished_for_session(tx, who, &start.session, now)? {
+    if let Some(item) = unfinished_for_session(tx, who, &start.session, now)?
+        .filter(|item| Some(item.id.as_str()) != provisional)
+    {
         return Ok(WorkStartResult {
             reclaimed: Vec::new(),
             conflict: Some(WorkStartConflict {
@@ -8447,11 +8495,24 @@ impl Store for SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         active_token(&tx, token, now)?;
         let name = session_name(&tx, token, session, now)?;
-        let work = match work_who(&tx, token, now) {
-            Ok(who) => unfinished_for_session(&tx, &who, &name, now)?,
+        let who = match work_who(&tx, token, now) {
+            Ok(who) => Some(who),
             // A token that can no longer act on Work cannot pause it; its session still ends.
             Err(HubError::Unauthorized) => None,
             Err(error) => return Err(error),
+        };
+        let work = match &who {
+            Some(who) => unfinished_for_session(&tx, who, &name, now)?,
+            None => None,
+        };
+        // Provisional Work ends with its session, which never named it: nothing is paused.
+        let work = match (work, &who) {
+            (Some(item), Some(who)) if item.is_provisional() => {
+                let ending = provisional::Ending::Abandoned(provisional::UNNAMED);
+                provisional::end(&tx, who, item, ending, now)?;
+                None
+            }
+            (work, _) => work,
         };
         // The Work is paused before the session ends, as in the PostgreSQL store, which locks
         // Work before intents.
@@ -10580,6 +10641,19 @@ impl Store for SqliteStore {
             inspected.request_key = None;
             let preflight = preflight::evaluate(&tx, &who, &inspected, &planned_scope, now)?;
             require_clear_preflight(&who, start, &preflight)?;
+            if item.is_provisional() {
+                // The session names its provisional Work: the same id, which it then resumes like
+                // any unheld Work, winning its scope as any start does.
+                let adopted = provisional::adopt(&tx, &who, item, start, &planned_scope, now)?;
+                let mut resume = start.clone();
+                resume.work_id = Some(adopted.id.clone());
+                resume.takeover_generation = Some(adopted.generation);
+                resume.scope = adopted.scope.clone();
+                let mut result = start_in(&tx, &who, &resume, true, now)?;
+                result.preflight = Some(preflight);
+                tx.commit()?;
+                return Ok(result);
+            }
             let changed = start
                 .issue_choice
                 .as_ref()

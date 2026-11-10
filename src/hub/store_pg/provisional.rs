@@ -2,7 +2,22 @@
 //! hooks without declaring Work, so that its person sees it and its waits reach them. A
 //! task-only start in the same session adopts it; otherwise it ends as abandoned.
 use super::super::coordination::PROVISIONAL_KEY_PREFIX;
+use super::super::work_transition::TerminalOutcome;
 use super::*;
+
+/// Why provisional Work ended, as abandoned, when its session never named it.
+pub(super) const UNNAMED: &str = "Its session ended without naming this Work";
+/// Idle provisional items one write ends at most; later writes end the rest.
+const SWEEP_LIMIT: i64 = 8;
+
+/// How provisional Work ends. Its outcome comes from no agent or person, so its provenance is
+/// unknown.
+pub(super) enum Ending<'a> {
+    /// Its session ended or went quiet without naming it: the reason.
+    Abandoned(&'a str),
+    /// Its session declared named Work instead: that Work's id.
+    Superseded(&'a str),
+}
 
 /// The start that would open the provisional Work of `session` over `paths`: unnamed until the
 /// session names it, and validated like any start.
@@ -37,6 +52,7 @@ pub(super) fn touch(
     paths: &[String],
     now: i64,
 ) -> Result<Option<WorkItem>> {
+    sweep(tx, who, now)?;
     match unfinished_for_session(tx, who, session, now)? {
         Some(item) if item.is_provisional() => widen(tx, who, item, paths, now).map(Some),
         Some(_) => Ok(None),
@@ -79,14 +95,156 @@ fn widen(
     let mut event = work_event("work_checkpoint", &item)?;
     event.data = json!({"operation": "provisional_scope_widened", "generation": item.generation})
         .to_string();
+    item.updated_seq = append(tx, &event)?;
+    save(tx, who, &item, &event, now)?;
+    Ok(item)
+}
+
+/// Names the provisional `item` for a task-only `start` of its session, keeping its id: a named
+/// key, and the start's declarations over the paths it asks for and everything already edited.
+/// The caller then resumes it like any unheld Work, so it wins its scope like any start.
+pub(super) fn adopt(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    mut item: WorkItem,
+    start: &WorkStart,
+    scope: &[String],
+    now: i64,
+) -> Result<WorkItem> {
+    let key = new_id("req")?;
+    let mut named = start.clone();
+    named.request_key = Some(key.clone());
+    named.scope = scope.to_vec();
+    for path in &item.scope {
+        if !named.scope.contains(path) {
+            named.scope.push(path.clone());
+        }
+    }
+    // Too many paths together: the start's own scope, which validated already.
+    let scope = named.validate(who).or_else(|_| {
+        named.scope = scope.to_vec();
+        named.validate(who)
+    })?;
+    relation_targets(tx, who, &named.depends_on)?;
+    relation_targets(tx, who, &named.related_work)?;
+    item.source = WorkSource::Native {
+        request_key: key.clone(),
+    };
+    item.issue_link = named
+        .issue_choice
+        .as_ref()
+        .and_then(|choice| choice.linked_issue())
+        .cloned();
+    item.initial_issue_choice = named.issue_choice.unwrap_or_default();
+    item.title = named.title;
+    item.description = named.description;
+    item.scope = scope;
+    item.branch = named.branch;
+    item.worktree = named.worktree;
+    item.next_action = named.next_action;
+    item.depends_on = named.depends_on;
+    item.related_work = named.related_work;
+    item.updated_at = now;
+    let mut event = work_event("work_checkpoint", &item)?;
+    event.data =
+        json!({"operation": "provisional_adopted", "generation": item.generation}).to_string();
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
-    let snapshot = save_work_version(tx, &item, seq)?;
-    adjust_work_payload_capacity(
-        tx,
-        who,
-        work_transition_payload_bytes(&snapshot, &event)?,
-        now,
+    tx.execute(
+        "UPDATE hub_work_items SET title = $2, request_key = $3 WHERE id = $1",
+        &[&item.id, &item.title, &key],
+    )?;
+    save(tx, who, &item, &event, now)?;
+    replace_relations(tx, who, &item.id, &item.depends_on, &item.related_work)?;
+    let declarations = json_string(&WorkDeclarations::legacy(&item))?;
+    tx.execute(
+        "UPDATE hub_work_declarations SET snapshot = $2, event_seq = $3 WHERE work = $1",
+        &[&item.id, &declarations, &seq],
     )?;
     Ok(item)
+}
+
+/// Finishes the provisional `item`. Its event is an internal checkpoint, so no new event kind or
+/// value reaches a reader, and its outcome's provenance is unknown.
+pub(super) fn end(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    mut item: WorkItem,
+    ending: Ending<'_>,
+    now: i64,
+) -> Result<WorkItem> {
+    let (outcome, data) = match ending {
+        Ending::Abandoned(reason) => (
+            TerminalOutcome::Abandoned,
+            json!({"operation": "provisional_ended", "outcome": "abandoned", "reason": reason,
+                "generation": item.generation}),
+        ),
+        Ending::Superseded(by) => {
+            if !item.related_work.iter().any(|work| work == by) {
+                item.related_work.push(by.to_owned());
+            }
+            (
+                TerminalOutcome::Superseded,
+                json!({"operation": "provisional_ended", "outcome": "superseded",
+                    "superseded_by": by, "generation": item.generation}),
+            )
+        }
+    };
+    item.state = WorkState::Finished;
+    item.updated_at = now;
+    let mut event = work_event("work_checkpoint", &item)?;
+    event.data = data.to_string();
+    item.updated_seq = append(tx, &event)?;
+    save(tx, who, &item, &event, now)?;
+    set_work_reservation(tx, &item.id, Some(outcome.column()), None, now)?;
+    replace_relations(tx, who, &item.id, &item.depends_on, &item.related_work)?;
+    Ok(item)
+}
+
+/// Ends, as abandoned, up to `SWEEP_LIMIT` provisional items of `who`'s repository whose session
+/// has been quiet for longer than a lease. Runs on writes only, so reads stay pure.
+fn sweep(tx: &mut postgres::Transaction<'_>, who: &WorkWho, now: i64) -> Result<()> {
+    let idle = tx
+        .query(
+            "SELECT w.snapshot FROM hub_work_items w
+               LEFT JOIN hub_sessions s ON s.token = w.lead_token AND s.session = w.lead_session
+             WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+               AND w.repository_id IS NOT DISTINCT FROM $4
+               AND w.state IN ('active', 'blocked') AND substr(w.request_key, 1, 5) = 'prov_'
+               AND GREATEST(COALESCE(s.updated_at, 0), COALESCE(s.tool_activity_at, 0)) < $5
+             ORDER BY w.updated_at, w.id LIMIT $6",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &(now - LEASE_SECONDS),
+                &SWEEP_LIMIT,
+            ],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    for snapshot in idle {
+        let item: WorkItem = json_value(&snapshot)?;
+        end(tx, who, item, Ending::Abandoned(UNNAMED), now)?;
+    }
+    Ok(())
+}
+
+/// Saves `item` at its `updated_seq` and accounts for its new version and event, less the stored
+/// row it replaces.
+fn save(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    item: &WorkItem,
+    event: &Event,
+    now: i64,
+) -> Result<()> {
+    let previous = stored_work_item_bytes(tx, &item.id)?;
+    let snapshot = save_work_version(tx, item, item.updated_seq)?;
+    let delta = work_transition_payload_bytes(&snapshot, event)?
+        .checked_sub(previous)
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    adjust_work_payload_capacity(tx, who, delta, now)
 }
