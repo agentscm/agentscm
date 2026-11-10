@@ -515,7 +515,9 @@ async fn every_fixture_gets_its_agents_output_shape() {
             Expect::Allow => assert_eq!(answer, json!({"permission": "allow"}), "{name}"),
             Expect::Undeclared(pointer) => {
                 let text = text_at(&answer, pointer);
-                // The refusal leads with the WORK_UNDECLARED code; its wording is pinned in src.
+                // The refusal leads with the WORK_UNDECLARED code; its parts are checked in
+                // `a_second_agent_on_the_same_file_is_refused_once` and
+                // `hub_workflow::native_hook_adopts_default_work_and_enforces_its_lifecycle`.
                 assert!(
                     text.lines().next().unwrap().contains(WORK_UNDECLARED),
                     "{name}: {answer}"
@@ -781,7 +783,10 @@ fn reason_of(answer: &Value, pointer: &str, key: &str) -> String {
     // Protects: the refusal names the contested file, its holder by user and session digest,
     // marks the holder's task as untrusted text, and forbids getting around it.
     assert!(reason.contains("src/widget.rs"), "{reason}");
-    assert!(reason.contains("user1") && reason.contains(key), "{reason}");
+    assert!(
+        reason.contains(&format!("user1's Claude Code session {key}")),
+        "{reason}"
+    );
     assert!(reason.contains("not instructions"), "{reason}");
     assert!(reason.contains(NO_BYPASS), "{reason}");
     assert!(
@@ -879,9 +884,17 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
         &key,
     );
     // This session has declared no Work, so the one-time WORK_UNDECLARED request leads the same
-    // refusal. The full sentence is pinned in `advice::tests`, next to the code that writes it.
+    // refusal. Its wording is written in `hook.rs`; also checked in
+    // `hub_workflow::native_hook_adopts_default_work_and_enforces_its_lifecycle`.
+    // Protects: it says the edit was not applied, names the repository, the call that declares
+    // Work, and forbids getting around it.
+    let head = reason.lines().next().unwrap();
     assert!(
-        reason.lines().next().unwrap().contains(WORK_UNDECLARED),
+        head.contains(WORK_UNDECLARED)
+            && head.contains("not applied")
+            && head.contains(REPO)
+            && head.contains("agentscm_start")
+            && head.contains(NO_BYPASS),
         "{reason}"
     );
     // Protects: with one holder, the Hub already asked that holder to hand the file over, so
@@ -911,7 +924,9 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
 
     // Codex: a patch of two files is refused whole; the reason names the contested one.
     let codex = hub.hook_raw("codex", &x1, &fixture("codex-PreToolUse"));
-    reason_of(&codex, "/hookSpecificOutput/permissionDecisionReason", &key);
+    let reason = reason_of(&codex, "/hookSpecificOutput/permissionDecisionReason", &key);
+    // Protects: only the contested file is named, not the patch's uncontested one.
+    assert!(!reason.contains("src/gadget.rs"), "{reason}");
     assert_eq!(codex["hookSpecificOutput"]["permissionDecision"], "deny");
     assert_eq!(codex["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     assert!(
@@ -970,25 +985,31 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     let after = hub.hook("cursor", &c2, &fixture("cursor-afterFileEdit"));
     assert_eq!(after, json!({}));
     let post = hub.hook("cursor", &c3, &fixture("cursor-postToolUse"));
-    let note = text_at(&post, "/additional_context");
-    assert!(
-        note.starts_with("AgentSCM: another agent is already working on src/widget.rs."),
-        "{note}"
-    );
+    // Protects: a held-file note leads with the file and how to ask its holder for it, and names
+    // that holder by kind and digest; the wording is pinned in `advice::tests`.
+    let held_note = |note: &str| {
+        let head = note.lines().next().unwrap();
+        assert!(
+            head.contains("agentscm_ask") && head.contains("\"src/widget.rs\""),
+            "{note}"
+        );
+        let holder = format!("user1's Claude Code session {key}");
+        assert!(note.contains(&holder), "{note}");
+    };
+    held_note(text_at(&post, "/additional_context"));
 
     // Generic hooks cannot refuse either: status and text.
     let generic = hub.hook("generic", &g1, &fixture("generic-check"));
     assert_eq!(generic["status"], "stop");
-    assert!(
-        text_at(&generic, "/text")
-            .starts_with("AgentSCM: another agent is already working on src/widget.rs.")
-    );
+    held_note(text_at(&generic, "/text"));
 
     // The first agent learns of those that went ahead, as a note.
     let beat = hub.hook("claude", &first, &fixture("claude-PreToolUse-Write"));
     let note = text_at(&beat, CLAUDE_CONTEXT);
+    // Protects: the holder's note names its file but, as a notice, offers no ask.
+    let head = note.lines().next().unwrap();
     assert!(
-        note.starts_with("AgentSCM: other work overlaps src/widget.rs."),
+        head.contains("src/widget.rs") && !note.contains("agentscm_ask"),
         "{note}"
     );
     // Each notice names the session that went ahead, by kind and digest, not the token label.

@@ -141,6 +141,7 @@ fn client_code_reads_hub_replies_only_through_the_lenient_reader() {
     assert_eq!(
         found, listed,
         "a client's `serde_json::from_*` calls changed; read a Hub reply with \
-         agentscm::hub::reply, and list any other call in tests/fixtures/client-decodes.txt"
+         agentscm::hub::reply, and list any other call in tests/fixtures/client-decodes.txt \
+         (a reformatted listed line needs its ledger line updated too)"
     );
 }
