@@ -6117,7 +6117,7 @@ fn contested_in(
     noticed: &[Overlap],
     now: i64,
 ) -> Result<()> {
-    use super::refusal_outcomes::{MAX_ROWS, RETAIN_SECONDS};
+    use super::refusal_outcomes::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS};
     let token = who.token.as_str();
     for key in edited {
         tx.execute(
@@ -6139,11 +6139,29 @@ fn contested_in(
         }));
     let mut wrote = false;
     for (key, hold, kind) in rows {
+        // A notice drawn by this hook-reported edit: the edit already went ahead.
+        let settled = kind == "notice" && edited.iter().any(|edit| edit == key);
+        let (outcome, resolved_at) = if settled {
+            ("pushed_through", Some(now))
+        } else {
+            ("pending", None)
+        };
         wrote |= tx.execute(
             "INSERT INTO hub_contested_edits
-                 (repository, token, session, path, hold, kind, outcome, observed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7) ON CONFLICT DO NOTHING",
-            &[&who.repository, &token, &session, &key, &hold, &kind, &now],
+                 (repository, token, session, path, hold, kind, outcome, observed_at,
+                  resolved_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+            &[
+                &who.repository,
+                &token,
+                &session,
+                &key,
+                &hold,
+                &kind,
+                &outcome,
+                &now,
+                &resolved_at,
+            ],
         )? > 0;
     }
     if wrote {
@@ -6154,8 +6172,8 @@ fn contested_in(
         tx.execute(
             "DELETE FROM hub_contested_edits WHERE (token, session, path, hold, kind) IN (
                  SELECT token, session, path, hold, kind FROM hub_contested_edits
-                 WHERE repository = $1 ORDER BY observed_at DESC OFFSET $2)",
-            &[&who.repository, &MAX_ROWS],
+                 WHERE token = $1 ORDER BY observed_at DESC OFFSET $2)",
+            &[&token, &MAX_ROWS_PER_TOKEN],
         )?;
     }
     Ok(())
@@ -6187,7 +6205,7 @@ fn contested_facts(
     until: i64,
     now: i64,
 ) -> Result<(Vec<super::refusal_outcomes::Observed>, bool)> {
-    use super::refusal_outcomes::{MAX_READ, MAX_ROWS, complete, observed};
+    use super::refusal_outcomes::{MAX_READ, MAX_ROWS_PER_TOKEN, complete, observed};
     let rows = tx
         .query(
             "SELECT c.kind, c.outcome, c.observed_at,
@@ -6210,13 +6228,14 @@ fn contested_facts(
             )
         })
         .collect::<Vec<_>>();
-    let stored: i64 = tx
+    let at_cap: bool = tx
         .query_one(
-            "SELECT COUNT(*)::bigint FROM hub_contested_edits WHERE repository = $1",
-            &[&repository],
+            "SELECT EXISTS (SELECT 1 FROM hub_contested_edits WHERE repository = $1
+                 GROUP BY token HAVING COUNT(*) >= $2)",
+            &[&repository, &MAX_ROWS_PER_TOKEN],
         )?
         .get(0);
-    let complete = complete(rows.len(), since, now, stored >= MAX_ROWS);
+    let complete = complete(rows.len(), since, now, at_cap);
     Ok((
         rows.into_iter().take(MAX_READ).flatten().collect(),
         complete,
@@ -6231,7 +6250,7 @@ fn overhead_facts(
     until: i64,
     now: i64,
 ) -> Result<(Vec<super::hook_overhead::SessionOverhead>, bool)> {
-    use super::hook_overhead::{MAX_READ, MAX_ROWS, SessionOverhead, complete};
+    use super::hook_overhead::{MAX_READ, MAX_ROWS_PER_TOKEN, SessionOverhead, complete};
     let count = |n: i64| u64::try_from(n).unwrap_or_default();
     let rows = tx
         .query(
@@ -6260,13 +6279,14 @@ fn overhead_facts(
             updated_at: r.get(12),
         })
         .collect::<Vec<_>>();
-    let stored: i64 = tx
+    let at_cap: bool = tx
         .query_one(
-            "SELECT COUNT(*)::bigint FROM hub_hook_overhead WHERE repository = $1",
-            &[&repository],
+            "SELECT EXISTS (SELECT 1 FROM hub_hook_overhead WHERE repository = $1
+                 GROUP BY token HAVING COUNT(*) >= $2)",
+            &[&repository, &MAX_ROWS_PER_TOKEN],
         )?
         .get(0);
-    let complete = complete(rows.len(), since, now, stored >= MAX_ROWS);
+    let complete = complete(rows.len(), since, now, at_cap);
     Ok((rows.into_iter().take(MAX_READ).collect(), complete))
 }
 
@@ -12870,7 +12890,7 @@ impl Store for PgStore {
         sample: &super::hook_overhead::Sample,
         now: i64,
     ) -> Result<()> {
-        use super::hook_overhead::{MAX_ROWS, RETAIN_SECONDS};
+        use super::hook_overhead::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS};
         let client = sample.client.unwrap_or_default();
         let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
         let values = [
@@ -12882,6 +12902,7 @@ impl Store for PgStore {
             count(client.ms_max),
             count(client.timeouts),
             count(client.failed_open),
+            count(sample.hub_calls),
         ];
         self.run(true, |client| {
             let mut tx = client.transaction()?;
@@ -12891,9 +12912,10 @@ impl Store for PgStore {
                          hub_calls, injected_start, injected_refusal, injected_other,
                          client_calls, client_ms_total, client_ms_max, client_timeouts,
                          client_failed_open, first_at, updated_at)
-                     VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+                     VALUES ($1, $2, $3, $4, $14, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
                      ON CONFLICT (token, session, agent) DO UPDATE SET
-                         repository = excluded.repository, hub_calls = o.hub_calls + 1,
+                         repository = excluded.repository,
+                         hub_calls = o.hub_calls + excluded.hub_calls,
                          injected_start = o.injected_start + excluded.injected_start,
                          injected_refusal = o.injected_refusal + excluded.injected_refusal,
                          injected_other = o.injected_other + excluded.injected_other,
@@ -12918,6 +12940,7 @@ impl Store for PgStore {
                         &values[6],
                         &values[7],
                         &now,
+                        &values[8],
                     ],
                 )?
                 .get(0);
@@ -12930,8 +12953,8 @@ impl Store for PgStore {
                 tx.execute(
                     "DELETE FROM hub_hook_overhead WHERE (token, session, agent) IN (
                          SELECT token, session, agent FROM hub_hook_overhead
-                         WHERE repository = $1 ORDER BY updated_at DESC OFFSET $2)",
-                    &[&repository, &MAX_ROWS],
+                         WHERE token = $1 ORDER BY updated_at DESC OFFSET $2)",
+                    &[&token, &MAX_ROWS_PER_TOKEN],
                 )?;
             }
             tx.commit()?;

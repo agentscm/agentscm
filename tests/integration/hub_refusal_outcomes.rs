@@ -125,7 +125,8 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     let carol = agent(&*store, 3, "c");
     hold(&*store, &carol, &["d.rs"], T0 + 5);
     // George's hook reports an edit it could not be refused before (as Cursor's does): the
-    // notice it draws is settled at once, because the edit already went ahead.
+    // notices it draws (one per hold on d.rs: alice's and carol's) are settled at once,
+    // because the edit already went ahead.
     let george = agent(&*store, 7, "g");
     store
         .touch_session(
@@ -150,9 +151,9 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     let notices = &live.issues.contested_edits.notices;
     assert_eq!(
         (notices.observed, notices.pending, notices.pushed_through),
-        (2, 1, 1)
+        (3, 1, 2)
     );
-    assert_eq!(live.issues.dismissed, Some(2));
+    assert_eq!(live.issues.dismissed, Some(3));
     assert_eq!(live.issues.resolved, 2);
     assert_eq!(live.issues.unresolved, 2);
 
@@ -162,7 +163,7 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     assert_eq!(contested.refusals.went_elsewhere, 1);
     assert_eq!(contested.refusals.pushed_through, 1);
     assert_eq!(contested.notices.went_elsewhere, 1);
-    assert_eq!(contested.notices.pushed_through, 1);
+    assert_eq!(contested.notices.pushed_through, 2);
     // Went elsewhere is inferred, so it is neither resolved nor unresolved.
     assert_eq!(later.issues.unresolved, 0);
     assert_eq!(later.issues.resolved, 2);
