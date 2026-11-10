@@ -515,7 +515,7 @@ async fn call_hub(
                 &cwd_of(&payload),
                 file.as_ref(),
             )?;
-            let root = repo_root(&cwd_of(&payload));
+            let root = sent_root(&cwd_of(&payload));
             let outbound = if agent == "codex" {
                 std::borrow::Cow::Owned(sanitized_codex(&payload, None)?)
             } else {
@@ -2083,6 +2083,22 @@ fn cwd_of(payload: &Value) -> PathBuf {
     )
 }
 
+/// The checkout root to send as `X-Agentscm-Root`, spelled the way `cwd` is. The Hub reads an
+/// edit's absolute path against it, and an agent reports `cwd` and its paths as it reached the
+/// checkout, so a symlink-resolved root (macOS `/var` is `/private/var`) left them outside it.
+/// Falls back to the resolved root when `cwd` cannot be walked back to it.
+fn sent_root(cwd: &Path) -> Option<PathBuf> {
+    let root = repo_root(cwd)?;
+    let depth = cwd
+        .canonicalize()
+        .ok()
+        .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.components().count()));
+    let spelled = depth
+        .and_then(|depth| cwd.ancestors().nth(depth))
+        .filter(|spelled| spelled.canonicalize().ok().as_deref() == Some(root.as_path()));
+    Some(spelled.map_or(root, Path::to_path_buf))
+}
+
 struct Settings {
     url: Option<String>,
     token: Option<String>,
@@ -2295,6 +2311,32 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Hub reads an edit's absolute `file_path` against the root the hook sends. An agent
+    /// reports paths as it reached the checkout, so through a symlink (macOS `/var` is one) a
+    /// resolved root put every edit outside the repository, and the Hub answered "clear".
+    #[cfg(unix)]
+    #[test]
+    fn the_sent_root_is_spelled_like_the_payloads_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = git_repo(temp.path(), "real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cwd = link.join("src");
+        let file = link.join("src/a.rs");
+
+        assert!(
+            !file.starts_with(repo_root(&cwd).unwrap()),
+            "the resolved root misses the path"
+        );
+        let root = sent_root(&cwd).unwrap();
+        assert_eq!(root, link);
+        assert!(file.starts_with(&root));
+        // A plain checkout is unchanged, and a path outside any checkout has no root.
+        assert_eq!(sent_root(&real.join("src")), Some(real.clone()));
+        assert_eq!(sent_root(temp.path()), None);
+    }
 
     #[test]
     fn a_wait_sends_one_redacted_line_of_what_it_asks() {
