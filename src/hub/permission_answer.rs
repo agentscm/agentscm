@@ -83,8 +83,8 @@ impl Decision {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Ended {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ended {
     /// Its permission wait is gone or replaced: it was answered in the session, or the session
     /// moved on.
     SessionMovedOn,
@@ -93,8 +93,8 @@ enum Ended {
     Expired,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Phase {
     /// Registered, but the host has not yet said it shows the prompt.
     Unconfirmed,
     Pending,
@@ -119,16 +119,16 @@ struct Pending {
     last_poll: i64,
     /// When it was answered or ended.
     settled: i64,
-    state: State,
+    state: Phase,
 }
 
 impl Pending {
     fn open(&self) -> bool {
-        matches!(self.state, State::Unconfirmed | State::Pending)
+        matches!(self.state, Phase::Unconfirmed | Phase::Pending)
     }
 
     fn end(&mut self, why: Ended, now: i64) {
-        self.state = State::Ended(why);
+        self.state = Phase::Ended(why);
         self.settled = now;
     }
 
@@ -237,22 +237,14 @@ pub(super) struct Registration {
     pub input_hash: String,
 }
 
-/// What `poll` reports to the hook.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Poll {
-    Unconfirmed,
-    Pending,
-    Answered(Decision),
-    Ended,
-}
-
-impl Poll {
+impl Phase {
+    /// What the hook is told: the state name and the decision, never why a request ended.
     fn parts(self) -> (&'static str, Option<&'static str>) {
         match self {
             Self::Unconfirmed => ("unconfirmed", None),
             Self::Pending => ("pending", None),
             Self::Answered(decision) => ("answered", Some(decision.code())),
-            Self::Ended => ("ended", None),
+            Self::Ended(_) => ("ended", None),
         }
     }
 }
@@ -335,7 +327,7 @@ impl Requests {
         principal: &Principal,
         registration: Registration,
         now: i64,
-    ) -> Outcome<(String, Poll)> {
+    ) -> Outcome<(String, Phase)> {
         if principal.read_only || now >= principal.expires_at {
             return Err(HubError::Unauthorized.into());
         }
@@ -392,12 +384,7 @@ impl Requests {
             .find(|(_, row)| row.open() && same(row) && row.input_hash == input_hash)
         {
             row.last_poll = now;
-            let state = if row.state == State::Pending {
-                Poll::Pending
-            } else {
-                Poll::Unconfirmed
-            };
-            return Ok((id.clone(), state));
+            return Ok((id.clone(), row.state));
         }
         for row in inner
             .rows
@@ -431,9 +418,9 @@ impl Requests {
             .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
         let id = random_id()?;
         let state = if confirmed {
-            State::Pending
+            Phase::Pending
         } else {
-            State::Unconfirmed
+            Phase::Unconfirmed
         };
         inner.rows.insert(
             id.clone(),
@@ -457,7 +444,7 @@ impl Requests {
         );
         drop(inner);
         self.changed.notify_waiters();
-        Ok((id, if confirmed { Poll::Pending } else { Poll::Unconfirmed }))
+        Ok((id, state))
     }
 
     /// The host showed (or is about to show) a permission prompt for `native`: its unconfirmed
@@ -471,14 +458,15 @@ impl Requests {
         inner
             .prompts
             .retain(|_, at| now - *at < CONFIRM_KEEP_SECONDS);
-        if inner.prompts.len() >= MAX_CONFIRMATIONS && !inner.prompts.contains_key(&key) {
-            return;
+        // A full map only stops remembering a prompt that arrives before its request; the
+        // requests already waiting are confirmed all the same.
+        if inner.prompts.len() < MAX_CONFIRMATIONS || inner.prompts.contains_key(&key) {
+            inner.prompts.insert(key, now);
         }
-        inner.prompts.insert(key, now);
         let mut changed = false;
         for row in inner.rows.values_mut() {
-            if row.state == State::Unconfirmed && row.token == token && row.native == native {
-                row.state = State::Pending;
+            if row.state == Phase::Unconfirmed && row.token == token && row.native == native {
+                row.state = Phase::Pending;
                 changed = true;
             }
         }
@@ -497,7 +485,7 @@ impl Requests {
         id: &str,
         hash: &str,
         now: i64,
-    ) -> Option<Poll> {
+    ) -> Option<Phase> {
         let mut inner = self.inner.lock().ok()?;
         inner.settle(waiting, now);
         let row = inner.rows.get_mut(id)?;
@@ -507,12 +495,7 @@ impl Requests {
         if row.open() {
             row.last_poll = now;
         }
-        Some(match row.state {
-            State::Unconfirmed => Poll::Unconfirmed,
-            State::Pending => Poll::Pending,
-            State::Answered(decision) => Poll::Answered(decision),
-            State::Ended(_) => Poll::Ended,
-        })
+        Some(row.state)
     }
 
     /// [`Self::check`], held for up to `wait_seconds` until the state changes. A change wakes
@@ -524,7 +507,7 @@ impl Requests {
         id: &str,
         hash: &str,
         wait_seconds: u64,
-    ) -> Option<Poll> {
+    ) -> Option<Phase> {
         let permit = self.polls.try_acquire().ok();
         let wait = if permit.is_some() { wait_seconds } else { 0 };
         let deadline = Instant::now() + Duration::from_secs(wait);
@@ -535,7 +518,7 @@ impl Requests {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let state = self.check(waiting, token, id, hash, unix_now())?;
-            let open = matches!(state, Poll::Unconfirmed | Poll::Pending);
+            let open = matches!(state, Phase::Unconfirmed | Phase::Pending);
             if !open || first.is_some_and(|first| first != state) || Instant::now() >= deadline {
                 return Some(state);
             }
@@ -580,9 +563,9 @@ impl Requests {
                 continue;
             }
             let (state, decision) = match row.state {
-                State::Pending => ("pending", None),
-                State::Answered(decision) => ("answered", Some(decision.code())),
-                State::Unconfirmed | State::Ended(_) => continue,
+                Phase::Pending => ("pending", None),
+                Phase::Answered(decision) => ("answered", Some(decision.code())),
+                Phase::Unconfirmed | Phase::Ended(_) => continue,
             };
             let Some(since) = row.attached(waiting, now) else {
                 continue;
@@ -617,7 +600,7 @@ impl Requests {
         inner
             .rows
             .values()
-            .any(|row| row.item_key == key && row.state == State::Pending)
+            .any(|row| row.item_key == key && row.state == Phase::Pending)
     }
 
     /// Records the person's decision for a pending request: the first decision wins, the same
@@ -638,24 +621,24 @@ impl Requests {
             return Err(Refusal::NotYours);
         }
         match row.state {
-            State::Unconfirmed => Err(Refusal::NotFound),
-            State::Pending => {
+            Phase::Unconfirmed => Err(Refusal::NotFound),
+            Phase::Pending => {
                 if decision == Decision::Allow && !row.complete {
                     return Err(Refusal::Invalid(
                         "Allow is offered only when the whole request is shown; deny it, or answer in the session"
                             .into(),
                     ));
                 }
-                row.state = State::Answered(decision);
+                row.state = Phase::Answered(decision);
                 row.settled = now;
                 drop(inner);
                 self.changed.notify_waiters();
                 Ok(decision)
             }
-            State::Answered(done) if done == decision => Ok(done),
-            State::Answered(_) => Err(Refusal::AlreadyAnswered),
-            State::Ended(Ended::SessionMovedOn) => Err(Refusal::AnsweredInSession),
-            State::Ended(_) => Err(Refusal::Ended),
+            Phase::Answered(done) if done == decision => Ok(done),
+            Phase::Answered(_) => Err(Refusal::AlreadyAnswered),
+            Phase::Ended(Ended::SessionMovedOn) => Err(Refusal::AnsweredInSession),
+            Phase::Ended(_) => Err(Refusal::Ended),
         }
     }
 }
@@ -936,7 +919,7 @@ mod tests {
         let (id, state) = requests
             .register(waiting, mine, registration("s", None, HASH), 1_002)
             .unwrap();
-        assert_eq!(state, Poll::Pending);
+        assert_eq!(state, Phase::Pending);
         id
     }
 
@@ -969,7 +952,7 @@ mod tests {
         ));
         assert!(matches!(
             register(&mine, "s", Some("sub")),
-            Ok(Poll::Unconfirmed)
+            Ok(Phase::Unconfirmed)
         ));
         // Another token has no wait under that session name.
         let theirs = principal("tok_b", "usr_them", "acme/widgets");
@@ -1006,11 +989,11 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             requests.check(&waiting, "tok_a", &first, HASH, 1_004),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::Superseded))
         );
         assert_eq!(
             requests.check(&waiting, "tok_a", &second, OTHER_HASH, 1_004),
-            Some(Poll::Unconfirmed)
+            Some(Phase::Unconfirmed)
         );
     }
 
@@ -1034,11 +1017,11 @@ mod tests {
         let at = 1_010;
         assert_eq!(
             requests.check(&waiting, "tok_a", &ids[0], HASH, at),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::Superseded))
         );
         assert_eq!(
             requests.check(&waiting, "tok_a", &ids[MAX_PER_TOKEN], HASH, at),
-            Some(Poll::Unconfirmed)
+            Some(Phase::Unconfirmed)
         );
         let mut refused = false;
         'fill: for t in 0..(MAX_LIVE / MAX_PER_TOKEN + 2) {
@@ -1070,7 +1053,7 @@ mod tests {
         let quiet = 1_000 + HOOK_GONE_SECONDS;
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, quiet),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::HookGone))
         );
         // Kept polling, it lives until the limit.
         let id = requests
@@ -1083,12 +1066,12 @@ mod tests {
             wait(&waiting, &mine, "s", WaitReason::Permission, None, now);
             assert_eq!(
                 requests.check(&waiting, "tok_a", &id, OTHER_HASH, now),
-                Some(Poll::Unconfirmed)
+                Some(Phase::Unconfirmed)
             );
         }
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, OTHER_HASH, quiet + TTL_SECONDS),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::Expired))
         );
     }
 
@@ -1099,7 +1082,7 @@ mod tests {
         let id = pending(&requests, &waiting, &mine);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_003),
-            Some(Poll::Pending)
+            Some(Phase::Pending)
         );
         assert_eq!(requests.check(&waiting, "tok_b", &id, HASH, 1_003), None);
         assert_eq!(
@@ -1142,13 +1125,13 @@ mod tests {
         };
         let started = Instant::now();
         let polled = requests.poll(&waiting, "tok_a", &id, HASH, 20).await;
-        assert_eq!(polled, Some(Poll::Answered(Decision::Allow)));
+        assert_eq!(polled, Some(Phase::Answered(Decision::Allow)));
         assert!(started.elapsed() < Duration::from_secs(5));
         answering.await.unwrap();
         // A lost reply can be read again.
         assert_eq!(
             requests.poll(&waiting, "tok_a", &id, HASH, 0).await,
-            Some(Poll::Answered(Decision::Allow))
+            Some(Phase::Answered(Decision::Allow))
         );
         assert_eq!(requests.poll(&waiting, "tok_b", &id, HASH, 0).await, None);
     }
@@ -1161,13 +1144,13 @@ mod tests {
         waiting.clear("tok_a", "s", None, true);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_003),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::SessionMovedOn))
         );
         let id = pending(&requests, &waiting, &mine);
         wait(&waiting, &mine, "s", WaitReason::Idle, None, 1_050);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_051),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::SessionMovedOn))
         );
         // A permission wait asked by a subagent is a different wait.
         wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_060);
@@ -1178,7 +1161,7 @@ mod tests {
         wait(&waiting, &mine, "s", WaitReason::Permission, Some("sub"), 1_062);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, OTHER_HASH, 1_063),
-            Some(Poll::Ended)
+            Some(Phase::Ended(Ended::SessionMovedOn))
         );
     }
 
@@ -1206,12 +1189,12 @@ mod tests {
         requests.confirm("tok_a", "other", 1_003);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_004),
-            Some(Poll::Unconfirmed)
+            Some(Phase::Unconfirmed)
         );
         requests.confirm("tok_a", "s", 1_005);
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_006),
-            Some(Poll::Pending)
+            Some(Phase::Pending)
         );
         // The notification may come first, within a few seconds before the request.
         wait(&waiting, &mine, "t", WaitReason::Permission, None, 2_000);
@@ -1219,7 +1202,7 @@ mod tests {
         let early = requests
             .register(&waiting, &mine, registration("t", None, HASH), 2_001 + CONFIRM_SLACK_SECONDS)
             .unwrap();
-        assert_eq!(early.1, Poll::Pending);
+        assert_eq!(early.1, Phase::Pending);
         wait(&waiting, &mine, "u", WaitReason::Permission, None, 3_000);
         requests.confirm("tok_a", "u", 3_001);
         let late = requests
@@ -1230,7 +1213,34 @@ mod tests {
                 3_001 + CONFIRM_SLACK_SECONDS + 1,
             )
             .unwrap();
-        assert_eq!(late.1, Poll::Unconfirmed);
+        assert_eq!(late.1, Phase::Unconfirmed);
+    }
+
+    #[test]
+    fn a_full_confirmation_map_still_confirms_the_requests_already_waiting() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
+        let id = requests
+            .register(&waiting, &mine, registration("s", None, HASH), 1_001)
+            .unwrap()
+            .0;
+        {
+            let mut inner = requests.inner.lock().unwrap();
+            for n in 0..MAX_CONFIRMATIONS {
+                inner.prompts.insert((format!("t{n}"), "x".into()), 1_002);
+            }
+        }
+        requests.confirm("tok_a", "s", 1_003);
+        assert_eq!(
+            requests.check(&waiting, "tok_a", &id, HASH, 1_004),
+            Some(Phase::Pending)
+        );
+        // Only the memory of an early prompt was skipped; the map did not grow.
+        assert_eq!(
+            requests.inner.lock().unwrap().prompts.len(),
+            MAX_CONFIRMATIONS
+        );
     }
 
     #[test]
@@ -1272,7 +1282,7 @@ mod tests {
         ));
         assert_eq!(
             requests.check(&waiting, "tok_a", &id, HASH, 1_011),
-            Some(Poll::Answered(Decision::Allow))
+            Some(Phase::Answered(Decision::Allow))
         );
 
         // A cut request can be denied but never allowed.
