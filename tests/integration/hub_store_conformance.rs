@@ -3714,6 +3714,30 @@ fn hand_off_pickups(db: &Db) {
     );
 }
 
+fn settings_read_write_and_create_once(db: &Db) {
+    let store = db.open();
+    assert_eq!(store.get_setting("k").unwrap(), None);
+    // The first create stores its value; a later create returns it unchanged.
+    assert_eq!(
+        store.get_or_create_setting("k", "first", "a").unwrap(),
+        "first"
+    );
+    assert_eq!(
+        store.get_or_create_setting("k", "second", "b").unwrap(),
+        "first"
+    );
+    assert_eq!(store.get_setting("k").unwrap().as_deref(), Some("first"));
+    // A set replaces it, and only that key changes.
+    store.set_setting("k", "it's $1", "c").unwrap();
+    store.set_setting("other", "x", "c").unwrap();
+    assert_eq!(store.get_setting("k").unwrap().as_deref(), Some("it's $1"));
+    assert_eq!(store.get_setting("other").unwrap().as_deref(), Some("x"));
+    assert_eq!(
+        store.get_or_create_setting("k", "third", "d").unwrap(),
+        "it's $1"
+    );
+}
+
 fn work_payload_used_reads_the_charged_bytes(db: &Db) {
     use agentscm::hub::work::WorkRepositoryScope;
 
@@ -3787,6 +3811,7 @@ conformance!(
     local_ci_corrupt_records_are_refused,
     hand_off_pickups,
     work_payload_used_reads_the_charged_bytes,
+    settings_read_write_and_create_once,
 );
 
 #[cfg(unix)]
