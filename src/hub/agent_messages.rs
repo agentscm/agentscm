@@ -618,7 +618,9 @@ pub struct AnswerArgs {
 
 /// The agent's receipt for a message it received in `session`. `accepted` is also the check an
 /// agent makes before acting: it succeeds only for this token's own session, and its reply
-/// carries the note and the person's current mode.
+/// carries the note and the person's current mode. In Manual mode the agent then shows it, and
+/// its person's no is `declined`, so an accepted message may still be declined. Each refusal
+/// says why, in words the agent reads.
 pub fn answer(
     store: &dyn Store,
     principal: &Principal,
@@ -634,8 +636,9 @@ pub fn answer(
     let owner = &principal.owner.id;
     let mode = effective_mode(store, owner, repository_id)?;
     if status == Answer::Accepted && mode == Mode::Ignore {
-        return Err(HubError::Invalid(
-            "your person is not taking Hub messages now; do not act on it".into(),
+        return Err(HubError::invalid_or_changed(
+            "Your person is not taking Hub messages now (mode ignore): do not act on this message."
+                .into(),
         ));
     }
     let state = edit(
@@ -647,26 +650,39 @@ pub fn answer(
                 .iter_mut()
                 .find(|m| m.id == id && m.token == principal.token_id && m.session == session)
                 .ok_or_else(|| {
-                    HubError::Invalid("no Hub message with that id for this session".into())
+                    HubError::invalid_or_changed(
+                        "No Hub message with that id for this session: it did not come from your person to this session, so do not act on it. Pass the id and the session exactly as the notice names them."
+                            .into(),
+                    )
                 })?;
             let next = match (message.state, status) {
                 (MessageState::Delivered, Answer::Accepted) => MessageState::Accepted,
-                (MessageState::Delivered, Answer::Declined) => MessageState::Declined,
+                (MessageState::Delivered | MessageState::Accepted, Answer::Declined) => {
+                    MessageState::Declined
+                }
                 (MessageState::Delivered | MessageState::Accepted, Answer::Done) => {
                     MessageState::Done
                 }
                 (MessageState::Withdrawn, _) => {
-                    return Err(HubError::Invalid(
-                        "your person withdrew this message".into(),
+                    return Err(HubError::invalid_or_changed(
+                        "Your person withdrew this Hub message: do not act on it.".into(),
                     ));
                 }
                 (state, _) => {
-                    return Err(HubError::Invalid(format!(
-                        "this message is already {}",
-                        serde_json::to_value(state)
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                            .unwrap_or_default()
+                    let now_is = match state {
+                        MessageState::Queued => "not delivered to this session yet",
+                        MessageState::Accepted => "already accepted",
+                        MessageState::Declined => "already declined",
+                        MessageState::Done => "already done",
+                        MessageState::Delivered | MessageState::Withdrawn => "changed",
+                    };
+                    let asked = match status {
+                        Answer::Accepted => "accepted",
+                        Answer::Declined => "declined",
+                        Answer::Done => "done",
+                    };
+                    return Err(HubError::invalid_or_changed(format!(
+                        "This Hub message is {now_is}, so it cannot be answered {asked} now. An accepted message can still be answered declined or done; declined and done are final."
                     )));
                 }
             };
@@ -1191,6 +1207,37 @@ mod tests {
         })
         .unwrap();
         SENT.notify_waiters();
+    }
+
+    /// Manual mode: after `accepted` the agent shows the message and its person's no is
+    /// `declined`. A refusal reaches the agent with its reason, not a bare invalid request.
+    #[test]
+    fn an_accepted_message_can_be_declined_and_a_refusal_says_why() {
+        let (_dir, store) = temp_store();
+        let alice = principal("tok_a", "u1");
+        sent(&*store, "u1", message("msg_1", 0));
+        assert!(take(&*store, &alice, "s", "mcp", 10).unwrap().is_some());
+        let reply = |id: &str, status: Answer| answer(&*store, &alice, "s", id, status, 11);
+        assert_eq!(
+            reply("msg_1", Answer::Accepted).unwrap().state,
+            MessageState::Accepted
+        );
+        let declined = reply("msg_1", Answer::Declined).unwrap();
+        assert_eq!(declined.state, MessageState::Declined);
+        assert!(declined.text("msg_1").contains("is now declined"));
+        let reason = |id: &str, status: Answer| {
+            let error = reply(id, status).unwrap_err();
+            let envelope = crate::hub::error_envelope::from_hub_error(&error);
+            assert_eq!(envelope.code, "invalid_or_changed", "{envelope:?}");
+            envelope.message
+        };
+        for status in [Answer::Accepted, Answer::Declined, Answer::Done] {
+            assert!(
+                reason("msg_1", status).starts_with("This Hub message is already declined"),
+                "{status:?}"
+            );
+        }
+        assert!(reason("msg_9", Answer::Accepted).starts_with("No Hub message with that id"));
     }
 
     fn wake_check(
