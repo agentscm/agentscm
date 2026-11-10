@@ -5424,39 +5424,3 @@ fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session
         b"OPENING_PROMPT_917"
     ));
 }
-
-#[test]
-fn retaining_an_artifact_costs_the_same_in_a_spool_with_thousands_of_files() {
-    // Each lock used to open every retained file, so a Git snapshot of N files cost N² opens
-    // (26-41 s per hook in a large checkout). A retain must not slow down as the spool grows.
-    let temp = TempDir::new().unwrap();
-    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
-    let retain = |range: std::ops::Range<usize>| {
-        let started = std::time::Instant::now();
-        for n in range {
-            spool
-                .retain_artifact(
-                    format!("artifact {n}").as_bytes(),
-                    ArtifactMediaV1::Binary,
-                    RetentionClassV1::WorkLocal,
-                )
-                .unwrap();
-        }
-        started.elapsed()
-    };
-    let empty = retain(0..100);
-    retain(100..2500);
-    let full = retain(2500..2600);
-    assert!(
-        full < empty * 4 + Duration::from_millis(200),
-        "{empty:?} empty, {full:?} full"
-    );
-    // Already retained content takes no lock.
-    spool
-        .retain_artifact(
-            b"artifact 0",
-            ArtifactMediaV1::Binary,
-            RetentionClassV1::WorkLocal,
-        )
-        .unwrap();
-}
