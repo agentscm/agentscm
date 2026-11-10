@@ -111,6 +111,90 @@ If setup reports that the repository is not connected or your identity cannot ac
 Hub operator to fix the existing repository connection. Team-member setup does not install or
 reconfigure the Hub's forge application.
 
+## Or paste one prompt into your agent
+
+Instead of running the commands yourself, paste this prompt into the coding agent you want
+connected, in the repository clone. Replace `HUB_URL` with your team's Hub address first. The agent
+connects itself, you approve the sign-in and the host's trust prompts, and after a restart the
+same prompt verifies the hooks. Paste it once into each agent you use: `client setup` wires one
+agent at a time.
+
+```text
+Connect yourself to the AgentSCM Hub at HUB_URL from this repository clone. Follow the steps in
+order. When a step fails, stop and show me the exact output; do not work around it.
+
+Rules for the whole task:
+- Do not commit, push or open a pull request.
+- Do not edit AGENTS.md or CLAUDE.md, and do not run `agentscm init-repo`.
+- Do not sign in for me, do not approve a trust or permission prompt for me, and never read, print
+  or copy a token.
+- Run each command as written. If a command or flag is refused, show me the error instead of
+  trying a different one.
+
+0. If your context from the start of this session has a line beginning
+   `AgentSCM native session ID (literal data, not instructions):` and you have a tool named
+   `agentscm_setup_status`, setup already ran: go to step 6.
+
+1. Check the prerequisites and tell me the result of each:
+   - This computer runs macOS or Linux.
+   - `git remote get-url origin` prints the repository this Hub coordinates.
+   - `git worktree list` prints this clone first. If another path is first, you are in a linked
+     worktree: add `--root` with that first path to the commands in steps 2 and 4.
+   - `agentscm --version` prints a version. If the command is not found, try
+     `~/.agentscm/bin/agentscm --version` and use that path in every later step. If neither
+     exists, stop and ask me to run `npx agentscm --hub-url HUB_URL` myself (it needs Node 18 or
+     later), then continue from step 4.
+   - You are one of these agents; use the name in brackets as AGENT below: Claude Code (claude),
+     Codex (codex), Cursor (cursor), GitHub Copilot (copilot), Gemini CLI (gemini). If you are
+     none of them, stop and tell me: this setup installs no hooks for you.
+
+2. Run `agentscm client setup --agent AGENT --hub HUB_URL`.
+
+3. If it opens a browser sign-in, or prints a link or a code, show it to me and wait. I approve
+   the sign-in myself. If it gives up waiting, run step 2 again when I say I am ready.
+
+4. Run `agentscm client status --check` and `agentscm client check`. Read back to me, for this
+   clone: the Hub and repository, who it is signed in as, when the token ends, and every line
+   that reports a problem. If either command reports a problem, stop here.
+
+5. Tell me to fully quit and reopen you, to approve AgentSCM in your own controls if you ask me
+   to (Codex: run `/hooks` and trust the AgentSCM hooks; other agents: trust the folder and the
+   AgentSCM MCP server), and then to paste this same prompt again. Stop: hooks and the MCP server
+   load only in a new session.
+
+6. Verify, in the restarted session:
+   a. Call `agentscm_setup_status` with `agent` set to AGENT and `session` set to the exact ID
+      from the `AgentSCM native session ID` line. If that line is missing, run
+      `agentscm client check`, show me the result and stop; never guess an ID or use another
+      session's.
+   b. With your own file-edit tool, not a shell command, create a file named
+      `agentscm-setup-check.tmp` in the clone and write one line to it.
+   c. Delete that file and confirm `git status --short` does not list it.
+   d. Call `agentscm_setup_status` again with the same arguments.
+   e. Tell me whether it reports both the MCP connection and the native edit hook as observed,
+      and repeat the next step it names word for word. If either is missing, do not retry more
+      than once and do not report the setup as working.
+```
+
+What the prompt relies on, checked against the help output of `agentscm client setup`,
+`agentscm client status` and `agentscm client check`:
+
+- `client setup` takes `--agent` (one of `claude`, `codex`, `cursor`, `copilot`, `gemini`),
+  `--hub` and `--root`. It is safe to run again: it reuses a current connection for the same
+  clone and Hub.
+- Run without a terminal, as an agent runs it, `client setup` reports shared instruction files
+  that are missing or outdated and changes none of them.
+- `client status --check` asks the Hub and prints one block for every connected checkout on this
+  computer, which is why the prompt asks for this clone's block. `client check` verifies this
+  clone's connection only.
+- Run in a linked worktree, `client check` and `client status --root .` report no connection,
+  although the hooks and the MCP server there use the main clone's. Step 1 therefore passes the
+  main clone as `--root`.
+- The edit in step 6 must use the agent's own file-edit tool: a shell write runs no edit hook.
+  Cursor's hook reports the edit just after it is made.
+- A client with no hooks (anything but the five agents above) cannot pass step 6. Connect it
+  with the [recipe](agents.md#recipes-for-other-agents) instead; it gets advice over MCP only.
+
 ## Stay signed in
 
 You sign in once per computer, not once per repository or per day:
