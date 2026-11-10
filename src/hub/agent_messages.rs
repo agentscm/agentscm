@@ -274,10 +274,14 @@ pub struct Client {
     /// only there, where a subagent's call is told apart, and never in an MCP result.
     pub hook_context: bool,
     /// A hook call from it carried no subagent marker: the evidence that it is the session a
-    /// person leads, not a subagent's. Nothing is delivered without it, so a client with only
-    /// MCP, whose calls cannot say who made them, gets nothing.
+    /// person leads, not a subagent's. A hook that carries context delivers only with it.
     pub top_level: bool,
-    /// It made an AgentSCM MCP tool call.
+    /// It made an AgentSCM MCP tool call that named this session (not the shared `default`,
+    /// which names no one conversation). That is enough for a client
+    /// whose hook cannot carry context, or that has no hook, to take messages in its tool
+    /// results: an MCP call cannot say whether a subagent made it, so the notice tells a
+    /// subagent to leave the message for the session that started it, and an unanswered one is
+    /// offered again at a later call.
     pub mcp: bool,
     pub seen_at: i64,
     /// When its background hook last waited for a message.
@@ -290,14 +294,17 @@ pub struct Client {
 impl Client {
     /// `wake`: its background hook waits now, so a message reaches it within seconds, idle or
     /// busy. `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
-    /// its next AgentSCM call. `unknown`: no top-level hook call seen since the Hub started;
-    /// copy and paste instead.
+    /// its next AgentSCM tool call, as an extra text block in the result. `unknown`: since the
+    /// Hub started, nothing from the session itself, only its subagents' hook calls; copy and
+    /// paste instead.
     pub fn tier(&self, now: i64) -> &'static str {
+        let woken = self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS);
         match (self.top_level, self.hook_context) {
-            (false, _) => "unknown",
-            _ if self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS) => "wake",
+            (true, _) if woken => "wake",
             (true, true) => "hook",
             (true, false) => "mcp",
+            (false, false) if self.mcp => "mcp",
+            (false, _) => "unknown",
         }
     }
 }
@@ -356,7 +363,8 @@ pub fn note_mcp(token: &str, install: Option<&str>, session: &str, now: i64) {
     let client = map
         .entry((token.to_owned(), session.to_owned()))
         .or_default();
-    client.mcp = true;
+    // `default` names no one conversation, so a message to it could reach any of the token's.
+    client.mcp |= session != super::session::DEFAULT_SESSION;
     client.seen_at = now;
     if let Some((name, version, _)) = info {
         client.name = Some(name);
@@ -391,14 +399,15 @@ fn note_wait(token: &str, session: &str, now: i64) {
     bounded(&mut map, |client| client.seen_at);
 }
 
-/// Whether this session takes its messages in AgentSCM tool results: it is known to be a
-/// top-level session and its hook cannot carry them.
+/// Whether this session takes its messages in AgentSCM tool results (tier `mcp`): it showed
+/// itself in a top-level hook call or an MCP call naming it, and it has no hook that carries
+/// them instead.
 pub fn mcp_delivers(token: &str, session: &str) -> bool {
     SESSIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&(token.to_owned(), session.to_owned()))
-        .is_some_and(|client| client.top_level && !client.hook_context)
+        .is_some_and(|client| !client.hook_context && (client.top_level || client.mcp))
 }
 
 fn clients_of(tokens: &[String]) -> Vec<((String, String), Client)> {
@@ -1817,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_session_shown_not_to_be_a_subagent_takes_messages() {
+    fn an_mcp_call_naming_its_session_takes_messages_unless_a_hook_carries_them() {
         let token = "tok_test_top_level";
         let tier = |session: &str| {
             clients_of(&[token.to_owned()])
@@ -1825,22 +1834,36 @@ mod tests {
                 .find(|((_, s), _)| s == session)
                 .map(|(_, client)| client.tier(3))
         };
-        // MCP alone cannot say whether a subagent made the call.
+        // A client with only MCP (Codex without hooks, Antigravity, opencode) is offered messages
+        // in its tool results; the notice tells a subagent to leave them.
         note_mcp(token, None, "mcp-only", 1);
-        assert_eq!(tier("mcp-only"), Some("unknown"));
-        assert!(!mcp_delivers(token, "mcp-only"));
-        // Only a subagent's hook calls seen so far, as after a Hub restart.
+        assert_eq!(tier("mcp-only"), Some("mcp"));
+        assert!(mcp_delivers(token, "mcp-only"));
+        // The shared `default` names no one conversation, so it is offered nothing.
+        note_mcp(token, None, crate::hub::session::DEFAULT_SESSION, 1);
+        assert_eq!(tier(crate::hub::session::DEFAULT_SESSION), Some("unknown"));
+        assert!(!mcp_delivers(token, crate::hub::session::DEFAULT_SESSION));
+        // Only a subagent's hook calls seen so far, as after a Hub restart: nothing from the
+        // session itself, so nothing is offered until it calls.
         note_hook(token, "copilot", "hook:copilot", false, false, 1);
-        note_mcp(token, None, "copilot", 1);
         assert_eq!(tier("copilot"), Some("unknown"));
         assert!(!mcp_delivers(token, "copilot"));
-        note_hook(token, "copilot", "hook:copilot", true, false, 2);
+        note_mcp(token, None, "copilot", 1);
         assert_eq!(tier("copilot"), Some("mcp"), "a hook without added context");
         assert!(mcp_delivers(token, "copilot"));
-        // A hook that carries context takes its messages there, even before its first such call.
+        note_hook(token, "copilot", "hook:copilot", true, false, 2);
+        assert_eq!(tier("copilot"), Some("mcp"));
+        // A hook that carries context takes its messages there, even before its first such call,
+        // and never in an MCP result.
         note_hook(token, "claude", "hook:claude", true, true, 3);
+        note_mcp(token, None, "claude", 3);
         assert_eq!(tier("claude"), Some("hook"));
         assert!(!mcp_delivers(token, "claude"));
+        // Its subagents' calls alone, hook or MCP, never move its messages into MCP results.
+        note_hook(token, "claude-sub", "hook:claude", false, true, 3);
+        note_mcp(token, None, "claude-sub", 3);
+        assert_eq!(tier("claude-sub"), Some("unknown"));
+        assert!(!mcp_delivers(token, "claude-sub"));
     }
 
     #[test]
@@ -1855,10 +1878,6 @@ mod tests {
         let seen = clients_of(&[token.to_owned()]);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1.name.as_deref(), Some("gemini-cli"));
-        assert_eq!(
-            seen[0].1.tier(5),
-            "unknown",
-            "MCP alone is no top-level evidence"
-        );
+        assert_eq!(seen[0].1.tier(5), "mcp", "its MCP calls take its messages");
     }
 }
