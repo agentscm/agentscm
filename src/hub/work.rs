@@ -309,6 +309,26 @@ pub struct WorkCompaction {
     pub merge_retention_floor: i64,
 }
 
+/// Which open deliveries a compaction ends: those whose event window starts below the first
+/// returned seq, or whose merge window starts below the second. Each floor is compared with its
+/// own old value and the highest raised one cuts; a pass that raised none returns 0, so a
+/// delivery that reads nothing removed keeps paging.
+pub fn delivery_cuts(
+    old_event_floors: [i64; 3],
+    new_event_floors: [i64; 3],
+    old_merge_floor: i64,
+    new_merge_floor: i64,
+) -> (i64, i64) {
+    let raised = |old: i64, new: i64| if new > old { new } else { 0 };
+    let event = old_event_floors
+        .into_iter()
+        .zip(new_event_floors)
+        .map(|(old, new)| raised(old, new))
+        .max()
+        .unwrap_or(0);
+    (event, raised(old_merge_floor, new_merge_floor))
+}
+
 /// A lapsed hold whose scope an admission took. Its lead's branch may hold edits it never pushed;
 /// the Hub cannot see them.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1195,8 +1215,22 @@ pub(super) fn check_work_delivery_page(page: &str) -> Result<()> {
 mod tests {
     use super::{
         WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_ROW_BYTES, check_work_delivery_page,
-        check_work_payload_capacity,
+        check_work_payload_capacity, delivery_cuts,
     };
+
+    #[test]
+    fn compaction_ends_only_deliveries_below_a_raised_floor() {
+        // Nothing raised: no delivery ends.
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 4), (0, 0));
+        // Any raised event floor cuts at the highest new floor; merges are separate.
+        assert_eq!(delivery_cuts([5, 9, 2], [12, 9, 2], 4, 4), (12, 0));
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 7), (0, 7));
+        // A raised floor below another, unraised one still cuts: events 600-950 were removed.
+        assert_eq!(
+            delivery_cuts([500, 900, 1000], [950, 900, 1000], 0, 0),
+            (950, 0)
+        );
+    }
 
     #[test]
     fn overlap_witnesses_bound_dense_scope_expansions() {

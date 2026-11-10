@@ -1859,7 +1859,9 @@ mod tests {
             Some("quiet-session"),
             observations.epoch(),
         );
-        let status = super::read(store, &observations, &viewer, now).unwrap();
+        // Observations stamp the wall clock, and a read leaves out rows stamped after its time.
+        let read_at = crate::hub::store::unix_now();
+        let status = super::read(store, &observations, &viewer, read_at).unwrap();
         let mut setup_rows = status
             .actions
             .iter()
@@ -2493,7 +2495,8 @@ mod tests {
     fn failed_checks_and_stopped_gates_reach_their_owner_on_postgres() {
         on_postgres(checks_contract);
     }
-    /// Runs one contract in its own disposable schema.
+    /// Runs one contract in a disposable schema of its own disposable database. The store's
+    /// advisory locks are database-wide, so a shared database would make parallel tests wait.
     fn on_postgres(contract: fn(&dyn Store)) {
         let Ok(base) = std::env::var("AGENTSCM_TEST_DATABASE_URL") else {
             eprintln!("skipping PostgreSQL status conformance: AGENTSCM_TEST_DATABASE_URL unset");
@@ -2510,26 +2513,32 @@ mod tests {
         );
         let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
         admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .unwrap();
-        struct Schema {
+            .batch_execute(&format!("CREATE DATABASE {schema}"))
+            .expect("the test role must be able to create databases");
+        struct Database {
             admin: postgres::Client,
             name: String,
         }
-        impl Drop for Schema {
+        impl Drop for Database {
             fn drop(&mut self) {
                 let _ = self
                     .admin
-                    .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.name));
+                    .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
             }
         }
-        let _schema = Schema {
+        let _database = Database {
             admin,
             name: schema.clone(),
         };
-        let separator = if base.contains('?') { '&' } else { '?' };
+        let mut database = reqwest::Url::parse(&base).unwrap();
+        database.set_path(&format!("/{schema}"));
+        postgres::Client::connect(database.as_str(), postgres::NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .unwrap();
+        let separator = if database.query().is_some() { '&' } else { '?' };
         let url = format!(
-            "{base}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
+            "{database}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
         );
         let store = store::open(&url).unwrap();
         contract(&*store);

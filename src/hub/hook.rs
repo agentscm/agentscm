@@ -785,8 +785,10 @@ impl Call {
                         let mut text = format!(
                             "AgentSCM: {WORK_UNDECLARED}: this edit was not applied because {why} Then make the edit again. If it is not part of a task, repeat it unchanged: this refusal happens once per session. {NO_BYPASS}"
                         );
-                        if !outcome.text.is_empty() {
-                            text = format!("{text}\n{}", outcome.text);
+                        // A holder's refusal is in `deny`; a plain note is in `text`.
+                        let prior = outcome.deny.as_deref().unwrap_or(&outcome.text);
+                        if !prior.is_empty() {
+                            text = format!("{text}\n{prior}");
                         }
                         Outcome {
                             deny: Some(text.clone()),

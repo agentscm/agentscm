@@ -1,9 +1,13 @@
 use postgres::{Client, NoTls};
 
-/// A fresh schema on the server named by AGENTSCM_TEST_DATABASE_URL, dropped on drop.
+/// A fresh database on the server named by AGENTSCM_TEST_DATABASE_URL, holding one fresh
+/// schema, dropped on drop. The store's advisory locks are database-wide, so a database per
+/// test keeps parallel tests from waiting on each other's locks.
 pub struct PgSchema {
-    /// Connects with the schema as search_path and a unique application_name.
+    /// Connects to the test database with the schema as search_path and a unique
+    /// application_name.
     pub url: String,
+    /// Names the schema, the database and the connections' application_name.
     pub schema: String,
     base: String,
 }
@@ -31,21 +35,29 @@ impl PgSchema {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        let mut admin = Client::connect(&base, NoTls).unwrap();
-        admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .unwrap();
-        let separator = if base.contains('?') { '&' } else { '?' };
-        Some(Self {
+        let mut database = reqwest::Url::parse(&base).unwrap();
+        database.set_path(&format!("/{schema}"));
+        let separator = if database.query().is_some() { '&' } else { '?' };
+        // Built before CREATE DATABASE, so that its Drop removes the database whatever fails later.
+        let pg = Self {
             url: format!(
-                "{base}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
+                "{database}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
             ),
             schema,
             base,
-        })
+        };
+        Client::connect(&pg.base, NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE DATABASE {}", pg.schema))
+            .expect("the test role must be able to create databases");
+        Client::connect(database.as_str(), NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE SCHEMA {}", pg.schema))
+            .unwrap();
+        Some(pg)
     }
 
-    /// A connection to the server's base database, outside the schema.
+    /// A connection to the server's base database, outside the test database.
     #[allow(dead_code)] // only the conformance suite uses it
     pub fn admin(&self) -> Client {
         Client::connect(&self.base, NoTls).unwrap()
@@ -55,7 +67,8 @@ impl PgSchema {
 impl Drop for PgSchema {
     fn drop(&mut self) {
         if let Ok(mut client) = Client::connect(&self.base, NoTls) {
-            let _ = client.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema));
+            // FORCE ends connections the test left open, which would otherwise block the drop.
+            let _ = client.batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.schema));
         }
     }
 }

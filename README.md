@@ -130,8 +130,9 @@ must remain visible. See [capture and qualification](docs/change-capture.md).
 
 Conversation capture defaults to **metadata-only**: no conversation bodies are retained or sent
 to the Hub. Per checkout, you can opt into local conversations or shared conversations.
-Shared bodies are redacted on the computer on a best-effort basis, then uploaded; only the
-person sharing them and Hub admins can read them. Hub retention defaults to 30 days.
+Shared bodies are redacted on the computer on a best-effort basis, then uploaded. While the
+repository shares agent conversations, anyone who can read the repository on the Hub can read
+them; otherwise only the person sharing them and Hub admins can. Hub retention defaults to 30 days.
 Turning sharing off stops future sharing; existing copies remain until expiry or deletion.
 Read [sharing, access and deletion](docs/change-capture.md#sharing-conversations-with-the-hub)
 before enabling it. This is distinct from task text and coordination metadata the Hub already

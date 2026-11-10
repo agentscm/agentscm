@@ -707,38 +707,36 @@ fn compaction_delivery_guard(fixture: &Fixture) {
         repository: REPOSITORY.into(),
         repository_id: Some(144),
     };
-    assert!(
-        fixture
-            .store
-            .work_compact(&work_scope, now - 86_400, false, now)
-            .unwrap_err()
-            .to_string()
-            .contains("work compaction is blocked by an unacknowledged catch-up delivery")
-    );
-    while !page.complete {
-        page = fixture
-            .store
-            .work_catchup(&token, &continuation(&page, 1), now)
-            .unwrap();
-    }
-    fixture
-        .store
-        .work_catchup_ack(
-            &token,
-            &CatchupAck {
-                delivery: page.delivery,
-                expected_event_from: page.event_from,
-                expected_merge_from: page.merge_from,
-            },
-            now + 1,
-        )
-        .unwrap();
+    // A live, half-read delivery no longer blocks compaction: a busy repository still compacts.
     let compacted = fixture
         .store
         .work_compact(&work_scope, now - 86_400, true, now + 1)
         .unwrap();
     assert_eq!(compacted.deleted_merge_observations, 1);
     assert_eq!(compacted.merge_retention_floor, 1);
+    // Its window started below the raised floor, so it is ended instead of skipping records.
+    let ended = fixture
+        .store
+        .work_catchup(&token, &continuation(&page, 1), now + 1);
+    assert!(
+        ended
+            .unwrap_err()
+            .to_string()
+            .contains("unknown catch-up delivery")
+    );
+    page = fixture
+        .store
+        .work_catchup(
+            &token,
+            &CatchupQuery {
+                delivery_client: "live-client".into(),
+                limit: 1,
+                ..CatchupQuery::default()
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert!(page.retention.merge_gap);
     assert!(
         !fixture
             .store

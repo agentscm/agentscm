@@ -415,7 +415,7 @@ async fn scenario(
     // declare it; the demo shows the part about the file another agent holds.
     let undeclared = format!(
         "AgentSCM: {}: ",
-        crate::hub::work_lifecycle::WORK_UNDECLARED
+        agentscm::hub::work_lifecycle::WORK_UNDECLARED
     );
     let reason = match reason.split_once('\n') {
         Some((head, rest)) if head.starts_with(&undeclared) => rest,
