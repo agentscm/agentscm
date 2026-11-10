@@ -1,8 +1,11 @@
 name: Windows
 
 on:
+  # Pull requests run only the `check` job; the full build and tests stay nightly and manual (the release PR dispatches them).
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
-  # Nightly and manual only; the release PR dispatches it.
   schedule:
     - cron: '43 7 * * *'
 
@@ -11,13 +14,36 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Proves the crate compiles on Windows on every pull request. Type checking without codegen or linking
+  # finishes well inside the Linux tests job; the `windows` job below still builds, links and tests.
+  check:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash # Git Bash on the Windows runner
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main (the nightly run) saves, so every pull request restores one shared cache and none evicts another.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The same targets the `windows` job tests; the other integration tests use Unix-only APIs.
+      - run: cargo check --locked --lib --bin agentscm --test integration
+      # The `#[cfg(test)]` unit-test modules in src/, which `cargo test` compiles in the `windows` job.
+      - run: cargo check --locked --profile test --lib --bin agentscm
+
   windows:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:

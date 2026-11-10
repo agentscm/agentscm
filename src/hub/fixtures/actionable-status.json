@@ -97,7 +97,7 @@
         "agent": null
       },
       "needs_you": true,
-      "action": "Review the handover and choose the next responsible party.",
+      "action": "Resolve the handover's reported blocker: Owner must select the deployment region",
       "reported_next_action": null,
       "freshness": "active",
       "operational": {

@@ -1213,12 +1213,18 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 }
                 (&Method::GET, ["contents", path @ ..]) => {
                     use base64::Engine as _;
-                    match state.repos[&id].files.get(&path.join("/")) {
+                    let path = path.join("/");
+                    let files = &state.repos[&id].files;
+                    match files.get(&path) {
                         Some(text) => json_reply(
                             200,
                             json!({"type": "file", "encoding": "base64", "size": text.len(),
                                 "content": base64::engine::general_purpose::STANDARD.encode(text)}),
                         ),
+                        // A directory lists its entries, as GitHub does.
+                        None if files.keys().any(|f| f.starts_with(&format!("{path}/"))) => {
+                            json_reply(200, json!([{"type": "dir", "path": path}]))
+                        }
                         None => not_found(),
                     }
                 }
