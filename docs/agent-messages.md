@@ -63,7 +63,7 @@ A message is never delivered:
 
 - to a subagent's hook call: those are skipped, and a session whose hook carries context takes its messages only in its own hook replies (a subagent of a client without such a hook can receive one in an MCP result; its notice tells it to leave it);
 - to a session the Hub has heard nothing from itself since it started (tier `unknown`);
-- by an MCP call that names no `session`;
+- by an MCP call that names no `session`, or names the shared `default`, which is no one conversation;
 - in a hook reply whose outcome is unknown, because that reply's text may be dropped.
 
 A delivered message that is not answered within 60 seconds is offered again at the next call, in case the reply that carried it never reached the model. Only a message never delivered wakes a session, so an agent that does not answer is not woken again and again.

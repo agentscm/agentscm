@@ -276,7 +276,8 @@ pub struct Client {
     /// A hook call from it carried no subagent marker: the evidence that it is the session a
     /// person leads, not a subagent's. A hook that carries context delivers only with it.
     pub top_level: bool,
-    /// It made an AgentSCM MCP tool call that named this session. That is enough for a client
+    /// It made an AgentSCM MCP tool call that named this session (not the shared `default`,
+    /// which names no one conversation). That is enough for a client
     /// whose hook cannot carry context, or that has no hook, to take messages in its tool
     /// results: an MCP call cannot say whether a subagent made it, so the notice tells a
     /// subagent to leave the message for the session that started it, and an unanswered one is
@@ -362,7 +363,8 @@ pub fn note_mcp(token: &str, install: Option<&str>, session: &str, now: i64) {
     let client = map
         .entry((token.to_owned(), session.to_owned()))
         .or_default();
-    client.mcp = true;
+    // `default` names no one conversation, so a message to it could reach any of the token's.
+    client.mcp |= session != super::session::DEFAULT_SESSION;
     client.seen_at = now;
     if let Some((name, version, _)) = info {
         client.name = Some(name);
@@ -1808,6 +1810,10 @@ mod tests {
         note_mcp(token, None, "mcp-only", 1);
         assert_eq!(tier("mcp-only"), Some("mcp"));
         assert!(mcp_delivers(token, "mcp-only"));
+        // The shared `default` names no one conversation, so it is offered nothing.
+        note_mcp(token, None, crate::hub::session::DEFAULT_SESSION, 1);
+        assert_eq!(tier(crate::hub::session::DEFAULT_SESSION), Some("unknown"));
+        assert!(!mcp_delivers(token, crate::hub::session::DEFAULT_SESSION));
         // Only a subagent's hook calls seen so far, as after a Hub restart: nothing from the
         // session itself, so nothing is offered until it calls.
         note_hook(token, "copilot", "hook:copilot", false, false, 1);
