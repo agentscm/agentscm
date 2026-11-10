@@ -323,10 +323,11 @@ the pull request (up to 300). For every adopted skill whose gates accept the kin
   pull request carries that label.
 - `human_approval`, when some reviewer's latest decisive review approves the exact head, that
   reviewer is a user (not a bot) whose repository permission is `write`, `maintain` or `admin`
-  (read per approver from GitHub), and no reviewer's latest review requests changes.
+  (read per approver from GitHub, every candidate in turn), and no reviewer's latest review
+  requests changes.
 - `merged`, when the sync sees the pull request merged (App or token connection). Just before,
   it reads the head again the same way and records what passed by `merged_at`. If any read fails
-  or takes over 10 seconds, the merge is not recorded at all, so a failed read never counts as a
+  or the reads take over 10 seconds, the merge is not recorded at all, so a failed read never counts as a
   skipped gate. The merge method is not observed, so a pin with `merge_method` other than `any`
   still needs a report naming it.
 
@@ -338,21 +339,29 @@ evidence goes stale, as an agent push would. Agents still cannot record `observe
 Observed evidence counts for a gate only when the gate's own rule accepts it: green CI without a
 required label is not the observed fact, whatever a report says about the label.
 
-**The skill status.** When the operator lists a repository in `AGENTSCM_SKILL_FORGE_STATUS`
-(comma-separated `owner/name`, like `AGENTSCM_GITHUB_EXTERNAL_RUNS`), the Hub posts
-`agentscm/skill/<name>` on each open pull request head after reading it, with the state in the
-`forge_status` row of section 2.5. `success` needs, for every gate before merge that the forge can
-show (CI and approval), accepted observed evidence on the head *and* the same fact in this pass's
-read: a later failing re-run or a dismissed approval turns it back to `pending`, and a report
-alone never makes it green. A pull request with no evidence shows `pending`. A team makes the
-context a required check to enforce the gates; the Hub needs the App's `statuses: write` grant.
-GitHub's combined status is the posting journal: the Hub posts only when the shown state or
-description differs, so an unchanged run posts nothing, and a pass whose read fails posts
-nothing. Updates follow the rotation, so a status can lag new evidence by a few polls. When the
-operator removes the repository from the list, the next pass replaces a still-shown success with
-`error` ("No longer published by the Hub for this repository."). The opt-in is a repository list
-rather than the agent-task profile's `publish_forge_status`, which belongs to native candidate
-publications and needs an operator-mapped native store a GitHub-only team does not have.
+**The skill status.** A per-repository Hub setting, off by default and stored in
+`hub_settings` like conversation sharing (keyed by the forge's repository id), turns it on: a
+repository admin or a Hub admin sets it on the Hub's web pages
+(`GET`/`PUT /v1/hub/session/skill-forge-status`), and agents read it at
+`GET /v1/hub/repos/{repo}/skills/forge-status`. Then the Hub posts `agentscm/skill/<name>` on each
+open pull request head after reading it, with the state in the `forge_status` row of section 2.5.
+`success` needs, for every gate before merge that the forge can show (CI and approval), accepted
+observed evidence on the head *and* the same fact in this pass's read: a later failing re-run or a
+dismissed approval turns it back to `pending`, and a report alone never makes it green. A pull
+request with no evidence shows `pending`. A team makes the context a required check on the
+repositories it chooses; the Hub needs the App's `statuses: write` grant. GitHub's combined status
+is the posting journal: the Hub posts only when the shown state or description differs, so an
+unchanged run posts nothing, and a pass whose read fails posts nothing. One pull request's reads,
+permission checks and posts share a 10-second deadline, so a slow forge never stalls the pass.
+Updates follow the rotation, so a status can lag new evidence by a few polls. When the setting
+goes off, or the skill leaves the lock file, the next pass replaces a still-shown success with
+`error` ("No longer published by the Hub for this repository."). The setting is not the
+agent-task profile's `publish_forge_status`, which belongs to native candidate publications and
+needs an operator-mapped native store a GitHub-only team does not have.
+
+Labels are read at pass time. CI that finished before a required label was added counts as
+labelled once the label is there, and a workflow the label triggers that has not been queued yet
+can leave `success` showing until the next pass sees it queued (a queued run is not green).
 
 **Gate-skip signal.** A run with an observed merge carries `merge_check` for its latest observed
 merge, judged only from the evidence recorded before it: `skipped` (gates before the merge gate

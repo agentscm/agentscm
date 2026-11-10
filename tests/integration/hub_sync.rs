@@ -142,8 +142,6 @@ impl Env {
             "AGENTSCM_GITHUB_URL" | "AGENTSCM_GITHUB_API_URL" => Some(base.clone()),
             "AGENTSCM_GITHUB_PAT" if pat => Some(PAT.into()),
             "AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET" if pat => Some(PAT_HOOK_SECRET.into()),
-            // Posts only for a repository that adopts a skill, which few tests do.
-            "AGENTSCM_SKILL_FORGE_STATUS" => Some(REPO.into()),
             _ => None,
         })
         .unwrap();
@@ -3351,8 +3349,20 @@ async fn observed_skill_fixture(env: &Env) -> String {
         s.collaborator_permissions
             .insert("maintainer-fixture".into(), "write".into());
     });
+    set_skill_status(env, "on");
     env.fake
         .with(|s| s.repos[&REPO_ID].pulls[&5].head_sha.clone())
+}
+
+/// The repository's skill-status setting, as a repository admin sets it on the web pages.
+fn set_skill_status(env: &Env, value: &str) {
+    env.store
+        .set_setting(
+            &format!("skill_forge_status:repo:{REPO_ID}"),
+            value,
+            "test-admin",
+        )
+        .unwrap();
 }
 
 fn skill_statuses(env: &Env, head: &str) -> Vec<Value> {
@@ -3409,6 +3419,14 @@ async fn forge_checks_approval_and_merge_become_observed_evidence_and_the_skill_
     assert_eq!(ci["detail"]["label"], "ci-extended");
     assert_eq!(run["gates"][5]["evidence"][0]["kind"], "human_approval");
     assert_eq!(run["current_gate"], "branch");
+
+    let (_, setting) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/forge-status",
+            Some(&author),
+        )
+        .await;
+    assert_eq!(setting["enabled"], true, "{setting}");
 
     // The run is posted on the head: nothing the agent must do is open at branch (advise).
     let posted = skill_statuses(&env, &head);
@@ -3533,6 +3551,108 @@ async fn the_status_goes_back_to_pending_when_ci_fails_or_the_approval_is_withdr
     });
     env.poll().await;
     assert_eq!(last(&env)["state"], "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    let author = env.agent(1, "dev", "author");
+    let reviewer = env.agent(2, "rev", "reviewer");
+    env.refresh(&connection).await;
+    self_report(&env, &author, "branch", "task_branch", &head).await;
+    self_report(&env, &author, "tests", "revision_tests", &head).await;
+    self_report(&env, &reviewer, "review", "independent_review", &head).await;
+    env.poll().await;
+    let last = |env: &Env| skill_statuses(env, &head).last().cloned().unwrap();
+    assert_eq!(last(&env)["state"], "success");
+
+    // Turned off: the success is replaced once, then nothing more is posted.
+    set_skill_status(&env, "off");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
+    assert_eq!(
+        last(&env)["description"],
+        "No longer published by the Hub for this repository."
+    );
+    let count = skill_statuses(&env, &head).len();
+    env.poll().await;
+    assert_eq!(skill_statuses(&env, &head).len(), count);
+
+    // On again, then the skill leaves the lock: retired as well.
+    set_skill_status(&env, "on");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "success");
+    env.store.skill_adoption_clear(REPO, None).unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approver_with_write_access_counts_behind_eight_without() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    env.fake.with(|s| {
+        let rows: Vec<Value> = (1..=9)
+            .map(|n| {
+                json!({"id": n, "state": "APPROVED", "commit_id": head,
+                    "user": {"login": format!("reviewer-{n}"), "type": "User"},
+                    "submitted_at": format!("2026-10-30T10:0{n}:00Z")})
+            })
+            .collect();
+        s.context_reviews.insert((REPO_ID, 5), rows);
+        for n in 1..=8 {
+            s.collaborator_permissions
+                .insert(format!("reviewer-{n}"), "triage".into());
+        }
+        s.collaborator_permissions
+            .insert("reviewer-9".into(), "write".into());
+    });
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    env.poll().await;
+    let (_, run) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5",
+            Some(&agent),
+        )
+        .await;
+    let approval = &run["gates"][5]["evidence"][0];
+    assert_eq!(approval["assurance"], "observed", "{run}");
+    assert!(
+        approval["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer-9")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_is_not_recorded_when_the_forge_read_outlasts_the_deadline() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    observed_skill_fixture(&env).await;
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    // The merge-time check-run read never answers: the 10-second deadline ends the attempt.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    env.fake
+        .with(|s| s.stall_next = Some(("/check-runs".into(), gate.clone())));
+    merge_pull_5(&env);
+    let started = Instant::now();
+    env.poll().await;
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    let merged = &library["counts"]["pr-gate"]["merged_observed"];
+    assert!(merged.is_null() || merged == 0, "{library}");
+    gate.add_permits(1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

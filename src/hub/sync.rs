@@ -68,8 +68,6 @@ pub struct SyncConfig {
     pub activity_days: i64,
     /// Lowercase `owner/name` of the GitHub repositories whose external runs are read.
     external_runs: BTreeSet<String>,
-    /// Lowercase `owner/name` of the GitHub repositories whose skill runs post a commit status.
-    skill_status: BTreeSet<String>,
     pat: Option<Pat>,
     gitlab: Option<GitlabConfig>,
 }
@@ -90,8 +88,7 @@ impl SyncConfig {
     /// Reads `AGENTSCM_GITHUB_URL`, `_API_URL`, `AGENTSCM_GITHUB_PAT[_FILE]` and
     /// `AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET[_FILE]`, and `AGENTSCM_GITLAB_URL`,
     /// `AGENTSCM_GITLAB_TOKEN[_FILE]`, `AGENTSCM_GITLAB_WEBHOOK_SECRET[_FILE]` and
-    /// `AGENTSCM_GITHUB_EXTERNAL_RUNS` and `AGENTSCM_SKILL_FORGE_STATUS` (comma-separated
-    /// `owner/name`) through `lookup`.
+    /// `AGENTSCM_GITHUB_EXTERNAL_RUNS` (comma-separated `owner/name`) through `lookup`.
     pub fn from_lookup(
         public_url: &str,
         secrets: PathBuf,
@@ -157,26 +154,23 @@ impl SyncConfig {
         if !(1..=365).contains(&activity_days) {
             return Err(HubError::Invalid("--activity-days must be 1 to 365".into()));
         }
-        let repositories = |variable: &str| {
-            lookup(variable)
-                .map(|list| {
-                    list.split(',')
-                        .map(|name| {
-                            let name = name.trim();
-                            if name.split('/').count() != 2 || validate_repository(name).is_err() {
-                                return Err(HubError::Invalid(format!(
-                                    "{variable} must list owner/name repositories"
-                                )));
-                            }
-                            Ok(name.to_ascii_lowercase())
-                        })
-                        .collect::<Result<BTreeSet<_>>>()
-                })
-                .transpose()
-                .map(Option::unwrap_or_default)
-        };
-        let external_runs = repositories("AGENTSCM_GITHUB_EXTERNAL_RUNS")?;
-        let skill_status = repositories("AGENTSCM_SKILL_FORGE_STATUS")?;
+        let external_runs = lookup("AGENTSCM_GITHUB_EXTERNAL_RUNS")
+            .map(|list| {
+                list.split(',')
+                    .map(|name| {
+                        let name = name.trim();
+                        if name.split('/').count() != 2 || validate_repository(name).is_err() {
+                            return Err(HubError::Invalid(
+                                "AGENTSCM_GITHUB_EXTERNAL_RUNS must list owner/name repositories"
+                                    .into(),
+                            ));
+                        }
+                        Ok(name.to_ascii_lowercase())
+                    })
+                    .collect::<Result<BTreeSet<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             web: urls.web,
             api: urls.api,
@@ -185,7 +179,6 @@ impl SyncConfig {
             secrets,
             activity_days,
             external_runs,
-            skill_status,
             pat: token.map(|token| Pat {
                 token,
                 webhook_secret: hook,
@@ -405,12 +398,6 @@ impl Sync {
         self.config
             .as_ref()
             .is_some_and(|c| c.external_runs.contains(&full_name.to_ascii_lowercase()))
-    }
-
-    pub(super) fn skill_status_enabled(&self, full_name: &str) -> bool {
-        self.config
-            .as_ref()
-            .is_some_and(|c| c.skill_status.contains(&full_name.to_ascii_lowercase()))
     }
 
     pub(super) fn external_cursor(&self, repository: &str) -> (i64, String) {
