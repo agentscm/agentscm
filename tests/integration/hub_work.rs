@@ -2024,10 +2024,17 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
         repository_id: Some(REPOSITORY_ID),
     };
     let open = store
-        .work_briefing(&lead.token, &BriefingQuery::default(), now)
+        .work_briefing(
+            &lead.token,
+            &BriefingQuery {
+                limit: 1,
+                ..BriefingQuery::default()
+            },
+            now,
+        )
         .unwrap();
-    assert!(open.complete);
-    // An open delivery no longer blocks compaction; the delivery it cuts is ended below.
+    assert!(!open.complete);
+    // An open delivery no longer blocks compaction; this half-read one is ended below.
     let open_delivery = open.delivery.unwrap();
 
     let preview = store
@@ -2050,7 +2057,7 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     assert_eq!(compacted.deleted_operations, 1);
     assert_eq!(compacted.deleted_versions, 1);
     assert_eq!(compacted.retention_floor, baseline.receipt.event_seq);
-    // Its window started below the raised floor, so acknowledging it now fails.
+    // It has unread records below the raised floor, so acknowledging it now fails.
     assert_invalid(
         store.work_ack(
             &lead.token,
