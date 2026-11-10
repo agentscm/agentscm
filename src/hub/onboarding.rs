@@ -37,6 +37,17 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// The name `from_name` reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::Claude),
@@ -156,6 +167,9 @@ pub struct Status {
     pub blocker: Option<Blocker>,
     pub mcp_verified: bool,
     pub native_verified: bool,
+    /// When MCP first verified in this session, so the edit hook gets a fair chance to be seen.
+    #[serde(skip)]
+    pub mcp_since: Option<i64>,
     pub expires_at: i64,
     pub next_action: &'static str,
 }
@@ -166,6 +180,8 @@ struct Row {
     client: String,
     call: SetupCall,
     mcp: Option<i64>,
+    /// The first MCP proof since the row last lost its proof.
+    mcp_first: Option<i64>,
     native: Option<i64>,
     updated: i64,
     closed: bool,
@@ -238,6 +254,7 @@ impl Row {
             },
             blocker,
             mcp_verified: mcp,
+            mcp_since: mcp.then_some(self.mcp_first).flatten(),
             native_verified: native,
             expires_at: expires.min(self.principal.expires_at),
             next_action: action,
@@ -383,6 +400,7 @@ impl Observations {
                 call.session,
             )) {
                 row.mcp = None;
+                row.mcp_first = None;
                 row.native = None;
                 // A stale Start still invalidates its own pre-restart proof, but
                 // cannot reopen a row after an intervening end/blocker.
@@ -435,6 +453,7 @@ impl Observations {
             }) {
                 row.call.blocker = call.blocker;
                 row.mcp = None;
+                row.mcp_first = None;
                 row.native = None;
             }
         }
@@ -476,6 +495,7 @@ impl Observations {
             client: client.into(),
             call: call.clone(),
             mcp: None,
+            mcp_first: None,
             native: None,
             updated: now,
             closed: true,
@@ -489,11 +509,13 @@ impl Observations {
         if call.blocker.is_some() {
             row.call.blocker = call.blocker;
             row.mcp = None;
+            row.mcp_first = None;
             row.native = None;
         } else {
             // A blocker is cleared only by new proof of BOTH transports, not a status report.
             if mcp {
                 row.mcp = Some(now);
+                row.mcp_first.get_or_insert(now);
             }
             if native {
                 row.native = Some(now);

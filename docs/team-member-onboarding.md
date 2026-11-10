@@ -67,9 +67,10 @@ local MCP server, by default in the host's user configuration so they run in eve
 private root binding of the checkout it starts in to proxy to the existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
 paths, but no Hub token. Different checkouts can therefore remain connected to different Hubs.
 
-A linked worktree created from a connected checkout (`git worktree add`, which Claude Code and
-Codex use for new sessions, inside the checkout or beside it) uses that checkout's connection with
-no further setup. The worktree must share the checkout's Git directory and keep its `origin`; a
+A linked worktree of a connected main checkout (`git worktree add`, which Claude Code and
+Codex use for new sessions, inside the checkout or beside it) uses the main checkout's connection
+with no further setup. It never borrows another linked worktree's connection, and a main checkout
+never borrows one either: that token belongs to the worktree that connected it. The worktree must share the checkout's Git directory and keep its `origin`; a
 separate or nested clone, a submodule, a copied `.git` file or a symlinked `.git` is never covered. The user-scope
 Claude Code and Codex plugins, and the other agents' user-scope hooks and MCP server, therefore
 coordinate in new worktrees at once. A `--checkout-only` entry is not copied into a new worktree,
@@ -206,7 +207,7 @@ You sign in once per computer, not once per repository or per day:
    auto-connect for <hub>? [Y/n]". The AgentSCM agent plugin runs a quick check whenever an
    agent starts; with this on, an agent that starts in a checkout of a repository the Hub has
    connects it, writes no file in it, and begins with
-   `AgentSCM: coordinating on owner/name.` Change it with `agentscm hub auto-connect on|off`.
+   `AgentSCM: coordinating on owner/name at <Hub>.` Change it with `agentscm hub auto-connect on|off`.
 3. Agent tokens renew in the background, and every renewal re-checks your role on the repository.
    If you lose it, your agents are told why and what to ask for.
 4. `agentscm hub whoami` shows who this computer is signed in as, and

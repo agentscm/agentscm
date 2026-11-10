@@ -100,6 +100,7 @@ use super::store::{
     plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
+use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
@@ -1234,6 +1235,20 @@ fn sqlite_record_catchup_merge(
             repository_key,
             seq + 1,
             observed_at
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_catchup_pull_commits
+            (provider,host,repository,repository_key,pull_number,head_commit,merge_commit)
+         VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING",
+        params![
+            scope.provider,
+            scope.host,
+            repository,
+            repository_key,
+            merge.pull_number,
+            merge.head_commit,
+            merge.merge_commit
         ],
     )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
@@ -2586,6 +2601,26 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     }
     event.at = item.updated_at;
     Ok(event)
+}
+
+/// Keeps `item`'s current decision checkpoint for `why` and search, and at most the newest
+/// [`why::MAX_WORK_DECISIONS`] of its Work.
+fn record_decision(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let Some(decision) = &item.current else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO hub_work_decisions (work, event_seq, summary, checkpoint)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![item.id, seq, decision.summary, json_string(decision)?],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_work_decisions WHERE work = ?1 AND event_seq <= (
+             SELECT event_seq FROM hub_work_decisions WHERE work = ?1
+             ORDER BY event_seq DESC LIMIT 1 OFFSET ?2)",
+        params![item.id, why::MAX_WORK_DECISIONS],
+    )?;
+    Ok(())
 }
 
 /// Returns the stored snapshot so callers can size it without serializing the item again.
@@ -7347,6 +7382,9 @@ fn work_checkpoint_in(
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
     let snapshot = save_work_version(tx, &item, seq)?;
+    if checkpoint.kind == super::work::CheckpointKind::Decision {
+        record_decision(tx, &item, seq)?;
+    }
     match checkpoint.kind {
         super::work::CheckpointKind::Finish => {
             set_work_reservation(tx, &item.id, Some("completed"), None, now)?;
@@ -11541,11 +11579,12 @@ impl Store for SqliteStore {
         let snapshot = save_work_version(&tx, &item, seq)?;
         let link = work_links::asserted_link(&who, update, seq, now);
         let new_link = link.as_ref().map(json_string).transpose()?;
-        if let Some(snapshot) = &new_link {
+        if let (Some(snapshot), Some(link)) = (&new_link, &link) {
             tx.execute(
-                "INSERT INTO hub_work_pr_links (work,snapshot) VALUES (?1,?2)
-                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
-                params![item.id, snapshot],
+                "INSERT INTO hub_work_pr_links (work,snapshot,number,head_sha) VALUES (?1,?2,?3,?4)
+                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot,
+                        number=excluded.number,head_sha=excluded.head_sha",
+                params![item.id, snapshot, link.target.number, link.target.head_sha],
             )?;
         } else {
             tx.execute("DELETE FROM hub_work_pr_links WHERE work=?1", [&item.id])?;
@@ -11633,7 +11672,9 @@ impl Store for SqliteStore {
                AND (?7 IS NULL OR w.source_issue = ?8
                  OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
                  OR ((lt.owner = ?10 OR w.lead_agent NOT LIKE 'client-%') AND lower(w.lead_agent) LIKE ?7 ESCAPE '\\') OR lower(u.login) LIKE ?7 ESCAPE '\\'
-                 OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
+                 OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\'
+                 OR EXISTS (SELECT 1 FROM hub_work_decisions d
+                   WHERE d.work = w.id AND lower(d.summary) LIKE ?7 ESCAPE '\\'))
              ORDER BY w.created_at DESC, w.id DESC LIMIT ?9",
         )?;
         let items = statement
@@ -11668,6 +11709,165 @@ impl Store for SqliteStore {
         drop(statement);
         tx.commit()?;
         Ok(WorkSearchPage::of(items, limit))
+    }
+
+    fn work_why(&self, token: &str, subject: &WhySubject, now: i64) -> Result<WhyAnswer> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
+        let mut pulls = Vec::new();
+        let more = (why::WHY_WORK + 1) as i64;
+        let mut unscanned = false;
+        // (Work id, pull request), newest Work first.
+        let matches: Vec<(String, Option<i64>)> = match subject {
+            WhySubject::Commit(commit) => {
+                let mut statement = tx.prepare(
+                    "SELECT pull_number, head_commit, merge_commit FROM hub_catchup_pull_commits
+                     WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
+                       AND (merge_commit=?5 OR head_commit=?5)
+                     ORDER BY pull_number DESC LIMIT ?6",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        provider,
+                        host,
+                        repository_namespace(&who.repository, who.repository_id),
+                        catchup_repository_key(who.repository_id),
+                        commit,
+                        why::WHY_PULLS as i64
+                    ],
+                    |row| {
+                        Ok(WhyPullRequest {
+                            number: row.get(0)?,
+                            head_commit: Some(row.get(1)?),
+                            merge_commit: Some(row.get(2)?),
+                        })
+                    },
+                )?;
+                for pull in rows {
+                    why::add_pull(&mut pulls, pull?);
+                }
+                drop(statement);
+                let numbers = json_string(&pulls.iter().map(|p| p.number).collect::<Vec<_>>())?;
+                let mut statement = tx.prepare(
+                    "SELECT w.id, l.number, l.head_sha
+                     FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                     WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                       AND w.repository_id IS ?4
+                       AND (l.head_sha = ?5 OR l.number IN (SELECT value FROM json_each(?6)))
+                     ORDER BY w.created_at DESC, w.id DESC LIMIT ?7",
+                )?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            provider,
+                            host,
+                            who.repository,
+                            who.repository_id,
+                            commit,
+                            numbers,
+                            more
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(id, number, head)| {
+                        if head == *commit {
+                            why::add_pull(
+                                &mut pulls,
+                                WhyPullRequest {
+                                    number,
+                                    head_commit: Some(head),
+                                    merge_commit: None,
+                                },
+                            );
+                        }
+                        (id, Some(number))
+                    })
+                    .collect()
+            }
+            WhySubject::Path(path) => {
+                let entries = json_string(&why::covering_scope_entries(path))?;
+                // Only the newest WHY_SCAN Work are scanned; older ones leave the answer cut.
+                unscanned = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM hub_work_items
+                     WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+                     ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET ?5)",
+                    params![
+                        provider,
+                        host,
+                        who.repository,
+                        who.repository_id,
+                        why::WHY_SCAN as i64
+                    ],
+                    |row| row.get(0),
+                )?;
+                let mut statement = tx.prepare(
+                    "SELECT w.id FROM (SELECT id, scope, created_at FROM hub_work_items
+                         WHERE provider = ?1 AND host = ?2 AND repository = ?3
+                           AND repository_id IS ?4
+                         ORDER BY created_at DESC, id DESC LIMIT ?7) w
+                     WHERE EXISTS (SELECT 1 FROM json_each(?5) c WHERE instr(w.scope, c.value) > 0)
+                     ORDER BY w.created_at DESC, w.id DESC LIMIT ?6",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            provider,
+                            host,
+                            who.repository,
+                            who.repository_id,
+                            entries,
+                            more,
+                            why::WHY_SCAN as i64
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, None)),
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+        };
+        let relation = match subject {
+            WhySubject::Commit(_) => WhyRelation::PullRequest,
+            WhySubject::Path(_) => WhyRelation::Scope,
+        };
+        let mut work = Vec::new();
+        for (id, pull_number) in matches {
+            let Some(item) = scoped_work(&tx, &who, &id, now)? else {
+                continue;
+            };
+            let decisions = tx
+                .prepare(
+                    "SELECT event_seq, checkpoint FROM hub_work_decisions WHERE work = ?1
+                     ORDER BY event_seq DESC LIMIT ?2",
+                )?
+                .query_map(params![id, (why::WHY_DECISIONS + 1) as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .map(|row| {
+                    let (seq, checkpoint) = row?;
+                    Ok((seq, json_value(&checkpoint)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            work.push(why::work(
+                why::WhyWorkFacts {
+                    item,
+                    relation,
+                    pull_number,
+                    decisions,
+                },
+                super::viewer::Viewer(&who.owner.id),
+            ));
+        }
+        tx.commit()?;
+        Ok(why::answer(subject, pulls, work, unscanned))
     }
 
     fn change_ingest(
@@ -14631,6 +14831,23 @@ impl Store for SqliteStore {
                     ],
                 )?;
             }
+            // The copy of which pull request a commit belongs to is bounded like the merge
+            // observations it comes from: the lowest pull request numbers go first.
+            tx.execute(
+                "DELETE FROM hub_catchup_pull_commits
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
+                   AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+                       WHERE provider=?1 AND host=?2 AND repository=?3
+                         AND repository_key=ifnull(?4,-1)
+                       ORDER BY pull_number DESC LIMIT 1 OFFSET ?5)",
+                params![
+                    scope.provider,
+                    scope.host,
+                    catchup_repository,
+                    scope.repository_id,
+                    MAX_CATCHUP_MERGE_ROWS
+                ],
+            )?;
             tx.execute(
                 "DELETE FROM hub_work_deliveries
                  WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
