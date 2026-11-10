@@ -8,10 +8,13 @@
 //! - `manual`: the agent shows it and waits for the person's yes in its session;
 //! - `ignore`: nothing is delivered and the Hub page keeps it as a to-do.
 //!
-//! Delivery rides on calls the session makes anyway: the hook reply's added context where the
-//! client's hook can carry it ([`take`] from `hook.rs`), else the next AgentSCM tool result
-//! (from `mcp.rs`). The agent answers with `agentscm_hub_message`, and the Hub page reads the
-//! receipts: queued, delivered, accepted or declined, done.
+//! A Claude Code session also runs a background hook (`agentscm hook-wait`, served by `wait` here) that
+//! holds a request open here while the session is idle or busy; a new message answers it at
+//! once and the hook wakes the session with it. Otherwise delivery rides on calls the session
+//! makes anyway: the hook reply's added context where the client's hook can carry it ([`take`]
+//! from `hook.rs`), else the next AgentSCM tool result (from `mcp.rs`). A closed session gets
+//! nothing until it runs again. The agent answers with `agentscm_hub_message`, and the Hub page
+//! reads the receipts: queued, delivered, accepted or declined, done.
 //!
 //! The delivered text is only a notice and carries no mode: other people's text rides the same
 //! channels, so an agent acts only on the note and mode in the reply to its `accepted` answer,
@@ -29,11 +32,14 @@ use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Notify;
+use tokio::time::{Duration, Instant};
 
-use super::http::{ApiError, JsonBody, blocking};
+use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
 use super::store::{Principal, Store, new_id, unix_now, validate_repository};
 use super::{HubError, HubState, Result};
@@ -50,6 +56,82 @@ const REOFFER_SECS: i64 = 60;
 /// The words that open every delivered message; relayed third-party text never contains them
 /// (`advice::sanitize`).
 pub const FRAME: &str = "AgentSCM Hub message";
+/// Longest a session's background hook waits in one request; under the Hub's 30-second bound.
+pub const WAIT_SECS: u64 = 25;
+/// A session whose hook waited this recently is reached at once.
+const WAKE_FRESH_SECS: i64 = 90;
+/// How a message the background hook took is recorded.
+const WAKE_VIA: &str = "wake:claude";
+/// Waits held open at once, in all and per person; past either a wait answers 429 and the hook
+/// asks again later. One per running Claude Code session, so forty sessions are well inside.
+const MAX_WAITS: usize = 1024;
+const MAX_WAITS_PER_PERSON: usize = 64;
+/// Wakes waiting hooks in this process when a message is sent.
+static SENT: Notify = Notify::const_new();
+static WAITS: Mutex<Waits> = Mutex::new(Waits {
+    total: 0,
+    per_person: BTreeMap::new(),
+    latest: BTreeMap::new(),
+    next: 0,
+});
+
+struct Waits {
+    total: usize,
+    per_person: BTreeMap<String, usize>,
+    /// The newest wait of each (token, session); an older one for the same session ends.
+    latest: BTreeMap<(String, String), u64>,
+    next: u64,
+}
+
+/// One open wait, counted until it is dropped.
+struct WaitSlot {
+    owner: String,
+    key: (String, String),
+    id: u64,
+}
+
+impl WaitSlot {
+    /// `None` when the Hub or this person already holds as many waits as it allows.
+    fn open(owner: &str, token: &str, session: &str) -> Option<Self> {
+        let mut waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = waits.per_person.get(owner).copied().unwrap_or(0);
+        if waits.total >= MAX_WAITS || held >= MAX_WAITS_PER_PERSON {
+            return None;
+        }
+        waits.total += 1;
+        waits.per_person.insert(owner.to_owned(), held + 1);
+        waits.next += 1;
+        let (key, id) = ((token.to_owned(), session.to_owned()), waits.next);
+        waits.latest.insert(key.clone(), id);
+        Some(Self {
+            owner: owner.to_owned(),
+            key,
+            id,
+        })
+    }
+
+    /// A later wait for the same session took over; this one returns empty.
+    fn replaced(&self) -> bool {
+        let waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+        waits.latest.get(&self.key) != Some(&self.id)
+    }
+}
+
+impl Drop for WaitSlot {
+    fn drop(&mut self) {
+        let mut waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+        waits.total = waits.total.saturating_sub(1);
+        if let Some(held) = waits.per_person.get_mut(&self.owner) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                waits.per_person.remove(&self.owner);
+            }
+        }
+        if waits.latest.get(&self.key) == Some(&self.id) {
+            waits.latest.remove(&self.key);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,15 +263,19 @@ pub struct Client {
     /// It made an AgentSCM MCP tool call.
     pub mcp: bool,
     pub seen_at: i64,
+    /// When its background hook last waited for a message.
+    pub waited_at: Option<i64>,
 }
 
 impl Client {
-    /// `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at its
-    /// next AgentSCM call. `unknown`: no top-level hook call seen since the Hub started; copy
-    /// and paste instead.
-    pub fn tier(&self) -> &'static str {
+    /// `wake`: its background hook waits now, so a message reaches it within seconds, idle or
+    /// busy. `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
+    /// its next AgentSCM call. `unknown`: no top-level hook call seen since the Hub started;
+    /// copy and paste instead.
+    pub fn tier(&self, now: i64) -> &'static str {
         match (self.top_level, self.hook_context) {
             (false, _) => "unknown",
+            _ if self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS) => "wake",
             (true, true) => "hook",
             (true, false) => "mcp",
         }
@@ -273,6 +359,18 @@ pub fn note_hook(token: &str, session: &str, via: &str, top_level: bool, context
     bounded(&mut map, |client| client.seen_at);
 }
 
+/// At a wait from the session's background hook, which runs only in the session a person leads.
+fn note_wait(token: &str, session: &str, now: i64) {
+    let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    let client = map
+        .entry((token.to_owned(), session.to_owned()))
+        .or_default();
+    client.top_level = true;
+    client.waited_at = Some(now);
+    client.seen_at = now;
+    bounded(&mut map, |client| client.seen_at);
+}
+
 /// Whether this session takes its messages in AgentSCM tool results: it is known to be a
 /// top-level session and its hook cannot carry them.
 pub fn mcp_delivers(token: &str, session: &str) -> bool {
@@ -280,7 +378,7 @@ pub fn mcp_delivers(token: &str, session: &str) -> bool {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&(token.to_owned(), session.to_owned()))
-        .is_some_and(|client| client.tier() == "mcp")
+        .is_some_and(|client| client.top_level && !client.hook_context)
 }
 
 fn clients_of(tokens: &[String]) -> Vec<((String, String), Client)> {
@@ -359,6 +457,13 @@ fn due(message: &Message, now: i64) -> bool {
     }
 }
 
+/// What wakes an idle session: only a message never delivered. One delivered and unanswered is
+/// offered again only with a call the session makes anyway, so an agent that does not answer
+/// is never woken over and over.
+fn wakes(message: &Message, _now: i64) -> bool {
+    message.state == MessageState::Queued
+}
+
 /// The queued messages for this session, marked delivered via `via`; `None` when there are
 /// none or the person's mode is `ignore`. Only a writing token's own session receives them.
 pub fn take(
@@ -367,6 +472,17 @@ pub fn take(
     session: &str,
     via: &str,
     now: i64,
+) -> Result<Option<String>> {
+    deliver(store, principal, session, via, now, due)
+}
+
+fn deliver(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    via: &str,
+    now: i64,
+    offered: fn(&Message, i64) -> bool,
 ) -> Result<Option<String>> {
     let Some(repository_id) = principal.repository_id else {
         return Ok(None);
@@ -378,7 +494,7 @@ pub fn take(
     let key = messages_key(owner, repository_id);
     // A read without the lock first: most calls have nothing to deliver.
     let waiting =
-        |m: &Message| due(m, now) && m.token == principal.token_id && m.session == session;
+        |m: &Message| offered(m, now) && m.token == principal.token_id && m.session == session;
     if !load(store, &key)?.iter().any(waiting) {
         return Ok(None);
     }
@@ -493,6 +609,109 @@ pub fn routes() -> Router<HubState> {
             get(list).post(send).delete(withdraw),
         )
         .route("/v1/hub/session/agent-messages/mode", put(set_mode))
+        .route("/v1/hub/agent-messages/wait", post(wait))
+}
+
+/// Returns the first `check` that finds something, rechecking whenever a message is sent in this
+/// process and at least every few seconds (another Hub process may have sent it); `None` at
+/// `deadline` or once `replaced` says a newer wait for the session took over. A busy Hub only
+/// skips one check.
+async fn waited<F, Fut>(
+    deadline: Instant,
+    replaced: impl Fn() -> bool,
+    mut check: F,
+) -> Result<Option<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>>>,
+{
+    loop {
+        // Register before reading so a send between the read and the wait is not missed.
+        let notified = SENT.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Checked before each delivery, so a replaced wait never takes a message.
+        if replaced() {
+            return Ok(None);
+        }
+        match check().await {
+            Ok(Some(text)) => return Ok(Some(text)),
+            Ok(None) | Err(HubError::Busy) => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::select! {
+            () = &mut notified => {},
+            () = tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_secs(5))) => {},
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitBody {
+    /// The session's native id, as its hooks report it.
+    session: String,
+}
+
+/// The session's background hook waits here for a message, with its agent token: 200 `{text}`
+/// with the notice when one comes, 204 when none came in [`WAIT_SECS`] or a newer wait for the
+/// session took over, 403 for a token that can never receive one, 410 while the person's mode is
+/// `ignore`, 429 when the Hub or the person holds too many waits. Delivery is [`deliver`], the
+/// hook path's own: the same token and session check, marked delivered once.
+async fn wait(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(body): JsonBody<WaitBody>,
+) -> std::result::Result<Response, ApiError> {
+    checked_name("session", &body.session)?;
+    let Some(repository_id) = principal.repository_id.filter(|_| !principal.read_only) else {
+        return Ok(StatusCode::FORBIDDEN.into_response());
+    };
+    let (store, token, owner) = (
+        state.store.clone(),
+        principal.token_id.clone(),
+        principal.owner.id.clone(),
+    );
+    let (session, mode) = blocking(&state, move || {
+        Ok((
+            store.session_name_for(&token, Some(&body.session), unix_now())?,
+            effective_mode(&*store, &owner, repository_id)?,
+        ))
+    })
+    .await?;
+    if mode == Mode::Ignore {
+        return Ok(StatusCode::GONE.into_response());
+    }
+    let Some(slot) = WaitSlot::open(&principal.owner.id, &principal.token_id, &session) else {
+        return Ok(StatusCode::TOO_MANY_REQUESTS.into_response());
+    };
+    note_wait(&principal.token_id, &session, unix_now());
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+    let text = waited(
+        deadline,
+        || slot.replaced(),
+        || {
+            let (store, principal, session) =
+                (state.store.clone(), principal.clone(), session.clone());
+            let state = state.clone();
+            async move {
+                blocking(&state, move || {
+                    deliver(&*store, &principal, &session, WAKE_VIA, unix_now(), wakes)
+                })
+                .await
+            }
+        },
+    )
+    .await?;
+    drop(slot);
+    note_wait(&principal.token_id, &session, unix_now());
+    Ok(match text {
+        Some(text) => Json(serde_json::json!({ "text": text })).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -558,6 +777,7 @@ fn page(
     repository_id: i64,
     tokens: &[(String, String)],
 ) -> Result<Page> {
+    let now = unix_now();
     let ids: Vec<String> = tokens.iter().map(|(id, _)| id.clone()).collect();
     let mut sessions: Vec<SessionView> = clients_of(&ids)
         .into_iter()
@@ -569,7 +789,7 @@ fn page(
                 .unwrap_or_default(),
             token,
             session,
-            tier: client.tier(),
+            tier: client.tier(now),
             client,
         })
         .collect();
@@ -724,6 +944,7 @@ async fn send(
         Ok(message)
     })
     .await?;
+    SENT.notify_waiters();
     Ok((StatusCode::CREATED, Json(message)))
 }
 
@@ -837,6 +1058,205 @@ mod tests {
         }
     }
 
+    fn principal(token: &str, owner: &str) -> Principal {
+        Principal {
+            token_id: token.into(),
+            name: "laptop".into(),
+            repository: "o/r".into(),
+            repository_id: Some(7),
+            expires_at: i64::MAX,
+            read_only: false,
+            owner: crate::hub::store::User {
+                id: owner.into(),
+                identity: crate::hub::store::ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: owner.into(),
+                name: None,
+                disabled: false,
+            },
+        }
+    }
+
+    fn temp_store() -> (tempfile::TempDir, std::sync::Arc<dyn Store>) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
+        let store = crate::hub::store::open(&url).unwrap();
+        (dir, store)
+    }
+
+    /// Queues `message` for `owner` as the page's send does.
+    fn sent(store: &dyn Store, owner: &str, message: Message) {
+        edit(store, &messages_key(owner, 7), owner, |messages| {
+            pushed(messages, message)
+        })
+        .unwrap();
+        SENT.notify_waiters();
+    }
+
+    fn wake_check(
+        store: std::sync::Arc<dyn Store>,
+        principal: Principal,
+        session: &'static str,
+    ) -> impl FnMut() -> std::future::Ready<Result<Option<String>>> {
+        move || {
+            std::future::ready(deliver(
+                &*store,
+                &principal,
+                session,
+                WAKE_VIA,
+                unix_now(),
+                wakes,
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_session_gets_a_message_sent_while_it_waits_and_only_once() {
+        let (_dir, store) = temp_store();
+        let alice = principal("tok_a", "u1");
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        let waiting = tokio::spawn(waited(
+            deadline,
+            || false,
+            wake_check(store.clone(), alice.clone(), "s"),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sent(&*store, "u1", message("msg_1", unix_now()));
+        let started = Instant::now();
+        let text = waiting
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the waiting session gets it");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken by the send"
+        );
+        assert!(text.starts_with(&format!("{FRAME} msg_1 ")), "{text}");
+        assert!(!text.contains("auto") && !text.contains("manual"), "{text}");
+        let kept = load(&*store, &messages_key("u1", 7)).unwrap();
+        assert_eq!(kept[0].state, MessageState::Delivered);
+        assert_eq!(kept[0].via.as_deref(), Some(WAKE_VIA));
+
+        // A second waiter for the same session, and the hook path, get nothing more.
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        let again = waited(
+            deadline,
+            || false,
+            wake_check(store.clone(), alice.clone(), "s"),
+        );
+        assert_eq!(again.await.unwrap(), None);
+        assert_eq!(
+            take(&*store, &alice, "s", "hook:claude", unix_now()).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_takes_nothing_for_another_token_person_or_session_or_once_replaced() {
+        let (_dir, store) = temp_store();
+        sent(&*store, "u1", message("msg_1", unix_now()));
+        let deadline = || Instant::now() + Duration::from_secs(WAIT_SECS);
+        for (token, owner, session) in [
+            ("tok_b", "u1", "s"), // another of the person's tokens
+            ("tok_a", "u2", "s"), // another person
+            ("tok_a", "u1", "other"),
+        ] {
+            let check = wake_check(store.clone(), principal(token, owner), session);
+            assert_eq!(waited(deadline(), || false, check).await.unwrap(), None);
+        }
+        // A wait a newer one replaced never takes the message.
+        let check = wake_check(store.clone(), principal("tok_a", "u1"), "s");
+        assert_eq!(waited(deadline(), || true, check).await.unwrap(), None);
+        let kept = load(&*store, &messages_key("u1", 7)).unwrap();
+        assert_eq!(kept[0].state, MessageState::Queued);
+        // Ignore holds it from a wait as from a hook.
+        store
+            .set_setting(&mode_key("u1", Some(7)), "\"ignore\"", "u1")
+            .unwrap();
+        let check = wake_check(store.clone(), principal("tok_a", "u1"), "s");
+        assert_eq!(waited(deadline(), || false, check).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_newer_wait_replaces_the_older_and_each_person_has_a_cap() {
+        let first = WaitSlot::open("u_slots", "tok_a", "s").unwrap();
+        assert!(!first.replaced());
+        let second = WaitSlot::open("u_slots", "tok_a", "s").unwrap();
+        assert!(first.replaced() && !second.replaced());
+        drop(first);
+        assert!(!second.replaced(), "the older one ending leaves the newer");
+        drop(second);
+        let held: Vec<_> = (0..MAX_WAITS_PER_PERSON)
+            .map(|i| WaitSlot::open("u_cap", "tok_a", &format!("s{i}")).unwrap())
+            .collect();
+        assert!(WaitSlot::open("u_cap", "tok_a", "one more").is_none());
+        assert!(WaitSlot::open("u_other", "tok_a", "s").is_some());
+        drop(held);
+        assert!(WaitSlot::open("u_cap", "tok_a", "s").is_some());
+    }
+
+    #[test]
+    fn only_a_message_never_delivered_wakes_a_session() {
+        let mut m = message("msg_1", 0);
+        assert!(wakes(&m, 0));
+        m.state = MessageState::Delivered;
+        m.delivered_at = Some(0);
+        // Offered again with the session's own next call, but never by waking it again.
+        assert!(due(&m, REOFFER_SECS) && !wakes(&m, REOFFER_SECS));
+    }
+
+    #[test]
+    fn a_session_whose_hook_waits_is_reached_at_once_until_it_stops_waiting() {
+        let mut client = Client {
+            top_level: true,
+            hook_context: true,
+            ..Client::default()
+        };
+        assert_eq!(client.tier(100), "hook");
+        client.waited_at = Some(100);
+        assert_eq!(client.tier(100 + WAKE_FRESH_SECS), "wake");
+        assert_eq!(client.tier(101 + WAKE_FRESH_SECS), "hook");
+        // A subagent's or an unknown caller's wait never makes it reachable.
+        client.top_level = false;
+        assert_eq!(client.tier(100), "unknown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_returns_when_a_message_is_sent_and_ends_empty_at_its_deadline() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sent = Arc::new(AtomicBool::new(false));
+        let check = |sent: Arc<AtomicBool>| {
+            move || {
+                let found = sent.load(Ordering::SeqCst).then(|| "notice".to_owned());
+                async move { Ok(found) }
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        let waiting = tokio::spawn(waited(deadline, || false, check(sent.clone())));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sent.store(true, Ordering::SeqCst);
+        SENT.notify_waiters();
+        let started = Instant::now();
+        assert_eq!(waiting.await.unwrap().unwrap().as_deref(), Some("notice"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken by the send, not a recheck"
+        );
+
+        let quiet = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        assert_eq!(
+            waited(deadline, || false, check(quiet)).await.unwrap(),
+            None
+        );
+        assert!(Instant::now() >= deadline);
+    }
+
     #[test]
     fn a_full_map_drops_the_entry_seen_longest_ago() {
         let mut map: BTreeMap<String, i64> = (0..MAX_SESSIONS as i64)
@@ -864,7 +1284,7 @@ mod tests {
             clients_of(&[token.to_owned()])
                 .into_iter()
                 .find(|((_, s), _)| s == session)
-                .map(|(_, client)| client.tier())
+                .map(|(_, client)| client.tier(3))
         };
         // MCP alone cannot say whether a subagent made the call.
         note_mcp(token, None, "mcp-only", 1);
@@ -897,7 +1317,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1.name.as_deref(), Some("gemini-cli"));
         assert_eq!(
-            seen[0].1.tier(),
+            seen[0].1.tier(5),
             "unknown",
             "MCP alone is no top-level evidence"
         );

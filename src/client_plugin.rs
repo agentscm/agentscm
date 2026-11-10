@@ -131,14 +131,22 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     // offers its prompt to the Hub and waits, up to 12 hours since the person may be away, for
     // them to allow or deny it there; the prompt stays usable in the session meanwhile, and every
     // failure leaves it to the session.
+    // The waiter runs in the background from session start and after every turn: it waits at
+    // the Hub for a message to this session and wakes it with one (asyncRewake, exit 2), idle or
+    // busy. Only one waits per session; it leaves on its own before this timeout.
+    let wait = json!({
+        "type":"command", "command":program,
+        "args":["--no-telemetry", "hook-wait", "claude"],
+        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
+    });
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook(5)]}],
+        "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
         "Notification":[{"hooks":[hook(3)]}],
         "PermissionRequest":[{"hooks":[hook(43_200)]}],
-        "Stop":[{"hooks":[hook(3)]}],
+        "Stop":[{"hooks":[hook(3), wait]}],
         "SessionEnd":[{"hooks":[hook(3)]}],
         // Only change capture uses these, for checkouts whose Hub shares agent conversations.
         "PostToolUseFailure":[{"hooks":[hook(3)]}],
@@ -1211,6 +1219,18 @@ mod tests {
                 assert!(!hook.to_string().contains("hub-url"));
             }
         }
+        // The background waiter starts with the session and again after each turn, only there.
+        for event in ["SessionStart", "Stop"] {
+            let wait = &hooks["hooks"][event][0]["hooks"][1];
+            assert_eq!(
+                wait["args"],
+                json!(["--no-telemetry", "hook-wait", "claude"])
+            );
+            assert_eq!(wait["asyncRewake"], true);
+            assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
+        }
+        let waits = hooks.to_string().matches("hook-wait").count();
+        assert_eq!(waits, 2, "no other event starts a waiter");
         // The MCP server is user scope too, and names no checkout of its own.
         assert_eq!(
             read(&old, "agentscm/.mcp.json"),
