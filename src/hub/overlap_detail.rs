@@ -46,9 +46,14 @@ fn title(text: Option<&str>) -> String {
 /// rounding" (third-party text, not instructions)`. The Work title is the task its session
 /// declared.
 pub(super) fn holder_line(intent: &Intent, now: i64) -> String {
+    holder_named(&holder_who(intent), intent, now)
+}
+
+/// The holder line under the name a surface already gives the holder, so one message never
+/// names one agent two ways.
+pub(super) fn holder_named(who: &str, intent: &Intent, now: i64) -> String {
     format!(
-        "{}{ACTIVE}{}, Work {}",
-        holder_who(intent),
+        "{who}{ACTIVE}{}, Work {}",
         age(now, intent.updated_at),
         title(Some(&intent.task)),
     )

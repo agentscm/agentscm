@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use super::advice::{agent_name, sanitize, session_kind};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
-use super::overlap_detail::{NOTHING_CHANGED, holder_line};
+use super::overlap_detail::{NOTHING_CHANGED, holder_named};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
@@ -964,12 +964,13 @@ impl Slack {
                             ),
                         ),
                     };
+                    let line = holder_named(&format!("Your {mine}"), intent, now);
                     let fields = [
                         files(&held),
                         ("Repository", sanitize(&repository, TEXT_CHARS)),
                         ("Your agent", mine),
                         ("Their agent", who.clone()),
-                        ("Holder", holder_line(intent, now)),
+                        ("Holder", line),
                     ];
                     let handoff = match held.as_slice() {
                         [path] => Some((
@@ -988,8 +989,8 @@ impl Slack {
                 // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
                 // with one display name stay two.
                 if listed_holders.insert((intent.token.as_str(), holder.clone())) {
+                    holder_lines.push(holder_named(&holder, intent, now));
                     holders.push(holder);
-                    holder_lines.push(holder_line(intent, now));
                 }
             }
             if let Some(person) = repeater
