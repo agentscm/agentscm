@@ -232,6 +232,26 @@ impl Fixture {
         assert!(self.seen.recv_timeout(Duration::from_millis(50)).is_err());
         seen
     }
+
+    /// The relay's pooled Hub connection. The host answers MCP before its relay has bound, and a
+    /// hook that finds no relay sends directly, so wait for two hooks in a row on one connection.
+    async fn relay_owner(&self) -> SocketAddr {
+        let started = Instant::now();
+        let mut previous = None;
+        loop {
+            self.hook("PreToolUse", true, |_| {}).finish(true);
+            let peer = self.only_hook().peer;
+            if previous == Some(peer) {
+                return peer;
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "the relay must start pooling hooks"
+            );
+            previous = Some(peer);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 impl Drop for Fixture {
@@ -302,8 +322,7 @@ async fn real_hooks_share_the_relays_own_pool_and_keep_legacy_bytes_and_rotated_
     let mut host = fixture.host();
     let warm = fixture.received();
     assert!(warm.uri.starts_with("/mcp?"));
-    fixture.hook("PreToolUse", true, |_| {}).finish(true);
-    let owner = fixture.only_hook().peer;
+    let owner = fixture.relay_owner().await;
     assert_ne!(
         owner, warm.peer,
         "relay and MCP must have independent pools"
@@ -354,8 +373,7 @@ async fn missing_or_proxy_or_binary_mismatched_relays_fall_back_without_loss() {
     fixture.only_hook();
     let _host = fixture.host();
     fixture.received();
-    fixture.hook("PreToolUse", true, |_| {}).finish(true);
-    let owner = fixture.only_hook().peer;
+    let owner = fixture.relay_owner().await;
     fixture
         .hook("PreToolUse", true, |command| {
             command.env("NO_PROXY", "127.0.0.1");
@@ -387,8 +405,7 @@ async fn a_second_host_takes_over_when_the_owners_stdio_ends() {
     let fixture = Fixture::new().await;
     let mut first = fixture.host();
     fixture.received();
-    fixture.hook("PreToolUse", true, |_| {}).finish(true);
-    let owner = fixture.only_hook().peer;
+    let owner = fixture.relay_owner().await;
     let _second = fixture.host();
     let standby = fixture.received().peer;
     fixture.hook("PreToolUse", true, |_| {}).finish(true);
@@ -423,8 +440,7 @@ async fn accepted_then_dead_is_not_resent_and_wedged_calls_keep_the_hook_deadlin
         let fixture = Fixture::new().await;
         let mut host = fixture.host();
         fixture.received();
-        fixture.hook("PreToolUse", true, |_| {}).finish(true);
-        let owner = fixture.only_hook().peer;
+        let owner = fixture.relay_owner().await;
         fixture.stalled.store(true, Ordering::SeqCst);
         let hook = fixture.hook(event, true, |_| {});
         assert_eq!(

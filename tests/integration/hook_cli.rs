@@ -495,6 +495,13 @@ fn stalled_git(dir: &TempDir) -> std::path::PathBuf {
 fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
     // (event, wall-clock bound): the 3 s limit, or 4.5 s at session start, plus process start on
     // a loaded host. Waiting for the stalled child would take 8 s.
+    // The first launch of a newly built binary can take seconds (macOS checks it once), which is
+    // not the hook's time: launch it once before timing.
+    let warm = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
     for (event, bound) in [("PreToolUse", 4000), ("SessionStart", 5500)] {
         let dir = home();
         let root = connected_checkout(&dir, "http://127.0.0.1:9");
