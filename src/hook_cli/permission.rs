@@ -689,6 +689,8 @@ enum Step {
     Decide(Answer),
     /// A busy or unreachable Hub: try again shortly, for as long as the hook waits.
     Retry,
+    /// The Hub no longer knows this hook's agent token, which this computer may have renewed.
+    Renew,
     Stop,
 }
 
@@ -754,6 +756,7 @@ fn classify(reply: Option<(u16, Value)>, id: &str, hash: &str) -> Step {
         200 => {}
         // 502 and 504 are a proxy in front of a Hub that is being replaced.
         429 | 502 | 503 | 504 => return Step::Retry,
+        401 => return Step::Renew,
         _ => return Step::Stop,
     }
     const KEYS: [&str; 7] = [
@@ -867,7 +870,7 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     if let Some(folder) = routed.checkout.file_name().and_then(|name| name.to_str()) {
         body["folder"] = json!(folder);
     }
-    let hub = Hub {
+    let mut hub = Hub {
         client: forge_http::client().ok()?,
         base: routed.connection.hub.trim_end_matches('/').to_owned(),
         repo: routed.connection.repo.clone(),
@@ -927,9 +930,20 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
                 failures = failures.saturating_add(1);
                 pause(failures).await;
             }
+            // The agent token ended while the prompt was up. The Hub keeps the request for the
+            // same person's next token, so the hook goes on with the one this computer holds
+            // now, and stops when that is the token the Hub just refused.
+            Step::Renew => hub.token = renewed(payload, &hub.token)?,
             Step::Stop => return None,
         }
     }
+}
+
+/// The agent token this checkout holds now, when it is not `old`.
+fn renewed(payload: &Value, old: &str) -> Option<String> {
+    let routed = super::route_client("claude", payload).ok()?;
+    let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
+    (!token.is_empty() && token != old).then_some(token)
 }
 
 #[cfg(test)]
@@ -1471,7 +1485,6 @@ mod tests {
             reply(200, "pending", json!("allow")),
             reply(200, "answered", json!(true)),
             reply(404, "answered", json!("allow")),
-            reply(401, "answered", json!("allow")),
             reply(409, "answered", json!("allow")),
             reply(500, "answered", json!("allow")),
             Some((200, json!("allow"))),
@@ -1493,6 +1506,11 @@ mod tests {
         ] {
             assert_eq!(classify(stop.clone(), id, &hash), Step::Stop, "{stop:?}");
         }
+        // An ended agent token is no decision either: the hook looks for its renewal.
+        assert_eq!(
+            classify(reply(401, "answered", json!("allow")), id, &hash),
+            Step::Renew
+        );
         // Transient trouble is retried.
         assert_eq!(classify(None, id, &hash), Step::Retry);
         assert_eq!(

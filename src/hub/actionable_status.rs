@@ -617,6 +617,7 @@ fn read_scoped(
             .get(session_key(&item.lead_token, &item.lead_session).as_str())
             .copied();
         let wait = setup.waiting().lead(
+            &item.owner,
             &item.lead_token,
             &item.lead_session,
             called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
@@ -953,7 +954,13 @@ fn waiting_actions(
         let led = items
             .values()
             .filter(|i| {
-                i.lead_token == wait.token && i.lead_session == wait.session && unfinished(i)
+                // A wait kept under its person is the session's whichever token leads its Work.
+                let leads = if wait.person {
+                    i.owner == owner
+                } else {
+                    i.lead_token == wait.token
+                };
+                leads && i.lead_session == wait.session && unfinished(i)
             })
             .collect::<Vec<_>>();
         // The sessions that started this one, nearest first.
@@ -2741,6 +2748,26 @@ mod tests {
                 .iter()
                 .all(|a| !a.action.contains("force-push"))
         );
+        // The person's computer renewed its agent token: the session reports its wait under the
+        // new one while its Work is still led under the old. It is the same session's Work.
+        const NAMED: &str = "0a1b2c3d-0000-4000-8000-000000000009";
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "fix-logout", "title": "Fix logout", "session": NAMED,
+            "scope": ["src/logout.rs"]
+        }))
+        .unwrap();
+        let led = store
+            .work_start(&viewer.token_id, &request, now)
+            .unwrap()
+            .item;
+        let renewed = token(&viewer.owner, "viewer-laptop-renewed");
+        wait(&renewed, NAMED, WaitReason::Idle, earlier);
+        let after = waits(&viewer, now);
+        let idle = after
+            .iter()
+            .find(|a| a.work_ids == vec![led.id.clone()])
+            .unwrap_or_else(|| panic!("{after:?}"));
+        assert!(idle.id.starts_with("waiting:idle:"), "{}", idle.id);
     }
 
     /// The end of a turn in a session that leads nothing reaches its person while a session that
