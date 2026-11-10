@@ -68,6 +68,24 @@ A message is never delivered:
 
 A delivered message that is not answered within 60 seconds is offered again at the next call, in case the reply that carried it never reached the model. Only a message never delivered wakes a session, so an agent that does not answer is not woken again and again.
 
+### Pick-up deadline
+
+No message sits unseen. When a message is sent, the Hub gives it a deadline for its agent's answer, from how its session is reached at that moment (`reach`, below):
+
+| `reach` | Deadline |
+| --- | --- |
+| `wake_now`: Claude Code's waiter waits at the Hub now, so it is woken within about a second, idle or busy | 2 minutes |
+| `wake_soon`: Codex's waiter waits now; it queues the notice, which Codex starts as a turn within about ten seconds once the session is idle | 5 minutes |
+| `next_step`: at its next prompt or tool call; a session that sits idle makes none | 10 minutes |
+| `unreachable`: nothing from the session itself since the Hub started | 2 minutes, since it will not arrive on its own |
+| `ended`: its `SessionEnd` hook came and nothing from it since | 2 minutes |
+
+A session reads `wake_now` or `wake_soon` only while a waiter really waits: a wait for it is open in this Hub process, or one ended with nothing under 5 seconds ago and its waiter is asking again. Having waited lately is not enough: a waiter that woke its session, or went away, wakes nothing. (`tier` keeps its 90-second rule for older pages.) A session that ended reads `ended` until a call of its own: a resumed session keeps its id, and its subagents' calls do not count. A wait still open when its session ends takes nothing.
+
+Past its deadline, a message that is still `queued` or `delivered` reads `not_picked_up`. Only the agent's own answer (`accepted`, `declined` or `done`) clears it, a late one included. A delivery never does, and neither does a wait or any other call of the session: none of them shows that the model read the message. A message stored before deadlines existed is due 10 minutes after it was sent.
+
+Each message keeps its own times: `created_at` (sent), `delivered_at` with `via` (its first delivery and the way it came), `offered_at` (its latest offer), `read_at` (its agent's first answer), `done_at` (its agent's `done`), and `answered_at` (its agent's latest answer).
+
 ### Waking an idle Claude Code session
 
 The Claude Code plugin that `agentscm client setup` installs adds a background hook, `agentscm hook-wait claude`, at `SessionStart` and at every `Stop`, declared with `"asyncRewake": true`. Claude Code documents that it runs such a hook in the background and, when the hook exits with code 2, wakes the session, an idle one included, and shows the hook's stderr to the model as a system reminder. Plain `"async": true` does not wake an idle session, and a `Stop` hook alone cannot reach a session that is already idle.
@@ -117,15 +135,15 @@ The routes are for the Hub's web page only:
 - `GET /v1/hub/session/agent-messages?repository=OWNER/NAME` returns:
   - `mode`, the mode in force;
   - `default_mode` and `repository_mode`, the person's own settings;
-  - `sessions`, with `token`, `token_name`, `session`, `tier`, `name`, `version`, `hook`, `hook_context`, `top_level`, `mcp` and `seen_at`;
-  - `messages`, newest first.
+  - `sessions`, with `token`, `token_name`, `session`, `tier`, `reach`, `name`, `version`, `hook`, `hook_context`, `top_level`, `mcp` and `seen_at`;
+  - `messages`, newest first, each with `not_picked_up` beside its stored fields.
 - `PUT /v1/hub/session/agent-messages/mode` with `{repository, this_repository, mode}` sets a mode; `mode: null` clears it.
 - `POST /v1/hub/session/agent-messages` with `{repository, token, session, work_id?, note}` queues a message and returns it (`201`). The note is 1 to 1000 bytes, with newlines allowed.
 - `DELETE /v1/hub/session/agent-messages?repository=…&id=…` withdraws a message that is still queued.
 
-The session's background hook uses one route with the agent token: `POST /v1/hub/agent-messages/wait` with `{session}`, the native session id. It answers `200 {text}` with the notice when a message comes, `204` when none came in 25 seconds or a newer wait for the session replaced this one, `403` for a read-only token or one without a repository, `410` while the person's mode is Ignore, and `429` when the Hub or the person holds too many waits.
+The session's background hook uses one route with the agent token: `POST /v1/hub/agent-messages/wait` with `{session, agent?}`: the native session id, and whose waiter it is, `claude` (the default) or `codex`. A message it takes is recorded `via` `wake:<agent>`. It answers `200 {text}` with the notice when a message comes, `204` when none came in 25 seconds, a newer wait for the session replaced this one or the session ended, `403` for a read-only token or one without a repository, `410` while the person's mode is Ignore, and `429` when the Hub or the person holds too many waits.
 
-A message's `state` is `queued`, `delivered`, `accepted`, `declined`, `done` or `withdrawn`. `via` is `wake:claude`, `hook:<agent>` or `mcp`, and `mode` is the mode it was delivered under. A session's `waited_at` is when its background hook last waited.
+A message's `state` is `queued`, `delivered`, `accepted`, `declined`, `done` or `withdrawn`. `via` is `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`, the way of its first delivery, and `mode` is the mode it was delivered under. Its times and `deadline_at` are under [Pick-up deadline](#pick-up-deadline). A session's `waited_at` is when its background hook last waited, `waker` is whose waiter waited last (`claude` or `codex`), `ended` is true from its `SessionEnd` hook to its next own call, and its `reach` is `wake_now`, `wake_soon`, `next_step`, `unreachable` or `ended`.
 
 ## MCP
 
