@@ -2,6 +2,69 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.4.0](https://github.com/agentscm/agentscm/compare/v0.3.0...v0.4.0) - 2026-11-10
+
+### Added
+
+- *(hub)* Show agents Work in their person's other repositories ([#443](https://github.com/agentscm/agentscm/pull/443))
+- *(hub)* Answer a waiting permission prompt from the Hub ([#448](https://github.com/agentscm/agentscm/pull/448))
+- *(hub)* Read forge coordination and Slack setup for a repository ([#400](https://github.com/agentscm/agentscm/pull/400))
+- *(hub)* Read whether a repository is watched after merge ([#401](https://github.com/agentscm/agentscm/pull/401))
+- *(hub)* Read a repository's retention limits and stand-up usage ([#399](https://github.com/agentscm/agentscm/pull/399))
+- *(hub)* Let a person connect an app that reads and answers for them ([#405](https://github.com/agentscm/agentscm/pull/405))
+- *(hub)* Say what an overlap alert is about in its text ([#427](https://github.com/agentscm/agentscm/pull/427))
+- *(hub)* Let a person message their own running agent session ([#413](https://github.com/agentscm/agentscm/pull/413))
+- *(hub)* Add a weekly private digest of stale Work and collisions ([#429](https://github.com/agentscm/agentscm/pull/429))
+- *(client)* State per-harness coverage and name unwired agents ([#430](https://github.com/agentscm/agentscm/pull/430))
+- *(hub)* Observe pr-gate CI, approval and merge; post the skill status ([#440](https://github.com/agentscm/agentscm/pull/440))
+- *(hub)* Answer why a commit or file was built ([#442](https://github.com/agentscm/agentscm/pull/442))
+- *(client)* Route MCP calls by path and fill in the session ([#426](https://github.com/agentscm/agentscm/pull/426))
+- *(cli)* Add collisions --history to count past overlaps ([#425](https://github.com/agentscm/agentscm/pull/425))
+- *(validation)* Select tests by path prefix within a command's paths ([#419](https://github.com/agentscm/agentscm/pull/419))
+- *(hub)* Retain validation evidence and maintain one PR summary ([#417](https://github.com/agentscm/agentscm/pull/417))
+- *(hub)* Re-land the actionable error envelope and connection states ([#416](https://github.com/agentscm/agentscm/pull/416))
+- *(hub)* Make conversation sharing a repository setting ([#410](https://github.com/agentscm/agentscm/pull/410))
+- *(hub)* Let people dismiss and snooze attention items ([#409](https://github.com/agentscm/agentscm/pull/409))
+- *(hub)* Let agents describe Work beside a short title ([#407](https://github.com/agentscm/agentscm/pull/407))
+- *(hub)* Report sessions that wait for their person ([#404](https://github.com/agentscm/agentscm/pull/404))
+- *(hub)* Let a Hub page ask the web sign-in to return to it ([#393](https://github.com/agentscm/agentscm/pull/393))
+
+### Fixed
+
+- *(client)* Build on Windows again ([#465](https://github.com/agentscm/agentscm/pull/465))
+- *(hub)* Ask a person only for what agents cannot settle ([#452](https://github.com/agentscm/agentscm/pull/452))
+- *(client)* Do not check an edit that resolves a Git conflict ([#449](https://github.com/agentscm/agentscm/pull/449))
+- *(hub)* Sanitize relayed titles; message only top-level sessions ([#450](https://github.com/agentscm/agentscm/pull/450))
+- *(hub)* Stop calling a task quiet while its agent works or waits ([#451](https://github.com/agentscm/agentscm/pull/451))
+- *(ci)* Report the merge gate as a commit status too ([#447](https://github.com/agentscm/agentscm/pull/447))
+- *(client)* Fast hooks, worktree routing, prompt and reply recovery ([#432](https://github.com/agentscm/agentscm/pull/432))
+- *(hub)* Ask a session to declare its Work at its first edit ([#431](https://github.com/agentscm/agentscm/pull/431))
+- *(hub)* Advise patching other lines before asking for a held file ([#422](https://github.com/agentscm/agentscm/pull/422))
+- *(hub)* Name the refusing limit and let busy repositories compact ([#441](https://github.com/agentscm/agentscm/pull/441))
+- *(hub)* State the shared-body read rule and fix two misleading reads ([#433](https://github.com/agentscm/agentscm/pull/433))
+- *(deps)* Raise rusqlite past RUSTSEC-2026-0459 ([#436](https://github.com/agentscm/agentscm/pull/436))
+- *(cli)* Read Hub replies that a newer Hub has added to ([#428](https://github.com/agentscm/agentscm/pull/428))
+- *(hub)* Finish Work from agentscm_done and show what agents wait for ([#418](https://github.com/agentscm/agentscm/pull/418))
+- *(validation)* Check Node before queueing an attestation ([#420](https://github.com/agentscm/agentscm/pull/420))
+- *(hub)* Do not flag a pull request against the agent that opened it ([#412](https://github.com/agentscm/agentscm/pull/412))
+- *(hub)* List Work ended by a transition among recent completions ([#414](https://github.com/agentscm/agentscm/pull/414))
+- *(hub)* Read an oversize pull request file list as unknown paths ([#411](https://github.com/agentscm/agentscm/pull/411))
+- *(hub)* Announce an intent once and keep a session's Work title ([#406](https://github.com/agentscm/agentscm/pull/406))
+
+### Other
+
+- Update the roadmap from merged pull requests ([#457](https://github.com/agentscm/agentscm/pull/457))
+- *(deps)* bump the actions group across 1 directory with 11 updates ([#438](https://github.com/agentscm/agentscm/pull/438))
+- *(hub)* Pin the preflight as readable with a read-only token ([#402](https://github.com/agentscm/agentscm/pull/402))
+- *(relay)* Tolerate a request sent before the pool close is seen ([#446](https://github.com/agentscm/agentscm/pull/446))
+- Fix two merge-batch flakes in setup status and fake Docker ([#434](https://github.com/agentscm/agentscm/pull/434))
+- Give the store consolidation design its page title ([#439](https://github.com/agentscm/agentscm/pull/439))
+- Design ending the double Hub store implementation ([#437](https://github.com/agentscm/agentscm/pull/437))
+- Run the checks on every pull request ([#435](https://github.com/agentscm/agentscm/pull/435))
+- Run PostgreSQL tests in parallel, one database per test ([#421](https://github.com/agentscm/agentscm/pull/421))
+- Add a setup prompt to paste into a coding agent ([#424](https://github.com/agentscm/agentscm/pull/424))
+- Lint in merge batches and make the signed check optional ([#423](https://github.com/agentscm/agentscm/pull/423))
+
 ## [0.3.0](https://github.com/agentscm/agentscm/compare/v0.2.1...v0.3.0) - 2026-11-06
 
 ### Added
