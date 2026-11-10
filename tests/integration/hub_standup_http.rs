@@ -1194,3 +1194,93 @@ async fn issue_choices_and_link_mutations_cross_http_and_mcp() {
     assert_eq!(removed["result"]["isError"], false, "{removed}");
     assert!(removed["result"]["structuredContent"]["item"]["issue_link"].is_null());
 }
+
+/// The replies the command-line tool, the menu bar app and managed execution read as typed
+/// values, taken from a live Hub and read as a client reads them after a newer Hub adds to them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clients_read_work_replies_a_newer_hub_adds_to() {
+    use crate::client_replies::reads_newer;
+    use agentscm::hub::work::{WorkCheckpointResult, WorkItem};
+    use agentscm::hub::work_http::actionable_status::ActionableStatus;
+    use agentscm::hub::work_recovery::{WorkRecoveryV1, WorkTransitionBatchV1};
+
+    let hub = Hub::start(None).await;
+    let (_, alice) = hub.token(31, "acme/widgets", false).await;
+    let (status, started) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &alice,
+            Some(start("newer-hub-replies")),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let (fields, values) = reads_newer::<WorkStartResult>(&started);
+    assert!(fields > 1 && values > 0, "start: {fields} {values}");
+    let id = started["item"]["id"].as_str().unwrap();
+
+    let (status, item) = hub
+        .call(
+            Method::GET,
+            &format!("/v1/hub/standup/work/{id}"),
+            &alice,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{item}");
+    let (fields, values) = reads_newer::<WorkItem>(&item);
+    assert!(fields > 0 && values > 0, "work: {fields} {values}");
+
+    let (status, checkpoint) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/checkpoint",
+            &alice,
+            Some(json!({
+                "work_id": id, "generation": 1, "session": "session-a",
+                "operation_id": "newer-hub-progress",
+                "expected_updated_seq": item["updated_seq"],
+                "kind": "progress", "summary": "Completed a boundary case",
+                "next_action": "Continue request validation"
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{checkpoint}");
+    let (fields, values) = reads_newer::<WorkCheckpointResult>(&checkpoint);
+    assert!(fields > 1 && values > 0, "checkpoint: {fields} {values}");
+
+    let (status, shared) = hub
+        .call(Method::GET, "/v1/hub/standup/status", &alice, None)
+        .await;
+    assert_eq!(status, 200, "{shared}");
+    let (fields, _) = reads_newer::<ActionableStatus>(&shared);
+    assert!(fields > 0, "status: {fields}");
+
+    let (status, recovery) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/recovery",
+            &alice,
+            Some(json!({"session": "session-a"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{recovery}");
+    let (fields, _) = reads_newer::<WorkRecoveryV1>(&recovery);
+    assert!(fields > 0, "recovery: {fields}");
+
+    let (status, batch) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/work-transitions",
+            &alice,
+            Some(json!({"session": "session-a", "items": [{
+                "work_id": id, "operation_id": "newer-hub-release", "generation": 1,
+                "expected_updated_seq": checkpoint["item"]["updated_seq"],
+                "transition": "release", "reason": "synthetic reason"
+            }]})),
+        )
+        .await;
+    assert_eq!(status, 200, "{batch}");
+    let (fields, values) = reads_newer::<WorkTransitionBatchV1>(&batch);
+    assert!(fields > 1 && values > 0, "transitions: {fields} {values}");
+}
