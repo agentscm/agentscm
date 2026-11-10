@@ -126,14 +126,18 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     };
     // UserPromptSubmit fires only in the session the person types in, so requests reach it
     // there rather than a subagent. It runs on every prompt, hence the short timeout. Every tool
-    // call keeps the session's hold live; the Hub checks only the edits. Notification and Stop
-    // tell the Hub the session waits for its person; they never answer a prompt.
+    // call keeps the session's hold live; the Hub checks only the edits. Notification, Stop and
+    // PermissionRequest tell the Hub the session waits for its person. PermissionRequest also
+    // offers its prompt to the Hub and waits, up to 12 hours since the person may be away, for
+    // them to allow or deny it there; the prompt stays usable in the session meanwhile, and every
+    // failure leaves it to the session.
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5)]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
         "Notification":[{"hooks":[hook(3)]}],
+        "PermissionRequest":[{"hooks":[hook(43_200)]}],
         "Stop":[{"hooks":[hook(3)]}],
         "SessionEnd":[{"hooks":[hook(3)]}],
         // Only change capture uses these, for checkouts whose Hub shares agent conversations.
@@ -1434,6 +1438,7 @@ mod tests {
             "PreToolUse",
             "PostToolUse",
             "Notification",
+            "PermissionRequest",
             "Stop",
             "SessionEnd",
         ] {

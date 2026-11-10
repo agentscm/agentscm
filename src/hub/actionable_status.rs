@@ -845,7 +845,8 @@ fn setup_actions(
 /// needs them; the end of a turn only while that session leads unfinished Work, since a finished
 /// chat left open is not waiting on anyone. Paused Work counts: a host that stops an idle session
 /// ends it, which pauses its Work, and the resumed session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
-/// version the time the wait began. Answering stays in the session.
+/// version the time the wait began. A permission wait whose hook offers its prompt to the Hub
+/// (`permission_answer`) says so; every other wait is answered in the session.
 fn waiting_actions(
     setup: &Observations,
     principal: &Principal,
@@ -902,6 +903,15 @@ fn waiting_actions(
                 format!(" {label}: “{text}”.")
             })
             .unwrap_or_default();
+        let answer = if wait.reason == WaitReason::Permission
+            && setup
+                .permissions()
+                .answerable(setup.waiting(), &wait.key, now)
+        {
+            "Answer it in that session, or allow or deny it once from the Hub."
+        } else {
+            "Answer it in that session; the Hub cannot answer it for you."
+        };
         actions.push(StatusAction {
             id: format!("waiting:{}:{}", wait.reason.code(), wait.key),
             kind: "session_waiting".into(),
@@ -909,7 +919,7 @@ fn waiting_actions(
             recipients: vec![viewer.clone()],
             needs_you: true,
             action: format!(
-                "Your {} {}{on}.{asks}{asker} Answer it in that session; the Hub cannot answer it for you.",
+                "Your {} {}{on}.{asks}{asker} {answer}",
                 crate::hub::advice::sanitize(&who, 64),
                 wait.reason.what(),
             ),
@@ -2409,6 +2419,31 @@ mod tests {
             !asking.id.contains("asking"),
             "the session ID is not exposed"
         );
+        // Once that session's hook offers its prompt and the host confirms it shows one, the
+        // item says the Hub can answer it; nothing else about it changes.
+        let requests = observations.permissions();
+        requests.confirm(&viewer.token_id, "asking", now);
+        requests
+            .register(
+                observations.waiting(),
+                &viewer,
+                crate::hub::permission_answer::Registration {
+                    session: "asking".into(),
+                    agent_id: None,
+                    tool: "Bash".into(),
+                    display: "ls".into(),
+                    complete: true,
+                    content_hidden: false,
+                    input_hash: "0".repeat(64),
+                },
+                now,
+            )
+            .unwrap();
+        assert!(waits(&viewer, now).iter().any(|a| {
+            a.id == asking.id
+                && a.action
+                    .ends_with("Answer it in that session, or allow or deny it once from the Hub.")
+        }));
         let status = super::read(store, &observations, &viewer, now).unwrap();
         assert!(status.counts.needs_you >= 2);
         assert!(super::render_text(&status).contains("for your permission to use a tool"));

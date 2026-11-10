@@ -218,11 +218,11 @@ An agent that is not wired, or wired with an older `client setup` that hooked on
 
 ### Waiting for you in its session
 
-When an agent stops to wait for its person, it makes no tool calls, which otherwise looks the same as a crash. Where the host reports the moment, the hook tells the Hub that the session is waiting and why: a **permission** prompt, a **question** (a choice, or a form an MCP server opened) or the **end of its turn**. The wait is a `session_waiting` action in that person's shared status (Needs you, the menu bar app's count and attention notice, `agentscm work status`), never anyone else's. With the wait, the hook sends a short excerpt of what it asks, so the person can see what their agent needs without opening the session. That is the end of the agent's last message when its turn ends, the questions it asks, or a permission prompt's own description. The excerpt is one line of at most 400 characters, from the end of the text, where a closing question sits. Recognizable secrets are redacted on the machine first; that redaction is best effort. The Hub keeps the excerpt in memory with the wait, quotes it in the action's text, and shows it only to that session's person. A stop that background work will resume sends none. The hook never answers the prompt, and the person's prompts, tool input and transcript are not sent. The person answers in the session itself.
+When an agent stops to wait for its person, it makes no tool calls, which otherwise looks the same as a crash. Where the host reports the moment, the hook tells the Hub that the session is waiting and why: a **permission** prompt, a **question** (a choice, or a form an MCP server opened) or the **end of its turn**. The wait is a `session_waiting` action in that person's shared status (Needs you, the menu bar app's count and attention notice, `agentscm work status`), never anyone else's. With the wait, the hook sends a short excerpt of what it asks, so the person can see what their agent needs without opening the session. That is the end of the agent's last message when its turn ends, the questions it asks, or a permission prompt's own description. The excerpt is one line of at most 400 characters, from the end of the text, where a closing question sits. Recognizable secrets are redacted on the machine first; that redaction is best effort. The Hub keeps the excerpt in memory with the wait, quotes it in the action's text, and shows it only to that session's person. A stop that background work will resume sends none. Except for a Claude Code permission prompt ([below](#answer-a-permission-prompt-from-the-hub)), the hook never answers the prompt, the person's prompts, tool input and transcript are not sent, and the person answers in the session itself.
 
 | Agent | Permission | Question | End of turn | What it cannot tell |
 | --- | --- | --- | --- | --- |
-| Claude Code | `Notification` `permission_prompt` | `AskUserQuestion` (`PreToolUse`), `Notification` `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | `Stop` (not while background tasks run), `Notification` `idle_prompt` | whether a subagent asked, unless its hook names the subagent |
+| Claude Code | `Notification` `permission_prompt`, `PermissionRequest` | `AskUserQuestion` (`PreToolUse`), `Notification` `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | `Stop` (not while background tasks run), `Notification` `idle_prompt` | whether a subagent asked, unless its hook names the subagent |
 | Codex CLI | `PermissionRequest` | none | `Stop` | a question asked in plain text |
 | Copilot CLI | `notification` `permission_prompt` | `notification` `elicitation_dialog` | `agentStop`, `notification` `agent_idle` | |
 | Cursor | none | none | `stop` | permission waits: Cursor reports none |
@@ -232,6 +232,39 @@ When an agent stops to wait for its person, it makes no tool calls, which otherw
 While a session waits for its person, the Work it leads reads as waiting for that person in [shared status](standup.md#shared-actionable-status), not as stale. Everyone who can read the repository sees that it waits and on whom; only that person sees what it asks. A Claude Code session that stops while its own background tasks run waits for nobody, and the Hub notes that stop too, so its Work stays active for up to 60 minutes instead of going quiet. Neither keeps the session's hold on its files, which lapses 20 minutes after its last call as before. So that the task also says what it waits on, an agent records a pause or blocker checkpoint whose `next_action` names it before it stops.
 
 The session's next tool call, edit check, prompt, start or end ends the wait. A tool call by a subagent ends only a wait that subagent asked, or one whose asker the host did not name, so a sibling working in parallel does not end it. A wait is shown only after 60 seconds, so someone at the keyboard never sees one. A permission prompt or question always needs you. The end of a turn needs you only while that session leads unfinished Work (active, blocked or paused), because an open chat whose work is done waits on nobody. Paused counts because a host that stops an idle session and later resumes it ends the session in between, which pauses its Work. The Hub keeps waits in memory, at most 32 per agent token and for at most 24 hours. A Hub restart forgets them, and a session that waits through a restart reads as not known, not as not waiting. Run `agentscm client setup` again (or update the plugin) to install these hooks.
+
+#### Answer a permission prompt from the Hub
+
+For a Claude Code permission prompt, the plugin's `PermissionRequest` hook also offers the prompt to the Hub. The person who owns that session's agent token can then allow it once or deny it on the Hub's web page, away from the computer the session runs on. The prompt stays usable in the session the whole time, and the first answer wins. There is nothing to turn on.
+
+Beyond the wait itself, the hook sends the tool's name, what the request is for, and a salted hash of the tool input. What the request is for is one of these, at most 4,000 characters:
+
+- a shell command, in full
+- an edit's file path, never its content
+- a fetch's address, without its query or sign-in part
+- a subagent's type and description
+- any other tool's input, as JSON
+
+Recognizable secrets are redacted on the machine first, with the same best-effort redaction as the excerpt above. The Hub keeps these in memory only, for at most 12 hours. It never stores, logs or notifies them, and it shows them only to the token's owner, signed in on the web page, once the wait has lasted the same 60 seconds.
+
+- **Only a prompt a person can see is offered.** A request is offered after the host's own `permission_prompt` notification confirms the prompt is on screen. A run with nobody at a dialog sends none, so it is never offered: its hook gives up after 20 seconds and the host decides as before.
+- **Allow needs the whole request.** A request that was cut, had anything redacted, or carries a setting that is not shown (for a shell command, anything other than the command, its description, its timeout and its background flag) can only be denied from the Hub.
+- **The Hub cannot change the request.** The hook prints one of two fixed decisions, and only for a reply that names its own request and input hash. The Hub cannot change the command, add input or put text in front of the model. After a deny the model reads only "Denied from the AgentSCM Hub by its person."
+- **Failures leave the prompt to the session.** An older Hub, a Hub restart, a network error or a timeout produce no decision.
+- **The request ends when the session moves on**: the prompt is answered in the session, or the session makes its next tool call, takes a prompt, or ends.
+- **Questions and subagents are answered in the session.** A question (`AskUserQuestion`) is not offered. Neither is a subagent's permission prompt: the host shows a subagent's dialog only after the hook returns, so the hook does not wait for it.
+- **One Hub process.** A Hub that runs as several processes behind one address answers a request only on the process that holds it. On another process the request reads as ended.
+
+This lets the Hub that a checkout is connected to approve a tool call at the moment the agent asks for it. To turn it off on a machine, set `AGENTSCM_REMOTE_ANSWERS=0` in the environment Claude Code runs in.
+
+The hook uses two routes with its agent token, and the web page two with the person's web sign-in:
+
+| Route | Body and reply |
+| --- | --- |
+| `POST /v1/hub/permission/register?repo=owner/name` | `{"session", "agent_id"?, "tool", "display", "complete", "content_hidden"?, "input_hash"}`. Replies `{"request_id", "input_hash", "state"}` with `state` `unconfirmed` or `pending`. 409 `request_conflict` with `reason` `not_waiting` when that session has no permission wait. 429 `rate_limited` past 8 open requests for a token or 256 for the Hub. |
+| `POST /v1/hub/permission/poll?repo=owner/name` | `{"request_id", "input_hash", "wait_seconds"}`, held for up to `wait_seconds` (0 to 25) until the state changes. Replies `{"request_id", "input_hash", "state", "decision"}`: `state` is `unconfirmed`, `pending`, `answered` or `ended`, and `decision` is `allow`, `deny` or null. An unknown id, another token's request and a wrong hash are all 404. |
+| `GET /v1/hub/session/permissions?repository=owner/name` | `{"requests": [{"item_id", "request_id", "tool", "display", "complete", "content_hidden", "subagent", "since", "state", "decision"}]}`: the person's own confirmed requests there, oldest first. `item_id` is the id of the wait's `session_waiting` action. |
+| `POST /v1/hub/session/permissions/answer` | `{"repository", "request_id", "decision"}` with `allow` or `deny`, and the page's CSRF token. Replies `{"state": "answered", "decision"}`; the same decision again is accepted. 400 when Allow is not offered, 403 `not_your_agent`, 409 `request_conflict` with `reason` `already_answered`, `answered_in_session` or `ended`. |
 
 ### Hooks fail open
 

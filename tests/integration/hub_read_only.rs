@@ -88,6 +88,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
     row(&post, "/v1/hub/standup/usage".into(), "{}".into(), AgentOnly);
+    row(&post, "/v1/hub/permission/register".into(), "{}".into(), AgentOnly);
+    row(&post, "/v1/hub/permission/poll".into(), "{}".into(), AgentOnly);
     row(&post, "/v1/hub/standup/pr-link".into(), "{}".into(), AgentOnly);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/pr-link".into(), "".into(), Status(404));
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
@@ -169,6 +171,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/session/dismissals?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
     row(&put, "/v1/hub/session/dismissals".into(), r#"{"repository":"acme/widgets","key":"k","fingerprint":"f"}"#.into(), HumanOnly);
     row(&delete, "/v1/hub/session/dismissals?repository=acme%2Fwidgets&key=k".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/session/permissions?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&post, "/v1/hub/session/permissions/answer".into(), r#"{"repository":"acme/widgets","request_id":"00ff","decision":"deny"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/conversation-sharing?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing".into(), r#"{"repository":"acme/widgets","enabled":true}"#.into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing/me".into(), r#"{"repository":"acme/widgets","opted_out":true}"#.into(), HumanOnly);
