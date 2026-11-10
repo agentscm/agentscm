@@ -85,6 +85,20 @@ by one of the same person's agent tokens in the same repository, before expiry, 
 the Unix time. Another person's agent using the same key never picks it up. A start that the
 preflight or a conflict refused does not count.
 
+### Permission prompts
+
+A person allows once or denies a Claude Code permission prompt of their own agent's session. The
+session's hook registers the prompt and waits; the person answers with the web sign-in. See
+[Answer a permission prompt from the Hub](agents.md#answer-a-permission-prompt-from-the-hub) for
+the bodies, replies and rules. Requests live in the memory of one Hub process.
+
+| Route | Caller | Effect |
+|---|---|---|
+| `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
+| `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
+| `GET /v1/hub/session/permissions?repository=…` | Web sign-in | `{"requests": [...]}`: the person's own requests there that a prompt on screen confirmed |
+| `POST /v1/hub/session/permissions/answer` | Web sign-in, `x-csrf-token` | Body `{"repository", "request_id", "decision"}`; `allow` only when the whole request was shown |
+
 ## Hub: connected apps
 
 An app registered in `AGENTSCM_HUB_APPS_FILE` connects to one person's account; see

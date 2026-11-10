@@ -37,15 +37,35 @@ fn stub(reply: Reply) -> (String, Receiver<Seen>) {
         let request = read_request(&mut stream);
         let _ = send.send(request);
         match reply {
-            Reply::Status(status, body) => {
-                let text = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(text.as_bytes());
-            }
+            Reply::Status(status, body) => answer(&mut stream, status, body),
             Reply::Silent => thread::sleep(Duration::from_secs(8)),
+        }
+    });
+    (url, seen)
+}
+
+fn answer(stream: &mut TcpStream, status: u16, body: &str) {
+    let text = format!(
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(text.as_bytes());
+}
+
+/// Serves every request on a loopback port with what `respond` says for it, and reports each.
+#[cfg(unix)]
+fn serve(respond: impl Fn(&Seen) -> (u16, Value) + Send + 'static) -> (String, Receiver<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (send, seen) = channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let request = read_request(&mut stream);
+            let (status, body) = respond(&request);
+            let _ = send.send(request);
+            answer(&mut stream, status, &body.to_string());
         }
     });
     (url, seen)
@@ -417,9 +437,10 @@ fn no_git_means_no_root_header_and_a_bad_repo_is_ignored() {
     assert_eq!(seen.root, "");
 }
 
-/// A saved connection for a real checkout whose `origin` can only be read by running `git`.
+/// A saved connection to `hub` for a real checkout whose `origin` can only be read by running
+/// `git`.
 #[cfg(unix)]
-fn connected_checkout(dir: &TempDir) -> std::path::PathBuf {
+fn connected_checkout(dir: &TempDir, hub: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let root = dir.path().join("repo");
     std::fs::create_dir(&root).unwrap();
@@ -448,7 +469,7 @@ fn connected_checkout(dir: &TempDir) -> std::path::PathBuf {
     let saved = json!({"version": 1, "connections": [{
         "root": root,
         "origin_host": "github.com",
-        "hub": "http://127.0.0.1:9",
+        "hub": hub,
         "repo": "acme/widgets",
         "token_file": token,
     }]});
@@ -476,7 +497,7 @@ fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
     // a loaded host. Waiting for the stalled child would take 8 s.
     for (event, bound) in [("PreToolUse", 4000), ("SessionStart", 5500)] {
         let dir = home();
-        let root = connected_checkout(&dir);
+        let root = connected_checkout(&dir, "http://127.0.0.1:9");
         let bin = stalled_git(&dir);
         let payload = json!({"hook_event_name": event, "session_id": "s1", "cwd": root});
         let path = bin.display().to_string();
@@ -498,4 +519,159 @@ fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
             run.stdout
         );
     }
+}
+
+/// What the stub Hub's poll replies, given the hook's own input hash.
+#[cfg(unix)]
+type Poll = fn(&Value) -> Value;
+/// Extra environment for one hook run.
+#[cfg(unix)]
+type Env<'a> = &'a [(&'a str, &'a str)];
+
+/// A stub Hub for one permission prompt: it records the wait, registers the request with
+/// `register`'s status, and answers each poll with what `poll` makes of the hook's own hash.
+#[cfg(unix)]
+fn permission_hub(register: u16, poll: Poll) -> (String, Receiver<Seen>) {
+    serve(move |seen| {
+        let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+        let hash = &body["input_hash"];
+        if seen.path.starts_with("/v1/hub/permission/register") {
+            let made = json!({"request_id": "00ff", "input_hash": hash, "state": "pending"});
+            (register, made)
+        } else if seen.path.starts_with("/v1/hub/permission/poll") {
+            (200, poll(hash))
+        } else {
+            (200, json!({}))
+        }
+    })
+}
+
+/// Runs the plugin's Claude Code hook for a permission prompt (changed by `edit`) against `hub`;
+/// returns the run and the paths it called.
+#[cfg(unix)]
+fn permission_prompt(
+    (hub, seen): (String, Receiver<Seen>),
+    env: Env,
+    edit: fn(&mut Value),
+) -> (Run, Vec<Seen>) {
+    let dir = home();
+    let root = connected_checkout(&dir, &hub);
+    let mut payload = json!({"hook_event_name": "PermissionRequest", "session_id": "s1",
+        "cwd": root, "tool_name": "Bash",
+        "tool_input": {"command": "deploy --token hunter2hunter2"}});
+    edit(&mut payload);
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut env = env.to_vec();
+    env.push(("PATH", &path));
+    let run = run_with(
+        &["claude", "--client-connection"],
+        &env,
+        &dir,
+        payload.to_string().as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    (run, seen.try_iter().collect())
+}
+
+/// A poll reply for the stub Hub's one request.
+#[cfg(unix)]
+fn polled(hash: &Value, state: &str, decision: Option<&str>) -> Value {
+    json!({"request_id": "00ff", "input_hash": hash, "state": state, "decision": decision})
+}
+
+#[cfg(unix)]
+fn answered(hash: &Value, decision: &str) -> Value {
+    polled(hash, "answered", Some(decision))
+}
+
+/// The hook prints one of two fixed decisions, and only for an exact answer to its own request.
+/// Anything else leaves the prompt to the session: the ordinary reply, which has no decision.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
+    const ALLOW: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}\n";
+    const DENY: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"deny\",\"message\":\"Denied from the AgentSCM Hub by its person.\"},\"hookEventName\":\"PermissionRequest\"}}\n";
+    let cases: [(Poll, &str); 6] = [
+        (|hash| answered(hash, "allow"), ALLOW),
+        (|hash| answered(hash, "deny"), DENY),
+        // Another prompt's hash, input the hook never takes, a decision it does not know, and a
+        // request that ended because the session moved on.
+        (|_| answered(&json!("b".repeat(64)), "allow"), "{}\n"),
+        (
+            |hash| {
+                let mut reply = answered(hash, "allow");
+                reply["updatedInput"] = json!({"command": "rm -rf /"});
+                reply
+            },
+            "{}\n",
+        ),
+        (|hash| answered(hash, "always"), "{}\n"),
+        (|hash| polled(hash, "ended", None), "{}\n"),
+    ];
+    for (poll, printed) in cases {
+        let (run, seen) = permission_prompt(permission_hub(200, poll), &[], |_| {});
+        assert_eq!(run.stdout, printed);
+        // What the Hub is told of the request: never the tool input, and no recognizable secret.
+        let register = seen
+            .iter()
+            .find(|seen| seen.path.starts_with("/v1/hub/permission/register"))
+            .expect("the prompt was offered");
+        assert_eq!(register.authorization, "Bearer synthetic-private-token");
+        let body: Value = serde_json::from_slice(&register.body).unwrap();
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "complete",
+                "content_hidden",
+                "display",
+                "input_hash",
+                "session",
+                "tool"
+            ]
+        );
+        assert_eq!(body["display"], "deploy --token [REDACTED:flag_value]");
+        assert_eq!(body["complete"], false, "a redacted request is deny-only");
+        assert!(
+            seen.iter()
+                .all(|seen| !String::from_utf8_lossy(&seen.body).contains("hunter2")),
+        );
+    }
+}
+
+/// A Hub without these routes, a request nobody answers, the off switch, a subagent's prompt and
+/// a question all leave the prompt to the session.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_the_hub() {
+    let offered = |seen: &[Seen]| {
+        seen.iter()
+            .filter(|seen| seen.path.starts_with("/v1/hub/permission/"))
+            .count()
+    };
+    // An older Hub: one refused registration, then nothing more.
+    let hub = permission_hub(404, |hash| answered(hash, "allow"));
+    let (run, seen) = permission_prompt(hub, &[], |_| {});
+    assert_eq!((run.stdout.as_str(), offered(&seen)), ("{}\n", 1));
+    // Nobody answers: the hook ends at its bound, here cut to a second and a half.
+    let hub = permission_hub(200, |hash| polled(hash, "pending", None));
+    let bound = [("AGENTSCM_TEST_PERMISSION_BOUND_MS", "1500")];
+    let (run, seen) = permission_prompt(hub, &bound, |_| {});
+    assert_eq!(run.stdout, "{}\n");
+    assert!(offered(&seen) >= 2, "it registered and polled");
+    assert!(run.elapsed < Duration::from_secs(10), "{:?}", run.elapsed);
+    // Never offered, even to a Hub that would allow it.
+    let never_offered = |env: Env, edit: fn(&mut Value)| {
+        let hub = permission_hub(200, |hash| answered(hash, "allow"));
+        let (run, seen) = permission_prompt(hub, env, edit);
+        assert_eq!((run.stdout.as_str(), offered(&seen)), ("{}\n", 0));
+        assert!(
+            seen.iter()
+                .any(|seen| seen.path.starts_with("/v1/hub/hook/claude"))
+        );
+    };
+    never_offered(&[("AGENTSCM_REMOTE_ANSWERS", "0")], |_| {});
+    never_offered(&[], |payload| payload["agent_id"] = json!("sub-1"));
+    never_offered(&[], |payload| {
+        payload["tool_name"] = json!("AskUserQuestion")
+    });
 }
