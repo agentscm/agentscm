@@ -1067,6 +1067,35 @@ fn devices_and_refusals(db: &Db) {
             .revoke_device(&app2, Some(&carol.id), &carol.id, now)
             .unwrap()
     );
+    // Racing connects from separate hub processes still leave exactly one live credential.
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let racers: Vec<_> = (0..8)
+        .map(|i| {
+            let (url, owner, start) = (db.url.clone(), carol.id.clone(), start.clone());
+            thread::spawn(move || {
+                let store = store::open(&url).unwrap();
+                let digest = device_digest(&format!("{:064x}", 0xa9_0000 + i)).unwrap();
+                start.wait();
+                store
+                    .insert_device(
+                        &owner,
+                        "Example App",
+                        &digest,
+                        None,
+                        Some("example-app"),
+                        now,
+                    )
+                    .unwrap();
+                digest
+            })
+        })
+        .collect();
+    let raced: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    let live = raced
+        .iter()
+        .filter(|d| reopened.authenticate_device(d, now).unwrap().is_some())
+        .count();
+    assert_eq!(live, 1);
 }
 
 fn browser_sessions(db: &Db) {

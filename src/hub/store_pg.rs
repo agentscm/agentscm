@@ -180,6 +180,9 @@ const PUBLICATION_LOCK_CLASS: i32 = 0x6167_6570;
 const WORK_DELIVERY_LOCK_CLASS: i32 = 0x6167_6578;
 /// Serializes every payload-growing effect in a complete repository identity.
 const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
+/// Serializes app connects per person and app, so a reconnect always sees the credential
+/// it retires.
+const APP_CONNECT_LOCK_CLASS: i32 = 0x6167_6561;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -7600,6 +7603,14 @@ impl Store for PgStore {
         let id = new_id("dev")?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            // Taken before any other lock: without it two racing connects each miss the
+            // other's uncommitted row below and both stay live.
+            if let Some(app) = app {
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                    &[&APP_CONNECT_LOCK_CLASS, &format!("{owner}\n{app}")],
+                )?;
+            }
             let inserted = tx.execute(
                 "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at, app_id)
                  SELECT $1, id, $3, $4, $5, $5, $6 FROM hub_users WHERE id = $2 AND NOT disabled
