@@ -1144,8 +1144,10 @@ pub fn render_text(status: &ActionableStatus) -> String {
 /// that agent's to give, not its person's, and `holding` is the Work that still holds its scope:
 /// once the target holds nothing the asker's next start takes the scope, so nothing waits. The
 /// one exception: a live lead that has not even acknowledged a request [`ACK_BOUND_SECS`] after
-/// it was made is stuck, and that Work's owner is asked, in one row for the request. The text,
-/// which the asker reads too, says why it waits and when it is raised.
+/// it was made is stuck, and that Work's owner is asked, in one row for the request. Only the
+/// acknowledgement counts as responding: a renewed lease, a checkpoint or a live connection
+/// keeps the Work live but does not show its lead reads anything. The text, which the asker
+/// reads too, says why it waits and when it is raised.
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
@@ -1190,9 +1192,13 @@ fn request_actions(
                     && a.agent == target.lead
             });
             let due = request.created_at + ACK_BOUND_SECS;
+            // Between two agents of one person the asking agent asks that person in its session,
+            // so the request never becomes their action too.
+            let one_person = request.requester.owner == target.lead.owner;
             // An incomplete receipt page proves no missing acknowledgement.
             let stuck = request.acknowledgements_complete
                 && !acknowledged
+                && !one_person
                 && !item.lead_idle()
                 && now >= due;
             let mut files = target
@@ -1212,26 +1218,40 @@ fn request_actions(
                 ascii_name(&request.requester.login),
                 ascii_name(&agent_name(&request.requester.agent)),
             );
-            let person = ascii_name(&item.owner_login);
+            // The lead's person answers for their agent; the Work's owner, if someone else, can
+            // release its hold.
+            let mut people = vec![lead_person(item)];
+            if people[0].owner.as_deref() != Some(item.owner.as_str()) {
+                people.push(owner(item));
+            }
+            let name = |r: &StatusRecipient| ascii_name(r.login.as_deref().unwrap_or("unknown"));
+            let to = match people.as_slice() {
+                [answers, releases] => format!(
+                    "its person, {}, and the Work's owner, {}",
+                    name(answers),
+                    name(releases)
+                ),
+                _ => format!("its person, {}", name(&people[0])),
+            };
             let (recipients, needs_you, action) = if stuck {
-                (
-                    vec![owner(item)],
-                    item.owner == viewer,
-                    format!(
-                        "{about} Its lead agent is live but has not acknowledged it in {} minutes, so it is raised to its person, {person}: answer it from the Hub's Inbox, or tell that session.",
-                        ACK_BOUND_SECS / 60
-                    ),
-                )
+                let needs_you = people.iter().any(|p| p.owner.as_deref() == Some(viewer));
+                let action = format!(
+                    "{about} Its lead agent has not responded to it since it was made at Unix {}, though its Work is live, so it is raised to {to}: answer it for that agent from the Hub's Inbox, or release that Work's hold so the asker's next agentscm_start takes the files.",
+                    request.created_at
+                );
+                (people, needs_you, action)
             } else {
                 let why = if acknowledged {
                     "Its lead acknowledged it and has not replied yet.".to_owned()
                 } else if item.lead_idle() {
-                    "Its lead is not running, so nobody is asked; its hold lapses by itself if it does not return.".to_owned()
+                    "Its lead is not running, so it is not raised in Needs you; its hold lapses by itself if it does not return.".to_owned()
                 } else if !request.acknowledgements_complete {
                     "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
+                } else if one_person {
+                    "Both agents are one person's, so it is not raised in Needs you: the asking agent asks its person in its session.".to_owned()
                 } else {
                     format!(
-                        "Its lead has not acknowledged it; if it still has not at Unix {due}, it is raised to its person, {person}."
+                        "Its lead has not acknowledged it; if it still has not at Unix {due}, it is raised to {to}."
                     )
                 };
                 (
@@ -3559,19 +3579,23 @@ mod tests {
         assert_eq!(before.recipients[0].kind, RecipientKind::LeadAgent);
         assert!(
             before.action.contains(&format!(
-                "if it still has not at Unix {due}, it is raised to its person, owner"
+                "if it still has not at Unix {due}, it is raised to its person, lead, and the Work's owner, owner"
             )),
             "{}",
             before.action
         );
+        // The lead's person answers for their agent; the Work's owner, here someone else, can
+        // release its hold. Each of them is asked; nobody else is.
         let raised = actions(&request, &item, "usr_owner", due);
         assert!(raised.needs_you);
-        assert_eq!(raised.recipients, vec![owner(&item)]);
+        assert_eq!(raised.recipients, vec![lead_person(&item), owner(&item)]);
+        assert!(actions(&request, &item, "usr_lead", due).needs_you);
         for named in [
             "crq_synthetic",
             "src/client_plugin.rs",
             "requester's asker",
-            "raised to its person, owner",
+            "has not responded to it since it was made at Unix 100",
+            "raised to its person, lead, and the Work's owner, owner",
         ] {
             assert!(raised.action.contains(named), "{named}: {}", raised.action);
         }
@@ -3612,6 +3636,18 @@ mod tests {
         let quiet = actions(&request, &item, "usr_owner", due);
         assert!(!quiet.needs_you);
         assert_eq!(quiet.recipients[0].kind, RecipientKind::LeadAgent);
+        // Between two agents of one person the asking agent asks that person in its session.
+        item.claim_status = ClaimStatus::Active;
+        let mut own = request.clone();
+        own.requester.owner = "usr_lead".into();
+        let own = actions(&own, &item, "usr_lead", due);
+        assert!(!own.needs_you);
+        assert_eq!(own.recipients[0].kind, RecipientKind::LeadAgent);
+        assert!(
+            own.action.contains("Both agents are one person's"),
+            "{}",
+            own.action
+        );
     }
 
     /// #486 from a real store: one person's live release Work reserves a file it is not

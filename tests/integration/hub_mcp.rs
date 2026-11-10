@@ -2084,7 +2084,7 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
     let said = refused(&idle);
     assert!(
         said.contains(&format!("The agent leading {work_id} is not running"))
-            && said.contains("nobody is asked")
+            && said.contains("It is not raised in the AgentSCM Hub's Needs you")
             && !said.contains("raised to its person"),
         "{said}"
     );

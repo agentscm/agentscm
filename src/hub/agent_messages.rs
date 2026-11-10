@@ -738,7 +738,7 @@ struct WaitBody {
 
 /// The session's background hook waits here for a message, with its agent token: 200 `{text}`
 /// with the notice when one comes, or when a coordination request to Work the session leads
-/// waits for its acknowledgement ([`request_wake`], rechecked every few seconds), 204 when
+/// waits for its acknowledgement ([`request_wake`], read once per wait), 204 when
 /// neither came in [`WAIT_SECS`] or a newer wait for the
 /// session took over, 403 for a token that can never receive one, 410 while the person's mode is
 /// `ignore`, 429 when the Hub or the person holds too many waits. Delivery is [`deliver`], the
@@ -772,10 +772,13 @@ async fn wait(
     };
     note_wait(&principal.token_id, &session, unix_now());
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+    // A request needs no instant wake, so its inbox is read once per wait, not at each recheck.
+    let mut requests = true;
     let text = waited(
         deadline,
         || slot.replaced(),
         || {
+            let asks = std::mem::take(&mut requests);
             let (store, principal, session) =
                 (state.store.clone(), principal.clone(), session.clone());
             let state = state.clone();
@@ -784,7 +787,16 @@ async fn wait(
                     let now = unix_now();
                     match deliver(&*store, &principal, &session, WAKE_VIA, now, wakes)? {
                         Some(text) => Ok(Some(text)),
-                        None => request_wake(&*store, &principal, &session, now),
+                        None if !asks => Ok(None),
+                        // Best effort: a failed read never ends a message wait, and the request
+                        // still rides on the session's next call.
+                        None => Ok(request_wake(&*store, &principal, &session, now)
+                            .unwrap_or_else(|error| {
+                                if !matches!(error, HubError::Busy) {
+                                    super::error_envelope::log_internal(&error);
+                                }
+                                None
+                            })),
                     }
                 })
                 .await
