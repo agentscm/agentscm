@@ -243,7 +243,9 @@ pub fn project_work(
     if quiet && wait == LeadWait::Unknown {
         limits.insert("lead_wait_unknown".to_owned());
     }
-    let mut asked_by_wait = false;
+    // Set where the row does not ask the person named by its recipient: their own action asks
+    // them already, or their agent settles it.
+    let mut not_the_persons = false;
     let consistent = item.generation == operational.generation
         && item.updated_seq == operational.updated_seq
         && reconciliation
@@ -323,17 +325,20 @@ pub fn project_work(
             lead(item),
             "Reassess the reported blocker against current prerequisite evidence.",
         )
-    } else if operational.merge.hidden_by_merged_pr {
-        // With nothing held only the close is left. The Hub does not complete it: Work may span
-        // several pull requests, and an outcome records who stated it.
+    } else if operational.merge.hidden_by_merged_pr && held {
         (
             StatusState::ReassessmentNeeded,
             owner(item),
-            if held {
-                "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work."
-            } else {
-                "Its pull request merged and it holds no files: close it as complete, or resume it if work remains. A merge alone does not complete Work."
-            },
+            "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work.",
+        )
+    } else if operational.merge.hidden_by_merged_pr {
+        // With nothing held only the close is left, and it is the lead's. The Hub does not
+        // complete it: Work may span several pull requests, and an outcome records who stated it.
+        not_the_persons = true;
+        (
+            StatusState::ReassessmentNeeded,
+            lead(item),
+            "Its pull request merged and it holds no files: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.",
         )
     } else if item.state == WorkState::Blocked {
         (
@@ -346,7 +351,7 @@ pub fn project_work(
             (StatusState::Active, lead(item), waiting_text(reason))
         } else {
             // Its `session_waiting` action asks the person, so one wait counts once.
-            asked_by_wait = true;
+            not_the_persons = true;
             (
                 StatusState::AwaitingParty,
                 lead_person(item),
@@ -384,7 +389,7 @@ pub fn project_work(
     let needs_you = consistent
         && state != StatusState::Active
         && state != StatusState::Retired
-        && !asked_by_wait
+        && !not_the_persons
         && recipient.owner.as_deref() == Some(viewer);
     StatusWork {
         work_id: item.id.clone(),
@@ -1502,18 +1507,20 @@ mod tests {
         });
         assert_eq!(lapsed.reservation.status, ReservationStatus::Lapsed);
         for operational in [lapsed, op(&item, false, true)] {
-            let row = project_work(&item, operational, None, NotWaiting, "usr_owner");
-            // Its owner is asked to close it, where a quiet claim that holds nothing asks nobody.
-            assert_eq!(row.state, StatusState::ReassessmentNeeded);
-            assert_eq!(row.recipient.kind, RecipientKind::Person);
-            assert_eq!(row.recipient.owner.as_deref(), Some("usr_owner"));
-            assert!(row.needs_you);
-            assert!(row.action.starts_with("Its pull request merged"));
-            // The Hub ends nothing: the Work stays unfinished with no outcome.
-            assert_eq!(
-                row.operational.outcome.value,
-                crate::hub::work_lifecycle::OutcomeValue::None
-            );
+            // Its lead agent is named to close it; no person is asked for what an agent settles.
+            for viewer in ["usr_owner", "usr_lead"] {
+                let row = project_work(&item, operational.clone(), None, NotWaiting, viewer);
+                assert_eq!(row.state, StatusState::ReassessmentNeeded);
+                assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+                assert_eq!(row.recipient.owner.as_deref(), Some("usr_lead"));
+                assert!(!row.needs_you);
+                assert!(row.action.starts_with("Its pull request merged"));
+                // The Hub ends nothing: the Work stays unfinished with no outcome.
+                assert_eq!(
+                    row.operational.outcome.value,
+                    crate::hub::work_lifecycle::OutcomeValue::None
+                );
+            }
         }
     }
 

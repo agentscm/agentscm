@@ -125,10 +125,11 @@ reservation on purpose and records why. Terminal transitions end the Work and dr
 Finished Work holds nothing under any outcome, and a merged pull request never changes outcome or
 reservation by itself; it is a provider fact shown beside them.
 
-Shared status names the owner of unfinished Work whose merge was observed and that holds no live
-reservation, and says that only its close is left: the owner or lead completes it, or resumes it
-if more remains. The Hub does not complete it. The observation matches a branch name, Work may
-span several pull requests, and an outcome records who stated it, which a merge cannot.
+Shared status names the lead agent of unfinished Work whose merge was observed and that holds no
+live reservation, and says that only its close is left: the lead completes it, or resumes it if
+more remains. It asks no person, because an agent can settle it. The Hub does not complete it.
+The observation matches a branch name, Work may span several pull requests, and an outcome records
+who stated it, which a merge cannot.
 
 ## 5. Atomic side effects
 
