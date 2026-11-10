@@ -174,6 +174,9 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    /// This client's hook can carry added context at a prompt or checked tool call (Claude
+    /// Code, Codex, Cursor, Copilot's PascalCase hooks); Copilot CLI's and generic hooks cannot.
+    context_hook: bool,
     /// The host's own notice that it shows a permission prompt to a person, which confirms a
     /// request to answer that prompt from the Hub (`permission_answer`).
     prompt_shown: bool,
@@ -386,7 +389,8 @@ async fn hook(
                     &principal.token_id,
                     &session,
                     &call.via,
-                    context,
+                    !call.child,
+                    call.context_hook,
                     unix_now(),
                 );
                 // An unknown reply loses its text after the session's first, so it takes nothing.
@@ -517,6 +521,7 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            context_hook: false,
             prompt_shown: false,
         }
     }
@@ -607,13 +612,17 @@ impl Call {
             _ => return Self::failed(agent, "hook payload not understood"),
         };
         let scope = scope(&v, root);
-        match agent {
-            Agent::Claude | Agent::Codex => pascal(agent, &v, &scope),
-            Agent::Copilot if v.get("hook_event_name").is_some() => pascal(agent, &v, &scope),
-            Agent::Copilot => copilot(&v, &scope),
-            Agent::Cursor => cursor(&v, &scope),
-            Agent::Generic => generic(&v, &scope),
-        }
+        let (mut call, context_hook) = match agent {
+            Agent::Claude | Agent::Codex => (pascal(agent, &v, &scope), true),
+            Agent::Copilot if v.get("hook_event_name").is_some() => {
+                (pascal(agent, &v, &scope), true)
+            }
+            Agent::Copilot => (copilot(&v, &scope), false),
+            Agent::Cursor => (cursor(&v, &scope), true),
+            Agent::Generic => (generic(&v, &scope), false),
+        };
+        call.context_hook = context_hook;
+        call
     }
 
     /// Whether the reply can carry text to the agent, so a handoff can be delivered with it.
@@ -1791,6 +1800,26 @@ mod tests {
             unnamed.contains("session set to your native session ID"),
             "{unnamed}"
         );
+    }
+
+    #[test]
+    fn hub_messages_ride_the_hooks_that_can_carry_context() {
+        let pascal: &[u8] = br#"{"hook_event_name":"SessionStart","session_id":"s"}"#;
+        let copilot_cli: &[u8] = br#"{"sessionId":"s","source":"new"}"#;
+        let cursor: &[u8] = br#"{"hook_event_name":"sessionStart","session_id":"s"}"#;
+        let generic: &[u8] = br#"{"event":"start","agent":"gemini","session":"s"}"#;
+        for (agent, body, carries) in [
+            (Agent::Claude, pascal, true),
+            (Agent::Codex, pascal, true),
+            (Agent::Copilot, pascal, true),
+            (Agent::Copilot, copilot_cli, false),
+            (Agent::Cursor, cursor, true),
+            (Agent::Generic, generic, false),
+        ] {
+            let call = Call::parse(agent, body, None);
+            assert_ne!(call.kind, Kind::Ignore, "{agent:?}");
+            assert_eq!(call.context_hook, carries, "{agent:?}");
+        }
     }
 
     #[test]
