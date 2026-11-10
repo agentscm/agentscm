@@ -1056,6 +1056,16 @@ id; their intents write the usual intent events. `GET /v1/hub/health` adds
 refused or noted), counted by this hub process since it started (p95 over the
 last 1024 hook calls). Session rows untouched for 7 days are pruned.
 
+Each refusal and overlap notice is also kept in `hub_contested_edits` with the outcome the Hub
+later observes, and each session's hook calls, injected characters and the hook client's own
+latency, timeout and fail-open counts (sent with its next call in `x-agentscm-hook-report`) in
+`hub_hook_overhead`. Both keep rows 30 days, at most 1,000 per token, and are read by
+[value metrics](work-insights.md#contested-edits-and-hook-overhead). Each client report carries
+an id and is counted once per session. Hook-call totals are held in memory and written about 30
+seconds after the first call since the last write; only tokens the store has accepted get totals
+of their own. A Hub restart loses totals not yet written and forgets which report ids it counted,
+so a report resent across a restart can be counted twice.
+
 ## Change-record capture and handoff
 
 The experimental Unix capture client adds a separate Claude Code hook set after a checkout has an

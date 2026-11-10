@@ -74,6 +74,7 @@ mod git_snapshot_cli;
 #[cfg(unix)]
 mod guided_cli;
 mod hook_cli;
+mod hook_report;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;

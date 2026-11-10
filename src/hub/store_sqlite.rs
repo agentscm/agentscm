@@ -66,8 +66,8 @@ use super::insights::{
     UsageReceipt, UsageRecord, UsageSummary, WorkInsight,
 };
 use super::intent::{
-    Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
-    finish, notice_events, plan, probe_set, validate_ttl,
+    Announced, Existing, INTENT_SELECT, Intent, NewIntent, Overlap, Plan, Who, announced,
+    display_all, finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
 use super::pickup::Pickup;
@@ -6240,9 +6240,223 @@ fn touch_in(
     if named {
         renew_leases(tx, token, &name, now)?;
     }
-    Ok(guarded.touched(
+    let edited: &[String] = if call.via.starts_with("hook:") && !guarded.refused() {
+        &call.keys
+    } else {
+        &[]
+    };
+    let refused = guarded.refused_holds();
+    let touched = guarded.touched(
         token, &name, announced, notices, handoffs, requested, lead_notes,
+    );
+    contested_in(tx, who, &name, edited, &refused, &touched.overlaps, now)?;
+    Ok(touched)
+}
+
+/// Settles the session's earlier refusals and notices for files this hook call edited while the
+/// hold that caused them still kept the file, then records this touch's refusals and notices
+/// (see `refusal_outcomes`). Rows are kept 30 days and at most 1,000 per token.
+fn contested_in(
+    tx: &Transaction<'_>,
+    who: &Who,
+    session: &str,
+    edited: &[String],
+    refused: &[(String, String)],
+    noticed: &[Overlap],
+    now: i64,
+) -> Result<()> {
+    use super::refusal_outcomes::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS};
+    let token = who.token.as_str();
+    for key in edited {
+        tx.prepare_cached(
+            "UPDATE hub_contested_edits SET outcome = 'pushed_through', resolved_at = ?4
+             WHERE token = ?1 AND session = ?2 AND path = ?3 AND kind = 'refusal'
+               AND outcome IN ('pending', 'asked')
+               AND EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+                   WHERE p.key = ?3 AND p.expires_at > ?4 AND i.token =
+                       (SELECT h.token FROM hub_intents h WHERE h.id = hub_contested_edits.hold)
+                     AND i.id NOT IN (SELECT s.intent FROM hub_sessions s
+                       WHERE s.token = ?1 AND s.session = ?2 AND s.intent IS NOT NULL))",
+        )?
+        .execute(params![token, session, key, now])?;
+    }
+    let rows = refused
+        .iter()
+        .map(|(key, hold)| (key.as_str(), hold.as_str(), "refusal"))
+        .chain(noticed.iter().flat_map(|overlap| {
+            overlap
+                .your_paths
+                .iter()
+                .map(|key| (key.as_str(), overlap.intent.id.as_str(), "notice"))
+        }));
+    let mut wrote = false;
+    for (key, hold, kind) in rows {
+        // The call that drew a notice took the file: its hook edit went ahead, or it claimed it.
+        let (outcome, resolved_at) = if kind == "notice" {
+            ("proceeded", Some(now))
+        } else {
+            ("pending", None)
+        };
+        wrote |=
+            tx.prepare_cached(
+                "INSERT INTO hub_contested_edits
+                     (repository, token, session, path, hold, kind, outcome, observed_at,
+                      resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
+            )?
+            .execute(params![
+                who.repository,
+                token,
+                session,
+                key,
+                hold,
+                kind,
+                outcome,
+                now,
+                resolved_at
+            ])? > 0;
+    }
+    if wrote {
+        tx.execute(
+            "DELETE FROM hub_contested_edits WHERE repository = ?1 AND observed_at < ?2",
+            params![who.repository, now - RETAIN_SECONDS],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_contested_edits WHERE (token, session, path, hold, kind) IN (
+                 SELECT token, session, path, hold, kind FROM hub_contested_edits
+                 WHERE token = ?1 ORDER BY observed_at DESC, session, path, hold, kind
+                 LIMIT -1 OFFSET ?2)",
+            params![token, MAX_ROWS_PER_TOKEN],
+        )?;
+    }
+    Ok(())
+}
+
+/// The session asked for a file it was refused (`granted` false), or its holder granted it
+/// (`granted` true). Matches the file under any hold, so a hold renewed past its cap under a new
+/// id still settles the refusal. Only a grant hands the file off; an ask may still be declined.
+fn contested_settle(
+    tx: &Transaction<'_>,
+    token: &str,
+    session: &str,
+    key: &str,
+    granted: bool,
+    now: i64,
+) -> Result<()> {
+    let (outcome, from) = if granted {
+        ("handed_off", "asked")
+    } else {
+        ("asked", "pending")
+    };
+    tx.prepare_cached(
+        "UPDATE hub_contested_edits SET outcome = ?4, resolved_at = ?5
+         WHERE token = ?1 AND session = ?2 AND path = ?3 AND kind = 'refusal'
+           AND outcome IN ('pending', ?6)",
+    )?
+    .execute(params![token, session, key, outcome, now, from])?;
+    Ok(())
+}
+
+/// The window's contested-edit rows with each hold as it stands now, and whether all are there.
+fn contested_facts(
+    tx: &Transaction<'_>,
+    repository: &str,
+    since: i64,
+    until: i64,
+    now: i64,
+) -> Result<(Vec<super::refusal_outcomes::Observed>, bool)> {
+    use super::refusal_outcomes::{MAX_READ, MAX_ROWS_PER_TOKEN, complete, observed};
+    let rows = tx
+        .prepare(
+            "SELECT c.kind, c.outcome, c.observed_at,
+                 EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+                     WHERE p.key = c.path AND p.expires_at > ?4 AND i.token =
+                         (SELECT h.token FROM hub_intents h WHERE h.id = c.hold)
+                       AND i.id NOT IN (SELECT s.intent FROM hub_sessions s
+                         WHERE s.token = c.token AND s.session = c.session
+                           AND s.intent IS NOT NULL)),
+                 EXISTS (SELECT 1 FROM hub_intents i WHERE i.id = c.hold)
+             FROM hub_contested_edits c
+             WHERE c.repository = ?1 AND c.observed_at >= ?2 AND c.observed_at <= ?3
+             ORDER BY c.observed_at, c.token, c.session, c.path, c.hold, c.kind LIMIT ?5",
+        )?
+        .query_map(
+            params![repository, since, until, now, MAX_READ as i64 + 1],
+            |r| {
+                Ok(observed(
+                    &r.get::<_, String>(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
+    let pruned: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hub_contested_edits WHERE repository = ?1
+             GROUP BY token HAVING COUNT(*) >= ?2 AND MIN(observed_at) > ?3)",
+        params![repository, MAX_ROWS_PER_TOKEN, since],
+        |r| r.get(0),
+    )?;
+    let complete = complete(rows.len(), since, now, pruned);
+    Ok((
+        rows.into_iter().take(MAX_READ).flatten().collect(),
+        complete,
     ))
+}
+
+/// The hook overhead rows of sessions active in the window, and whether all are there.
+fn overhead_facts(
+    tx: &Transaction<'_>,
+    repository: &str,
+    since: i64,
+    until: i64,
+    now: i64,
+) -> Result<(Vec<super::hook_overhead::SessionOverhead>, bool)> {
+    use super::hook_overhead::{MAX_READ, MAX_ROWS_PER_TOKEN, SessionOverhead, complete};
+    let count = |n: i64| u64::try_from(n).unwrap_or_default();
+    let rows = tx
+        .prepare(
+            "SELECT session, agent, hub_calls, injected_start, injected_refusal, injected_other,
+                 client_calls, client_ms_total, client_ms_max, client_timeouts,
+                 client_failed_open, first_at, updated_at
+             FROM hub_hook_overhead
+             WHERE repository = ?1 AND updated_at >= ?2 AND first_at <= ?3
+             ORDER BY updated_at DESC, token, session, agent LIMIT ?4",
+        )?
+        .query_map(
+            params![repository, since, until, MAX_READ as i64 + 1],
+            |r| {
+                Ok(SessionOverhead {
+                    session: r.get(0)?,
+                    agent: r.get(1)?,
+                    hub_calls: count(r.get(2)?),
+                    injected_start: count(r.get(3)?),
+                    injected_refusal: count(r.get(4)?),
+                    injected_other: count(r.get(5)?),
+                    client_calls: count(r.get(6)?),
+                    client_ms_total: count(r.get(7)?),
+                    client_ms_max: count(r.get(8)?),
+                    client_timeouts: count(r.get(9)?),
+                    client_failed_open: count(r.get(10)?),
+                    first_at: r.get(11)?,
+                    updated_at: r.get(12)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let pruned: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hub_hook_overhead WHERE repository = ?1
+             GROUP BY token HAVING COUNT(*) >= ?2 AND MIN(updated_at) > ?3)",
+        params![repository, MAX_ROWS_PER_TOKEN, since],
+        |r| r.get(0),
+    )?;
+    // Calls this process dropped, or has not written yet, are missing from the rows.
+    let complete = complete(rows.len(), since, now, pruned)
+        && super::hook_overhead::all_written(repository, since, until);
+    Ok((rows.into_iter().take(MAX_READ).collect(), complete))
 }
 
 /// Files a handoff request from the session for `key`, if the limits and the holders allow.
@@ -6295,6 +6509,11 @@ fn ask_in(
         row.intent.as_deref(),
         (&asked, open.len(), &queued),
     );
+    // A request the session made itself counts as asking; the Hub's own ask after a refusal
+    // does not, until the holder grants it.
+    if !auto && matches!(verdict, Verdict::Request(_) | Verdict::AlreadyAsked(_)) {
+        contested_settle(tx, token, name, key, false, now)?;
+    }
     let holder = match verdict {
         Verdict::Yours => return Ok(Asked::Yours),
         Verdict::NotHeld => return Ok(Asked::NotHeld),
@@ -8668,6 +8887,14 @@ impl Store for SqliteStore {
                 tx.commit()?;
                 return Ok(Answered::NoRequest);
             };
+            contested_settle(
+                &tx,
+                &request.requester_token,
+                &request.requester_session,
+                &key,
+                true,
+                now,
+            )?;
             let left = remaining(&current, &key);
             if left.is_empty() {
                 release_in(&tx, token, &current.id, now)?;
@@ -13488,6 +13715,10 @@ impl Store for SqliteStore {
             "signed-in owner's own structured catch-up deliveries"
         }
         .into();
+        let (contested, contested_complete) =
+            contested_facts(&tx, &scope.repository, since, until, now)?;
+        let (overhead, overhead_complete) =
+            overhead_facts(&tx, &scope.repository, since, until, now)?;
         tx.commit()?;
         Ok(ValueFacts {
             scope,
@@ -13505,6 +13736,10 @@ impl Store for SqliteStore {
             request_membership_complete,
             delivery_pruned_range,
             context_population,
+            contested,
+            contested_complete,
+            overhead,
+            overhead_complete,
         })
     }
 
@@ -13531,6 +13766,72 @@ impl Store for SqliteStore {
                     "value observation capacity reached".into(),
                 ));
             }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn hook_overhead(
+        &self,
+        token: &str,
+        repository: &str,
+        sample: &super::hook_overhead::Sample,
+        now: i64,
+    ) -> Result<()> {
+        use super::hook_overhead::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS};
+        let client = sample.client.unwrap_or_default();
+        let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let new: bool = tx.query_row(
+            "INSERT INTO hub_hook_overhead (repository, token, session, agent, hub_calls,
+                 injected_start, injected_refusal, injected_other, client_calls, client_ms_total,
+                 client_ms_max, client_timeouts, client_failed_open, first_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?14, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+             ON CONFLICT (token, session, agent) DO UPDATE SET
+                 repository = excluded.repository,
+                 hub_calls = hub_calls + excluded.hub_calls,
+                 injected_start = injected_start + excluded.injected_start,
+                 injected_refusal = injected_refusal + excluded.injected_refusal,
+                 injected_other = injected_other + excluded.injected_other,
+                 client_calls = client_calls + excluded.client_calls,
+                 client_ms_total = client_ms_total + excluded.client_ms_total,
+                 client_ms_max = MAX(client_ms_max, excluded.client_ms_max),
+                 client_timeouts = client_timeouts + excluded.client_timeouts,
+                 client_failed_open = client_failed_open + excluded.client_failed_open,
+                 updated_at = excluded.updated_at
+             RETURNING first_at = updated_at",
+            params![
+                repository,
+                token,
+                sample.session,
+                sample.agent,
+                count(sample.injected_start),
+                count(sample.injected_refusal),
+                count(sample.injected_other),
+                count(client.calls),
+                count(client.ms_total),
+                count(client.ms_max),
+                count(client.timeouts),
+                count(client.failed_open),
+                now,
+                count(sample.hub_calls)
+            ],
+            |row| row.get(0),
+        )?;
+        // A new row is the only write that can grow the table, so only it prunes.
+        if new {
+            tx.execute(
+                "DELETE FROM hub_hook_overhead WHERE repository = ?1 AND updated_at < ?2",
+                params![repository, now - RETAIN_SECONDS],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_hook_overhead WHERE (token, session, agent) IN (
+                     SELECT token, session, agent FROM hub_hook_overhead
+                     WHERE token = ?1 ORDER BY updated_at DESC, session, agent
+                     LIMIT -1 OFFSET ?2)",
+                params![token, MAX_ROWS_PER_TOKEN],
+            )?;
         }
         tx.commit()?;
         Ok(())

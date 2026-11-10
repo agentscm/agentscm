@@ -102,6 +102,9 @@ pub struct HookRequest {
     pub root: Option<String>,
     pub client: Option<String>,
     pub report_completion: bool,
+    /// The hook client's measure of its earlier calls (`hook_overhead::REPORT_HEADER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
     #[serde(skip)]
     pub body: Vec<u8>,
 }
@@ -139,6 +142,9 @@ impl HookRequest {
         }
         if self.report_completion {
             request = request.header(crate::hub::insights::COMPLETION_HEADER, "true");
+        }
+        if let Some(report) = &self.report {
+            request = request.header(crate::hub::hook_overhead::REPORT_HEADER, report);
         }
         Ok(request)
     }

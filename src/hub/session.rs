@@ -585,6 +585,18 @@ impl Guarded {
         keys.into_iter().cloned().collect()
     }
 
+    /// Each refused file with the hold (intent) it was refused for.
+    pub(super) fn refused_holds(&self) -> Vec<(String, String)> {
+        self.denied
+            .iter()
+            .flat_map(|o| {
+                o.your_paths
+                    .iter()
+                    .map(|k| (k.clone(), o.intent.id.clone()))
+            })
+            .collect()
+    }
+
     /// The events of the check, to append in the touch's transaction.
     pub(super) fn events(&self, token: &str, session: &str) -> Result<Vec<Event>> {
         let mut events = Vec::new();

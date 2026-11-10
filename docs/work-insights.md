@@ -27,14 +27,90 @@ resolved refusal episodes, configured follow-up evidence, recorded resources, an
 Context preparation does not establish transport delivery, application, or that an agent read
 it before editing. A refusal is not necessarily a defect. Retained self-reported check evidence
 keeps its assurance and source/recipe/policy applicability; it is not independent execution
-verification. Unknown observation populations and unallocated AgentSCM overhead remain unknown.
+verification. Unknown observation populations and AgentSCM's token overhead remain unknown;
+hook overhead is counted as described in [contested edits and hook overhead](#contested-edits-and-hook-overhead).
 Group `availability` and evidence `basis`, `assurance`, `availability`, and `applicability`
 explain the evidence available behind each number.
 
-Dismissed episodes, false-trigger classifications, failed follow-ups and cancelled follow-ups
-currently have no observation producer. Their fields are `null` and the contribution surfaces
-say **Not captured**. This does not establish zero such outcomes. Supported counts can still
+False-trigger classifications, failed follow-ups and cancelled follow-ups currently have no
+observation producer. Their fields are `null` and the contribution surfaces say **Not captured**.
+This does not establish zero such outcomes. `issues.dismissed` counts only contested edits an
+agent pushed through after a refusal (below); it is `null` for a single-Work query and when no
+hook session was seen in the window. Supported counts can still
 be observed zeros; other missing values, including context application and usage, stay unknown.
+
+## Contested edits and hook overhead
+
+Each contested-edit refusal is recorded with the session, file and the hold (intent) that caused
+it. Later Hub calls settle it:
+
+| Outcome | What the Hub observed |
+|---|---|
+| `pushed_through` | The same session's hook reported an edit of the file while its holder still kept it. |
+| `asked` | The session asked for the file itself (`agentscm_ask`) and no grant has followed. The holder may have declined. The Hub's own request after a refusal does not count as asking. |
+| `handed_off` | The holder granted a request for the file. |
+| `pending` | None of these, and a hold of the same holder still keeps the file. A hold renewed past its 30-minute cap under a new id still counts. The refused session's own hold never counts: two sessions of one token are two agents, so a session that waited and then took the file went elsewhere. |
+| `went_elsewhere` | None of these, and the holder no longer keeps the file. |
+| `unknown` | None of these, and the hold's record is gone. |
+
+Each overlap the Hub reported without refusing (a notice, for example to an agent whose hook runs
+after the edit, or to an MCP claim) is recorded as `proceeded`: the call that drew it took the file.
+Its hook edit went ahead, or it claimed the file over MCP.
+
+`issues.contested_edits` reports `refusals` and `notices` by outcome. Only refusals feed the issue
+totals: `pushed_through` is counted in `dismissed`, `handed_off` in `resolved`, and `pending`,
+`asked` and `unknown` in `unresolved`. A notice is not a dismissal and feeds no total.
+`went_elsewhere` is counted in neither `resolved` nor `unresolved`, because it is inferred from
+what the Hub did not see: a session that ended, or whose later hooks failed open, looks the same
+as one that moved on, and `coverage.gaps` says so. `dismissed` is `null` when no hook session was
+seen in the window, because only a hook can report an edit. An outcome is what the Hub saw, not
+why the agent did it, and an outcome that cannot be determined is reported as such, never as a
+favourable class.
+
+`overhead` reports, for the sessions active in the window and in total:
+- `hub_calls`: the hook calls that reached the Hub.
+- The characters of text in the reply as sent, split into session-start context (including the
+  session ID line and required rules), refusal text, and other text (notices, advice, requests).
+  Each distinct text is counted once, in UTF-16 units, as Claude Code limits them.
+- `client`: what the hook client measured itself. That is calls, total and longest latency in
+  milliseconds, calls that timed out, and calls that failed open.
+
+A call that timed out never reached the Hub, so the client keeps its counts in small files per
+agent session and sends them with the next call that does (`x-agentscm-hook-report`); no extra
+request is made. A call takes waiting files by renaming them first, so two hooks of one session
+running at once never send the same counts. Each report carries an id. When the call that carried
+it is not answered, the Hub may still have received it (a relayed request outlives the hook), so
+the client sends the same report again, with the same id, until a call is answered. The Hub counts
+each id once per session.
+
+Recording overhead never adds a store call to a hook. The Hub adds each call to an in-memory total
+and writes the totals 30 seconds after the first call since the last write, in one background
+store call. Only tokens the store has verified get a total of their own. A token not yet verified
+waits in a small table until the next write checks it, so made-up tokens cannot crowd out real
+sessions. `per_session` lists up to 50 sessions by agent and counts, without session or token
+identities. A session counts as a whole when it was active in the window, including its calls
+outside it.
+
+Coverage stays explicit. Both are recorded per session, so a single-Work query reports
+`availability: "not_scoped_to_work"`.
+- `sessions_without_client_report` counts sessions whose client sent no measurement: an older
+  client, a client whose calls all failed before a token was found, or one that never got a call
+  through after a measured one. Their latency, timeouts and fail-open answers are unknown, and
+  `coverage.gaps` says so.
+- Rows are kept 30 days and at most 1,000 per token of each kind. The cap is per token because
+  session IDs come from the client, and a cap per repository would let one token push out everyone
+  else's rows.
+- `partial` is true, with a gap, when the window reaches past the 30 days, a token's cap pruned
+  rows inside the window, or more rows matched than were read. For overhead it is also true when
+  this Hub process dropped calls of this repository inside the window because its memory tables
+  were full, or holds calls of this repository from the window that are overdue for writing. Calls
+  of the last minute are on their way to the store and do not make a read partial. A Hub restart
+  loses totals not yet written, and forgets which report ids it counted, so a report resent
+  across a restart can be counted twice.
+- A reply of "coordination unknown" from the Hub itself arrives as an answer, so the client does
+  not count it as failed open; `/v1/hub/health` counts those per process.
+
+Nothing is converted into time, money or a percentage.
 
 Reads default to seven days, accept a maximum 90-day window, and return bounded evidence.
 MCP lists a default of 20 evidence rows and permits at most 50; repeat `since`, `until`, `work_id` when used, and
@@ -283,7 +359,7 @@ unallocated and excluded from individual Work resource totals. `unallocated_usag
 counts retained report rows excluded from the selected scope's additive totals. For a shared
 request, an individual Work counts only its own excluded reports; the repository projection
 counts the request once and does not classify those included reports as unallocated. Missing usage, costs and
-AgentSCM overhead remain unknown. Work observation coverage does not measure token-volume or
+AgentSCM's token overhead remain unknown. Work observation coverage does not measure token-volume or
 all-provider coverage, and these measurements establish no causal savings.
 
 A requested Work is loaded explicitly, independently of the aggregate Work cap. Aggregate Work
