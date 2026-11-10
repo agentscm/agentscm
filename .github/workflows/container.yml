@@ -51,6 +51,7 @@ jobs:
   client-macos:
     # Unsigned convenience build for maintainers' test computers, built as release.yml builds its
     # aarch64-apple-darwin binary; released binaries come only from release.yml, with provenance.
+    # No continue-on-error: a macOS build break should turn this main run red, not hide.
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
     timeout-minutes: 45
