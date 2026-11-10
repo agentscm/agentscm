@@ -124,6 +124,22 @@ and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (w
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
 items stay applied, and sending the same batch again is safe.
 
+### `why`
+
+`agentscm why <commit | path | path:line>` asks the Hub which Work produced a commit or a file,
+and prints its description, outcome and decision checkpoints as JSON. A commit is anything
+`git rev-parse` resolves to a full SHA. For `path:line`, local `git blame` names the commit that
+last changed that line; for a path, `git log` names its newest commits (`--commits`, default 5,
+at most 20). Each commit is asked about together with the merge that brought it into `HEAD`:
+the oldest merge on `HEAD`'s first-parent line that descends from it, not a merge of `main`
+into the branch, because the Hub knows pull requests by their merge and head commits. On
+squash-merge history the blamed commit is already the merge commit. The path is asked about
+too, relative to the repository root, so `.` and absolute paths work and the root itself asks
+only about commits; its answer lists Work whose declared scope covers it. An answer with
+`known: false` means the Hub has no Work recorded for that commit or path: a commit merged
+without a linked Work, or history the Hub never saw, stays unknown. A line that is not
+committed yet names no commit.
+
 ### `change-capture` (experimental, Unix)
 
 After `agentscm client connect` has saved a write-capable connection for a checkout, configure its

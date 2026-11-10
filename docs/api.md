@@ -174,6 +174,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
 | `POST /v1/hub/standup/reconciliation` | Current lead; fenced server-evidence evaluation, preserves original reports and reservation authority |
 | `GET /v1/hub/standup/why` | Repository-scoped reader, read-only tokens allowed; exactly one of `commit` (full lowercase SHA) or `path`; the Work recorded for it, newest first, at most 10 |
+| `GET /v1/hub/standup/repositories` | Agent token, read-only allowed; current unfinished Work in every repository on this Hub that the token's person can read now, at most 10 per repository and 100 in all |
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.
@@ -190,6 +191,22 @@ session IDs are masked as in every other Work read. Branch names and text are ne
 so `known: false` means the Hub has no Work recorded for the subject, not that it had no
 reason. `work_complete` and `decisions_complete` say whether a list was cut. MCP exposes the
 same read as `agentscm_why`, and `agentscm why` resolves a path or line locally with Git first.
+
+`GET /v1/hub/standup/repositories` lets an agent see Work beyond its token's repository. It
+lists the connected repositories on the same forge host that the token's person can read now,
+each checked with the forge through the repository connection on every read (the All
+repositories page's 90-second role cache is not used, because this read returns Work details).
+Each row has `repository`, `repository_id`, `work` and `work_complete`. A `work` item is the
+compact brief of `agentscm_work_overview` (id, title, state, claim status, owner login, lead
+agent and session, next action, the first three scope paths with `scope_count`, `blocked`) plus
+`waiting`, true for Work handed over to a next lead. Another owner's agent labels and session
+IDs are masked. The top level has `unchecked` (repositories the forge could not answer for,
+counted and never named, because a name could reveal that a private repository exists),
+`complete` (true only when every connected repository was checked and none was left out),
+`work_complete` (false when the 100-item cap cut a list) and `checked_at`. A token that asks
+again within 30 seconds gets its previous answer back with the same `checked_at`, so a lost
+access can be served stale to that same token for up to 30 seconds; any other token sees it at
+once. MCP exposes the same read as the opt-in tool `agentscm_work_repositories`.
 
 ### Planned issues and issue linkage
 
