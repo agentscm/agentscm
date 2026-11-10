@@ -73,24 +73,32 @@ const ENTRYPOINT: &str = "CLAUDE_CODE_ENTRYPOINT";
 /// Whether this hook call should offer its prompt to the Hub.
 pub(super) fn applies(agent: &str, client_connection: bool, payload: &Value) -> bool {
     let env = |name: &str| std::env::var(name).ok();
-    let subagent = payload["agent_id"]
-        .as_str()
-        .is_some_and(|id| !id.is_empty());
     applies_with(
         agent,
         client_connection,
         payload,
         env(OFF_SWITCH).as_deref(),
-    ) && (!subagent || asks_its_app(env(ENTRYPOINT).as_deref()))
+    ) && asker_fits(payload, env(ENTRYPOINT).as_deref())
+}
+
+/// Whether the prompt's asker can be offered: the lead always; a subagent only with an id the
+/// Hub takes, and only where its dialog is on screen while this hook waits.
+fn asker_fits(payload: &Value, entrypoint: Option<&str>) -> bool {
+    match payload["agent_id"].as_str() {
+        None | Some("") => true,
+        Some(_) => agent_id_of(payload).is_some() && asks_its_app(entrypoint),
+    }
 }
 
 /// Whether the host asks an app for permission while this hook still waits, so a subagent's
 /// dialog is on screen meanwhile. Measured: started by an app or an SDK (`claude-desktop`,
 /// `sdk-cli`) the host sends the app its request as the hook starts. In a terminal (`cli`) it
 /// shows a subagent's dialog only after the hook returns, so waiting there would hide the prompt
-/// from the person at the keyboard; that prompt is left to the session.
+/// from the person at the keyboard; that prompt is left to the session. A host this does not
+/// know is taken to ask its app: if it does not, the request is never confirmed and the hook
+/// gives up after [`UNCONFIRMED_GIVE_UP`].
 fn asks_its_app(entrypoint: Option<&str>) -> bool {
-    entrypoint.is_some_and(|entry| !entry.trim().is_empty() && entry != "cli")
+    entrypoint.is_some_and(|entry| !matches!(entry.trim(), "" | "cli"))
 }
 
 /// Everything but the asker: see [`applies`] for a subagent's prompt.
@@ -943,15 +951,25 @@ mod tests {
         assert!(!applies_with("claude", false, &prompt, None));
         assert!(!applies_with("codex", true, &prompt, None));
         // A subagent's prompt is offered only where the host asks its app while the hook waits.
+        let mut subagent = prompt.clone();
+        subagent["agent_id"] = json!("sub-1");
         for (entrypoint, offered) in [
             (Some("claude-desktop"), true),
             (Some("sdk-cli"), true),
             (Some("cli"), false),
+            (Some(" cli "), false),
             (Some(" "), false),
             (None, false),
         ] {
-            assert_eq!(asks_its_app(entrypoint), offered, "{entrypoint:?}");
+            assert_eq!(asker_fits(&subagent, entrypoint), offered, "{entrypoint:?}");
+            // The lead's prompt is offered wherever the host runs.
+            assert!(asker_fits(&prompt, entrypoint), "{entrypoint:?}");
         }
+        // An empty id is the lead; an id the Hub would not take is nobody's prompt to offer.
+        subagent["agent_id"] = json!("");
+        assert!(asker_fits(&subagent, Some("cli")));
+        subagent["agent_id"] = json!("sub\n1");
+        assert!(!asker_fits(&subagent, Some("claude-desktop")));
         let mut question = prompt.clone();
         question["tool_name"] = json!("AskUserQuestion");
         assert!(applies_with("claude", true, &question, None));

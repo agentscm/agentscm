@@ -153,11 +153,30 @@ pub(super) fn wait_key(token: &str, native: &str) -> String {
 pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>, AtomicI64);
 
 impl Waiting {
+    /// The host's notice that a dialog is on screen for `native`. It names no asker and says
+    /// nothing, also when the dialog is a question or a subagent's, so a wait at a dialog stays as
+    /// it is: its kind, its asker, its start and what it asks. With no such wait on record (the
+    /// prompt's own hook did not report it), the notice is the wait.
+    pub(super) fn notice(
+        &self,
+        principal: &Principal,
+        native: &str,
+        session: &str,
+        agent: &str,
+        now: i64,
+    ) -> Result<()> {
+        if self.dialog_wait(&principal.token_id, native, now).is_some() {
+            return Ok(());
+        }
+        let reason = WaitReason::Permission;
+        self.record(principal, native, session, agent, reason, None, None, now)
+    }
+
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
     /// the subagent `asker` when the host names one, with `asks` saying what for when the hook
     /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`; a repeat by
-    /// the same asker that says nothing (the host's notice after its own prompt) keeps the older,
-    /// and leaves a question a question.
+    /// the same asker that says nothing keeps the older. The host's own notice goes through
+    /// [`Self::notice`].
     #[allow(clippy::too_many_arguments)] // The fields of one hook report.
     pub(super) fn record(
         &self,
@@ -176,21 +195,6 @@ impl Waiting {
         let mut rows = self.0.lock().map_err(|_| HubError::Busy)?;
         rows.retain(|_, row| row.current(now));
         let key = (principal.token_id.clone(), native.to_owned());
-        // The host's notice that a dialog is on screen arrives as a permission prompt that says
-        // nothing and names no asker, also when the dialog is a question or a subagent's. That
-        // is the wait already on record: its kind, its asker and what it asks all stay.
-        // shortcut: any such report over a dialog's wait is taken for the notice. A real prompt
-        // follows a tool call, which ends the wait first; pass the notice down from the hook
-        // route if a prompt ever follows a dialog with no call between.
-        if reason == WaitReason::Permission
-            && asks.is_none()
-            && asker.is_none()
-            && rows.get(&key).is_some_and(|row| {
-                matches!(row.reason, WaitReason::Permission | WaitReason::Question)
-            })
-        {
-            return Ok(());
-        }
         if !rows.contains_key(&key) {
             let mine = |row: &Row| row.principal.owner.id == principal.owner.id;
             if rows.values().filter(|row| mine(row)).count() >= MAX_OWNER_ROWS {
@@ -461,38 +465,41 @@ mod tests {
             record(WaitReason::Question, Some("Which color?"), 1_000),
             question
         );
-        // The notice names a permission prompt and says nothing: same wait, same start.
-        assert_eq!(record(WaitReason::Permission, None, 1_006), question);
+        let notice = |now| {
+            waiting.notice(&mine, "s", "s", "claude", now).unwrap();
+            waiting.dialog_wait("tok_a", "s", now)
+        };
+        // The notice says a dialog is on screen, not which: same wait, same start.
+        assert_eq!(notice(1_006), question);
         assert_eq!(
             waiting.owned(&mine, 2_000).unwrap()[0].asks.as_deref(),
             Some("Which color?")
         );
-        // A permission prompt that says what it is for is a new wait, and the end of a turn is
-        // no dialog at all.
+        // A permission prompt is a new wait, also one that says nothing, and the end of a turn
+        // is no dialog at all.
         assert_eq!(
-            record(WaitReason::Permission, Some("Push the branch"), 1_010),
+            record(WaitReason::Permission, None, 1_010),
             Some((1_010, None, WaitReason::Permission))
         );
         assert_eq!(record(WaitReason::Idle, None, 1_020), None);
-        // A subagent's prompt keeps its asker through the notice, which names none.
-        let report = |asker, asks, now| {
+        // With no dialog's wait on record, the notice is the wait.
+        assert_eq!(notice(1_025), Some((1_025, None, WaitReason::Permission)));
+        // A subagent's prompt keeps its asker through the notice, which names none. The lead's
+        // own prompt, which says nothing either, replaces it.
+        let report = |asker, now| {
+            let reason = WaitReason::Permission;
             waiting
-                .record(
-                    &mine,
-                    "s",
-                    "s",
-                    "claude",
-                    WaitReason::Permission,
-                    asker,
-                    asks,
-                    now,
-                )
+                .record(&mine, "s", "s", "claude", reason, asker, None, now)
                 .unwrap();
             waiting.dialog_wait("tok_a", "s", now)
         };
-        let asked = Some((1_030, Some("sub".to_owned()), WaitReason::Permission));
-        assert_eq!(report(Some("sub"), Some("Run it"), 1_030), asked);
-        assert_eq!(report(None, None, 1_036), asked);
+        let asked = Some((1_025, Some("sub".to_owned()), WaitReason::Permission));
+        assert_eq!(report(Some("sub"), 1_030), asked);
+        assert_eq!(notice(1_036), asked);
+        assert_eq!(
+            report(None, 1_040),
+            Some((1_025, None, WaitReason::Permission))
+        );
     }
 
     #[test]
