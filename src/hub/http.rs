@@ -147,9 +147,15 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .with_sync(github)
         .with_skill_workflows(workflows)
         .with_shared_conversation_retention_days(config.shared_conversation_retention_days)?;
-    // The waits sessions reported to the previous process are gone: a session that has not
-    // called since reads as not known to wait, never as quiet. So are their subagents.
-    state.onboarding.waiting().lost_before(unix_now());
+    // The waits sessions reported to the previous process: the list it left when it was stopped,
+    // or, when it left none, not known. Their subagents are not known either way.
+    let restoring = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let waiting = restoring.onboarding.waiting();
+        waiting.restore(&*restoring.store, unix_now());
+    })
+    .await
+    .map_err(|_| HubError::Unavailable("startup task failed".into()))?;
     state.onboarding.subagents().started(unix_now());
     // An app dropped from the apps file loses its credentials for good, not only while absent.
     let revoker = state.clone();
@@ -225,12 +231,15 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .slack
         .as_ref()
         .map(|slack| slack.clone().spawn_worker(state.clone()));
-    crate::http_listener::serve(
-        listener,
-        router(state),
-        crate::http_listener::shutdown_signal(),
-    )
-    .await;
+    // A stopping Hub leaves its waits for the process that starts next, as soon as it is told to
+    // stop: whoever stops it may not wait for the open calls to end, and a later save could
+    // replace a list the next process already took.
+    let stopping = state.clone();
+    let stop = async move {
+        crate::http_listener::shutdown_signal().await;
+        save_waits(stopping).await;
+    };
+    crate::http_listener::serve(listener, router(state), stop).await;
     if let Some(worker) = slack_worker {
         worker.abort();
     }
@@ -239,6 +248,19 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         worker.abort();
     }
     Ok(())
+}
+
+/// Saves the waits of sessions for the next Hub process. A failure is logged and costs only
+/// what a Hub that died costs: those sessions read as not known to wait.
+async fn save_waits(state: HubState) {
+    let saved = tokio::task::spawn_blocking(move || {
+        let waiting = state.onboarding.waiting();
+        waiting.save(&*state.store, unix_now())
+    })
+    .await;
+    if let Ok(Err(error)) = saved {
+        crate::hub::error_envelope::log_internal(&error);
+    }
 }
 
 pub struct ApiError {

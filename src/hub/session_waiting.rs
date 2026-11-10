@@ -4,10 +4,11 @@
 //! `waiting` event for the rest. The session's next tool call, prompt, start or end clears it, so
 //! it never outlives the wait it describes.
 //!
-//! Short-lived like the setup observations beside it: in memory, bounded, and lost on a Hub
-//! restart, after which a waiting session reads as not known rather than not waiting. The wait
-//! of a session its host named belongs to its person, not to the agent token that reported it
-//! (see [`holder`]). The only text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
+//! Short-lived like the setup observations beside it: in memory and bounded. A Hub that is
+//! stopped leaves its waits in the store for the process that starts next ([`Waiting::save`]);
+//! one that dies does not, and then a waiting session reads as not known rather than not
+//! waiting. The wait of a session its host named belongs to its person, not to the agent token
+//! that reported it (see [`holder`]). The only text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
 //! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
 //! shown to that session's own person alone. No prompt, tool input or transcript is kept here,
 //! and this table cannot answer a prompt. A wait at a permission prompt or a question may have a
@@ -16,10 +17,11 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::onboarding::same_repository;
-use super::store::Principal;
+use super::store::{ForgeIdentity, Principal, Store, User};
 use super::work_lifecycle::IN_FLIGHT_CAP_SECONDS;
 use super::{HubError, Result};
 
@@ -31,6 +33,10 @@ const MAX_ROWS: usize = 4096;
 /// Waits one person may have on record, across all their agent tokens. Far above real use: a
 /// person's sessions that wait are all listed, however many they run on one token.
 const MAX_OWNER_ROWS: usize = 256;
+/// The setting a stopping Hub leaves its waits in, for the process that starts next.
+const SAVED_KEY: &str = "hub.session_waiting.saved.v1";
+/// A saved list older than this is not believed: too much went unheard while the Hub was down.
+const SAVED_MAX_AGE_SECONDS: i64 = 10 * 60;
 /// The longest excerpt of what a wait asks that is kept, in characters.
 const MAX_ASKS_CHARS: usize = 500;
 
@@ -244,6 +250,8 @@ struct Row {
     asks: Option<String>,
     /// Kept under its person ([`holder`]), so it does not end with the token that reported it.
     person: bool,
+    /// The host said a dialog is on screen for this wait.
+    noticed: bool,
 }
 
 impl Row {
@@ -277,11 +285,51 @@ pub(super) fn wait_key(holder: &str, native: &str) -> String {
     )
 }
 
+/// The waits of a Hub that stopped, as [`Waiting::save`] leaves them.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    at: i64,
+    /// The mark of [`Waiting::lost_before`].
+    lost_before: i64,
+    rows: Vec<SavedRow>,
+}
+
+/// One saved wait: who waits, for what kind of answer and since when. Never what it asks.
+#[derive(Serialize, Deserialize)]
+struct SavedRow {
+    holder: String,
+    native: String,
+    session: String,
+    agent: String,
+    reason: String,
+    since: i64,
+    asker: Option<String>,
+    person: bool,
+    #[serde(default)]
+    noticed: bool,
+    token: String,
+    name: String,
+    repository: String,
+    repository_id: Option<i64>,
+    expires_at: i64,
+    owner: String,
+    provider: String,
+    host: String,
+    forge_user: i64,
+    login: String,
+}
+
 /// Keyed by the wait's [`holder`] and the session ID the hook reported.
 /// The second field is the time before which a session's last call leaves its wait unknown: the
 /// Hub's start, or just after the start of the newest wait it dropped for room.
+/// The third is a span of time with the same meaning for a last call inside it: what sessions
+/// that were at work before a Hub stopped may have reported while no Hub ran.
 #[derive(Default)]
-pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>, AtomicI64);
+pub struct Waiting(
+    Mutex<BTreeMap<(String, String), Row>>,
+    AtomicI64,
+    (AtomicI64, AtomicI64),
+);
 
 impl Waiting {
     /// The host's notice that a dialog is on screen for `native`. It names no asker and says
@@ -296,14 +344,24 @@ impl Waiting {
         agent: &str,
         now: i64,
     ) -> Result<()> {
-        if self
-            .dialog_wait(holder(principal, native), native, now)
-            .is_some()
-        {
-            return Ok(());
+        let kept_by = holder(principal, native);
+        if self.dialog_wait(kept_by, native, now).is_none() {
+            let reason = WaitReason::Permission;
+            self.record(principal, native, session, agent, reason, None, None, now)?;
         }
-        let reason = WaitReason::Permission;
-        self.record(principal, native, session, agent, reason, None, None, now)
+        let mut rows = self.0.lock().map_err(|_| HubError::Busy)?;
+        if let Some(row) = rows.get_mut(&(kept_by.to_owned(), native.to_owned())) {
+            row.noticed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether the host said a dialog is on screen for the current wait of `native` at one.
+    pub(super) fn noticed(&self, holder: &str, native: &str, now: i64) -> bool {
+        self.0.lock().is_ok_and(|rows| {
+            rows.get(&(holder.to_owned(), native.to_owned()))
+                .is_some_and(|row| row.noticed && row.current(now))
+        })
     }
 
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
@@ -371,12 +429,13 @@ impl Waiting {
         {
             return Ok(());
         }
-        let (since, said) = match rows.get(&key) {
+        let (since, said, noticed) = match rows.get(&key) {
             Some(row) if row.reason == reason => (
                 row.since,
                 row.asks.clone().filter(|_| row.asker.as_deref() == asker),
+                row.noticed,
             ),
-            _ => (now, None),
+            _ => (now, None, false),
         };
         rows.insert(
             key,
@@ -392,13 +451,124 @@ impl Waiting {
                     .filter(|text| !text.is_empty())
                     .or(said),
                 person,
+                noticed,
             },
         );
         Ok(())
     }
 
-    /// Says that a wait may be missing for any session whose last call was before `at`. The Hub
-    /// says so for its own start, since the waits reported to the previous process are gone.
+    /// Leaves the current waits in the store for the Hub process that starts next. What a wait
+    /// asks is not saved: that text is kept in memory only.
+    pub(super) fn save(&self, store: &dyn Store, now: i64) -> Result<()> {
+        let saved = {
+            let rows = self.0.lock().map_err(|_| HubError::Busy)?;
+            let rows = rows
+                .iter()
+                .filter(|(_, row)| row.current(now))
+                .map(|((holder, native), row)| SavedRow {
+                    holder: holder.clone(),
+                    native: native.clone(),
+                    session: row.session.clone(),
+                    agent: row.agent.clone(),
+                    reason: row.reason.code().to_owned(),
+                    since: row.since,
+                    asker: row.asker.clone(),
+                    person: row.person,
+                    noticed: row.noticed,
+                    token: row.principal.token_id.clone(),
+                    name: row.principal.name.clone(),
+                    repository: row.principal.repository.clone(),
+                    repository_id: row.principal.repository_id,
+                    expires_at: row.principal.expires_at,
+                    owner: row.principal.owner.id.clone(),
+                    provider: row.principal.owner.identity.provider.clone(),
+                    host: row.principal.owner.identity.host.clone(),
+                    forge_user: row.principal.owner.identity.user_id,
+                    login: row.principal.owner.login.clone(),
+                })
+                .collect();
+            Saved {
+                at: now,
+                lost_before: self.1.load(Ordering::Relaxed),
+                rows,
+            }
+        };
+        let text = serde_json::to_string(&saved).unwrap_or_default();
+        store.set_setting(SAVED_KEY, &text, "hub")
+    }
+
+    /// Takes the waits the previous Hub process left when it stopped. The list is taken once,
+    /// so a Hub that later dies without saving does not start from an old one, and it is
+    /// believed only while fresh. Without a list, the waits reported to the previous process are
+    /// gone: a session that has not called since reads as not known to wait, never as quiet.
+    /// With a list, what was reported while no Hub ran is still missing: a session that was at
+    /// work shortly before the stop, has no wait in the list and has not called since may have
+    /// stopped meanwhile, so it reads as not known until its next call.
+    pub(super) fn restore(&self, store: &dyn Store, now: i64) {
+        let left = store.get_setting(SAVED_KEY).ok().flatten();
+        let taken = left.is_none() || store.set_setting(SAVED_KEY, "", "hub").is_ok();
+        let saved = left
+            .filter(|_| taken)
+            .and_then(|text| serde_json::from_str::<Saved>(&text).ok())
+            .filter(|saved| saved.at <= now && now - saved.at < SAVED_MAX_AGE_SECONDS);
+        let (Some(saved), Ok(mut rows)) = (saved, self.0.lock()) else {
+            self.lost_before(now);
+            return;
+        };
+        self.lost_before(saved.lost_before);
+        // A session whose last call is older than a running call is believed was not at work.
+        let unheard = (saved.at - IN_FLIGHT_CAP_SECONDS, now);
+        self.2.0.store(unheard.0, Ordering::Relaxed);
+        self.2.1.store(unheard.1, Ordering::Relaxed);
+        for row in saved.rows.into_iter().take(MAX_ROWS) {
+            // Every kind a wait can have, also the ones a hook never reports by name.
+            let kinds = [
+                WaitReason::Permission,
+                WaitReason::Question,
+                WaitReason::Idle,
+                WaitReason::Finished,
+                WaitReason::Background,
+            ];
+            let Some(reason) = kinds.into_iter().find(|kind| kind.code() == row.reason) else {
+                continue;
+            };
+            let wait = Row {
+                principal: Principal {
+                    token_id: row.token,
+                    name: row.name,
+                    repository: row.repository,
+                    repository_id: row.repository_id,
+                    expires_at: row.expires_at,
+                    read_only: false,
+                    owner: User {
+                        id: row.owner,
+                        identity: ForgeIdentity {
+                            provider: row.provider,
+                            host: row.host,
+                            user_id: row.forge_user,
+                        },
+                        login: row.login,
+                        name: None,
+                        disabled: false,
+                    },
+                },
+                session: row.session,
+                agent: row.agent,
+                reason,
+                since: row.since,
+                asker: row.asker,
+                asks: None,
+                person: row.person,
+                noticed: row.noticed,
+            };
+            if wait.current(now) {
+                rows.insert((row.holder, row.native), wait);
+            }
+        }
+    }
+
+    /// Says that a wait may be missing for any session whose last call was before `at`: the
+    /// waits a Hub dropped for room, or the ones reported to a process that left no list.
     pub(super) fn lost_before(&self, at: i64) {
         self.1.fetch_max(at, Ordering::Relaxed);
     }
@@ -501,13 +671,11 @@ impl Waiting {
             };
             leads && row.session == session && row.current(now)
         });
+        let unheard = self.2.0.load(Ordering::Relaxed)..self.2.1.load(Ordering::Relaxed);
+        let missing = last_call < self.1.load(Ordering::Relaxed) || unheard.contains(&last_call);
         match wait {
             Some((_, row)) => LeadWait::Waiting(row.reason),
-            None if last_call < self.1.load(Ordering::Relaxed)
-                && now - last_call < MAX_AGE_SECONDS =>
-            {
-                LeadWait::Unknown
-            }
+            None if missing && now - last_call < MAX_AGE_SECONDS => LeadWait::Unknown,
             None => LeadWait::NotWaiting,
         }
     }
@@ -516,7 +684,6 @@ impl Waiting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::store::{ForgeIdentity, User};
 
     fn principal(token: &str, owner: &str, repository: &str) -> Principal {
         Principal {
@@ -839,6 +1006,108 @@ mod tests {
         assert_eq!(waiting.owned(&new, 1_900).unwrap().len(), 1);
         assert!(!waiting.owned(&new, 1_900).unwrap()[0].person);
         assert!(waiting.owned(&new, 2_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_hub_leaves_its_waits_for_the_one_that_starts_next() {
+        const NATIVE: &str = "0a1b2c3d-0000-4000-8000-000000000002";
+        // The Hub stops at `STOP` and the next process starts five seconds later.
+        const STOP: i64 = 100_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.sqlite");
+        let store = crate::hub::store::open(&format!("sqlite://{}", path.display())).unwrap();
+        let mut mine = principal("tok_a", "usr_me", "acme/widgets");
+        mine.expires_at = i64::MAX;
+        let stopping = Waiting::default();
+        let record = |native: &str, reason, asks| {
+            stopping
+                .record(
+                    &mine,
+                    native,
+                    native,
+                    "claude",
+                    reason,
+                    None,
+                    asks,
+                    STOP - 100,
+                )
+                .unwrap();
+        };
+        record(NATIVE, WaitReason::Permission, Some("Push it?"));
+        stopping
+            .notice(&mine, NATIVE, NATIVE, "claude", STOP - 94)
+            .unwrap();
+        record("idle", WaitReason::Idle, None);
+        record("busy", WaitReason::Background, None);
+        record("done", WaitReason::Finished, None);
+        stopping.lost_before(STOP - 50_000);
+        stopping.save(&*store, STOP).unwrap();
+        // The next process knows the same waits, from the same start, under the same keys.
+        let started = Waiting::default();
+        started.restore(&*store, STOP + 5);
+        let (before, after) = (
+            stopping.owned(&mine, STOP + 100).unwrap(),
+            started.owned(&mine, STOP + 100).unwrap(),
+        );
+        assert_eq!(after.len(), 2);
+        for (was, is) in before.iter().zip(&after) {
+            let same = |wait: &WaitingSession| {
+                (
+                    wait.key.clone(),
+                    wait.reason,
+                    wait.since,
+                    wait.person,
+                    wait.token.clone(),
+                )
+            };
+            assert_eq!(same(was), same(is));
+        }
+        // What a wait asks was never stored. That the host showed its dialog was.
+        assert!(after.iter().all(|wait| wait.asks.is_none()));
+        assert_eq!(
+            started.dialog_wait("usr_me", NATIVE, STOP + 100),
+            Some((STOP - 100, None, WaitReason::Permission))
+        );
+        assert!(started.noticed("usr_me", NATIVE, STOP + 100));
+        assert!(!started.noticed("tok_a", "idle", STOP + 100));
+        // A session that stopped on its own work still does. One with no wait on record is as
+        // known as it was (quiet since the old mark, not known before it), unless it was at
+        // work in the hour before the stop and has not called since: it may have stopped while
+        // no Hub ran.
+        let lead =
+            |session, last_call| started.lead("usr_me", "tok_a", session, last_call, STOP + 100);
+        assert_eq!(
+            lead("busy", STOP - 200),
+            LeadWait::Waiting(WaitReason::Background)
+        );
+        assert_eq!(
+            lead("done", STOP - 200),
+            LeadWait::Waiting(WaitReason::Finished)
+        );
+        assert_eq!(lead("other", STOP - 40_000), LeadWait::NotWaiting);
+        assert_eq!(lead("other", STOP - 60_000), LeadWait::Unknown);
+        assert_eq!(lead("other", STOP - 600), LeadWait::Unknown);
+        assert_eq!(lead("other", STOP + 5), LeadWait::NotWaiting);
+        // The session's next call ends its restored wait.
+        started.clear(holder(&mine, NATIVE), NATIVE, None, false);
+        assert_eq!(started.dialog_wait("usr_me", NATIVE, STOP + 100), None);
+        // The list is taken once: a Hub that then dies without saving starts knowing nothing.
+        let died = Waiting::default();
+        died.restore(&*store, STOP + 200);
+        assert!(died.owned(&mine, STOP + 300).unwrap().is_empty());
+        assert_eq!(
+            died.lead("usr_me", "tok_a", "idle", STOP + 150, STOP + 300),
+            LeadWait::Unknown
+        );
+        // A list from a Hub that was down too long is not believed.
+        stopping.save(&*store, STOP).unwrap();
+        let late = Waiting::default();
+        late.restore(&*store, STOP + SAVED_MAX_AGE_SECONDS);
+        assert!(
+            late.owned(&mine, STOP + SAVED_MAX_AGE_SECONDS)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

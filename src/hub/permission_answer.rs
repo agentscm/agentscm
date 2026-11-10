@@ -9,9 +9,10 @@
 //! text of the Hub's that reaches the model is what the person typed: a reason with a deny, or
 //! an answer to a question.
 //!
-//! In memory only, like the waits beside it ([`super::session_waiting`]): bounded, lost on a Hub
-//! restart (a hook then reads an unknown request and leaves the prompt to the session), and never
-//! written to either store, a log, a notification or a status read. A request is live only while
+//! In memory only: bounded, and never written to either store, a log, a notification or a status
+//! read. A Hub restart loses every request. A hook then reads an unknown request and offers its
+//! prompt again, which the Hub takes while it still knows the session's wait at that prompt
+//! ([`super::session_waiting`] keeps the waits of a Hub that was stopped). A request is live only while
 //! the permission wait it was made for is still the session's current wait, so a prompt answered
 //! in the session, or replaced by anything else, ends it.
 //!
@@ -34,6 +35,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
@@ -540,6 +542,22 @@ impl From<Refusal> for ApiError {
     }
 }
 
+/// The id of the request for one prompt of one wait: the same when the same hook offers the same
+/// prompt again, also to a Hub process that started since and never issued it. It says which
+/// prompt a request is for and proves nothing about who asks: the caller is known by its agent
+/// token, and whether the host showed the prompt by the wait.
+fn request_id(holder: &str, native: &str, since: i64, input_hash: &str, offer: &Offer) -> String {
+    const DOMAIN: &str = "agentscm.hub.permission-request.v1";
+    let (reason, choices, questions) = (offer.takes_reason, &offer.choices, &offer.questions);
+    let parts = (
+        DOMAIN, holder, native, since, input_hash, reason, choices, questions,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&parts).unwrap_or_default())
+    )
+}
+
 /// What a hook registers: the facts of one prompt, all made on the machine.
 pub(super) struct Registration {
     pub session: String,
@@ -684,19 +702,30 @@ impl Requests {
         registration: Registration,
         now: i64,
     ) -> Outcome<(String, Phase)> {
-        self.register_with(waiting, principal, registration, Offer::default(), now)
+        self.register_with(
+            waiting,
+            principal,
+            registration,
+            Offer::default(),
+            None,
+            now,
+        )
     }
 
     /// Records a prompt the hook is showing. Needs the session's current wait at that kind of
     /// dialog (a question for an offer with questions, a permission prompt otherwise), asked by
     /// the same subagent. A repeat for the same prompt returns the same request; a different
-    /// prompt of the session ends the older request.
+    /// prompt of the session ends the older request. `again` is the request id a hook holds
+    /// from an earlier registration that the Hub no longer knows (it restarted): the prompt is
+    /// taken only as that same request, and is confirmed at once when the host's notice for
+    /// its wait is on record.
     pub(super) fn register_with(
         &self,
         waiting: &Waiting,
         principal: &Principal,
         registration: Registration,
         offer: Offer,
+        again: Option<&str>,
         now: i64,
     ) -> Outcome<(String, Phase)> {
         if principal.read_only || now >= principal.expires_at {
@@ -784,9 +813,17 @@ impl Requests {
         // A request is its session's, like the wait it is for: of a session its host named, it
         // is the person's, whichever of their agent tokens registered it.
         let kept_by = holder(principal, &session);
-        match waiting.dialog_wait(kept_by, &session, now) {
-            Some((_, asker, waits)) if asker == agent_id && waits == kind => {}
+        let since = match waiting.dialog_wait(kept_by, &session, now) {
+            Some((since, asker, waits)) if asker == agent_id && waits == kind => since,
             _ => return Err(Refusal::NotWaiting),
+        };
+        // The id names this prompt of this wait. A hook that offers again a prompt of an earlier
+        // wait (it outlived an answer in the session) holds another id, and is not heard. Two
+        // prompts of one wait that never ended between them share its start, so there the last
+        // offer wins, as it does without `again`.
+        let made = request_id(kept_by, &session, since, &input_hash, &offer);
+        if again.is_some_and(|held| held != made) {
+            return Err(Refusal::NotWaiting);
         }
         let session_of = |row: &Pending| row.holder == kept_by && row.native == session;
         // The same prompt offers the same things: the hash covers the tool input, not what the
@@ -819,11 +856,14 @@ impl Requests {
         if inner.rows.len() >= MAX_LIVE {
             return Err(Refusal::Busy);
         }
-        let confirmed = inner
-            .prompts
-            .get(&(kept_by.to_owned(), session.clone()))
-            .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
-        let id = super::login::random_hex()?;
+        // A prompt offered again was confirmed by a notice this process may never have heard:
+        // the wait remembers it, also across a restart.
+        let confirmed = (again.is_some() && waiting.noticed(kept_by, &session, now))
+            || inner
+                .prompts
+                .get(&(kept_by.to_owned(), session.clone()))
+                .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
+        let id = made;
         let state = if confirmed {
             Phase::Pending
         } else {
@@ -1173,6 +1213,10 @@ struct RegisterBody {
     choices: Vec<Choice>,
     #[serde(default)]
     questions: Vec<Question>,
+    /// The request id the hook holds for this prompt, when the Hub answered a poll of it with
+    /// 404.
+    #[serde(default)]
+    again: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1209,6 +1253,7 @@ async fn register(
             choices: body.choices,
             questions: body.questions,
         },
+        body.again.as_deref(),
         unix_now(),
     )?;
     Ok(Json(Registered {
@@ -2194,8 +2239,14 @@ mod tests {
             questions: Vec::new(),
         };
         let register = |offer: Offer, hash: &str, at| {
-            let made =
-                requests.register_with(&waiting, &mine, registration("s", None, hash), offer, at);
+            let made = requests.register_with(
+                &waiting,
+                &mine,
+                registration("s", None, hash),
+                offer,
+                None,
+                at,
+            );
             requests.confirm("tok_a", "s", at);
             made
         };
@@ -2270,7 +2321,14 @@ mod tests {
         wait(&waiting, &mine, "t", WaitReason::Permission, None, at);
         let again = |offer: Offer| {
             requests
-                .register_with(&waiting, &mine, registration("t", None, HASH), offer, at)
+                .register_with(
+                    &waiting,
+                    &mine,
+                    registration("t", None, HASH),
+                    offer,
+                    None,
+                    at,
+                )
                 .unwrap()
                 .0
         };
@@ -2390,6 +2448,7 @@ mod tests {
                 &mine,
                 registration("s", None, HASH),
                 offer.clone(),
+                None,
                 at,
             )
         };
@@ -2531,6 +2590,63 @@ mod tests {
             requests.token_for("usr_me", Some(7), &kept).unwrap(),
             "tok_old"
         );
+    }
+
+    #[test]
+    fn a_hook_offers_its_prompt_again_to_a_hub_that_restarted() {
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, NAMED, WaitReason::Permission, None, 1_000);
+        let before = Requests::default();
+        let id = before
+            .register(&waiting, &mine, registration(NAMED, None, HASH), 1_001)
+            .unwrap()
+            .0;
+        // The Hub restarted: it kept the session's wait and none of the requests.
+        let after = Requests::default();
+        assert_eq!(after.check(&waiting, "tok_a", &id, HASH, 1_100), None);
+        let again = |requests: &Requests, held: &str, hash: &str, at| {
+            let prompt = registration(NAMED, None, hash);
+            requests.register_with(&waiting, &mine, prompt, Offer::default(), Some(held), at)
+        };
+        // Another id, or another prompt under that id, is not the request the hook holds.
+        assert!(matches!(
+            again(&after, &"0".repeat(64), HASH, 1_101),
+            Err(Refusal::NotWaiting)
+        ));
+        assert!(matches!(
+            again(&after, &id, OTHER_HASH, 1_101),
+            Err(Refusal::NotWaiting)
+        ));
+        // The same prompt of the same wait is the same request. Saying `again` confirms
+        // nothing: while the host has not said it shows the prompt, the request is not offered.
+        assert_eq!(
+            again(&after, &id, HASH, 1_101).unwrap(),
+            (id.clone(), Phase::Unconfirmed)
+        );
+        // The host's notice is kept with the wait, so the Hub that started next still knows of
+        // it and needs no second one: the request is listed and can be answered at once.
+        waiting
+            .notice(&mine, NAMED, NAMED, "claude", 1_002)
+            .unwrap();
+        let after = Requests::default();
+        assert_eq!(
+            again(&after, &id, HASH, 1_102).unwrap(),
+            (id.clone(), Phase::Pending)
+        );
+        assert!(matches!(
+            after.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, 1_103),
+            Ok(Decision::Allow)
+        ));
+        // The session answered there and stopped at its next prompt: a hook of the earlier
+        // prompt that is still running is not heard, so it cannot stand in for the new one.
+        waiting.clear(holder(&mine, NAMED), NAMED, None, false);
+        wait(&waiting, &mine, NAMED, WaitReason::Permission, None, 1_200);
+        let restarted = Requests::default();
+        assert!(matches!(
+            again(&restarted, &id, HASH, 1_201),
+            Err(Refusal::NotWaiting)
+        ));
     }
 
     #[test]
