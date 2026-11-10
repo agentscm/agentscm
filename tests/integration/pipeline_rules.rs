@@ -878,6 +878,8 @@ struct PollFakeState {
     /// Open pull requests listed for `state=open`, and each one's changed files.
     open: Vec<i64>,
     files: BTreeMap<i64, Vec<String>>,
+    /// After that pull request's files are read, its head moves to this commit.
+    move_after_files: Option<(i64, String)>,
 }
 fn raw_poll_pull(provider: &str, number: i64, sha: &str, merged: bool) -> Value {
     if provider == "github" {
@@ -969,13 +971,41 @@ async fn poll_fake(
                 }
                 if kind == "files" {
                     let number = path.rsplit('/').nth(1).unwrap().parse::<i64>().unwrap();
-                    return Json(
-                        s.files[&number]
-                            .iter()
-                            .map(|f| json!({"filename": f, "status": "modified"}))
-                            .collect::<Vec<_>>(),
-                    )
-                    .into_response();
+                    let query = |key: &str| {
+                        uri.query()
+                            .unwrap_or("")
+                            .split('&')
+                            .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+                            .and_then(|v| v.parse::<usize>().ok())
+                    };
+                    let (page, per_page) = (query("page").unwrap_or(1), query("per_page").unwrap_or(30));
+                    let files = &s.files[&number];
+                    let body: Vec<_> = files
+                        .iter()
+                        .skip((page - 1) * per_page)
+                        .take(per_page)
+                        .map(|f| json!({"filename": f, "status": "modified"}))
+                        .collect();
+                    let more = page * per_page < files.len();
+                    if let Some((moved, sha)) = s.move_after_files.take() {
+                        if moved == number {
+                            s.pulls.get_mut(&number).unwrap()["head"]["sha"] = json!(sha);
+                        } else {
+                            s.move_after_files = Some((moved, sha));
+                        }
+                    }
+                    let mut response = Json(body).into_response();
+                    if more {
+                        response.headers_mut().insert(
+                            "link",
+                            HeaderValue::from_str(&format!(
+                                "<http://fake.invalid{path}?per_page={per_page}&page={}>; rel=\"next\"",
+                                page + 1
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    return response;
                 }
                 if kind == "list" {
                     let url = reqwest::Url::parse(&format!("http://fake.invalid{uri}")).unwrap();
@@ -1640,11 +1670,11 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
         first.blocked.is_none() && first.checkpoint_advanced,
         "{first:?}"
     );
-    // No merge rule is installed, so closed proposals are not listed; drafts and forks
-    // are re-read but their files are not.
+    // No merge rule is installed, so closed proposals are not listed. Drafts and forks are
+    // not read; the head is read again after its files.
     assert_eq!(
         state.lock().unwrap().requests,
-        vec!["repo", "open", "pull", "files", "pull", "pull"]
+        vec!["repo", "open", "pull", "files", "pull"]
     );
     let pending = j.pending(8).unwrap();
     assert_eq!(pending.len(), 1);
@@ -1673,10 +1703,7 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     .await
     .unwrap();
     assert_eq!(second.skipped_confirmed, 1);
-    assert_eq!(
-        state.lock().unwrap().requests,
-        vec!["repo", "open", "pull", "pull"]
-    );
+    assert_eq!(state.lock().unwrap().requests, vec!["repo", "open"]);
     assert_eq!(j.pending(8).unwrap().len(), 1);
     // The same executor runs the head's exact source.
     let claim = j.claim(&pending[0].dispatch_id).unwrap();
@@ -1700,14 +1727,15 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     let pending = j.pending(8).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event.accepted_commit, "e".repeat(40));
-    // A file list past the retained bound is unknown, never "no match": the rule does not run.
+    // More than three pages of files is unknown, never "no match": the rule does not run, and
+    // the poll and status say so.
     {
         let mut s = state.lock().unwrap();
         s.pulls
             .insert(12, open_pull(12, &"f".repeat(40), false, 42));
         s.open = vec![12];
         s.files
-            .insert(12, (0..3001).map(|i| format!("docs/{i}.md")).collect());
+            .insert(12, (0..301).map(|i| format!("docs/{i}.md")).collect());
     }
     let report = poll_merges(
         api,
@@ -1718,8 +1746,146 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     )
     .await
     .unwrap();
-    let observed = &report.observations[0]["event"];
-    assert_eq!(observed["changes"]["paths"], Value::Null, "{observed}");
+    let observed = &report.observations[0];
+    assert_eq!(
+        observed["event"]["changes"]["paths"],
+        Value::Null,
+        "{observed}"
+    );
+    assert_eq!(
+        observed["previews"][0]["preview"]["unknown"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(report.not_evaluated, 1);
+    assert_eq!(j.unevaluated(8).unwrap()[0]["proposal"], 12);
+    // A list too large for one journal row is unknown too, and the journal still opens.
+    {
+        let mut s = state.lock().unwrap();
+        s.pulls
+            .insert(13, open_pull(13, &"1".repeat(40), false, 42));
+        s.open = vec![13];
+        s.files
+            .insert(13, (0..300).map(|i| format!("src/{i:0>230}.rs")).collect());
+    }
+    let report = poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 4,
+    )
+    .await
+    .unwrap();
+    assert!(report.blocked.is_none(), "{report:?}");
+    assert_eq!(
+        report.observations[0]["event"]["changes"]["paths"],
+        Value::Null
+    );
+    drop(j);
+    let mut j = journal(&f);
     assert_eq!(j.pending(8).unwrap().len(), 1);
+    // A head that moves while its files are read is not accepted; the next poll reads it again.
+    {
+        let mut s = state.lock().unwrap();
+        s.pulls
+            .insert(14, open_pull(14, &"2".repeat(40), false, 42));
+        s.open = vec![14];
+        s.files.insert(14, vec!["src/a.rs".into()]);
+        s.move_after_files = Some((14, "3".repeat(40)));
+    }
+    let report = poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 5,
+    )
+    .await
+    .unwrap();
+    assert!(report.blocked.is_some() && !report.checkpoint_advanced);
+    assert_eq!(j.pending(8).unwrap().len(), 1);
+    poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 6,
+    )
+    .await
+    .unwrap();
+    let pending = j.pending(8).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[1].event.accepted_commit, "3".repeat(40));
     task.abort();
+}
+
+fn event_rows(f: &Fixture) -> i64 {
+    rusqlite::Connection::open(f.data.join("pipeline-rules/state.sqlite"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM pipeline_events", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn head_observations_follow_base_labels_and_rule_generation_and_are_pruned() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let head = |target: &str, labels: &[&str], commit: &str| ConfirmedMerge {
+        target: target.into(),
+        labels: labels.iter().map(|v| v.to_string()).collect(),
+        accepted_commit: commit.into(),
+        ..head_event(&f, Some(&["src/a.rs"]))
+    };
+    // Retargeting an observed head to the rule's branch evaluates it again.
+    assert!(j.accept(&head("dev", &[], &f.commit)).unwrap().is_empty());
+    assert_eq!(j.accept(&head("main", &[], &f.commit)).unwrap().len(), 1);
+    // A relabel is a new observation, but the same head never runs twice for one rule.
+    assert!(
+        j.accept(&head("main", &["x"], &f.commit))
+            .unwrap()
+            .is_empty()
+    );
+    // A head seen while the rule was disabled runs once it is enabled again.
+    let mut rule = j.rule("acme/widgets", "scan").unwrap();
+    rule.enabled = false;
+    rule.generation = 2;
+    j.install(&rule, Some(1)).unwrap();
+    let other = "a".repeat(40);
+    assert!(j.accept(&head("main", &[], &other)).unwrap().is_empty());
+    rule.enabled = true;
+    rule.generation = 3;
+    j.install(&rule, Some(2)).unwrap();
+    assert_eq!(j.accept(&head("main", &[], &other)).unwrap().len(), 1);
+    // Heads of one pull request that started no run are pruned when another is accepted.
+    let quiet = |commit: &str| ConfirmedMerge {
+        accepted_commit: commit.into(),
+        ..head_event(&f, Some(&["README.md"]))
+    };
+    for commit in ["b", "c", "d"] {
+        assert!(j.accept(&quiet(&commit.repeat(40))).unwrap().is_empty());
+    }
+    // Left: the two heads that ran, and the newest.
+    assert_eq!(event_rows(&f), 3);
+    // Many failed predicates are stored within what opening the journal accepts.
+    let mut strict = pull_rule(&f);
+    strict.rule_id = "strict".into();
+    strict.enabled = false;
+    strict.trigger.target = "release".into();
+    strict.trigger.labels_all = BTreeSet::from(["security".into()]);
+    strict.trigger.min_changed_files = Some(50);
+    strict.trigger.min_changed_lines = Some(500);
+    j.install(&strict, None).unwrap();
+    let many = quiet(&"e".repeat(40));
+    assert!(preview(&strict, &many).reasons.len() > 4);
+    j.accept(&many).unwrap();
+    // An event too large for a journal row is refused when written, never on open.
+    let paths: Vec<String> = (0..300).map(|i| format!("src/{i:0>230}.rs")).collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    assert!(j.accept(&head_event(&f, Some(&paths))).is_err());
+    drop(j);
+    journal(&f);
 }

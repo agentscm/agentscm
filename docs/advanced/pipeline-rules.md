@@ -204,31 +204,63 @@ predicates narrow it, and every one must hold:
 
 These predicates are refused on a merge rule.
 
-Unknown stays unknown. When GitHub's file list is incomplete (more pages than
-the client reads), its paths exceed 3000 entries, 256 KiB in all or 4096 bytes for one path, a count is missing,
-or matching exceeds its work limit, preview reports `could not evaluate ...`,
-lists the predicate under `unknown` and the rule does not run. With
-`run_when_unknown: true` the rule runs anyway when every predicate it could
-evaluate holds, and preview still lists what it could not evaluate.
+Unknown stays unknown. The paths are unknown when:
 
-`observe --proposal N` confirms an open head as well as a merge, and `poll`
-lists open pull requests when any rule that is not policy-owned uses this event.
-Each head is re-read with its file list; a head already observed is skipped from
-the listing. The file list is read just after the head, so a push in between
-can pair a head with the next head's files; the next head is observed on its
-own. A head event is keyed apart from a merge of the same commit.
+- the pull request has more than 300 changed files (the client reads three pages
+  of 100);
+- GitHub's file reply is too large;
+- one path is longer than 4096 bytes;
+- or the list does not fit one 64 KiB journal event.
+
+A missing count, and matching that exceeds its work limit, are unknown in the
+same way. Preview then reports `could not evaluate ...`, lists the predicate
+under `unknown`, and the rule does not run. With `run_when_unknown: true` the
+rule runs anyway when every predicate it could evaluate holds, and preview still
+lists what it could not evaluate. `poll` shows each rule's preview for every head
+it reads, counts heads that were not evaluated in `not_evaluated`, and `status`
+lists recent ones under `unevaluated`.
+
+`observe --proposal N` confirms an open head as well as a merge. `poll` lists
+open pull requests when any rule that is not policy-owned uses this event:
+
+- Drafts and fork heads in the listing are not read.
+- Each other head is read, its file list is read, and then the head is read again.
+  If the head moved in between, nothing is accepted and the next poll reads it
+  again.
+- A head is skipped when every pull request rule has already evaluated that
+  head, base branch and label set at the rule's current generation.
+
+So retargeting, relabelling, editing a rule or re-enabling it evaluates a head
+again, but one rule runs a head at most once. Older heads of the same pull
+request that started no run are pruned. A head event is keyed apart from a merge
+of the same commit. A write that would take the journal past its 128 MiB budget
+is refused, so the journal always opens.
 
 Preview takes the same synthetic JSON with `"kind": "pull_request"` and an
 optional `changes` object (`files`, `lines`, `paths`; a missing value is
-unknown). For a head, `accepted_commit` is the head commit. The dispatch keeps
-the event, so status shows which rule and which head started each run.
+unknown). For a head, `accepted_commit` is the head commit, and the workflow also
+gets the input field `event` set to `pull_request`. The dispatch keeps the
+event, so status shows which rule and which head started each run.
 
-Delivery uses the same executor, profile and limits as a merge rule, and the
-head's selected skill resource bytes must still equal the pinned ones, so a
-pull request cannot rewrite its own rule's instructions. The runner never
-fetches: the head commit must already be in the operator's checkout (for
-example after `git fetch origin`), or delivery is blocked. Rules owned by an
-operating policy receive merge events only.
+Delivery uses the same executor, profile and limits as a merge rule. The head's
+selected skill resource bytes must still equal the pinned ones, so a pull
+request cannot rewrite its own rule's instructions. The runner never fetches:
+the head commit must already be in the operator's checkout (for example after
+`git fetch origin`), or delivery is blocked. Rules owned by an operating policy
+receive merge events only.
+
+**Who runs code on your machine.** A pull request rule runs the profile's local
+commands and the skill agent on an unreviewed head. It runs them with the
+operator account's privileges and credentials. Any account that can push a
+branch to the repository can start that run, including bots and apps such as
+Dependabot. The head's files can also try to steer the agent (prompt injection).
+Before enabling one:
+
+- Run it under a dedicated operator account that holds no credentials beyond the
+  forge read token, on a machine or container you can discard.
+- Keep the profile's commands to read-only analysis.
+- Restrict who can push branches to the repository. A label is no gate: anyone
+  who can push can also label.
 
 ## Inspect and recover
 

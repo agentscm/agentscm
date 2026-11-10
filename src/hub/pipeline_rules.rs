@@ -147,8 +147,12 @@ pub struct ObservedChanges {
 
 const MAX_PATH_GLOBS: usize = 32;
 const MAX_PATH_GLOB_BYTES: usize = 256;
-const MAX_CHANGED_PATHS: usize = 3000;
-const MAX_CHANGED_PATH_BYTES: usize = 256 * 1024;
+/// Journal row and total limits. Writes refuse what `validate_recovery` would refuse on open,
+/// so no stored row can stop the journal from opening.
+const MAX_EVENT_BODY: usize = 65536;
+const MAX_OBSERVATION_REASONS: usize = 4;
+const MAX_REASON_CHARS: usize = 1024;
+const MAX_JOURNAL_PAYLOAD: i64 = 128 * 1024 * 1024;
 /// Git's own path limit on most systems; it also bounds one glob match's work.
 const MAX_CHANGED_PATH_LEN: usize = 4096;
 /// Matching work per preview, in the glob matcher's units; past it the paths are unknown.
@@ -407,8 +411,7 @@ fn labels_of(pull: &serde_json::Value) -> BTreeSet<String> {
 }
 
 /// A GitHub pull request that is open, not a draft, and whose head is in this repository (a
-/// fork's head is never run). The file list is read after the head, so a push in between can
-/// pair this head with the next head's files; that next head is observed on its own.
+/// fork's head is never run).
 async fn open_head(
     api: ForgeApi<'_>,
     token: &str,
@@ -432,11 +435,20 @@ async fn open_head(
         .to_owned();
     let count = |key: &str| pull.get(key).and_then(|v| v.as_u64());
     let (paths, truncated) = api.pull_files(token, repository, number).await?;
-    let complete = !truncated
-        && paths.len() <= MAX_CHANGED_PATHS
-        && paths.iter().map(String::len).sum::<usize>() <= MAX_CHANGED_PATH_BYTES
-        && paths.iter().all(|p| p.len() <= MAX_CHANGED_PATH_LEN);
-    let event = ConfirmedMerge {
+    // The file list is not pinned to a commit: re-read the head and retry next poll if it moved.
+    let after = api.pull(token, repository, number).await?;
+    if after
+        .as_ref()
+        .and_then(|p| p.pointer("/head/sha")?.as_str())
+        != Some(head.as_str())
+    {
+        return Err(Error::Invalid(
+            "pull request head moved while its files were read; it is read again next poll".into(),
+        )
+        .into());
+    }
+    let complete = !truncated && paths.iter().all(|p| p.len() <= MAX_CHANGED_PATH_LEN);
+    let mut event = ConfirmedMerge {
         provider: "github".into(),
         host: repository.host.clone(),
         repository: repository.full_name.clone(),
@@ -456,6 +468,12 @@ async fn open_head(
             paths: complete.then_some(paths),
         }),
     };
+    // A list too large to retain is unknown, never "no match".
+    if serde_json::to_vec(&event).map_err(Error::from)?.len() > MAX_EVENT_BODY
+        && let Some(changes) = event.changes.as_mut()
+    {
+        changes.paths = None;
+    }
     validate_event(&event)?;
     Ok(Some(event))
 }
@@ -476,6 +494,8 @@ pub struct PollReport {
     pub checkpoint_advanced: bool,
     pub blocked: Option<PollBlocked>,
     pub coverage: &'static str,
+    /// Pull request heads a rule did not run on because a predicate could not be evaluated.
+    pub not_evaluated: usize,
 }
 impl PollReport {
     fn block(&mut self, error: ObservationError) {
@@ -540,6 +560,7 @@ pub async fn poll_merges(
         unread_pages: None,
         checkpoint_advanced: false,
         blocked: None,
+        not_evaluated: 0,
         coverage: "newest 100 updated proposals; known confirmed events are skipped, unconfirmed candidates are re-read; labels are observation-time",
     };
     let (merges, pulls) = journal.legacy_events(&repository.full_name)?;
@@ -612,7 +633,7 @@ pub async fn poll_merges(
                 }
             });
         if let Some(commit) = commit
-            && journal.confirmed_hint(provider, repository, number, commit, TriggerEvent::Merge)?
+            && journal.confirmed_hint(provider, repository, number, commit)?
         {
             report.skipped_confirmed += 1;
             continue;
@@ -659,32 +680,63 @@ pub async fn poll_merges(
                 report.block(error.into());
                 continue;
             };
+            // The listing is a hint: a draft or fork here is not read; the full read re-checks the rest.
+            if candidate.get("draft").and_then(|v| v.as_bool()) == Some(true)
+                || candidate.pointer("/head/repo/id").and_then(|v| v.as_i64())
+                    != Some(repository.repository_id)
+            {
+                report.observations.push(serde_json::json!({"proposal":number,"accepted":[],"reason":"draft or fork head; not read"}));
+                continue;
+            }
             if let Some(head) = candidate
                 .pointer("/head/sha")
                 .and_then(|v| v.as_str())
                 .filter(|v| is_oid(v))
-                && journal.confirmed_hint(
-                    provider,
-                    repository,
-                    number,
-                    head,
-                    TriggerEvent::PullRequest,
-                )?
+                && let Ok(target) = target_of(candidate)
             {
-                report.skipped_confirmed += 1;
-                continue;
+                let proposal = proposal_key(
+                    provider,
+                    &repository.host,
+                    repository.repository_id,
+                    number as u64,
+                    head,
+                );
+                let key = head_key(&proposal, &target, &labels_of(candidate));
+                if journal.head_settled(&key, &repository.full_name)? {
+                    report.skipped_confirmed += 1;
+                    continue;
+                }
             }
             match confirm_in_repository(api, token, repository, number, observed_at, None, true)
                 .await
             {
                 Ok(Some(event)) => {
+                    let previews: Vec<_> = journal
+                        .rules()?
+                        .iter()
+                        .filter(|r| {
+                            r.repository == repository.full_name
+                                && r.trigger.event == TriggerEvent::PullRequest
+                        })
+                        .map(|rule| (rule.rule_id.clone(), preview(rule, &event)))
+                        .collect();
+                    if previews
+                        .iter()
+                        .any(|(_, p)| !p.matches && !p.unknown.is_empty())
+                    {
+                        report.not_evaluated += 1;
+                    }
                     let accepted = journal
                         .accept(&event)?
                         .into_iter()
                         .map(|d| serde_json::json!({"dispatch_id":d.dispatch_id,"run_id":d.run_id}))
                         .collect::<Vec<_>>();
+                    let previews: Vec<_> = previews
+                        .into_iter()
+                        .map(|(rule_id, preview)| serde_json::json!({"rule_id":rule_id,"preview":preview}))
+                        .collect();
                     report.observations.push(
-                        serde_json::json!({"proposal":number,"event":event,"accepted":accepted}),
+                        serde_json::json!({"proposal":number,"event":event,"accepted":accepted,"previews":previews}),
                     );
                 }
                 Ok(None) => report.observations.push(
@@ -992,7 +1044,6 @@ impl RuleJournal {
         repository: &ConnectedRepository,
         number: i64,
         commit: &str,
-        kind: TriggerEvent,
     ) -> Result<bool> {
         self.assert_repository(provider, &repository.host, repository.repository_id)?;
         let key = proposal_key(
@@ -1001,13 +1052,64 @@ impl RuleJournal {
             repository.repository_id,
             number as u64,
             commit,
-            kind,
         );
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pipeline_observations o WHERE o.event_key=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=o.rule_id))",
             [key],
             |r| r.get(0),
         )?)
+    }
+    /// Whether every pull request rule that is not policy-owned has evaluated this head, base
+    /// and label set at its current generation; an edited or re-enabled rule evaluates again.
+    fn head_settled(&self, key: &str, repository: &str) -> Result<bool> {
+        for (rule_id, generation) in self.legacy_head_rules(repository)? {
+            let observed: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT rule_generation FROM pipeline_observations WHERE semantic_key=?1",
+                    [format!("{key}\0{rule_id}")],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if observed != Some(generation) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn legacy_head_rules(&self, repository: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.db.prepare("SELECT body FROM pipeline_rules r WHERE repository=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=r.rule_id)")?;
+        let bodies = stmt
+            .query_map([repository], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rules = Vec::new();
+        for body in bodies {
+            let rule: PipelineRule = serde_json::from_str(&body)?;
+            if rule.trigger.event == TriggerEvent::PullRequest {
+                rules.push((rule.rule_id, rule.generation));
+            }
+        }
+        Ok(rules)
+    }
+    /// Pull request heads a rule could not evaluate, newest first.
+    pub fn unevaluated(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.db.prepare("SELECT o.rule_id,o.reasons,e.body FROM pipeline_observations o JOIN pipeline_events e ON e.semantic_key=o.event_key WHERE o.reasons LIKE '%could not evaluate%' ORDER BY o.rowid DESC LIMIT ?1")?;
+        let rows = stmt
+            .query_map([limit.min(256) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(rule_id, reasons, body)| {
+                let event: ConfirmedMerge = serde_json::from_str(&body)?;
+                let reasons: Vec<String> = serde_json::from_str(&reasons)?;
+                Ok(serde_json::json!({"rule_id":rule_id,"proposal":event.proposal_number,"head":event.accepted_commit,"target":event.target,"reasons":reasons}))
+            })
+            .collect()
     }
     /// Whether rules that are not policy-owned fire on merges and on pull request heads.
     fn legacy_events(&self, repository: &str) -> Result<(bool, bool)> {
@@ -1121,6 +1223,9 @@ impl RuleJournal {
         )?;
         let event: ConfirmedMerge = serde_json::from_str(&stored)?;
         let event = &event;
+        if event.kind == TriggerEvent::PullRequest {
+            prune_superseded_heads(&tx, event)?;
+        }
         let mut accepted = Vec::new();
         for mut rule in selected {
             let mut matched = preview(&rule, event);
@@ -1132,6 +1237,24 @@ impl RuleJournal {
                 continue;
             }
             let semantic = semantic_key(event, &rule.rule_id);
+            if event.kind == TriggerEvent::PullRequest {
+                // A head seen by an older generation (edited, re-enabled) is evaluated again,
+                // unless it already dispatched.
+                tx.execute(
+                    "DELETE FROM pipeline_observations WHERE semantic_key=?1 AND rule_generation<>?2 AND NOT EXISTS(SELECT 1 FROM pipeline_dispatches d WHERE d.semantic_key=?1)",
+                    params![semantic, rule.generation],
+                )?;
+                if matched.matches && head_ran(&tx, event, &rule.rule_id)? {
+                    matched.matches = false;
+                    matched.reasons = vec!["this head already ran for this rule".into()];
+                }
+            }
+            matched.reasons.truncate(MAX_OBSERVATION_REASONS);
+            for reason in &mut matched.reasons {
+                if reason.len() > MAX_REASON_CHARS {
+                    *reason = reason.chars().take(MAX_REASON_CHARS).collect();
+                }
+            }
             let duplicate: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pipeline_observations WHERE semantic_key=?1)",
                 [&semantic],
@@ -1179,6 +1302,12 @@ impl RuleJournal {
                 }
                 accepted.push(dispatch);
             }
+        }
+        // Refuse here, rolling back, what opening the journal would later refuse.
+        if payload_bytes(&tx)? > MAX_JOURNAL_PAYLOAD {
+            return Err(Error::Limit(
+                "pipeline journal payload budget reached; no event accepted".into(),
+            ));
         }
         tx.commit()?;
         Ok(accepted)
@@ -1308,37 +1437,104 @@ impl RuleJournal {
     }
 }
 
-fn event_key(event: &ConfirmedMerge) -> String {
-    proposal_key(
+/// Older heads (or base and labels) of the same pull request that started no run are dropped
+/// with their observations, so pushes to one pull request do not grow the journal.
+fn prune_superseded_heads(db: &Connection, event: &ConfirmedMerge) -> Result<()> {
+    let proposal = format!(
+        "{}\0{}\0{}\0{}\0",
+        event.provider, event.host, event.provider_repository_id, event.proposal_number
+    );
+    let current = event_key(event);
+    let mut stmt = db.prepare("SELECT semantic_key FROM pipeline_events WHERE substr(CAST(semantic_key AS BLOB),1,length(CAST(?1 AS BLOB)))=CAST(?1 AS BLOB) AND NOT EXISTS(SELECT 1 FROM pipeline_dispatches d WHERE d.event_key=pipeline_events.semantic_key)")?;
+    let keys = stmt
+        .query_map([&proposal], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for key in keys
+        .into_iter()
+        .filter(|key| *key != current && key.contains("\0pull_request\0"))
+    {
+        db.execute(
+            "DELETE FROM pipeline_observations WHERE event_key=?1",
+            [&key],
+        )?;
+        db.execute("DELETE FROM pipeline_events WHERE semantic_key=?1", [&key])?;
+    }
+    Ok(())
+}
+/// Whether this rule already dispatched this head under any base or label set.
+fn head_ran(db: &Connection, event: &ConfirmedMerge, rule_id: &str) -> Result<bool> {
+    let prefix = head_prefix(&proposal_key(
         &event.provider,
         &event.host,
         event.provider_repository_id,
         event.proposal_number,
         &event.accepted_commit,
-        event.kind,
-    )
+    ));
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pipeline_dispatches WHERE rule_id=?1 AND substr(CAST(event_key AS BLOB),1,length(CAST(?2 AS BLOB)))=CAST(?2 AS BLOB))",
+        params![rule_id, prefix],
+        |r| r.get(0),
+    )?)
 }
-/// A pull request head is keyed apart from a merge of the same commit; merge keys are unchanged.
+const PAYLOAD_COLUMNS: [(&str, &str, i64); 4] = [
+    ("pipeline_rules", "body", 262144),
+    ("pipeline_events", "body", MAX_EVENT_BODY as i64),
+    ("pipeline_observations", "reasons", 32768),
+    ("pipeline_dispatches", "body", 524288),
+];
+fn payload_bytes(db: &Connection) -> Result<i64> {
+    let mut bytes = 0i64;
+    for (table, column, _) in PAYLOAD_COLUMNS {
+        let sum: i64 = db.query_row(
+            &format!("SELECT coalesce(sum(length(CAST({column} AS BLOB))),0) FROM {table}"),
+            [],
+            |r| r.get(0),
+        )?;
+        bytes = bytes.saturating_add(sum);
+    }
+    Ok(bytes)
+}
+fn event_key(event: &ConfirmedMerge) -> String {
+    let key = proposal_key(
+        &event.provider,
+        &event.host,
+        event.provider_repository_id,
+        event.proposal_number,
+        &event.accepted_commit,
+    );
+    match event.kind {
+        TriggerEvent::Merge => key,
+        TriggerEvent::PullRequest => head_key(&key, &event.target, &event.labels),
+    }
+}
 fn proposal_key(
     provider: &str,
     host: &str,
     repository_id: i64,
     number: u64,
     commit: &str,
-    kind: TriggerEvent,
 ) -> String {
-    let mut key = [
+    [
         provider,
         host,
         &repository_id.to_string(),
         &number.to_string(),
         commit,
     ]
-    .join("\0");
-    if kind == TriggerEvent::PullRequest {
-        key.push_str("\0pull_request");
-    }
-    key
+    .join("\0")
+}
+/// A head is keyed apart from a merge of the same commit, and by the base and labels a rule
+/// reads, so a retarget or relabel is evaluated again. Merge keys are unchanged.
+fn head_key(proposal: &str, target: &str, labels: &BTreeSet<String>) -> String {
+    format!(
+        "{}{}",
+        head_prefix(proposal),
+        serde_json::json!([target, labels])
+    )
+}
+fn head_prefix(proposal: &str) -> String {
+    format!("{proposal}\0pull_request\0")
 }
 fn semantic_key(event: &ConfirmedMerge, rule_id: &str) -> String {
     format!("{}\0{rule_id}", event_key(event))
@@ -1444,14 +1640,17 @@ fn validate_event(e: &ConfirmedMerge) -> Result<()> {
             .as_ref()
             .and_then(|c| c.paths.as_ref())
             .is_some_and(|paths| {
-                paths.len() > MAX_CHANGED_PATHS
-                    || paths.iter().map(String::len).sum::<usize>() > MAX_CHANGED_PATH_BYTES
-                    || paths
-                        .iter()
-                        .any(|p| p.is_empty() || p.len() > MAX_CHANGED_PATH_LEN || p.contains('\0'))
+                paths
+                    .iter()
+                    .any(|p| p.is_empty() || p.len() > MAX_CHANGED_PATH_LEN || p.contains('\0'))
             })
     {
         return Err(Error::Invalid("invalid confirmed merge".into()));
+    }
+    if serde_json::to_vec(e)?.len() > MAX_EVENT_BODY {
+        return Err(Error::Limit(format!(
+            "confirmed event exceeds {MAX_EVENT_BODY} bytes"
+        )));
     }
     Ok(())
 }
@@ -1825,7 +2024,7 @@ fn deliver_guarded(
             runtime::start(data_dir, &claim.dispatch.run_id, &plan)?;
         }
         let event = &claim.dispatch.event;
-        let inputs = std::collections::BTreeMap::from([
+        let mut inputs = std::collections::BTreeMap::from([
             ("accepted_commit".into(), event.accepted_commit.clone()),
             ("proposal_number".into(), event.proposal_number.to_string()),
             ("target".into(), event.target.clone()),
@@ -1835,6 +2034,10 @@ fn deliver_guarded(
             ("host".into(), event.host.clone()),
             ("observed_at".into(), event.observed_at.to_string()),
         ]);
+        // Merge inputs keep their pinned bytes; only a head says what it is.
+        if event.kind == TriggerEvent::PullRequest {
+            inputs.insert("event".into(), "pull_request".into());
+        }
         runtime::bind_inputs(data_dir, &claim.dispatch.run_id, &inputs)?;
 
         let db_path = journal
@@ -2024,17 +2227,12 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
             "pipeline native/forge binding differs".into(),
         ));
     }
-    for (table, column, limit) in [
-        ("pipeline_rules", "body", 262144),
-        ("pipeline_events", "body", 65536),
-        ("pipeline_observations", "reasons", 32768),
-        ("pipeline_dispatches", "body", 524288),
-    ] {
+    for (table, column, limit) in PAYLOAD_COLUMNS {
         let (max,sum):(i64,i64)=db.query_row(&format!("SELECT coalesce(max(length(CAST({column} AS BLOB))),0),coalesce(sum(length(CAST({column} AS BLOB))),0) FROM {table}"),[],|r|Ok((r.get(0)?,r.get(1)?)))?;
         bytes = bytes
             .checked_add(sum)
             .ok_or_else(|| Error::Limit("pipeline payload overflow".into()))?;
-        if max > limit || bytes > 128 * 1024 * 1024 {
+        if max > limit || bytes > MAX_JOURNAL_PAYLOAD {
             return Err(Error::Limit(
                 "pipeline recovery payload budget exceeded".into(),
             ));
@@ -2111,7 +2309,7 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
         if key != semantic_key(event, &rule_id)
             || generation < 1
             || generation > rule.generation
-            || reasons.len() > 4
+            || reasons.len() > MAX_OBSERVATION_REASONS
         {
             return Err(Error::Invalid(
                 "pipeline observation binding differs".into(),

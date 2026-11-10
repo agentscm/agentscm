@@ -274,7 +274,7 @@ fn install(
     rule.skill_digest = plan.skill_digest().into();
     journal.install(&rule, expected)?;
     Ok(
-        json!({"rule":rule,"source_commit":manifest.source_commit,"note":"exact resource identity pinned; local commands use operator privileges"}),
+        json!({"rule":rule,"source_commit":manifest.source_commit,"note":"exact resource identity pinned; local commands use operator privileges, and a pull_request rule runs them on unreviewed code from anyone who can push a branch"}),
     )
 }
 
@@ -439,7 +439,7 @@ pub async fn run(data: &Path, command: PipelineCommand) -> Result<Value> {
                 None
             };
             Ok(
-                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?}),
+                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?,"unevaluated":journal.unevaluated(64)?}),
             )
         }
         PipelineCommand::Preview {
