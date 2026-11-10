@@ -703,7 +703,7 @@ fn why_resolves_a_line_and_a_path_through_git_then_asks_the_hub() {
     assert_eq!(absolute["commits"], serde_json::json!([commit]));
 
     // A line from a merged branch also names the merge that brought it in, not a merge of the
-    // main line into the branch. A squash-merged or direct line, as above, is its own commit.
+    // main line into the branch.
     let main = git(&["symbolic-ref", "--short", "HEAD"]).trim().to_owned();
     git(&["checkout", "-q", "-b", "feature"]);
     std::fs::write(
@@ -729,6 +729,27 @@ fn why_resolves_a_line_and_a_path_through_git_then_asks_the_hub() {
         merged["commits"],
         serde_json::json!([feature, merge]),
         "{merged}"
+    );
+
+    // A squash merge leaves one new commit on the main line and no merge: the line names it.
+    git(&["checkout", "-q", "-b", "squashed"]);
+    std::fs::write(
+        repository.path().join("src/why.rs"),
+        "fn why() {}\nfn because() {}\nfn so() {}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "branch work"]);
+    git(&["checkout", "-q", &main]);
+    git(&["merge", "-q", "--squash", "squashed"]);
+    git(&["commit", "-q", "-m", "squash merge"]);
+    let squash = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let squashed = client.why(repository.path(), "src/why.rs:3");
+    assert!(squashed.status.success(), "{squashed:?}");
+    let squashed: serde_json::Value = serde_json::from_slice(&squashed.stdout).unwrap();
+    assert_eq!(
+        squashed["commits"],
+        serde_json::json!([squash]),
+        "{squashed}"
     );
 
     let unknown = client.why(repository.path(), "no-such-target");

@@ -2536,6 +2536,151 @@ fn compaction_bounds_pull_commits(fixture: &Fixture) {
     assert_eq!(read(lowest), 1001);
 }
 
+/// The two why migrations backfill an existing database: a Work's newest 100 decisions (no more,
+/// so old Work does not keep extra until its next decision) and the PR-link number and head.
+fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
+    let now = unix_now();
+    let owner = fixture.owner(50);
+    let token = fixture.token(&owner, "why-migrate", 150, false);
+    let started = fixture
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("why-migrate".into()),
+                title: "Migrate why".into(),
+                description: None,
+                session: "migrate".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/migrate.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            now,
+        )
+        .unwrap();
+    let mut seq = started.item.updated_seq;
+    let mut decisions = Vec::new();
+    for n in 0..101 {
+        seq = fixture
+            .store
+            .work_checkpoint(
+                &token,
+                &WorkCheckpoint {
+                    work_id: started.item.id.clone(),
+                    operation_id: format!("migrate-{n}"),
+                    generation: 1,
+                    session: "migrate".into(),
+                    expected_updated_seq: Some(seq),
+                    kind: CheckpointKind::Decision,
+                    summary: format!("decision {n}"),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                now,
+            )
+            .unwrap()
+            .item
+            .updated_seq;
+        decisions.push(seq);
+    }
+    let head = "c".repeat(40);
+    fixture
+        .store
+        .work_pr_link_set(
+            &token,
+            &WorkPrLinkUpdate {
+                work_id: started.item.id.clone(),
+                operation_id: "migrate-link".into(),
+                generation: 1,
+                session: "migrate".into(),
+                expected_updated_seq: seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: 150,
+                    number: 77,
+                    head_sha: head.clone(),
+                }),
+            },
+            now,
+        )
+        .unwrap();
+    // Undo both migrations, then let the store apply them again over the existing rows.
+    const UNDO: [&str; 7] = [
+        "DROP TABLE hub_work_decisions",
+        "DROP INDEX hub_work_pr_links_number",
+        "DROP INDEX hub_work_pr_links_head",
+        "ALTER TABLE hub_work_pr_links DROP COLUMN number",
+        "ALTER TABLE hub_work_pr_links DROP COLUMN head_sha",
+        "DELETE FROM hub_named_migrations WHERE name='work_decisions'",
+        "DELETE FROM hub_named_migrations WHERE name='pr_link_columns'",
+    ];
+    let work = &started.item.id;
+    let read = format!(
+        "SELECT (SELECT COUNT(*) FROM hub_work_decisions WHERE work='{work}'),
+                (SELECT MIN(event_seq) FROM hub_work_decisions WHERE work='{work}'),
+                (SELECT number FROM hub_work_pr_links WHERE work='{work}'),
+                (SELECT head_sha FROM hub_work_pr_links WHERE work='{work}')"
+    );
+    let (store, row): (Arc<dyn Store>, (i64, i64, i64, String)) =
+        if let Some(database) = &fixture.database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            UNDO.iter().for_each(|sql| {
+                connection.execute(sql, []).unwrap();
+            });
+            drop(connection);
+            let store = store::open(&format!("sqlite://{}", database.display())).unwrap();
+            let row = rusqlite::Connection::open(database)
+                .unwrap()
+                .query_row(&read, [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap();
+            (store, row)
+        } else {
+            let url = &fixture._pg.as_ref().unwrap().url;
+            let mut client = Client::connect(url, NoTls).unwrap();
+            UNDO.iter().for_each(|sql| {
+                client.execute(*sql, &[]).unwrap();
+            });
+            let store = store::open(url).unwrap();
+            let row = client.query_one(&read, &[]).unwrap();
+            (store, (row.get(0), row.get(1), row.get(2), row.get(3)))
+        };
+    assert_eq!(row, (100, decisions[1], 77, head.clone()));
+    let answer = store
+        .work_why(&token, &WhySubject::Commit(head), now)
+        .unwrap();
+    assert_eq!(answer.work[0].id, *work);
+    assert_eq!(answer.work[0].decisions[0].summary, "decision 100");
+}
+
+#[test]
+fn sqlite_why_migrations_backfill_existing_rows() {
+    why_migrations_backfill_existing_rows(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_migrations_backfill_existing_rows() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_migrations_backfill_existing_rows(&fixture);
+}
+
 #[test]
 fn sqlite_compaction_bounds_pull_commits() {
     compaction_bounds_pull_commits(&Fixture::sqlite());
