@@ -211,7 +211,7 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
             missing["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .ends_with("missing field `agent`"),
+                .contains("missing field `agent`"),
             "{missing}"
         );
         let (endpoint, edit, lifecycle) = match agent {
@@ -1014,10 +1014,9 @@ async fn change_record_is_a_read_only_bounded_projection() {
         )
         .await;
     assert_eq!(missing["isError"], true);
-    assert_eq!(
-        missing["content"][0]["text"],
-        "AgentSCM: coordination unknown (change record not found). Other agents' work on these files is not visible."
-    );
+    let text = missing["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("The resource was not found;"), "{text}");
+    assert_eq!(missing["structuredContent"]["error"]["code"], "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1028,7 +1027,9 @@ async fn method_and_auth_rules() {
 
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let reply = hub.send(method, "/mcp", Some(&key), "").await;
-        assert_eq!((reply.status, reply.text.as_str()), (405, ""));
+        assert_eq!(reply.status, 405);
+        let body: Value = serde_json::from_str(&reply.text).unwrap();
+        assert_eq!(body["error"], "method_not_allowed");
         assert_eq!(reply.headers["allow"], "POST");
     }
     for secret in [None, Some("agt_not-a-token")] {
@@ -1285,7 +1286,10 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         ("agentscm_handoff", json!({"path": file, "accept": "yes"})),
     ] {
         let (text, error) = call(&bob, name, arguments).await;
-        assert!(error && text.contains("invalid arguments"), "{text}");
+        assert!(
+            error && text.contains("invalid arguments") && text.contains("ref cor_"),
+            "{text}"
+        );
     }
 
     // Declining: the requester hears it on its next call.
@@ -1598,6 +1602,90 @@ async fn done_leaves_blocked_work_blocked_and_says_so() {
         overview["structuredContent"]["operational"]["work"][0]["state"], "blocked",
         "{overview}"
     );
+}
+
+/// A finished agent completes the Work it leads in the call it already makes, with no work_id or
+/// fences, even after its session ended once and paused that Work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_with_outcome_complete_finishes_the_led_work_without_fences() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "s1", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let (paused, _) = hub
+        .tool(&alice, "/mcp", "agentscm_done", json!({"session": "s1"}))
+        .await;
+    assert!(paused.contains("paused"), "{paused}");
+
+    // A multi-line summary past the reason's 500 bytes still completes: it becomes one line.
+    let summary = format!("Merged the billing fix.\n\n{}", "Details. ".repeat(80));
+    let (done, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "complete", "summary": summary}),
+        )
+        .await;
+    assert!(!error, "{done}");
+    assert!(done.starts_with("AgentSCM: completed “billing”;"), "{done}");
+    assert!(
+        done.ends_with("Before editing again, start new Work with agentscm_start."),
+        "{done}"
+    );
+    let after = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert!(
+        after["structuredContent"]["operational"]["work"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{after}"
+    );
+    // Its scope is free for another agent.
+    let taken = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "s2", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        taken["structuredContent"]["work"]["created"], true,
+        "{taken}"
+    );
+
+    // A session that leads nothing says so instead of claiming a completion.
+    let (none, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "complete"}),
+        )
+        .await;
+    assert!(!error, "{none}");
+    assert!(
+        none.starts_with("AgentSCM: nothing to complete: this session leads no unfinished Work;"),
+        "{none}"
+    );
+    let (bad, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "finished"}),
+        )
+        .await;
+    assert!(error, "{bad}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1972,10 +2060,9 @@ async fn errors_are_tool_results_with_fixed_text() {
     for path in ["/mcp?repo=acme/other", "/mcp?repo=acme%2Fother"] {
         let (text, error) = hub.tool(&key, path, "agentscm_status", json!({})).await;
         assert!(error);
-        assert_eq!(
-            text,
-            "AgentSCM: coordination unknown (this token is for another repository). \
-             Other agents' work on these files is not visible."
+        assert!(
+            text.starts_with("This token is for another repository;"),
+            "{text}"
         );
     }
     let (_, error) = hub
@@ -2012,7 +2099,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
         assert!(
-            text.starts_with(&format!("AgentSCM: invalid arguments for {name}: ")),
+            text.contains("invalid arguments") && text.contains("ref cor_"),
             "{text}"
         );
         assert!(!text.contains("sekrit"), "{text}");
@@ -2026,7 +2113,10 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(text.contains("invalid_or_changed"), "{text}");
+    assert!(
+        text.contains("path must be a repo-relative path") && text.contains("ref cor_"),
+        "{text}"
+    );
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {
@@ -2871,7 +2961,7 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
             json!({}),
         )
         .await;
-    assert!(error && foreign.contains("another repository"));
+    assert!(error && foreign.contains("another repository"), "{foreign}");
     // The typed MCP query must not allow an aggregate repository escape.
     let foreign = hub
         .tool_result(
@@ -3578,4 +3668,90 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
         "params": {"name": "agentscm_work_transitions", "arguments": {"session": "s", "items": []}}});
     let denied = hub.rpc(&reader, &body).await;
     assert_ne!(denied.status, 200, "{}", denied.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr_overlap_skips_the_work_that_opened_the_pull_request() {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::session::SessionCall;
+    use agentscm::hub::work::WorkStart;
+    let hub = Hub::start().await;
+    let now = unix_now();
+    // One person's MCP and hook tokens share a native session, as a client with both does.
+    let (mcp, secret) = hub.secret_with_id(1, "author-mcp");
+    let (hook, _) = hub.secret_with_id(1, "author-hook");
+    let start: WorkStart = serde_json::from_value(json!({"request_key": "self-pr",
+        "title": "Open the pull request", "session": "native-1", "scope": ["src/a.rs"],
+        "branch": "feature/self"}))
+    .unwrap();
+    hub.store.work_start(&mcp, &start, now).unwrap();
+    let touch = |token: &str, session: &str, path: &str| {
+        hub.store
+            .touch_session(
+                token,
+                &SessionCall {
+                    session: Some(session.into()),
+                    via: "hook:claude".into(),
+                    task: Some("Edit".into()),
+                    paths: vec![path.into()],
+                    deny: false,
+                    report: false,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    touch(&hook, "native-1", "src/a.rs");
+    let owner = hub.store.user_for_identity(&ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 1,
+    });
+    let connection = hub
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: format!("con_{}", "e".repeat(32)),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("user1".into()),
+            },
+            &owner.unwrap().unwrap().id,
+        )
+        .unwrap();
+    let repo = hub
+        .store
+        .upsert_repository(&connection.id, "github.com", 77, REPO, None, None)
+        .unwrap();
+    let pull = json!({"number": 7, "state": "open", "head_ref": "feature/self",
+        "head_sha": "a".repeat(40), "files": ["src/a.rs", "src/b.rs"], "files_truncated": false});
+    hub.store
+        .observe(&repo.id, "pull_request", "7", &pull.to_string(), now * 1000)
+        .unwrap();
+    let overlap = || async {
+        let status = hub
+            .tool_result(&secret, "agentscm_work_status", json!({}))
+            .await;
+        status["structuredContent"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["kind"] == "pr_overlap")
+            .cloned()
+    };
+    assert_eq!(overlap().await, None);
+    // Another agent holding one of the pull request's files still raises it, naming only them.
+    let (other, _) = hub.secret_with_id(2, "other-hook");
+    touch(&other, "native-2", "src/b.rs");
+    let row = overlap().await.expect("another holder raises pr_overlap");
+    let logins: Vec<&str> = row["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["login"].as_str())
+        .collect();
+    assert_eq!(logins, ["user2"]);
 }

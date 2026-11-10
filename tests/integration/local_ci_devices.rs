@@ -615,7 +615,15 @@ async fn only_an_administrator_session_can_change_devices() {
     let key = signing(5);
     let statement = statement(&t.label, &t.owner, "lcd_two", &key, 1);
     let rotation = statement_for_rotation(&t, &key);
+    let repository = t
+        .env
+        .store
+        .repository_named(&t.env.host, REPO)
+        .unwrap()
+        .unwrap();
+    let summary_path = format!("/v1/hub/admin/repos/{}/validation-summary", repository.id);
     let calls = [
+        (Method::POST, summary_path.clone(), json!({"enabled": true})),
         (
             Method::POST,
             ENROLL.to_owned(),
@@ -632,6 +640,24 @@ async fn only_an_administrator_session_can_change_devices() {
             json!({"request_id": "r3", "expected_generation": 1}),
         ),
     ];
+    let (status, _) = t
+        .env
+        .call(
+            Method::POST,
+            &summary_path,
+            Some(&t.admin),
+            Some(json!({"enabled": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let config = t
+        .env
+        .store
+        .validation_summary_config(&repository.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.connection, repository.connection);
+    assert!(config.enabled);
     let credentials: [(&str, Option<&str>); 5] = [
         ("signed-in non-admin", Some(&t.alice)),
         ("computer credential", Some(&t.alice_computer)),

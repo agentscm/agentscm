@@ -411,6 +411,59 @@ pub struct WorkOutcome {
     pub at: i64,
     pub kind: WorkOutcomeKind,
     pub item: WorkItem,
+    /// Set only on a completion row built from a `work_transition` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<WorkEnded>,
+}
+
+/// Who ended Work through a transition and why, as the `work_transition` event records it. The
+/// event stores the actor's kind, user login and how they authenticated, not an agent label.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEnded {
+    pub transition: String,
+    pub reason: String,
+    pub by: WorkEndedBy,
+    pub at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEndedBy {
+    pub kind: super::work_lifecycle::WorkActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    pub via: super::work_lifecycle::ActorVia,
+}
+
+impl WorkEnded {
+    /// Reads a `work_transition` event's data; None for any other event kind or unreadable data.
+    pub(super) fn from_event(kind: &str, data: &str, at: i64) -> Option<Self> {
+        if kind != "work_transition" {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).ok()?;
+        let actor = v.get("actor")?;
+        Some(Self {
+            transition: v.get("transition")?.as_str()?.to_owned(),
+            reason: v.get("reason")?.as_str()?.to_owned(),
+            by: WorkEndedBy {
+                kind: serde_json::from_value(actor.get("kind")?.clone()).ok()?,
+                login: actor
+                    .get("login")
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned),
+                via: serde_json::from_value(actor.get("via")?.clone()).ok()?,
+            },
+            at,
+            superseded_by: v
+                .get("superseded_by")
+                .and_then(|l| l.as_str())
+                .map(str::to_owned),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -655,8 +708,23 @@ impl WorkStart {
             + usize::from(self.request_key.is_some())
             != 1
         {
-            return Err(invalid(
-                "exactly one of work_id, source or request_key is required",
+            let problem =
+                if self.work_id.is_none() && self.source.is_none() && self.request_key.is_none() {
+                    super::error_envelope::FieldProblem::Missing
+                } else {
+                    super::error_envelope::FieldProblem::Conflict
+                };
+            return Err(HubError::Input(
+                ["work_id", "source", "request_key"]
+                    .into_iter()
+                    .filter_map(|name| {
+                        super::error_envelope::InputProblem::new(
+                            name,
+                            problem,
+                            "Provide exactly one of work_id, source or request_key.",
+                        )
+                    })
+                    .collect(),
             ));
         }
         if self.work_id.is_none() && self.role != WorkRole::Lead {

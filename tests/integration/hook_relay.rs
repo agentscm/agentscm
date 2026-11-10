@@ -282,7 +282,7 @@ impl Hook {
             assert!(context.contains("synthetic Hub reply"), "{reply}");
         } else {
             assert!(
-                context.contains("coordination unknown (hub unreachable)"),
+                context.contains("coordination unknown (hub unreachable;"),
                 "{reply}"
             );
             assert!(

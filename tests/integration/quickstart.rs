@@ -3979,10 +3979,12 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
         [("claude".to_owned(), "unverified".to_owned())]
     );
     let said = doctor(&[]);
+    // Doctor first reports the live connection, then the session proof.
     assert!(
-        said.starts_with(
-            "claude session quickstart-session: unverified (MCP seen, native edit hook not seen). "
-        ),
+        said.starts_with("Connection: authenticated")
+            && said.contains(
+                "\nclaude session quickstart-session: unverified (MCP seen, native edit hook not seen). "
+            ),
         "{said}"
     );
     hook("PreToolUse", true);

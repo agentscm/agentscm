@@ -189,10 +189,18 @@ async fn whoami_rejects_every_failure_identically() {
             .0,
         200
     );
+    let mut first = None;
     for attempt in attempts {
         let (status, headers, body) = hub.get("/v1/hub/whoami", attempt.as_deref());
         assert_eq!(status, 401, "{attempt:?}");
-        assert_eq!(body, r#"{"error":"unauthorized"}"#, "{attempt:?}");
+        // Every failure is the same body apart from its error reference.
+        let body = crate::hub_error_assert::blank_references(&body);
+        assert!(body.starts_with(r#"{"error":"unauthorized","#), "{body}");
+        assert_eq!(
+            first.get_or_insert_with(|| body.clone()),
+            &body,
+            "{attempt:?}"
+        );
         assert!(headers.contains(&("www-authenticate".into(), "Bearer".into())));
     }
 }

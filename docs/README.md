@@ -45,6 +45,7 @@ observed actions and source; they are not independent verification or human appr
 - [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
 - [Work reconciliation](design/work-reconciliation.md): durable exact-head prerequisite conditions, preserved reports, reassessment and scope disposition through HTTP, CLI, MCP and Work detail.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
+- [Hub local-validation summaries](advanced/hub-local-validation.md): opt-in durable evidence, one GitHub summary, explicit migration and standalone fallback.
 - [Immutable local CI plans](advanced/local-ci-plans.md): experimental command-first requirements, exact source bindings and independent coverage checks; execution adapters remain separate.
 - [Trusted local CI devices](advanced/local-ci-devices.md): experimental administrator enrollment of device keys and the current-authorization check; no result submission or execution.
 - [Productive actions](advanced/productive-workflow-actions.md) and [pipeline rules](advanced/pipeline-rules.md): bounded artifacts and operator-local post-merge workflows, separate from native admission.

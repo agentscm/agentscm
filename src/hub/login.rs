@@ -1071,7 +1071,7 @@ fn safe_forge_error(body: &Value) -> Option<&str> {
 
 fn log_forge_error(context: &str, body: &Value) {
     if let Some(code) = safe_forge_error(body) {
-        eprintln!("hub: {context}: forge error {code}");
+        super::error_envelope::log_internal(&format!("{context}: {code}"));
     }
 }
 

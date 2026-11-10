@@ -229,6 +229,7 @@ async fn withdraw(
 fn person_error(error: HubError) -> ApiError {
     match error {
         HubError::Unauthorized => not_your_agent(),
+        // The store's reason (closed, changed) is the person's own request state.
         HubError::Invalid(message) => ApiError::invalid().with_message(message),
         other => other.into(),
     }

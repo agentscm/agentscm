@@ -668,7 +668,14 @@ fn http_route(fixture: &StoreFixture) {
     let foreign = get(&work.id, &other);
     assert_eq!(unknown.0, 404, "{}", unknown.1);
     assert_eq!(
-        foreign, unknown,
+        (
+            foreign.0,
+            crate::hub_error_assert::blank_references(&foreign.1)
+        ),
+        (
+            unknown.0,
+            crate::hub_error_assert::blank_references(&unknown.1)
+        ),
         "another repository must look like unknown Work"
     );
     assert_eq!(get(&work.id, "agt_not-a-token").0, 401);

@@ -679,10 +679,10 @@ pub async fn start(state: &HubState) -> Result<()> {
         if conn.kind == "app"
             && let Err(error) = sync.load_app(&conn.id)
         {
-            eprintln!(
+            crate::hub::error_envelope::log_internal(&format!(
                 "hub: credentials of GitHub connection {} unavailable: {error}",
                 conn.id
-            );
+            ));
         }
     }
     if let Some(pat) = &config.pat {
@@ -714,10 +714,10 @@ async fn ensure_pat(
         }
         // A blip at startup must not keep the hub down; a restart will create the connection.
         Err(error) => {
-            eprintln!(
+            crate::hub::error_envelope::log_internal(&format!(
                 "hub: {who} {what} not checked: {}",
                 forge_to_hub(who, error)
-            );
+            ));
             return Ok(());
         }
     };
@@ -761,7 +761,7 @@ async fn ensure_pat(
 pub async fn poll_loop(state: HubState, seconds: u64) {
     loop {
         if let Err(error) = poll_once(&state).await {
-            eprintln!("hub: poll failed: {error}");
+            crate::hub::error_envelope::log_internal(&error);
         }
         tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
     }
@@ -834,7 +834,7 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
 pub(super) async fn failed(
     state: &HubState,
     conn: &Connection,
-    what: &str,
+    _what: &str,
     error: GhError,
 ) -> Result<bool> {
     match error {
@@ -855,7 +855,7 @@ pub(super) async fn failed(
             Ok(true)
         }
         GhError::Failed(detail) | GhError::TooLarge(detail) => {
-            eprintln!("hub: {} sync of {what}: {detail}", conn.provider);
+            crate::hub::error_envelope::log_internal(&detail);
             Ok(false)
         }
     }
@@ -1171,14 +1171,20 @@ async fn read_repo(
         if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
             return Err(error);
         }
-        eprintln!("hub: merge catch-up observation failed: {error:?}");
+        crate::hub::error_envelope::log_internal(&error);
     }
 
     if conn.outbound {
         outbound_repo(state, conn, repo, token).await?;
     }
     #[cfg(unix)]
-    super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
+    {
+        let validation =
+            super::validation_summary::reconcile_repo(state, conn, repo, token, None).await;
+        let native = super::forge_check::reconcile_repo(state, conn, repo, token, None).await;
+        validation?;
+        native?;
+    }
     super::external_runs::reconcile_repo(state, conn, repo, token).await?;
     reconcile_provider_context(state, conn, repo, token).await?;
     if sync.skill_read_due(&repo.id) {
@@ -1489,7 +1495,7 @@ async fn reread_pull(
             super::catchup_sync::observe(state, conn, repo, token, number, pull).await
     {
         super::catchup_sync::unavailable(state, conn, repo).await?;
-        eprintln!("hub: merge catch-up observation failed: {error:?}");
+        crate::hub::error_envelope::log_internal(&error);
     }
     let data = match &pull {
         None => json!({"number": number, "state": "gone", "merged": false}),
@@ -1946,10 +1952,10 @@ async fn outbound_repo(
             .collect();
         match outbound_pull(state, conn, repo, token, number, &pull, &overlapping).await {
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!(
+                crate::hub::error_envelope::log_internal(&format!(
                     "hub: {} outbound for {}#{number}: {detail}",
                     conn.provider, repo.full_name
-                );
+                ));
             }
             other => other?,
         }
@@ -2214,7 +2220,7 @@ impl Drop for PendingJob {
 
 async fn webhook_job(state: HubState, conn: Connection, event: String, payload: Value) {
     if let Err(error) = webhook_work(&state, &conn, &event, &payload).await {
-        eprintln!("hub: {} webhook {event}: {error}", conn.provider);
+        crate::hub::error_envelope::log_internal(&error);
     }
 }
 
@@ -2253,7 +2259,10 @@ async fn webhook_work(
         }
         return Ok(());
     }
-    if !matches!(event, "pull_request" | "push" | "merge_group") {
+    if !matches!(
+        event,
+        "pull_request" | "push" | "merge_group" | "issue_comment"
+    ) {
         return Ok(());
     }
     let Some(repository_id) = payload["repository"]["id"].as_i64() else {
@@ -2277,6 +2286,24 @@ async fn webhook_work(
         let token = sync.token(conn, repo.installation_id).await?;
         let reads = async {
             match event {
+                "issue_comment" => {
+                    // Only an authenticated delivery's repository/PR identifiers are hints.
+                    // Reconciliation re-reads the head, inventory and owned comment body.
+                    #[cfg(unix)]
+                    if payload["issue"]["pull_request"].is_object()
+                        && let Some(number) = payload["issue"]["number"].as_i64().filter(|n| *n > 0)
+                    {
+                        super::validation_summary::reconcile_repo(
+                            state,
+                            conn,
+                            &repo,
+                            &token,
+                            Some(number),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
                 // A merge queue group is judged on its own commit; no pull request or branch
                 // read stands in for it.
                 "merge_group" => {
@@ -2318,7 +2345,13 @@ async fn webhook_work(
                     })
                     .flatten();
                 if event != "pull_request" || only.is_some() {
-                    super::forge_check::reconcile_repo(state, conn, &repo, &token, only).await?;
+                    let validation =
+                        super::validation_summary::reconcile_repo(state, conn, &repo, &token, only)
+                            .await;
+                    let native =
+                        super::forge_check::reconcile_repo(state, conn, &repo, &token, only).await;
+                    validation?;
+                    native?;
                 }
             }
             Ok(())
@@ -2525,11 +2558,12 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
         "callback_urls": [format!("{public}/v1/hub/login/github/callback")],
         "public": false,
         "default_permissions": {"contents": "read", "metadata": "read",
-            "pull_requests": "write", "statuses": "write", "merge_queues": "read"}});
+            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read"}});
     if webhook_reachable(public) {
         manifest["hook_attributes"] =
             json!({"url": format!("{public}/v1/hub/webhooks/github/{connection}")});
-        manifest["default_events"] = json!(["pull_request", "push", "merge_group"]);
+        manifest["default_events"] =
+            json!(["pull_request", "push", "merge_group", "issue_comment"]);
     }
     manifest
 }
@@ -3002,8 +3036,9 @@ mod tests {
         );
         assert_eq!(
             public["default_events"],
-            json!(["pull_request", "push", "merge_group"])
+            json!(["pull_request", "push", "merge_group", "issue_comment"])
         );
+        assert_eq!(public["default_permissions"]["issues"], "read");
         for url in [
             "http://127.0.0.1:7332",
             "http://[::1]:7332",

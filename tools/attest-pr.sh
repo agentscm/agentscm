@@ -19,7 +19,8 @@
 #
 # PostgreSQL and S3 come from the AGENTSCM_TEST_* variables when set; otherwise disposable containers
 # start from the images pinned in .github/workflows/ci.yml. Tools the recipe selects for this change
-# (see docs/contributor-testing.md) must be on PATH, or the run fails rather than skipping them.
+# (see docs/contributor-testing.md) must be on PATH, or the run fails rather than skipping them. An
+# `npm ci` the recipe selects is checked against the Node and npm on PATH before the job is queued.
 set -euo pipefail
 umask 077
 renice -n 10 -p $$ >/dev/null 2>&1 || true # Keep the laptop responsive; children inherit this.
@@ -100,8 +101,38 @@ head=$(git rev-parse HEAD)
 [[ "$(gh pr view "$pr" --json headRefOid --jq .headRefOid)" == "$head" ]] \
   || die "local HEAD is not the head of pull request $pr; push first"
 
+# Refuse before taking a slot when an `npm ci` the default branch's recipe selects for this change
+# would reject the Node or npm on PATH. The check installs nothing and reads no network.
+npm_engines_preflight() {
+  local base recipe all line parts prefix dir
+  git fetch -q origin main
+  base=$(git merge-base origin/main HEAD)
+  recipe=$(git show origin/main:.github/local-validation/recipe.json)
+  all=false # a trust-input change requires every command
+  git diff --quiet "$base" HEAD -- .github/local-validation .github/workflows/local-validation.yml || all=true
+  while IFS= read -r line; do
+    IFS=$'\t' read -r -a parts <<<"$line"
+    prefix=${parts[0]}
+    if [[ "$all" == false && ${#parts[@]} -gt 1 ]] && git diff --quiet "$base" HEAD -- "${parts[@]:1}"; then
+      continue
+    fi
+    command -v npm >/dev/null || die "the recipe selects npm for $prefix, but npm is not on PATH"
+    dir=$(mktemp -d)
+    cp "$prefix/package.json" "$prefix/package-lock.json" "$dir/"
+    if ! (cd "$dir" && npm ci --dry-run --engine-strict --ignore-scripts --offline --no-audit --no-fund) \
+      >"$dir/log" 2>&1 && grep -q 'notsup' "$dir/log"; then
+      grep -E 'notsup (Not compatible|Required|Actual)' "$dir/log" | sed 's/^npm error /  /' >&2
+      rm -rf "$dir"
+      die "Node $(node --version) on PATH cannot install $prefix; put a newer Node first on PATH (for example \$HOME/.nvm/versions/node/<version>/bin) and rerun"
+    fi
+    rm -rf "$dir"
+  done < <(jq -r '.commands[] | select(.argv[0:2] == ["npm", "--prefix"] and .argv[3] == "ci")
+    | [.argv[2]] + (.paths // []) | @tsv' <<<"$recipe")
+}
+
 # Re-enter under the supervisor so all command descendants and cleanup share one slot.
 if [[ "$queued" == false ]]; then
+  npm_engines_preflight
   run_queued attestation bash tools/attest-pr.sh --queued-attestation "$pr"
   exit
 fi
