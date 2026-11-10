@@ -257,6 +257,59 @@ the head commit must already be in the operator's checkout (for example after
 `git fetch origin`), or delivery is blocked. Rules owned by an operating policy
 receive merge events only.
 
+### What the pull request shows
+
+Each time `observe` or `poll` runs (and so each `watch` cycle), it posts a commit
+status for every pull request run whose state the forge has not been told yet:
+
+| Run state | Status on the head commit | Description |
+| --- | --- | --- |
+| accepted, waiting or running | `pending` | AgentSCM rule fired on this commit; the run has not finished |
+| complete | `success` | AgentSCM rule run succeeded on this commit |
+| blocked or failed | `failure` | AgentSCM rule run failed or was blocked; see pipeline status |
+
+- The context is `agentscm/pipeline/<rule_id>`. The status is set on the exact
+  head commit that ran, so a result for an older head never appears on a newer
+  one. A new head shows nothing from this rule until the rule fires for it.
+- GitHub keeps one status per commit and context, so all runs of one rule on one
+  commit share it. This happens when two pull requests have the same head, or after
+  a relabel or retarget. The status is `failure` if any of those runs failed,
+  `pending` while any is unfinished, and `success` only when every one succeeded.
+- `pending` goes out in the same cycle that accepts the run. `watch` posts the
+  final state on its next cycle after pickup. A rule that fired always has a
+  status, or a retried post failure.
+- Descriptions are fixed text. Nothing from the pull request (title, body, branch,
+  paths or labels) is put in a status.
+- A post that fails (refused, rate limited, unavailable) is kept as unposted and
+  retried on later cycles. Results that have never failed are posted first, so
+  failing posts cannot hold back new heads. An answer that cannot change (HTTP
+  422, for example a commit GitHub no longer has, or a 64-digit commit) is given up
+  after three attempts. It stays listed with `gave_up: true` and is tried again
+  only when the run's state changes. `status` lists it under `unposted_reports` with
+  the attempt count and reason, and `observe`/`poll` output lists each attempt
+  under `reports`. An authentication or rate-limit failure, or a refusal that
+  applies to the whole token (HTTP 401, 403 or 404), stops that cycle's posting.
+- The forge token needs permission to write commit statuses (`statuses: write`).
+- Statuses are only written, never read back, so a posted status cannot start a
+  rule again.
+- When a journal moves to this version, runs that already existed count as
+  reported, so an upgrade posts nothing on older, often closed, pull requests.
+- `success` means the workflow run succeeded. Whether a finding fails the run is
+  up to the workflow's own steps.
+- **A required check is not a gate against people who can push.** Anyone with
+  push access can set `agentscm/pipeline/<rule_id>` to `success` themselves. So
+  can a workflow in the pull request, through the repository token, and the
+  pull request's author controls that workflow file. A token-posted status
+  cannot be pinned to this observer. If you require it anyway, set the default
+  workflow token to read-only.
+- A head gets no status when the rule does not fire for it: the rule doesn't
+  match, or its changed files could not be read (`unevaluated` in `status`,
+  unless the rule sets `run_when_unknown`). With the context required, such a
+  pull request waits on "Expected" and can't merge until someone reviews why.
+  Don't require the context unless the rule fires on every pull request.
+
+Recovering a blocked run with `recover` sets the head back to `pending`.
+
 **Who runs code on your machine.** A pull request rule runs the profile's local
 commands and the skill agent on an unreviewed head. It runs them with the
 operator account's privileges and credentials. Any account that can push a
