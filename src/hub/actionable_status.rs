@@ -903,14 +903,14 @@ fn waiting_actions(
                 format!(" {label}: “{text}”.")
             })
             .unwrap_or_default();
-        let answer = if wait.reason == WaitReason::Permission
+        let offered = matches!(wait.reason, WaitReason::Permission | WaitReason::Question)
             && setup
                 .permissions()
-                .answerable(setup.waiting(), &wait.key, now)
-        {
-            "Answer it in that session, or allow or deny it once from the Hub."
-        } else {
-            "Answer it in that session; the Hub cannot answer it for you."
+                .answerable(setup.waiting(), &wait.key, now);
+        let answer = match (offered, wait.reason) {
+            (true, WaitReason::Question) => "Answer it in that session, or from the Hub.",
+            (true, _) => "Answer it in that session, or allow or deny it once from the Hub.",
+            (false, _) => "Answer it in that session; the Hub cannot answer it for you.",
         };
         actions.push(StatusAction {
             id: format!("waiting:{}:{}", wait.reason.code(), wait.key),
