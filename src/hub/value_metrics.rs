@@ -997,14 +997,17 @@ pub fn project(
     } else {
         issues.unresolved += contested.unresolved();
         issues.resolved += contested.resolved();
-        issues.dismissed = Some(contested.dismissed());
+        // Only a hook can report an edit, so with no hook session in the window an override
+        // could not have been observed: unknown, not zero.
+        issues.dismissed = (contested.refusals.observed > 0 || overhead.sessions > 0)
+            .then(|| contested.dismissed());
         contested.partial = !contested_complete;
         overhead.partial = !overhead_complete;
         if !contested_complete {
             gaps.insert("Contested-edit records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
         }
         if !overhead_complete {
-            gaps.insert("Hook overhead records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
+            gaps.insert("Hook overhead for this window is partial: records were pruned by age or count, more matched than were read, or this Hub process dropped calls or has not written its latest totals yet".into());
         }
         if contested.went_elsewhere() > 0 {
             gaps.insert("Went elsewhere means the hold ended with no further edit or request seen; it includes sessions that ended or whose later hooks failed open, so it is counted neither resolved nor unresolved".into());
@@ -1305,7 +1308,8 @@ mod tests {
         f.contested = vec![
             observed("refusal", "pushed_through".into(), 10, true, true).unwrap(),
             observed("refusal", "pending".into(), 11, false, true).unwrap(),
-            observed("notice", "pending".into(), 12, true, true).unwrap(),
+            observed("refusal", "asked".into(), 12, true, true).unwrap(),
+            observed("notice", "proceeded".into(), 13, true, true).unwrap(),
         ];
         f.overhead = vec![SessionOverhead {
             session: "s".into(),
@@ -1324,10 +1328,13 @@ mod tests {
             ..Default::default()
         };
         let p = project(vec![f.clone()], &all, 100).unwrap();
-        assert_eq!(p.issues.contested_edits.refusals.observed, 2);
+        assert_eq!(p.issues.contested_edits.refusals.observed, 3);
         assert_eq!(p.issues.contested_edits.refusals.went_elsewhere, 1);
+        assert_eq!(p.issues.contested_edits.notices.proceeded, 1);
+        // Only the refusal pushed through is a dismissal; the notice is not.
         assert_eq!(p.issues.dismissed, Some(1));
-        // Went elsewhere is inferred, so it is neither resolved nor unresolved.
+        // Went elsewhere is inferred, so it is neither resolved nor unresolved; asked without a
+        // grant is unresolved.
         assert_eq!((p.issues.resolved, p.issues.unresolved), (0, 1));
         assert!(
             p.coverage
@@ -1340,11 +1347,14 @@ mod tests {
         assert_eq!(p.overhead.hub_calls, 13);
         let one = ValueMetricsQuery {
             work_id: Some("wrk_0123456789abcdef0123456789abcdef".into()),
-            ..all
+            ..all.clone()
         };
         let p = project(vec![f], &one, 100).unwrap();
         assert_eq!(p.issues.contested_edits.availability, "not_scoped_to_work");
         assert_eq!(p.overhead.availability, "not_scoped_to_work");
+        assert_eq!(p.issues.dismissed, None);
+        // With no hook session in the window an override could not be seen: unknown, not zero.
+        let p = project(vec![facts()], &all, 100).unwrap();
         assert_eq!(p.issues.dismissed, None);
     }
     fn usage(work: &str, owner: &str, id: &str) -> ValueUsage {

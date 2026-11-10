@@ -6107,7 +6107,7 @@ fn touch_in(
 
 /// Settles the session's earlier refusals and notices for files this hook call edited while the
 /// hold that caused them still kept the file, then records this touch's refusals and notices
-/// (see `refusal_outcomes`). Rows are bounded by age and count per repository.
+/// (see `refusal_outcomes`). Rows are kept 30 days and at most 1,000 per token.
 fn contested_in(
     tx: &mut postgres::Transaction<'_>,
     who: &Who,
@@ -6122,9 +6122,11 @@ fn contested_in(
     for key in edited {
         tx.execute(
             "UPDATE hub_contested_edits SET outcome = 'pushed_through', resolved_at = $4
-             WHERE token = $1 AND session = $2 AND path = $3 AND outcome = 'pending'
-               AND EXISTS (SELECT 1 FROM hub_intent_paths p
-                   WHERE p.intent = hub_contested_edits.hold AND p.key = $3 AND p.expires_at > $4)",
+             WHERE token = $1 AND session = $2 AND path = $3 AND kind = 'refusal'
+               AND outcome IN ('pending', 'asked')
+               AND EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+                   WHERE p.key = $3 AND p.expires_at > $4 AND i.token =
+                       (SELECT h.token FROM hub_intents h WHERE h.id = hub_contested_edits.hold))",
             &[&token, &session, key, &now],
         )?;
     }
@@ -6139,10 +6141,9 @@ fn contested_in(
         }));
     let mut wrote = false;
     for (key, hold, kind) in rows {
-        // A notice drawn by this hook-reported edit: the edit already went ahead.
-        let settled = kind == "notice" && edited.iter().any(|edit| edit == key);
-        let (outcome, resolved_at) = if settled {
-            ("pushed_through", Some(now))
+        // The call that drew a notice took the file: the agent was told and went ahead.
+        let (outcome, resolved_at) = if kind == "notice" {
+            ("proceeded", Some(now))
         } else {
             ("pending", None)
         };
@@ -6172,27 +6173,35 @@ fn contested_in(
         tx.execute(
             "DELETE FROM hub_contested_edits WHERE (token, session, path, hold, kind) IN (
                  SELECT token, session, path, hold, kind FROM hub_contested_edits
-                 WHERE token = $1 ORDER BY observed_at DESC OFFSET $2)",
+                 WHERE token = $1 ORDER BY observed_at DESC, session, path, hold, kind
+                 OFFSET $2)",
             &[&token, &MAX_ROWS_PER_TOKEN],
         )?;
     }
     Ok(())
 }
 
-/// The session asked for, or was granted, a file it was refused or told about: settles those
-/// rows for that hold as handed off.
-fn contested_handed_off(
+/// The session asked for a file it was refused (`granted` false), or its holder granted it
+/// (`granted` true). Matches the file under any hold, so a hold renewed past its cap under a new
+/// id still settles the refusal. Only a grant hands the file off; an ask may still be declined.
+fn contested_settle(
     tx: &mut postgres::Transaction<'_>,
     token: &str,
     session: &str,
     key: &str,
-    hold: &str,
+    granted: bool,
     now: i64,
 ) -> Result<()> {
+    let (outcome, from) = if granted {
+        ("handed_off", "asked")
+    } else {
+        ("asked", "pending")
+    };
     tx.execute(
-        "UPDATE hub_contested_edits SET outcome = 'handed_off', resolved_at = $5
-         WHERE token = $1 AND session = $2 AND path = $3 AND hold = $4 AND outcome = 'pending'",
-        &[&token, &session, &key, &hold, &now],
+        "UPDATE hub_contested_edits SET outcome = $4, resolved_at = $5
+         WHERE token = $1 AND session = $2 AND path = $3 AND kind = 'refusal'
+           AND outcome IN ('pending', $6)",
+        &[&token, &session, &key, &outcome, &now, &from],
     )?;
     Ok(())
 }
@@ -6209,8 +6218,9 @@ fn contested_facts(
     let rows = tx
         .query(
             "SELECT c.kind, c.outcome, c.observed_at,
-                 EXISTS (SELECT 1 FROM hub_intent_paths p
-                     WHERE p.intent = c.hold AND p.key = c.path AND p.expires_at > $4),
+                 EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+                     WHERE p.key = c.path AND p.expires_at > $4 AND i.token =
+                         (SELECT h.token FROM hub_intents h WHERE h.id = c.hold)),
                  EXISTS (SELECT 1 FROM hub_intents i WHERE i.id = c.hold)
              FROM hub_contested_edits c
              WHERE c.repository = $1 AND c.observed_at >= $2 AND c.observed_at <= $3
@@ -6228,14 +6238,15 @@ fn contested_facts(
             )
         })
         .collect::<Vec<_>>();
-    let at_cap: bool = tx
+    // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
+    let pruned: bool = tx
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM hub_contested_edits WHERE repository = $1
-                 GROUP BY token HAVING COUNT(*) >= $2)",
-            &[&repository, &MAX_ROWS_PER_TOKEN],
+                 GROUP BY token HAVING COUNT(*) >= $2 AND MIN(observed_at) > $3)",
+            &[&repository, &MAX_ROWS_PER_TOKEN, &since],
         )?
         .get(0);
-    let complete = complete(rows.len(), since, now, at_cap);
+    let complete = complete(rows.len(), since, now, pruned);
     Ok((
         rows.into_iter().take(MAX_READ).flatten().collect(),
         complete,
@@ -6279,14 +6290,16 @@ fn overhead_facts(
             updated_at: r.get(12),
         })
         .collect::<Vec<_>>();
-    let at_cap: bool = tx
+    // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
+    let pruned: bool = tx
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM hub_hook_overhead WHERE repository = $1
-                 GROUP BY token HAVING COUNT(*) >= $2)",
-            &[&repository, &MAX_ROWS_PER_TOKEN],
+                 GROUP BY token HAVING COUNT(*) >= $2 AND MIN(updated_at) > $3)",
+            &[&repository, &MAX_ROWS_PER_TOKEN, &since],
         )?
         .get(0);
-    let complete = complete(rows.len(), since, now, at_cap);
+    // Calls this process dropped, or has not written yet, are missing from the rows.
+    let complete = complete(rows.len(), since, now, pruned) && super::hook_overhead::all_written();
     Ok((rows.into_iter().take(MAX_READ).collect(), complete))
 }
 
@@ -6346,8 +6359,8 @@ fn ask_in(
     );
     // A request the session made itself counts as asking; the Hub's own ask after a refusal
     // does not, until the holder grants it.
-    if !auto && let Verdict::Request(holder) | Verdict::AlreadyAsked(holder) = &verdict {
-        contested_handed_off(tx, token, name, key, &holder.id, now)?;
+    if !auto && matches!(verdict, Verdict::Request(_) | Verdict::AlreadyAsked(_)) {
+        contested_settle(tx, token, name, key, false, now)?;
     }
     let holder = match verdict {
         Verdict::Yours => return Ok(Asked::Yours),
@@ -8781,12 +8794,12 @@ impl Store for PgStore {
                     tx.commit()?;
                     return Ok(Answered::NoRequest);
                 };
-                contested_handed_off(
+                contested_settle(
                     &mut tx,
                     &request.requester_token,
                     &request.requester_session,
                     &key,
-                    &current.id,
+                    true,
                     now,
                 )?;
                 let left = remaining(&current, &key);
@@ -12904,7 +12917,7 @@ impl Store for PgStore {
             count(client.failed_open),
             count(sample.hub_calls),
         ];
-        self.run(true, |client| {
+        self.run(false, |client| {
             let mut tx = client.transaction()?;
             let new: bool = tx
                 .query_one(
@@ -12953,7 +12966,8 @@ impl Store for PgStore {
                 tx.execute(
                     "DELETE FROM hub_hook_overhead WHERE (token, session, agent) IN (
                          SELECT token, session, agent FROM hub_hook_overhead
-                         WHERE token = $1 ORDER BY updated_at DESC OFFSET $2)",
+                         WHERE token = $1 ORDER BY updated_at DESC, session, agent
+                         OFFSET $2)",
                     &[&token, &MAX_ROWS_PER_TOKEN],
                 )?;
             }

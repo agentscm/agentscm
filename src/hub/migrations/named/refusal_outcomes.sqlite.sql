@@ -1,5 +1,5 @@
 -- One row per contested-edit refusal or overlap notice and the outcome the Hub observed
--- afterwards; hook overhead per session. Both are bounded by age and count when written.
+-- afterwards; hook overhead per session. Both keep rows 30 days and at most 1,000 per token.
 CREATE TABLE hub_contested_edits (
     repository TEXT NOT NULL,
     token TEXT NOT NULL,
@@ -7,13 +7,15 @@ CREATE TABLE hub_contested_edits (
     path TEXT NOT NULL,
     hold TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('refusal', 'notice')),
-    outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'pushed_through', 'handed_off')),
+    outcome TEXT NOT NULL
+        CHECK (outcome IN ('pending', 'pushed_through', 'asked', 'handed_off', 'proceeded')),
     observed_at INTEGER NOT NULL,
     resolved_at INTEGER,
     PRIMARY KEY (token, session, path, hold, kind)
 ) STRICT;
 CREATE INDEX hub_contested_edits_scope ON hub_contested_edits (repository, observed_at);
 CREATE INDEX hub_contested_edits_pending ON hub_contested_edits (token, session, outcome);
+CREATE INDEX hub_contested_edits_token ON hub_contested_edits (token, observed_at);
 CREATE TABLE hub_hook_overhead (
     repository TEXT NOT NULL,
     token TEXT NOT NULL,
@@ -33,3 +35,4 @@ CREATE TABLE hub_hook_overhead (
     PRIMARY KEY (token, session, agent)
 ) STRICT;
 CREATE INDEX hub_hook_overhead_scope ON hub_hook_overhead (repository, updated_at);
+CREATE INDEX hub_hook_overhead_token ON hub_hook_overhead (token, updated_at);

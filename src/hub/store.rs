@@ -1169,7 +1169,7 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<()>;
     /// Adds one hook call to its session's overhead row, for an authenticated token of
-    /// `repository`; rows are bounded by age and count per repository (see `hook_overhead`).
+    /// `repository`; rows are kept 30 days and at most 1,000 per token (see `hook_overhead`).
     fn hook_overhead(
         &self,
         token: &str,

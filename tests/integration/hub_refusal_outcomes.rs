@@ -45,6 +45,11 @@ impl Db {
 }
 
 fn agent(store: &dyn Store, user_id: i64, name: &str) -> String {
+    agent_with_secret(store, user_id, name).0
+}
+
+/// The token id and the bearer secret of a fresh agent token.
+fn agent_with_secret(store: &dyn Store, user_id: i64, name: &str) -> (String, String) {
     let identity = ForgeIdentity {
         provider: "github".into(),
         host: "github.com".into(),
@@ -53,9 +58,8 @@ fn agent(store: &dyn Store, user_id: i64, name: &str) -> String {
     let owner = store
         .upsert_user(&identity, &format!("user{user_id}"))
         .unwrap();
-    mint_agent_token(store, &owner.id, name, REPO, 3600)
-        .unwrap()
-        .0
+    let (token, secret) = mint_agent_token(store, &owner.id, name, REPO, 3600).unwrap();
+    (token, secret.expose().to_owned())
 }
 
 fn call(via: &str, session: Option<&str>, paths: &[&str], deny: bool) -> SessionCall {
@@ -113,20 +117,23 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     }
     // Bob edits again while the hold stands: pushed through.
     assert!(!edit(&*store, &bob, "s", &["a.rs"], T0 + 2));
-    // Dave asks for the file himself (the Hub's own ask after the refusal does not count).
+    // Dave asks for the file himself (the Hub's own ask after the refusal does not count),
+    // and Alice declines: asked, not handed off.
     store
         .ask_handoff(&dave, Some("s"), "b.rs", None, T0 + 3)
         .unwrap();
-    // Alice grants erin the Hub's request.
+    store
+        .answer_handoff(&alice, None, "b.rs", false, None, T0 + 3)
+        .unwrap();
+    // Alice grants erin the Hub's request: handed off.
     store
         .answer_handoff(&alice, None, "c.rs", true, None, T0 + 4)
         .unwrap();
-    // Carol's MCP touch is told about the overlap, not refused: a notice, still pending.
+    // Carol's MCP touch is told about the overlap and claims the file anyway: proceeded.
     let carol = agent(&*store, 3, "c");
     hold(&*store, &carol, &["d.rs"], T0 + 5);
-    // George's hook reports an edit it could not be refused before (as Cursor's does): the
-    // notices it draws (one per hold on d.rs: alice's and carol's) are settled at once,
-    // because the edit already went ahead.
+    // George's hook reports an edit it could not be refused before (as Cursor's does): told about
+    // both holds on d.rs (alice's and carol's) and went ahead. Nothing was dismissed.
     let george = agent(&*store, 7, "g");
     store
         .touch_session(
@@ -143,36 +150,106 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     assert_eq!(
         (
             refusals.pushed_through,
+            refusals.asked,
             refusals.handed_off,
             refusals.pending
         ),
-        (1, 2, 1)
+        (1, 1, 1, 1)
     );
     let notices = &live.issues.contested_edits.notices;
-    assert_eq!(
-        (notices.observed, notices.pending, notices.pushed_through),
-        (3, 1, 2)
-    );
-    assert_eq!(live.issues.dismissed, Some(3));
-    assert_eq!(live.issues.resolved, 2);
+    assert_eq!((notices.observed, notices.proceeded), (3, 3));
+    // Only Bob overrode a refusal; only Erin's grant resolves; Dave's declined ask does not.
+    assert_eq!(live.issues.dismissed, Some(1));
+    assert_eq!(live.issues.resolved, 1);
     assert_eq!(live.issues.unresolved, 2);
 
-    // Alice's hold lapses: frank and carol went elsewhere; settled rows keep their outcome.
+    // Alice's hold lapses: Frank went elsewhere, inferred and counted apart; settled rows and
+    // Dave's unanswered ask keep their outcome.
     let later = metrics(&*store, &alice, T0 + 10 + 2 * SESSION_TTL_SECONDS);
     let contested = &later.issues.contested_edits;
     assert_eq!(contested.refusals.went_elsewhere, 1);
     assert_eq!(contested.refusals.pushed_through, 1);
-    assert_eq!(contested.notices.went_elsewhere, 1);
-    assert_eq!(contested.notices.pushed_through, 2);
-    // Went elsewhere is inferred, so it is neither resolved nor unresolved.
-    assert_eq!(later.issues.unresolved, 0);
-    assert_eq!(later.issues.resolved, 2);
+    assert_eq!(contested.refusals.asked, 1);
+    assert_eq!(contested.notices.proceeded, 3);
+    assert_eq!((later.issues.resolved, later.issues.unresolved), (1, 1));
+}
+
+fn a_hold_renewed_past_its_cap_keeps_the_refusal_live_and_its_grant_settles_it(db: &Db) {
+    use agentscm::hub::session::HOLD_CAP_SECONDS;
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1, "a"), agent(&*store, 2, "b"));
+    hold(&*store, &alice, &["a.rs"], T0);
+    hold(&*store, &alice, &[], T0 + 1000);
+    let refused_at = T0 + HOLD_CAP_SECONDS - 300;
+    assert!(edit(&*store, &bob, "s", &["a.rs"], refused_at));
+    // Past the cap, Alice's next touch keeps a.rs under a new hold id.
+    hold(&*store, &alice, &[], T0 + HOLD_CAP_SECONDS + 1);
+    let renewed = metrics(&*store, &alice, T0 + HOLD_CAP_SECONDS + 2);
+    assert_eq!(
+        renewed.issues.contested_edits.refusals.pending, 1,
+        "still held by alice, not went elsewhere"
+    );
+    store
+        .answer_handoff(&alice, None, "a.rs", true, None, T0 + HOLD_CAP_SECONDS + 3)
+        .unwrap();
+    let granted = metrics(&*store, &alice, T0 + HOLD_CAP_SECONDS + 4);
+    assert_eq!(granted.issues.contested_edits.refusals.handed_off, 1);
+    assert_eq!(granted.issues.resolved, 1);
+}
+
+fn a_failed_overhead_write_keeps_only_the_totals_not_yet_written(db: &Db) {
+    use agentscm::hub::hook_overhead::{all_written, flush, record};
+    use agentscm::hub::store::unix_now;
+    let store = db.open();
+    let objects = TempDir::new().unwrap();
+    let state = agentscm::hub::HubState::new(
+        store.clone(),
+        Arc::new(agentscm::backend::LocalBackend::open(objects.path()).unwrap()),
+    );
+    let (token, secret) = agent_with_secret(&*store, 1, "a");
+    let sample = |session: &str, hub_calls: u64| Sample {
+        session: session.into(),
+        agent: "claude".into(),
+        hub_calls,
+        ..Default::default()
+    };
+    // A row at the integer limit: adding one more call to it fails in either store.
+    store
+        .hook_overhead(&token, REPO, &sample("big", i64::MAX as u64), unix_now())
+        .unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        record(&state, Some(&secret), None, sample("a", 1));
+        record(&state, Some(&secret), None, sample("big", 1));
+        // "a" is written, "big" fails and waits; the next write must not add "a" again.
+        flush(&state).await;
+        flush(&state).await;
+    });
+    let query = ValueMetricsQuery {
+        since: Some(unix_now() - 3600),
+        ..Default::default()
+    };
+    let overhead = store
+        .value_metrics(&token, &query, unix_now())
+        .unwrap()
+        .overhead;
+    let a = overhead
+        .per_session
+        .iter()
+        .find(|row| row.session == "a")
+        .expect("session a was written");
+    assert_eq!(a.hub_calls, 1, "the written total is not written twice");
+    assert!(!all_written());
+    assert!(
+        overhead.partial,
+        "a total still waiting makes the read partial"
+    );
 }
 
 fn hook_overhead_adds_calls_per_session_and_prunes_old_rows(db: &Db) {
     let store = db.open();
     let token = agent(&*store, 1, "a");
     let report = ClientReport {
+        id: None,
         calls: 61,
         ms_total: 250_000,
         ms_max: 5000,
@@ -254,19 +331,23 @@ async fn a_hook_call_and_its_client_report_reach_value_metrics() {
         )
         .unwrap();
     let (token, secret) = mint_agent_token(&*store, &owner.id, "a", REPO, 3600).unwrap();
-    let reply = reqwest::Client::new()
-        .post(format!("http://{address}/v1/hub/hook/claude"))
-        .bearer_auth(secret.expose())
-        .header(
-            REPORT_HEADER,
-            r#"{"calls":3,"ms_total":9000,"ms_max":5000,"timeouts":1,"failed_open":1}"#,
-        )
-        .header("content-type", "application/json")
-        .body(r#"{"hook_event_name":"SessionStart","session_id":"s1"}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(reply.status(), 200);
+    // The client sends one report twice, as it does when the first carrying call timed out on
+    // its side after the Hub received it: the Hub counts it once.
+    for _ in 0..2 {
+        let reply = reqwest::Client::new()
+            .post(format!("http://{address}/v1/hub/hook/claude"))
+            .bearer_auth(secret.expose())
+            .header(
+                REPORT_HEADER,
+                r#"{"id":42,"calls":3,"ms_total":9000,"ms_max":5000,"timeouts":1,"failed_open":1}"#,
+            )
+            .header("content-type", "application/json")
+            .body(r#"{"hook_event_name":"SessionStart","session_id":"s1"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 200);
+    }
     // Totals are written in the background, at most every 30 seconds: write them now.
     let query = ValueMetricsQuery {
         since: Some(unix_now() - 3600),
@@ -276,14 +357,14 @@ async fn a_hook_call_and_its_client_report_reach_value_metrics() {
     for _ in 0..50 {
         agentscm::hub::hook_overhead::flush(&state).await;
         let read = store.value_metrics(&token, &query, unix_now()).unwrap();
-        if read.overhead.hub_calls > 0 {
+        if read.overhead.hub_calls >= 2 {
             overhead = Some(read.overhead);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let overhead = overhead.expect("the hook call was recorded");
-    assert_eq!(overhead.hub_calls, 1);
+    assert_eq!(overhead.hub_calls, 2);
     assert!(overhead.injected_characters.session_start > 0);
     assert_eq!(
         (
@@ -346,4 +427,6 @@ conformance!(
     refusal_outcomes_follow_what_the_session_did_next,
     hook_overhead_adds_calls_per_session_and_prunes_old_rows,
     one_tokens_sessions_cannot_push_out_another_tokens_rows,
+    a_hold_renewed_past_its_cap_keeps_the_refusal_live_and_its_grant_settles_it,
+    a_failed_overhead_write_keeps_only_the_totals_not_yet_written,
 );
