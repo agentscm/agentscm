@@ -74,6 +74,9 @@ These options are shown in `agentscm quickstart --help`:
 Older flags (`--local`, `--hub`, `--agent`, `--no-agents`, `--init` and others) still parse and are
 documented in the [setup guide](setup-guide.md#other-flags).
 
+To try agents against a Hub on this computer without a GitHub App or any forge sign-in, see
+[agent tokens for a local Hub without a forge](local-agent-token.md).
+
 ### Share your local Hub over Tailscale
 
 *Untested: this section has not been run end to end.*

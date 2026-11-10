@@ -209,6 +209,31 @@ impl PgStore {
         })
     }
 
+    /// An existing, current database only: never migrated here (see
+    /// [`super::store::open_existing`]). Connecting never creates a PostgreSQL database.
+    pub(super) fn open_existing(url: &str) -> Result<Self> {
+        let not_current = |_| HubError::Invalid(super::store::NOT_CURRENT.into());
+        let config = config(url)?;
+        let mut client = connect(&config)?;
+        let versions: Vec<i64> = client
+            .query("SELECT version FROM hub_schema_migrations", &[])
+            .map_err(not_current)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let names: Vec<String> = client
+            .query("SELECT name FROM hub_named_migrations", &[])
+            .map_err(not_current)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        super::store::ensure_current(&versions, &names)?;
+        Ok(Self {
+            config,
+            client: Mutex::new(Some(client)),
+        })
+    }
+
     /// Runs `op` on a live connection, reconnecting first if it is known closed.
     /// With `retry`, an error that leaves the connection closed is retried once
     /// on a new connection; only use that for reads, since a lost reply to a

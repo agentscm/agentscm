@@ -227,6 +227,8 @@ mod local_recovery_issue_config_cli;
 #[cfg(unix)]
 mod local_recovery_issue_workflow;
 #[cfg(unix)]
+mod local_token;
+#[cfg(unix)]
 mod local_validation;
 #[cfg(unix)]
 mod local_validation_cli;

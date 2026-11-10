@@ -503,6 +503,17 @@ agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called b
 
 `init-repo` writes only the committed agent instruction files for the chosen agents (all five by default) into the Git repository you are in: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursor/rules/agentscm.mdc` and `.github/copilot-instructions.md`. It writes no MCP config, hooks or token. It needs no data directory and is idempotent. `--hub-url` (default: `AGENTSCM_HUB_URL`, then `hub.json`) fills in the setup command in those files and in the next steps it prints; without one they keep a `<HUB_URL>` placeholder. Each developer then runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout. (`init` is the unrelated command that prepares a data directory.) `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`; the hooks `client setup` writes instead pass `--client-connection` (also accepted for `gemini`), which uses only the checkout's saved connection and cannot be combined with `--hub-url` or `--repo`. Details, the file list and limits: [supported agents](../agents.md).
 
+## Local Hub tokens
+
+```sh
+agentscm hub local-token --repo OWNER/NAME --login NAME [--name AGENT] [--hours 1..720]
+```
+
+Mints an agent token straight into the Hub database named by `AGENTSCM_DATABASE_URL`, for a Hub on
+this computer with no forge connection and no forge sign-ins. The database must exist and match
+this release; nothing is created or migrated. The token is printed once. See
+[agent tokens for a local Hub without a forge](../local-agent-token.md).
+
 ## Serving
 
 ```sh

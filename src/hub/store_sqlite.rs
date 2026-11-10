@@ -216,6 +216,30 @@ impl SqliteStore {
         })
     }
 
+    /// An existing, current database only: never created or migrated here (see
+    /// [`super::store::open_existing`]).
+    pub(super) fn open_existing(path: &Path) -> Result<Self> {
+        let not_current = || HubError::Invalid(super::store::NOT_CURRENT.into());
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|_| not_current())?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let versions = conn
+            .prepare("SELECT version FROM hub_schema_migrations")
+            .map_err(|_| not_current())?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let names = conn
+            .prepare("SELECT name FROM hub_named_migrations")
+            .map_err(|_| not_current())?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        super::store::ensure_current(&versions, &names)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }

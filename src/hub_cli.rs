@@ -417,9 +417,11 @@ fn database_url() -> Result<String> {
     }
 }
 
-/// An agent token for `repo`, owned by the local person `login`, minted into the Hub database at
-/// `database_url`. The identity is GitHub-shaped so the store accepts it, but on host `localhost`,
-/// which no forge sign-in uses, with an id derived from the login so one login is one user.
+/// An agent token for `repo`, owned by the local person `login`, minted into the existing Hub
+/// database at `database_url`. The identity is GitHub-shaped so the store accepts it, but on host
+/// `localhost`, which no forge sign-in uses, with an id derived from the lowercased login so one
+/// login is one user. Refused on a Hub that has a forge connection or anyone signed in through a
+/// forge: there, tokens come from `hub token create` or `client setup`.
 fn local_token(
     database_url: &str,
     repo: &str,
@@ -427,17 +429,31 @@ fn local_token(
     name: &str,
     hours: i64,
 ) -> Result<String> {
-    use agentscm::hub::store::{self, ForgeIdentity, mint_agent_token};
+    use agentscm::hub::store::{self, ForgeIdentity, LOCAL_HOST, mint_agent_token};
+    store::validate_repository(repo).map_err(map_hub_error)?;
+    let login = login.to_ascii_lowercase();
+    let store = store::open_existing(database_url).map_err(map_hub_error)?;
+    let forge_people = store.list_users().map_err(map_hub_error)?;
+    if !store.connections().map_err(map_hub_error)?.is_empty()
+        || forge_people
+            .iter()
+            .any(|user| user.identity.host != LOCAL_HOST)
+    {
+        return Err(Error::Invalid(
+            "this Hub has a forge connection or forge sign-ins; use `agentscm hub token create` or `agentscm client setup` there".into(),
+        ));
+    }
     let digest = Sha256::digest(login.as_bytes());
     let mut id = [0u8; 8];
     id.copy_from_slice(&digest[..8]);
     let identity = ForgeIdentity {
         provider: "github".into(),
-        host: "localhost".into(),
+        host: LOCAL_HOST.into(),
         user_id: (i64::from_be_bytes(id) & i64::MAX).max(1),
     };
-    let store = store::open(database_url).map_err(map_hub_error)?;
-    let user = store.upsert_user(&identity, login).map_err(map_hub_error)?;
+    let user = store
+        .upsert_user(&identity, &login)
+        .map_err(map_hub_error)?;
     let (_, secret) =
         mint_agent_token(&*store, &user.id, name, repo, hours * 3600).map_err(map_hub_error)?;
     Ok(secret.expose().to_owned())
@@ -2603,13 +2619,14 @@ mod tests {
 
     #[test]
     fn a_local_token_authenticates_in_its_repository_and_one_login_is_one_user() {
-        use agentscm::hub::store::{self, agent_token_digest};
+        use agentscm::hub::store::{self, ForgeIdentity, agent_token_digest};
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
-        let first = local_token(&url, "acme/widgets", "maya", "claude", 1).unwrap();
+        // The Hub created and migrated its database first.
+        let store = store::open(&url).unwrap();
+        let first = local_token(&url, "acme/widgets", "Maya", "claude", 1).unwrap();
         let second = local_token(&url, "acme/widgets", "maya", "codex", 1).unwrap();
         assert_ne!(first, second);
-        let store = store::open(&url).unwrap();
         let who = |secret: &str| {
             store
                 .authenticate(&agent_token_digest(secret).unwrap(), unix_now())
@@ -2624,8 +2641,45 @@ mod tests {
         assert!(!a.read_only);
         assert!(a.expires_at <= unix_now() + 3600);
         assert_eq!(a.owner.id, b.owner.id);
-        assert_eq!(a.owner.identity.host, "localhost");
-        assert!(local_token(&url, "not a repository", "maya", "x", 1).is_err());
+        assert_eq!(
+            (a.owner.identity.host.as_str(), a.owner.login.as_str()),
+            ("localhost", "maya")
+        );
+        // A bad repository is refused before anyone is made.
+        let users = store.list_users().unwrap().len();
+        assert!(local_token(&url, "not a repository", "sam", "x", 1).is_err());
+        assert_eq!(store.list_users().unwrap().len(), users);
+        // Not on a Hub where people sign in through a forge.
+        let forge = ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id: 9,
+        };
+        store.upsert_user(&forge, "alice").unwrap();
+        assert!(local_token(&url, "acme/widgets", "maya", "claude", 1).is_err());
+    }
+
+    #[test]
+    fn a_local_token_never_creates_or_migrates_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mistyped path: nothing is created and no token is printed.
+        let missing = dir.path().join("typo.sqlite");
+        let url = |path: &std::path::Path| format!("sqlite://{}", path.display());
+        assert!(local_token(&url(&missing), "acme/widgets", "maya", "a", 1).is_err());
+        assert!(!missing.exists());
+        // An older database, here one that applied no migration yet, is refused untouched.
+        let old = dir.path().join("old.sqlite");
+        let conn = rusqlite::Connection::open(&old).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hub_schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+             CREATE TABLE hub_named_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&old).unwrap();
+        let refused = local_token(&url(&old), "acme/widgets", "maya", "a", 1).unwrap_err();
+        assert!(refused.to_string().contains("hub serve"), "{refused}");
+        assert_eq!(std::fs::read(&old).unwrap(), before);
     }
 
     #[test]

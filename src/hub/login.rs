@@ -587,9 +587,25 @@ impl Login {
         listed(&self.config.admins, provider, id, login)
     }
 
-    /// True when the configured admin list names this stored user.
+    /// True when the configured admin list names this stored user, on that provider's configured
+    /// host (its public host when the provider is not configured). A person on another host, such
+    /// as one made with `agentscm hub local-token`, never matches an entry by login or id.
     pub(super) fn is_admin_user(&self, user: &super::store::User) -> bool {
-        self.is_admin(&user.identity.provider, user.identity.user_id, &user.login)
+        let identity = &user.identity;
+        let host = self
+            .config
+            .providers
+            .iter()
+            .find(|provider| provider.name == identity.provider)
+            .map_or(
+                match identity.provider.as_str() {
+                    "github" => "github.com",
+                    "gitlab" => "gitlab.com",
+                    _ => "",
+                },
+                |provider| provider.host.as_str(),
+            );
+        identity.host == host && self.is_admin(&identity.provider, identity.user_id, &user.login)
     }
 
     fn has_allow_list(&self) -> bool {
@@ -1947,6 +1963,31 @@ mod tests {
         // Expired sessions do not count against the cap.
         sessions.insert_session("a9".into(), 300, human("usr_a"), 150);
         assert!(sessions.get("a1", 0).is_some() && sessions.get("a9", 150).is_some());
+    }
+
+    #[test]
+    fn an_admin_entry_names_a_person_on_the_providers_own_host_only() {
+        let config = LoginConfig::from_lookup("http://127.0.0.1:7332", |name| {
+            (name == "AGENTSCM_ADMINS").then(|| "github:maya,github:#7".to_owned())
+        })
+        .unwrap();
+        let login = Login::new(config).unwrap();
+        let person = |host: &str, user_id: i64, login: &str| super::super::store::User {
+            id: "usr_x".into(),
+            identity: super::super::store::ForgeIdentity {
+                provider: "github".into(),
+                host: host.into(),
+                user_id,
+            },
+            login: login.into(),
+            name: None,
+            disabled: false,
+        };
+        assert!(login.is_admin_user(&person("github.com", 1, "maya")));
+        assert!(login.is_admin_user(&person("github.com", 7, "someone")));
+        assert!(!login.is_admin_user(&person("localhost", 1, "maya")));
+        assert!(!login.is_admin_user(&person("localhost", 7, "someone")));
+        assert!(!login.is_admin_user(&person("github.example.com", 1, "maya")));
     }
 
     #[test]
