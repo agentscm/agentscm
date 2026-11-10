@@ -234,6 +234,7 @@ pub struct WorkItem {
     pub last_checkin_at: i64,
     /// Set only on the automatic pause written at session end: the last check-in time before it.
     /// Later auto-pauses keep it, so the pause does not make the session look newly checked in.
+    /// The report of that session's return puts it back as the last check-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<i64>,
     pub generation: i64,
@@ -850,7 +851,25 @@ impl WorkCheckpoint {
     /// an agent asks for with `done` is written the same way under `mcp`, and is a pause on
     /// purpose.
     pub(super) fn ended_its_session(operation_id: &str) -> bool {
-        operation_id.starts_with("hook") && operation_id.contains("-done-")
+        operation_id.starts_with("hook:") && operation_id.contains("-done-")
+    }
+
+    /// The Work's `last_checkin_at` and `reported_at` once this checkpoint is written at `now`.
+    /// A checkpoint is the lead's check-in, except the two the Hub writes for it. The pause a
+    /// session end writes sets the pause's time aside from the lead's own last check-in, which
+    /// `reported_at` keeps. The report of that session's return puts that check-in back, so the
+    /// Work reads as it did before its session ended: the return is not a check-in either, and
+    /// a merge or a long silence since the lead's own report still counts.
+    pub(super) fn check_in(&self, item: &WorkItem, now: i64) -> (i64, Option<i64>) {
+        match (self.kind, self.summary.as_str()) {
+            (CheckpointKind::Pause, AUTO_PAUSE_SUMMARY) => {
+                (now, item.reported_at.or(Some(item.last_checkin_at)))
+            }
+            (CheckpointKind::Progress, AUTO_RESUME_SUMMARY) => {
+                (item.reported_at.unwrap_or(item.last_checkin_at), None)
+            }
+            _ => (now, None),
+        }
     }
 
     /// The report that returns Work to active when the session whose end paused it starts again:

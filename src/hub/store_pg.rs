@@ -3277,15 +3277,16 @@ fn unfinished_for_session(
         .transpose()
 }
 
-/// The paused Work `session` leads that changed last, when that change is the pause its own
+/// The paused Work `session` leads that changed last, when its last report is the pause its own
 /// session end wrote and the Work's hold is still live. `None` while the session leads active
-/// or blocked Work: a returning session is not given a second. The Work is read under its row
-/// lock, as the pause was.
+/// or blocked Work: a returning session is not given a second. With `lock` the Work is read
+/// under its row lock, as the pause was; the caller then holds the repository's Work lock.
 fn paused_by_session_end(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     session: &str,
     now: i64,
+    lock: bool,
 ) -> Result<Option<WorkItem>> {
     if unfinished_for_session(tx, who, session, now)?.is_some() {
         return Ok(None);
@@ -3308,19 +3309,24 @@ fn paused_by_session_end(
     let Some(id) = found.map(|row| row.get::<_, String>(0)) else {
         return Ok(None);
     };
-    let Some(item) = scoped_work(tx, who, &id, now, true)?.filter(|i| i.state == WorkState::Paused)
+    let Some(item) = scoped_work(tx, who, &id, now, lock)?.filter(|i| i.state == WorkState::Paused)
     else {
         return Ok(None);
     };
+    // Its last report, not its last change: a pull request the Hub linked since is no report.
     let pause = tx.query_opt(
-        "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = $1 AND event_seq = $2",
-        &[&item.id, &item.updated_seq],
+        "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = $1
+         ORDER BY event_seq DESC LIMIT 1",
+        &[&item.id],
     )?;
-    let ended = pause.is_some_and(|row| WorkCheckpoint::ended_its_session(row.get(0)));
+    let ended = pause.is_some_and(|row| WorkCheckpoint::ended_its_session(row.get(0)))
+        && item
+            .current
+            .as_ref()
+            .is_some_and(|report| report.summary == AUTO_PAUSE_SUMMARY);
     // Only within the hold's own patience: a session that comes back after its hold lapsed may
     // be back for something else, and its Work must not take its files again unasked.
-    let held =
-        work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
+    let held = work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
     Ok((ended && held).then_some(item))
 }
 
@@ -7526,14 +7532,7 @@ fn work_checkpoint_in(
     )?;
     item.state = checkpoint.state();
     item.claim_status = ClaimStatus::Active;
-    item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
-        && checkpoint.summary == AUTO_PAUSE_SUMMARY
-    {
-        item.reported_at.or(Some(item.last_checkin_at))
-    } else {
-        None
-    };
-    item.last_checkin_at = now;
+    (item.last_checkin_at, item.reported_at) = checkpoint.check_in(&item, now);
     item.next_action = checkpoint.next_action.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
@@ -8777,9 +8776,16 @@ impl Store for PgStore {
             active_token(&mut tx, token, now)?;
             let name = session_name(&mut tx, token, session, now)?;
             let paused = match work_who(&mut tx, token, now) {
+                // Most starts have nothing to resume, and the repository's Work lock is
+                // exclusive: look without it first, then read again under it.
                 Ok(who) if !who.read_only => {
-                    lock_work_capacity(&mut tx, &who)?;
-                    paused_by_session_end(&mut tx, &who, &name, now)?
+                    match paused_by_session_end(&mut tx, &who, &name, now, false)? {
+                        Some(_) => {
+                            lock_work_capacity(&mut tx, &who)?;
+                            paused_by_session_end(&mut tx, &who, &name, now, true)?
+                        }
+                        None => None,
+                    }
                 }
                 // A token that cannot report on Work resumes none.
                 Ok(_) | Err(HubError::Unauthorized) => None,

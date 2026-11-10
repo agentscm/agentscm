@@ -740,11 +740,27 @@ fn a_session_end_pause_ends_when_the_session_returns(db: &Db) {
     assert_eq!(resumed.id, turns.id);
     assert_eq!(resumed.state, WorkState::Active);
     assert_eq!(resumed.next_action, turns.next_action);
+    // The pause and the return are the Hub's words, not check-ins: the Work reads as it did
+    // before its session ended, so a merge or a long silence since still counts.
+    assert_eq!(
+        (resumed.last_checkin_at, resumed.reported_at),
+        (turns.last_checkin_at, None)
+    );
     // Nothing is left to resume, and another session's start resumes nothing.
     assert!(back("turns", now + 61).is_none());
     assert!(end("turns", "hook:claude"));
     assert!(back("another", now + 62).is_none());
-    assert_eq!(state(&turns.id), WorkState::Paused);
+    let paused = store.work_get(&alice.token, &turns.id, now + 90).unwrap();
+    let paused = paused.unwrap();
+    assert_eq!(paused.state, WorkState::Paused);
+    assert_eq!(paused.reported_at, Some(turns.last_checkin_at));
+    // The next turn does the same again.
+    let again = back("turns", now + 63).unwrap();
+    assert_eq!(
+        (again.state, again.last_checkin_at),
+        (WorkState::Active, turns.last_checkin_at)
+    );
+    assert!(end("turns", "hook:claude"));
 
     // The agent's own `done` writes the same pause on purpose: it stays.
     let done = begin("done");

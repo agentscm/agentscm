@@ -460,11 +460,12 @@ pub trait Store: Send + Sync {
     ) -> Result<SessionEnd>;
     /// The session is back: return the Work its own end paused to active, with the progress
     /// report a lead would write. Only the pause `end_session_pausing` wrote for a hook's
-    /// session end is undone, and only while it is the Work's last change and the Work's hold
+    /// session end is undone, and only while it is the Work's last report and the Work's hold
     /// is still live, so a session that comes back later takes no files again unasked. A pause
     /// reported on purpose (a pause checkpoint, or the agent's own `done`) stays, and so does
-    /// everything while the session leads other active or blocked Work. `None` when nothing
-    /// was resumed.
+    /// everything while the session leads other active or blocked Work. The return is not the
+    /// lead's check-in: `last_checkin_at` goes back to what it was before the pause. `None`
+    /// when nothing was resumed.
     fn resume_ended_session(
         &self,
         token: &str,

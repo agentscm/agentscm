@@ -195,13 +195,23 @@ a completion, the session's next edit needs a new `agentscm_start`, and the repl
 A session that starts again after its own end takes that Work up again. Some clients end the session
 after every turn, so for them the pause only means "between turns". When a hook's session start
 names a session, the Hub looks at the paused Work that session leads which changed last. If its last
-change is the pause that session's own hook end wrote, the Hub writes the progress report a lead
-would write, with the summary `Session returned; the Work its end paused goes on.`: the Work is
-active again, keeps its next action, and its lease is renewed. Nothing is resumed when the pause
-was reported on purpose (a pause checkpoint, or `agentscm_done`, whose pause is written under
-`mcp`), when anything changed the Work since, when it no longer has a reservation, or while the
-session already leads other active or blocked Work. A start that names no session resumes nothing,
-as its end pauses nothing. The resume is best effort: a failure is logged and the start is answered.
+report is the pause that session's own hook end wrote, and its hold is still live, the Hub writes
+the progress report a lead would write, with the summary `Session returned; the Work its end paused
+goes on.`: the Work is active again and keeps its next action. The same start's touch then renews
+its lease, as for any active Work the session leads.
+
+Neither the pause nor the return is the lead's own check-in. The pause keeps the lead's last
+check-in time in `reported_at`; the return puts it back as `last_checkin_at` and clears
+`reported_at`. A resumed Work therefore reads as it did before its session ended: a pull request
+that merged meanwhile still hides or flags it, and a long silence since the lead's own report still
+counts as one.
+
+Nothing is resumed when the pause was reported on purpose (a pause checkpoint, or `agentscm_done`,
+whose pause is written under `mcp`), when the lead reported anything since, when its hold has lapsed
+(one lease after the session's end: 20 minutes, or 2 hours for a retained hold, so a session that
+comes back later takes no files again unasked), or while the session already leads other active or
+blocked Work. A start that names no session resumes nothing, as its end pauses nothing. The resume
+is best effort: a failure is logged and the start is answered.
 
 ## 6. The WorkOperationalV1 projection
 
@@ -503,7 +513,8 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   nobody.
 - **Paused only by its session's end**, with its hold still live: the row stays `active` and asks
   nobody, because the session may only be between turns. The patience is the hold's own lease,
-  20 minutes from that session's last call. Once the hold has lapsed the row is
+  which the pause starts anew: 20 minutes from the session's end, or 2 hours for a retained hold.
+  Once the hold has lapsed the row is
   `reassessment_needed` like any quiet Work, and Work that holds nothing gets no patience. The
   pause `agentscm_done` writes is the same report and reads the same way; a pause reported in the
   agent's own words is quiet at once.

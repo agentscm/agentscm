@@ -3324,7 +3324,7 @@ fn unfinished_for_session(
         .transpose()
 }
 
-/// The paused Work `session` leads that changed last, when that change is the pause its own
+/// The paused Work `session` leads that changed last, when its last report is the pause its own
 /// session end wrote and the Work's hold is still live. `None` while the session leads active
 /// or blocked Work: a returning session is not given a second.
 fn paused_by_session_end(
@@ -3359,18 +3359,23 @@ fn paused_by_session_end(
     else {
         return Ok(None);
     };
+    // Its last report, not its last change: a pull request the Hub linked since is no report.
     let pause: Option<String> = tx
         .query_row(
-            "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = ?1 AND event_seq = ?2",
-            params![item.id, item.updated_seq],
+            "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = ?1
+             ORDER BY event_seq DESC LIMIT 1",
+            [&item.id],
             |row| row.get(0),
         )
         .optional()?;
-    let ended = pause.is_some_and(|operation| WorkCheckpoint::ended_its_session(&operation));
+    let ended = pause.is_some_and(|operation| WorkCheckpoint::ended_its_session(&operation))
+        && item
+            .current
+            .as_ref()
+            .is_some_and(|report| report.summary == AUTO_PAUSE_SUMMARY);
     // Only within the hold's own patience: a session that comes back after its hold lapsed may
     // be back for something else, and its Work must not take its files again unasked.
-    let held =
-        work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
+    let held = work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
     Ok((ended && held).then_some(item))
 }
 
@@ -7693,14 +7698,7 @@ fn work_checkpoint_in(
     )?;
     item.state = checkpoint.state();
     item.claim_status = ClaimStatus::Active;
-    item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
-        && checkpoint.summary == AUTO_PAUSE_SUMMARY
-    {
-        item.reported_at.or(Some(item.last_checkin_at))
-    } else {
-        None
-    };
-    item.last_checkin_at = now;
+    (item.last_checkin_at, item.reported_at) = checkpoint.check_in(&item, now);
     item.next_action = checkpoint.next_action.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
