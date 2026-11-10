@@ -1,4 +1,8 @@
-# Hub store consolidation
+---
+title: "Design: Hub store consolidation"
+---
+
+# Design: Hub store consolidation
 
 Status: proposed. Nothing in this document is implemented.
 
