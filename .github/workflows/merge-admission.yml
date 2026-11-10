@@ -4,17 +4,21 @@ on:
   pull_request_target: # zizmor: ignore[dangerous-triggers] trusted workflow source only; no candidate checkout or execution
     types: [opened, reopened, synchronize, edited, ready_for_review]
   workflow_run: # zizmor: ignore[dangerous-triggers] API results only; never downloads candidate artifacts
-    workflows: [Local validation verifier, Conventional PR title]
+    # CI completion re-evaluates admission, so a queued pull request enters once static and tests pass.
+    workflows: [Local validation verifier, Conventional PR title, CI]
     types: [requested, in_progress, completed]
 
 permissions: {}
 
-concurrency:
-  group: merge-admission
-  cancel-in-progress: false
-
 jobs:
   admission:
+    # A CI start is skipped: the pull request's own event already set its head pending. A newer pending
+    # run replaces an older one in a group, and the docs do not say whether a job skipped by `if` joins
+    # it, so a skipped CI start gets a group of its own and can never displace a queued sweep.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.name != 'CI' || github.event.action == 'completed' }}
+    concurrency:
+      group: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && github.event.action != 'completed') && format('merge-admission-skip-{0}', github.run_id) || 'merge-admission' }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

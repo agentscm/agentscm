@@ -2,6 +2,8 @@
 const NAME = 'Merge batch gate';
 const ACTIONS_APP = 15368;
 const ACTIONS_BOT = 41898282;
+// ci.yml check names, matched by name and app rather than job id, so an aggregate job named `tests` counts.
+const CI_CHECKS = ['static', 'tests'];
 
 async function pages(call, key, visit = async () => {}) {
   const values = [];
@@ -26,7 +28,7 @@ async function report(github, repo, head, latest, state, description) {
 
 async function admit({github, context, validateTitle}) {
   const repo = context.repo;
-  // Only the pull request's own event sets its status pending; sweeps write final states only.
+  // Only the pull request's own event resets its status to pending; sweeps write only a changed outcome.
   const ownEvent = Boolean(context.payload.pull_request);
   const pendingStatus = async head => report(github, repo, head,
     (await github.rest.repos.listCommitStatusesForRef({...repo, ref: head, per_page: 100})).data,
@@ -40,7 +42,7 @@ async function admit({github, context, validateTitle}) {
       try {
         const create = head => github.rest.checks.create({
           ...repo, name: NAME, head_sha: head, status: 'in_progress',
-          output: {title: 'PR admission pending', summary: 'Checking current local validation and title; this does not qualify a merge batch.'},
+          output: {title: 'PR admission pending', summary: 'Checking current local validation, title and CI checks; this does not qualify a merge batch.'},
         });
         let {data: check} = await create(candidate.head.sha);
         // A status failure is reported but never stops the check-run path below.
@@ -78,24 +80,33 @@ async function admit({github, context, validateTitle}) {
     // The signed local check is optional evidence; every batch runs fmt, Clippy and the full
     // suite. Only a signed failure refuses; missing, pending or error does not.
     const localState = trustedLocal ? local.state : 'none';
-    let conclusion;
-    if (!currentTitleValid || localState === 'failure' ||
-        (trustedTitle && title.status === 'completed' && title.conclusion !== 'success')) {
-      conclusion = 'failure';
-    } else if (trustedTitle && title.status === 'completed' && title.conclusion === 'success') {
-      conclusion = 'success';
+    const failed = [];
+    const waiting = [];
+    if (!currentTitleValid) failed.push('PR title');
+    if (localState === 'failure') failed.push('signed local validation');
+    if (!trustedTitle || title.status !== 'completed') waiting.push('Conventional PR title');
+    else if (title.conclusion !== 'success') failed.push('Conventional PR title');
+    // The pull request's own CI jobs must pass on this exact head, so a red change never enters
+    // the queue. Every trusted latest run of each name must succeed; other apps never count.
+    for (const name of CI_CHECKS) {
+      const runs = checks.filter(c => c.name === name && c.app?.id === ACTIONS_APP && c.head_sha === head);
+      if (runs.some(c => c.status === 'completed' && c.conclusion !== 'success')) failed.push(name);
+      else if (!runs.length || runs.some(c => c.status !== 'completed')) waiting.push(name);
     }
+    const conclusion = failed.length ? 'failure' : waiting.length ? undefined : 'success';
     // Re-read after the API sweep. Never certify an obsolete head/base/title snapshot.
     const {data: current} = await github.rest.pulls.get({...repo, pull_number: pull.number});
     if (current.head.sha !== head || current.base.ref !== pull.base.ref || current.title !== pull.title || current.state !== 'open') continue;
-    const outcome = conclusion === 'success' ? 'PR admitted; batch tests still required' : 'PR admission blocked';
+    const outcome = conclusion === 'success' ? 'PR admitted; batch tests still required'
+      : failed.length ? `PR admission blocked: ${failed.join(', ')} failed`
+      : `PR admission pending: waiting for ${waiting.join(', ')}`;
     await github.rest.checks.update({
       ...repo, check_run_id: check.id,
       status: conclusion ? 'completed' : 'in_progress',
       ...(conclusion ? {conclusion} : {}),
       output: {
         title: outcome,
-        summary: `Exact head ${head}. The current Conventional PR title must pass from GitHub Actions; a missing, untrusted or pending title check remains pending. Signed local validation: ${localState} (optional; only a signed failure refuses). Batch qualification is a separate merge-group run with fmt, Clippy and the full test suite.`,
+        summary: `Exact head ${head}. ${outcome}. The current Conventional PR title and the CI checks ${CI_CHECKS.join(' and ')} must pass on this head from GitHub Actions; a missing, untrusted or unfinished check remains pending, and admission is re-evaluated when each finishes. Signed local validation: ${localState} (optional; only a signed failure refuses). Batch qualification is a separate merge-group run with fmt, Clippy and the full test suite.`,
       },
     });
     await report(github, repo, head, statuses, conclusion ?? 'pending', outcome);
