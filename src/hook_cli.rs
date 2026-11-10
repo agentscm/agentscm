@@ -460,9 +460,22 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
-            if note.is_none() && session_start {
-                note = crate::client_cli::attention(&routed.connection.root)
-                    .map(|message| format!("AgentSCM: {message}."));
+            if session_start {
+                // Every connected session says where it coordinates, unless something stops it.
+                let coordinating = format!(
+                    "AgentSCM: coordinating on {} at {}.",
+                    routed.connection.repo, routed.connection.hub
+                );
+                note = Some(
+                    match (
+                        note.is_some(),
+                        crate::client_cli::attention(&routed.connection.root),
+                    ) {
+                        (true, _) => format!("{coordinating} This checkout was just connected."),
+                        (false, Some(message)) => format!("AgentSCM: {message}."),
+                        (false, None) => coordinating,
+                    },
+                );
             }
             if session_start
                 && let Some(also) = client_config::load().ok().and_then(|all| {

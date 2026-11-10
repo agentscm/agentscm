@@ -760,7 +760,7 @@ agentscm --data-dir ./agentscm-data git-snapshot capture --repository ./checkout
 
 ## Supported skills (experimental)
 
-`agentscm skill` browses the first-party skills embedded in the binary and adopts them per repository. Adoption is the lock file `agentscm-skills.lock.json` at the repository root; committing it is the review. Evidence an agent records is **self-reported**: the Hub stores what the session said, and every gate satisfied that way is labelled `[self-reported]` in `status` output.
+`agentscm skill` browses the first-party skills embedded in the binary and adopts them per repository. Adoption is the lock file `agentscm-skills.lock.json` at the repository root; committing it is the review. Evidence an agent records is **self-reported**: the Hub stores what the session said, and every gate satisfied that way is labelled `[self-reported]` in `status` output. On a GitHub connection the Hub also records green checks, an approval and the merge it reads from the forge; a gate satisfied only by those is labelled `[observed]`. After an observed merge, `status` names any gate the merge went past.
 
 - `skill list [--json]` and `skill show NAME [--version N] [--json]` work offline: summary, when to follow it, prerequisites, what it is not for, parameters with defaults, gates (id, who, enforcement, minimum assurance), an adopted marker from the lock file and, for `show`, the agent procedure (`SKILL.md`) under "Procedure:". The `sha256` is a bundle digest of `skill.json` and `SKILL.md`.
 - `skill add NAME [--version N] [--param key=value ...]` pins the embedded manifest (sha256, source `first_party`), validates parameters against it (`key=null` resets one) and prints a before/after of the pin. `skill remove NAME` removes it. Neither commits.

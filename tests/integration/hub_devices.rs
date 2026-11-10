@@ -1299,7 +1299,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // The next session connects the checkout and says so in one line, writing no file in it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO}.")),
+        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+            && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
     let connection = machine.connection();
@@ -3850,6 +3851,85 @@ async fn a_hand_off_is_picked_up_only_by_its_own_persons_agent_start() {
         .unwrap();
     let found = pickup(&env, &alice, &json!(expired.id)).await;
     assert_eq!(found["state"], "expired");
+}
+
+const SKILL_STATUS: &str = "/v1/hub/session/skill-forge-status";
+
+/// A PUT of the skill-status setting from a web page; `csrf` is withheld to play another site.
+async fn put_skill_status(env: &Env, page: &Page, csrf: bool, enabled: bool) -> (u16, Value) {
+    let mut request = browser()
+        .put(format!("{}{SKILL_STATUS}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"repository": REPO, "enabled": enabled}).to_string());
+    if csrf {
+        request = request.header("x-csrf-token", &page.csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn only_a_repository_or_hub_admin_sets_the_skill_status() {
+    let env = Env::start("github").await;
+    let (alice, admin) = (page(&env, ALICE).await, page(&env, ADMIN).await);
+    let read = |page: &Page| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        let path = format!("{SKILL_STATUS}?repository={REPO}");
+        async move { with_cookie(&hub, Method::GET, &path, &cookie, None).await }
+    };
+    // Off by default; a writer sees it but may not change it.
+    let (status, seen) = read(&alice).await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(
+        (seen["enabled"].clone(), seen["can_change"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(put_skill_status(&env, &alice, true, true).await.0, 403);
+    assert_eq!(read(&alice).await.1["enabled"], false);
+
+    // A Hub admin sets and unsets it; without the page's CSRF token nothing changes.
+    assert_eq!(put_skill_status(&env, &admin, false, true).await.0, 403);
+    let (status, set) = put_skill_status(&env, &admin, true, true).await;
+    assert_eq!(
+        (status, set["enabled"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+    assert_eq!(read(&alice).await.1["enabled"], true);
+    assert_eq!(
+        put_skill_status(&env, &admin, true, false).await.1["enabled"],
+        false
+    );
+
+    // A repository admin may change it too.
+    env.role(ALICE, "admin", "admin", 50);
+    let (status, set) = put_skill_status(&env, &alice, true, true).await;
+    assert_eq!(
+        (status, set["can_change"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+
+    // No agent or read-only token writes it.
+    for read_only in [false, true] {
+        let (_, secret) = agent_for(&env, &alice.id, "skill-status", read_only);
+        let response = browser()
+            .put(format!("{}{SKILL_STATUS}", env.hub))
+            .bearer_auth(&secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"repository": REPO, "enabled": false}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401, "read_only={read_only}");
+    }
+    assert_eq!(read(&alice).await.1["enabled"], true);
 }
 
 const DISMISSALS: &str = "/v1/hub/session/dismissals";

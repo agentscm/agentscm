@@ -817,6 +817,7 @@ fn capture_git_source_snapshot(
         )));
     }
     let mut entries = Vec::with_capacity(paths.len());
+    let mut contents = Vec::new();
     let mut total = 0u64;
     let mut unsupported = Vec::new();
     let mut unsupported_content = false;
@@ -859,14 +860,25 @@ fn capture_git_source_snapshot(
                 "working source snapshot exceeds {MAX_SNAPSHOT_TOTAL_BYTES} content bytes"
             )));
         }
-        let artifact =
-            spool.retain_artifact(&bytes, ArtifactMediaV1::Binary, RetentionClassV1::WorkLocal)?;
+        contents.push((entries.len(), bytes));
         entries.push(WorkingSnapshotEntry {
             path: path.to_owned(),
             kind,
             executable,
-            artifact: Some(artifact),
+            artifact: None,
         });
+    }
+    // One lock and one quota scan for the whole snapshot, not one per file.
+    let artifacts = spool.retain_artifacts(
+        &contents
+            .iter()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect::<Vec<_>>(),
+        ArtifactMediaV1::Binary,
+        RetentionClassV1::WorkLocal,
+    )?;
+    for ((index, _), artifact) in contents.iter().zip(artifacts) {
+        entries[*index].artifact = Some(artifact);
     }
     entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
     opened_root.verify_descriptor()?;
