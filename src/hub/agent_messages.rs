@@ -11,10 +11,12 @@
 //! A Claude Code session also runs a background hook (`agentscm hook-wait`, served by `wait` here) that
 //! holds a request open here while the session is idle or busy; a new message answers it at
 //! once and the hook wakes the session with it. The same wait wakes a lead, once, for a
-//! coordination request to its Work that it has not acknowledged. Otherwise delivery rides on
-//! calls the session makes anyway: the hook reply's added context where the client's hook can
-//! carry it ([`take`] from `hook.rs`), else the next AgentSCM tool result (from `mcp.rs`). A
-//! closed session gets nothing until it runs again. The agent answers with
+//! coordination request to its Work that it has not acknowledged, also when the session leads
+//! that Work with another of its person's tokens: a session works in every repository its
+//! computer has connected, each with its own token, and its hook waits with one. Otherwise
+//! delivery rides on calls the session makes anyway: the hook reply's added context where the
+//! client's hook can carry it ([`take`] from `hook.rs`), else the next AgentSCM tool result
+//! (from `mcp.rs`). A closed session gets nothing until it runs again. The agent answers with
 //! `agentscm_hub_message`, and the Hub page reads the receipts: queued, delivered, accepted or
 //! declined, done.
 //!
@@ -72,6 +74,9 @@ const MAX_WAITS: usize = 4096;
 const MAX_WAITS_PER_PERSON: usize = 64;
 /// The words that open a wake for a coordination request to the session's Work.
 pub const REQUEST_FRAME: &str = "AgentSCM coordination request";
+/// A person's other tokens read for Work the same session leads with them, newest first.
+/// shortcut: one inbox read per token, upgrade to one store query if people hold more live ones.
+const MAX_ELSEWHERE: usize = 8;
 /// Wakes waiting hooks in this process when a message is sent.
 static SENT: Notify = Notify::const_new();
 /// The coordination requests each (token, session, request) was woken for, so a lead that does
@@ -277,6 +282,9 @@ pub struct Client {
     pub seen_at: i64,
     /// When its background hook last waited for a message.
     pub waited_at: Option<i64>,
+    /// When a call of its own last read its person's other tokens for requests ([`take`]).
+    #[serde(skip)]
+    elsewhere_at: i64,
 }
 
 impl Client {
@@ -478,6 +486,9 @@ fn wakes(message: &Message, _now: i64) -> bool {
 
 /// The queued messages for this session, marked delivered via `via`; `None` when there are
 /// none or the person's mode is `ignore`. Only a writing token's own session receives them.
+/// With no message, a session whose hook does not wait learns here of a coordination request to
+/// Work it leads with another of its person's tokens ([`request_wake_elsewhere`]), read at
+/// most once per wait's length.
 pub fn take(
     store: &dyn Store,
     principal: &Principal,
@@ -485,7 +496,30 @@ pub fn take(
     via: &str,
     now: i64,
 ) -> Result<Option<String>> {
-    deliver(store, principal, session, via, now, due)
+    if let Some(text) = deliver(store, principal, session, via, now, due)? {
+        return Ok(Some(text));
+    }
+    if principal.read_only || !elsewhere_due(&principal.token_id, session, now) {
+        return Ok(None);
+    }
+    // Both callers drop a take that fails: the request still reaches its lead's person after
+    // the bound.
+    request_wake_elsewhere(store, principal, session, now)
+}
+
+/// Whether this call reads the person's other tokens: the session's hook is not waiting (a
+/// wait reads them itself) and no call of the session read them in the last wait's length.
+fn elsewhere_due(token: &str, session: &str, now: i64) -> bool {
+    let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(client) = map.get_mut(&(token.to_owned(), session.to_owned())) else {
+        return false;
+    };
+    let wait = i64::try_from(WAIT_SECS).unwrap_or(i64::MAX);
+    if client.tier(now) == "wake" || now - client.elsewhere_at < wait {
+        return false;
+    }
+    client.elsewhere_at = now;
+    true
 }
 
 fn deliver(
@@ -531,13 +565,63 @@ fn deliver(
     Ok((!blocks.is_empty()).then(|| blocks.join("\n")))
 }
 
+/// [`request_wake`] for Work the same session leads with another live writing token of its
+/// person, newest token first. The binding is the Work's own lead record, that token and this
+/// session, and the store checks each token as it does on that token's own call, so the notice
+/// tells the session nothing its other token could not read. `session` is the name the
+/// session's hooks report; each token resolves it for itself.
+fn request_wake_elsewhere(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    // `default` names no one conversation: Work that an unnamed start leads with another token
+    // is not this session's.
+    if session == super::session::DEFAULT_SESSION {
+        return Ok(None);
+    }
+    let tokens = store.list_agent_tokens(&principal.owner.id)?;
+    let live = tokens.into_iter().filter(|token| {
+        token.id != principal.token_id
+            && !token.revoked
+            && !token.read_only
+            && token.expires_at > now
+            && token.repository_id.is_some()
+    });
+    for token in live.take(MAX_ELSEWHERE) {
+        let other = Principal {
+            token_id: token.id,
+            name: token.name,
+            repository: token.repository,
+            repository_id: token.repository_id,
+            expires_at: token.expires_at,
+            read_only: false,
+            owner: principal.owner.clone(),
+        };
+        let found = store
+            .session_name_for(&other.token_id, Some(session), now)
+            .and_then(|name| request_wake(store, &other, &name, true, now));
+        match found {
+            Ok(Some(text)) => return Ok(Some(text)),
+            // Nothing there, or the store no longer lets that token act (its repository was
+            // renamed since this list was read): the others are still read.
+            Ok(None) | Err(HubError::Unauthorized) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 /// A coordination request to Work this session leads that its lead has neither acknowledged
 /// nor answered, as the wake's notice, once per request. The notice is the Hub's own words:
-/// names and paths filtered, no request title.
+/// names and paths filtered, no request title. `elsewhere` when `principal` is not the token
+/// the session called with: the notice then names the repository and how to reach it.
 fn request_wake(
     store: &dyn Store,
     principal: &Principal,
     session: &str,
+    elsewhere: bool,
     now: i64,
 ) -> Result<Option<String>> {
     use super::advice::{agent_name, ascii_name, sanitize};
@@ -586,8 +670,21 @@ fn request_wake(
             if files.is_empty() {
                 files = "files it reserves".into();
             }
+            // The session reads this in another repository's context, where its calls go to
+            // that repository unless they name this one's checkout.
+            let (place, root) = if elsewhere {
+                let repository = sanitize(&principal.repository, 140);
+                (
+                    format!(" in {repository}"),
+                    format!(
+                        " Pass `root` set to your checkout of {repository} on each of those calls."
+                    ),
+                )
+            } else {
+                (String::new(), String::new())
+            };
             return Ok(Some(format!(
-                "{REQUEST_FRAME} {} for your Work {}: {}'s {} asks for {files}, which this Work reserves. Read it with agentscm_coordination_inbox, acknowledge it with agentscm_coordination_ack, then reply with agentscm_coordination_reply: split, join, handover or decline. If it is still not acknowledged {} minutes after it was made, your person is asked in the Hub's Needs you. A subagent leaves it for the session that started it.",
+                "{REQUEST_FRAME} {} for your Work {}{place}: {}'s {} asks for {files}, which this Work reserves. Read it with agentscm_coordination_inbox, acknowledge it with agentscm_coordination_ack, then reply with agentscm_coordination_reply: split, join, handover or decline.{root} If it is still not acknowledged {} minutes after it was made, your person is asked in the Hub's Needs you. A subagent leaves it for the session that started it.",
                 request.id,
                 target.work_id,
                 ascii_name(&request.requester.login),
@@ -738,7 +835,8 @@ struct WaitBody {
 
 /// The session's background hook waits here for a message, with its agent token: 200 `{text}`
 /// with the notice when one comes, or when a coordination request to Work the session leads
-/// waits for its acknowledgement ([`request_wake`], read once per wait), 204 when
+/// waits for its acknowledgement ([`request_wake`], then [`request_wake_elsewhere`] for Work it
+/// leads with another of its person's tokens; read once per wait), 204 when
 /// neither came in [`WAIT_SECS`] or a newer wait for the
 /// session took over, 403 for a token that can never receive one, 410 while the person's mode is
 /// `ignore`, 429 when the Hub or the person holds too many waits. Delivery is [`deliver`], the
@@ -757,6 +855,7 @@ async fn wait(
         principal.token_id.clone(),
         principal.owner.id.clone(),
     );
+    let reported = body.session.clone();
     let (session, mode) = blocking(&state, move || {
         Ok((
             store.session_name_for(&token, Some(&body.session), unix_now())?,
@@ -779,8 +878,12 @@ async fn wait(
         || slot.replaced(),
         || {
             let asks = std::mem::take(&mut requests);
-            let (store, principal, session) =
-                (state.store.clone(), principal.clone(), session.clone());
+            let (store, principal, session, reported) = (
+                state.store.clone(),
+                principal.clone(),
+                session.clone(),
+                reported.clone(),
+            );
             let state = state.clone();
             async move {
                 blocking(&state, move || {
@@ -790,7 +893,11 @@ async fn wait(
                         None if !asks => Ok(None),
                         // Best effort: a failed read never ends a message wait, and the request
                         // still rides on the session's next call.
-                        None => Ok(request_wake(&*store, &principal, &session, now)
+                        None => Ok(request_wake(&*store, &principal, &session, false, now)
+                            .and_then(|own| match own {
+                                Some(text) => Ok(Some(text)),
+                                None => request_wake_elsewhere(&*store, &principal, &reported, now),
+                            })
                             .unwrap_or_else(|error| {
                                 if !matches!(error, HubError::Busy) {
                                     super::error_envelope::log_internal(&error);
@@ -1251,7 +1358,7 @@ mod tests {
         let release = start(&lead, "release").item;
         let request = start(&asker, "fix").coordination_request.unwrap();
         let session = release.lead_session.clone();
-        let text = request_wake(&*store, &lead, &session, now)
+        let text = request_wake(&*store, &lead, &session, false, now)
             .unwrap()
             .unwrap();
         assert!(text.starts_with(REQUEST_FRAME), "{text}");
@@ -1263,13 +1370,16 @@ mod tests {
         ] {
             assert!(text.contains(named), "{named}: {text}");
         }
-        assert_eq!(request_wake(&*store, &lead, &session, now).unwrap(), None);
         assert_eq!(
-            request_wake(&*store, &lead, "another-session", now).unwrap(),
+            request_wake(&*store, &lead, &session, false, now).unwrap(),
             None
         );
         assert_eq!(
-            request_wake(&*store, &asker, "fix-session", now).unwrap(),
+            request_wake(&*store, &lead, "another-session", false, now).unwrap(),
+            None
+        );
+        assert_eq!(
+            request_wake(&*store, &asker, "fix-session", false, now).unwrap(),
             None
         );
         // A second request, acknowledged before any wait, never wakes the lead.
@@ -1286,7 +1396,184 @@ mod tests {
                 now,
             )
             .unwrap();
-        assert_eq!(request_wake(&*store, &lead, &session, now).unwrap(), None);
+        assert_eq!(
+            request_wake(&*store, &lead, &session, false, now).unwrap(),
+            None
+        );
+    }
+
+    /// One person's session that calls with a `acme/widgets` token and leads Work in
+    /// `acme/gadgets` with another, and people who ask for that Work's file.
+    struct Elsewhere {
+        _dir: tempfile::TempDir,
+        store: std::sync::Arc<dyn Store>,
+        now: i64,
+        /// The lead's token for the repository its hooks call from.
+        here: Principal,
+        /// Its token for the repository where it leads the Work.
+        there: Principal,
+        work: String,
+    }
+
+    const LEAD_SESSION: &str = "release-session";
+
+    /// A token of `login` for `repository`, as the Hub authenticates it.
+    fn minted(
+        store: &dyn Store,
+        now: i64,
+        user_id: i64,
+        login: &str,
+        repository: &str,
+    ) -> Principal {
+        use crate::hub::store::{ForgeIdentity, agent_token_digest, mint_bound_agent_token};
+        let identity = ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        let user = store.upsert_user(&identity, login).unwrap();
+        let id = if repository == "acme/widgets" {
+            101
+        } else {
+            102
+        };
+        let name = format!("{login}-{id}");
+        let (_, secret, _) =
+            mint_bound_agent_token(store, &user.id, &name, repository, id, 3600, false).unwrap();
+        store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Work `key` over one file, started by `who` in session `{key}-session`.
+    fn started(
+        store: &dyn Store,
+        now: i64,
+        who: &Principal,
+        key: &str,
+    ) -> crate::hub::work::WorkStartResult {
+        let request: crate::hub::work::WorkStart = serde_json::from_value(serde_json::json!({
+            "request_key": key, "title": key, "session": format!("{key}-session"),
+            "scope": ["src/client_plugin.rs"]
+        }))
+        .unwrap();
+        store.work_start(&who.token_id, &request, now).unwrap()
+    }
+
+    impl Elsewhere {
+        fn new() -> Self {
+            let (dir, store) = temp_store();
+            let now = unix_now();
+            let here = minted(&*store, now, 701, "releaser", "acme/widgets");
+            let there = minted(&*store, now, 701, "releaser", "acme/gadgets");
+            let work = started(&*store, now, &there, "release").item.id;
+            Self {
+                _dir: dir,
+                store,
+                now,
+                here,
+                there,
+                work,
+            }
+        }
+
+        /// Another person's agent asks for the file the lead's Work holds; the request's id.
+        fn asked(&self, user_id: i64, login: &str) -> String {
+            let asker = minted(&*self.store, self.now, user_id, login, "acme/gadgets");
+            started(&*self.store, self.now, &asker, login)
+                .coordination_request
+                .unwrap()
+                .id
+        }
+    }
+
+    /// #486: a session's hook waits with the token of the repository it runs in. A request to
+    /// Work the same session leads with another of its person's tokens wakes it once, names
+    /// that repository and how to reach it, and reaches no other person and no other session.
+    #[test]
+    fn a_lead_is_woken_for_a_request_to_work_it_leads_with_another_token() {
+        let at = Elsewhere::new();
+        let request = at.asked(702, "fixer");
+        let (store, now) = (&*at.store, at.now);
+        assert_eq!(
+            request_wake(store, &at.here, LEAD_SESSION, false, now).unwrap(),
+            None
+        );
+        let stranger = minted(store, now, 703, "stranger", "acme/widgets");
+        assert_eq!(
+            request_wake_elsewhere(store, &stranger, LEAD_SESSION, now).unwrap(),
+            None
+        );
+        assert_eq!(
+            request_wake_elsewhere(store, &at.here, "another-session", now).unwrap(),
+            None
+        );
+        let text = request_wake_elsewhere(store, &at.here, LEAD_SESSION, now)
+            .unwrap()
+            .unwrap();
+        assert!(text.starts_with(REQUEST_FRAME), "{text}");
+        for named in [
+            request.as_str(),
+            at.work.as_str(),
+            "fixer's",
+            "src/client_plugin.rs",
+            " in acme/gadgets:",
+            "Pass `root` set to your checkout of acme/gadgets",
+        ] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
+        assert_eq!(
+            request_wake_elsewhere(store, &at.here, LEAD_SESSION, now).unwrap(),
+            None
+        );
+        // The token that leads the Work is still woken by its own wait, without the detour.
+        let second = at.asked(704, "helper");
+        let own = request_wake(store, &at.there, LEAD_SESSION, false, now)
+            .unwrap()
+            .unwrap();
+        assert!(
+            own.contains(&second) && !own.contains("acme/gadgets"),
+            "{own}"
+        );
+    }
+
+    /// A session whose hook does not wait learns of such a request at a call of its own, read
+    /// at most once per wait's length; a session whose hook waits leaves it to the wait.
+    #[test]
+    fn a_call_reads_the_persons_other_tokens_once_per_wait_and_never_beside_a_wait() {
+        let at = Elsewhere::new();
+        let (store, now) = (&*at.store, at.now);
+        let wait = i64::try_from(WAIT_SECS).unwrap();
+        let call =
+            |at_time: i64| take(store, &at.here, LEAD_SESSION, "hook:codex", at_time).unwrap();
+        let first = at.asked(702, "fixer");
+        // A session no top-level hook call has shown takes nothing.
+        assert_eq!(call(now), None);
+        note_hook(
+            &at.here.token_id,
+            LEAD_SESSION,
+            "hook:codex",
+            true,
+            true,
+            now,
+        );
+        let text = call(now).unwrap();
+        assert!(
+            text.starts_with(REQUEST_FRAME) && text.contains(&first),
+            "{text}"
+        );
+        let second = at.asked(704, "helper");
+        assert_eq!(call(now + wait - 1), None);
+        assert!(call(now + wait).unwrap().contains(&second));
+        // While its hook waits, the wait reads them and a call does not.
+        let third = at.asked(705, "third");
+        note_wait(&at.here.token_id, LEAD_SESSION, now + 2 * wait);
+        assert_eq!(call(now + 2 * wait), None);
+        let woken = request_wake_elsewhere(store, &at.here, LEAD_SESSION, now + 2 * wait)
+            .unwrap()
+            .unwrap();
+        assert!(woken.contains(&third), "{woken}");
     }
 
     #[tokio::test(start_paused = true)]
