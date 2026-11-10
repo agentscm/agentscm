@@ -2431,6 +2431,8 @@ mod tests {
                     session: "asking".into(),
                     agent_id: None,
                     tool: "Bash".into(),
+                    summary: None,
+                    folder: None,
                     display: "ls".into(),
                     complete: true,
                     content_hidden: false,

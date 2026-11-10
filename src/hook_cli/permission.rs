@@ -34,8 +34,12 @@ const MAX_RETRIES: u32 = 3;
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
-/// Characters of the display line sent; the Hub cuts at the same bound.
-const MAX_DISPLAY_CHARS: usize = 4000;
+/// Characters of the display sent; the Hub cuts at the same bound. Room for a long tool input
+/// (a brief for a new session, a message to send), which the person reads in full before allowing.
+const MAX_DISPLAY_CHARS: usize = 20_000;
+const MAX_SUMMARY_CHARS: usize = 200;
+/// Input fields that name what a call is about, in the order tried.
+const TITLE_FIELDS: [&str; 4] = ["title", "name", "subject", "description"];
 /// What the model sees when the person denies from the Hub: fixed here, never taken from the Hub.
 const DENY_MESSAGE: &str = "Denied from the AgentSCM Hub by its person.";
 const HASH_DOMAIN: &[u8] = b"agentscm.permission.v1\0";
@@ -143,17 +147,9 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
             None => (None, true, false),
         },
         "WebSearch" => (text(field("query").map(str::to_owned)), true, false),
-        "Task" | "Agent" => (
-            text(Some(format!(
-                "{}: {}",
-                field("subagent_type").unwrap_or("agent"),
-                field("description").unwrap_or_default()
-            ))),
-            false,
-            false,
-        ),
         _ if input.is_null() => (None, true, false),
-        // Any other tool, an MCP server's included: its whole input.
+        // Any other tool, a subagent's start and an MCP server's tools included: its whole
+        // input, as indented JSON below, so the person can allow it when they could read all of it.
         _ => (Some(input.clone()), true, false),
     };
     // The same redaction as everything else that leaves this machine. It can hide the very part
@@ -163,7 +159,7 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
     let shown = shown
         .and_then(|value| match value {
             Value::String(text) => Some(text),
-            other => serde_json::to_string(&other).ok(),
+            other => serde_json::to_string_pretty(&other).ok(),
         })
         .filter(|text| !text.trim().is_empty());
     let Some(shown) = shown else {
@@ -185,6 +181,71 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
         complete,
         content_hidden,
     }
+}
+
+/// One plain line saying what the call does, for a person who is not looking at the session:
+/// "run a shell command: Publish the crate", "use start session (ccd_session): Fix the login".
+/// A label beside the display, never a replacement for it; secrets are redacted like the display's.
+fn summary(tool: &str, input: &Value) -> String {
+    let field = |key: &str| {
+        input[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let file = |key: &str| {
+        field(key).and_then(|path| Path::new(path).file_name()?.to_str().map(str::to_owned))
+    };
+    let (what, about) = match tool {
+        "Bash" => (
+            "run a shell command".to_owned(),
+            field("description").map(str::to_owned),
+        ),
+        "Edit" | "MultiEdit" => ("edit a file".to_owned(), file("file_path")),
+        "NotebookEdit" => ("edit a notebook".to_owned(), file("notebook_path")),
+        "Write" => ("write a file".to_owned(), file("file_path")),
+        "Read" => ("read a file".to_owned(), file("file_path")),
+        "Glob" | "Grep" => (
+            "search files".to_owned(),
+            field("pattern").map(str::to_owned),
+        ),
+        "WebFetch" => (
+            "fetch a web page".to_owned(),
+            field("url").map(|url| shaped_url(url).0),
+        ),
+        "WebSearch" => (
+            "search the web".to_owned(),
+            field("query").map(str::to_owned),
+        ),
+        "Task" | "Agent" => (
+            "start a subagent".to_owned(),
+            field("description").map(str::to_owned),
+        ),
+        _ => {
+            // An MCP tool is `mcp__<server>__<tool>`; its words read better without underscores.
+            let what = match tool
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split_once("__"))
+            {
+                Some((server, name)) => format!("use {} ({server})", name.replace('_', " ")),
+                None => format!("use {tool}"),
+            };
+            let about = TITLE_FIELDS.iter().find_map(|key| field(key));
+            (what, about.map(str::to_owned))
+        }
+    };
+    let line = match about {
+        Some(about) => format!("{what}: {about}"),
+        None => what,
+    };
+    let mut line = Value::String(line.split_whitespace().collect::<Vec<_>>().join(" "));
+    redact_json(&mut line);
+    let line = line.as_str().unwrap_or_default();
+    if line.chars().count() <= MAX_SUMMARY_CHARS {
+        return line.to_owned();
+    }
+    let kept: String = line.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+    format!("{kept}…")
 }
 
 /// `scheme://host/path` without userinfo, query or fragment; false when any was dropped.
@@ -385,6 +446,7 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     let mut body = json!({
         "session": session,
         "tool": tool,
+        "summary": summary(tool, input),
         "display": shown.text,
         "complete": shown.complete,
         "content_hidden": shown.content_hidden,
@@ -392,6 +454,10 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     });
     if let Some(agent_id) = agent_id {
         body["agent_id"] = json!(agent_id);
+    }
+    // Names the session to its person when it leads no Work: the folder they started it in.
+    if let Some(folder) = routed.checkout.file_name().and_then(|name| name.to_str()) {
+        body["folder"] = json!(folder);
     }
     let hub = Hub {
         client: forge_http::client().ok()?,
@@ -545,15 +611,25 @@ mod tests {
             (plain.text.as_str(), plain.complete),
             ("https://example.com/a", true)
         );
-        let task = line(
-            "Task",
-            json!({"subagent_type": "explore", "description": "find it", "prompt": "long"}),
-        );
+        // Any other tool shows its whole input as indented JSON, which can be allowed.
+        let task = line("Task", json!({"description": "find it", "prompt": "long"}));
         assert_eq!(
             (task.text.as_str(), task.complete),
-            ("explore: find it", false)
+            (
+                "{\n  \"description\": \"find it\",\n  \"prompt\": \"long\"\n}",
+                true
+            )
         );
-        // Other tools send their input, masked, compact.
+        let started = line(
+            "mcp__ccd_session__start_session",
+            json!({"title": "Fix the login", "prompt": "Read src/login.rs.\nThen fix it.",
+                "use_worktree": true}),
+        );
+        assert!(started.complete && !started.content_hidden);
+        assert_eq!(
+            started.text,
+            "{\n  \"prompt\": \"Read src/login.rs.\\nThen fix it.\",\n  \"title\": \"Fix the login\",\n  \"use_worktree\": true\n}"
+        );
         let mcp = line(
             "mcp__srv__do",
             json!({"id": 3, "api_key": "abc", "note": "token=zzz"}),
@@ -562,7 +638,7 @@ mod tests {
             !mcp.complete && !mcp.content_hidden,
             "a redacted display is deny-only"
         );
-        assert!(mcp.text.contains(r#""id":3"#));
+        assert!(mcp.text.contains(r#""id": 3"#));
         assert!(
             !mcp.text.contains("abc") && !mcp.text.contains("zzz"),
             "{}",
@@ -572,6 +648,44 @@ mod tests {
         let none = line("Bash", json!({}));
         assert_eq!((none.text.as_str(), none.complete), ("Bash", false));
         assert_eq!(line("Custom", Value::Null).text, "Custom");
+    }
+
+    #[test]
+    fn the_summary_says_in_one_line_what_the_call_does() {
+        let cases = [
+            (
+                "Bash",
+                json!({"command": "cargo publish", "description": "Publish the crate"}),
+                "run a shell command: Publish the crate",
+            ),
+            ("Bash", json!({"command": "ls"}), "run a shell command"),
+            (
+                "Edit",
+                json!({"file_path": "/work/acme/src/a.rs", "new_string": "secret"}),
+                "edit a file: a.rs",
+            ),
+            (
+                "WebFetch",
+                json!({"url": "https://user:pw@example.com/a?q=1"}),
+                "fetch a web page: https://example.com/a",
+            ),
+            (
+                "mcp__ccd_session__start_session",
+                json!({"title": "Fix the\n login", "prompt": "long"}),
+                "use start session (ccd_session): Fix the login",
+            ),
+            ("mcp__srv__send", json!({"body": "x"}), "use send (srv)"),
+            ("Custom", Value::Null, "use Custom"),
+        ];
+        for (tool, input, says) in cases {
+            assert_eq!(summary(tool, &input), says, "{tool}");
+        }
+        // Secrets are redacted, and a long title is cut.
+        let secret = summary("mcp__srv__do", &json!({"title": "set TOKEN=abc123xyz now"}));
+        assert!(!secret.contains("abc123xyz"), "{secret}");
+        let long = summary("mcp__srv__do", &json!({"title": "y".repeat(500)}));
+        assert_eq!(long.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

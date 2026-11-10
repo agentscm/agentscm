@@ -58,8 +58,12 @@ const MAX_CONFIRMATIONS: usize = 1024;
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
-/// Characters of the display line kept; the hook cuts at the same bound.
-pub const MAX_DISPLAY_CHARS: usize = 4000;
+/// Characters of the display kept; the hook cuts at the same bound.
+pub const MAX_DISPLAY_CHARS: usize = 20_000;
+/// What the first page written for these requests shows of a display before it cuts it.
+const FIRST_PAGE_DISPLAY_CHARS: usize = 4000;
+/// Characters kept of a request's one-line summary and of its folder name.
+const MAX_LABEL_CHARS: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decision {
@@ -112,6 +116,8 @@ struct Pending {
     repository_id: Option<i64>,
     item_key: String,
     tool: String,
+    summary: Option<String>,
+    folder: Option<String>,
     display: String,
     complete: bool,
     content_hidden: bool,
@@ -227,6 +233,10 @@ pub(super) struct Registration {
     pub session: String,
     pub agent_id: Option<String>,
     pub tool: String,
+    /// One line saying what the call does, as the hook worded it.
+    pub summary: Option<String>,
+    /// The name of the checkout folder the session runs in.
+    pub folder: Option<String>,
     pub display: String,
     pub complete: bool,
     pub content_hidden: bool,
@@ -251,7 +261,14 @@ pub(super) struct Listed {
     item_id: String,
     request_id: String,
     tool: String,
+    summary: Option<String>,
+    folder: Option<String>,
     display: String,
+    /// Whether the Hub accepts an allow: nothing was cut or redacted and no setting is unshown.
+    /// A page that offers Allow on this must show the whole display.
+    allowable: bool,
+    /// `allowable`, and the display also fits what the first page for these requests shows
+    /// before it cuts, so that page never offers Allow on a request it shows only part of.
     complete: bool,
     content_hidden: bool,
     subagent: bool,
@@ -330,6 +347,8 @@ impl Requests {
             session,
             agent_id,
             tool,
+            summary,
+            folder,
             display,
             complete,
             content_hidden,
@@ -364,6 +383,12 @@ impl Requests {
         if display.is_empty() {
             return Err(bad("display"));
         }
+        // Labels beside the display: one clean line each, dropped when nothing is left.
+        let label = |text: Option<String>| {
+            text.map(|text| super::advice::sanitize(text.trim(), MAX_LABEL_CHARS))
+                .filter(|text| !text.is_empty())
+        };
+        let (summary, folder) = (label(summary), label(folder));
         let mut inner = self.lock()?;
         inner.settle(waiting, now);
         match waiting.permission_wait(&principal.token_id, &session, now) {
@@ -427,6 +452,8 @@ impl Requests {
                 owner: principal.owner.id.clone(),
                 repository_id: principal.repository_id,
                 tool,
+                summary,
+                folder,
                 display,
                 complete: complete && !cut,
                 content_hidden,
@@ -572,8 +599,11 @@ impl Requests {
                 item_id: format!("waiting:permission:{}", row.item_key),
                 request_id: id.clone(),
                 tool: row.tool.clone(),
+                summary: row.summary.clone(),
+                folder: row.folder.clone(),
                 display: row.display.clone(),
-                complete: row.complete,
+                allowable: row.complete,
+                complete: row.complete && row.display.chars().count() <= FIRST_PAGE_DISPLAY_CHARS,
                 content_hidden: row.content_hidden,
                 subagent: row.asker.is_some(),
                 since,
@@ -670,6 +700,10 @@ struct RegisterBody {
     #[serde(default)]
     agent_id: Option<String>,
     tool: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
     display: String,
     complete: bool,
     #[serde(default)]
@@ -699,6 +733,8 @@ async fn register(
             session: body.session,
             agent_id: body.agent_id,
             tool: body.tool,
+            summary: body.summary,
+            folder: body.folder,
             display: body.display,
             complete: body.complete,
             content_hidden: body.content_hidden,
@@ -892,6 +928,8 @@ mod tests {
             session: session.into(),
             agent_id: agent_id.map(str::to_owned),
             tool: "Bash".into(),
+            summary: None,
+            folder: None,
             display: "git push origin main".into(),
             complete: true,
             content_hidden: false,
@@ -1433,6 +1471,33 @@ mod tests {
                 .iter()
                 .all(|listed| listed.request_id != id)
         );
+    }
+
+    #[test]
+    fn a_long_whole_request_is_allowable_and_its_labels_are_one_clean_line() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
+        requests.confirm("tok_a", "s", 1_001);
+        let mut long = registration("s", None, HASH);
+        long.tool = "mcp__ccd_session__start_session".into();
+        long.display = "x".repeat(FIRST_PAGE_DISPLAY_CHARS + 1);
+        long.summary = Some("use start session\n (ccd_session): \u{202e}Fix \"login\"".into());
+        long.folder = Some("  ".into());
+        let id = requests.register(&waiting, &mine, long, 1_002).unwrap().0;
+        let at = 1_000 + GRACE_SECONDS;
+        let shown = requests.list(&waiting, "usr_me", Some(7), at).unwrap();
+        // The first page cuts a display this long, so to it the request is not complete.
+        assert_eq!((shown[0].allowable, shown[0].complete), (true, false));
+        assert_eq!(
+            shown[0].summary.as_deref(),
+            Some("use start session (ccd_session): Fix 'login'")
+        );
+        assert_eq!(shown[0].folder, None);
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, at),
+            Ok(Decision::Allow)
+        ));
     }
 
     #[test]

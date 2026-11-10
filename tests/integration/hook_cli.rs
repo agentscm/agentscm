@@ -624,11 +624,15 @@ fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
                 "complete",
                 "content_hidden",
                 "display",
+                "folder",
                 "input_hash",
                 "session",
+                "summary",
                 "tool"
             ]
         );
+        assert_eq!(body["summary"], "run a shell command");
+        assert_eq!(body["folder"], "repo");
         assert_eq!(body["display"], "deploy --token [REDACTED:flag_value]");
         assert_eq!(body["complete"], false, "a redacted request is deny-only");
         assert!(

@@ -4333,6 +4333,7 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
     let register = |hash: &str, complete: bool| {
         json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "summary": "run a shell command: Publish the crate", "folder": "widgets",
             "complete": complete, "input_hash": hash.repeat(64)})
     };
     let answer = |id: &Value, decision: &str| {
