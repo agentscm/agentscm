@@ -1,5 +1,5 @@
 //! The Hub's automatic stand-up compaction removes exactly what the operator command removes
-//! at the automatic cutoff, with the same guards. Runs on SQLite and, when configured,
+//! at the automatic cutoff, with the same guards, and an open delivery does not stop it. Runs on SQLite and, when configured,
 //! PostgreSQL.
 
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use crate::hub_pg::PgSchema;
 use agentscm::backend::LocalBackend;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
 use agentscm::hub::work::{
-    BriefingQuery, CheckpointKind, WorkCheckpoint, WorkCompaction, WorkRole, WorkStart,
+    BriefingAck, BriefingQuery, CheckpointKind, WorkCheckpoint, WorkCompaction, WorkRole, WorkStart,
 };
 use agentscm::hub::{HubError, HubState, WORK_AUTO_COMPACTION_AGE_SECONDS, compact_work_history};
 use tempfile::TempDir;
@@ -117,6 +117,7 @@ fn start(key: &str, session: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: format!("auto compaction {key}"),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: vec!["src/**".into()],
@@ -170,8 +171,8 @@ fn history(store: &dyn Store, agent: &Agent, key: &str, started: i64, at: &[i64]
 }
 
 /// One repository with old, three-day-old and recent history; one whose briefing delivery is
-/// still unacknowledged, which the compaction guard refuses.
-fn fixture(db: &Db, now: i64) -> Arc<dyn Store> {
+/// still unacknowledged, as on a busy Hub. Returns that delivery's token and id.
+fn fixture(db: &Db, now: i64) -> (Arc<dyn Store>, String, String) {
     let store = db.open();
     let lead = agent(&*store, 1, "acme/widgets", 101);
     history(
@@ -187,8 +188,7 @@ fn fixture(db: &Db, now: i64) -> Arc<dyn Store> {
         .work_briefing(&other.token, &BriefingQuery::default(), now)
         .unwrap()
         .delivery;
-    assert!(delivery.is_some());
-    store
+    (store, other.token, delivery.unwrap())
 }
 
 /// The operator command, run for each scope with the automatic cutoff.
@@ -198,10 +198,7 @@ fn operator_compaction(store: &dyn Store, now: i64) -> (Vec<WorkCompaction>, usi
     for scope in store.work_compaction_scopes().unwrap() {
         match store.work_compact(&scope, now - WORK_AUTO_COMPACTION_AGE_SECONDS, true, now) {
             Ok(result) => applied.push(result),
-            Err(HubError::Invalid(message)) => {
-                assert!(message.contains("unacknowledged"), "{message}");
-                skipped += 1;
-            }
+            Err(HubError::Invalid(_)) => skipped += 1,
             Err(error) => panic!("{error}"),
         }
     }
@@ -219,26 +216,44 @@ fn automatic_compaction(db: &Db, store: Arc<dyn Store>, now: i64) -> (Vec<WorkCo
 
 fn removes_what_the_operator_command_removes(cli: &Db, auto: &Db) {
     let now = unix_now();
-    let cli_store = fixture(cli, now);
-    let auto_store = fixture(auto, now);
+    let (cli_store, _, _) = fixture(cli, now);
+    let (auto_store, reader, delivery) = fixture(auto, now);
     assert_eq!(cli.retained(), auto.retained());
 
     let expected = operator_compaction(&*cli_store, now);
     let actual = automatic_compaction(auto, auto_store.clone(), now);
     assert_eq!(actual, expected);
+    // The busy repository compacts too; its open delivery is ended, not a reason to skip.
     assert_eq!(
-        actual.1, 1,
-        "the unacknowledged delivery blocks its repository"
+        actual.1, 0,
+        "an unacknowledged delivery no longer blocks its repository"
     );
-    assert_eq!(actual.0.len(), 1);
-    assert!(actual.0[0].applied);
-    assert_eq!(actual.0[0].scope.repository, "acme/widgets");
-    assert_eq!(actual.0[0].deleted_operations, 2);
-    assert_eq!(actual.0[0].deleted_versions, 2);
+    assert_eq!(actual.0.len(), 2);
+    assert!(actual.0.iter().all(|compaction| compaction.applied));
+    let other = actual
+        .0
+        .iter()
+        .find(|c| c.scope.repository == "acme/other")
+        .unwrap();
+    assert!(other.deleted_versions > 0, "{other:?}");
+    assert!(
+        auto_store
+            .work_ack(&reader, &BriefingAck { delivery }, now)
+            .unwrap_err()
+            .to_string()
+            .contains("delivery is unknown or incomplete")
+    );
+    let widgets = actual
+        .0
+        .iter()
+        .find(|c| c.scope.repository == "acme/widgets")
+        .unwrap();
+    assert_eq!(widgets.deleted_operations, 2);
+    assert_eq!(widgets.deleted_versions, 2);
     assert_eq!(cli.retained(), auto.retained());
 
     // History younger than the automatic cutoff stays, though the operator may remove it.
-    let widgets = &actual.0[0].scope;
+    let widgets = &widgets.scope;
     let shorter = auto_store
         .work_compact(widgets, now - DAY, false, now)
         .unwrap();
@@ -249,10 +264,12 @@ fn removes_what_the_operator_command_removes(cli: &Db, auto: &Db) {
 
     // A repeated pass finds nothing more to remove.
     let again = automatic_compaction(auto, auto_store, now);
-    assert_eq!(again.1, 1);
-    assert_eq!(
-        (again.0[0].deleted_operations, again.0[0].deleted_versions),
-        (0, 0)
+    assert_eq!(again.1, 0);
+    assert!(
+        again
+            .0
+            .iter()
+            .all(|c| (c.deleted_operations, c.deleted_versions) == (0, 0))
     );
     assert_eq!(cli.retained(), auto.retained());
 }

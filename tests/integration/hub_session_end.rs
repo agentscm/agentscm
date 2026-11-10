@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use agentscm::hub::HubError;
 use agentscm::hub::connection::NewConnection;
-use agentscm::hub::session::{SESSION_REQUIRED, SessionCall};
+use agentscm::hub::error_envelope::ErrorCode;
+use agentscm::hub::session::{SESSION_REQUIRED, SessionCall, Touched};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_bound_agent_token, new_connection_id, unix_now,
 };
@@ -174,6 +175,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: key.into(),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: vec![scope.into()],
@@ -189,7 +191,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
 }
 
 /// A hook call of `session` that adds `path` to its intent.
-fn touch(store: &dyn Store, who: &Agent, session: &str, path: &str, now: i64) {
+fn touch(store: &dyn Store, who: &Agent, session: &str, path: &str, now: i64) -> Touched {
     store
         .touch_session(
             &who.token,
@@ -203,7 +205,7 @@ fn touch(store: &dyn Store, who: &Agent, session: &str, path: &str, now: i64) {
             },
             now,
         )
-        .unwrap();
+        .unwrap()
 }
 
 /// Work led by `session` over `dir/**`, and its session holding `dir/lib.rs`.
@@ -212,7 +214,9 @@ fn leading(store: &dyn Store, who: &Agent, session: &str, dir: &str, now: i64) -
         .work_start(&who.token, &start(dir, session, &format!("{dir}/**")), now)
         .unwrap();
     assert!(started.created);
-    touch(store, who, session, &format!("{dir}/lib.rs"), now + 1);
+    let held = touch(store, who, session, &format!("{dir}/lib.rs"), now + 1);
+    // The session called no start with a task, so its intent takes the title of its Work.
+    assert_eq!(held.intent.unwrap().task, started.item.title);
     started.item
 }
 
@@ -395,6 +399,33 @@ fn blocked_work_stays_blocked_and_the_intent_is_released(db: &Db) {
     assert!(live(&*store, now + 10).is_empty());
 }
 
+/// An end removes the session row and the task on it; the Work the session leads keeps its title.
+fn an_edit_after_the_row_is_removed_takes_the_title_of_the_led_work(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let item = leading(&*store, &alice, "s-a", "src", now);
+    // Blocked Work stays eligible after the end, so the session's edits go on.
+    store
+        .work_checkpoint(
+            &alice.token,
+            &checkpoint(&item, CheckpointKind::Blocker, "block"),
+            now + 2,
+        )
+        .unwrap();
+    let end = store
+        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 10)
+        .unwrap();
+    assert!(end.ended && !end.paused);
+    assert_eq!(db.sessions(), "0");
+
+    let again = touch(&*store, &alice, "s-a", "src/more.rs", now + 11);
+    assert_eq!(again.intent.unwrap().task, item.title);
+    // A session that leads no Work still reads the default.
+    let other = touch(&*store, &alice, "s-b", "docs/notes.md", now + 12);
+    assert_eq!(other.intent.unwrap().task, "task unknown");
+}
+
 fn settled_work_is_left_as_it_is_and_the_intent_is_released(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -498,12 +529,13 @@ fn an_unnamed_end_resolves_the_session_like_end_session(db: &Db) {
     // A second hook session makes an omitted name ambiguous, and nothing is written.
     touch(&*store, &alice, "s-b", "docs/guide.md", now + 2);
     let seen = events(&*store).len();
-    let Err(HubError::Invalid(message)) =
+    let Err(HubError::Rejected(rejection)) =
         store.end_session_pausing(&alice.token, None, "mcp", now + 3)
     else {
         panic!("an ambiguous session must be refused");
     };
-    assert_eq!(message, SESSION_REQUIRED);
+    assert_eq!(rejection.code(), ErrorCode::SessionRequired);
+    assert_eq!(rejection.message(), SESSION_REQUIRED);
     assert_eq!(events(&*store).len(), seen);
     assert_eq!(
         work(&*store, &alice, &first.id, now + 3).state,
@@ -588,6 +620,7 @@ conformance!(
     a_failed_end_writes_nothing_and_a_retry_completes_it,
     an_end_after_the_old_two_step_crash_finishes_the_pause,
     blocked_work_stays_blocked_and_the_intent_is_released,
+    an_edit_after_the_row_is_removed_takes_the_title_of_the_led_work,
     settled_work_is_left_as_it_is_and_the_intent_is_released,
     a_session_with_no_work_still_releases_its_intent,
     a_retained_reservation_stays_retained,

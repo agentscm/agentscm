@@ -18,6 +18,7 @@ title: "Documentation"
 ## Coordinate work
 
 - [Supported agents](agents.md): client support levels, setup and hook behavior.
+- [Messages to your own agent session](agent-messages.md): sending from the Hub page to a running session, the Auto, Manual and Ignore modes, and how each client receives them.
 - [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
 - [Join an existing Hub](team-member-onboarding.md) or read the [Hub operator guide](hub.md).
 - [Two-container Hub walkthrough](two-agent-demo.md): Docker, GitHub App and a repository you can connect are required.
@@ -44,6 +45,7 @@ observed actions and source; they are not independent verification or human appr
 - [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
 - [Work reconciliation](design/work-reconciliation.md): durable exact-head prerequisite conditions, preserved reports, reassessment and scope disposition through HTTP, CLI, MCP and Work detail.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
+- [Hub local-validation summaries](advanced/hub-local-validation.md): opt-in durable evidence, one GitHub summary, explicit migration and standalone fallback.
 - [Immutable local CI plans](advanced/local-ci-plans.md): experimental command-first requirements, exact source bindings and independent coverage checks; execution adapters remain separate.
 - [Trusted local CI devices](advanced/local-ci-devices.md): experimental administrator enrollment of device keys and the current-authorization check; no result submission or execution.
 - [Productive actions](advanced/productive-workflow-actions.md) and [pipeline rules](advanced/pipeline-rules.md): bounded artifacts and operator-local post-merge workflows, separate from native admission.

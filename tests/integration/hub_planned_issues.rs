@@ -80,6 +80,7 @@ fn start(key: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: format!("Implement {key} #7"),
+        description: None,
         session: key.into(),
         role: WorkRole::Lead,
         scope: vec![],

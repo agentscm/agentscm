@@ -696,6 +696,9 @@ pub struct ConversationEntryV1 {
     pub size_bytes: u64,
     pub availability: ContentAvailabilityV1,
     pub expires_at: Option<i64>,
+    /// The forge login of the person who shared it; absent from older Hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 impl ConversationEntryV1 {
@@ -1652,6 +1655,7 @@ mod tests {
             size_bytes: 10,
             availability: ContentAvailabilityV1::Shared,
             expires_at: Some(2),
+            author: None,
         }
     }
 

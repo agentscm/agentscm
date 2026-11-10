@@ -1,27 +1,32 @@
 name: CI
 
 on:
+  # Advisory checks on every pull request; the merge batch stays the only merge gate.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
-  # Nightly and manual only; the release PR dispatches it.
+  # Release targets run nightly and manually only; the release PR dispatches them.
   schedule:
     - cron: '23 7 * * *'
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Routine checks run locally; this is the explicit hosted fallback. Platform checks below keep
-  # their nightly coverage.
+  # The same formatting, Clippy, nextest and doctest commands as the merge batch, so a pull request
+  # finds these failures before the queue does. Platform checks below keep their nightly coverage.
   static:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,10 +44,12 @@ jobs:
           "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # The local recipe requires PostgreSQL and S3; keep the same hosted service-backed fallback.
+  # PostgreSQL and S3 services, as in the merge batch.
   tests:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 30
     services:
       postgres: # hub store conformance runs against this
@@ -100,6 +107,9 @@ jobs:
   # nightly, manual and release-branch dispatch runs before release.yml. windows.yml builds the Windows target.
   # Without `--features ui`, which needs the UI build. Runs on scheduled and manual runs, like the `windows` job in windows.yml.
   release-targets:
+    if: ${{ github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:

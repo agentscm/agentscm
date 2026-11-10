@@ -290,11 +290,8 @@ fn private_authority_modes_block_mutation_but_not_read_only_inspection() {
         Err(agentscm::change_capture::CaptureError::Conflict(message))
             if message.starts_with("spool_private_permissions:")
     ));
-    assert!(matches!(
-        spool.pending(10),
-        Err(agentscm::change_capture::CaptureError::Conflict(message))
-            if message.starts_with("spool_private_permissions:")
-    ));
+    // Each hook opens the spool, so a retained file's mode is checked at the next open; a lock
+    // re-checks only the root and directories, which keeps one hook from rescanning per write.
     fs::set_permissions(retained, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -5387,4 +5384,43 @@ fn shared_import_with_many_redacted_bodies_splits_batches_within_gap_limit() {
         );
     }
     assert_eq!(redacted, 45);
+}
+
+#[test]
+fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session_claims() {
+    let temp = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    run_git(
+        repo.path(),
+        &["init", "--quiet", "--initial-branch", "main"],
+    );
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"OPENING_PROMPT_917"}"#;
+    deferred_native_hook(
+        prompt,
+        DeferredReasonV1::NoCurrentAuthorizedWork,
+        &ActionCaptureConfig {
+            source: git_request(repo.path()),
+            setup_digest: "0".repeat(64),
+            managed_invocations: Vec::new(),
+            rules: Vec::new(),
+        },
+        &spool,
+    )
+    .unwrap();
+    // The deferred fact never carries the text.
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"OPENING_PROMPT_917"
+    ));
+    // Replayed into the claimed, shared conversation, the held prompt keeps its text.
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    assert_eq!(
+        capture_hook(prompt, &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    assert!(contains_bytes(
+        &retained_bytes(spool.root()),
+        b"OPENING_PROMPT_917"
+    ));
 }

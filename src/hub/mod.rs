@@ -1,5 +1,6 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod agent_messages;
 pub mod agent_rules;
 pub mod capacity;
 pub mod catchup;
@@ -9,9 +10,14 @@ pub mod change_record_http;
 mod compact;
 pub mod connection;
 pub mod continuity;
+pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod digest;
+pub mod digest_http;
+pub mod dismissals;
+pub mod error_envelope;
 pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]
@@ -39,8 +45,10 @@ pub mod promise;
 mod promise_http;
 pub mod provider_context;
 pub mod publish;
+pub mod reply;
 mod repository_summary;
 pub mod session;
+pub mod session_waiting;
 pub mod setup_attention;
 pub mod skill_workflow;
 pub mod skills;
@@ -51,9 +59,14 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 pub mod ui;
+pub mod validation_evidence;
+pub mod validation_evidence_http;
+#[cfg(unix)]
+mod validation_summary;
 pub mod value_metrics;
 pub mod view_settings;
 pub mod viewer;
+pub mod why;
 pub mod work;
 pub mod work_http;
 pub mod work_issues;
@@ -95,6 +108,8 @@ const MAX_CONCURRENT_STORE_CALLS: usize = 32;
 #[derive(Debug)]
 pub enum HubError {
     Invalid(String),
+    Rejected(error_envelope::ReviewedRejection),
+    Input(Vec<error_envelope::InputProblem>),
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
@@ -129,12 +144,20 @@ impl fmt::Display for HubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
+            Self::Rejected(rejection) => f.write_str(&rejection.message),
+            Self::Input(_) => f.write_str("invalid request fields"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
             Self::WorkCapacity(capacity) => write!(
                 f,
-                "capacity reached: {}; operator action required",
-                capacity.limit.what()
+                "capacity reached: {} (limit {}; {})",
+                capacity.limit.what(),
+                capacity.limit.as_str(),
+                if capacity.limit.agent_remedy().is_some() {
+                    "the refused agent can clear it"
+                } else {
+                    "operator action required"
+                }
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {
@@ -182,7 +205,10 @@ impl From<std::io::Error> for HubError {
 
 impl From<crate::Error> for HubError {
     fn from(error: crate::Error) -> Self {
-        Self::Unavailable(error.to_string())
+        match error {
+            crate::Error::Hub(envelope) => Self::from(envelope),
+            error => Self::Unavailable(error.to_string()),
+        }
     }
 }
 
@@ -196,8 +222,9 @@ const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
 
 /// Applies the operator `work compact` to every repository scope with history older than
 /// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
-/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
-/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+/// results and how many scopes were skipped: refused by a guard or the store stayed busy. An open
+/// delivery the pass would cut is ended, not a reason to skip, so a busy repository still
+/// compacts. Each scope is a separate bounded store call.
 pub async fn compact_work_history(
     state: &HubState,
     now: i64,
@@ -255,7 +282,7 @@ pub async fn work_compaction_loop(state: HubState) {
                     applied.len(),
                 );
             }
-            Err(error) => eprintln!("hub: work compaction failed: {error}"),
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
         }
     }
 }
@@ -465,6 +492,8 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(digest_http::routes())
+        .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())
         .merge(promise_http::routes())
@@ -487,7 +516,9 @@ pub fn router(state: HubState) -> Router {
     let router = bounded(router, publication, &state);
     #[cfg(unix)]
     let router = router.merge(source_bounded(workspace_source_http::routes()));
-    router.with_state(state)
+    router
+        .with_state(state)
+        .layer(axum::middleware::map_response(http::envelope_response))
 }
 
 /// Source bundles may take [`workspace_source_http::BODY_TIMEOUT`] to arrive, longer than the

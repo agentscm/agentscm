@@ -52,6 +52,9 @@ pub struct WorkStart {
     pub source: Option<ForgeWorkRef>,
     pub request_key: Option<String>,
     pub title: String,
+    /// What the new Work changes and why, for a teammate; set only when Work is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub session: String,
     #[serde(default)]
     pub role: WorkRole,
@@ -222,6 +225,9 @@ pub struct WorkItem {
     pub owner_login: String,
     pub source: WorkSource,
     pub title: String,
+    /// What this Work changes and why, from the start that created it; absent when it had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub state: WorkState,
     /// A request-time projection. Stale and unknown claims remain claimed.
     pub claim_status: ClaimStatus,
@@ -301,6 +307,26 @@ pub struct WorkCompaction {
     pub deleted_merge_observations: u64,
     #[serde(default)]
     pub merge_retention_floor: i64,
+}
+
+/// Which open deliveries a compaction ends: those whose event window starts below the first
+/// returned seq, or whose merge window starts below the second. Each floor is compared with its
+/// own old value and the highest raised one cuts; a pass that raised none returns 0, so a
+/// delivery that reads nothing removed keeps paging.
+pub fn delivery_cuts(
+    old_event_floors: [i64; 3],
+    new_event_floors: [i64; 3],
+    old_merge_floor: i64,
+    new_merge_floor: i64,
+) -> (i64, i64) {
+    let raised = |old: i64, new: i64| if new > old { new } else { 0 };
+    let event = old_event_floors
+        .into_iter()
+        .zip(new_event_floors)
+        .map(|(old, new)| raised(old, new))
+        .max()
+        .unwrap_or(0);
+    (event, raised(old_merge_floor, new_merge_floor))
 }
 
 /// A lapsed hold whose scope an admission took. Its lead's branch may hold edits it never pushed;
@@ -405,6 +431,59 @@ pub struct WorkOutcome {
     pub at: i64,
     pub kind: WorkOutcomeKind,
     pub item: WorkItem,
+    /// Set only on a completion row built from a `work_transition` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<WorkEnded>,
+}
+
+/// Who ended Work through a transition and why, as the `work_transition` event records it. The
+/// event stores the actor's kind, user login and how they authenticated, not an agent label.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEnded {
+    pub transition: String,
+    pub reason: String,
+    pub by: WorkEndedBy,
+    pub at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEndedBy {
+    pub kind: super::work_lifecycle::WorkActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    pub via: super::work_lifecycle::ActorVia,
+}
+
+impl WorkEnded {
+    /// Reads a `work_transition` event's data; None for any other event kind or unreadable data.
+    pub(super) fn from_event(kind: &str, data: &str, at: i64) -> Option<Self> {
+        if kind != "work_transition" {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).ok()?;
+        let actor = v.get("actor")?;
+        Some(Self {
+            transition: v.get("transition")?.as_str()?.to_owned(),
+            reason: v.get("reason")?.as_str()?.to_owned(),
+            by: WorkEndedBy {
+                kind: serde_json::from_value(actor.get("kind")?.clone()).ok()?,
+                login: actor
+                    .get("login")
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned),
+                via: serde_json::from_value(actor.get("via")?.clone()).ok()?,
+            },
+            at,
+            superseded_by: v
+                .get("superseded_by")
+                .and_then(|l| l.as_str())
+                .map(str::to_owned),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -649,8 +728,23 @@ impl WorkStart {
             + usize::from(self.request_key.is_some())
             != 1
         {
-            return Err(invalid(
-                "exactly one of work_id, source or request_key is required",
+            let problem =
+                if self.work_id.is_none() && self.source.is_none() && self.request_key.is_none() {
+                    super::error_envelope::FieldProblem::Missing
+                } else {
+                    super::error_envelope::FieldProblem::Conflict
+                };
+            return Err(HubError::Input(
+                ["work_id", "source", "request_key"]
+                    .into_iter()
+                    .filter_map(|name| {
+                        super::error_envelope::InputProblem::new(
+                            name,
+                            problem,
+                            "Provide exactly one of work_id, source or request_key.",
+                        )
+                    })
+                    .collect(),
             ));
         }
         if self.work_id.is_none() && self.role != WorkRole::Lead {
@@ -666,6 +760,7 @@ impl WorkStart {
             label("request_key", key)?;
         }
         text("title", &self.title, MAX_TEXT_BYTES)?;
+        option_text("description", &self.description, MAX_TEXT_BYTES)?;
         label("session", &self.session)?;
         option_text("next_action", &self.next_action, MAX_TEXT_BYTES)?;
         option_label("worktree", &self.worktree)?;
@@ -1113,8 +1208,22 @@ pub(super) fn check_work_delivery_page(page: &str) -> Result<()> {
 mod tests {
     use super::{
         WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_ROW_BYTES, check_work_delivery_page,
-        check_work_payload_capacity,
+        check_work_payload_capacity, delivery_cuts,
     };
+
+    #[test]
+    fn compaction_ends_only_deliveries_below_a_raised_floor() {
+        // Nothing raised: no delivery ends.
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 4), (0, 0));
+        // Any raised event floor cuts at the highest new floor; merges are separate.
+        assert_eq!(delivery_cuts([5, 9, 2], [12, 9, 2], 4, 4), (12, 0));
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 7), (0, 7));
+        // A raised floor below another, unraised one still cuts: events 600-950 were removed.
+        assert_eq!(
+            delivery_cuts([500, 900, 1000], [950, 900, 1000], 0, 0),
+            (950, 0)
+        );
+    }
 
     #[test]
     fn overlap_witnesses_bound_dense_scope_expansions() {
@@ -1159,5 +1268,37 @@ mod tests {
         let payload = (WORK_DELIVERY_RESERVATION_BYTES - WORK_PAYLOAD_ROW_BYTES) as usize;
         assert!(check_work_delivery_page(&"x".repeat(payload)).is_ok());
         assert!(check_work_delivery_page(&"x".repeat(payload + 1)).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_stored_before_descriptions_still_decodes() {
+        let mut snapshot = serde_json::json!({
+            "id": "wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repository": "acme/widgets",
+            "owner": "usr_alice", "owner_login": "alice",
+            "source": {"kind": "native", "request_key": "synthetic"},
+            "title": "Synthetic", "state": "active", "claim_status": "active",
+            "last_checkin_at": 1, "generation": 1, "lead_token": "tok_alice",
+            "lead_agent": "agent", "lead_session": "session",
+            "participants": [{"owner": "usr_alice", "login": "alice", "token": "tok_alice",
+                "agent": "agent", "session": "session", "role": "lead"}],
+            "scope": [], "branch": null, "worktree": null, "next_action": null,
+            "current": null, "blocker": null, "depends_on": [], "related_work": [],
+            "created_at": 1, "updated_at": 1, "created_seq": 1, "updated_seq": 1
+        });
+        let old: super::WorkItem = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(old.description, None);
+        // Work without a description keeps the snapshot shape older readers decode.
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("description")
+                .is_none()
+        );
+        snapshot["description"] = "Says what the Work changes and why.".into();
+        let described: super::WorkItem = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(
+            described.description.as_deref(),
+            Some("Says what the Work changes and why.")
+        );
     }
 }

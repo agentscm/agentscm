@@ -187,7 +187,8 @@ async fn library_shows_the_catalog_with_and_without_adoption_and_flags_an_unknow
             None,
         )
         .await;
-    assert_eq!(status, 401);
+    // Another repository looks like an unknown one.
+    assert_eq!(status, 404);
 
     // A checkout reports a pin of a version this hub does not know.
     let entry = catalog_entry("pr-gate", 1).unwrap();
@@ -320,7 +321,8 @@ async fn evidence_runs_through_the_gates_to_ci_and_every_assurance_is_labelled()
         .await;
     assert_eq!(
         lib["counts"]["pr-gate"],
-        json!({"open": 1, "at_stop_gate": 0, "completed": 0})
+        json!({"open": 1, "at_stop_gate": 0, "completed": 0, "merged_observed": 0,
+            "merged_with_skips": 0, "merged_unobserved": 0})
     );
 
     let (status, _) = hub
@@ -493,11 +495,9 @@ async fn mcp_tools_list_status_and_record_with_labels_and_named_errors() {
             "kind": "independent_review", "head_sha": H1, "summary": "ok", "branch": "feat/x", "session": "author"}))
         .await;
     assert_eq!(refused["isError"], true);
-    assert!(
-        refused["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("not_independent")
+    assert_eq!(
+        refused["structuredContent"]["error"]["code"], "not_independent",
+        "{refused}"
     );
 }
 

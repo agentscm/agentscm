@@ -263,9 +263,10 @@ fn hub_problems_are_coordination_unknown_and_exit_zero() {
     let text = context(&down.edit("s", "Edit", work.path(), file), "PreToolUse");
     // The hook's 3 s limit plus process start on a loaded host.
     assert!(started.elapsed() < Duration::from_secs(15));
-    assert_eq!(
-        text,
-        "AgentSCM coordination unknown: hub unreachable. Other agents' work on these files is not visible."
+    assert!(
+        text.starts_with("AgentSCM coordination unknown: The Hub is unreachable;")
+            && text.ends_with("Other agents' work on these files is not visible."),
+        "{text}"
     );
 
     let mut bare = Client::new(&hub, &agent, "laptop-a");
@@ -280,7 +281,7 @@ fn hub_problems_are_coordination_unknown_and_exit_zero() {
     assert!(hub.store.revoke_agent_token(&agent.id).unwrap());
     let output = revoked.edit("s", "Edit", work.path(), file);
     let text = context(&output, "PreToolUse");
-    assert!(text.contains("rejected"), "{text}");
+    assert!(text.contains("not accepted"), "{text}");
     let plain = revoked.run_in(work.path(), &["check", file], "");
     assert!(plain.status.success());
     for out in [&output, &plain] {
@@ -705,7 +706,7 @@ fn a_failed_retry_after_a_refusal_keeps_the_refusal_note() {
         &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
         "PreToolUse",
     );
-    assert!(text.contains("hub error 500"), "{text}");
+    assert!(text.contains("synthetic failure"), "{text}");
     assert!(text.contains("Resume it."), "{text}");
 }
 
@@ -721,11 +722,8 @@ fn an_incomplete_overlap_scan_is_reported_as_such_and_not_as_a_busy_hub() {
         &client.edit("s", "Edit", work.path(), file.to_str().unwrap()),
         "PreToolUse",
     );
-    assert!(text.contains("work_overlap_incomplete"), "{text}");
-    assert!(
-        text.contains("could not finish its work overlap check, more than 100 items to compare"),
-        "{text}"
-    );
+    assert!(text.contains("Overlap coverage is incomplete"), "{text}");
+    assert!(text.contains("more than 100 items to compare"), "{text}");
     assert!(!text.contains("unfinished Work"), "{text}");
     assert!(!text.contains("hub busy"), "{text}");
 }

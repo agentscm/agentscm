@@ -1037,29 +1037,34 @@ struct Machine {
     checkout: TempDir,
 }
 
+/// A checkout of `repo` whose origin is on the fake forge's host.
+fn checkout_of(repo: &str) -> TempDir {
+    let checkout = TempDir::new().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            &format!("http://127.0.0.1/{repo}.git"),
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(checkout.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    checkout
+}
+
 impl Machine {
     fn new(repo: &str) -> Self {
-        let checkout = TempDir::new().unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec![
-                "remote",
-                "add",
-                "origin",
-                &format!("http://127.0.0.1/{repo}.git"),
-            ],
-        ] {
-            let status = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(checkout.path())
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
         Self {
             config: TempDir::new().unwrap(),
             home: TempDir::new().unwrap(),
-            checkout,
+            checkout: checkout_of(repo),
         }
     }
 
@@ -1192,6 +1197,18 @@ impl Mcp {
         self.stdout.read_line(&mut line).unwrap();
         line
     }
+
+    /// One tool call; the reply's result.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.next += 1;
+        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}});
+        writeln!(self.stdin, "{request}").unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()["result"].take()
+    }
 }
 
 impl Drop for Mcp {
@@ -1282,7 +1299,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // The next session connects the checkout and says so in one line, writing no file in it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO}.")),
+        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+            && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
     let connection = machine.connection();
@@ -1322,6 +1340,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     ]);
     assert!(ok, "{stderr}");
     assert!(doctor.contains("Connection verified"), "{doctor}");
+    assert!(doctor.contains("Connection: authenticated"), "{doctor}");
+    assert!(doctor.contains("Hub build: "), "{doctor}");
 
     // Renewal swaps the token before it ends and revokes the old one; a running MCP server
     // keeps working across it.
@@ -1379,6 +1399,107 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// A session that starts in one repository and edits another declares its Work in the other:
+/// the MCP server sends the call to the repository of the file it names, under that
+/// repository's token and the session the start hook recorded for this agent host.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
+    const OTHER: &str = "acme/gadgets";
+    const OTHER_ID: i64 = 4343;
+    let env = Env::start("github").await;
+    env.connect_repo(OTHER, OTHER_ID, ALICE);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.insert((OTHER.into(), ALICE), ("write", "write"));
+        fake.levels.insert((OTHER_ID, ALICE), 30);
+        fake.approve = ALICE;
+    }
+    let machine = Machine::new(REPO);
+    let other = checkout_of(OTHER);
+    let other = other.path().canonicalize().unwrap();
+    for root in [machine.root(), other.clone()] {
+        let (ok, _, stderr) = machine.run(&[
+            "--no-telemetry",
+            "client",
+            "connect",
+            "--hub",
+            &env.hub,
+            "--provider",
+            "github",
+            "--root",
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{stderr}");
+    }
+
+    // The start context names the second repository, so the agent knows it is covered.
+    let reply = machine.session_start("native-1");
+    assert!(
+        context(&reply).contains(&format!("Also connected on this computer: {OTHER}.")),
+        "{reply}"
+    );
+
+    // No session and no root in the call: the file's path and the hook's record decide both.
+    let mut mcp = machine.mcp();
+    let file = other.join("src/lib.rs");
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Change the gadget", "paths": [file]}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    let said = started["content"].to_string();
+    assert!(
+        said.contains(&format!("this call went to {OTHER}")),
+        "{said}"
+    );
+    let connections = machine.file("connections.json");
+    let work = |repo: &str| {
+        let token = connections["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connection| connection["repo"] == repo)
+            .unwrap()["owned_token_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let query = agentscm::hub::work::WorkOverviewQuery::default();
+        env.store
+            .work_overview(&token, &query, unix_now())
+            .unwrap()
+            .current
+    };
+    let recorded = work(OTHER);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].title, "Change the gadget");
+    assert_eq!(recorded[0].scope, ["src/lib.rs"]);
+    assert_eq!(recorded[0].lead_session, "native-1");
+    assert!(work(REPO).is_empty());
+
+    // A read reaches the same repository by root; without it the start checkout answers.
+    let there = mcp.call(
+        "agentscm_work_overview",
+        json!({"root": other, "detail": "full"}),
+    );
+    assert!(there.to_string().contains("Change the gadget"), "{there}");
+    let here = mcp.call("agentscm_work_overview", json!({"detail": "full"}));
+    assert!(!here.to_string().contains("Change the gadget"), "{here}");
+
+    // One call cannot declare files of both repositories.
+    let both = mcp.call(
+        "agentscm_start",
+        json!({"task": "Change both", "paths": [machine.root().join("a.rs"), file]}),
+    );
+    assert_eq!(both["isError"], true, "{both}");
+    assert!(
+        both.to_string().contains("Call once per repository"),
+        "{both}"
+    );
+    assert_eq!(work(OTHER).len(), 1);
+    assert!(work(REPO).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1694,10 +1815,15 @@ fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
 
 /// Runs a web-page sign-in for `user` up to the Hub's answer to the forge's callback.
 async fn callback_for(env: &Env, user: i64, purpose: &str) -> reqwest::Response {
+    callback_query(env, user, &format!("{purpose}=1")).await
+}
+
+/// `callback_for` with the sign-in's whole query, e.g. `web=1&return_to=%2Fnext%2F`.
+async fn callback_query(env: &Env, user: i64, query: &str) -> reqwest::Response {
     env.fake.lock().unwrap().approve = user;
     let http = browser();
     let start = http
-        .get(format!("{}/v1/hub/login/github?{purpose}=1", env.hub))
+        .get(format!("{}/v1/hub/login/github?{query}", env.hub))
         .send()
         .await
         .unwrap();
@@ -1766,6 +1892,8 @@ async fn with_cookie(
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
+    // Each refusal carries its own error reference; blank it so equal refusals compare equal.
+    let text = crate::hub_error_assert::blank_references(&text);
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
@@ -1829,6 +1957,7 @@ fn work(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: key.into(),
+        description: None,
         session: session.into(),
         role: agentscm::hub::work::WorkRole::Lead,
         scope: vec!["src/billing.rs".into()],
@@ -2485,6 +2614,32 @@ async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() 
 }
 
 #[tokio::test]
+async fn a_web_sign_in_returns_to_the_hub_page_that_asked_and_nowhere_else() {
+    let env = Env::start("github").await;
+    let done = callback_query(&env, ALICE, "web=1&return_to=%2Fnext%2F").await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(done.headers()[header::LOCATION], "/next/#home");
+    assert!(set_cookie(&done, "__Host-agentscm_session").is_some());
+    // Another site, an API route or an odd path is refused before GitHub is asked.
+    for bad in [
+        "https%3A%2F%2Fevil.example%2F",
+        "%2F%2Fevil.example%2F",
+        "%2Fv1%2Fhub%2Fsession%2F",
+        "%2Fnext",
+    ] {
+        let start = browser()
+            .get(format!(
+                "{}/v1/hub/login/github?web=1&return_to={bad}",
+                env.hub
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), 400, "{bad}");
+    }
+}
+
+#[tokio::test]
 async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
     let env = Env::start("github").await;
     let cookie = web_sign_in(&env, ALICE).await;
@@ -2599,6 +2754,12 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
         "/ui/#/signed-in?status=refused&reason=user_disabled"
     );
     assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
+    // A page that asked to come back gets the refusal on itself.
+    let refused = callback_query(&env, ALICE, "web=1&return_to=%2Fnext%2F").await;
+    assert_eq!(
+        refused.headers()[header::LOCATION],
+        "/next/#/signed-in?status=refused&reason=user_disabled"
+    );
     env.store.set_user_disabled(&alice.id, false).unwrap();
     assert_eq!(session(cookie).await.0, 401);
 
@@ -3287,6 +3448,7 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
                     source: None,
                     request_key: Some(key.into()),
                     title: title.into(),
+                    description: None,
                     session: key.into(),
                     role: WorkRole::Lead,
                     scope: vec![format!("src/{key}.rs")],
@@ -3504,12 +3666,10 @@ async fn a_capacity_refusal_reaches_the_operator_with_what_to_run() {
             Some(start(MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN)),
         )
         .await;
-    assert_eq!(
-        (status, refused),
-        (
-            503,
-            json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
-        )
+    assert_eq!(status, 503, "{refused}");
+    crate::assert_hub_error!(
+        refused,
+        json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
     );
 
     // The admin sees which repository and limit, counted, with the remedy.
@@ -3691,4 +3851,390 @@ async fn a_hand_off_is_picked_up_only_by_its_own_persons_agent_start() {
         .unwrap();
     let found = pickup(&env, &alice, &json!(expired.id)).await;
     assert_eq!(found["state"], "expired");
+}
+
+const SKILL_STATUS: &str = "/v1/hub/session/skill-forge-status";
+
+/// A PUT of the skill-status setting from a web page; `csrf` is withheld to play another site.
+async fn put_skill_status(env: &Env, page: &Page, csrf: bool, enabled: bool) -> (u16, Value) {
+    let mut request = browser()
+        .put(format!("{}{SKILL_STATUS}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"repository": REPO, "enabled": enabled}).to_string());
+    if csrf {
+        request = request.header("x-csrf-token", &page.csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn only_a_repository_or_hub_admin_sets_the_skill_status() {
+    let env = Env::start("github").await;
+    let (alice, admin) = (page(&env, ALICE).await, page(&env, ADMIN).await);
+    let read = |page: &Page| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        let path = format!("{SKILL_STATUS}?repository={REPO}");
+        async move { with_cookie(&hub, Method::GET, &path, &cookie, None).await }
+    };
+    // Off by default; a writer sees it but may not change it.
+    let (status, seen) = read(&alice).await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(
+        (seen["enabled"].clone(), seen["can_change"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(put_skill_status(&env, &alice, true, true).await.0, 403);
+    assert_eq!(read(&alice).await.1["enabled"], false);
+
+    // A Hub admin sets and unsets it; without the page's CSRF token nothing changes.
+    assert_eq!(put_skill_status(&env, &admin, false, true).await.0, 403);
+    let (status, set) = put_skill_status(&env, &admin, true, true).await;
+    assert_eq!(
+        (status, set["enabled"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+    assert_eq!(read(&alice).await.1["enabled"], true);
+    assert_eq!(
+        put_skill_status(&env, &admin, true, false).await.1["enabled"],
+        false
+    );
+
+    // A repository admin may change it too.
+    env.role(ALICE, "admin", "admin", 50);
+    let (status, set) = put_skill_status(&env, &alice, true, true).await;
+    assert_eq!(
+        (status, set["can_change"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+
+    // No agent or read-only token writes it.
+    for read_only in [false, true] {
+        let (_, secret) = agent_for(&env, &alice.id, "skill-status", read_only);
+        let response = browser()
+            .put(format!("{}{SKILL_STATUS}", env.hub))
+            .bearer_auth(&secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"repository": REPO, "enabled": false}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401, "read_only={read_only}");
+    }
+    assert_eq!(read(&alice).await.1["enabled"], true);
+}
+
+const DISMISSALS: &str = "/v1/hub/session/dismissals";
+
+/// A PUT from a web page with its CSRF token.
+async fn page_put(env: &Env, page: &Page, body: Value) -> (u16, Value) {
+    let response = browser()
+        .put(format!("{}{DISMISSALS}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-csrf-token", &page.csrf)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let list = format!("{DISMISSALS}?repository={REPO}");
+    let read = |page: &Page| {
+        let (hub, cookie, list) = (env.hub.clone(), page.cookie.clone(), list.clone());
+        async move { with_cookie(&hub, Method::GET, &list, &cookie, None).await }
+    };
+    assert_eq!(read(&alice).await.1, json!({"dismissals": []}));
+
+    let dismiss = json!({"repository": REPO, "key": "stale:wrk_1", "fingerprint": "abc"});
+    let (status, page) = page_put(&env, &alice, dismiss.clone()).await;
+    assert_eq!(status, 200, "{page}");
+    let until = unix_now() + 86_400;
+    let snooze =
+        json!({"repository": REPO, "key": "pr:12", "fingerprint": "head1", "until": until});
+    assert_eq!(page_put(&env, &alice, snooze).await.0, 200);
+    // A second dismissal of the same key replaces the first.
+    let mut changed = dismiss.clone();
+    changed["fingerprint"] = json!("def");
+    let (_, page) = page_put(&env, &alice, changed).await;
+    let rows = page["dismissals"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{page}");
+    assert_eq!(rows[1]["key"], "stale:wrk_1");
+    assert_eq!(rows[1]["fingerprint"], "def");
+    assert_eq!(rows[1]["until"], Value::Null);
+    assert_eq!(rows[0]["until"], json!(until));
+    assert_eq!(read(&alice).await.1, page);
+
+    // They are Alice's own; Bob reads none, and a person who cannot read the repository is refused.
+    assert_eq!(read(&bob).await.1, json!({"dismissals": []}));
+    // Without the page's CSRF token, signed out, or with bad values, nothing changes.
+    let remove = format!("{DISMISSALS}?repository={REPO}&key=pr%3A12");
+    assert_eq!(
+        with_cookie(&env.hub, Method::DELETE, &remove, &alice.cookie, None)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(&env.hub, Method::GET, &list, "nope", None)
+            .await
+            .0,
+        401
+    );
+    for bad in [
+        json!({"repository": REPO, "key": "", "fingerprint": "f"}),
+        json!({"repository": REPO, "key": "k".repeat(201), "fingerprint": "f"}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f".repeat(129)}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f", "until": 1}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f", "extra": 1}),
+    ] {
+        assert_eq!(page_put(&env, &alice, bad.clone()).await.0, 400, "{bad}");
+    }
+
+    let (status, page) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        &remove,
+        &alice.cookie,
+        Some(&alice.csrf),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["dismissals"].as_array().unwrap().len(), 1);
+    assert_eq!(page["dismissals"][0]["key"], "stale:wrk_1");
+
+    env.drop_role(BOB);
+    let (status, refused) = read(&bob).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+}
+
+const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
+
+async fn mcp_call(env: &Env, token: &str, method: &str, params: Value) -> Value {
+    let (status, reply) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/mcp",
+            Some(token),
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params})),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    reply["result"].clone()
+}
+
+fn texts(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_person_messages_only_their_own_session_which_answers_with_receipts() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (alice_token, alice_secret) = agent_for(&env, &alice.id, "laptop", false);
+    let (bob_token, bob_secret) = agent_for(&env, &bob.id, "desk", false);
+    let list = format!("{AGENT_MESSAGES}?repository={REPO}");
+    let read = || {
+        let (hub, cookie, list) = (env.hub.clone(), alice.cookie.clone(), list.clone());
+        async move { with_cookie(&hub, Method::GET, &list, &cookie, None).await.1 }
+    };
+    let page0 = read().await;
+    assert_eq!(page0["mode"], "manual", "{page0}");
+    assert_eq!(page0["sessions"], json!([]));
+
+    // An MCP-only client: its initialize names it, its first call names its session.
+    mcp_call(
+        &env,
+        &alice_secret,
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"gemini-cli","version":"0.9.0"}}),
+    )
+    .await;
+    let status_call = json!({"name":"agentscm_status","arguments":{"session":"s1"}});
+    mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
+    let seen = read().await;
+    let session = seen["sessions"][0].clone();
+    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["name"], "gemini-cli");
+    assert_eq!(session["token_name"], "laptop");
+    let s1 = session["session"].as_str().unwrap().to_owned();
+
+    let send = |token: &str, session: &str, note: &str| json!({"repository": REPO, "token": token, "session": session, "note": note});
+    // Never to another person's token, and never without the page's CSRF token.
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&bob_token, &s1, "x"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        false,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "x"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, message) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "Please release the stale Work"),
+    )
+    .await;
+    assert_eq!(status, 201, "{message}");
+    assert_eq!(message["state"], "queued");
+    let id = message["id"].as_str().unwrap().to_owned();
+
+    // A call that names no session never takes it.
+    let no_session = json!({"name":"agentscm_status","arguments":{}});
+    let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
+    assert!(!unnamed.contains(&id), "{unnamed}");
+
+    // Delivered once, in the next tool result, as a notice that names no mode.
+    let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(text.contains("AgentSCM Hub message"), "{text}");
+    assert!(
+        text.contains(&id) && text.contains("status accepted"),
+        "{text}"
+    );
+    assert!(!text.contains("their yes"), "{text}");
+    let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!again.contains(&id), "{again}");
+    assert_eq!(read().await["messages"][0]["state"], "delivered");
+    assert_eq!(read().await["messages"][0]["via"], "mcp");
+
+    // Only the receiving session answers, and only a real id verifies.
+    let answer_id = |id: &str, status: &str| {
+        json!({"name":"agentscm_hub_message",
+            "arguments":{"id": id, "status": status, "session": "s1"}})
+    };
+    let answer = |status: &str| answer_id(&id, status);
+    let refused = mcp_call(&env, &bob_secret, "tools/call", answer("accepted")).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let forged = mcp_call(
+        &env,
+        &alice_secret,
+        "tools/call",
+        answer_id("msg_00000000000000000000000000000000", "accepted"),
+    )
+    .await;
+    assert_eq!(forged["isError"], true, "{forged}");
+    let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
+    assert_eq!(ok["isError"], false, "{ok}");
+    let verified = texts(&ok);
+    assert!(
+        verified.contains("verified")
+            && verified.contains("Please release the stale Work")
+            && verified.contains("their yes"),
+        "{verified}"
+    );
+    mcp_call(&env, &alice_secret, "tools/call", answer("done")).await;
+    assert_eq!(read().await["messages"][0]["state"], "done");
+
+    // A hook client gets it in the next prompt's added context, with no tool call.
+    let hook = |session: &str| {
+        let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        async move {
+            let response = browser()
+                .post(format!("{hub}/v1/hub/hook/claude"))
+                .bearer_auth(secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
+        }
+    };
+    hook("h1").await;
+    let h1 = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude")
+        .cloned()
+        .unwrap();
+    assert_eq!(h1["tier"], "hook", "{h1}");
+    let h1 = h1["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &h1, "Auto please"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("h1").await;
+    let context = reply["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("Auto please"), "{reply}");
+    assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // Ignore holds everything: sending is refused.
+    let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});
+    let response = browser()
+        .put(format!("{}{AGENT_MESSAGES}/mode", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", alice.cookie),
+        )
+        .header("x-csrf-token", &alice.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(mode(json!("ignore")).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let page = read().await;
+    assert_eq!(
+        (page["mode"].clone(), page["repository_mode"].clone()),
+        (json!("ignore"), json!("ignore"))
+    );
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "held"),
+    )
+    .await;
+    assert_eq!(status, 400);
 }

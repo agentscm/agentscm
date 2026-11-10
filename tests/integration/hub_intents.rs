@@ -406,6 +406,14 @@ fn events_are_appended_once(db: &Db) {
         ..intent(2, &["e/f"])
     };
     store.announce_intent(&b.token, &same, T0 + 6).unwrap();
+    // A change of only the paths, wider or narrower, is no new announce; a new branch is.
+    announce(&*store, &b, 2, &["e/f", "e/g"], T0 + 6);
+    announce(&*store, &b, 2, &["e/f"], T0 + 6);
+    let moved = NewIntent {
+        branch: Some("other".into()),
+        ..intent(2, &["e/f"])
+    };
+    store.announce_intent(&b.token, &moved, T0 + 6).unwrap();
     assert!(store.release_intent(&a.token, &id(1), T0 + 7).unwrap());
     let kinds: Vec<(&str, String)> = vec![
         ("intent_announced", id(1)),
@@ -413,6 +421,10 @@ fn events_are_appended_once(db: &Db) {
         ("intent_notice", id(1)),
         ("intent_renewed", id(1)),
         ("intent_renewed", id(2)),
+        ("intent_paths_changed", id(2)),
+        ("intent_notice", id(1)),
+        ("intent_paths_changed", id(2)),
+        ("intent_announced", id(2)),
         ("intent_released", id(1)),
     ];
     let got = intent_events(&*store);
@@ -826,7 +838,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
     );
     let valid = announce_body(1, &["a/b.rs"]);
     let (status, body) = hub.call(post.clone(), INTENTS, None, Some(&valid)).await;
-    assert_eq!((status, body), (401, json!({"error": "unauthorized"})));
+    crate::assert_hub_error!((status, body), (401, json!({"error": "unauthorized"})));
     assert_eq!(hub.call(get.clone(), NOTICES, None, None).await.0, 401);
     assert_eq!(
         hub.call(get.clone(), INTENTS, Some("bogus"), None).await.0,
@@ -842,7 +854,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
         "/v1/hub/repos/acme%2F..%2Fwidgets/intents",
     ] {
         let (status, body) = hub.call(get.clone(), path, Some(&alice), None).await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, body),
             (404, json!({"error": "not_found"})),
             "{path}"
@@ -868,7 +880,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
         let (status, reply) = hub
             .call(post.clone(), INTENTS, Some(&alice), Some(&body.to_string()))
             .await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{body}"
@@ -881,7 +893,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
     for query in ["wait=abc", "wait=26", "after=-1", "after=x", "foo=1"] {
         let url = format!("{NOTICES}?{query}");
         let (status, reply) = hub.call(get.clone(), &url, Some(&alice), None).await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{query}"
@@ -941,12 +953,12 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "a");
     let get = reqwest::Method::GET;
-    assert_eq!(
+    crate::assert_hub_error!(
         hub.call(get.clone(), ACTIVITY, None, None).await,
         (401, json!({"error": "unauthorized"}))
     );
     let other = "/v1/hub/repos/acme%2Fother/activity";
-    assert_eq!(
+    crate::assert_hub_error!(
         hub.call(get.clone(), other, Some(&alice), None).await,
         (404, json!({"error": "not_found"}))
     );
@@ -962,7 +974,7 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     ] {
         let url = format!("{ACTIVITY}?{query}");
         let (status, reply) = hub.call(get.clone(), &url, Some(&alice), None).await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{query}"
@@ -1131,6 +1143,7 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
                 source: None,
                 request_key: Some("w".into()),
                 title: "Synthetic work".into(),
+                description: None,
                 session: "w".into(),
                 role: WorkRole::Lead,
                 scope: vec!["src/**".into()],
@@ -1179,7 +1192,9 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["error", "message", "refused_paths"]);
+    for key in ["error", "message", "refused_paths", "retryable", "recovery"] {
+        assert!(keys.contains(&key), "{key}: {keys:?}");
+    }
     assert_eq!(reply["error"], "invalid_request");
     assert!(reply["message"].as_str().unwrap().contains(&started.id));
     assert_eq!(

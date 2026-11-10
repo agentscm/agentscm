@@ -611,12 +611,33 @@ fn render(view: &RunView) -> String {
             GateState::Current => "current",
             GateState::NotReached => "not reached",
         };
-        let label = if g.assurance == Some(Assurance::SelfReported) {
-            " [self-reported]"
-        } else {
-            ""
+        let label = match g.assurance {
+            Some(Assurance::SelfReported) => " [self-reported]",
+            Some(Assurance::Observed) => " [observed]",
+            _ => "",
         };
         let _ = writeln!(out, "  {:<12} {state}{label}", g.id);
+    }
+    if let Some(check) = &view.merge_check {
+        let mut past = check.skipped.clone();
+        past.extend(
+            check
+                .unobserved
+                .iter()
+                .map(|g| format!("{g} (not observed)")),
+        );
+        if check.merged_head != check.run_head {
+            past.push("evidence for another head".into());
+        }
+        let _ = writeln!(
+            out,
+            "Merged past: {}",
+            if past.is_empty() {
+                "nothing".into()
+            } else {
+                past.join(", ")
+            }
+        );
     }
     let _ = writeln!(out, "Next: {}", view.next_action);
     let _ = write!(
@@ -631,7 +652,7 @@ fn decode_run(status: u16, body: Value) -> Result<RunView> {
     if status != 200 {
         return Err(invalid(format!("the Hub returned status {status}")));
     }
-    Ok(serde_json::from_value(body)?)
+    Ok(agentscm::hub::reply::decode(&body)?)
 }
 
 async fn status(branch: Option<String>, as_json: bool) -> Result<()> {
@@ -654,15 +675,10 @@ async fn status(branch: Option<String>, as_json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    let view = decode_run(code, body.clone())?;
-    println!(
-        "{}",
-        if as_json {
-            body.to_string()
-        } else {
-            render(&view)
-        }
-    );
+    if code != 200 {
+        return Err(invalid(format!("the Hub returned status {code}")));
+    }
+    agentscm::hub::reply::print(&body, as_json, render)?;
     Ok(())
 }
 
@@ -734,7 +750,7 @@ async fn record(args: EvidenceArgs) -> Result<()> {
             body["error"].as_str().unwrap_or("")
         )));
     }
-    println!("{}", render(&decode_run(code, body)?));
+    agentscm::hub::reply::print(&body, false, render)?;
     println!("Evidence recorded as self-reported.");
     Ok(())
 }

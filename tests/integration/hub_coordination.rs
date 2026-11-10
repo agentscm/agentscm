@@ -202,6 +202,7 @@ fn start_scope(
         source: None,
         request_key: work_id.is_none().then(|| key.into()),
         title: key.into(),
+        description: None,
         session: session.into(),
         role,
         scope: scope.iter().map(|path| (*path).into()).collect(),

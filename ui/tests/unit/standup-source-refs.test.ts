@@ -71,6 +71,13 @@ describe('stand-up intent source references', () => {
   })
 })
 
+it('decodes an optional Work description and refuses hidden characters in it', () => {
+  expect('description' in decodeWorkItem(fixture())).toBe(false)
+  const described = { ...fixture(), description: 'Keeps intent provenance with each checkpoint so a reader can trace it.' }
+  expect(decodeWorkItem(described).description).toBe(described.description)
+  expect(() => decodeWorkItem({ ...described, description: 'line\nbreak' })).toThrow(/work.description/)
+})
+
 it('decodes issue-link changes as metadata events', () => {
   const page = { delivery: null, from: 0, through: 20, after: 0, work_after: null, next_after: 20, next_work_after: null, next_work_done: true, items: [], events: [{ seq: 20, at: 1_798_000_010, kind: 'work_issue_link', work_id: WORK_ID, item: fixture() }], retention_gap: false, complete: true }
   expect(decodeBriefing(page).events[0]?.kind).toBe('work_issue_link')

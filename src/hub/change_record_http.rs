@@ -196,7 +196,8 @@ async fn list_conversation(
     ))
 }
 
-/// The caller's own entries, or every author's for a Hub admin, shared by the HTTP and MCP reads.
+/// The caller's own entries, or every author's for a Hub admin or, while the repository shares
+/// agent conversations, anyone who can read the repository. Shared by the HTTP and MCP reads.
 pub(super) async fn conversation_page(
     state: &HubState,
     principal: &Principal,
@@ -206,8 +207,24 @@ pub(super) async fn conversation_page(
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let admin = state.login.is_admin_user(&principal.owner);
+    let repository_id = principal.repository_id;
     let entries = blocking(state, move || {
-        store.shared_conversation_page(&token, &work_id, cursor.as_deref(), admin, unix_now())
+        let all = admin || super::conversation_sharing::repository_shares(&*store, repository_id)?;
+        let mut entries =
+            store.shared_conversation_page(&token, &work_id, cursor.as_deref(), all, unix_now())?;
+        // Each entry names who shared it by login; a page holds at most a few authors.
+        let mut logins = std::collections::HashMap::new();
+        for entry in entries.iter_mut().flatten() {
+            let Some(id) = entry.author.take() else {
+                continue;
+            };
+            if !logins.contains_key(&id) {
+                let login = store.user_by_id(&id)?.map(|user| user.login);
+                logins.insert(id.clone(), login);
+            }
+            entry.author = logins[&id].clone();
+        }
+        Ok(entries)
     })
     .await?
     .ok_or_else(ApiError::not_found)?;
@@ -226,8 +243,8 @@ fn no_access(admin: bool) -> ApiError {
     }
 }
 
-/// A shared body's verified bytes for its author and Hub admins, shared by the HTTP and MCP
-/// reads. Never uploaded is `not_found`, expired or deleted is `gone`, and an object that is
+/// A shared body's verified bytes for its author, Hub admins and, while the repository shares
+/// agent conversations, anyone who can read the repository. Shared by the HTTP and MCP reads. Never uploaded is `not_found`, expired or deleted is `gone`, and an object that is
 /// missing, corrupt or not the declared size is `integrity_failure` (424).
 pub(super) async fn conversation_body(
     state: &HubState,
@@ -242,6 +259,7 @@ pub(super) async fn conversation_body(
     let objects = state.objects.clone();
     let admin = state.login.is_admin_user(&principal.owner);
     let token = principal.token_id.clone();
+    let repository_id = principal.repository_id;
     blocking(
         state,
         move || -> Result<Result<Vec<u8>, ApiError>, HubError> {
@@ -249,8 +267,10 @@ pub(super) async fn conversation_body(
             let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
                 return Ok(Err(ApiError::not_found()));
             };
-            let Some(row) = access.accessible(admin, now) else {
-                return Ok(Err(no_access(admin)));
+            let all =
+                admin || super::conversation_sharing::repository_shares(&*store, repository_id)?;
+            let Some(row) = access.accessible(all, now) else {
+                return Ok(Err(no_access(all)));
             };
             let row = row.clone();
             match row.state_at(now) {
@@ -280,7 +300,7 @@ pub(super) async fn conversation_body(
                         && let Err(error) =
                             store.shared_body_demote_available(&work_id, &sha256, None)
                     {
-                        eprintln!("hub: shared body not demoted: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                     Ok(Err(ApiError::new(
                         StatusCode::FAILED_DEPENDENCY,
@@ -399,7 +419,7 @@ fn physically_delete(
         if let Err(error) =
             store.shared_body_delete_failed(&row.work, &row.digest, &row.author, retry_at)
         {
-            eprintln!("hub: shared body retry not recorded: {error}");
+            crate::hub::error_envelope::log_internal(&error);
         }
     }
     removed
@@ -423,8 +443,14 @@ async fn upload_body(
     let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
     let token = principal.token_id;
     let admin = state.login.is_admin_user(&principal.owner);
+    let (author, repository_id) = (principal.owner.id, principal.repository_id);
     blocking(&state, move || -> Result<Refusal, HubError> {
         let now = unix_now();
+        // Off means off: nothing more is stored once the repository stops sharing or this
+        // person opts out, whatever the client still holds.
+        if !super::conversation_sharing::person_shares(&*store, &author, repository_id)? {
+            return Ok(Err(ApiError::new(StatusCode::FORBIDDEN, "sharing_off")));
+        }
         let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
             return Ok(Err(ApiError::not_found()));
         };
@@ -459,7 +485,7 @@ async fn upload_body(
             if let Err(revert) =
                 store.shared_body_demote_available(&work_id, &sha256, Some(&row.author))
             {
-                eprintln!("hub: shared body not reverted: {revert}");
+                super::error_envelope::log_internal(&revert);
             }
             return Err(error.into());
         }
@@ -476,7 +502,7 @@ async fn upload_body(
                 }
                 _ => {
                     if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
-                        eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                     ApiError::gone()
                 }
@@ -518,7 +544,7 @@ async fn delete_body(
                 continue;
             }
             if let Err(error) = physically_delete(&*store, &*objects, &row, now, false) {
-                eprintln!("hub: shared body removal deferred to the sweep: {error}");
+                crate::hub::error_envelope::log_internal(&error);
             }
         }
         Ok(Ok(()))
@@ -548,14 +574,25 @@ async fn missing_bodies(
     let store = state.store.clone();
     let token = principal.token_id;
     let digests = request.digests;
-    let rows = {
+    let (author, repository_id) = (principal.owner.id, principal.repository_id);
+    let Some((rows, shares)) = ({
         let digests = digests.clone();
         blocking(&state, move || {
-            store.shared_bodies_own(&token, &work_id, &digests, unix_now())
+            let shares =
+                super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
+            Ok(store
+                .shared_bodies_own(&token, &work_id, &digests, unix_now())?
+                .map(|rows| (rows, shares)))
         })
         .await?
-        .ok_or_else(ApiError::not_found)?
+    }) else {
+        return Err(ApiError::not_found());
     };
+    // While sharing is off nothing is missing, so the client sends nothing and its bodies stay
+    // declared `local` on the Hub.
+    if !shares {
+        return Ok(Json(ConversationMissingV1::default()));
+    }
     let now = unix_now();
     let mut answer = ConversationMissingV1::default();
     for digest in digests {
@@ -614,7 +651,7 @@ pub async fn sweep_shared_bodies(state: &HubState, now: i64) -> Result<SweepRepo
                     Ok(()) => batch.deleted += 1,
                     Err(error) => {
                         batch.failed += 1;
-                        eprintln!("hub: shared body removal failed, will retry: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                 }
             }
@@ -640,7 +677,7 @@ pub async fn sweep_loop(state: HubState) {
             match sweep_shared_bodies(&state, unix_now()).await {
                 Err(HubError::Busy) => tokio::time::sleep(SWEEP_BUSY_RETRY).await,
                 Err(error) => {
-                    eprintln!("hub: shared body sweep failed: {error}");
+                    crate::hub::error_envelope::log_internal(&error);
                     break;
                 }
                 Ok(_) => break,

@@ -1,0 +1,7 @@
+{
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "timestamp": 1790000060000,
+  "cwd": "/work/acme-widgets",
+  "stopReason": "end_turn",
+  "stop_hook_active": false
+}
