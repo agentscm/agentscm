@@ -46,11 +46,104 @@ pub enum WaitReason {
     Permission,
     /// The agent asked the person a question: a choice, or a form an MCP server opened.
     Question,
-    /// The agent finished its turn and waits for the person's next message.
+    /// The agent finished its turn and waits for the person's next message. Its last message
+    /// asked for something, or whether it did is not known.
     Idle,
+    /// The agent finished its turn and the end of its last message asked its person nothing. It
+    /// asks nobody, so it is never shown as a wait: a finished turn is read, not answered.
+    Finished,
     /// The agent stopped on its own background work, which will resume it. It asks nobody, so it
     /// is never shown as a wait: it only keeps the Work its session leads from reading as quiet.
     Background,
+}
+
+/// The words of `text`, lower-cased, split at anything that is not a letter or a digit.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `text` speaks to its reader: "you", "your", "yours" or "yourself" as a word.
+pub(super) fn addresses_person(text: &str) -> bool {
+    words(text)
+        .iter()
+        .any(|word| matches!(word.as_str(), "you" | "your" | "yours" | "yourself"))
+}
+
+/// Whether the end of an agent's last message may ask its person for something. A wrong yes
+/// only shows a session its person need not answer; a wrong no hides a request. So a question
+/// mark, any word to the person, and any word for waiting, needing or being stuck counts.
+fn asks_person(text: &str) -> bool {
+    const WAITING: &[&str] = &[
+        "wait",
+        "until",
+        "need",
+        "require",
+        "approv",
+        "confirm",
+        "choose",
+        "choice",
+        "pick",
+        "decision",
+        "decide",
+        "permission",
+        "sign in",
+        "sign-in",
+        "log in",
+        "login",
+        "credential",
+        "expired",
+        "block",
+        "stuck",
+        "unable",
+        "cannot",
+        "can't",
+        "proceed",
+        "go ahead",
+        "go-ahead",
+        "say go",
+        "reply",
+        "respond",
+        "provide",
+        "let me know",
+        "tell me",
+        "send me",
+        "please",
+        "should i",
+        "want me to",
+        "owner",
+    ];
+    // A typographic apostrophe spells the same word.
+    let lower = text.to_lowercase().replace('’', "'");
+    text.contains(['?', '？'])
+        || addresses_person(text)
+        || WAITING.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Whether `text` is English prose the rule above can read: nearly all of its letters are
+/// unaccented, and it uses at least two of a few words other languages do not share. Anything
+/// else (another language, a bare word or two, code) is not known to ask nothing.
+fn reads_as_english(text: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "the", "and", "are", "with", "this", "that", "for", "not", "have", "from", "been", "its",
+    ];
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    let plain = text.chars().filter(char::is_ascii_alphabetic).count();
+    let mut common = words(text);
+    common.retain(|word| COMMON.contains(&word.as_str()));
+    common.sort_unstable();
+    common.dedup();
+    letters > 0 && plain * 10 >= letters * 9 && common.len() >= 2
+}
+
+/// Whether an agent's whole last message asked its person nothing, so its turn's end is read
+/// and not answered: English prose with no sign of an ask. The hook client judges the message
+/// on the person's machine and sends only this answer; the Hub judges nothing it has not all of.
+pub fn turn_asked_nothing(message: &str) -> bool {
+    reads_as_english(message) && !asks_person(message)
 }
 
 impl WaitReason {
@@ -60,8 +153,25 @@ impl WaitReason {
             Self::Permission => "permission",
             Self::Question => "question",
             Self::Idle => "idle",
+            Self::Finished => "finished",
             Self::Background => "background",
         }
+    }
+
+    /// A stop that asks nobody: never shown as a wait, and never counted for a person.
+    pub fn asks_nobody(self) -> bool {
+        matches!(self, Self::Finished | Self::Background)
+    }
+
+    /// The wait a turn's end is. `asked_nothing` is the hook client's answer for the whole last
+    /// message. A client that sends none sent only `excerpt`, the message's last characters: it
+    /// decides when it is the whole message, and says nothing when it is cut (it then starts
+    /// with "…"), because the ask may sit before the cut. Not known means shown.
+    pub(super) fn turn_end(asked_nothing: Option<bool>, excerpt: Option<&str>) -> Self {
+        let nothing = asked_nothing.unwrap_or_else(|| {
+            excerpt.is_some_and(|text| !text.starts_with('…') && turn_asked_nothing(text))
+        });
+        if nothing { Self::Finished } else { Self::Idle }
     }
 
     /// How long a wait is believed with no further call from its session. Nothing shows that
@@ -88,6 +198,7 @@ impl WaitReason {
             Self::Permission => "is waiting in its session for your permission to use a tool",
             Self::Question => "is waiting in its session for your answer to a question",
             Self::Idle => "finished its turn and is waiting in its session for your reply",
+            Self::Finished => "finished its turn and asked you nothing",
             Self::Background => "stopped on its own background work, which will resume it",
         }
     }
@@ -281,15 +392,15 @@ impl Waiting {
         if !rows.contains_key(&key) {
             let mine = |row: &Row| row.principal.owner.id == principal.owner.id;
             if rows.values().filter(|row| mine(row)).count() >= MAX_OWNER_ROWS {
-                // Room is made from waits that ask nobody or the least: a stop on background
-                // work first, then the end of a turn, oldest first. A prompt or a question is
+                // Room is made from waits that ask nobody or the least: a stop that asks nobody
+                // first, then the end of a turn, oldest first. A prompt or a question is
                 // never dropped for room; with only those left, the new wait is refused.
                 let spare = rows
                     .iter()
                     .filter(|(_, row)| {
-                        mine(row) && matches!(row.reason, WaitReason::Background | WaitReason::Idle)
+                        mine(row) && (row.reason.asks_nobody() || row.reason == WaitReason::Idle)
                     })
-                    .min_by_key(|(_, row)| (row.reason != WaitReason::Background, row.since))
+                    .min_by_key(|(_, row)| (!row.reason.asks_nobody(), row.since))
                     .map(|(key, _)| key.clone());
                 // shortcut: one mark for the whole Hub, so one person's overflow also makes
                 // other people's older quiet Work read unknown; keep a mark per person if that
@@ -304,6 +415,19 @@ impl Waiting {
                 self.lost_before(now + 1);
                 return Err(HubError::Busy);
             }
+        }
+        // The host's idle notice follows a turn's end and says nothing: a turn that asked nothing
+        // still asked nothing.
+        // shortcut: any turn's end that says nothing is taken for that notice. A second stop
+        // with no message and no call since the first would also be kept hidden; pass the
+        // notice down from the hook route if a host ever sends one.
+        if reason == WaitReason::Idle
+            && asks.is_none()
+            && rows
+                .get(&key)
+                .is_some_and(|row| row.reason == WaitReason::Finished)
+        {
+            return Ok(());
         }
         let (since, said, noticed) = match rows.get(&key) {
             Some(row) if row.reason == reason => (
@@ -397,12 +521,16 @@ impl Waiting {
         self.2.0.store(unheard.0, Ordering::Relaxed);
         self.2.1.store(unheard.1, Ordering::Relaxed);
         for row in saved.rows.into_iter().take(MAX_ROWS) {
-            let reason = match row.reason.as_str() {
-                "background" => WaitReason::Background,
-                code => match WaitReason::from_code(code) {
-                    Some(reason) => reason,
-                    None => continue,
-                },
+            // Every kind a wait can have, also the ones a hook never reports by name.
+            let kinds = [
+                WaitReason::Permission,
+                WaitReason::Question,
+                WaitReason::Idle,
+                WaitReason::Finished,
+                WaitReason::Background,
+            ];
+            let Some(reason) = kinds.into_iter().find(|kind| kind.code() == row.reason) else {
+                continue;
             };
             let wait = Row {
                 principal: Principal {
@@ -495,7 +623,7 @@ impl Waiting {
             .iter()
             .filter(|(_, row)| {
                 row.current(now)
-                    && row.reason != WaitReason::Background
+                    && !row.reason.asks_nobody()
                     && now - row.since >= GRACE_SECONDS
                     && row.principal.owner.id == viewer.owner.id
                     && same_repository(&row.principal, viewer)
@@ -911,6 +1039,7 @@ mod tests {
             .unwrap();
         record("idle", WaitReason::Idle, None);
         record("busy", WaitReason::Background, None);
+        record("done", WaitReason::Finished, None);
         stopping.lost_before(STOP - 50_000);
         stopping.save(&*store, STOP).unwrap();
         // The next process knows the same waits, from the same start, under the same keys.
@@ -950,6 +1079,10 @@ mod tests {
         assert_eq!(
             lead("busy", STOP - 200),
             LeadWait::Waiting(WaitReason::Background)
+        );
+        assert_eq!(
+            lead("done", STOP - 200),
+            LeadWait::Waiting(WaitReason::Finished)
         );
         assert_eq!(lead("other", STOP - 40_000), LeadWait::NotWaiting);
         assert_eq!(lead("other", STOP - 60_000), LeadWait::Unknown);
@@ -1012,6 +1145,88 @@ mod tests {
             lead("s1", 2_000 + IN_FLIGHT_CAP_SECONDS),
             LeadWait::NotWaiting
         );
+    }
+
+    #[test]
+    fn a_turn_that_ended_asking_nothing_is_nobodys_wait() {
+        // Endings modelled on real last messages. These ask, or are not known to ask nothing:
+        // a question, words to the person, words for waiting or needing, an ask that sits
+        // before a long report, another language, and too little to read.
+        for asks in [
+            "Which of the two should I merge?",
+            "Both are ready. Let me know which one to merge.",
+            "The next step requires your AWS sign-in.",
+            "I stopped here until the migration is approved.",
+            "The branch is pushed and the checks are running; you can merge it when they pass.",
+            "Two options: A (rebase) or B (merge). Pick one and I will go on. The tests pass for both.",
+            "Say go and I will merge it. The checks are green and the diff is small.",
+            "I am stuck: the build fails with a linker error and the cause is not clear.",
+            "I can’t continue. The token has expired and the deploy stopped for that reason.",
+            "Decision for the reviewer: the unused volumes take about 31 GiB, and deleting them \
+             is not reversible. Status of the open pull requests: 12 conflicts with main, and 13 \
+             and 14 have had no pushes since this morning. Nothing has merged since noon.",
+            "Die Migration ist fertig und die Tests laufen durch.",
+            "どちらにしますか？",
+            "Done.",
+        ] {
+            assert!(!turn_asked_nothing(asks), "{asks}");
+        }
+        // These report and ask nothing.
+        for done in [
+            "The Work is completed and its claim is released. The first call failed because it \
+             passed a field that the schema does not have; the retry with only the outcome and \
+             the summary succeeded.",
+            "Both results are in: there are 2 text files in the current folder, and the first \
+             one holds the word one.",
+            "The command was denied from the Hub by its person. The run stopped there and has \
+             not been tried again, so the file was not created.",
+            "The pull request is merged into main after its checks passed. Both problems from \
+             the review are fixed and both have tests. One thing is still unchecked: asking \
+             three repositories at once could overspend the monthly allowance, and that is only \
+             noted in the pull request.",
+            "Verified so far against current main: both findings are real. The fix for the \
+             first is written and its test run is in the build queue. Still to do in this \
+             batch: the second finding, then two more.",
+        ] {
+            assert!(turn_asked_nothing(done), "{done}");
+        }
+        // The client's answer for the whole message decides. Without it an uncut excerpt is the
+        // whole message; a cut one may hide an ask before the cut, and no excerpt says nothing.
+        let report = "The fix is merged and the tests pass for both stores.";
+        let cut = format!("…{report}");
+        for (answer, excerpt, want) in [
+            (Some(true), None, WaitReason::Finished),
+            (Some(true), Some(cut.as_str()), WaitReason::Finished),
+            (Some(false), Some(report), WaitReason::Idle),
+            (None, Some(report), WaitReason::Finished),
+            (None, Some(cut.as_str()), WaitReason::Idle),
+            (None, Some("Shall I merge it?"), WaitReason::Idle),
+            (None, None, WaitReason::Idle),
+        ] {
+            assert_eq!(
+                WaitReason::turn_end(answer, excerpt),
+                want,
+                "{answer:?} {excerpt:?}"
+            );
+        }
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        let record = |reason, asks, at| {
+            waiting
+                .record(&mine, "native", "s1", "claude", reason, None, asks, at)
+                .unwrap();
+            waiting.owned(&mine, 5_000).unwrap().len()
+        };
+        // The Work its session leads knows the turn ended; its person is shown no wait.
+        assert_eq!(record(WaitReason::Finished, None, 1_000), 0);
+        assert_eq!(
+            waiting.lead("usr_me", "tok_a", "s1", 990, 5_000),
+            LeadWait::Waiting(WaitReason::Finished)
+        );
+        // The host's idle notice a minute later says nothing, so nothing changes.
+        assert_eq!(record(WaitReason::Idle, None, 1_060), 0);
+        // A turn whose end asks is a wait.
+        assert_eq!(record(WaitReason::Idle, Some("Which one?"), 1_100), 1);
     }
 
     #[test]
