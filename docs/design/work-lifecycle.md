@@ -483,10 +483,14 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   background work is believed for 60 minutes (`IN_FLIGHT_CAP_SECONDS`), as long as a running shell
   call, because nothing shows that the background work still runs. After that the row reads from
   the claim again.
-- **Unknown, never stale.** After a Hub restart, or when the Hub dropped a wait for room, a quiet
+- **Unknown, never stale.** After a Hub restart that left no list of waits (the Hub died, or was
+  down for 10 minutes or more), or when the Hub dropped a wait for room, a quiet
   Work whose lead session has not called since reads `freshness: unknown` with the limit
   `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
-  24 hours after its last check-in, when no wait could still be believed.
+  24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
+  leaves its waits for the process that starts next, which then knows them as before. What
+  sessions reported while no Hub ran is still missing, so Work whose lead session called in the
+  hour before the stop, has no wait in that list and has not called since reads unknown too.
 - **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews lapses by itself. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
   rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:
