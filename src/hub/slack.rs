@@ -1,11 +1,11 @@
-//! Optional Slack app that tells people, by direct message as it happens, about the
-//! coordination moments that need a person: an agent edited a file again after AgentSCM
-//! refused it, a handoff was declined, or new work reads like work already under way.
-//! Each binding links one Slack user to their forge identity in one repository through a
-//! dedicated, revocable read-only token. A file's holder can answer a handoff for their own
-//! agent with a button, and the weekly digest (`digest.rs`) lets a person release or complete
-//! their own stale Work and stop their own digest; nothing else is written from Slack.
-use std::collections::{BTreeMap, BTreeSet};
+//! Optional Slack app that tells people, by direct message, about the moments that need a
+//! person: one of their own agent sessions has waited for them, and, if they opt in, blocked
+//! or handover Work. Moments between agents are never sent. Each binding links one Slack
+//! user to their forge identity in one repository through a dedicated, revocable read-only
+//! token. The weekly digest (`digest.rs`) lets a person release or complete their own stale
+//! Work and stop their own digest; buttons on handoff messages sent by earlier versions still
+//! answer for the clicking person's own agent; nothing else is written from Slack.
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,30 +24,37 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::advice::{agent_name, sanitize, session_kind};
+use super::advice::{agent_name, sanitize};
 use super::handoff::{Answered, Via};
-use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
-use super::overlap_detail::{NOTHING_CHANGED, holder_named};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
-use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
+use super::store::{Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
 
 pub const CONFIG_ENV: &str = "AGENTSCM_SLACK_FILE";
 /// Journal rows kept at most; past this, collection waits for deliveries to drain.
 const CAPACITY: i64 = 4096;
-/// Hub events read per worker pass.
-const BATCH: usize = 200;
 /// A message is tried at most this many times.
 const MAX_ATTEMPTS: i64 = 8;
+/// The retry delay `api_data` reports for a server error or network failure; `retry_delay`
+/// grows it with each attempt, so an outage of Slack is waited out, not burned through.
+const TRANSIENT: u64 = 5;
+/// The longest wait between two tries.
+const RETRY_CAP: i64 = 300;
 const SENDS_PER_PASS: usize = 20;
-/// The Hub events that become direct messages.
-const KINDS: [&str; 4] = [
-    "edit_repeated",
-    "handoff_decline",
-    "task_overlap",
-    "coordination_requested",
-];
+
+/// Seconds before try `attempts + 2`: a server's own request (`Retry-After`) as given, a
+/// transient failure doubling from 5 s up to [`RETRY_CAP`], so eight tries span about ten minutes.
+fn retry_delay(delay: u64, attempts: i64) -> i64 {
+    let seconds = if delay == TRANSIENT {
+        (TRANSIENT as i64) << attempts.clamp(0, 6)
+    } else {
+        delay as i64
+    };
+    seconds.min(RETRY_CAP)
+}
+/// The moments that become direct messages without an opt-in.
+const KINDS: [&str; 1] = ["session_waiting"];
 const NAME_CHARS: usize = 64;
 const TEXT_CHARS: usize = 120;
 /// List lines a message field shows before `+N more`.
@@ -106,42 +113,9 @@ pub struct Slack {
     client: reqwest::Client,
     requests: Arc<Semaphore>,
     verified_until: tokio::sync::Mutex<i64>,
-    /// Whether the last collection found the journal full, so the log says it once.
-    full: std::sync::atomic::AtomicBool,
     // Fixed in production. Tests use a private loopback fake only.
     api: String,
 }
-
-/// A bound person as the Hub authorizes them now.
-struct Person {
-    slack_user: String,
-    login: String,
-    repository: String,
-    provider: String,
-    host: String,
-    repository_id: i64,
-    /// The binding's read-only token, for reads scoped to the repository.
-    token: String,
-    /// The person's agent tokens in the repository: id -> name.
-    agents: BTreeMap<String, String>,
-}
-
-impl Person {
-    /// How people say this person's agent: `Claude Code`.
-    fn agent(&self, token: &str) -> String {
-        agent_name(self.agents.get(token).map_or("agent", String::as_str))
-    }
-
-    fn label(&self, token: &str) -> String {
-        label(
-            &self.login,
-            self.agents.get(token).map_or("agent", String::as_str),
-        )
-    }
-}
-
-/// One direct message to send: (journal id, Slack user, Block Kit body).
-type Message = (String, String, Value);
 
 async fn offload<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
@@ -315,38 +289,6 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
     })
 }
 
-/// `bob’s Claude Code`, the way the Hub names someone else's agent.
-fn label(login: &str, agent: &str) -> String {
-    format!("{}’s {}", sanitize(login, NAME_CHARS), agent_name(agent))
-}
-
-fn strings(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect()
-}
-
-/// At most `LISTED` lines, then `+N more`.
-fn listed(lines: &[String]) -> String {
-    let mut shown = lines.iter().take(LISTED).cloned().collect::<Vec<_>>();
-    if lines.len() > LISTED {
-        shown.push(format!("+{} more", lines.len() - LISTED));
-    }
-    shown.join("\n")
-}
-
-/// The files field of a message: `File` or `Files`, one path per line.
-fn files(paths: &[String]) -> (&'static str, String) {
-    let lines: Vec<String> = paths.iter().map(|p| sanitize(p, TEXT_CHARS)).collect();
-    (
-        if paths.len() == 1 { "File" } else { "Files" },
-        listed(&lines),
-    )
-}
-
 /// Plain text that keeps its line breaks: each line is clipped and control-free like
 /// `plain_text`, and the whole stays within `max_chars`.
 fn plain_lines(text: &str, max_chars: usize) -> Value {
@@ -371,35 +313,29 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn label(login: &str, agent: &str) -> String {
+    format!("{}’s {}", sanitize(login, NAME_CHARS), agent_name(agent))
+}
+
+fn listed(lines: &[String]) -> String {
+    let mut shown = lines.iter().take(LISTED).cloned().collect::<Vec<_>>();
+    if lines.len() > LISTED {
+        shown.push(format!("+{} more", lines.len() - LISTED));
+    }
+    shown.join("\n")
+}
+
 /// The button that opens the Hub at `url`.
 fn open_button(url: &str) -> Value {
     json!({"type":"button","action_id":OPEN,"text":plain_text("Open Hub",30),"url":url})
 }
 
 /// A direct message, all plain text (never mrkdwn): a header, two-column label/value
-/// fields, handoff buttons for `handoff` (holder token, holder session, path) beside a link
-/// to the Hub page `link` is about, and one line of guidance. The notification text is the
-/// header, followed by the first field's first line unless the header already says it.
-fn message(
-    headline: &str,
-    fields: &[(&str, String)],
-    guidance: &str,
-    handoff: Option<(&str, Option<&str>, &str)>,
-    link: &str,
-) -> Value {
-    let mut elements = Vec::new();
-    // Slack refuses a whole message whose button value passes 2000 characters; send it without buttons.
-    let value = handoff
-        .map(|(token, session, path)| json!({"t": token, "s": session, "p": path}).to_string())
-        .filter(|value| value.chars().count() <= 2000);
-    // Both answers look alike: handing a file over is not the better choice.
-    if let Some(value) = value {
-        elements.push(json!({"type":"button","action_id":YES,
-            "text":plain_text("Hand it over",30),"value":value}));
-        elements.push(json!({"type":"button","action_id":NO,
-            "text":plain_text("Keep it",30),"value":value}));
-    }
-    elements.push(open_button(link));
+/// fields, a button to the Hub page `link` is about, and one line of guidance. The
+/// notification text is the header, followed by the first field's first line unless the
+/// header already says it.
+fn message(headline: &str, fields: &[(&str, String)], guidance: &str, link: &str) -> Value {
+    let elements = vec![open_button(link)];
     let subject = fields
         .first()
         .and_then(|(_, value)| value.lines().next())
@@ -535,7 +471,6 @@ impl Slack {
         db.busy_timeout(Duration::from_millis(250))?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS installation (id INTEGER PRIMARY KEY CHECK(id=1), team TEXT NOT NULL, app TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);")?;
         db.execute(
             "INSERT OR IGNORE INTO installation(id,team,app) VALUES(1,?1,?2)",
@@ -554,6 +489,11 @@ impl Slack {
             "UPDATE messages SET state='queued' WHERE state='sending'",
             [],
         )?;
+        // Earlier versions queued other direct messages; only wait messages are sent now.
+        db.execute(
+            "UPDATE messages SET state='failed' WHERE state='queued' AND body NOT LIKE ?1",
+            [format!("%\"{}\"%", status::WAIT_HEADLINE)],
+        )?;
         Ok(Self {
             app: config.app_id,
             expected_bot: config.bot_id,
@@ -571,7 +511,6 @@ impl Slack {
                 .map_err(|_| unavailable())?,
             requests: Arc::new(Semaphore::new(8)),
             verified_until: tokio::sync::Mutex::new(0),
-            full: std::sync::atomic::AtomicBool::new(false),
             api: "https://slack.com/api/".into(),
         })
     }
@@ -613,40 +552,6 @@ impl Slack {
         Ok(who)
     }
 
-    fn person(&self, state: &HubState, binding: &Binding) -> Result<Person> {
-        let who = self.principal(state, binding)?;
-        let agents = state
-            .store
-            .list_agent_tokens(&who.owner.id)?
-            .into_iter()
-            .filter(|t| t.repository == who.repository && t.repository_id == who.repository_id)
-            .map(|t| (t.id, t.name))
-            .collect();
-        Ok(Person {
-            slack_user: binding.config.slack_user.clone(),
-            login: who.owner.login.clone(),
-            repository: who.repository,
-            provider: who.owner.identity.provider.clone(),
-            host: who.owner.identity.host.clone(),
-            repository_id: who.repository_id.ok_or(HubError::Unauthorized)?,
-            token: who.token_id,
-            agents,
-        })
-    }
-
-    /// Every bound person the Hub still authorizes; a revoked or changed binding is skipped.
-    fn people(&self, state: &HubState) -> Result<Vec<Person>> {
-        let mut people = Vec::new();
-        for binding in &self.bindings {
-            match self.person(state, binding) {
-                Ok(person) => people.push(person),
-                Err(HubError::Unauthorized) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(people)
-    }
-
     async fn api_data(&self, method: &str, body: Value) -> std::result::Result<Value, u64> {
         let response = self
             .client
@@ -656,7 +561,7 @@ impl Slack {
             .body(serde_json::to_vec(&body).map_err(|_| 0u64)?)
             .send()
             .await
-            .map_err(|_| 5u64)?;
+            .map_err(|_| TRANSIENT)?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             return Err(response
                 .headers()
@@ -668,14 +573,14 @@ impl Slack {
         }
         if !response.status().is_success() {
             return Err(if response.status().is_server_error() {
-                5
+                TRANSIENT
             } else {
                 0
             });
         }
         let mut response = response;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| 5u64)? {
+        while let Some(chunk) = response.chunk().await.map_err(|_| TRANSIENT)? {
             if bytes.len() + chunk.len() > 512 * 1024 {
                 return Err(0);
             }
@@ -714,172 +619,30 @@ impl Slack {
         self.api_data(method, body).await.map(|_| ())
     }
 
-    /// Turns Hub events after the cursor into queued messages and advances the cursor. The
-    /// first pass starts at the newest event: history from before installation is never sent.
+    /// Queues what is due: the status reminders and one message per wait. A sent message's row
+    /// is the memory that stops a wait from being told twice, and is dropped after a day, which
+    /// is longer than the Hub believes a wait.
     fn collect(&self, state: &HubState) -> Result<()> {
         self.active()?;
-        if self.collect_status(state, unix_now()).is_err() {
-            eprintln!("Slack status collection unavailable");
-        }
-        let _store_slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
-        let cursor: Option<i64> = self
-            .database()?
-            .query_row("SELECT seq FROM cursor WHERE id=1", [], |r| r.get(0))
-            .optional()?;
-        let Some(cursor) = cursor else {
-            let latest = state.store.latest_event_seq()?;
-            self.database()?
-                .execute("INSERT INTO cursor(id,seq) VALUES(1,?1)", [latest])?;
-            return Ok(());
-        };
-        let events = state.store.events_after(cursor, BATCH)?;
-        if events.is_empty() {
-            // A restored Hub database can end below the cursor; restart from its newest
-            // event, or every event until it passes the old cursor would be skipped.
-            let latest = state.store.latest_event_seq()?;
-            if latest < cursor {
-                self.database()?
-                    .execute("UPDATE cursor SET seq=?1 WHERE id=1", [latest])?;
-            }
-            return Ok(());
-        }
-        let people = if events.iter().any(|e| KINDS.contains(&e.kind.as_str())) {
-            self.people(state)?
-        } else {
-            Vec::new()
-        };
-        let mut batches = Vec::new();
-        for event in &events {
-            let messages = if KINDS.contains(&event.kind.as_str()) {
-                self.messages_for(state, &people, event)?
-            } else {
-                Vec::new()
-            };
-            batches.push((event.seq, messages));
-        }
         let now = unix_now();
-        let mut db = self.database()?;
-        let tx = db.transaction()?;
-        tx.execute(
+        self.database()?.execute(
             "DELETE FROM messages WHERE state IN ('done','failed') AND created < ?1",
             [now - 86400],
         )?;
-        // Sent rows only remember what was sent; the cap bounds what is still waiting.
-        let mut waiting: i64 = tx.query_row(
-            "SELECT count(*) FROM messages WHERE state IN ('queued','sending')",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut reached = None;
-        for (seq, messages) in batches {
-            if waiting + messages.len() as i64 > CAPACITY {
-                break;
-            }
-            waiting += messages.len() as i64;
-            for (id, user, body) in messages {
-                tx.execute(
-                    "INSERT OR IGNORE INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
-                    params![id, user, body.to_string(), now],
-                )?;
-                if let Some(binding) = self.bindings.iter().find(|b| b.config.slack_user == user) {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO message_bindings(message,binding) VALUES(?1,?2)",
-                        params![id, status::binding_key(binding)],
-                    )?;
-                }
-            }
-            reached = Some(seq);
+        if self.collect_status(state, now).is_err() {
+            eprintln!("Slack status collection unavailable");
         }
-        // Events that do not fit wait at the cursor until sends make room.
-        let full = reached != events.last().map(|event| event.seq);
-        if full != self.full.swap(full, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "{}",
-                if full {
-                    "Slack message journal is full; new coordination messages wait until queued ones are sent"
-                } else {
-                    "Slack message journal has room again"
-                }
-            );
+        if self.collect_waits(state, now).is_err() {
+            eprintln!("Slack wait collection unavailable");
         }
-        let Some(reached) = reached else {
-            return Err(HubError::Busy);
-        };
-        tx.execute("UPDATE cursor SET seq=?1 WHERE id=1", [reached])?;
-        tx.commit()?;
         Ok(())
     }
 
-    /// The messages one event asks for. Malformed event data asks for none; only a store
-    /// failure is an error, so the event is read again on the next pass.
-    fn messages_for(
-        &self,
-        state: &HubState,
-        people: &[Person],
-        event: &HubEvent,
-    ) -> Result<Vec<Message>> {
-        let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
-            return Ok(Vec::new());
-        };
-        let messages = match event.kind.as_str() {
-            "edit_repeated" => self.repeated(state, people, &event.subject, &data)?,
-            "handoff_decline" => self.declined(state, people, &event.subject, &data)?,
-            "task_overlap" => self.similar(state, people, &event.subject, &data)?,
-            "coordination_requested" => self.asked(state, people, &data)?,
-            _ => Vec::new(),
-        };
-        Ok(messages
-            .into_iter()
-            .map(|(user, key, body)| {
-                (
-                    hash(format!("{}\n{user}\n{key}", event.id).as_bytes()),
-                    user,
-                    body,
-                )
-            })
-            .collect())
-    }
-
-    /// The repositories an event by `token` can be about, with their live intents: the
-    /// bound repository of its owner, or every bound repository where it holds an intent.
-    fn repositories(
-        state: &HubState,
-        people: &[Person],
-        token: &str,
-    ) -> Result<Vec<(String, Vec<Intent>)>> {
-        let bound = people.iter().find(|p| p.agents.contains_key(token));
-        let names: BTreeSet<&str> = match bound {
-            Some(person) => [person.repository.as_str()].into(),
-            None => people.iter().map(|p| p.repository.as_str()).collect(),
-        };
-        let mut found = Vec::new();
-        for name in names {
-            let (intents, truncated) = live_intents_capped(&*state.store, name, unix_now())?;
-            if truncated {
-                eprintln!(
-                    "hub: {name} has more than {MAX_LIVE_INTENTS} live intents; Slack messages see only the first"
-                );
-            }
-            if bound.is_some() || intents.iter().any(|i| i.token == token) {
-                found.push((name.to_owned(), intents));
-            }
-        }
-        Ok(found)
-    }
-
-    fn bound<'a>(people: &'a [Person], repository: &str, token: &str) -> Option<&'a Person> {
-        people
-            .iter()
-            .find(|p| p.repository == repository && p.agents.contains_key(token))
-    }
-
-    /// The Hub page at hash route `route`, as the UI's `#work/<id>`, `#inbox` and
-    /// `#box-contested` anchors name it.
+    /// The Hub page at hash route `route`, as the UI's `#box-needs` anchor names it.
     fn link(&self, route: &str) -> String {
         format!("{}#{route}", self.hub_url)
     }
 
-    /// The page of one Work item; the Hub's front page for an id that is not a Work id.
     fn work_link(&self, id: &str) -> String {
         let plain = !id.is_empty()
             && id
@@ -890,475 +653,6 @@ impl Slack {
         } else {
             self.hub_url.clone()
         }
-    }
-
-    /// `edit_repeated`: the repeating agent's person and each holder's person.
-    fn repeated(
-        &self,
-        state: &HubState,
-        people: &[Person],
-        token: &str,
-        data: &Value,
-    ) -> Result<Vec<(String, String, Value)>> {
-        let paths = strings(&data["paths"]);
-        let link = self.link("box-contested");
-        let now = unix_now();
-        // What the Hub did first, as `CONTESTED_FILE` in `ui/src/copy.ts` says it, then the
-        // sentence every overlap alert carries.
-        let warned = |whom: &str| {
-            format!(
-                "The Hub warned {whom} once; a repeat edit goes ahead by design. Files are never locked. {NOTHING_CHANGED}"
-            )
-        };
-        let mut out = Vec::new();
-        for (repository, intents) in Self::repositories(state, people, token)? {
-            let repeater = Self::bound(people, &repository, token);
-            let named = intents
-                .iter()
-                .find(|i| i.token == token)
-                .map(|i| label(&i.owner.login, &i.agent))
-                .or_else(|| repeater.map(|p| p.label(token)));
-            let who = named.clone().unwrap_or_else(|| "another agent".into());
-            // Opens the header, which is not a name to keep lower case.
-            let opening = named.unwrap_or_else(|| "Another agent".into());
-            let mut holders = Vec::new();
-            let mut holder_lines = Vec::new();
-            // Under the repeater's token only its other hook sessions are other agents, as in
-            // `same_agent`; an event without a session id skips the whole token.
-            let own = data["session"].as_str();
-            let skipped = |i: &Intent| {
-                i.token == token
-                    && own.is_none_or(|own| {
-                        i.session.as_deref() == Some(own) || session_kind(&i.via).is_none()
-                    })
-            };
-            // Whom `judge` would ask first: a connected session on the exact file, oldest first.
-            // That session's button has a request to answer.
-            let asked = |i: &Intent| {
-                !i.via.is_empty()
-                    && i.paths
-                        .iter()
-                        .any(|spec| paths.iter().any(|path| path == spec))
-            };
-            let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
-            holding.sort_by_key(|i| (!asked(i), i.created_at, i.id.as_str()));
-            let mut told = BTreeSet::new();
-            let mut listed_holders = BTreeSet::new();
-            for &intent in &holding {
-                let held: Vec<String> = paths
-                    .iter()
-                    .filter(|path| intent.paths.iter().any(|spec| overlaps(path, key_of(spec))))
-                    .cloned()
-                    .collect();
-                if held.is_empty() {
-                    continue;
-                }
-                // The label alone cannot say which session: another of the repeater's own token
-                // would read as itself, and distinct agents of one token would read alike.
-                use crate::hub::session::same_agent;
-                let sessions: Vec<&Intent> = holding
-                    .iter()
-                    .copied()
-                    .filter(|other| {
-                        other.token == intent.token
-                            && other.session.is_some()
-                            && paths.iter().any(|path| {
-                                other.paths.iter().any(|spec| overlaps(path, key_of(spec)))
-                            })
-                    })
-                    .collect();
-                // Per token, since `same_agent` is not transitive: hook a and hook c are distinct
-                // although each may be the same agent as one MCP session.
-                let several = sessions.iter().enumerate().any(|(index, one)| {
-                    sessions[index + 1..]
-                        .iter()
-                        .any(|other| !same_agent(&intent.token, &one.via, other))
-                });
-                let session_name = intent
-                    .session
-                    .as_deref()
-                    .filter(|_| several || intent.token == token)
-                    .map(|session| {
-                        let kind = session_kind(&intent.via).unwrap_or_else(|| "agent".into());
-                        let key = session_key(&intent.token, session);
-                        format!("{kind} session {}", &key[..8])
-                    });
-                let holder = session_name.as_ref().map_or_else(
-                    || label(&intent.owner.login, &intent.agent),
-                    |name| format!("{}’s {name}", sanitize(&intent.owner.login, NAME_CHARS)),
-                );
-                if let Some(person) = Self::bound(people, &repository, &intent.token)
-                    && repeater.is_none_or(|r| r.slack_user != person.slack_user)
-                    && told.insert(intent.token.as_str())
-                {
-                    // One message per holder token and event; buttons answer one file only.
-                    let mine = session_name
-                        .filter(|_| several)
-                        .unwrap_or_else(|| person.agent(&intent.token));
-                    let (headline, guidance) = match held.as_slice() {
-                        [path] => (
-                            format!(
-                                "{opening} edited {}, which your {mine} holds",
-                                sanitize(path, TEXT_CHARS)
-                            ),
-                            format!(
-                                "{} Hand it over, or keep it and agree who goes first.",
-                                warned(&who)
-                            ),
-                        ),
-                        _ => (
-                            format!("{opening} edited {} files your {mine} holds", held.len()),
-                            format!(
-                                "{} Open the Hub to hand them over or keep them, or agree who goes first.",
-                                warned(&who)
-                            ),
-                        ),
-                    };
-                    let line = holder_named(&format!("Your {mine}"), intent, now);
-                    let fields = [
-                        files(&held),
-                        ("Repository", sanitize(&repository, TEXT_CHARS)),
-                        ("Your agent", mine),
-                        ("Their agent", who.clone()),
-                        ("Holder", line),
-                    ];
-                    let handoff = match held.as_slice() {
-                        [path] => Some((
-                            intent.token.as_str(),
-                            intent.session.as_deref(),
-                            path.as_str(),
-                        )),
-                        _ => None,
-                    };
-                    out.push((
-                        person.slack_user.clone(),
-                        format!("holder\n{}", intent.token),
-                        message(&headline, &fields, &guidance, handoff, &link),
-                    ));
-                }
-                // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
-                // with one display name stay two.
-                if listed_holders.insert((intent.token.as_str(), holder.clone())) {
-                    holder_lines.push(holder_named(&holder, intent, now));
-                    holders.push(holder);
-                }
-            }
-            if let Some(person) = repeater
-                && !holders.is_empty()
-            {
-                let mine = person.agent(token);
-                let held_by = match holders.as_slice() {
-                    [one] => format!("which {one} holds"),
-                    many => format!("which {} other agents hold", many.len()),
-                };
-                let edited = match paths.as_slice() {
-                    [path] => sanitize(path, TEXT_CHARS),
-                    _ => format!("{} files", paths.len()),
-                };
-                let fields = [
-                    files(&paths),
-                    ("Repository", sanitize(&repository, TEXT_CHARS)),
-                    ("Your agent", mine.clone()),
-                    (
-                        if holders.len() == 1 {
-                            "Their agent"
-                        } else {
-                            "Their agents"
-                        },
-                        listed(&holders),
-                    ),
-                    (
-                        if holders.len() == 1 {
-                            "Holder"
-                        } else {
-                            "Holders"
-                        },
-                        listed(&holder_lines),
-                    ),
-                ];
-                out.push((
-                    person.slack_user.clone(),
-                    "repeater".into(),
-                    message(
-                        &format!("Your {mine} edited {edited}, {held_by}"),
-                        &fields,
-                        &format!(
-                            "{} Agree with them who goes first.",
-                            warned(&format!("your {mine}"))
-                        ),
-                        None,
-                        &link,
-                    ),
-                ));
-            }
-        }
-        Ok(out)
-    }
-
-    /// `handoff_decline` (subject: the holder's token): both people, except a holder who
-    /// answered for their own agent, from Slack or the Hub, and so already knows.
-    fn declined(
-        &self,
-        state: &HubState,
-        people: &[Person],
-        holder: &str,
-        data: &Value,
-    ) -> Result<Vec<(String, String, Value)>> {
-        let paths = strings(&data["paths"]);
-        let from = &data["from"];
-        let (Some(requester), Some(agent), Some(login)) = (
-            from["token"].as_str(),
-            from["agent"].as_str(),
-            from["login"].as_str(),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let answered_by_person = data["via"].is_string();
-        let link = self.link("inbox");
-        let reason = data["reason"]
-            .as_str()
-            .map(|reason| sanitize(reason, TEXT_CHARS));
-        let fields = |repository: &str, mine: String, theirs: String| {
-            let mut fields = vec![
-                files(&paths),
-                ("Repository", sanitize(repository, TEXT_CHARS)),
-                ("Your agent", mine),
-                ("Their agent", theirs),
-            ];
-            fields.extend(reason.clone().map(|reason| ("Reason", reason)));
-            fields
-        };
-        let mut out = Vec::new();
-        for (repository, intents) in Self::repositories(state, people, holder)? {
-            let holder_person = Self::bound(people, &repository, holder);
-            let holder_label = holder_person
-                .map(|p| p.label(holder))
-                .or_else(|| {
-                    intents
-                        .iter()
-                        .find(|i| i.token == holder)
-                        .map(|i| label(&i.owner.login, &i.agent))
-                })
-                .unwrap_or_else(|| "the holder".into());
-            let requester_person = Self::bound(people, &repository, requester);
-            if let Some(person) = requester_person {
-                // Under one token both sides read alike; the requester's session tells them apart.
-                let mine = from["session"]["key"]
-                    .as_str()
-                    .and_then(|key| key.get(..8))
-                    .filter(|_| requester == holder)
-                    .map_or_else(
-                        || agent_name(agent),
-                        |key| {
-                            let kind = from["session"]["kind"].as_str().unwrap_or("agent");
-                            format!("{} session {key}", sanitize(kind, NAME_CHARS))
-                        },
-                    );
-                let fields = fields(&repository, mine, holder_label);
-                out.push((
-                    person.slack_user.clone(),
-                    "requester".into(),
-                    message(
-                        "Another agent kept a file your agent asked for",
-                        &fields,
-                        "Agree with them who goes first.",
-                        None,
-                        &link,
-                    ),
-                ));
-            }
-            if let Some(person) = holder_person
-                && !answered_by_person
-                && requester_person.is_none_or(|r| r.slack_user != person.slack_user)
-            {
-                let fields = fields(&repository, person.agent(holder), label(login, agent));
-                out.push((
-                    person.slack_user.clone(),
-                    "holder".into(),
-                    message(
-                        "Your agent kept a file",
-                        &fields,
-                        "Agree with them who goes first.",
-                        None,
-                        &link,
-                    ),
-                ));
-            }
-        }
-        Ok(out)
-    }
-
-    /// `task_overlap` (subject: the starting token): the starter's person and the person
-    /// leading each matched work item.
-    fn similar(
-        &self,
-        state: &HubState,
-        people: &[Person],
-        starter: &str,
-        data: &Value,
-    ) -> Result<Vec<(String, String, Value)>> {
-        let Some(task) = data["task"].as_str() else {
-            return Ok(Vec::new());
-        };
-        let ids = strings(&data["work"]);
-        let pulls: Vec<i64> = data["pulls"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_i64)
-            .collect();
-        let mut out = Vec::new();
-        let mut done = BTreeSet::new();
-        for reader in people {
-            if !done.insert((&reader.provider, &reader.host, reader.repository_id)) {
-                continue;
-            }
-            let repository = &reader.repository;
-            let now = unix_now();
-            let mut items = Vec::new();
-            for id in &ids {
-                if let Some(item) = state.store.work_get(&reader.token, id, now)? {
-                    items.push(item);
-                }
-            }
-            let starter_person = Self::bound(people, repository, starter);
-            if starter_person.is_none() && items.is_empty() {
-                continue;
-            }
-            let starter_label = starter_person.map(|p| p.label(starter)).or_else(|| {
-                state
-                    .store
-                    .work_overview(&reader.token, &Default::default(), now)
-                    .ok()?
-                    .current
-                    .into_iter()
-                    .find(|item| item.lead_token == starter)
-                    .map(|item| label(&item.owner_login, &item.lead_agent))
-            });
-            let starter_label = starter_label.unwrap_or_else(|| "another agent".into());
-            let mut like: Vec<String> = items
-                .iter()
-                .map(|item| {
-                    format!(
-                        "{}: {}",
-                        label(&item.owner_login, &item.lead_agent),
-                        sanitize(&item.title, TEXT_CHARS)
-                    )
-                })
-                .collect();
-            like.extend(pulls.iter().map(|n| format!("Open pull request #{n}")));
-            let task = sanitize(task, TEXT_CHARS);
-            let repository_name = sanitize(repository, TEXT_CHARS);
-            if let Some(person) = starter_person
-                && !like.is_empty()
-            {
-                let fields = [
-                    ("Task", task.clone()),
-                    ("Repository", repository_name.clone()),
-                    ("Your agent", person.agent(starter)),
-                    ("Reads like", listed(&like)),
-                ];
-                // The first work it reads like, else the open pull requests.
-                let link = items
-                    .first()
-                    .map_or_else(|| self.link("box-prs"), |item| self.work_link(&item.id));
-                out.push((
-                    person.slack_user.clone(),
-                    "starter".into(),
-                    message(
-                        "Your agent started similar work",
-                        &fields,
-                        "Check whether it is the same work.",
-                        None,
-                        &link,
-                    ),
-                ));
-            }
-            for item in &items {
-                let Some(person) = Self::bound(people, repository, &item.lead_token) else {
-                    continue;
-                };
-                if starter_person.is_some_and(|s| s.slack_user == person.slack_user) {
-                    continue;
-                }
-                let fields = [
-                    ("Task", task.clone()),
-                    ("Repository", repository_name.clone()),
-                    ("Their agent", starter_label.clone()),
-                    ("Your agent", agent_name(&item.lead_agent)),
-                    ("Your work", sanitize(&item.title, TEXT_CHARS)),
-                ];
-                out.push((
-                    person.slack_user.clone(),
-                    format!("lead\n{}", item.id),
-                    message(
-                        "Similar work started",
-                        &fields,
-                        "Check with them whether it is the same work.",
-                        None,
-                        &self.work_link(&item.id),
-                    ),
-                ));
-            }
-        }
-        Ok(out)
-    }
-
-    /// `coordination_requested` (subject: the request): the person leading a target work item
-    /// whose agent is paused or no longer checking in, since that agent cannot answer. One
-    /// message per person per request.
-    fn asked(
-        &self,
-        state: &HubState,
-        people: &[Person],
-        data: &Value,
-    ) -> Result<Vec<(String, String, Value)>> {
-        let Some(requester) = data["requester"].as_str() else {
-            return Ok(Vec::new());
-        };
-        let ids = strings(&data["targets"]);
-        let paths = strings(&data["proposal"]["scope"]);
-        let mut out = Vec::new();
-        let mut done = BTreeSet::new();
-        for reader in people {
-            if !done.insert((&reader.provider, &reader.host, reader.repository_id)) {
-                continue;
-            }
-            let repository = &reader.repository;
-            let now = unix_now();
-            for id in &ids {
-                let Some(item) = state.store.work_get(&reader.token, id, now)? else {
-                    continue;
-                };
-                if !item.lead_idle() {
-                    continue;
-                }
-                let Some(person) = Self::bound(people, repository, &item.lead_token) else {
-                    continue;
-                };
-                let theirs = Self::bound(people, repository, requester)
-                    .map_or_else(|| "another agent".into(), |p| p.label(requester));
-                let fields = [
-                    files(&paths),
-                    ("Repository", sanitize(repository, TEXT_CHARS)),
-                    ("Their agent", theirs),
-                    ("Your agent", agent_name(&item.lead_agent)),
-                    ("Your work", sanitize(&item.title, TEXT_CHARS)),
-                ];
-                out.push((
-                    person.slack_user.clone(),
-                    "lead".into(),
-                    message(
-                        "Another agent asked for files your agent holds",
-                        &fields,
-                        "Your agent isn’t running, so it can’t answer. Answer for it in the Hub Inbox.",
-                        None,
-                        &self.link("inbox"),
-                    ),
-                ));
-            }
-        }
-        Ok(out)
     }
 
     /// The oldest due message whose person is still authorized, marked as sending; a message
@@ -1403,6 +697,9 @@ impl Slack {
             }
             Some(Err(error)) => return Err(error),
         }
+        // shortcut: a queued wait message is not re-checked against its wait, so a long Slack
+        // rate limit can deliver it after the person answered; store the wait key and skip
+        // ended waits if that shows.
         self.database()?.execute(
             "UPDATE messages SET state='sending',attempts=attempts+1 WHERE id=?1",
             [&id],
@@ -1429,7 +726,9 @@ impl Slack {
         body["channel"] = json!(user);
         let (status, delay) = match self.api("chat.postMessage", body).await {
             Ok(()) => ("done", 0),
-            Err(delay) if delay > 0 && attempts + 1 < MAX_ATTEMPTS => ("queued", delay as i64),
+            Err(delay) if delay > 0 && attempts + 1 < MAX_ATTEMPTS => {
+                ("queued", retry_delay(delay, attempts))
+            }
             Err(_) => ("failed", 0),
         };
         let service = self.clone();
@@ -1493,10 +792,18 @@ impl Slack {
             .iter()
             .find(|b| b.config.slack_user == user)
             .ok_or(HubError::Unauthorized)?;
-        let person = self.person(state, binding)?;
-        if !person.agents.contains_key(token) {
-            return Err(Refusal::NotYours);
-        }
+        let who = self.principal(state, binding)?;
+        let agent = state
+            .store
+            .list_agent_tokens(&who.owner.id)?
+            .into_iter()
+            .find(|t| {
+                t.id == token
+                    && !t.revoked
+                    && t.repository == who.repository
+                    && t.repository_id == who.repository_id
+            })
+            .ok_or(Refusal::NotYours)?;
         let file = sanitize(path, TEXT_CHARS);
         let answered = state.store.answer_handoff_via(
             token,
@@ -1520,7 +827,7 @@ impl Slack {
             ),
             Answered::NotHeld => format!(
                 "Nothing changed. Your {} no longer holds {file}, so there is nothing to hand over.",
-                person.agent(token)
+                agent_name(&agent.name)
             ),
         })
     }
