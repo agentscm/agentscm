@@ -118,6 +118,10 @@ fn endpoint(connection: &Connection) -> Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(&format!("{}/mcp", connection.hub))
         .map_err(|_| invalid("saved Hub URL is invalid"))?;
     url.query_pairs_mut().append_pair("repo", &connection.repo);
+    // The Hub lists only core tools by default; this asks it for the full set.
+    if std::env::var("AGENTSCM_MCP_TOOLS").as_deref() == Ok("all") {
+        url.query_pairs_mut().append_pair("tools", "all");
+    }
     Ok(url)
 }
 
