@@ -799,9 +799,10 @@ pub fn resolve(lock: &SkillLock) -> Vec<PinStatus> {
 
 /// A pin is adopted only when its sha256 matches a manifest of the same name and version, and
 /// its params fit that manifest. A `first_party` pin matches an embedded manifest; a
-/// `repo_local` pin matches the repository skill read from its own path in `local`. The
-/// sha256 is integrity, not trust: trust is the review a change to the default branch gets.
-/// `third_party` and `private` are unsupported.
+/// `repo_local` pin matches the repository skill read from its own path in `local`, and is
+/// unsupported when it takes a built-in skill's name. The sha256 is integrity, not trust: trust
+/// is the review a change to the default branch gets. `third_party` and `private` are
+/// unsupported.
 pub fn resolve_with(lock: &SkillLock, local: &[LocalSkill]) -> Vec<PinStatus> {
     lock.skills
         .iter()
@@ -814,7 +815,11 @@ pub fn resolve_with(lock: &SkillLock, local: &[LocalSkill]) -> Vec<PinStatus> {
                 None => catalog_entry_by_sha256(&pin.sha256),
             }
             .filter(|e| e.name == pin.name && e.workflow_version == pin.workflow_version);
-            let supported = pin.source.first_party() || pin.source.kind == "repo_local";
+            // A repository skill may not take a built-in's name, so it can never post or be read as
+            // that built-in (its `agentscm/skill/<name>` status a branch rule may require).
+            let builtin = catalog().iter().any(|e| e.name == pin.name);
+            let supported =
+                pin.source.first_party() || (pin.source.kind == "repo_local" && !builtin);
             let status = match entry {
                 _ if !supported => AdoptionStatus::UnsupportedSource,
                 None => AdoptionStatus::UnknownVersion,
@@ -2328,6 +2333,21 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_with(&lock, &moved)[0].status,
             AdoptionStatus::UnknownVersion
+        );
+        // A repository skill named like a built-in is refused, whatever its bytes.
+        let mut named: Value = serde_json::from_str(&bundle.manifest).unwrap();
+        named["name"] = "pr-gate".into();
+        let impostor = local_skills(&[LocalBundle {
+            manifest: named.to_string(),
+            ..bundle.clone()
+        }]);
+        let lock_of = |skill: &LocalSkill| SkillLock {
+            version: 1,
+            skills: vec![SkillPin::repo_local(skill, None)],
+        };
+        assert_eq!(
+            resolve_with(&lock_of(&impostor[0]), &impostor)[0].status,
+            AdoptionStatus::UnsupportedSource
         );
         // third_party and private stay unsupported.
         let mut other = lock.clone();

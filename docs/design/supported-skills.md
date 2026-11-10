@@ -292,21 +292,29 @@ satisfy a gate only when the gate says `min_assurance: self_reported`; the Hub n
 A pin's `source` says where the manifest bytes come from. `first_party` (embedded in the binary)
 and `repo_local` resolve; `third_party` and `private` parse and resolve to `unsupported_source`:
 
-- `repo_local {path}`: a skill defined in the repository itself (Experimental). `path` is the
-  repository path of its manifest (`skill.json`, manifest version 2); the procedure is the file
-  its `skill.entrypoint` names, and it may name no other resources. The pin's `sha256` is the same
-  bundle digest a first-party pin uses, over those two files. Each file is at most 64 KiB, and a
-  lock resolves at most 8 repository skills. With a forge connection the Hub reads both files from
-  the default branch when it reads the lock (GitHub; GitLab's file read returns JSON files only,
-  so a procedure there does not resolve); otherwise `agentscm skill report-adoption` sends them
-  with the lock, labelled `reported_by_checkout`. The Hub stores them with the adoption. A pin
-  whose bytes are missing, oversized, invalid or changed resolves to `unknown_version` until it
-  is re-pinned. A credential or rate-limit failure keeps the previous adoption. Once adopted, a
-  repository skill is evaluated exactly like a first-party one: the same evidence kinds,
-  admission rules, Stop hook, observed evidence and skill status. The sha256 is integrity, not
-  trust. Trust is the default branch's protection and the review a change to the skill gets,
-  the same as for `AGENTS.md`. `agentscm skill add NAME --path PATH` pins one; `skill list`,
-  `skill show`, MCP `agentscm_skill_list` and the Hub library mark it as a repository skill.
+- `repo_local {path}`: a skill defined in the repository itself (Experimental, GitHub only).
+  `path` is the repository path of its manifest (`skill.json`, manifest version 2); the procedure
+  is the file its `skill.entrypoint` names, and it may name no other resources. The pin's `sha256`
+  is the same bundle digest a first-party pin uses, over those two files. Each file is at most
+  64 KiB, a lock resolves at most 8 repository skills, and a repository skill may not take a
+  built-in skill's name (it resolves to `unsupported_source`), so it can never post or be read as
+  that skill. A repository needs a forge connection for its own skills: the Hub reads the lock and
+  both files from the default branch at one commit, and stores them with the adoption. A checkout
+  report (`agentscm skill report-adoption`) carries only the lock, and the Hub refuses one that
+  pins a repository skill (400 `invalid_request`), because a branch's files are not the default
+  branch's. GitLab does not resolve repository skills: its file read returns JSON re-encoded, so
+  the manifest's digest never matches. A read that finds a file missing, too large or invalid, or
+  bytes that no longer match the pin, makes the pin `unknown_version` until it is re-pinned; a
+  forge error keeps the last definition that resolved, so a failed read never drops a gate. Once
+  adopted, a repository skill is evaluated like a first-party one: the same evidence kinds,
+  admission rules, Stop hook, observed evidence and skill status. The value metrics' skill
+  configuration identity counts first-party skills only. The sha256 is integrity, not trust. Trust
+  is the default branch's protection and the review a change to the skill gets, the same as for
+  `AGENTS.md`. `agentscm skill add NAME --path PATH` pins one. `skill show` prints a repository
+  skill's procedure only while the checkout's files match the pin; otherwise it says they differ
+  and points to MCP `agentscm_skill_list`, which serves the default branch's copy, so a change
+  cannot rewrite the instructions its own reviewer follows. `skill list`, `skill show`, MCP
+  `agentscm_skill_list` and the Hub library mark it as a repository skill.
 - `third_party {url, commit, path}`: a skill vendored from another Git repository at an exact
   commit; `agentscm skill add <git-url>@<commit>:<path>` would copy it, compute the SHA and write
   the pin for review.

@@ -210,12 +210,16 @@ fn read_lock(root: &Path) -> Result<Option<SkillLock>> {
 }
 
 /// One repository skill's bytes from the checkout: the manifest at `path` and the procedure
-/// its entrypoint names, each at most 64 KiB.
+/// its entrypoint names, each a regular file (not a symlink, device or pipe) of at most 64 KiB.
 fn read_bundle(root: &Path, path: &str) -> Result<LocalBundle> {
     let read = |rel: &str| -> Result<String> {
         agentscm::store::validate_path(rel)?;
         let file = root.join(rel);
-        if std::fs::metadata(&file)?.len() > supported::MAX_LOCAL_FILE_BYTES as u64 {
+        let meta = std::fs::symlink_metadata(&file)?;
+        if !meta.file_type().is_file() {
+            return Err(invalid(format!("{rel} is not a regular file")));
+        }
+        if meta.len() > supported::MAX_LOCAL_FILE_BYTES as u64 {
             return Err(invalid(format!("{rel} is larger than 64 KiB")));
         }
         String::from_utf8(std::fs::read(file)?).map_err(|_| invalid(format!("{rel} is not UTF-8")))
@@ -355,11 +359,10 @@ fn list(as_json: bool) -> Result<()> {
     if as_json {
         let skills: Vec<Value> = rows
             .iter()
-            .map(|(e, label)| {
+            .map(|(e, _)| {
                 let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
                 v["status"] = json!(adoption_label(lock.as_ref(), &local, e));
                 v["adopted"] = json!(v["status"] == "adopted");
-                v["label"] = json!(label);
                 v
             })
             .collect();
@@ -399,13 +402,30 @@ fn pick(name: &str, version: Option<u32>) -> Result<&'static CatalogEntry> {
 
 fn show(name: &str, version: Option<u32>, as_json: bool) -> Result<()> {
     let (lock, local) = checkout()?;
-    // A repository skill of that name is the one this repository means.
-    let entry = match local
-        .iter()
-        .find(|l| l.entry.name == name && version.is_none())
-    {
-        Some(l) => &l.entry,
-        None => pick(name, version)?,
+    // A repository skill is shown only as pinned: bytes this branch changed are not the
+    // procedure the Hub evaluates, and must not instruct the agent reviewing that change.
+    let pinned = lock.as_ref().and_then(|l| {
+        let adopted = supported::resolve_with(l, &local);
+        l.skills
+            .iter()
+            .find(|p| p.name == name && p.source.repo_local_path().is_some())
+            .map(|p| {
+                adopted
+                    .iter()
+                    .any(|s| s.pin.name == name && s.status == AdoptionStatus::Adopted)
+                    .then(|| local.iter().find(|s| s.entry.sha256 == p.sha256))
+                    .flatten()
+            })
+    });
+    let entry = match pinned {
+        Some(Some(l)) if version.is_none() => &l.entry,
+        Some(_) if version.is_none() => {
+            println!(
+                "{name} is a repository skill whose files on this branch differ from the pin in {LOCK_PATH}, so its procedure is not shown. Read the pinned one from the Hub with MCP `agentscm_skill_list`."
+            );
+            return Ok(());
+        }
+        _ => pick(name, version)?,
     };
     if as_json {
         println!("{}", serde_json::to_value(entry)?);
@@ -506,6 +526,11 @@ fn add(name: &str, version: Option<u32>, raw_params: &[String]) -> Result<()> {
 fn add_local(name: &str, path: &str, raw_params: &[String]) -> Result<()> {
     let root = repo_root(&cwd()?)?;
     let skill = read_bundle(&root, path)?.skill()?;
+    if supported::catalog().iter().any(|e| e.name == name) {
+        return Err(invalid(format!(
+            "{name} is a built-in skill's name; a repository skill needs its own name"
+        )));
+    }
     if skill.entry.name != name {
         return Err(invalid(format!(
             "the manifest at {path} names skill {}, not {name}",
@@ -652,13 +677,7 @@ async fn report_adoption() -> Result<()> {
     let lock =
         read_lock(&root)?.ok_or_else(|| invalid(format!("no {LOCK_PATH} in this repository")))?;
     let hub = Hub::for_dir(&root)?;
-    // Repository skills travel with the lock; the Hub checks each against its pin.
-    let local = local_bundles(&root, &lock);
-    let body = if local.is_empty() {
-        serde_json::to_value(&lock)?
-    } else {
-        json!({"lock": lock, "local": local})
-    };
+    let body = serde_json::to_value(&lock)?;
     let (status, reply) = hub
         .call(reqwest::Method::PUT, "adoption", &[], Some(&body))
         .await?;
@@ -670,6 +689,12 @@ async fn report_adoption() -> Result<()> {
                 .unwrap_or("the Hub reads the lock from the forge.")
         );
         return Ok(());
+    }
+    if status == 400 {
+        return Err(invalid(format!(
+            "the Hub refused the report: {}",
+            reply["message"].as_str().unwrap_or("invalid lock file")
+        )));
     }
     if status != 200 {
         return Err(invalid(format!(
