@@ -638,16 +638,8 @@ impl Call {
             None => {}
         }
         if let Some(sub) = &self.launched {
-            let kind = sub.agent_type.as_deref();
-            roster.described(
-                principal,
-                native,
-                &sub.id,
-                kind,
-                &sub.does,
-                sub.running,
-                now,
-            );
+            let running = sub.agent_type.as_deref().filter(|_| sub.running);
+            roster.described(principal, native, &sub.id, running, &sub.does, now);
         }
     }
 

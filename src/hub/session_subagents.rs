@@ -198,29 +198,19 @@ impl Subagents {
     }
 
     /// What `native` started its subagent `id` to do, from the call that started it. `running`
-    /// says that call returned while the subagent still runs, so a start this table has not
-    /// seen yet is added; a finished one is only described.
+    /// is its type when that call returned while the subagent still runs, so that a start this
+    /// table has not seen yet is added; one that finished is only described.
     pub(super) fn described(
         &self,
         principal: &Principal,
         native: &str,
         id: &str,
-        kind: Option<&str>,
+        running: Option<&str>,
         does: &str,
-        running: bool,
         now: i64,
     ) {
         let does = Some(sanitize(does.trim(), MAX_DOES_CHARS)).filter(|does| !does.is_empty());
-        self.with(
-            principal,
-            native,
-            id,
-            kind.filter(|_| running),
-            now,
-            |row| {
-                row.does = does;
-            },
-        );
+        self.with(principal, native, id, running, now, |row| row.does = does);
     }
 
     /// The person answered `native`: none of its subagents waits any longer.
@@ -373,27 +363,19 @@ mod tests {
         let mine = principal("tok_a", "usr_me");
         roster.seen(&mine, "s", "a1", Some("Explore"), false, LATER);
         // The start call returned while a1 runs: its description is added to its row.
+        let explore = Some("Explore");
         roster.described(
             &mine,
             "s",
             "a1",
-            Some("Explore"),
+            explore,
             " Find \"session\" keys ",
-            true,
             LATER + 1,
         );
         // A background start whose own first call has not arrived yet is added by it.
-        roster.described(
-            &mine,
-            "s",
-            "a2",
-            Some("Plan"),
-            "Plan the read",
-            true,
-            LATER + 2,
-        );
+        roster.described(&mine, "s", "a2", Some("Plan"), "Plan the read", LATER + 2);
         // A subagent that already finished and was never seen is not brought back.
-        roster.described(&mine, "s", "a3", Some("Plan"), "Old", false, LATER + 3);
+        roster.described(&mine, "s", "a3", None, "Old", LATER + 3);
         let own = roster.of("tok_a", "s", "usr_me", LATER + 3).unwrap();
         assert_eq!(
             own.iter()

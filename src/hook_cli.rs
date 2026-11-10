@@ -267,14 +267,9 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
 const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
 const CAPTURE_SESSION_START_BUDGET: Duration = Duration::from_millis(4000);
 
-/// Claude Code events the plugin registers only so capture sees them.
-const CAPTURE_ONLY_EVENTS: [&str; 5] = [
-    "PostToolUseFailure",
-    "MessageDisplay",
-    "PreCompact",
-    "SubagentStart",
-    "SubagentStop",
-];
+/// Claude Code events the plugin registers only so capture sees them. A subagent's start and
+/// stop are not among them: the Hub keeps each session's subagents from those.
+const CAPTURE_ONLY_EVENTS: [&str; 3] = ["PostToolUseFailure", "MessageDisplay", "PreCompact"];
 
 #[allow(clippy::too_many_arguments)]
 async fn coordinate(
@@ -1792,13 +1787,15 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
 /// for coordination leave the machine. For patches, only recognized operation headers survive.
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
-    // `agent_id` marks a subagent's call, so the hub can keep requests for the lead session.
+    // `agent_id` marks a subagent's call, so the hub can keep requests for the lead session, and
+    // `agent_type` says which kind of subagent it is.
     // `notification_type` says which wait a notification reports; its message is never sent.
     for (key, max) in [
         ("hook_event_name", 64),
         ("session_id", 1024),
         ("tool_name", 128),
         ("agent_id", 128),
+        ("agent_type", 128),
         ("notification_type", 64),
     ] {
         if let Some(value) = payload[key]
@@ -1814,6 +1811,9 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
     }
     if let Some(asks) = wait_asks(payload) {
         out.insert("asks".into(), json!(asks));
+    }
+    if let Some(subagent) = started_subagent(payload) {
+        out.insert("subagent".into(), subagent);
     }
     if normalized.is_none() {
         if let Some(cwd) = payload["cwd"]
@@ -1880,17 +1880,49 @@ fn wait_asks(payload: &Value) -> Option<String> {
         "PermissionRequest" => payload["tool_input"]["description"].as_str()?.to_owned(),
         _ => return None,
     };
-    let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
-    agentscm::redact::redact_json(&mut text);
-    let text = text.as_str()?.chars().collect::<Vec<_>>();
+    let text = redacted_line(&text)?.chars().collect::<Vec<_>>();
     let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
         .iter()
         .collect();
     match text.len() {
-        0 => None,
         n if n > ASKS_CHARS => Some(format!("…{tail}")),
         _ => Some(tail),
     }
+}
+
+/// `text` on one line with secrets redacted, the only form in which an agent's words leave the
+/// machine. `None` when nothing is left.
+fn redacted_line(text: &str) -> Option<String> {
+    let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
+    agentscm::redact::redact_json(&mut text);
+    text.as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// The most of a subagent's task description that leaves the machine, in characters.
+const DOES_CHARS: usize = 120;
+
+/// The subagent a finished `Agent` call started, so the Hub can show its session's person what
+/// it was started to do: its id and type, and the short description its session gave it, as one
+/// redacted line cut to its first [`DOES_CHARS`] characters. The prompt is never read. `running`
+/// says the call returned while the subagent goes on in the background. The host names the
+/// subagent only in this call's result, so nothing can be sent when it starts.
+fn started_subagent(payload: &Value) -> Option<Value> {
+    if payload["hook_event_name"] != "PostToolUse"
+        || !matches!(payload["tool_name"].as_str(), Some("Agent" | "Task"))
+    {
+        return None;
+    }
+    let result = &payload["tool_response"];
+    let id = bounded_string(&result["agentId"], 128)?;
+    let does: String = redacted_line(payload["tool_input"]["description"].as_str()?)?
+        .chars()
+        .take(DOES_CHARS)
+        .collect();
+    Some(json!({"id": id, "does": does,
+        "type": bounded_string(&payload["tool_input"]["subagent_type"], 128),
+        "running": result["status"] == "async_launched"}))
 }
 
 fn bounded_string(value: &Value, max: usize) -> Option<&str> {
@@ -2082,12 +2114,14 @@ fn is_pre_tool(payload: &Value) -> bool {
 }
 
 /// The marker key of a tool event that only renews the session's lease: every tool event except
-/// the one that checks an edit (preToolUse, or postToolUse in Cursor) and a shell call's start or
-/// end, which the Hub counts so a long call stays live. None without a session.
+/// the one that checks an edit (preToolUse, or postToolUse in Cursor), a shell call's start or
+/// end, which the Hub counts so a long call stays live, and the end of a call that started a
+/// subagent, which says what the subagent is for. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
     let session = session_of(payload)?;
     if waits(agent, payload)
         || agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0)
+        || started_subagent(payload).is_some()
     {
         return None;
     }
@@ -2400,6 +2434,60 @@ mod tests {
         ] {
             assert_eq!(wait_asks(&quiet), None, "{quiet}");
         }
+    }
+
+    #[test]
+    fn a_call_that_started_a_subagent_sends_who_and_one_redacted_line_of_what_for() {
+        let does = format!(
+            "Find the  session\nkeys with GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 {}",
+            "and more ".repeat(30)
+        );
+        let done = json!({"hook_event_name":"PostToolUse","session_id":"s","tool_name":"Agent",
+            "tool_input":{"description":does,"prompt":"SECRET PROMPT","subagent_type":"Explore"},
+            "tool_response":{"status":"async_launched","agentId":"a4d2c8f1","content":"REPLY"}});
+        let sent = sanitized_codex(&done, Some(&[])).unwrap();
+        let subagent = &sent["subagent"];
+        assert_eq!(
+            (&subagent["id"], &subagent["type"], &subagent["running"]),
+            (&json!("a4d2c8f1"), &json!("Explore"), &json!(true))
+        );
+        let line = subagent["does"].as_str().unwrap();
+        assert!(line.starts_with("Find the session keys with "), "{line}");
+        assert!(!line.contains("ghp_abc") && line.chars().count() == DOES_CHARS);
+        // Neither the prompt nor the subagent's reply leaves, and the Hub always hears of it.
+        let text = sent.to_string();
+        assert!(
+            !text.contains("SECRET") && !text.contains("REPLY"),
+            "{text}"
+        );
+        assert_eq!(activity_key("claude", &done), None);
+        // A subagent that ran to its end is named too, and said not to be running.
+        let mut ended = done.clone();
+        ended["tool_response"]["status"] = json!("completed");
+        assert_eq!(started_subagent(&ended).unwrap()["running"], false);
+        // Nothing for a call that names no subagent or says nothing of what for, or another event.
+        let mut unnamed = done.clone();
+        unnamed["tool_response"] = json!("Agent failed to start");
+        let mut bare = done.clone();
+        bare["tool_input"] = json!({"prompt":"x"});
+        let mut before = done.clone();
+        before["hook_event_name"] = json!("PreToolUse");
+        let mut other = done.clone();
+        other["tool_name"] = json!("Read");
+        for none in [unnamed, bare, before, other] {
+            assert_eq!(started_subagent(&none), None, "{none}");
+            let sent = sanitized_codex(&none, Some(&[])).unwrap();
+            assert!(sent.get("subagent").is_none(), "{sent}");
+        }
+        // A subagent's own events and calls say which kind it is.
+        let start = json!({"hook_event_name":"SubagentStart","session_id":"s","cwd":"/r",
+            "transcript_path":"/t","agent_id":"a4d2c8f1","agent_type":"Explore"});
+        assert_eq!(
+            sanitized_codex(&start, Some(&[])).unwrap(),
+            json!({"hook_event_name":"SubagentStart","session_id":"s","agent_id":"a4d2c8f1",
+                "agent_type":"Explore"})
+        );
+        assert_eq!(activity_key("claude", &start), None);
     }
 
     #[test]
