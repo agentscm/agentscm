@@ -47,8 +47,8 @@ use super::coordination::{
     CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, NOT_PROVISIONAL_SQL, parse_response_kind, parse_status,
+    response_kind_name, status_name, with_hub_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -1389,19 +1389,21 @@ fn pg_catchup_page(
             "catch-up cursor is outside its delivery".into(),
         ));
     }
-    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
+    // Provisional Work stays out of catch-up: its widening and ending are the Hub's, not news.
+    let rows=tx.query(&format!("SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
         SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status
           FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq JOIN hub_work_items w ON w.id=v.work
          WHERE e.seq>$1 AND e.seq<=$2 AND w.provider=$3 AND w.host=$4
            AND (($6::bigint IS NOT NULL AND w.repository_id=$6)
              OR ($6::bigint IS NULL AND w.repository=$5 AND w.repository_id IS NULL))
+           AND {NOT_PROVISIONAL_SQL}
         UNION ALL
         SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status
           FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
           JOIN hub_coordination_requests r ON r.id=v.request
          WHERE e.seq>$1 AND e.seq<=$2 AND r.provider=$3 AND r.host=$4
            AND (($6::bigint IS NOT NULL AND r.repository_id=$6)
-             OR ($6::bigint IS NULL AND r.repository=$5 AND r.repository_id IS NULL))) events ORDER BY seq LIMIT $7",
+             OR ($6::bigint IS NULL AND r.repository=$5 AND r.repository_id IS NULL))) events ORDER BY seq LIMIT $7"),
         &[&event_after,&event_through,&who.owner.identity.provider,&who.owner.identity.host,
           &who.repository,&who.repository_id,&((limit+1) as i64)])?;
     let mut more_events = rows.len() > limit;
@@ -4986,13 +4988,17 @@ fn briefing_page(
         .map(|item| item.id.clone())
         .or_else(|| work_after.clone());
     let next_work_done = work_done || !more_work;
+    // As in catch-up, provisional Work's own events are not news.
     let rows = tx.query(
-        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+        &format!(
+            "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > $1 AND e.seq <= $2 AND w.provider = $3 AND w.host = $4
            AND w.repository = $5 AND w.repository_id IS NOT DISTINCT FROM $6
-         ORDER BY e.seq LIMIT $7",
+           AND {NOT_PROVISIONAL_SQL}
+         ORDER BY e.seq LIMIT $7"
+        ),
         &[
             &after,
             &through,
@@ -10600,6 +10606,11 @@ impl Store for PgStore {
                     resume.takeover_generation = Some(adopted.generation);
                     resume.scope = adopted.scope.clone();
                     let mut result = start_in(&mut tx, &who, &resume, true, now)?;
+                    if result.conflict.is_none() {
+                        // To the agent this is a new start: the unnamed item was the Hub's.
+                        result.created = true;
+                        result.took_over = false;
+                    }
                     result.preflight = Some(preflight);
                     tx.commit()?;
                     return Ok(result);
@@ -12523,7 +12534,7 @@ impl Store for PgStore {
             .chain(usage.iter().map(|usage|usage.work.clone()))
             .chain(deliveries.iter().flat_map(|delivery|delivery.page.work_events.iter().map(|event|event.work_id.clone())))
             .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-        let work_rows=tx.query("SELECT w.snapshot FROM hub_work_items w WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND (($5::text IS NOT NULL AND w.id=$5) OR ($5::text IS NULL AND w.created_at<=$6 AND ((w.updated_at>=$8 AND w.updated_at<=$6) OR w.state<>'finished' OR w.id=ANY($9::text[]) OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(w.snapshot::jsonb->'current'->'source_refs','[]'::jsonb)) ref WHERE ref->>'kind'='commit' AND ref->>'oid'=ANY($10::text[]))))) ORDER BY w.updated_at DESC,w.id DESC LIMIT $7",&[&provider,&host,&repository,&repository_id,&work_id,&until,&cap,&since,&referenced_work_ids,&merge_heads])?.iter().map(|r|(r.get::<_,String>(0),)).collect::<Vec<_>>();
+        let work_rows=tx.query(&format!("SELECT w.snapshot FROM hub_work_items w WHERE {NOT_PROVISIONAL_SQL} AND w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND (($5::text IS NOT NULL AND w.id=$5) OR ($5::text IS NULL AND w.created_at<=$6 AND ((w.updated_at>=$8 AND w.updated_at<=$6) OR w.state<>'finished' OR w.id=ANY($9::text[]) OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(w.snapshot::jsonb->'current'->'source_refs','[]'::jsonb)) ref WHERE ref->>'kind'='commit' AND ref->>'oid'=ANY($10::text[]))))) ORDER BY w.updated_at DESC,w.id DESC LIMIT $7"),&[&provider,&host,&repository,&repository_id,&work_id,&until,&cap,&since,&referenced_work_ids,&merge_heads])?.iter().map(|r|(r.get::<_,String>(0),)).collect::<Vec<_>>();
         if work_id.is_some() && work_rows.is_empty() && !who.token_id.is_empty(){return Err(HubError::Invalid("unknown Work in value metrics scope".into()));}
         complete &= work_rows.len()<=MAX_FACTS;
         let works=work_rows.into_iter().take(MAX_FACTS).map(|(s,)|json_value::<WorkItem>(&s)).collect::<Result<Vec<_>>>()?;
@@ -12598,7 +12609,7 @@ impl Store for PgStore {
             let through=query.through.unwrap_or(tx.query_one("SELECT COALESCE(MAX(seq),0)::bigint FROM hub_events",&[])?.get(0));
             let cursor=query.after.as_ref().map(|v|InsightCursor::decode(v,since,until,through)).transpose()?;
             let after_at=cursor.as_ref().map(|c|c.created_at); let after_id=cursor.as_ref().map(|c|c.id.as_str());
-            let rows=tx.query("SELECT snapshot FROM hub_work_items WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_id IS NOT DISTINCT FROM $4 AND created_at>=$5 AND created_at<=$6 AND (created_seq IS NULL OR created_seq<=0 OR created_seq<=$7) AND ($8::bigint IS NULL OR created_at>$8 OR (created_at=$8 AND id>$9)) ORDER BY created_at,id LIMIT $10",&[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id,&since,&until,&through,&after_at,&after_id,&((query.limit+1)as i64)])?;
+            let rows=tx.query(&format!("SELECT snapshot FROM hub_work_items w WHERE {NOT_PROVISIONAL_SQL} AND provider=$1 AND host=$2 AND repository=$3 AND repository_id IS NOT DISTINCT FROM $4 AND created_at>=$5 AND created_at<=$6 AND (created_seq IS NULL OR created_seq<=0 OR created_seq<=$7) AND ($8::bigint IS NULL OR created_at>$8 OR (created_at=$8 AND id>$9)) ORDER BY created_at,id LIMIT $10"),&[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id,&since,&until,&through,&after_at,&after_id,&((query.limit+1)as i64)])?;
             let complete=rows.len()<=query.limit; let mut items=Vec::new();
             for r in rows.iter().take(query.limit) { let snapshot:String=r.get(0); let item:WorkItem=json_value(&snapshot)?; items.push(super::insights::project(pg_insight_input(&mut tx,item,now,20)?)); }
             let next_after=if complete{None}else{items.last().map(|i|InsightCursor{since,until,through,created_at:i.created_at,id:i.work_id.clone()}.encode())};

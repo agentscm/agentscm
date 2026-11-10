@@ -263,6 +263,13 @@ pub fn project_work(
             StatusRecipient::none(),
             "Refresh changed Work before acting.",
         )
+    } else if item.is_provisional() && item.state != WorkState::Finished {
+        // The Hub's own unnamed item holds nothing, so there is nothing to finish or release.
+        (
+            StatusState::Active,
+            lead(item),
+            "A session is editing without naming its Work; the Hub tracks it until the session names it or ends.",
+        )
     } else if item.state == WorkState::Finished {
         (
             StatusState::Retired,

@@ -45,8 +45,8 @@ use super::coordination::{
     CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, NOT_PROVISIONAL_SQL, parse_response_kind, parse_status,
+    response_kind_name, status_name, with_hub_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -833,7 +833,8 @@ fn sqlite_catchup_page(
             "catch-up cursor is outside its delivery".into(),
         ));
     }
-    let mut statement = tx.prepare(
+    // Provisional Work stays out of catch-up: its widening and ending are the Hub's, not news.
+    let mut statement = tx.prepare(&format!(
         "SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
              SELECT e.seq,e.at,e.kind,e.subject,'work' AS stream,v.snapshot,
                     NULL AS title,NULL AS status
@@ -842,6 +843,7 @@ fn sqlite_catchup_page(
               WHERE e.seq>?1 AND e.seq<=?2 AND w.provider=?3 AND w.host=?4
                 AND ((?6 IS NOT NULL AND w.repository_id IS ?6)
                   OR (?6 IS NULL AND w.repository=?5 AND w.repository_id IS NULL))
+                AND {NOT_PROVISIONAL_SQL}
              UNION ALL
              SELECT e.seq,e.at,e.kind,e.subject,'coordination' AS stream,NULL AS snapshot,
                     r.proposed_title,v.status
@@ -851,7 +853,7 @@ fn sqlite_catchup_page(
                 AND ((?6 IS NOT NULL AND r.repository_id IS ?6)
                   OR (?6 IS NULL AND r.repository=?5 AND r.repository_id IS NULL)))
          ORDER BY seq LIMIT ?7",
-    )?;
+    ))?;
     let event_rows = statement
         .query_map(
             params![
@@ -5124,14 +5126,15 @@ fn briefing_page(
         .or_else(|| work_after.clone());
     let next_work_done = work_done || !more_work;
 
-    let mut statement = tx.prepare(
+    // As in catch-up, provisional Work's own events are not news.
+    let mut statement = tx.prepare(&format!(
         "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > ?1 AND e.seq <= ?2 AND w.provider = ?3 AND w.host = ?4
-           AND w.repository = ?5 AND w.repository_id IS ?6
+           AND w.repository = ?5 AND w.repository_id IS ?6 AND {NOT_PROVISIONAL_SQL}
          ORDER BY e.seq LIMIT ?7",
-    )?;
+    ))?;
     let rows = statement
         .query_map(
             params![
@@ -10650,6 +10653,11 @@ impl Store for SqliteStore {
                 resume.takeover_generation = Some(adopted.generation);
                 resume.scope = adopted.scope.clone();
                 let mut result = start_in(&tx, &who, &resume, true, now)?;
+                if result.conflict.is_none() {
+                    // To the agent this is a new start: the unnamed item was the Hub's.
+                    result.created = true;
+                    result.took_over = false;
+                }
                 result.preflight = Some(preflight);
                 tx.commit()?;
                 return Ok(result);
@@ -13311,7 +13319,7 @@ impl Store for SqliteStore {
             .collect::<Vec<_>>();
         let referenced_work_ids = json_string(&referenced_work_ids)?;
         let work_rows = {
-            let mut stmt=tx.prepare("SELECT w.snapshot FROM hub_work_items w WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3 AND w.repository_id IS ?4 AND ((?5 IS NOT NULL AND w.id=?5) OR (?5 IS NULL AND w.created_at<=?6 AND ((w.updated_at>=?8 AND w.updated_at<=?6) OR w.state<>'finished' OR w.id IN (SELECT value FROM json_each(?9)) OR EXISTS (SELECT 1 FROM json_each(w.snapshot,'$.current.source_refs') ref WHERE json_extract(ref.value,'$.kind')='commit' AND json_extract(ref.value,'$.oid') IN (SELECT value FROM json_each(?10)))))) ORDER BY w.updated_at DESC,w.id DESC LIMIT ?7")?;
+            let mut stmt=tx.prepare(&format!("SELECT w.snapshot FROM hub_work_items w WHERE {NOT_PROVISIONAL_SQL} AND w.provider=?1 AND w.host=?2 AND w.repository=?3 AND w.repository_id IS ?4 AND ((?5 IS NOT NULL AND w.id=?5) OR (?5 IS NULL AND w.created_at<=?6 AND ((w.updated_at>=?8 AND w.updated_at<=?6) OR w.state<>'finished' OR w.id IN (SELECT value FROM json_each(?9)) OR EXISTS (SELECT 1 FROM json_each(w.snapshot,'$.current.source_refs') ref WHERE json_extract(ref.value,'$.kind')='commit' AND json_extract(ref.value,'$.oid') IN (SELECT value FROM json_each(?10)))))) ORDER BY w.updated_at DESC,w.id DESC LIMIT ?7"))?;
             stmt.query_map(
                 params![
                     provider,
@@ -13506,7 +13514,7 @@ impl Store for SqliteStore {
             .map(|c| (Some(c.created_at), Some(c.id.as_str())))
             .unwrap_or((None, None));
         let snapshots = {
-            let mut statement=tx.prepare("SELECT snapshot FROM hub_work_items WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4 AND created_at>=?5 AND created_at<=?6 AND (created_seq IS NULL OR created_seq<=0 OR created_seq<=?7) AND (?8 IS NULL OR created_at>?8 OR (created_at=?8 AND id>?9)) ORDER BY created_at,id LIMIT ?10")?;
+            let mut statement=tx.prepare(&format!("SELECT snapshot FROM hub_work_items w WHERE {NOT_PROVISIONAL_SQL} AND provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4 AND created_at>=?5 AND created_at<=?6 AND (created_seq IS NULL OR created_seq<=0 OR created_seq<=?7) AND (?8 IS NULL OR created_at>?8 OR (created_at=?8 AND id>?9)) ORDER BY created_at,id LIMIT ?10"))?;
             statement
                 .query_map(
                     params![

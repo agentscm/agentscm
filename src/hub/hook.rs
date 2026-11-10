@@ -685,7 +685,9 @@ impl Call {
                 })
                 .await
                 .map_err(reason)?;
+                // Provisional Work is the Hub's, not a declaration, so its scope never refuses.
                 if let Some(item) = &coverage.item
+                    && !item.is_provisional()
                     && !coverage.uncovered_scope.is_empty()
                 {
                     let lead =
@@ -747,7 +749,24 @@ impl Call {
                     .filter(|path| !super::session::never_hold(path))
                     .cloned()
                     .collect();
-                if coverage.item.is_none()
+                // Such a session gets provisional Work, unnamed and unreserved, so its person sees
+                // it and its waits reach them. A failure here never refuses the edit.
+                let unnamed = coverage
+                    .item
+                    .as_ref()
+                    .is_none_or(|item| item.is_provisional());
+                let mut opened = false;
+                if unnamed && !self.child && !holdable.is_empty() && self.session.is_some() {
+                    let store = state.store.clone();
+                    let token = principal.token_id.clone();
+                    let (session, paths) = (resolved.clone(), holdable.clone());
+                    opened = blocking(state, move || {
+                        store.work_provisional_touch(&token, &session, &paths, unix_now())
+                    })
+                    .await
+                    .is_ok_and(|item| item.is_some());
+                }
+                if unnamed
                     && !self.child
                     && !holdable.is_empty()
                     && let Some(native) = self.session.as_deref()
@@ -759,7 +778,7 @@ impl Call {
                     )
                 {
                     super::session::count_undeclared();
-                    let why = self.undeclared_text(&principal.repository, &holdable);
+                    let why = self.undeclared_text(&principal.repository, &holdable, opened);
                     outcome = if self.deny {
                         // One refusal: any note on a file another session holds rides along, and
                         // that note's own warn-once is spent, so the repeat passes both.
@@ -934,12 +953,24 @@ impl Call {
 
     /// Why a session that declared no Work in `repository` is told to, with the calls that
     /// declare it through MCP or, when its tools are bound to another repository, the CLI.
-    fn undeclared_text(&self, repository: &str, paths: &[String]) -> String {
+    /// `opened` says the Hub keeps provisional Work for it, which the declaration names.
+    fn undeclared_text(&self, repository: &str, paths: &[String], opened: bool) -> String {
         let session = self.session.as_deref().unwrap_or_default();
         let named = serde_json::to_string(session).unwrap_or_default();
         let paths = serde_json::to_string(paths).unwrap_or_default();
+        let (why, verb) = if opened {
+            (
+                "so the Hub opened unnamed Work for it: your person sees that it is editing and is told when it stops to wait on them, but not what it is doing, and the unnamed Work ends as abandoned when the session does",
+                "Name it",
+            )
+        } else {
+            (
+                "so your person and other agents cannot see what it is doing, and when it stops to wait on your person they are not told",
+                "Declare it",
+            )
+        };
         format!(
-            "this session has declared no Work in {repository}, so your person and other agents cannot see what it is doing, and when it stops to wait on your person they are not told. Declare it: call agentscm_start with session {named}, a short task title and paths {paths}. If your AgentSCM tools are bound to another repository, that call records the Work there instead: run `agentscm work start` inside this file's checkout with {{\"title\":\"<short task title>\",\"session\":{named},\"scope\":{paths}}} on standard input. When the task is done, call agentscm_done with outcome complete."
+            "this session has declared no Work in {repository}, {why}. {verb}: call agentscm_start with session {named}, a short task title and paths {paths}. If your AgentSCM tools are bound to another repository, that call records the Work there instead: run `agentscm work start` inside this file's checkout with {{\"title\":\"<short task title>\",\"session\":{named},\"scope\":{paths}}} on standard input. When the task is done, call agentscm_done with outcome complete."
         )
     }
 
