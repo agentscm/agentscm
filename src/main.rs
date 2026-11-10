@@ -123,6 +123,7 @@ mod telemetry_cli;
 mod tray;
 #[cfg(unix)]
 mod walkthrough_cli;
+mod why_cli;
 mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -328,6 +329,8 @@ enum Command {
     /// Run a trusted-local, pinned skill intent review operation from JSON stdin.
     #[cfg(unix)]
     IntentReview(intent_review_cli::IntentReviewArgs),
+    /// Show the Work recorded for a commit, a file or a line, with its decisions.
+    Why(why_cli::WhyArgs),
     /// Coordinate durable engineering work, claims and resumable check-ins.
     Work {
         #[command(subcommand)]
@@ -1057,6 +1060,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::Intent { command } => intent_cli::run(command).await?,
         #[cfg(unix)]
         Command::IntentReview(args) => print_json(&intent_review_cli::run(args)?),
+        Command::Why(args) => print_json(&why_cli::run(args).await?),
         Command::Work { command } => work_cli::run(command).await?,
         Command::Promise { command } => promise_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
