@@ -63,6 +63,7 @@ pub mod slack;
 pub mod slack_protocol;
 pub mod store;
 mod store_pg;
+mod store_sql;
 mod store_sqlite;
 pub mod sync;
 pub mod ui;
