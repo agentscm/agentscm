@@ -116,6 +116,28 @@ fn resolve(git: &Git, name: &str) -> Result<String> {
         .map_err(|_| Error::Invalid(format!("{name} does not resolve to a commit")))
 }
 
+/// The Git version string, or an error when it is older than the shared command layer needs.
+fn supported_version(exe: &Path) -> Result<String> {
+    let version = git_version(exe)?;
+    match parse_version(&version) {
+        Some(found) if found >= MIN_GIT => Ok(version),
+        _ => Err(Error::Invalid(format!(
+            "Git 2.43 or newer is required; found {version:?}"
+        ))),
+    }
+}
+
+/// The base's name and commit: the given ref, else origin/HEAD, else main.
+fn resolve_base(git: &Git, name: Option<&str>) -> Result<(String, String)> {
+    match name {
+        Some(name) => Ok((name.to_owned(), resolve(git, name)?)),
+        None => ["origin/HEAD", "main"]
+            .iter()
+            .find_map(|name| Some((name.to_string(), resolve(git, name).ok()?)))
+            .ok_or_else(|| Error::Invalid("no origin/HEAD or main; pass --base".into())),
+    }
+}
+
 fn short(name: &str) -> &str {
     let name = name.strip_prefix("refs/").unwrap_or(name);
     name.strip_prefix("heads/")
@@ -541,22 +563,8 @@ pub fn collisions(request: &Request) -> Result<Value> {
         repository: &request.repository,
         deadline: request.deadline,
     };
-    let version = git_version(&request.git)?;
-    match parse_version(&version) {
-        Some(found) if found >= MIN_GIT => {}
-        _ => {
-            return Err(Error::Invalid(format!(
-                "Git 2.43 or newer is required; found {version:?}"
-            )));
-        }
-    }
-    let (base_name, base) = match &request.base {
-        Some(name) => (name.clone(), resolve(&git, name)?),
-        None => ["origin/HEAD", "main"]
-            .iter()
-            .find_map(|name| Some((name.to_string(), resolve(&git, name).ok()?)))
-            .ok_or_else(|| Error::Invalid("no origin/HEAD or main; pass --base".into()))?,
-    };
+    let version = supported_version(&request.git)?;
+    let (base_name, base) = resolve_base(&git, request.base.as_deref())?;
 
     let mut named: Vec<(String, String)> = Vec::new();
     let mut inactive = 0;
@@ -751,6 +759,159 @@ pub fn collisions(request: &Request) -> Result<Value> {
         report["merge_order"] = order;
     }
     Ok(report)
+}
+
+pub const HISTORY_PROFILE: &str = "agentscm-git-collisions-history/v1";
+
+/// Two changes to one file by different authors are an overlap when their author dates are at
+/// most this many hours apart.
+pub const HISTORY_WINDOW_HOURS: i64 = 72;
+
+#[derive(Clone, Debug)]
+pub struct HistoryRequest {
+    /// Absolute path of the Git executable.
+    pub git: PathBuf,
+    /// A working directory of the repository.
+    pub repository: PathBuf,
+    pub base: Option<String>,
+    /// Read the commits that reached the base in this many days, by committer date.
+    pub days: u32,
+}
+
+/// One non-merge commit of `git log -z --name-only --format=%x00%aE%x00%at`: an empty field
+/// starts a commit, then come its author email and author date, then its paths.
+struct Landed {
+    author: String,
+    at: i64,
+    paths: Vec<String>,
+}
+
+fn parse_history(log: &[u8]) -> Result<Vec<Landed>> {
+    let mut commits: Vec<Landed> = Vec::new();
+    let mut fields = log.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            // The output ends with one empty field after the last path.
+            let (Some(author), Some(at)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            let at = lossy(at)
+                .parse()
+                .map_err(|_| Error::Invalid("git log printed a commit without a date".into()))?;
+            commits.push(Landed {
+                author: lossy(author).to_lowercase(),
+                at,
+                paths: Vec::new(),
+            });
+        } else if let Some(commit) = commits.last_mut() {
+            // Git writes a newline between a commit's header and its first path.
+            let path = if commit.paths.is_empty() {
+                field.strip_prefix(b"\n").unwrap_or(field)
+            } else {
+                field
+            };
+            commit.paths.push(lossy(path));
+        } else {
+            return Err(Error::Invalid(
+                "git log printed a path before any commit".into(),
+            ));
+        }
+    }
+    Ok(commits)
+}
+
+/// Counts past overlaps from this repository's own history, by top directory: a change to a file
+/// that a different author also changed within `HISTORY_WINDOW_HOURS` before it. Reads non-merge
+/// commits reachable from the base and committed in the period; runs only `git log` and
+/// `rev-parse`, so it needs no network and no Hub and writes nothing. The count is a lower bound
+/// (see the report's `notes`).
+pub fn history(request: &HistoryRequest) -> Result<Value> {
+    let git = Git {
+        exe: &request.git,
+        repository: &request.repository,
+        deadline: None,
+    };
+    let version = supported_version(&request.git)?;
+    let (base_name, base) = resolve_base(&git, request.base.as_deref())?;
+    let since = format!("--since={}.days.ago", request.days);
+    let args = [
+        "log",
+        "-z",
+        "--no-merges",
+        "--no-renames",
+        "--name-only",
+        "--format=%x00%aE%x00%at",
+        &since,
+        "--end-of-options",
+        &base,
+    ];
+    let commits = parse_history(&git.run(&args, None, OUTPUT)?)?;
+    let shallow = git.text(&["rev-parse", "--is-shallow-repository"])? == "true";
+
+    let authors: BTreeSet<&str> = commits.iter().map(|c| c.author.as_str()).collect();
+    let mut changes: Vec<(i64, &str, &str)> = commits
+        .iter()
+        .flat_map(|c| {
+            c.paths
+                .iter()
+                .map(|path| (c.at, c.author.as_str(), path.as_str()))
+        })
+        .collect();
+    changes.sort_by_key(|change| change.0);
+    // Per file: who changed it last and when, and the latest change by anyone else.
+    let mut last: HashMap<&str, (&str, i64, Option<i64>)> = HashMap::new();
+    let mut directories: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
+    for (at, author, path) in changes {
+        let earlier = last.get(path).copied();
+        let by_another = earlier.and_then(
+            |(who, when, other)| {
+                if who == author { other } else { Some(when) }
+            },
+        );
+        if by_another.is_some_and(|when| at - when <= HISTORY_WINDOW_HOURS * 3600) {
+            let directory = path.split_once('/').map_or("(root)", |(top, _)| top);
+            let entry = directories.entry(directory).or_default();
+            entry.0 += 1;
+            entry.1.insert(path);
+        }
+        last.insert(path, (author, at, by_another));
+    }
+    let mut listed: Vec<(&str, usize, usize)> = directories
+        .iter()
+        .map(|(directory, (overlaps, files))| (*directory, *overlaps, files.len()))
+        .collect();
+    listed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut notes = vec![
+        format!(
+            "An overlap is a change to a file that a different author also changed in the {HISTORY_WINDOW_HOURS} hours before it, by author date."
+        ),
+        "Lower bound: a squash or rebase merge records when a change landed, not how long it was in flight, so work that overlapped before it landed is not counted.".to_owned(),
+        "Authors are told apart by email, so several agents that commit as one person count as one author. Merge commits and work that never reached the base are not read.".to_owned(),
+    ];
+    if shallow {
+        notes.push("This clone is shallow: history outside it was not read.".to_owned());
+    }
+    Ok(json!({
+        "profile": HISTORY_PROFILE,
+        "git_version": version,
+        "base": {"name": base_name, "commit": base},
+        "days": request.days,
+        "window_hours": HISTORY_WINDOW_HOURS,
+        "commits": commits.len(),
+        "authors": authors.len(),
+        "overlaps": listed.iter().map(|entry| entry.1).sum::<usize>(),
+        "files": listed.iter().map(|entry| entry.2).sum::<usize>(),
+        "directories": listed
+            .iter()
+            .map(|(directory, overlaps, files)| {
+                json!({"directory": directory, "overlaps": overlaps, "files": files})
+            })
+            .collect::<Vec<_>>(),
+        "lower_bound": true,
+        "shallow": shallow,
+        "notes": notes,
+    }))
 }
 
 /// A deliberately incomplete, path-only observation for command hooks. It never runs
@@ -997,6 +1158,34 @@ mod tests {
         );
         assert_eq!(parse_version("git version 2.43.0"), Some((2, 43)));
         assert_eq!(parse_version("nonsense"), None);
+    }
+
+    #[test]
+    fn parses_history_log_records_and_rejects_malformed_ones() {
+        // Two paths, then a commit with no paths and no email, then one path with a newline.
+        let log = b"\0A@x.invalid\x00100\0\nsrc/a\0b\0\0\x00200\0\0c@x.invalid\x00300\0\n\nodd\0";
+        let commits = parse_history(log).unwrap();
+        let seen: Vec<(&str, i64, Vec<&str>)> = commits
+            .iter()
+            .map(|c| {
+                (
+                    c.author.as_str(),
+                    c.at,
+                    c.paths.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a@x.invalid", 100, vec!["src/a", "b"]),
+                ("", 200, vec![]),
+                ("c@x.invalid", 300, vec!["\nodd"]),
+            ]
+        );
+        assert!(parse_history(b"").unwrap().is_empty());
+        assert!(parse_history(b"\0a@x.invalid\0soon\0").is_err());
+        assert!(parse_history(b"path\0").is_err());
     }
 
     #[test]
