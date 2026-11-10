@@ -177,12 +177,12 @@ impl Bench {
 
     /// Another person's session announces an edit of `file`, so it holds that file.
     fn other_holds(&self, file: &str) {
-        let edit = json!({"hook_event_name": "PreToolUse", "session_id": "other-session",
-            "cwd": "/r", "tool_name": "Write",
-            "tool_input": {"file_path": format!("/r/{file}"), "content": ""}});
-        let path = format!("/v1/hub/hook/claude?repo={REPO}");
+        // Through the generic hook, so `held_through` never counts it as the agent under test's.
+        let edit = json!({"agent": "other", "session": "other-session", "event": "check",
+            "cwd": "/r", "paths": [format!("/r/{file}")]});
+        let path = format!("/v1/hub/hook/generic?repo={REPO}");
         let reply = self.post(&path, &self.other, &edit);
-        assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
+        assert_ne!(reply["status"], "unknown", "{reply}");
     }
 
     /// The files the Hub lists as held through `agent`'s hooks.
@@ -287,7 +287,8 @@ fn end_releases(bench: &Bench, agent: &str, end: &Value) {
         "{agent}"
     );
     bench.hook(agent, end);
-    assert!(bench.held_through(agent).is_empty(), "{agent}");
+    let held = bench.held_through(agent);
+    assert!(held.is_empty(), "{agent} still holds {held:?}");
 }
 
 /// A Claude Code or Codex payload: PascalCase event names and snake_case fields.
