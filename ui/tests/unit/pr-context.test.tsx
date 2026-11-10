@@ -119,6 +119,11 @@ describe('PR context boundaries', () => {
     await screen.findByText('This PR is not in the retained mirror')
     expect(screen.getByText(/this PR may be missing because of that gap/)).toBeTruthy()
   })
+  it('says a merged PR merged instead of failing', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ version: 1, availability: 'merged', merges: [], coverage: contextFixture(42).coverage })))
+    render(<PrContextPanel repo="acme/widgets" token="merged-fixture" pulls={[{ number: 42, title: 'Invoice', state: 'open', draft: false, head_ref: 'feature', base_ref: 'main', author: { login: 'sam' }, files: [] }]} />)
+    await screen.findByText('This PR merged; its open-PR context is no longer kept')
+  })
   it('rejects invalid Work IDs before they reach the rendering helper', () => {
     const data = contextFixture(42)
     data.work_overlaps![0]!.work_id = 'invalid'
