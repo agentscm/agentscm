@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentscm::change_record::{ChangeRecordResponseV1, SCHEMA_VERSION_V1};
+use agentscm::hub::reply;
 use agentscm::hub::store::unix_now;
 use agentscm::hub::work::{
     WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkRepositoryScope, WorkStart,
@@ -91,7 +92,7 @@ impl ManagedWork {
         let root = root.canonicalize()?;
         let hub = Hub::connect_in(Duration::from_secs(10), &root)?;
         let identity: Identity =
-            serde_json::from_value(hub.call(Method::GET, "/v1/hub/whoami", None).await?)?;
+            reply::decode(&hub.call(Method::GET, "/v1/hub/whoami", None).await?)?;
         let scope = WorkRepositoryScope {
             provider: identity.owner.provider.clone(),
             host: identity.owner.host.clone(),
@@ -132,7 +133,7 @@ impl ManagedWork {
             ));
         }
         let identity: Identity =
-            serde_json::from_value(current.call(Method::GET, "/v1/hub/whoami", None).await?)?;
+            reply::decode(&current.call(Method::GET, "/v1/hub/whoami", None).await?)?;
         identity.validate(&self.scope)?;
         if identity.token.id != self.identity.token.id || identity.owner != self.identity.owner {
             return Err(invalid("Hub execution identity changed"));
@@ -149,8 +150,9 @@ impl ManagedWork {
         {
             return Err(invalid("invalid Work identity"));
         }
-        let item: WorkItem = serde_json::from_value(
-            self.hub
+        let item: WorkItem = reply::decode(
+            &self
+                .hub
                 .call(Method::GET, &format!("/v1/hub/standup/work/{id}"), None)
                 .await?,
         )?;
@@ -164,8 +166,9 @@ impl ManagedWork {
 
     pub(crate) async fn start(&self, request: &WorkStart) -> Result<WorkItem> {
         self.authenticate().await?;
-        let result: WorkStartResult = serde_json::from_value(
-            self.hub
+        let result: WorkStartResult = reply::decode(
+            &self
+                .hub
                 .call(
                     Method::POST,
                     "/v1/hub/standup/start",
@@ -202,7 +205,7 @@ impl ManagedWork {
             work.id
         );
         let record: ChangeRecordResponseV1 =
-            serde_json::from_value(self.hub.call(Method::GET, &path, None).await?)?;
+            reply::decode(&self.hub.call(Method::GET, &path, None).await?)?;
         if record.version != SCHEMA_VERSION_V1
             || record.summary.schema_version != SCHEMA_VERSION_V1
             || record.summary.work_id != work.id
@@ -238,8 +241,9 @@ impl ManagedWork {
         request: &WorkCheckpoint,
     ) -> Result<WorkCheckpointResult> {
         self.authenticate().await?;
-        let result: WorkCheckpointResult = serde_json::from_value(
-            self.hub
+        let result: WorkCheckpointResult = reply::decode(
+            &self
+                .hub
                 .call(
                     Method::POST,
                     "/v1/hub/standup/checkpoint",
@@ -295,7 +299,7 @@ impl ManagedWork {
                 "recovery checkpoint unconfirmed; retained request preserved",
             ));
         }
-        let result: WorkCheckpointResult = serde_json::from_value(body)?;
+        let result: WorkCheckpointResult = reply::decode(&body)?;
         if result.receipt.work_id != request.work_id
             || result.receipt.operation_id != request.operation_id
             || result.receipt.generation != request.generation

@@ -742,7 +742,8 @@ fn setup_actions(
 
 /// The viewer's own sessions that stopped for them: a permission prompt or a question always
 /// needs them; the end of a turn only while that session leads unfinished Work, since a finished
-/// chat left open is not waiting on anyone. Its id is `waiting:<reason>:<key>` and its semantic
+/// chat left open is not waiting on anyone. Paused Work counts: a host that stops an idle session
+/// ends it, which pauses its Work, and the resumed session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
 /// version the time the wait began. Answering stays in the session.
 fn waiting_actions(
     setup: &Observations,
@@ -764,7 +765,10 @@ fn waiting_actions(
             .filter(|i| {
                 i.lead_token == wait.token
                     && i.lead_session == wait.session
-                    && matches!(i.state, WorkState::Active | WorkState::Blocked)
+                    && matches!(
+                        i.state,
+                        WorkState::Active | WorkState::Blocked | WorkState::Paused
+                    )
             })
             .collect::<Vec<_>>();
         if wait.reason == WaitReason::Idle && led.is_empty() {
@@ -783,6 +787,19 @@ fn waiting_actions(
         } else {
             ""
         };
+        // Only this person sees it, so their own agent's words can say what it needs.
+        let asks = wait
+            .asks
+            .as_deref()
+            .map(|text| {
+                let label = match wait.reason {
+                    WaitReason::Permission => "The prompt is for",
+                    WaitReason::Question => "It asks",
+                    WaitReason::Idle => "Its last message ends",
+                };
+                format!(" {label}: “{text}”.")
+            })
+            .unwrap_or_default();
         actions.push(StatusAction {
             id: format!("waiting:{}:{}", wait.reason.code(), wait.key),
             kind: "session_waiting".into(),
@@ -790,7 +807,7 @@ fn waiting_actions(
             recipients: vec![viewer.clone()],
             needs_you: true,
             action: format!(
-                "Your agent {}{brand} {}{on}.{asker} Answer it in that session; the Hub cannot answer it for you.",
+                "Your agent {}{brand} {}{on}.{asks}{asker} Answer it in that session; the Hub cannot answer it for you.",
                 crate::hub::advice::sanitize(&wait.name, 64),
                 wait.reason.what(),
             ),
@@ -2040,7 +2057,7 @@ mod tests {
         let wait = |who: &Principal, session: &str, reason, at| {
             observations
                 .waiting()
-                .record(who, session, session, "claude", reason, None, at)
+                .record(who, session, session, "claude", reason, None, None, at)
                 .unwrap();
         };
         let waits = |who: &Principal, at| {
@@ -2100,6 +2117,43 @@ mod tests {
         let after = super::read(store, &observations, &viewer, now).unwrap();
         assert_eq!(waits(&viewer, now).len(), 1);
         assert_ne!(after.digest, status.digest);
+        // A host that stops the idle session ends it, which pauses its Work. When the session
+        // resumes and stops for its person again, that wait still reaches them, with what it asks.
+        assert!(
+            store
+                .end_session_pausing(&viewer.token_id, Some("working"), "hook:claude", now)
+                .unwrap()
+                .paused
+        );
+        observations
+            .waiting()
+            .record(
+                &viewer,
+                "working",
+                "working",
+                "claude",
+                WaitReason::Idle,
+                None,
+                Some("Should I force-push the rebased branch?\u{7}"),
+                earlier,
+            )
+            .unwrap();
+        let resumed = waits(&viewer, now);
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert_eq!(resumed[0].work_ids, vec![work.id.clone()]);
+        assert!(
+            resumed[0].action.contains(
+                "Its last message ends: “Should I force-push the rebased branch?”. Answer it"
+            ),
+            "{}",
+            resumed[0].action
+        );
+        // The other person never sees it.
+        assert!(
+            waits(&other, now)
+                .iter()
+                .all(|a| !a.action.contains("force-push"))
+        );
     }
 
     #[test]
@@ -2465,7 +2519,8 @@ mod tests {
     fn failed_checks_and_stopped_gates_reach_their_owner_on_postgres() {
         on_postgres(checks_contract);
     }
-    /// Runs one contract in its own disposable schema.
+    /// Runs one contract in a disposable schema of its own disposable database. The store's
+    /// advisory locks are database-wide, so a shared database would make parallel tests wait.
     fn on_postgres(contract: fn(&dyn Store)) {
         let Ok(base) = std::env::var("AGENTSCM_TEST_DATABASE_URL") else {
             eprintln!("skipping PostgreSQL status conformance: AGENTSCM_TEST_DATABASE_URL unset");
@@ -2482,26 +2537,32 @@ mod tests {
         );
         let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
         admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .unwrap();
-        struct Schema {
+            .batch_execute(&format!("CREATE DATABASE {schema}"))
+            .expect("the test role must be able to create databases");
+        struct Database {
             admin: postgres::Client,
             name: String,
         }
-        impl Drop for Schema {
+        impl Drop for Database {
             fn drop(&mut self) {
                 let _ = self
                     .admin
-                    .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.name));
+                    .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
             }
         }
-        let _schema = Schema {
+        let _database = Database {
             admin,
             name: schema.clone(),
         };
-        let separator = if base.contains('?') { '&' } else { '?' };
+        let mut database = reqwest::Url::parse(&base).unwrap();
+        database.set_path(&format!("/{schema}"));
+        postgres::Client::connect(database.as_str(), postgres::NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .unwrap();
+        let separator = if database.query().is_some() { '&' } else { '?' };
         let url = format!(
-            "{base}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
+            "{database}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
         );
         let store = store::open(&url).unwrap();
         contract(&*store);

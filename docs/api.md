@@ -455,6 +455,27 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
 
+## Hub: requests and replies across versions
+
+The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
+
+**The Hub refuses what it does not know.** A request with a field the Hub does not have, or with a value outside the set a field takes, gets `400` with `invalid_request` and changes nothing. The Hub never ignores part of a request, because the ignored part could be the part that mattered. A client must not send a field to a Hub that does not have it yet.
+
+**A client ignores what it does not know.** `agentscm` reads a reply that has a field it does not know as if the field were absent. A Hub release can add a field to any JSON reply without a new route or a new schema version.
+
+A later Hub can also add a value to a reply field that takes one of a set of values, such as a Work `state`. A client never reads an unknown value as a known one:
+
+| Client | With a value it does not know |
+|---|---|
+| A command that prints the reply as JSON (`--json`, `work start`, `work transitions`, `promise`) | Prints the reply as the Hub sent it. `work start` also exits non-zero when `item.state` is unknown, because the claim is not confirmed |
+| `work status`, `work recovery` and `skill status` as text | Print the reply as JSON, and on standard error name the field and the value |
+| The menu bar app | Shows the Hub's own text for an unknown state, claim status or recipient kind. Its counts do not change |
+| A client that acts on the whole reply (managed Work, change capture, agent tasks, the hosted workflow client) | Stops with an error that names the field and the value |
+
+If you write your own client, do the same: ignore a field you do not know, and treat a value you do not know as unknown.
+
+This applies to `agentscm` from the release that adds this section. An `agentscm` installed before it reads replies strictly, and `work status`, `work start` and `work recovery` fail there when a reply has a field they do not know.
+
 ## Hub errors
 
 Every error the Hub returns carries the same fields on every surface: HTTP bodies, MCP tool
