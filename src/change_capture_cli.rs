@@ -487,6 +487,19 @@ async fn capture_claude(
             None => Err(Error::Invalid("capture Hub client unavailable".into())),
         }
     };
+    // Upkeep runs beside the Hub lookups, and this event is written only after it, so a spool
+    // that filled with what the Hub has accepted makes room first; delivery, which can take the
+    // rest of the hook's time, comes after. Session start and turn end tidy from 80% of a limit;
+    // any other event only a full spool, so a spool that stays past 80% does not cost every
+    // tool hook a pass.
+    let tidy = matches!(
+        payload.get("hook_event_name").and_then(Value::as_str),
+        Some("SessionStart" | "Stop")
+    );
+    let upkeep = tokio::task::spawn_blocking({
+        let spool = spool.clone();
+        move || (tidy || spool.usage().is_ok_and(|usage| usage.is_full())) && maintain(&spool)
+    });
     let (target, sharing) = match hub {
         Some(hub) => tokio::time::timeout_at(deadline, async {
             tokio::join!(
@@ -514,29 +527,11 @@ async fn capture_claude(
     if session_start {
         sweep_session_files();
     }
-    // Upkeep at each session start and turn end, so the spool never fills unnoticed. It runs after
-    // delivery, so what the Hub just accepted is compacted too, and within delivery's time: a pass
-    // cut short is not known full, and the next hook carries on.
-    let upkeep = || async {
-        if !matches!(event, Some("SessionStart" | "Stop")) {
-            return false;
-        }
-        let spool = spool.clone();
-        tokio::time::timeout_at(
-            deadline - Duration::from_millis(400),
-            tokio::task::spawn_blocking(move || maintain(&spool)),
-        )
+    let full = upkeep
         .await
-        .is_ok_and(|joined| joined.unwrap_or(false))
-    };
-    // Said at session start: whether this session shares, why not when it does not, and a full
-    // spool, which records only gaps until it has room.
-    let start_lines = |mode: CaptureModeV1, full: bool| {
-        let mut lines = vec![change_capture_client::sharing_state(mode, binding, sharing)];
-        if full {
-            lines.push(change_capture_client::store_full(binding));
-        }
-        lines
+        .unwrap_or_else(|_| spool.usage().is_ok_and(|usage| usage.is_full()));
+    let start_lines = |mode: CaptureModeV1| {
+        change_capture_client::session_start_lines(mode, binding, sharing, full)
     };
     let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
@@ -568,8 +563,7 @@ async fn capture_claude(
                     "AgentSCM local capture warning: native session has no current authorized work; a sanitized fact remains unassociated"
                 );
             }
-            let full = upkeep().await;
-            return session_start.then(|| start_lines(live_mode, full).join("\n\n"));
+            return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
         Err(_) => {
             let retained = claude_code::deferred_native_hook(
@@ -588,8 +582,7 @@ async fn capture_claude(
                     "AgentSCM local capture warning: current authorized work could not be resolved; a sanitized fact remains unassociated"
                 );
             }
-            let full = upkeep().await;
-            return session_start.then(|| start_lines(live_mode, full).join("\n\n"));
+            return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
     };
     let live_parent = payload
@@ -699,11 +692,10 @@ async fn capture_claude(
             eprintln!("AgentSCM local capture warning: retained records remain pending delivery")
         }
     }
-    let full = upkeep().await;
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
     }
-    let mut context = start_lines(capture_mode, full);
+    let mut context = start_lines(capture_mode);
     if capture_mode == CaptureModeV1::SharedConversation
         && let (Some(answer), Some(hub)) = (sharing.sharing(), hub)
         && answer.sharing
@@ -1020,7 +1012,7 @@ fn missed_replies(
 }
 
 /// Upkeep (`LocalSpool::upkeep`) that fails open. Answers whether the spool is still full, where
-/// capture records only gaps.
+/// capture records only gaps; when upkeep fails, whether it is full as it stands.
 fn maintain(spool: &LocalSpool) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1506,10 +1498,12 @@ mod tests {
         assert_eq!(taken[0], br#"{"prompt":"0"}"#);
         assert!(super::take_held_prompts(&path).is_empty());
     }
-    use agentscm::change_capture::{LocalSpool, ObservedStop, SpoolLimits};
+    use agentscm::change_capture::{
+        DeferredHookV1, DeferredReasonV1, LocalSpool, ObservedStop, SpoolLimits,
+    };
     use agentscm::change_record::{
         ActionOutcomeV1, AgentHarnessV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1,
-        CapturedEventKindV1, CapturedEventV1, SCHEMA_VERSION_V1, SessionIdentityV1,
+        CapturedEventKindV1, CapturedEventV1, GapReasonV1, SCHEMA_VERSION_V1, SessionIdentityV1,
     };
     use std::path::Path;
 
@@ -1609,6 +1603,11 @@ mod tests {
     /// A small spool at `root/spool`, filled until it refuses facts; `accepted` acknowledges each.
     fn filled_spool(root: &Path, accepted: bool) -> LocalSpool {
         let spool = LocalSpool::open_with_limits(root.join("spool"), SMALL).unwrap();
+        fill(&spool, accepted);
+        spool
+    }
+
+    fn fill(spool: &LocalSpool, accepted: bool) {
         for n in 0..100 {
             let envelope = batch(n);
             if spool.append(&envelope).is_err() {
@@ -1619,18 +1618,17 @@ mod tests {
             }
         }
         assert!(spool.usage().unwrap().is_full());
-        spool
     }
 
     /// Runs the capture hook for `event` as Claude Code sends it, and returns its context.
     fn hook(
-        root: &Path,
+        binding: &CaptureBinding,
         spool: &LocalSpool,
         event: &str,
         hub: Option<&CaptureHub>,
     ) -> Option<String> {
         let payload = serde_json::json!({
-            "session_id": "session_fixture", "hook_event_name": event, "cwd": root
+            "session_id": "session_fixture", "hook_event_name": event, "cwd": binding.root
         });
         let input = payload.to_string();
         tokio::runtime::Builder::new_current_thread()
@@ -1640,7 +1638,7 @@ mod tests {
             .block_on(super::capture_claude(
                 input.as_bytes(),
                 &payload,
-                &binding(root),
+                binding,
                 spool,
                 hub,
                 None,
@@ -1652,7 +1650,7 @@ mod tests {
         crate::client_config::in_isolated_config_home(|config| {
             let spool = filled_spool(config, true);
             let before = spool.usage().unwrap();
-            assert_eq!(hook(config, &spool, "Stop", None), None);
+            assert_eq!(hook(&binding(config), &spool, "Stop", None), None);
             let after = spool.usage().unwrap();
             assert!(
                 after.records < before.records && !after.is_full(),
@@ -1665,7 +1663,7 @@ mod tests {
     fn a_full_store_and_an_unknown_hub_answer_are_said_at_session_start() {
         crate::client_config::in_isolated_config_home(|config| {
             let spool = filled_spool(config, false);
-            let context = hook(config, &spool, "SessionStart", None).unwrap();
+            let context = hook(&binding(config), &spool, "SessionStart", None).unwrap();
             assert!(context.contains("local capture store is full"), "{context}");
             assert!(
                 context.contains("is unknown, because the Hub did not answer in time"),
@@ -1675,8 +1673,9 @@ mod tests {
         });
     }
 
-    /// A loopback Hub that says the repository shares, and answers 404 to everything else.
-    fn sharing_hub() -> String {
+    /// A loopback Hub that says the repository shares and, with `target`, that the session's
+    /// current Work is `TARGET_WORK`; it answers 404 to everything else.
+    fn sharing_hub(target: bool) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1687,12 +1686,20 @@ mod tests {
                 while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
                     head.push(byte[0]);
                 }
-                let (status, body) = if String::from_utf8_lossy(&head)
+                let head = String::from_utf8_lossy(&head);
+                let (status, body) = if head
                     .starts_with("GET /v1/hub/repos/acme%2Fwidgets/conversation-sharing ")
                 {
                     (
                         200,
                         r#"{"sharing":true,"notified":true,"enabled":true,"opted_out":false}"#,
+                    )
+                } else if target
+                    && head.starts_with("GET /v1/hub/repos/acme%2Fwidgets/change-records/current?")
+                {
+                    (
+                        200,
+                        r#"{"version":1,"work_id":"wrk_11111111111111111111111111111111","generation":1,"session_id":"session_fixture"}"#,
                     )
                 } else {
                     (404, "{}")
@@ -1709,27 +1716,35 @@ mod tests {
         url
     }
 
+    /// A client for the loopback Hub (`sharing_hub`), with a token under `config`, and its URL,
+    /// which a binding names to have its Work looked up there.
+    fn loopback(config: &Path, target: bool) -> (CaptureHub, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let token = config.join("token");
+        std::fs::write(&token, "synthetic-token").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let url = sharing_hub(target);
+        let hub = CaptureHub::new(crate::client_config::Connection {
+            root: config.into(),
+            origin_host: "github.com".into(),
+            hub: url.clone(),
+            repo: "acme/widgets".into(),
+            token_file: token,
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        })
+        .unwrap();
+        (hub, url)
+    }
+
     #[test]
     fn a_checkout_set_to_metadata_only_says_it_caps_a_sharing_repository_and_the_fix() {
-        use std::os::unix::fs::PermissionsExt;
         crate::client_config::in_isolated_config_home(|config| {
-            let token = config.join("token");
-            std::fs::write(&token, "synthetic-token").unwrap();
-            std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let hub = CaptureHub::new(crate::client_config::Connection {
-                root: config.into(),
-                origin_host: "github.com".into(),
-                hub: sharing_hub(),
-                repo: "acme/widgets".into(),
-                token_file: token,
-                report_completion: false,
-                owned_token_id: None,
-                owned_token_expires_at: None,
-                agents: Vec::new(),
-            })
-            .unwrap();
+            let (hub, _) = loopback(config, false);
             let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
-            let context = hook(config, &spool, "SessionStart", Some(&hub)).unwrap();
+            let context = hook(&binding(config), &spool, "SessionStart", Some(&hub)).unwrap();
             assert!(
                 context.contains("acme/widgets shares agent conversations, but this checkout's local setting is to record metadata only"),
                 "{context}"
@@ -1739,6 +1754,106 @@ mod tests {
                     && context.contains("--mode shared-conversation"),
                 "{context}"
             );
+        });
+    }
+
+    #[test]
+    fn a_store_full_of_accepted_records_makes_room_and_records_the_next_event() {
+        crate::client_config::in_isolated_config_home(|config| {
+            records_the_next_event_in_a_full_store(config, "Stop", CapturedEventKindV1::TurnEnded);
+        });
+    }
+
+    #[test]
+    fn a_tool_or_prompt_hook_also_makes_room_in_a_full_store() {
+        crate::client_config::in_isolated_config_home(|config| {
+            records_the_next_event_in_a_full_store(
+                config,
+                "UserPromptSubmit",
+                CapturedEventKindV1::UserPrompt,
+            );
+        });
+    }
+
+    /// A store filled to its limit with accepted records and holding unattached facts two days
+    /// old: the hook for `event` makes room before it writes, so its event is recorded and not a
+    /// gap, and the old facts are gone.
+    fn records_the_next_event_in_a_full_store(
+        config: &Path,
+        hook_event: &str,
+        kind: CapturedEventKindV1,
+    ) {
+        let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+        // Facts from before a session had Work, two days old: nothing reads them again.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for n in 1..=3_u64 {
+            spool
+                .retain_deferred(&DeferredHookV1 {
+                    occurrence_id: format!("evt:{n}"),
+                    reserved_sequence: Some(n),
+                    session_id: "session_before_work".into(),
+                    hook_event_name: "SessionStart".into(),
+                    observed_at: now - 2 * 24 * 60 * 60,
+                    reason: DeferredReasonV1::NoCurrentAuthorizedWork,
+                    input_digest: format!("{n:064x}"),
+                    event_kind: Some(CapturedEventKindV1::SessionStarted),
+                    tool_kind: None,
+                    source: None,
+                    recipe_digest: None,
+                    action_kind: None,
+                })
+                .unwrap();
+        }
+        fill(&spool, true);
+        let (hub, url) = loopback(config, true);
+        let bound = CaptureBinding {
+            hub: url,
+            ..binding(config)
+        };
+
+        assert_eq!(hook(&bound, &spool, hook_event, Some(&hub)), None);
+        let events: Vec<CapturedEventV1> = spool
+            .pending(100)
+            .unwrap()
+            .into_iter()
+            .flat_map(|envelope| match envelope {
+                CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(events.iter().any(|event| event.kind == kind), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.gap.as_ref().is_none_or(|gap| !matches!(
+                    gap.reason,
+                    GapReasonV1::LocalRetentionExpired | GapReasonV1::CaptureInterrupted
+                ))),
+            "{events:?}"
+        );
+        assert!(spool.deferred(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_store_never_says_sharing_is_on_at_session_start() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let spool = filled_spool(config, false);
+            let (hub, url) = loopback(config, false);
+            let shared = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::SharedConversation,
+                ..binding(config)
+            };
+            let context = hook(&shared, &spool, "SessionStart", Some(&hub)).unwrap();
+            assert!(context.contains("local capture store is full"), "{context}");
+            assert!(
+                context.contains("agentscm change-capture unconfigure --root"),
+                "{context}"
+            );
+            assert!(!context.contains("sharing is on"), "{context}");
         });
     }
 }
