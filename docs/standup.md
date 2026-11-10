@@ -382,8 +382,7 @@ agentscm work compact --database sqlite:///absolute/path/hub.sqlite \
 
 For a password-bearing PostgreSQL URL, select an existing environment variable instead of placing its value in command arguments or shell history: use `--database-env AGENTSCM_DATABASE_URL` in place of `--database`. The variable must already contain the intended database URL.
 
-The default is a dry run. Inspect its result before repeating the command with `--apply`. The cutoff is a Unix timestamp and must be at least 24 hours old. Compaction refuses while an unexpired, unacknowledged briefing or catch-up delivery
-depends on the repository’s history. It preserves current work, recent operation receipts and the historical baseline needed for retained snapshots. Later briefings explicitly report a retention gap when their acknowledgement boundary predates removed history.
+The default is a dry run. Inspect its result before repeating the command with `--apply`. The cutoff is a Unix timestamp and must be at least 24 hours old. Applying it ends every unacknowledged briefing or catch-up delivery whose window starts below history it removes, so a busy repository still compacts; continuing or acknowledging an ended delivery fails as an unknown delivery, and the agent's next read starts a new one that reports the gap. A delivery that reads no removed history keeps paging. It preserves current work, recent operation receipts and the historical baseline needed for retained snapshots. Later briefings explicitly report a retention gap when their acknowledgement boundary predates removed history.
 
 Merge observations have a separate retained limit of 100,000 rows and 512 MiB of
 accounted payload per repository. Ingestion that exceeds either limit fails with
