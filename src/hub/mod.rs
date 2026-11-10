@@ -49,7 +49,9 @@ pub mod provider_context;
 pub mod publish;
 pub mod refusal_outcomes;
 pub mod reply;
+mod repo_setup;
 mod repository_summary;
+mod retention;
 pub mod session;
 pub mod session_waiting;
 pub mod setup_attention;
@@ -500,14 +502,17 @@ pub fn router(state: HubState) -> Router {
     let router = Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
+        .merge(repo_setup::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
+        .merge(retention::routes())
         .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
+        .merge(external_runs::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

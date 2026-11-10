@@ -577,13 +577,20 @@ on no others:
 - `GET /v1/hub/repos/{repo}/intents`
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
+- `GET /v1/hub/repos/{repo}/forge-coordination` and `GET /v1/hub/repos/{repo}/slack` (what is
+  switched on for the repository, and the Hub's Slack direct messages for the token's owner; see
+  the [API](api.md#hub-repository-setup-reads))
 - `GET /v1/hub/health`, which needs no token
+- `GET /v1/hub/repos/{repo}/after-merge` (whether the Hub watches the repository's CI and
+  deployments after a merge)
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/overview`, `GET /v1/hub/standup/work?q=`
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
+- `POST /v1/hub/standup/preflight`, the exact-subject check: it changes no Work and records no
+  event, though it may store catch-up backfill and merge-observation rows
 - `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
   [weekly digest](#weekly-digest))
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
@@ -596,6 +603,8 @@ on no others:
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
+- `GET /v1/hub/repos/{repo}/retention` (the Hub's retention limits for the repository and the
+  stand-up bytes it holds now; see the [API](api.md#hub-retention))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,

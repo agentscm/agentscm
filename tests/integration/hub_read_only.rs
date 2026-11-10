@@ -53,7 +53,10 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
     row(&get, format!("{REPO}/pr-context?number=1"), "".into(), Allowed);
+    row(&get, format!("{REPO}/retention"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, format!("{REPO}/forge-coordination"), "".into(), Allowed);
+    row(&get, format!("{REPO}/slack"), "".into(), Allowed);
     row(&get, format!("{REPO}/change-records/wrk_missing"), "".into(), Status(404));
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
@@ -62,6 +65,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    // A preflight reads: the exact-subject check names overlaps, changes no Work and records no event.
+    row(&post, "/v1/hub/standup/preflight".into(), r#"{"request_key":"k","title":"Synthetic","session":"s","scope":["a.rs"]}"#.into(), Allowed);
     row(&get, "/v1/hub/standup/digest".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/digest/settings".into(), "".into(), Allowed);
     row(&put, "/v1/hub/standup/digest/settings".into(), r#"{"enabled":true}"#.into(), AgentOnly);
@@ -73,6 +78,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/why?path=../x".into(), "".into(), Status(400));
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/after-merge"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);
     for tool in ["agentscm_work_search", "agentscm_publications_list", "agentscm_workflow_runs_list"] {
         row(&post, "/mcp".into(), format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"q":"x"}}}}}}"#), Allowed);

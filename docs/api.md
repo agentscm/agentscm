@@ -122,6 +122,22 @@ identity, permission, generation and `updated_seq` in its own transaction. See
 MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
 `agentscm_work_transitions`.
 
+## Hub retention
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/retention` | Agent or read-only bearer token for that repository (another repository is 404); read-only |
+
+The reply names no person, Work item or record content: `repository`; `shared_conversations`
+(`retention_days`, `readable_by`, `deletable_early_by`); `work` (`payload_capacity_bytes`,
+`payload_used_bytes`, `compaction.after_seconds`, `compaction.interval_seconds`);
+`merge_observations` (`max_rows`, `max_bytes`); `catchup_deliveries.capacity_bytes`;
+`handoff_pickups` (`waits_seconds`, `retain_seconds`, `max_per_person`); and
+`capacity_refusals.retain_seconds`. Every figure but `payload_used_bytes` is a limit this Hub
+build enforces. `payload_used_bytes` is the stand-up payload the repository retains now, 0 for a
+repository that never wrote; it is the figure a write is refused against when it reaches
+`payload_capacity_bytes`.
+
 ## Hub PR context
 
 | Route | Token and effect |
@@ -134,6 +150,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | Work relationship route | Contract |
 | --- | --- |
 | `GET /v1/hub/standup/status` | Repository-scoped reader, read-only tokens allowed; bounded shared states, named recipients, personal actions, reservations, evidence digests and explicit coverage; advisory non-atomic reads, no generated prose required |
+| `POST /v1/hub/standup/preflight` | Repository-scoped reader, read-only tokens allowed (pinned by a test); the exact-subject, declared-scope and merge-window check, which names overlapping Work in `scope_overlaps`; it changes no Work and records no event, though it may store catch-up backfill and merge-observation rows |
 | `GET /v1/hub/standup/work/{id}/pr-link` | Repository-scoped reader; optional `expected_updated_seq` and `expected_head` comparisons |
 | `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
 | `POST /v1/hub/standup/issue-link` | Current native Work lead; fenced, idempotent set or explicit `link:null` removal of a caller-declared issue relationship |
@@ -183,6 +200,28 @@ same read as `agentscm_why`, and `agentscm why` resolves a path or line locally 
 
 
 The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
+
+## Hub repository setup reads
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/forge-coordination` | Agent or read-only bearer token for that repository (another repository is 404); read-only |
+| `GET /v1/hub/repos/{repo}/slack` | Same; what the Hub's Slack direct messages do for the token's owner there |
+
+`forge-coordination` replies `{"repository", "connected"}`, and when connected `forge`
+(`provider`, `host`, `connection_status`) and `outbound` (`enabled`, `switch`, `status_context`,
+`status_state`, `is_gate`). The switch belongs to the forge connection, so `enabled` covers every
+repository that connection has; `status_state` is always `success` and `is_gate` is `false`.
+
+`slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the Hub
+event kinds sent as direct messages as they happen; none has a switch of its own, and the
+[weekly digest](slack.md#weekly-digest) is not among them), `bound`, and for a bound person
+`reminders` (`enabled`, `interval_seconds`, `max_reminders`, `send_resolution`, and `escalation`
+with `after_seconds`, or `null`). It answers as a send would: `configured` is false once Slack
+reports the app uninstalled or its tokens revoked, and `bound` is true only while the token
+owner's binding in this repository has a live read-only token for them (a revoked or expired
+binding token is not bound), which is also what makes the Hub answer their `@AgentSCM` mentions.
+Slack user, team, app and bot IDs, files and tokens never appear.
 
 ## Hub change-record routes
 
@@ -491,6 +530,15 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
 
+`GET /v1/hub/repos/{repo}/after-merge` (agent or read-only bearer token for that repository;
+another repository is 404) says whether the Hub watches that repository after a merge:
+`{"repository", "provider", "connected", "supported", "watched", "opt_in"}`. It decides as the
+watcher does, from the repository the Hub has connected (looked up by the token's repository id)
+and that repository's current name: `connected` says the Hub has a connection for it,
+`supported` is true only when that connection is GitHub, and `watched` only when it is also
+listed in `opt_in`, which is `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A listed repository the Hub is not
+connected to is not watched, and `provider` is then the token owner's.
+
 ## Hub: requests and replies across versions
 
 The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
@@ -658,7 +706,6 @@ Registered codes:
 | `owner_disabled` | 409 | no | `ask_owner` |
 | `owner_wrong_forge` | 409 | no | `provide_field` |
 | `repository_renamed` | 409 | no | `inspect_work` |
-
 
 ## HTTP boundaries
 

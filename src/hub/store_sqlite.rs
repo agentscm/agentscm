@@ -15453,6 +15453,24 @@ impl Store for SqliteStore {
         Ok(scopes)
     }
 
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT charged_bytes FROM hub_work_usage
+                 WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4",
+                params![
+                    scope.provider,
+                    scope.host,
+                    scope.repository,
+                    scope.repository_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
     fn work_briefing_preview_for(
         &self,
         token: &str,
