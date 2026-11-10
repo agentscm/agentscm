@@ -320,6 +320,12 @@ impl Requests {
         if principal.read_only || now >= principal.expires_at {
             return Err(HubError::Unauthorized.into());
         }
+        // The person's page finds requests by repository id; without one nobody could answer.
+        if principal.repository_id.is_none() {
+            return Err(Refusal::Invalid(
+                "this agent token is not bound to a repository".into(),
+            ));
+        }
         let Registration {
             session,
             agent_id,

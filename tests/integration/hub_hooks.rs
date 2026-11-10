@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use agentscm::backend::LocalBackend;
 use agentscm::hub::store::{
-    self, ForgeIdentity, Store, agent_token_digest, lower_hex_of, mint_agent_token, unix_now,
+    self, ForgeIdentity, Store, agent_token_digest, lower_hex_of, mint_agent_token,
+    mint_bound_agent_token, unix_now,
 };
 use agentscm::hub::work::{WorkRole, WorkStart, WorkState};
 use agentscm::hub::{HubState, router};
@@ -1377,7 +1378,23 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_permission_request_needs_its_wait_and_the_hosts_notice_and_ends_with_the_wait() {
     let mut hub = Hub::start().await;
-    let (secret, other) = (hub.agent(), hub.agent());
+    let unbound = hub.agent();
+    // Bound to the repository's id, as a connected checkout's token is.
+    let bound = |user_id: i64| {
+        let identity = ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        let login = format!("bound{user_id}");
+        let user = hub.store.upsert_user(&identity, &login).unwrap();
+        mint_bound_agent_token(&*hub.store, &user.id, "agent", REPO, 4242, 3600, false)
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+    };
+    let (secret, other) = (bound(101), bound(102));
     let prompt = fixture("claude-PermissionRequest");
     let session = prompt["session_id"].clone();
     let hash = "a".repeat(64);
@@ -1398,8 +1415,10 @@ async fn a_permission_request_needs_its_wait_and_the_hosts_notice_and_ends_with_
         "{refused}"
     );
     hub.hook("claude", &secret, &prompt);
-    // Another token has no such wait; a bad hash and a field the Hub does not take are refused.
+    // Another token has no such wait. A token with no repository id, a bad hash and a field the
+    // Hub does not take are refused.
     assert_eq!(call("register", &other, &register).0, 409);
+    assert_eq!(call("register", &unbound, &register).0, 400);
     let mut bad = register.clone();
     bad["input_hash"] = json!("short");
     assert_eq!(call("register", &secret, &bad).0, 400);
