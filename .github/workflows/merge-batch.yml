@@ -47,7 +47,7 @@ jobs:
         with:
           tool: nextest@0.9.148
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Interim: formatting and Clippy run here while the signed local check is optional evidence.
+      # Formatting and Clippy gate every merge here; the signed local check is optional evidence.
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
