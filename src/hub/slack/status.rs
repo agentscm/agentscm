@@ -183,11 +183,11 @@ fn entry_message(item: &WorkItem, repository: &str, link: &str) -> Option<Value>
             "Answer the blocker where your agent is running, or reassign the task.",
             item.blocker.as_ref(),
         ),
-        WorkState::Handover => (
+        WorkState::Handover if item.blocker.is_some() => (
             "Work is offered for handover",
-            "Handover note",
-            "Review the handover in the Hub. Pick an agent to take it over.",
-            item.current.as_ref(),
+            "Blocked on",
+            "Resolve the reported blocker where your agent is running, or reassign the task.",
+            item.blocker.as_ref(),
         ),
         _ => return None,
     };
@@ -918,7 +918,8 @@ fn confirmed_cleared(
                 return Ok(false);
             };
             let cleared = item.generation != *generation
-                || matches!(item.state, WorkState::Active | WorkState::Finished);
+                || matches!(item.state, WorkState::Active | WorkState::Finished)
+                || (item.state == WorkState::Handover && item.blocker.is_none());
             let same = state
                 .store
                 .work_get(&principal.token_id, id, now)?

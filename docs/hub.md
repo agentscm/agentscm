@@ -309,7 +309,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
   `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
   short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
-  is the shared status count of what asks this person (see [shared actionable status](standup.md#shared-actionable-status)): their own agent waiting for them, Work its agent reported blocked, a handover, a failed required check, a stopped workflow gate and an agent setup problem. What agents settle between themselves is not counted: quiet or paused work, a merged task still to close, declared-scope overlaps, a file two agents hold, a pull request over a held file and a request from one agent to another. A refused role or a
+  is the shared status count of what asks this person (see [shared actionable status](standup.md#shared-actionable-status)): their own agent waiting for them, Work its agent reported blocked, a handover with an unresolved blocker, a failed required check, a stopped workflow gate and an agent setup problem. What agents settle between themselves is not counted: quiet or paused work, a routine handover, a merged task still to close, declared-scope overlaps, a file two agents hold, a pull request over a held file and a request from one agent to another. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each

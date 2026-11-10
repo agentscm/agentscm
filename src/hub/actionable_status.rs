@@ -242,7 +242,7 @@ pub fn project_work(
     if quiet && wait == LeadWait::Unknown {
         limits.insert("lead_wait_unknown".to_owned());
     }
-    // A row asks a person only for what no agent settles: a handover, a reported blocker or its
+    // A row asks a person only for what no agent settles: a reported blocker or its
     // reassessment. Set where it does not ask the person its recipient names: their own action
     // asks them already, or their agent settles it.
     let mut not_the_persons = false;
@@ -314,10 +314,17 @@ pub fn project_work(
             "Inspect the recorded outcome and its provenance.",
         )
     } else if item.state == WorkState::Handover {
+        // Handover is an agent follow-up, regardless of merge coverage or reservation state.
+        // An unresolved structured blocker is the exception; free-form next steps are reports.
+        not_the_persons = item.blocker.is_none();
         (
             StatusState::AwaitingParty,
-            owner(item),
-            "Review the handover and choose the next responsible party.",
+            if item.blocker.is_some() {
+                owner(item)
+            } else {
+                lead(item)
+            },
+            "Its lead reviews the handover and completes or resumes the remaining Work.",
         )
     } else if current.is_some_and(|r| !r.reassessments.is_empty()) {
         (
@@ -391,7 +398,19 @@ pub fn project_work(
         state,
         recipient,
         needs_you,
-        action: action.into(),
+        action: if consistent && item.state == WorkState::Handover {
+            item.blocker.as_ref().map_or_else(
+                || action.to_owned(),
+                |blocker| {
+                    format!(
+                        "Resolve the handover's reported blocker: {}",
+                        crate::hub::advice::sanitize(&blocker.summary, 240)
+                    )
+                },
+            )
+        } else {
+            action.into()
+        },
         reported_next_action: item.next_action.clone(),
         freshness,
         operational: StatusOperational {
@@ -1179,13 +1198,13 @@ mod tests {
         );
     }
     #[test]
-    fn handover_names_a_person_and_preserves_reservation() {
+    fn routine_handover_names_its_lead_and_preserves_reservation() {
         let item = item(WorkState::Handover);
         let row = project_work(&item, op(&item, true, false), None, NotWaiting, "usr_owner");
         assert_eq!(row.state, StatusState::AwaitingParty);
-        assert_eq!(row.recipient.kind, RecipientKind::Person);
-        assert_eq!(row.recipient.login.as_deref(), Some("owner"));
-        assert!(row.needs_you);
+        assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+        assert_eq!(row.recipient.login.as_deref(), Some("lead"));
+        assert!(!row.needs_you);
         assert_eq!(row.operational.reservation.status, ReservationStatus::Held);
     }
     #[test]
@@ -1273,8 +1292,16 @@ mod tests {
         }
     }
     #[test]
-    fn handover_keeps_human_recipient_with_current_reassessment_and_merged_reservation() {
-        let item = item(WorkState::Handover);
+    fn handover_keeps_unresolved_blocker_with_reassessment_and_merged_reservation() {
+        let mut item = item(WorkState::Handover);
+        item.blocker = Some(
+            serde_json::from_value(json!({
+                "kind":"blocker", "summary":"Owner must select the deployment region",
+                "next_action":null, "source_refs":[], "at":100, "token":"tok_lead",
+                "agent":"agent", "session":"session", "generation":1
+            }))
+            .unwrap(),
+        );
         let row = project_work(
             &item,
             op(&item, true, true),
@@ -1286,6 +1313,10 @@ mod tests {
         assert_eq!(row.recipient.kind, RecipientKind::Person);
         assert_eq!(row.recipient.owner.as_deref(), Some("usr_owner"));
         assert!(row.needs_you);
+        assert!(
+            row.action
+                .contains("Owner must select the deployment region")
+        );
         assert_eq!(row.operational.reservation.status, ReservationStatus::Held);
         assert!(row.operational.merge.hidden_by_merged_pr);
         assert!(row.reconciliation.as_ref().unwrap().current);
@@ -1297,6 +1328,46 @@ mod tests {
             "usr_lead",
         );
         assert!(!lead_row.needs_you);
+    }
+    #[test]
+    fn routine_handover_is_agent_follow_up_for_every_merge_and_reservation_state() {
+        let mut item = item(WorkState::Handover);
+        // Words in a reported next step do not constitute a structured blocker.
+        item.next_action = Some("Ask owner for permission; merged PR may be partial".into());
+        for reservation in [
+            ReservationStatus::Held,
+            ReservationStatus::Lapsed,
+            ReservationStatus::None,
+        ] {
+            for merge in [
+                MergeStatus::Observed,
+                MergeStatus::Unknown,
+                MergeStatus::None,
+            ] {
+                for viewer in ["usr_owner", "usr_lead", "usr_other"] {
+                    let mut operational = op(&item, true, merge == MergeStatus::Observed);
+                    operational.reservation.status = reservation;
+                    operational.merge.status = merge;
+                    let expected = operational.clone();
+                    let row = project_work(
+                        &item,
+                        operational,
+                        Some(reassessment(&item)),
+                        NotWaiting,
+                        viewer,
+                    );
+                    assert_eq!(row.state, StatusState::AwaitingParty);
+                    assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+                    assert_eq!(row.recipient.owner.as_deref(), Some("usr_lead"));
+                    assert!(!row.needs_you);
+                    assert_eq!(row.operational.reservation.status, reservation);
+                    assert_eq!(row.operational.merge, expected.merge);
+                    assert_eq!(row.operational.outcome, expected.outcome);
+                    assert_eq!(row.reported_next_action, item.next_action);
+                    assert!(row.reconciliation.as_ref().unwrap().current);
+                }
+            }
+        }
     }
     #[test]
     fn only_current_matching_reconciliation_can_request_reassessment() {
@@ -2884,6 +2955,112 @@ mod tests {
         needs_you_contract(&*store);
     }
 
+    fn handover_attention_contract(store: &dyn Store) {
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 711,
+                },
+                "synthetic-handover-owner",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(store, &user.id, "agent", "acme/widgets", 101, 3600, false)
+                .unwrap();
+        let principal = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        for blocked in [false, true] {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key":format!("handover-{blocked}"), "title":"Synthetic handover",
+                "session":format!("handover-{blocked}"), "scope":[format!("src/{blocked}.rs")]
+            }))
+            .unwrap();
+            let mut item = store
+                .work_start(&principal.token_id, &request, now)
+                .unwrap()
+                .item;
+            let kinds = if blocked {
+                vec![CheckpointKind::Blocker, CheckpointKind::Handover]
+            } else {
+                vec![CheckpointKind::Handover]
+            };
+            for (index, kind) in kinds.into_iter().enumerate() {
+                item = store
+                    .work_checkpoint(
+                        &principal.token_id,
+                        &WorkCheckpoint {
+                            work_id: item.id.clone(),
+                            operation_id: format!("handover-{blocked}-{index}"),
+                            generation: item.generation,
+                            session: item.lead_session.clone(),
+                            expected_updated_seq: Some(item.updated_seq),
+                            kind,
+                            summary: if kind == CheckpointKind::Blocker {
+                                "Choose a deployment region".into()
+                            } else {
+                                "Hand over the remaining work".into()
+                            },
+                            next_action: Some("Ask owner; pull request merged".into()),
+                            scope: None,
+                            branch: None,
+                            worktree: None,
+                            resolve_blocker: false,
+                            source_refs: vec![],
+                            depends_on: vec![],
+                            related_work: vec![],
+                        },
+                        now,
+                    )
+                    .unwrap()
+                    .item;
+            }
+        }
+        for at in [now, now + LEASE_SECONDS + 1] {
+            let token = read(store, &principal, at).unwrap();
+            let person = read_person(store, &user, "acme/widgets", 101, at).unwrap();
+            assert_eq!(token, person);
+            assert_eq!(token.work.len(), 2);
+            assert_eq!(token.counts.needs_you, 1);
+            assert_eq!(token.counts.awaiting_party, 2);
+            for row in &token.work {
+                assert_eq!(row.state, StatusState::AwaitingParty);
+                if row.needs_you {
+                    assert_eq!(row.recipient.kind, RecipientKind::Person);
+                    assert!(row.action.contains("Choose a deployment region"));
+                } else {
+                    assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+                }
+                assert_eq!(
+                    row.operational.outcome.value,
+                    crate::hub::work_lifecycle::OutcomeValue::None
+                );
+            }
+            assert!(render_text(&token).contains("1 actions need you"));
+            assert!(render_compact_text(&token).contains("1 actions need you"));
+        }
+    }
+
+    #[test]
+    fn sqlite_handovers_keep_only_unresolved_blockers_personal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        handover_attention_contract(&*store);
+    }
+
+    #[test]
+    fn handovers_keep_only_unresolved_blockers_personal_on_postgres() {
+        on_postgres(handover_attention_contract);
+    }
+
     #[test]
     fn needs_you_counts_match_the_shared_fixture_on_postgres() {
         on_postgres(needs_you_contract);
@@ -3114,6 +3291,16 @@ mod tests {
             });
             source.id = expected.work_id.clone();
             source.title = expected.title.clone();
+            if source.state == WorkState::Handover && expected.needs_you {
+                source.blocker = Some(
+                    serde_json::from_value(json!({
+                        "kind":"blocker", "summary":"Owner must select the deployment region",
+                        "next_action":null, "source_refs":[], "at":100, "token":"tok_lead",
+                        "agent":"codex", "session":"session", "generation":1
+                    }))
+                    .unwrap(),
+                );
+            }
             let recipient = &expected.recipient;
             source.owner = recipient.owner.clone().unwrap();
             source.owner_login = recipient.login.clone().unwrap();
