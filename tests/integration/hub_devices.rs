@@ -1105,6 +1105,11 @@ impl Machine {
 
     /// One SessionStart hook in the checkout; returns the hook's JSON reply.
     fn session_start(&self, session: &str) -> Value {
+        self.session_start_in(&self.root(), session)
+    }
+
+    /// One SessionStart hook whose working directory is `cwd`.
+    fn session_start_in(&self, cwd: &std::path::Path, session: &str) -> Value {
         use std::io::Write;
         let mut child = self
             .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
@@ -1113,7 +1118,7 @@ impl Machine {
             .spawn()
             .unwrap();
         let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": self.root(), "source": "startup"});
+            "cwd": cwd, "source": "startup"});
         child
             .stdin
             .take()
@@ -1148,7 +1153,11 @@ impl Machine {
     }
 
     fn mcp(&self) -> Mcp {
-        let root = self.root();
+        self.mcp_at(&self.root())
+    }
+
+    /// A `client mcp` server started with `--root root`.
+    fn mcp_at(&self, root: &std::path::Path) -> Mcp {
         let mut child = self
             .command(&[
                 "--no-telemetry",
@@ -1558,6 +1567,77 @@ async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
     );
     assert_eq!(work(OTHER).len(), 1);
     assert!(work(REPO).is_empty());
+}
+
+/// A Claude Code session in a linked worktree that has its own connection is one agent: the
+/// MCP server, started in the main checkout, declares Work under the worktree connection the
+/// session's hooks use, not under the main checkout's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_agent() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let main = machine.root();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let linked = machine.home.path().join("linked");
+    git(&["worktree", "add", "-q", linked.to_str().unwrap()]);
+    let linked = linked.canonicalize().unwrap();
+    for (root, own) in [(&main, false), (&linked, true)] {
+        let mut args = vec!["--no-telemetry", "client", "connect"];
+        if own {
+            args.push("--own-connection");
+        }
+        args.extend(["--hub", &env.hub, "--provider", "github", "--root"]);
+        args.push(root.to_str().unwrap());
+        let (ok, _, stderr) = machine.run(&args);
+        assert!(ok, "{stderr}");
+    }
+
+    machine.session_start_in(&linked, "native-1");
+    let mut mcp = machine.mcp_at(&main);
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the worktree", "session": "native-1"}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    // The same repository, so the reply does not claim it left the session's repository.
+    assert!(!started["content"].to_string().contains("this call went to"));
+    // A session no hook routed stays on the main checkout's connection.
+    let default = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the main checkout", "session": "native-2"}),
+    );
+    assert_ne!(default["isError"], true, "{default}");
+
+    let connections = machine.file("connections.json");
+    let token = connections["connections"][0]["owned_token_id"]
+        .as_str()
+        .unwrap();
+    let query = agentscm::hub::work::WorkOverviewQuery::default();
+    let current = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let lead = |task: &str| {
+        let work = current.iter().find(|work| work.title == task).unwrap();
+        work.lead_agent.clone()
+    };
+    let (worktree_agent, main_agent) = (
+        lead("Work in the worktree"),
+        lead("Work in the main checkout"),
+    );
+    assert_ne!(worktree_agent, main_agent, "{current:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
