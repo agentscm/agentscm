@@ -1236,7 +1236,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
          "inputSchema": schema(json!({
              "id": {"type": "string", "description": "The message id (msg_...)."},
              "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
-             "session": session}), &["id", "status"])},
+             "session": session}), &["id", "status", "session"])},
         {"name": "agentscm_view_settings",
          "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -1601,8 +1601,9 @@ async fn call(
     }
     // What the session's own person sent it from the Hub page rides on its next tool call. Only a
     // call naming its own session takes it: without one the Hub would guess the token's recent hook
-    // session. A session whose hook carries context takes it there, where subagents are excluded;
-    // an MCP call cannot say whether a subagent made it.
+    // session. An MCP call cannot say whether a subagent made it, so it takes messages only for a
+    // session a top-level hook call has shown and whose hook cannot carry them; a hook that can
+    // takes them itself, where subagents are excluded.
     if !principal.read_only
         && let Some(requested) = params
             .and_then(|p| p["arguments"]["session"].as_str())
@@ -1614,7 +1615,7 @@ async fn call(
             let now = unix_now();
             let session = store.session_name_for(&scope.token_id, Some(requested.as_str()), now)?;
             super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
-            if super::agent_messages::hook_delivers(&scope.token_id, &session) {
+            if !super::agent_messages::mcp_delivers(&scope.token_id, &session) {
                 return Ok(None);
             }
             super::agent_messages::take(&*store, &scope, &session, "mcp", now)
@@ -2098,7 +2099,7 @@ async fn call_inner(
             match blocking(state, move || {
                 let now = unix_now();
                 let session =
-                    store.session_name_for(&scope.token_id, args.session.as_deref(), now)?;
+                    store.session_name_for(&scope.token_id, Some(args.session.as_str()), now)?;
                 super::agent_messages::answer(&*store, &scope, &session, &args.id, args.status, now)
             })
             .await

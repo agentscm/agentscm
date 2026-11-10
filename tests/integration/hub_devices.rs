@@ -4077,7 +4077,8 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(page0["mode"], "manual", "{page0}");
     assert_eq!(page0["sessions"], json!([]));
 
-    // An MCP-only client: its initialize names it, its first call names its session.
+    // Gemini CLI: its initialize names it, its first call names its session. MCP alone does not
+    // show that a person leads the session rather than a subagent, so its tier is unknown.
     mcp_call(
         &env,
         &alice_secret,
@@ -4090,7 +4091,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
     let seen = read().await;
     let session = seen["sessions"][0].clone();
-    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["tier"], "unknown", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4127,10 +4128,25 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // A call that names no session never takes it.
+    // A call that names no session never takes it, and nor does a session shown only by MCP.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
     let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
     assert!(!unnamed.contains(&id), "{unnamed}");
+    let held = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!held.contains(&id), "{held}");
+
+    // Its hook's start carries no subagent marker, and that hook cannot carry context.
+    let response = browser()
+        .post(format!("{}/v1/hub/hook/generic", env.hub))
+        .bearer_auth(&alice_secret)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"event":"start","agent":"gemini","session":"s1"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let seen = read().await;
+    assert_eq!(seen["sessions"][0]["tier"], "mcp", "{seen}");
 
     // Delivered once, in the next tool result, as a notice that names no mode.
     let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
@@ -4161,6 +4177,14 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(forged["isError"], true, "{forged}");
+    // Without its session the Hub does not guess one: it asks for the field.
+    let unnamed = json!({"name":"agentscm_hub_message",
+        "arguments":{"id": id, "status": "accepted"}});
+    let unnamed = mcp_call(&env, &alice_secret, "tools/call", unnamed).await;
+    assert_eq!(unnamed["isError"], true, "{unnamed}");
+    let error = &unnamed["structuredContent"]["error"];
+    assert_eq!(error["recovery"]["action"], "provide_field", "{unnamed}");
+    assert_eq!(error["fields"][0]["name"], "session", "{unnamed}");
     let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
     assert_eq!(ok["isError"], false, "{ok}");
     let verified = texts(&ok);
@@ -4174,9 +4198,13 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(read().await["messages"][0]["state"], "done");
 
     // A hook client gets it in the next prompt's added context, with no tool call.
-    let hook = |session: &str| {
+    let hook = |session: &str, subagent: bool| {
         let (hub, secret) = (env.hub.clone(), alice_secret.clone());
-        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        let mut body =
+            json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        if subagent {
+            body["agent_id"] = json!("sub-1");
+        }
         async move {
             let response = browser()
                 .post(format!("{hub}/v1/hub/hook/claude"))
@@ -4189,7 +4217,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
             serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
         }
     };
-    hook("h1").await;
+    hook("h1", false).await;
     let h1 = read().await["sessions"]
         .as_array()
         .unwrap()
@@ -4208,12 +4236,36 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 201);
-    let reply = hook("h1").await;
+    let reply = hook("h1", false).await;
     let context = reply["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
     assert!(context.contains("Auto please"), "{reply}");
     assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // A session seen only through a subagent's hook calls is offered nothing.
+    hook("sub1", true).await;
+    let sub = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude" && s["session"] != h1.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(sub["tier"], "unknown", "{sub}");
+    let sub = sub["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &sub, "Not for a subagent"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("sub1", true).await;
+    assert!(!reply.to_string().contains("Not for a subagent"), "{reply}");
+    assert_eq!(read().await["messages"][0]["state"], "queued");
 
     // Ignore holds everything: sending is refused.
     let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});
