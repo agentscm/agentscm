@@ -58,7 +58,9 @@ the forge did not accept the code. What signing in gives you:
   the next session. In a repository no such Hub has, the check stays silent, and that Hub is not
   asked about it again for an hour. A Hub that sees your origin is a fork of a repository it has
   says so, and names the repository to use as `origin`. Any other attempt is retried after five
-  minutes.
+  minutes. The agent's start context also names the other repositories connected on this computer,
+  and an AgentSCM call with absolute paths in one of them, or with `root` set to its checkout, goes
+  to that repository.
 - **Tokens renew.** An agent token minted through this computer lasts 24 hours. When less than 12
   hours are left, the next hook call renews it in the background: the Hub re-checks your access, a
   new token is saved, and the old one is revoked. A running MCP server switches to the new token.
@@ -210,6 +212,7 @@ remains for a Hub page served elsewhere.
   browser that cannot read files in your config directory (for example some sandboxed Linux
   browser packages), or a computer where `.html` files open in an editor, does not open the page;
   `agentscm open` prints the file to open by hand.
+- The MCP server fills in an omitted session from the start hook's record on macOS and Linux only.
 - The page runs on this computer only. Over SSH, `agentscm open` has no local browser to hand the
   connection to; use the team's Hub there, with the manual setup for files.
 - Templates and Timeline read a native workspace chosen with `agentscm serve --timeline-workspace`;

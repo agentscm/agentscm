@@ -63,40 +63,46 @@ impl Viewer<'_> {
             .map_or(fallback, |p| (Some(p.owner.as_str()), p.token.as_str()))
     }
 
+    /// A checkpoint of a Work with these `participants`; an author not among them is shown as
+    /// another owner's.
+    pub(super) fn checkpoint(self, participants: &[WorkParticipant], checkpoint: &mut Checkpoint) {
+        let author = participants
+            .iter()
+            .find(|p| p.token == checkpoint.token && p.session == checkpoint.session)
+            .map(|p| p.owner.as_str());
+        let Checkpoint {
+            token,
+            agent,
+            session,
+            source_refs,
+            ..
+        } = checkpoint;
+        for reference in source_refs {
+            if let SourceRef::CapturedEvent { session_id, .. } = reference {
+                let (owner, by) =
+                    Self::capturer(participants, session_id, (author, token.as_str()));
+                self.session(owner, by, session_id);
+            }
+        }
+        self.agent(author, token, agent, session);
+    }
+
     pub(super) fn work(self, item: &mut WorkItem) {
-        // Owners come from the stored participants; a lead or author not among them is shown as
-        // another owner's.
+        // Owners come from the stored participants; a lead not among them is shown as another
+        // owner's.
         let participants = item.participants.clone();
-        let owner_of = |token: &str, session: &str| {
-            participants
-                .iter()
-                .find(|p| p.token == token && p.session == session)
-                .map(|p| p.owner.clone())
-        };
-        let lead = owner_of(&item.lead_token, &item.lead_session);
+        let lead = participants
+            .iter()
+            .find(|p| p.token == item.lead_token && p.session == item.lead_session)
+            .map(|p| p.owner.as_str());
         self.agent(
-            lead.as_deref(),
+            lead,
             &item.lead_token,
             &mut item.lead_agent,
             &mut item.lead_session,
         );
         for checkpoint in [&mut item.current, &mut item.blocker].into_iter().flatten() {
-            let author = owner_of(&checkpoint.token, &checkpoint.session);
-            let Checkpoint {
-                token,
-                agent,
-                session,
-                source_refs,
-                ..
-            } = checkpoint;
-            for reference in source_refs {
-                if let SourceRef::CapturedEvent { session_id, .. } = reference {
-                    let fallback = (author.as_deref(), token.as_str());
-                    let (owner, by) = Self::capturer(&participants, session_id, fallback);
-                    self.session(owner, by, session_id);
-                }
-            }
-            self.agent(author.as_deref(), token, agent, session);
+            self.checkpoint(&participants, checkpoint);
         }
         for p in &mut item.participants {
             self.agent(Some(&p.owner), &p.token, &mut p.agent, &mut p.session);

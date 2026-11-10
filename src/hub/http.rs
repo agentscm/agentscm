@@ -674,6 +674,24 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "work_storage_capacity");
         assert_eq!(body["limit"], "coordination_requests");
-        assert_eq!(body["recovery"]["action"], "contact_operator");
+        // The agent clears this limit itself; compaction cannot.
+        assert_eq!(body["recovery"]["action"], "inspect_work");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.starts_with("Too many coordination requests are open: at most 8 are open per agent token, 25 per person and 100 per repository"), "{message}");
+        assert!(
+            message.contains("agentscm_coordination_withdraw"),
+            "{message}"
+        );
+        assert!(!message.contains("compact"), "{message}");
+        // Full storage still goes to the operator.
+        let storage = crate::hub::error_envelope::from_hub_error(&HubError::capacity(
+            super::super::capacity::CapacityLimit::WorkStorage,
+            None,
+        ));
+        assert_eq!(
+            storage.recovery.action,
+            crate::hub::error_envelope::RecoveryAction::ContactOperator
+        );
+        assert!(storage.message.contains("compact"));
     }
 }

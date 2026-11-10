@@ -26,6 +26,9 @@ pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
 /// The start of the refusal of an edit not linked to a current assignment of its session. Like
 /// `LEASE_LAPSED`, it holds for every repeat until a start or checkpoint links the edit.
 pub const EDIT_UNLINKED: &str = "EDIT_UNLINKED";
+/// The start of the one refusal a session meets at its first edit while it has declared no Work.
+/// Unlike `EDIT_UNLINKED`, a repeat of the edit passes.
+pub const WORK_UNDECLARED: &str = "WORK_UNDECLARED";
 /// Participants from owners other than the Work's own. The rest of the 100 participants stay for
 /// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
 pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;
@@ -45,22 +48,34 @@ pub(super) enum Unheld {
     UnnamedStart,
 }
 
-/// The refusal on Work `id` whose lease, last renewed at `renewed`, lapsed at `expired` while
-/// nothing took its scope: it must be held again through fresh admission first.
-pub(super) fn lapsed_unheld_text(id: &str, renewed: i64, expired: i64, what: Unheld) -> String {
+/// How a lead whose MCP tools are bound to another repository reaches this one: the CLI, run in
+/// the file's own checkout, which is bound to it.
+pub(super) const OTHER_REPOSITORY_ROUTE: &str = "If your AgentSCM tools are bound to another repository, that call reaches the wrong one: run `agentscm work start` inside this file's checkout instead, with the same work_id, takeover_generation and session, and the Work's title, as JSON on standard input.";
+
+/// The refusal on Work `id` at `generation` whose lease, last renewed at `renewed`, lapsed at
+/// `expired` while nothing took its scope: it must be held again through fresh admission first,
+/// which needs the current generation.
+pub(super) fn lapsed_unheld_text(
+    id: &str,
+    generation: i64,
+    renewed: i64,
+    expired: i64,
+    what: Unheld,
+) -> String {
+    let start = format!("agentscm_start with work_id {id}, takeover_generation {generation}");
     let what = match what {
         Unheld::Edit => {
-            format!("Hold it again before editing: the lead runs agentscm_start with work_id {id}")
+            format!("Hold it again before editing: the lead runs {start} and its session")
         }
-        Unheld::Retain => format!(
-            "A retain cannot revive it: hold it again with agentscm_start with work_id {id}"
-        ),
+        Unheld::Retain => {
+            format!("A retain cannot revive it: hold it again with {start} and its session")
+        }
         Unheld::UnnamedStart => format!(
-            "This start names no session, so it cannot hold it again: the lead runs agentscm_start with work_id {id} and its session named"
+            "This start names no session, so it cannot hold it again: the lead runs {start} and its session named"
         ),
     };
     format!(
-        "{LEASE_LAPSED}: the hold on {id} lapsed at Unix {expired}, {} minutes after its lead session last renewed it. Nothing held the scope when this was refused, but other Work may take it at any time. {what}; a helper rejoins after that.",
+        "{LEASE_LAPSED}: the hold on {id} lapsed at Unix {expired}, {} minutes after its lead session last renewed it. Nothing held the scope when this was refused, but other Work may take it at any time. {what}; a helper rejoins after that. {OTHER_REPOSITORY_ROUTE}",
         held_minutes(renewed, expired)
     )
 }
@@ -88,7 +103,7 @@ pub(super) fn lapsed_refusal_text(
         None => holder.to_owned(),
     };
     format!(
-        "{LEASE_LAPSED}: your hold on {id} lapsed at Unix {expired}, {} minutes after this session last renewed it, and {holder} took the scope then. {branch} may hold unpushed work: push or set it aside before you continue. Resume with agentscm_start work_id {id} takeover_generation {generation}, a fresh admission that conflicts while the scope is held.",
+        "{LEASE_LAPSED}: your hold on {id} lapsed at Unix {expired}, {} minutes after this session last renewed it, and {holder} took the scope then. {branch} may hold unpushed work: push or set it aside before you continue. Resume with agentscm_start work_id {id} takeover_generation {generation}, a fresh admission that conflicts while the scope is held. {OTHER_REPOSITORY_ROUTE}",
         held_minutes(renewed, expired)
     )
 }

@@ -569,6 +569,7 @@ async fn protocol_basics() {
             "agentscm_contribution_receipt",
             "agentscm_receipt_settings",
             "agentscm_work_search",
+            "agentscm_why",
             "agentscm_publications_list",
             "agentscm_workflow_runs_list",
             "agentscm_work_usage",
@@ -2509,6 +2510,58 @@ fn publication(branch: &str) -> agentscm::hub::publish::NewPublication {
         id: agentscm::hub::publish::derive_id(REPO, 3, &"b".repeat(40), branch),
         manifest,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn why_answers_the_same_over_mcp_and_http() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "why-agent");
+    let started = hub
+        .tool_result(
+            &secret,
+            "agentscm_start",
+            json!({"task": "Why over MCP", "request_key": "why-mcp", "session": "why-mcp",
+                "paths": ["src/why_mcp.rs"]}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let mcp = hub
+        .tool_result(&secret, "agentscm_why", json!({"path": "src/why_mcp.rs"}))
+        .await;
+    assert_eq!(mcp["isError"], false, "{mcp}");
+    let body = &mcp["structuredContent"];
+    assert_eq!(body["known"], true, "{body}");
+    assert_eq!(body["path"], "src/why_mcp.rs");
+    assert_eq!(body["work"][0]["title"], "Why over MCP");
+    assert_eq!(body["work"][0]["relation"], "scope");
+    assert_eq!(body["work"][0]["decisions"], json!([]));
+    let http = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/why?path=src/why_mcp.rs",
+            Some(&secret),
+            "",
+        )
+        .await;
+    assert_eq!(http.status, 200, "{}", http.text);
+    assert_eq!(http.json(), *body);
+    let unknown = hub
+        .tool_result(&secret, "agentscm_why", json!({"commit": "0".repeat(40)}))
+        .await;
+    assert_eq!(unknown["structuredContent"]["known"], false, "{unknown}");
+    for arguments in [json!({}), json!({"path": "../x"}), json!({"commit": "ABC"})] {
+        let refused = hub.tool_result(&secret, "agentscm_why", arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+    }
+    let bad = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/why",
+            Some(&secret),
+            "",
+        )
+        .await;
+    assert_eq!(bad.status, 400, "{}", bad.text);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

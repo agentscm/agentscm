@@ -150,6 +150,7 @@ async fn hook(
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
     let session_start = is_session_start(agent, &payload);
+    let host_session = host_session(agent, &payload);
     let wants_capture = client_connection
         && agent == "claude"
         && crate::change_capture_cli::captures_claude_event(&payload);
@@ -195,15 +196,47 @@ async fn hook(
         )
         .await
     };
-    let Some(capture) = early.or_else(|| (wants_capture && session_start).then(spawn_capture))
-    else {
-        return reply;
+    let capture = early.or_else(|| (wants_capture && session_start).then(spawn_capture));
+    let reply = match capture {
+        Some(capture) => {
+            let remaining = budget.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, capture).await {
+                Ok(Ok(Some(context))) => {
+                    within_context_limit(with_note(reply, agent, &payload, &context))
+                }
+                _ => reply,
+            }
+        }
+        None => reply,
     };
-    let remaining = budget.saturating_duration_since(Instant::now());
-    match tokio::time::timeout(remaining, capture).await {
-        Ok(Ok(Some(context))) => within_context_limit(with_note(reply, agent, &payload, &context)),
-        _ => reply,
+    // The record is written beside the Hub call; the process must not exit before it is.
+    if let Some(recording) = host_session {
+        let remaining = budget.saturating_duration_since(Instant::now());
+        let _ = tokio::time::timeout(remaining, recording).await;
     }
+    reply
+}
+
+/// Keeps the record that the checkout's MCP server reads to name its calls with this
+/// conversation's session ([`crate::client_session`]): written when the session starts, dropped
+/// when it ends. Only an ID the Hub would accept as a session is recorded.
+fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<()>> {
+    let session = session_of(payload)
+        .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))?
+        .to_owned();
+    let config = config_dir().ok()?;
+    if is_session_start(agent, payload) {
+        return Some(tokio::task::spawn_blocking(move || {
+            crate::client_session::record(&config, &session);
+        }));
+    }
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) {
+        crate::client_session::forget(&config, &session);
+    }
+    None
 }
 
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
@@ -430,6 +463,17 @@ async fn call_hub(
             if note.is_none() && session_start {
                 note = crate::client_cli::attention(&routed.connection.root)
                     .map(|message| format!("AgentSCM: {message}."));
+            }
+            if session_start
+                && let Some(also) = client_config::load().ok().and_then(|all| {
+                    let now = agentscm::hub::store::unix_now();
+                    also_connected(&routed.connection, &all, now)
+                })
+            {
+                note = Some(match note {
+                    Some(note) => format!("{note} {also}"),
+                    None => format!("AgentSCM: {also}"),
+                });
             }
             (
                 routed.connection.hub.clone(),
@@ -1369,6 +1413,37 @@ fn route_client_with(
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
     })
+}
+
+/// One sentence for the start context that names the other repositories this computer can
+/// reach now, so an agent that edits one of them knows its AgentSCM calls go there too. Names
+/// only, at most six; a connection whose managed token has expired is left out.
+fn also_connected(current: &Connection, connections: &[Connection], now: i64) -> Option<String> {
+    const LISTED: usize = 6;
+    let mut others: Vec<&str> = connections
+        .iter()
+        .filter(|other| other.hub != current.hub || !other.repo.eq_ignore_ascii_case(&current.repo))
+        .filter(|other| {
+            other
+                .owned_token_expires_at
+                .is_none_or(|expiry| expiry > now)
+        })
+        .map(|other| other.repo.as_str())
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    let more = others.len().saturating_sub(LISTED);
+    others.truncate(LISTED);
+    if others.is_empty() {
+        return None;
+    }
+    let mut names = others.join(", ");
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
+    }
+    Some(format!(
+        "Also connected on this computer: {names}. An AgentSCM call with absolute paths in one of them, or with `root` set to its checkout, goes to that repository."
+    ))
 }
 
 /// A start-of-session event, when an agent begins a conversation.
@@ -3461,6 +3536,30 @@ mod tests {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_start_context_names_the_other_repositories_this_computer_can_reach() {
+        let here = std::env::temp_dir();
+        let current = connection(&here, "acme/widgets");
+        assert_eq!(
+            also_connected(&current, std::slice::from_ref(&current), 100),
+            None
+        );
+        let mut expired = connection(&here, "acme/expired");
+        expired.owned_token_expires_at = Some(100);
+        let mut all = vec![current.clone(), expired, connection(&here, "acme/gadgets")];
+        // A second checkout of a repository does not list it twice.
+        all.push(connection(&here, "acme/gadgets"));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(
+            sentence.starts_with("Also connected on this computer: acme/gadgets. "),
+            "{sentence}"
+        );
+        assert!(sentence.contains("`root`"), "{sentence}");
+        all.extend((0..7).map(|n| connection(&here, &format!("acme/more-{n}"))));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(sentence.contains("acme/more-4 and 2 more."), "{sentence}");
     }
 
     #[test]
