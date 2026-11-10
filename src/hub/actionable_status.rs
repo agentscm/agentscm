@@ -3291,6 +3291,16 @@ mod tests {
             });
             source.id = expected.work_id.clone();
             source.title = expected.title.clone();
+            if source.state == WorkState::Handover && expected.needs_you {
+                source.blocker = Some(
+                    serde_json::from_value(json!({
+                        "kind":"blocker", "summary":"Owner must select the deployment region",
+                        "next_action":null, "source_refs":[], "at":100, "token":"tok_lead",
+                        "agent":"codex", "session":"session", "generation":1
+                    }))
+                    .unwrap(),
+                );
+            }
             let recipient = &expected.recipient;
             source.owner = recipient.owner.clone().unwrap();
             source.owner_login = recipient.login.clone().unwrap();
