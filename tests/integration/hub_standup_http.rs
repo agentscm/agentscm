@@ -577,6 +577,94 @@ fn billing(key: &str, session: &str) -> Value {
         "scope": ["src/billing.rs"], "branch": "feat/billing", "next_action": "Continue"})
 }
 
+/// A read-only token may run the exact-subject preflight, which reads: it names the Work already
+/// on the paths, creates no Work and records no event. Another repository's token is told nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_token_runs_a_preflight_that_names_the_overlap_and_records_no_event() {
+    let hub = Hub::start(None).await;
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, reader) = hub.token(2, "acme/widgets", true).await;
+    let (_, elsewhere) = hub.token(3, "acme/private", true).await;
+    let (status, started) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &lead,
+            Some(billing("bill", "s-a")),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let id = started["item"]["id"].as_str().unwrap().to_owned();
+    let store = hub.store.clone();
+    let events = tokio::task::spawn_blocking(move || store.latest_event_seq().unwrap())
+        .await
+        .unwrap();
+
+    let (status, pre) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight",
+            &reader,
+            Some(billing("reader-goal", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{pre}");
+    let overlap = &pre["scope_overlaps"][0];
+    assert_eq!(overlap["item"]["id"], id.as_str(), "{pre}");
+    assert_eq!(overlap["their_scope"], json!(["src/billing.rs"]));
+    assert_eq!(overlap["your_scope"], json!(["src/billing.rs"]));
+
+    // A scope nobody holds has no overlap.
+    let mut free = billing("free-goal", "s-b");
+    free["scope"] = json!(["src/other.rs"]);
+    let (status, none) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight",
+            &reader,
+            Some(free),
+        )
+        .await;
+    assert_eq!(status, 200, "{none}");
+    assert!(none["scope_overlaps"].as_array().unwrap().is_empty());
+
+    // The reader saw it and changed no Work and recorded no event: one Work, no new event.
+    let (_, overview) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(
+        overview["current"].as_array().unwrap().len(),
+        1,
+        "{overview}"
+    );
+    let store = hub.store.clone();
+    let after = tokio::task::spawn_blocking(move || store.latest_event_seq().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(after, events);
+
+    // Signed out, and a token of another repository sees only its own repository's Work.
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight",
+            "nope",
+            Some(billing("k", "s")),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, theirs) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight",
+            &elsewhere,
+            Some(billing("k", "s-c")),
+        )
+        .await;
+    assert_eq!(status, 200, "{theirs}");
+    assert!(theirs["scope_overlaps"].as_array().unwrap().is_empty());
+}
+
 /// Merged Work that still holds its scope stays in `current`. The opt-in `operational` field
 /// adds evidence and reservation details without changing that visibility or strict decoding.
 async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {

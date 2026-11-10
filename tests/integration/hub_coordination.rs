@@ -302,7 +302,7 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
         expected_updated_seq: acknowledged.updated_seq,
         kind: CoordinationResponseKind::Join,
         note: Some("Join the incumbent work as a helper".into()),
-        via_hub: false,
+        via: agentscm::hub::handoff::Via::Agent,
     };
     let responded = store
         .coordination_reply(&incumbent, &reply, now + 6)
@@ -626,7 +626,7 @@ fn response_projection_does_not_change_status(db: &Db) {
                 expected_updated_seq: request.updated_seq,
                 kind: CoordinationResponseKind::Decline,
                 note: None,
-                via_hub: false,
+                via: agentscm::hub::handoff::Via::Agent,
             },
             now + 3,
         )
@@ -643,7 +643,7 @@ fn response_projection_does_not_change_status(db: &Db) {
                     expected_updated_seq: current.updated_seq,
                     kind: CoordinationResponseKind::ProposeSplit,
                     note: None,
-                    via_hub: false,
+                    via: agentscm::hub::handoff::Via::Agent,
                 },
                 now + 4 + index,
             )
@@ -1389,7 +1389,11 @@ fn a_person_reply_through_the_hub_is_marked_and_delivered(db: &Db) {
         expected_updated_seq: seq,
         kind: CoordinationResponseKind::ProposeSplit,
         note: Some("I take tax, you take rounding".into()),
-        via_hub,
+        via: if via_hub {
+            agentscm::hub::handoff::Via::Hub
+        } else {
+            agentscm::hub::handoff::Via::Agent
+        },
     };
     let by_person = reply("person", request.updated_seq, true);
     let first = store
