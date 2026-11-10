@@ -951,7 +951,7 @@ mod tests {
         // The Work its session leads knows the turn ended; its person is shown no wait.
         assert_eq!(record(WaitReason::Finished, None, 1_000), 0);
         assert_eq!(
-            waiting.lead("tok_a", "s1", 990, 5_000),
+            waiting.lead("usr_me", "tok_a", "s1", 990, 5_000),
             LeadWait::Waiting(WaitReason::Finished)
         );
         // The host's idle notice a minute later says nothing, so nothing changes.
