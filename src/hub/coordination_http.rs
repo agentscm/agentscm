@@ -654,6 +654,7 @@ async fn person_ask(
         Asked::Requested { holder } => ("requested", Some(holder)),
         Asked::AlreadyAsked { holder } => ("already_asked", Some(holder)),
         Asked::NotHeld => ("not_held", None),
+        Asked::Reserved { .. } => ("reserved", None),
         Asked::Yours => ("yours", None),
         Asked::TooMany => ("too_many", None),
     };

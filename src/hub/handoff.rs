@@ -91,6 +91,12 @@ pub enum Asked {
     },
     /// Nobody else holds the file now: a retry of the edit passes.
     NotHeld,
+    /// No session holds the file, but another live Work reserves it, so a start or an edit
+    /// that needs it is still refused: its lead answers a coordination request instead.
+    Reserved {
+        work_id: String,
+        lead: super::coordination::CoordinationAgent,
+    },
     /// The asking session holds it.
     Yours,
     AlreadyAsked {

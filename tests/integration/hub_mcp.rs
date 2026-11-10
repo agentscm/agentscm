@@ -2055,6 +2055,13 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
         .await;
     let said = refused(&running);
     assert!(!said.contains("is not running"), "{said}");
+    // It says when the request is raised to that lead's person if it is not acknowledged.
+    assert!(
+        said.contains(&format!(
+            "If the agent leading {work_id} has not acknowledged it by Unix "
+        )) && said.contains("it is raised to its person, user1, in the AgentSCM Hub's Needs you"),
+        "{said}"
+    );
 
     let paused = hub
         .tool_result(
@@ -2077,7 +2084,8 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
     let said = refused(&idle);
     assert!(
         said.contains(&format!("The agent leading {work_id} is not running"))
-            && said.contains("Its person, user1, is asked in the AgentSCM Hub's Needs you"),
+            && said.contains("It is not raised in the AgentSCM Hub's Needs you")
+            && !said.contains("raised to its person"),
         "{said}"
     );
 }

@@ -6553,7 +6553,7 @@ fn ask_in(
     }
     let holder = match verdict {
         Verdict::Yours => return Ok(Asked::Yours),
-        Verdict::NotHeld => return Ok(Asked::NotHeld),
+        Verdict::NotHeld => return unheld(tx, token, name, key, now),
         Verdict::AlreadyAsked(holder) => return Ok(Asked::AlreadyAsked { holder }),
         Verdict::TooMany => return Ok(Asked::TooMany),
         Verdict::Request(holder) => holder,
@@ -6566,7 +6566,7 @@ fn ask_in(
         )
         .optional()?;
     let Some(holder_session) = holder_session else {
-        return Ok(Asked::NotHeld);
+        return unheld(tx, token, name, key, now);
     };
     tx.execute(
         "DELETE FROM hub_handoffs WHERE repository = ?1 AND created_at < ?2",
@@ -6594,6 +6594,25 @@ fn ask_in(
     let event = Event::handoff_request(token, &id, name, key, note, &holder, (auto, via))?;
     append(tx, &event)?;
     Ok(Asked::Requested { holder })
+}
+
+/// What an ask says of a file no session holds: another live Work's reservation still refuses a
+/// start or an edit that needs it, as `agentscm_start` and the edit hook say, so it is not free.
+fn unheld(tx: &Transaction<'_>, token: &str, name: &str, key: &str, now: i64) -> Result<Asked> {
+    let work = work_who(tx, token, now)?;
+    let overlaps = work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)?;
+    Ok(overlaps
+        .into_iter()
+        .find(|o| {
+            !o.item
+                .participants
+                .iter()
+                .any(|p| p.token == token && p.session == name)
+        })
+        .map_or(Asked::NotHeld, |o| Asked::Reserved {
+            lead: coordination_lead(&o.item),
+            work_id: o.item.id,
+        }))
 }
 
 /// A refused call asks the holder of each contested file to hand it over, as `agentscm_ask`

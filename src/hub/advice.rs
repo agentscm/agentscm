@@ -541,6 +541,12 @@ pub fn asked(asked: &Asked, path: &str) -> String {
         Asked::NotHeld => {
             format!("AgentSCM: no other agent holds {path} now; the edit can go ahead.")
         }
+        Asked::Reserved { work_id, lead } => format!(
+            "AgentSCM: {path} is not free. No session holds it, but Work {work_id}, which {}'s {} leads, reserves it with a live lease, so agentscm_start and the edit hook refuse it. Do not edit it. agentscm_start with this path files a coordination request to that lead, or finds the open one; if that lead is running and has not acknowledged it within {} minutes, its person is asked in the Hub's Needs you. Read the answer with agentscm_coordination_inbox.",
+            ascii_name(&lead.login),
+            ascii_name(&agent_name(&lead.agent)),
+            super::coordination::ACK_BOUND_SECS / 60
+        ),
         Asked::Yours => format!("AgentSCM: this session already holds {path}."),
         Asked::AlreadyAsked { .. } => format!(
             "AgentSCM: {path} was already asked for; an answer, if one comes, arrives with a later AgentSCM reply."

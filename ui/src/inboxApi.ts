@@ -153,9 +153,9 @@ export async function withdrawRequest(session: BrowserSession, body: WithdrawBod
 }
 
 export type AnswerOutcome = 'granted' | 'declined' | 'no_open_request' | 'not_held'
-export type AskOutcome = 'requested' | 'already_asked' | 'not_held' | 'yours' | 'too_many'
+export type AskOutcome = 'requested' | 'already_asked' | 'not_held' | 'reserved' | 'yours' | 'too_many'
 const ANSWER = new Set<string>(['granted', 'declined', 'no_open_request', 'not_held'])
-const ASK = new Set<string>(['requested', 'already_asked', 'not_held', 'yours', 'too_many'])
+const ASK = new Set<string>(['requested', 'already_asked', 'not_held', 'reserved', 'yours', 'too_many'])
 
 export async function answerHandoff(session: BrowserSession, body: { token: string; session?: string; path: string; accept: boolean; reason?: string }): Promise<AnswerOutcome> {
   const o = rec(await call('/v1/hub/session/handoff/answer', session, 'POST', body))['outcome']
@@ -183,6 +183,7 @@ export const OUTCOME_SENTENCE: Record<AnswerOutcome | AskOutcome, string> = {
   not_held: 'That agent no longer holds the file, so there is nothing to hand over.',
   requested: 'Asked.',
   already_asked: 'Already asked; the other agent has not answered yet.',
+  reserved: 'Another live task reserves that file. Its lead answers a coordination request instead, which your agent files by starting work on it.',
   yours: 'Your own agent already holds that file.',
   too_many: 'Too many requests are open for that file or session; wait for one to be answered.',
 }

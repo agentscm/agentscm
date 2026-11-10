@@ -255,8 +255,9 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   - `POST /v1/hub/session/handoff/ask` (`token`, optional `session`, `path`, optional `note`)
     asks the session holding the exact file to hand it over to that agent's session, as
     `agentscm_ask` does (200-character filtered note, three open requests per session).
-    Reply: `{"outcome": "requested" | "already_asked" | "not_held" | "yours" | "too_many",
-    "holder": {"agent", "login"}}`.
+    Reply: `{"outcome": "requested" | "already_asked" | "not_held" | "reserved" | "yours" |
+    "too_many", "holder": {"agent", "login"}}`; `reserved` (no holder) means no session holds
+    the file but another live Work reserves it.
   - `GET /v1/hub/session/handoffs?repository=owner/name` lists the person's 50 newest file
     handoffs in that repository where one of their agents is the requester or the holder. Each
     row has `id`, `path`, `state` (`pending`, `granted`, `declined`, or `lapsed` for a pending
@@ -895,6 +896,10 @@ counter-offer.
 - **No:** the requester is told on its next call, with the reason if one was
   given (in quotes, as third-party text); its retry still passes once, as after
   any refusal.
+- A file no session holds but another live Work reserves is not free: `agentscm_ask`
+  says which Work reserves it and who leads it, as `agentscm_start` and the edit hook
+  refuse it, and files no handoff (HTTP outcome `reserved`). `agentscm_start` with that
+  path files the coordination request to that lead instead.
 - A request lapses after 30 minutes, or when the holder no longer holds the file.
   A session may have 3 open requests, and a holder 3 for one file; asking again
   for the same file only says it was already asked. A request whose requesting
@@ -1255,7 +1260,7 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer and never shows in the Dashboard's Needs you; when that lead is paused or quiet the refused agent's `agentscm_start` reply says its lead is not running, and once the target's hold has lapsed the asker's next start takes the files, History (Finished, Changes, Change records, and Files from this
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer, and a Claude Code lead's background waiter wakes it once for one it has not acknowledged (see [Waking an idle Claude Code session](agent-messages.md#waking-an-idle-claude-code-session)). It shows in the Dashboard's Needs you only when that lead is live but has not acknowledged it 10 minutes after it was made: then it is one action for the lead's person (and for the Work's owner, if someone else), naming the request, the files, the requester and the time since which the lead has not responded; that person answers it for their agent from the Inbox, or the owner releases that Work's hold so the asker's next start takes the files. Only the acknowledgement counts as responding: a renewed lease, a checkpoint or a connection that looks live does not. The row every reader sees, the asker's included, says so; before that it says when it will be raised, or that the lead acknowledged it and has not replied. When that lead is paused or quiet it is not raised there (the [Slack adapter](slack.md), where set up, tells that lead's person): the refused agent's `agentscm_start` reply says its lead is not running, and once the target's hold has lapsed the asker's next start takes the files. Between two agents of one person it is never raised: the asking agent asks that person in its session, History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in

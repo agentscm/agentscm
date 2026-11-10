@@ -4,7 +4,8 @@
 //! Claude Code runs it at session start and after every turn as an `asyncRewake` hook: it runs
 //! in the background, and when it exits with code 2 its stderr wakes the session as a new turn.
 //! It holds one request at a time open at the Hub (`/v1/hub/agent-messages/wait`) for this
-//! session; when a message comes it prints the Hub's notice and exits 2. Only one waits per
+//! session; when a message comes, or a coordination request to Work the session leads waits for
+//! its acknowledgement, it prints the Hub's notice and exits 2. Only one waits per
 //! session: a later start finds the lock held and exits at once. It ends quietly when its time is
 //! up, when the process that started it is gone or the session's `SessionEnd` hook
 //! (`hook-wait claude --end`) left its end marker, when the checkout is not connected, when the
@@ -16,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agentscm::hub::agent_messages::{FRAME, WAIT_SECS};
+use agentscm::hub::agent_messages::{FRAME, REQUEST_FRAME, WAIT_SECS};
 use agentscm::hub::reply;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -58,9 +59,10 @@ pub async fn run(args: HookWaitArgs) -> ! {
     std::process::exit(finish(found, &mut std::io::stderr()))
 }
 
-/// Writes the notice and returns 2 only for the Hub's framed notice; anything else is 0, silent.
+/// Writes the notice and returns 2 only for the Hub's framed notice (a message, or a coordination
+/// request to the session's Work); anything else is 0, silent.
 fn finish(found: Option<String>, err: &mut impl Write) -> i32 {
-    match found.filter(|text| text.starts_with(FRAME)) {
+    match found.filter(|text| text.starts_with(FRAME) || text.starts_with(REQUEST_FRAME)) {
         Some(text) => {
             // A write error still wakes the session; the notice is then empty.
             let _ = writeln!(err, "{text}");
@@ -299,6 +301,10 @@ mod tests {
         let notice = format!("{FRAME} msg_1 for this session, from octo");
         assert_eq!(finish(Some(notice.clone()), &mut err), 2);
         assert_eq!(String::from_utf8(err).unwrap().trim_end(), notice);
+        let mut err = Vec::new();
+        let request = format!("{REQUEST_FRAME} crq_1 for your Work wrk_1");
+        assert_eq!(finish(Some(request.clone()), &mut err), 2);
+        assert_eq!(String::from_utf8(err).unwrap().trim_end(), request);
         let mut err = Vec::new();
         assert_eq!(finish(None, &mut err), 0);
         assert_eq!(finish(Some("something else".into()), &mut err), 0);

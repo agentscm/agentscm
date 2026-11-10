@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hub::coordination::{CoordinationInbox, CoordinationListQuery, CoordinationStatus};
+use crate::hub::coordination::{
+    ACK_BOUND_SECS, CoordinationInbox, CoordinationListQuery, CoordinationStatus,
+};
 use crate::hub::onboarding::Observations;
 use crate::hub::session_waiting::{LeadWait, WaitReason};
 use crate::hub::store::{Principal, Store, owner_session, session_ancestors, session_key};
@@ -668,7 +670,7 @@ fn read_scoped(
         .filter(|w| w.operational.reservation.status == ReservationStatus::Held)
         .map(|w| w.work_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut actions = request_actions(&requests, &items, &holding);
+    let mut actions = request_actions(&requests, &items, &holding, &principal.owner.id, now);
     for overlap in &overview.overlaps {
         let ids = [&overlap.left.id, &overlap.right.id];
         let pair = ids
@@ -1139,13 +1141,21 @@ pub fn render_text(status: &ActionableStatus) -> String {
 }
 
 /// Requests still waiting for an answer from the lead agent they were sent to. An answer is
-/// that agent's to give, never its person's, and `holding` is the Work that still holds its
-/// scope: once the target holds nothing the asker's next start takes the scope, so nothing waits.
+/// that agent's to give, not its person's, and `holding` is the Work that still holds its scope:
+/// once the target holds nothing the asker's next start takes the scope, so nothing waits. The
+/// one exception: a live lead that has not even acknowledged a request [`ACK_BOUND_SECS`] after
+/// it was made is stuck, and that Work's owner is asked, in one row for the request. Only the
+/// acknowledgement counts as responding: a renewed lease, a checkpoint or a live connection
+/// keeps the Work live but does not show its lead reads anything. The text, which the asker
+/// reads too, says why it waits and when it is raised.
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
     holding: &BTreeSet<&str>,
+    viewer: &str,
+    now: i64,
 ) -> Vec<StatusAction> {
+    use crate::hub::advice::{agent_name, ascii_name, sanitize};
     let mut actions = Vec::new();
     for request in &inbox.requests {
         if matches!(
@@ -1176,21 +1186,98 @@ fn request_actions(
             }) {
                 continue;
             }
+            let acknowledged = request.acknowledgements.iter().any(|a| {
+                a.target_work_id.as_deref() == Some(target.work_id.as_str())
+                    && a.generation == target.generation
+                    && a.agent == target.lead
+            });
+            let due = request.created_at + ACK_BOUND_SECS;
+            // Between two agents of one person the asking agent asks that person in its session,
+            // so the request never becomes their action too.
+            let one_person = request.requester.owner == target.lead.owner;
+            // An incomplete receipt page proves no missing acknowledgement.
+            let stuck = request.acknowledgements_complete
+                && !acknowledged
+                && !one_person
+                && !item.lead_idle()
+                && now >= due;
+            let mut files = target
+                .reasons
+                .iter()
+                .map(|reason| sanitize(&reason.your_path, 100))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if files.is_empty() {
+                files = "its files".into();
+            } else if !target.reasons_complete {
+                files.push_str(" and more");
+            }
+            let about = format!(
+                "Coordination request {} from {}'s {} asks for {files}.",
+                request.id,
+                ascii_name(&request.requester.login),
+                ascii_name(&agent_name(&request.requester.agent)),
+            );
+            // The lead's person answers for their agent; the Work's owner, if someone else, can
+            // release its hold.
+            let mut people = vec![lead_person(item)];
+            if people[0].owner.as_deref() != Some(item.owner.as_str()) {
+                people.push(owner(item));
+            }
+            let name = |r: &StatusRecipient| ascii_name(r.login.as_deref().unwrap_or("unknown"));
+            let to = match people.as_slice() {
+                [answers, releases] => format!(
+                    "its person, {}, and the Work's owner, {}",
+                    name(answers),
+                    name(releases)
+                ),
+                _ => format!("its person, {}", name(&people[0])),
+            };
+            let (recipients, needs_you, action) = if stuck {
+                let needs_you = people.iter().any(|p| p.owner.as_deref() == Some(viewer));
+                let action = format!(
+                    "{about} Its lead agent has not responded to it since it was made at Unix {}, though its Work is live, so it is raised to {to}: answer it for that agent from the Hub's Inbox, or release that Work's hold so the asker's next agentscm_start takes the files.",
+                    request.created_at
+                );
+                (people, needs_you, action)
+            } else {
+                let why = if acknowledged {
+                    "Its lead acknowledged it and has not replied yet.".to_owned()
+                } else if item.lead_idle() {
+                    "Its lead is not running, so it is not raised in Needs you; its hold lapses by itself if it does not return.".to_owned()
+                } else if !request.acknowledgements_complete {
+                    "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
+                } else if one_person {
+                    "Both agents are one person's, so it is not raised in Needs you: the asking agent asks its person in its session.".to_owned()
+                } else {
+                    format!(
+                        "Its lead has not acknowledged it; if it still has not at Unix {due}, it is raised to {to}."
+                    )
+                };
+                (
+                    vec![lead(item)],
+                    false,
+                    format!("Answer the outstanding directed coordination request. {about} {why}"),
+                )
+            };
+            let mut limits = Vec::new();
+            if !target.reasons_complete {
+                limits.push("request_reasons_truncated".to_owned());
+            }
+            if !request.acknowledgements_complete {
+                limits.push("request_acknowledgements_truncated".to_owned());
+            }
             actions.push(StatusAction {
                 id: format!("request:{}:{}", request.id, target.work_id),
                 kind: "directed_request".into(),
                 work_ids: vec![target.work_id.clone()],
-                needs_you: false,
-                recipients: vec![lead(item)],
-                action: "Answer the outstanding directed coordination request.".into(),
+                needs_you,
+                recipients,
+                action,
                 updated_seq: request.updated_seq,
                 semantic_version: None,
                 session: None,
-                limits: if target.reasons_complete {
-                    vec![]
-                } else {
-                    vec!["request_reasons_truncated".into()]
-                },
+                limits,
             });
         }
     }
@@ -3415,14 +3502,25 @@ mod tests {
         let id = request.targets[0].work_id.clone();
         let holding = BTreeSet::from([id.as_str()]);
         // The answer is the lead agent's to give, however quiet it is: its person is not asked.
-        let actions = request_actions(&inbox(request.clone()), &items, &holding);
+        let actions = request_actions(&inbox(request.clone()), &items, &holding, "usr_owner", 100);
         assert_eq!(actions.len(), 1);
         assert!(!actions[0].needs_you);
         assert_eq!(actions[0].recipients[0].kind, RecipientKind::LeadAgent);
         // Once the target holds nothing the asker's next start takes the scope: nothing waits.
-        assert!(request_actions(&inbox(request.clone()), &items, &BTreeSet::new()).is_empty());
+        assert!(
+            request_actions(
+                &inbox(request.clone()),
+                &items,
+                &BTreeSet::new(),
+                "usr_owner",
+                100
+            )
+            .is_empty()
+        );
         request.targets[0].generation = 2;
-        assert!(request_actions(&inbox(request.clone()), &items, &holding).is_empty());
+        assert!(
+            request_actions(&inbox(request.clone()), &items, &holding, "usr_owner", 100).is_empty()
+        );
         request.targets[0].generation = 1;
         request
             .responses
@@ -3438,7 +3536,229 @@ mod tests {
                 created_at: 100,
                 seq: 2,
             });
-        assert!(request_actions(&inbox(request), &items, &holding).is_empty());
+        assert!(request_actions(&inbox(request), &items, &holding, "usr_owner", 100).is_empty());
+    }
+
+    /// #486: a live lead that never acknowledges a request. Before the bound its lead agent is
+    /// asked and the asker reads when it is raised; from the bound it is one personal action for
+    /// the Work's owner, naming the request, the files and the requester. An acknowledgement, a
+    /// lead that is not running or an incomplete receipt page never raises it.
+    #[test]
+    fn a_request_a_live_lead_never_acknowledges_reaches_its_owner_after_the_bound() {
+        let mut item = item(WorkState::Active);
+        let request: crate::hub::coordination::CoordinationRequest = serde_json::from_value(json!({
+            "id":"crq_synthetic", "requester":{"token":"tok_requester","agent":"asker","session":"requester-session","owner":"usr_requester","login":"requester"},
+            "proposal":{"work_id":null,"source":null,"request_key":"synthetic","title":"Synthetic request","scope":["src/client_plugin.rs"]},
+            "targets":[{"work_id":item.id,"lead":{"token":"tok_lead","agent":"agent","session":"session","owner":"usr_lead","login":"lead"},"generation":1,
+                "reasons":[{"your_path":"src/client_plugin.rs","their_path":"src/client_plugin.rs"}],"reasons_complete":true}],
+            "status":"pending","acknowledgements":[],"acknowledgements_complete":true,"responses":[],"responses_complete":true,"created_at":100,"updated_at":100,"created_seq":1,"updated_seq":1
+        })).unwrap();
+        let id = item.id.clone();
+        let inbox = |request| CoordinationInbox {
+            from: 0,
+            through: 1,
+            next_after: 1,
+            requests: vec![request],
+            complete: true,
+            retention_gap: false,
+        };
+        let holding = BTreeSet::from([id.as_str()]);
+        let due = 100 + ACK_BOUND_SECS;
+        let actions = |request: &crate::hub::coordination::CoordinationRequest,
+                       item: &WorkItem,
+                       viewer: &str,
+                       now: i64| {
+            let items = BTreeMap::from([(id.clone(), item.clone())]);
+            let mut actions =
+                request_actions(&inbox(request.clone()), &items, &holding, viewer, now);
+            assert_eq!(actions.len(), 1, "one row per stuck request");
+            actions.remove(0)
+        };
+        let before = actions(&request, &item, "usr_owner", due - 1);
+        assert!(!before.needs_you);
+        assert_eq!(before.recipients[0].kind, RecipientKind::LeadAgent);
+        assert!(
+            before.action.contains(&format!(
+                "if it still has not at Unix {due}, it is raised to its person, lead, and the Work's owner, owner"
+            )),
+            "{}",
+            before.action
+        );
+        // The lead's person answers for their agent; the Work's owner, here someone else, can
+        // release its hold. Each of them is asked; nobody else is.
+        let raised = actions(&request, &item, "usr_owner", due);
+        assert!(raised.needs_you);
+        assert_eq!(raised.recipients, vec![lead_person(&item), owner(&item)]);
+        assert!(actions(&request, &item, "usr_lead", due).needs_you);
+        for named in [
+            "crq_synthetic",
+            "src/client_plugin.rs",
+            "requester's asker",
+            "has not responded to it since it was made at Unix 100",
+            "raised to its person, lead, and the Work's owner, owner",
+        ] {
+            assert!(raised.action.contains(named), "{named}: {}", raised.action);
+        }
+        // The asker reads the same row and words, and is not asked.
+        let asker = actions(&request, &item, "usr_requester", due);
+        assert!(!asker.needs_you);
+        assert_eq!(asker.action, raised.action);
+        // A lead that acknowledged it keeps it; the asker reads that it waits for a reply.
+        let mut acknowledged = request.clone();
+        acknowledged
+            .acknowledgements
+            .push(crate::hub::coordination::CoordinationAcknowledgement {
+                target_work_id: Some(id.clone()),
+                agent: request.targets[0].lead.clone(),
+                generation: 1,
+                through_seq: 1,
+                acknowledged_at: 101,
+                seq: 2,
+            });
+        let replied = actions(&acknowledged, &item, "usr_owner", due);
+        assert!(!replied.needs_you);
+        assert!(
+            replied
+                .action
+                .contains("acknowledged it and has not replied")
+        );
+        let mut unread = request.clone();
+        unread.acknowledgements_complete = false;
+        let unread = actions(&unread, &item, "usr_owner", due);
+        assert!(!unread.needs_you);
+        assert!(
+            unread
+                .limits
+                .contains(&"request_acknowledgements_truncated".to_owned())
+        );
+        // A lead that is not running will not answer, and its hold lapses by itself.
+        item.claim_status = ClaimStatus::Stale;
+        let quiet = actions(&request, &item, "usr_owner", due);
+        assert!(!quiet.needs_you);
+        assert_eq!(quiet.recipients[0].kind, RecipientKind::LeadAgent);
+        // Between two agents of one person the asking agent asks that person in its session.
+        item.claim_status = ClaimStatus::Active;
+        let mut own = request.clone();
+        own.requester.owner = "usr_lead".into();
+        let own = actions(&own, &item, "usr_lead", due);
+        assert!(!own.needs_you);
+        assert_eq!(own.recipients[0].kind, RecipientKind::LeadAgent);
+        assert!(
+            own.action.contains("Both agents are one person's"),
+            "{}",
+            own.action
+        );
+    }
+
+    /// #486 from a real store: one person's live release Work reserves a file it is not
+    /// changing, and another person's start for it files a request its lead never acknowledges.
+    fn unacknowledged_request_contract(store: &dyn Store) {
+        let now = crate::hub::store::unix_now();
+        let token = |user_id: i64, login: &str| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap();
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, login, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let lead = token(501, "releaser");
+        let asker = token(502, "fixer");
+        let start = |who: &Principal, key: &str, scope: &[&str]| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": key, "title": key, "session": format!("{key}-session"), "scope": scope
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap()
+        };
+        let release = start(&lead, "release", &["src/client_plugin.rs", "CHANGELOG.md"]).item;
+        let refused = start(&asker, "fix", &["src/client_plugin.rs"]);
+        let request = refused
+            .coordination_request
+            .expect("the start files a request");
+        let id = format!("request:{}:{}", request.id, release.id);
+        let row = |status: &ActionableStatus| {
+            status.actions.iter().find(|a| a.id == id).cloned().unwrap()
+        };
+        let due = request.created_at + ACK_BOUND_SECS;
+        let early = read(store, &lead, due - 1).unwrap();
+        assert_eq!(early.counts.needs_you, 0);
+        assert!(
+            row(&read(store, &asker, due - 1).unwrap())
+                .action
+                .contains(&format!("at Unix {due}"))
+        );
+        // The release lead stays live (its claim and lease are fresh) and never acknowledges.
+        let owner_status = read(store, &lead, due).unwrap();
+        assert_eq!(owner_status.counts.needs_you, 1);
+        let raised = row(&owner_status);
+        assert!(raised.needs_you);
+        assert_eq!(raised.recipients[0].kind, RecipientKind::Person);
+        assert_eq!(raised.recipients[0].login.as_deref(), Some("releaser"));
+        for named in [
+            request.id.as_str(),
+            "src/client_plugin.rs",
+            "fixer's",
+            "raised to its person, releaser",
+        ] {
+            assert!(raised.action.contains(named), "{named}: {}", raised.action);
+        }
+        let asker_status = read(store, &asker, due).unwrap();
+        assert_eq!(asker_status.counts.needs_you, 0);
+        assert_eq!(row(&asker_status).action, raised.action);
+        // The asker's hook saw it edit another file, so its session exists to ask from.
+        let call = crate::hub::session::SessionCall {
+            session: Some("fix-session".into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: vec!["src/other.rs".into()],
+            deny: false,
+            report: true,
+        };
+        store.touch_session(&asker.token_id, &call, now).unwrap();
+        assert!(
+            store
+                .ask_handoff(&asker.token_id, Some("fix-session"), "src/client_plugin.rs", None, now)
+                .is_ok_and(|asked| matches!(asked, crate::hub::handoff::Asked::Reserved { ref work_id, .. } if *work_id == release.id)),
+            "agentscm_ask does not call a file another live Work reserves free"
+        );
+        assert_eq!(
+            store
+                .ask_handoff(
+                    &asker.token_id,
+                    Some("fix-session"),
+                    "src/free.rs",
+                    None,
+                    now
+                )
+                .unwrap(),
+            crate::hub::handoff::Asked::NotHeld
+        );
+    }
+    #[test]
+    fn sqlite_an_unacknowledged_request_reaches_its_owner_and_ask_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        unacknowledged_request_contract(&*store);
+    }
+    #[test]
+    fn an_unacknowledged_request_reaches_its_owner_and_ask_agrees_on_postgres() {
+        on_postgres(unacknowledged_request_contract);
     }
 
     #[tokio::test]

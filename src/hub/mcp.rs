@@ -4016,7 +4016,8 @@ fn start_result(
     text.push_str(&catchup_summary(catchup.as_ref()));
     if let Some(request) = &work.coordination_request {
         text.push_str(&format!("\nCoordination request {} is queued for the affected leads. Queued is not received; inspect agentscm_coordination_inbox for receipts and replies.", request.id));
-        // A paused or quiet lead will not answer; the Hub's Needs you asks the person who owns it instead.
+        // A live lead that does not even acknowledge it in time is stuck, and its person is asked
+        // in the Hub's Needs you. A paused or quiet lead asks nobody: its hold lapses by itself.
         for target in &request.targets {
             let idle = work
                 .context
@@ -4029,7 +4030,11 @@ fn start_result(
                 })
                 .is_some_and(WorkItem::lead_idle);
             if idle {
-                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. Its person, {}, is asked in the AgentSCM Hub's Needs you instead and can answer for it.", target.work_id, target.lead.login));
+                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. It is not raised in the AgentSCM Hub's Needs you: its hold lapses by itself if it does not return, and a later agentscm_start then takes the files. Where Slack is set up, its person is told there and can answer for it from the Hub's Inbox.", target.work_id));
+            } else if request.requester.owner == target.lead.owner {
+                text.push_str(&format!("\nThe agent leading {} is your person's too, so the request is not raised in the AgentSCM Hub's Needs you: if it stays unanswered, ask your person in this session.", target.work_id));
+            } else {
+                text.push_str(&format!("\nIf the agent leading {} has not acknowledged it by Unix {}, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, request.created_at + super::coordination::ACK_BOUND_SECS, super::advice::sanitize(&target.lead.login, 64)));
             }
         }
     }
