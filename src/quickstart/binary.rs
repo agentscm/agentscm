@@ -3,8 +3,10 @@
 //! in the layout the installer uses: `agentscm-<version>` plus an `agentscm` symlink.
 use std::path::{Path, PathBuf};
 
-/// The version in the installed file's name: the release version, or `<version>+<commit>` for
-/// any other build (set by build.rs).
+/// The version in the installed file's name: the release version on the release tag,
+/// `<version>+<commit>` when the build knows its commit (a release-profile build from a checkout,
+/// or `AGENTSCM_BUILD_COMMIT` set), `<version>+dev` for a debug build without one, else the plain
+/// version (set by build.rs).
 pub(crate) const VERSION: &str = env!("AGENTSCM_INSTALL_VERSION");
 
 // Where symlinks need privileges (Windows) this is a copy of the versioned file instead.
@@ -92,10 +94,10 @@ fn same_contents(a: &Path, b: &Path) -> bool {
 }
 
 /// Copies `exe` to `<dir>/agentscm-<version>` (temp file then rename, 0755) and points
-/// `<dir>/agentscm` at it. An existing release file (a version without `+<commit>`) is never
+/// `<dir>/agentscm` at it. An existing release file (a version without a `+` suffix) is never
 /// overwritten: it may be a verified release. It is used as it is when it is the running program
-/// or an identical copy. A different dev build of the same commit is replaced. Returns the
-/// symlink's path.
+/// or an identical copy. A different dev build with the same name (the same commit, or any debug
+/// build's `+dev`) is replaced. Returns the symlink's path.
 pub(crate) fn install(dir: &Path, exe: &Path, version: &str) -> Result<PathBuf, String> {
     let fail = |e: std::io::Error| e.to_string();
     super::private_dir(dir).map_err(fail)?;
@@ -242,12 +244,16 @@ mod tests {
             Path::new("agentscm-10.0.0")
         );
         assert_eq!(installed(&dir).len(), 3);
-        // A dev build (`+<commit>`) is not a release, so another build of it is replaced.
+        // A dev build (`+<commit>` or `+dev`) is not a release, so another build of it is replaced.
         install(&dir, &exe, "10.0.0+abc").unwrap();
         std::fs::write(&exe, b"three").unwrap();
         install(&dir, &exe, "10.0.0+abc").unwrap();
         assert_eq!(std::fs::read(&link).unwrap(), b"three");
         assert_eq!(std::fs::read(dir.join("agentscm-10.0.0")).unwrap(), b"two");
+        install(&dir, &exe, "10.0.0+dev").unwrap();
+        std::fs::write(&exe, b"four").unwrap();
+        install(&dir, &exe, "10.0.0+dev").unwrap();
+        assert_eq!(std::fs::read(&link).unwrap(), b"four");
         // A regular file named agentscm is never replaced.
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"mine").unwrap();
