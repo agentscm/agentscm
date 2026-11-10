@@ -786,6 +786,138 @@ pub async fn poll_merges(
     Ok(report)
 }
 
+const MAX_REPORT_ERROR: usize = 1024;
+/// Attempts before a post that got an unchanging answer (HTTP 422, an unsupported commit) is
+/// given up; it stays listed in `status`.
+const MAX_PERMANENT_ATTEMPTS: i64 = 3;
+const REPORTS_PER_POLL: usize = 64;
+
+/// The commit status context a pull request rule posts on the head it ran.
+pub fn report_context(rule_id: &str) -> String {
+    format!("agentscm/pipeline/{rule_id}")
+}
+
+/// What the runs of one rule on one commit tell the pull request: failure if any failed,
+/// pending while any is unfinished, success only when every one succeeded. GitHub keeps one
+/// status per commit and context, so no single run may decide it alone.
+fn combined_state(run_states: &[String]) -> &'static str {
+    if run_states.iter().any(|s| s == "blocked") {
+        "failure"
+    } else if run_states.iter().any(|s| s != "complete") {
+        "pending"
+    } else {
+        "success"
+    }
+}
+
+/// The status for a combined state. Fixed text only: nothing from the pull request reaches it.
+fn report_state(state: &str) -> (super::github::StatusState, &'static str) {
+    use super::github::StatusState;
+    match state {
+        "success" => (
+            StatusState::Success,
+            "AgentSCM rule run succeeded on this commit",
+        ),
+        "failure" => (
+            StatusState::Failure,
+            "AgentSCM rule run failed or was blocked; see pipeline status",
+        ),
+        _ => (
+            StatusState::Pending,
+            "AgentSCM rule fired on this commit; the run has not finished",
+        ),
+    }
+}
+
+/// Post each pull request run's current state as a commit status on the exact head it ran,
+/// once per state. A failed post is kept as unposted, retried on the next call and shown by
+/// [`RuleJournal::report_failures`]. Statuses never feed observation, so they cannot re-trigger
+/// a rule.
+pub async fn report_results(
+    api: ForgeApi<'_>,
+    token: &str,
+    repository: &ConnectedRepository,
+    journal: &mut RuleJournal,
+) -> Result<Vec<serde_json::Value>> {
+    use super::github::GhError;
+    // Pull request rules are GitHub only.
+    if !matches!(api, ForgeApi::Github(_)) {
+        return Ok(Vec::new());
+    }
+    journal.assert_repository("github", &repository.host, repository.repository_id)?;
+    let mut reports = Vec::new();
+    let mut done = BTreeSet::new();
+    for dispatch in journal.unreported(REPORTS_PER_POLL)? {
+        let event = &dispatch.event;
+        let rule_id = &dispatch.rule.rule_id;
+        if event.host != repository.host
+            || event.provider_repository_id != repository.repository_id
+            || !done.insert((rule_id.clone(), event.accepted_commit.clone()))
+        {
+            continue;
+        }
+        let runs = journal.runs_on_commit(rule_id, &event.accepted_commit)?;
+        let states: Vec<String> = runs.iter().map(|(_, state)| state.clone()).collect();
+        let want = combined_state(&states);
+        let (status_state, description) = report_state(want);
+        let context = report_context(rule_id);
+        let mut stop = false;
+        // An answer that cannot change on retry; it is given up after a few attempts.
+        let mut permanent = false;
+        let outcome = match super::github::CommitStatus::new(
+            &event.accepted_commit,
+            status_state,
+            &context,
+            description,
+        ) {
+            Err(_) => {
+                permanent = true;
+                Err("this commit cannot carry a GitHub status (40-digit commits only)".to_owned())
+            }
+            Ok(status) => match api
+                .post_commit_status(token, repository, &status, &event.target)
+                .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(code)) => {
+                    // A token or repository refusal applies to every later post too.
+                    stop = matches!(code, 401 | 403 | 404);
+                    permanent = code == 422;
+                    Err(format!(
+                        "forge refused the status (HTTP {code}); check the token can write commit statuses and the commit still exists"
+                    ))
+                }
+                Err(error) => {
+                    stop = matches!(error, GhError::Auth(_) | GhError::Limited(_));
+                    Err(match error {
+                        GhError::Auth(_) => "forge authentication failed".to_owned(),
+                        GhError::Limited(_) => "forge rate limited".to_owned(),
+                        GhError::Failed(_) | GhError::TooLarge(_) => {
+                            "forge write failed".to_owned()
+                        }
+                    })
+                }
+            },
+        };
+        let error = outcome.err();
+        for (dispatch_id, run_state) in &runs {
+            journal.record_report(dispatch_id, run_state, want, error.as_deref(), permanent)?;
+        }
+        reports.push(serde_json::json!({
+            "head": event.accepted_commit,
+            "context": context,
+            "state": want,
+            "runs": runs.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            "posted": error.is_none(),
+            "error": error,
+        }));
+        if stop {
+            break;
+        }
+    }
+    Ok(reports)
+}
+
 pub fn preview(rule: &PipelineRule, event: &ConfirmedMerge) -> MatchPreview {
     let mut reasons = Vec::new();
     if rule.repository != event.repository
@@ -893,8 +1025,18 @@ const SCHEMA:&str="CREATE TABLE pipeline_binding(singleton INTEGER PRIMARY KEY C
             CREATE TABLE pipeline_observations(semantic_key TEXT PRIMARY KEY,event_key TEXT NOT NULL REFERENCES pipeline_events(semantic_key),rule_id TEXT NOT NULL REFERENCES pipeline_rules(rule_id),rule_generation INTEGER NOT NULL CHECK(rule_generation>0),reasons TEXT NOT NULL) STRICT;
             CREATE TABLE pipeline_polls(repository TEXT PRIMARY KEY,observed_at INTEGER NOT NULL CHECK(observed_at>=0),unread_pages INTEGER NOT NULL CHECK(unread_pages>=0)) STRICT;
             CREATE TABLE pipeline_dispatches(dispatch_id TEXT PRIMARY KEY,run_id TEXT NOT NULL UNIQUE,semantic_key TEXT NOT NULL UNIQUE REFERENCES pipeline_observations(semantic_key),event_key TEXT NOT NULL REFERENCES pipeline_events(semantic_key),rule_id TEXT NOT NULL REFERENCES pipeline_rules(rule_id),body TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','claimed','complete','blocked')),claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation>=0),error TEXT) STRICT;";
+/// Version 3: what each pull request run last told the forge, so a status is posted once per
+/// state and a failed post is retried and shown.
+/// `run_state` is the run's outbox state when last reported; `state` is what was posted for its
+/// commit and rule, combined over every run of that rule on that commit.
+const REPORTS_SCHEMA: &str = "CREATE TABLE pipeline_reports(dispatch_id TEXT PRIMARY KEY REFERENCES pipeline_dispatches(dispatch_id),run_state TEXT NOT NULL CHECK(run_state IN ('pending','claimed','complete','blocked')),state TEXT NOT NULL CHECK(state IN ('pending','success','failure')),posted INTEGER NOT NULL CHECK(posted IN (0,1)),attempts INTEGER NOT NULL CHECK(attempts>=0),gave_up INTEGER NOT NULL CHECK(gave_up IN (0,1)),error TEXT) STRICT;";
+/// Runs that already existed when the journal moved to version 3 count as reported, so an
+/// upgrade posts nothing on old (often closed) pull requests.
+const REPORTS_SEED: &str = "INSERT INTO pipeline_reports(dispatch_id,run_state,state,posted,attempts,gave_up,error)
+  SELECT dispatch_id,state,CASE state WHEN 'complete' THEN 'success' WHEN 'blocked' THEN 'failure' ELSE 'pending' END,1,0,0,NULL
+  FROM pipeline_dispatches WHERE instr(CAST(event_key AS BLOB),CAST(char(0)||'pull_request'||char(0) AS BLOB))>0;";
 const APPLICATION_ID: i64 = 0x4153_5052;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 pub struct RuleJournal {
     pub(crate) db: Connection,
     native_repository: String,
@@ -932,16 +1074,25 @@ impl RuleJournal {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(crate::operating_policy::SCHEMA)?;
+            tx.execute_batch(REPORTS_SCHEMA)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
-        if app == APPLICATION_ID && version == 1 {
+        // Each step validates the version it starts from, then adds the next one's tables.
+        for (from, added) in [(1, crate::operating_policy::SCHEMA), (2, REPORTS_SCHEMA)] {
+            let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if app != APPLICATION_ID || version != from {
+                continue;
+            }
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             quarantine_rows(&tx, &native_repository, &directory.join(QUARANTINE_FILE))?;
             validate_recovery(&tx, &native_repository)?;
-            tx.execute_batch(crate::operating_policy::SCHEMA)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.execute_batch(added)?;
+            if from == 2 {
+                tx.execute_batch(REPORTS_SEED)?;
+            }
+            tx.pragma_update(None, "user_version", from + 1)?;
             tx.commit()?;
         }
         let quarantine = directory.join(QUARANTINE_FILE);
@@ -1178,6 +1329,96 @@ impl RuleJournal {
             }
         }
         Ok(serde_json::json!({"count":count,"newest":newest,"file":QUARANTINE_FILE}))
+    }
+    /// Pull request runs whose state changed since it was last reported, or whose post failed
+    /// and is not given up. Runs that never failed come first, so failing posts cannot starve
+    /// new heads.
+    fn unreported(&self, limit: usize) -> Result<Vec<PendingDispatch>> {
+        let mut stmt = self.db.prepare(
+            "SELECT d.body FROM pipeline_dispatches d LEFT JOIN pipeline_reports r ON r.dispatch_id=d.dispatch_id
+             WHERE instr(CAST(d.event_key AS BLOB),CAST(?1 AS BLOB))>0
+               AND (r.dispatch_id IS NULL OR r.run_state<>d.state OR (r.posted=0 AND r.gave_up=0))
+             ORDER BY coalesce(r.attempts,0)>0, d.rowid LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params!["\0pull_request\0", limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|body| Ok(serde_json::from_str(&body)?))
+            .collect()
+    }
+    /// Every run of `rule_id` on head `commit`, under any pull request, base or labels.
+    fn runs_on_commit(&self, rule_id: &str, commit: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT dispatch_id,state FROM pipeline_dispatches WHERE rule_id=?1 AND instr(CAST(event_key AS BLOB),CAST(?2 AS BLOB))>0 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![rule_id, format!("\0{commit}\0pull_request\0")],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+    fn record_report(
+        &mut self,
+        dispatch_id: &str,
+        run_state: &str,
+        state: &str,
+        error: Option<&str>,
+        permanent: bool,
+    ) -> Result<()> {
+        // Bytes, cut on a character boundary: the same measure `validate_recovery` uses.
+        let error = error.map(|e| {
+            let mut end = e.len().min(MAX_REPORT_ERROR);
+            while !e.is_char_boundary(end) {
+                end -= 1;
+            }
+            e[..end].to_owned()
+        });
+        // A new failure, or a changed run state, starts counting attempts again.
+        self.db.execute(
+            "INSERT INTO pipeline_reports(dispatch_id,run_state,state,posted,attempts,gave_up,error) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(dispatch_id) DO UPDATE SET
+               attempts=CASE WHEN excluded.posted=1 THEN 0
+                 WHEN pipeline_reports.run_state<>excluded.run_state THEN 1
+                 ELSE pipeline_reports.attempts+1 END,
+               gave_up=CASE WHEN excluded.posted=1 THEN 0
+                 WHEN pipeline_reports.run_state<>excluded.run_state THEN excluded.gave_up
+                 ELSE (?8 AND pipeline_reports.attempts+1>=?9) END,
+               run_state=excluded.run_state,state=excluded.state,posted=excluded.posted,error=excluded.error",
+            params![
+                dispatch_id,
+                run_state,
+                state,
+                error.is_none(),
+                i64::from(error.is_some()),
+                permanent && MAX_PERMANENT_ATTEMPTS <= 1,
+                error,
+                permanent,
+                MAX_PERMANENT_ATTEMPTS,
+            ],
+        )?;
+        Ok(())
+    }
+    /// Pull request runs whose latest state is not posted, newest first. `gave_up` marks an
+    /// answer that cannot change, no longer retried until the run's state changes.
+    pub fn report_failures(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.db.prepare("SELECT dispatch_id,state,attempts,gave_up,error FROM pipeline_reports WHERE posted=0 ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = stmt
+            .query_map([limit.min(256) as i64], |r| {
+                Ok(serde_json::json!({
+                    "dispatch_id": r.get::<_, String>(0)?,
+                    "state": r.get::<_, String>(1)?,
+                    "attempts": r.get::<_, i64>(2)?,
+                    "gave_up": r.get::<_, bool>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
     /// Pull request heads a rule could not evaluate, newest first.
     pub fn unevaluated(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -1689,6 +1930,20 @@ fn quarantine_rows(db: &Connection, native: &str, file: &Path) -> Result<usize> 
     }
     out.sync_all()?;
     // Dependents first, so no reference is left dangling.
+    let reports: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_reports')",
+        [],
+        |r| r.get(0),
+    )?;
+    for (_, key, _, _) in moved
+        .iter()
+        .filter(|m| reports && m.0 == "pipeline_dispatches")
+    {
+        db.execute(
+            "DELETE FROM pipeline_reports WHERE dispatch_id IN (SELECT dispatch_id FROM pipeline_dispatches WHERE semantic_key=?1)",
+            [key],
+        )?;
+    }
     for table in [
         "pipeline_dispatches",
         "pipeline_observations",
@@ -2391,7 +2646,7 @@ fn ensure_binding(
 pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if app != APPLICATION_ID || !matches!(version, 1 | SCHEMA_VERSION) {
+    if app != APPLICATION_ID || !(1..=SCHEMA_VERSION).contains(&version) {
         return Err(Error::Invalid(
             "unsupported pipeline journal identity/schema".into(),
         ));
@@ -2403,10 +2658,13 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
         ));
     }
     let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full_schema = if version == 1 {
-        SCHEMA.to_owned()
-    } else {
-        format!("{SCHEMA}{}", crate::operating_policy::SCHEMA)
+    let full_schema = match version {
+        1 => SCHEMA.to_owned(),
+        2 => format!("{SCHEMA}{}", crate::operating_policy::SCHEMA),
+        _ => format!(
+            "{SCHEMA}{}{REPORTS_SCHEMA}",
+            crate::operating_policy::SCHEMA
+        ),
     };
     for ddl in full_schema
         .split(';')
@@ -2431,13 +2689,23 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if count != if version == 1 { 6 } else { 12 } {
+    if count != [6, 12, 13][version as usize - 1] {
         return Err(Error::Invalid(
             "unsupported extra pipeline relations".into(),
         ));
     }
-    if version == SCHEMA_VERSION {
+    if version >= 2 {
         crate::operating_policy::validate_retained(db)?;
+    }
+    if version >= 3 {
+        let (count, oversized): (i64, bool) = db.query_row(
+            "SELECT count(*),coalesce(max(length(CAST(error AS BLOB))),0)>?1 FROM pipeline_reports",
+            [MAX_REPORT_ERROR as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count > 100_000 || oversized {
+            return Err(Error::Invalid("oversized pipeline report table".into()));
+        }
     }
     let bound:Option<(String,String,String,i64)>=db.query_row("SELECT native_repository,provider,host,provider_repository_id FROM pipeline_binding WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let mut bytes = 0i64;

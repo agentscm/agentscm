@@ -993,8 +993,8 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
         DbKind::Issue => return Ok(()),
         // Both versions still pass the exact table/payload/foreign-key validator in
         // validate_journal before backup publication, verification, restore or activation.
-        // Recovery preserves v1 bytes; only the ordinary journal opener migrates to v2.
-        DbKind::Pipeline => app == 0x4153_5052 && matches!(version, 1 | 2),
+        // Recovery preserves v1 and v2 bytes; only the ordinary journal opener migrates.
+        DbKind::Pipeline => app == 0x4153_5052 && matches!(version, 1..=3),
     };
     if !supported {
         return Err(Error::Invalid(format!(

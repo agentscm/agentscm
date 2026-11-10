@@ -32,7 +32,7 @@ use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
     done_pausing_for, others_for, record_hook_ms,
 };
-use super::session_waiting::WaitReason;
+use super::session_waiting::{WaitReason, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
@@ -316,16 +316,20 @@ async fn hook(
         }
     };
     // The session is moving again, so its person no longer holds it up. Only a session that
-    // waits costs the authentication; another token's call cannot end it.
+    // waits costs the authentication. Any token of the same person ends the wait of a session
+    // its host named (the session's token may have been renewed meanwhile); another person's
+    // call cannot.
     if let Some((native, all)) = call.ends_wait()
         && state.onboarding.waiting().has_session(native)
         && let Ok(Ok(principal)) =
             timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
     {
-        state
-            .onboarding
-            .waiting()
-            .clear(&principal.token_id, native, call.asker.as_deref(), all);
+        state.onboarding.waiting().clear(
+            holder(&principal, native),
+            native,
+            call.asker.as_deref(),
+            all,
+        );
         if all {
             state
                 .onboarding
@@ -795,11 +799,24 @@ impl Call {
                     })
                     .await
                     .and_then(|session| {
-                        state.onboarding.waiting().record(
+                        let waiting = state.onboarding.waiting();
+                        let agent = self.via.strip_prefix("hook:").unwrap_or("");
+                        // The host's notice says only that a dialog is on screen: it must not
+                        // replace the wait that says whose dialog it is and what it asks.
+                        if self.prompt_shown {
+                            return waiting.notice(
+                                &principal,
+                                &native,
+                                &session,
+                                agent,
+                                unix_now(),
+                            );
+                        }
+                        waiting.record(
                             &principal,
                             &native,
                             &session,
-                            self.via.strip_prefix("hook:").unwrap_or(""),
+                            agent,
                             reason,
                             self.asker.as_deref(),
                             self.asks.as_deref(),
@@ -810,7 +827,7 @@ impl Call {
                         eprintln!("hub: waiting hook not recorded: {error}");
                     } else if self.prompt_shown {
                         let requests = state.onboarding.permissions();
-                        requests.confirm(&principal.token_id, &native, unix_now());
+                        requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
                 }
                 Ok(Outcome::clean())
