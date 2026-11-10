@@ -55,6 +55,8 @@ pub struct SkillAdoption {
     pub default_branch: Option<String>,
     pub observed_at: i64,
     pub reported_by: Option<String>,
+    /// The `repo_local` skills' bytes (JSON `[LocalBundle]`), read with the lock.
+    pub local_skills: Option<String>,
 }
 
 /// One evidence row as the tables hold it.
@@ -208,21 +210,54 @@ pub fn run_id_of(repo: &str, branch: &str, skill: &str) -> String {
     format!("run_{}", &full[..16])
 }
 
-fn pins_of(adoption: Option<&SkillAdoption>) -> Vec<PinStatus> {
+/// A repository's resolved pins with the repository skills they may name.
+#[derive(Default)]
+struct Adopted {
+    pins: Vec<PinStatus>,
+    local: Vec<supported::LocalSkill>,
+}
+
+impl std::ops::Deref for Adopted {
+    type Target = [PinStatus];
+    fn deref(&self) -> &[PinStatus] {
+        &self.pins
+    }
+}
+
+impl Adopted {
+    /// The embedded or repository skill a pin or run names by digest.
+    fn entry(&self, sha256: &str) -> Option<&supported::CatalogEntry> {
+        supported::entry_for(sha256, &self.local)
+    }
+}
+
+fn local_of(adoption: &SkillAdoption) -> Vec<supported::LocalSkill> {
     adoption
-        .and_then(|a| SkillLock::parse(a.lock_json.as_bytes()).ok())
-        .map(|lock| supported::resolve(&lock))
+        .local_skills
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Vec<supported::LocalBundle>>(text).ok())
+        .map(|bundles| supported::local_skills(&bundles))
         .unwrap_or_default()
 }
 
+fn pins_of(adoption: Option<&SkillAdoption>) -> Adopted {
+    let Some(adoption) = adoption else {
+        return Adopted::default();
+    };
+    let local = local_of(adoption);
+    let pins = SkillLock::parse(adoption.lock_json.as_bytes())
+        .map(|lock| supported::resolve_with(&lock, &local))
+        .unwrap_or_default();
+    Adopted { pins, local }
+}
+
 /// Pins as JSON; an adopted pin also carries its walkthrough with the pin's own settings.
-fn pins_json(pins: &[PinStatus]) -> Value {
+fn pins_json(pins: &Adopted) -> Value {
     let rows: Vec<Value> = pins
         .iter()
         .map(|p| {
             let mut v = json!(p);
-            if let (AdoptionStatus::Adopted, Some(e)) =
-                (&p.status, supported::catalog_entry_by_sha256(&p.pin.sha256))
+            if let (AdoptionStatus::Adopted, Some(e)) = (&p.status, pins.entry(&p.pin.sha256))
                 && let Ok(params) = e.manifest.effective_params(p.pin.params.as_ref())
             {
                 v["walkthrough"] = json!(supported::walkthrough(&e.manifest, Some(&params)));
@@ -243,9 +278,9 @@ fn run_view(
     store: &dyn Store,
     repo: &str,
     head: &RunHead,
-    pins: &[PinStatus],
+    pins: &Adopted,
 ) -> Result<Option<RunView>> {
-    let Some(entry) = supported::catalog_entry_by_sha256(&head.skill_sha256) else {
+    let Some(entry) = pins.entry(&head.skill_sha256) else {
         return Ok(None);
     };
     let stored: Vec<StoredEvidence> = store
@@ -322,7 +357,7 @@ fn enforce_stop(view: &RunView) -> bool {
 }
 
 fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
-    let catalog = supported::catalog();
+    let mut catalog = json!(supported::catalog());
     let mut adoption = json!({"repo": repo.unwrap_or(""), "source": "none", "observed_at": null,
         "default_branch": null, "pins": []});
     let mut counts = BTreeMap::new();
@@ -333,7 +368,16 @@ fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
             adoption["observed_at"] = json!(a.observed_at);
             adoption["default_branch"] = json!(a.default_branch);
         }
-        adoption["pins"] = pins_json(&pins_of(stored.as_ref()));
+        let pins = pins_of(stored.as_ref());
+        adoption["pins"] = pins_json(&pins);
+        // This repository's own skills join the embedded ones, marked by `first_party: false`.
+        if let Some(rows) = catalog.as_array_mut() {
+            rows.extend(pins.local.iter().map(|l| {
+                let mut row = json!(l.entry);
+                row["path"] = json!(l.path);
+                row
+            }));
+        }
         for view in views(store, repo, None, None, MAX_RUNS)? {
             let c = counts.entry(view.skill.name.clone()).or_insert_with(|| {
                 json!({"open": 0, "at_stop_gate": 0, "completed": 0, "merged_observed": 0,
@@ -364,10 +408,40 @@ fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
     Ok(json!({"catalog": catalog, "adoption": adoption, "counts": counts}))
 }
 
+/// A checkout's report: the lock file itself, or `{"lock": …, "local": [LocalBundle]}` when it
+/// pins repository skills.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Report {
+    lock: Value,
+    #[serde(default)]
+    local: Vec<supported::LocalBundle>,
+}
+
+/// The stored form of repository skills: only the bundles that validate and that a
+/// `repo_local` pin names, at most `MAX_LOCAL_SKILLS`, or `None` when there are none.
+fn stored_local(lock: &SkillLock, bundles: Vec<supported::LocalBundle>) -> Option<String> {
+    let wanted: BTreeSet<&str> = lock
+        .skills
+        .iter()
+        .filter_map(|p| p.source.repo_local_path())
+        .collect();
+    let kept: Vec<supported::LocalBundle> = bundles
+        .into_iter()
+        .filter(|b| wanted.contains(b.path.as_str()) && b.skill().is_ok())
+        .take(supported::MAX_LOCAL_SKILLS)
+        .collect();
+    (!kept.is_empty()).then(|| serde_json::to_string(&kept).unwrap_or_default())
+}
+
 /// Stores a lock a checkout reported; the forge's own reading, when there is one, still wins.
 fn report_adoption(store: &dyn Store, repo: &str, token: &str, body: &[u8]) -> Out<Value> {
-    let lock =
-        SkillLock::parse(body).map_err(|e| bad_request(format!("invalid lock file: {e}")))?;
+    let (lock_bytes, bundles) = match serde_json::from_slice::<Report>(body) {
+        Ok(report) => (report.lock.to_string().into_bytes(), report.local),
+        Err(_) => (body.to_vec(), Vec::new()),
+    };
+    let lock = SkillLock::parse(&lock_bytes)
+        .map_err(|e| bad_request(format!("invalid lock file: {e}")))?;
     let lock_json = serde_json::to_string(&lock).map_err(|_| bad_request("unserializable lock"))?;
     let applied = store.skill_adoption_put(&SkillAdoption {
         repository: repo.to_owned(),
@@ -376,13 +450,14 @@ fn report_adoption(store: &dyn Store, repo: &str, token: &str, body: &[u8]) -> O
         default_branch: None,
         observed_at: unix_now(),
         reported_by: Some(token.to_owned()),
+        local_skills: stored_local(&lock, bundles),
     })?;
     Ok(json!({
         "source": applied.source,
         "applied": applied.lock_json == lock_json && applied.source == "reported_by_checkout",
         "observed_at": applied.observed_at,
         "default_branch": applied.default_branch,
-        "pins": pins_of(Some(&applied)),
+        "pins": pins_of(Some(&applied)).pins,
     }))
 }
 
@@ -410,7 +485,8 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
             format!("skill {skill} is not adopted in this repository"),
         )
     })?;
-    let entry = supported::catalog_entry_by_sha256(&pin.pin.sha256)
+    let entry = pins
+        .entry(&pin.pin.sha256)
         .ok_or_else(|| conflict("not_adopted", format!("skill {skill} is not available")))?;
     let now = unix_now();
     let session = store.session_name_for(who.token, who.session, now)?;
@@ -582,6 +658,25 @@ pub(super) async fn sync_adoption(
         }
     };
     let lock = file.and_then(|bytes| SkillLock::parse(&bytes).ok());
+    // Repository skills come from the same branch. A credential or rate-limit failure keeps the
+    // previous adoption rather than turning every repository skill unknown.
+    let mut bundles = Vec::new();
+    for path in lock
+        .iter()
+        .flat_map(|l| &l.skills)
+        .filter_map(|p| p.source.repo_local_path())
+        .take(supported::MAX_LOCAL_SKILLS)
+    {
+        match read_bundle(api, token, repo, &branch, path).await {
+            Ok(Some(bundle)) => bundles.push(bundle),
+            Ok(None) => {}
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => {
+                return crate::hub::error_envelope::log_internal(&error);
+            }
+            // Too large or unreadable: that pin is unknown until the next read.
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
+        }
+    }
     let (store, name) = (state.store.clone(), repo.full_name.clone());
     let done = blocking(state, move || match lock {
         Some(lock) => store
@@ -593,6 +688,7 @@ pub(super) async fn sync_adoption(
                 default_branch: Some(branch),
                 observed_at: unix_now(),
                 reported_by: None,
+                local_skills: stored_local(&lock, bundles),
             })
             .map(|_| ()),
         None => store.skill_adoption_clear(&name, None),
@@ -601,6 +697,41 @@ pub(super) async fn sync_adoption(
     if let Err(error) = done {
         crate::hub::error_envelope::log_internal(&error);
     }
+}
+
+/// One repository skill's manifest at `path` and its procedure, read from `branch`; `None`
+/// when a file is missing, too large or the manifest is invalid (the pin is then unknown).
+async fn read_bundle(
+    api: ForgeApi<'_>,
+    token: &str,
+    repo: &ConnectedRepository,
+    branch: &str,
+    path: &str,
+) -> std::result::Result<Option<supported::LocalBundle>, GhError> {
+    let max = supported::MAX_LOCAL_FILE_BYTES;
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
+    let Some(manifest) = api
+        .file(token, repo, path, branch, max)
+        .await?
+        .and_then(text)
+    else {
+        return Ok(None);
+    };
+    let Ok(entrypoint) = supported::local_procedure_path(manifest.as_bytes()) else {
+        return Ok(None);
+    };
+    let Some(procedure) = api
+        .file(token, repo, &entrypoint, branch, max)
+        .await?
+        .and_then(text)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(supported::LocalBundle {
+        path: path.to_owned(),
+        manifest,
+        procedure,
+    }))
 }
 
 // ---- forge observation ----------------------------------------------------------------------
@@ -849,11 +980,11 @@ fn record_observed(
     repo: &str,
     pull: &ForgePull,
     facts: &[Fact],
-) -> Result<Vec<(&'static supported::CatalogEntry, Option<RunView>)>> {
+) -> Result<Vec<(supported::CatalogEntry, Option<RunView>)>> {
     let pins = pins_of(store.skill_adoption(repo)?.as_ref());
     let mut out = Vec::new();
     for pin in pins.iter().filter(|p| p.status == AdoptionStatus::Adopted) {
-        let Some(entry) = supported::catalog_entry_by_sha256(&pin.pin.sha256) else {
+        let Some(entry) = pins.entry(&pin.pin.sha256) else {
             continue;
         };
         let params = entry
@@ -927,7 +1058,7 @@ fn record_observed(
         } else {
             run_view(store, repo, &head, &pins)?
         };
-        out.push((entry, view));
+        out.push((entry.clone(), view));
     }
     Ok(out)
 }
@@ -1648,7 +1779,7 @@ pub fn render_run(view: &RunView) -> String {
     lines.join("\n")
 }
 
-fn render_library(lib: &Value, pins: &[PinStatus]) -> String {
+fn render_library(lib: &Value, pins: &Adopted) -> String {
     let list = |v: &Value| {
         let items: Vec<&str> = v
             .as_array()
@@ -1673,12 +1804,17 @@ fn render_library(lib: &Value, pins: &[PinStatus]) -> String {
             p.pin.name == name && p.pin.sha256 == sha && p.status == AdoptionStatus::Adopted
         });
         lines.push(format!(
-            "{name} v{} ({}): {}",
+            "{name} v{} ({}{}): {}",
             entry["workflow_version"],
             if pin.is_some() {
                 "adopted"
             } else {
                 "available"
+            },
+            if entry["first_party"] == false {
+                ", repository skill"
+            } else {
+                ""
             },
             entry["summary"].as_str().unwrap_or("")
         ));
@@ -1688,12 +1824,13 @@ fn render_library(lib: &Value, pins: &[PinStatus]) -> String {
         lines.push(format!("  Not for: {}", list(&a["not_for"])));
         let mut steps = entry["walkthrough"].clone();
         if let Some(pin) = pin {
-            let params = supported::catalog_entry_by_sha256(sha)
+            let params = pins
+                .entry(sha)
                 .and_then(|e| e.manifest.effective_params(pin.pin.params.as_ref()).ok())
                 .unwrap_or_default();
             let text: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
             lines.push(format!("  Parameters: {}", text.join(", ")));
-            if let Some(e) = supported::catalog_entry_by_sha256(sha) {
+            if let Some(e) = pins.entry(sha) {
                 steps = json!(supported::walkthrough(&e.manifest, Some(&params)));
             }
         }

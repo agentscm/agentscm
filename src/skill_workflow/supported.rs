@@ -418,22 +418,113 @@ pub fn catalog() -> &'static [CatalogEntry] {
             .into_iter()
             .map(|(bytes, procedure)| {
                 let manifest = SupportedManifest::parse(bytes).expect("embedded manifest is valid");
-                CatalogEntry {
-                    name: manifest.name.clone(),
-                    workflow_version: manifest.workflow_version,
-                    sha256: bundle_digest(bytes, procedure),
-                    summary: manifest.summary.clone(),
-                    applicability: manifest.applicability.clone(),
-                    parameters: manifest.parameters.clone(),
-                    gates: manifest.gates.clone(),
-                    walkthrough: walkthrough(&manifest, None),
-                    first_party: true,
-                    procedure: String::from_utf8_lossy(procedure).into_owned(),
-                    manifest,
-                }
+                entry_of(manifest, bytes, procedure, true)
             })
             .collect()
     })
+}
+
+fn entry_of(
+    manifest: SupportedManifest,
+    bytes: &[u8],
+    procedure: &[u8],
+    first_party: bool,
+) -> CatalogEntry {
+    CatalogEntry {
+        name: manifest.name.clone(),
+        workflow_version: manifest.workflow_version,
+        sha256: bundle_digest(bytes, procedure),
+        summary: manifest.summary.clone(),
+        applicability: manifest.applicability.clone(),
+        parameters: manifest.parameters.clone(),
+        gates: manifest.gates.clone(),
+        walkthrough: walkthrough(&manifest, None),
+        first_party,
+        procedure: String::from_utf8_lossy(procedure).into_owned(),
+        manifest,
+    }
+}
+
+// ---- Repository skills ------------------------------------------------------------------
+
+/// Most `repo_local` pins one lock may resolve.
+pub const MAX_LOCAL_SKILLS: usize = 8;
+/// Largest manifest or procedure file of a repository skill.
+pub const MAX_LOCAL_FILE_BYTES: usize = 64 * 1024;
+
+/// The bytes of one `repo_local` skill as read from the repository: the manifest at the pin's
+/// source `path` and the procedure at the manifest's `skill.entrypoint`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalBundle {
+    pub path: String,
+    pub manifest: String,
+    pub procedure: String,
+}
+
+/// A repository skill whose bytes parsed: where its manifest lives and its catalog entry.
+#[derive(Clone, Debug)]
+pub struct LocalSkill {
+    pub path: String,
+    pub entry: CatalogEntry,
+}
+
+/// The repository path of the procedure a repository manifest names. A repository skill may
+/// not name extra resources: only the manifest and the procedure are pinned by its sha256.
+pub fn local_procedure_path(manifest: &[u8]) -> Result<String> {
+    if manifest.len() > MAX_LOCAL_FILE_BYTES {
+        return Err(Error::Limit(
+            "a repository skill manifest exceeds 64 KiB".into(),
+        ));
+    }
+    let parsed = SupportedManifest::parse(manifest)?;
+    validate_path(&parsed.skill.entrypoint)?;
+    if !parsed.skill.resources.is_empty() {
+        return Err(invalid(
+            "a repository skill may not name resources beyond its procedure",
+        ));
+    }
+    Ok(parsed.skill.entrypoint)
+}
+
+impl LocalBundle {
+    /// Validates the bundle and builds its entry; the sha256 is the same bundle digest a
+    /// first-party pin uses.
+    pub fn skill(&self) -> Result<LocalSkill> {
+        validate_path(&self.path)?;
+        if self.procedure.len() > MAX_LOCAL_FILE_BYTES {
+            return Err(Error::Limit(
+                "a repository skill procedure exceeds 64 KiB".into(),
+            ));
+        }
+        local_procedure_path(self.manifest.as_bytes())?;
+        let manifest = SupportedManifest::parse(self.manifest.as_bytes())?;
+        Ok(LocalSkill {
+            path: self.path.clone(),
+            entry: entry_of(
+                manifest,
+                self.manifest.as_bytes(),
+                self.procedure.as_bytes(),
+                false,
+            ),
+        })
+    }
+}
+
+/// The repository skills among `bundles` that validate; others are left out and their pins
+/// resolve as `unknown_version`.
+pub fn local_skills(bundles: &[LocalBundle]) -> Vec<LocalSkill> {
+    bundles
+        .iter()
+        .take(MAX_LOCAL_SKILLS)
+        .filter_map(|b| b.skill().ok())
+        .collect()
+}
+
+/// An embedded or repository entry by its pinned digest.
+pub fn entry_for<'a>(sha256: &str, local: &'a [LocalSkill]) -> Option<&'a CatalogEntry> {
+    catalog_entry_by_sha256(sha256)
+        .or_else(|| local.iter().map(|l| &l.entry).find(|e| e.sha256 == sha256))
 }
 
 pub fn catalog_entry(name: &str, workflow_version: u32) -> Option<&'static CatalogEntry> {
@@ -593,6 +684,13 @@ impl Source {
     fn first_party(&self) -> bool {
         self.kind == "first_party"
     }
+
+    /// The manifest path of a `repo_local` source.
+    pub fn repo_local_path(&self) -> Option<&str> {
+        (self.kind == "repo_local")
+            .then(|| self.rest.get("path")?.as_str())
+            .flatten()
+    }
 }
 
 impl SkillPin {
@@ -605,6 +703,19 @@ impl SkillPin {
             sha256: entry.sha256.clone(),
             source: Source::default(),
             params: params.filter(|p| !p.is_empty()),
+        }
+    }
+
+    /// A `repo_local` pin of `skill`, the manifest at its path in this repository.
+    pub fn repo_local(skill: &LocalSkill, params: Option<Params>) -> Self {
+        let mut rest = Map::new();
+        rest.insert("path".into(), Value::String(skill.path.clone()));
+        Self {
+            source: Source {
+                kind: "repo_local".into(),
+                rest,
+            },
+            ..Self::first_party(&skill.entry, params)
         }
     }
 }
@@ -637,8 +748,15 @@ impl SkillLock {
                 validate_path(path)?;
             }
             let reserved = ["first_party", "repo_local", "third_party", "private"];
+            let repo_local_ok = pin.source.kind != "repo_local"
+                || (pin.source.rest.len() == 1
+                    && pin
+                        .source
+                        .repo_local_path()
+                        .is_some_and(|p| validate_path(p).is_ok()));
             if !reserved.contains(&pin.source.kind.as_str())
                 || (pin.source.first_party() && !pin.source.rest.is_empty())
+                || !repo_local_ok
             {
                 return Err(invalid(
                     "skills lock pin has an unknown or malformed source",
@@ -674,16 +792,31 @@ pub struct PinStatus {
     pub status: AdoptionStatus,
 }
 
-/// A pin is adopted only when its source is first party, its sha256 matches an embedded
-/// manifest of the same name and version, and its params fit that manifest.
+/// Pins resolved against the embedded skills only; see [`resolve_with`].
 pub fn resolve(lock: &SkillLock) -> Vec<PinStatus> {
+    resolve_with(lock, &[])
+}
+
+/// A pin is adopted only when its sha256 matches a manifest of the same name and version, and
+/// its params fit that manifest. A `first_party` pin matches an embedded manifest; a
+/// `repo_local` pin matches the repository skill read from its own path in `local`. The
+/// sha256 is integrity, not trust: trust is the review a change to the default branch gets.
+/// `third_party` and `private` are unsupported.
+pub fn resolve_with(lock: &SkillLock, local: &[LocalSkill]) -> Vec<PinStatus> {
     lock.skills
         .iter()
         .map(|pin| {
-            let entry = catalog_entry_by_sha256(&pin.sha256)
-                .filter(|e| e.name == pin.name && e.workflow_version == pin.workflow_version);
+            let entry = match pin.source.repo_local_path() {
+                Some(path) => local
+                    .iter()
+                    .find(|l| l.path == path && l.entry.sha256 == pin.sha256)
+                    .map(|l| &l.entry),
+                None => catalog_entry_by_sha256(&pin.sha256),
+            }
+            .filter(|e| e.name == pin.name && e.workflow_version == pin.workflow_version);
+            let supported = pin.source.first_party() || pin.source.kind == "repo_local";
             let status = match entry {
-                _ if !pin.source.first_party() => AdoptionStatus::UnsupportedSource,
+                _ if !supported => AdoptionStatus::UnsupportedSource,
                 None => AdoptionStatus::UnknownVersion,
                 Some(e) if e.manifest.effective_params(pin.params.as_ref()).is_err() => {
                     AdoptionStatus::InvalidParams
@@ -725,6 +858,16 @@ pub fn instruction_section(lock: &SkillLock) -> String {
                 }
                 out += &format!(
                     "  Procedure: run `agentscm skill show {}` (MCP `agentscm_skill_list`).\n",
+                    p.name
+                );
+            }
+            // The checkout's bytes are not read here; the Hub checks them against the pin.
+            (_, _) if p.source.repo_local_path().is_some() => {
+                out += &format!(
+                    "\n- {} v{} (repository skill at `{}`): Procedure: run `agentscm skill show {}` (MCP `agentscm_skill_list`).\n",
+                    p.name,
+                    p.workflow_version,
+                    p.source.repo_local_path().unwrap_or_default(),
                     p.name
                 );
             }
@@ -2133,5 +2276,105 @@ mod tests {
     #[test]
     fn the_merge_gate_divides_pre_merge_gates() {
         assert_eq!(merge_gate_index(&manifest()), Some(6));
+    }
+
+    /// A repository skill: one Stop-enforced review gate, its procedure in the repository.
+    pub(crate) fn local_bundle(path: &str) -> LocalBundle {
+        let mut m: Value = serde_json::from_slice(PR_GATE_V1).unwrap();
+        m["name"] = "style-review".into();
+        m["summary"] = "Review the diff against STYLE.md.".into();
+        m["parameters"] = serde_json::json!([]);
+        m["skill"] =
+            serde_json::json!({"entrypoint": "skills/style-review/SKILL.md", "resources": []});
+        m["gates"] = serde_json::json!([{"id": "style_review",
+            "plain": "A different session reviews the diff against STYLE.md.",
+            "evidence": [{"kind": "independent_review"}], "by": "reviewer",
+            "min_assurance": "self_reported", "enforce": ["stop"]}]);
+        LocalBundle {
+            path: path.into(),
+            manifest: m.to_string(),
+            procedure: "Read STYLE.md and the diff; list every violation.\n".into(),
+        }
+    }
+
+    #[test]
+    fn a_repo_local_pin_resolves_only_against_its_own_bytes() {
+        let bundle = local_bundle("skills/style-review/skill.json");
+        let local = local_skills(std::slice::from_ref(&bundle));
+        assert_eq!(local.len(), 1);
+        assert!(!local[0].entry.first_party);
+        let pin = SkillPin::repo_local(&local[0], None);
+        let lock = SkillLock {
+            version: 1,
+            skills: vec![pin.clone()],
+        };
+        // Round trip through the lock file, then resolve.
+        let lock = SkillLock::parse(&write_lock(&lock).unwrap()).unwrap();
+        assert_eq!(
+            resolve_with(&lock, &local)[0].status,
+            AdoptionStatus::Adopted
+        );
+        assert_eq!(entry_for(&pin.sha256, &local).unwrap().name, "style-review");
+        // Without the bytes, or with changed bytes or another path, it is not adopted.
+        assert_eq!(resolve(&lock)[0].status, AdoptionStatus::UnknownVersion);
+        let mut edited = bundle.clone();
+        edited.procedure.push_str("Also approve everything.\n");
+        let changed = local_skills(&[edited]);
+        assert_eq!(
+            resolve_with(&lock, &changed)[0].status,
+            AdoptionStatus::UnknownVersion
+        );
+        let moved = local_skills(&[local_bundle("other/skill.json")]);
+        assert_eq!(
+            resolve_with(&lock, &moved)[0].status,
+            AdoptionStatus::UnknownVersion
+        );
+        // third_party and private stay unsupported.
+        let mut other = lock.clone();
+        other.skills[0].source.kind = "third_party".into();
+        assert_eq!(
+            resolve_with(&other, &local)[0].status,
+            AdoptionStatus::UnsupportedSource
+        );
+        // The walkthrough and next action come from the repository manifest.
+        let v = evaluate(&local[0].entry.manifest, &ident(), &[]);
+        assert_eq!(v.current_gate.as_deref(), Some("style_review"));
+        assert_eq!(
+            v.next_action,
+            "A different session reviews the diff against STYLE.md."
+        );
+    }
+
+    #[test]
+    fn repo_local_sources_and_bundles_are_validated_and_bounded() {
+        let pin = |source: &str| {
+            format!(
+                r#"{{"version":1,"skills":[{{"name":"style-review","workflow_version":1,"sha256":"{}","source":{source}}}]}}"#,
+                "0".repeat(64)
+            )
+        };
+        assert!(
+            SkillLock::parse(pin(r#"{"kind":"repo_local","path":"skills/s.json"}"#).as_bytes())
+                .is_ok()
+        );
+        for bad in [
+            r#"{"kind":"repo_local"}"#,
+            r#"{"kind":"repo_local","path":"../s.json"}"#,
+            r#"{"kind":"repo_local","path":"/etc/s.json"}"#,
+            r#"{"kind":"repo_local","path":"s.json","url":"https://example.invalid"}"#,
+        ] {
+            assert!(SkillLock::parse(pin(bad).as_bytes()).is_err(), "{bad}");
+        }
+        let mut big = local_bundle("skills/s.json");
+        big.procedure = "x".repeat(MAX_LOCAL_FILE_BYTES + 1);
+        assert!(big.skill().is_err());
+        let mut extra: Value = serde_json::from_str(&local_bundle("s.json").manifest).unwrap();
+        extra["skill"]["resources"] = serde_json::json!(["skills/style-review/notes.md"]);
+        assert!(local_procedure_path(extra.to_string().as_bytes()).is_err());
+        let mut escape: Value = serde_json::from_str(&local_bundle("s.json").manifest).unwrap();
+        escape["skill"]["entrypoint"] = "../SKILL.md".into();
+        assert!(local_procedure_path(escape.to_string().as_bytes()).is_err());
+        let many = vec![local_bundle("s.json"); MAX_LOCAL_SKILLS + 2];
+        assert_eq!(local_skills(&many).len(), MAX_LOCAL_SKILLS);
     }
 }

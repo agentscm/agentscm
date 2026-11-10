@@ -2750,6 +2750,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
             default_branch: Some("main".into()),
             observed_at: unix_now(),
             reported_by: None,
+            local_skills: None,
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());

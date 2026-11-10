@@ -2589,12 +2589,15 @@ fn skill_adoption_and_evidence(db: &Db) {
         default_branch: (source == "default_branch").then(|| "main".to_owned()),
         observed_at: 10,
         reported_by: None,
+        local_skills: (lock == "{\"a\":1}").then(|| "[{\"local\":1}]".to_owned()),
     };
     assert_eq!(store.skill_adoption(REPO).unwrap(), None);
     let checkout = store
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"a\":1}"))
         .unwrap();
     assert_eq!(checkout.lock_json, "{\"a\":1}");
+    // Repository skills are stored with the lock and replaced with it.
+    assert_eq!(checkout.local_skills.as_deref(), Some("[{\"local\":1}]"));
     // The forge replaces a checkout report; a checkout report never replaces the forge.
     let forge = store
         .skill_adoption_put(&adoption("default_branch", "{\"b\":2}"))

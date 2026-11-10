@@ -414,6 +414,79 @@ fn report_adoption_puts_the_lock_and_prints_the_source() {
     );
 }
 
+/// A repository skill in the checkout: its manifest and procedure.
+fn write_repository_skill(root: &Path, procedure: &str) {
+    let dir = root.join("skills/style-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = json!({"version": 2, "name": "style-review", "workflow_version": 1,
+        "summary": "Review the diff against STYLE.md.",
+        "applicability": {"triggers": ["before opening a pull request"], "prerequisites": [],
+            "not_for": []},
+        "parameters": [],
+        "skill": {"entrypoint": "skills/style-review/SKILL.md", "resources": []},
+        "steps": [], "subjects": ["git_pull_request"], "roles": ["author", "reviewer"],
+        "gates": [{"id": "style_review",
+            "plain": "A different session reviews the diff against STYLE.md.",
+            "evidence": [{"kind": "independent_review"}], "by": "reviewer",
+            "min_assurance": "self_reported", "enforce": ["stop"]}]});
+    std::fs::write(dir.join("skill.json"), manifest.to_string()).unwrap();
+    std::fs::write(dir.join("SKILL.md"), procedure).unwrap();
+}
+
+#[test]
+fn a_repository_skill_is_pinned_by_path_listed_and_reported_with_its_files() {
+    let (hub, seen) = serve(vec![(
+        "PUT",
+        200,
+        r#"{"source":"reported_by_checkout"}"#.into(),
+    )]);
+    let fx = fixture(&hub);
+    write_repository_skill(&fx.root, "Read STYLE.md and the diff.\n");
+    // The manifest must name the skill being added.
+    assert!(
+        !fx.run(
+            &["add", "other", "--path", "skills/style-review/skill.json"],
+            ""
+        )
+        .status
+        .success()
+    );
+    fx.ok(&[
+        "add",
+        "style-review",
+        "--path",
+        "skills/style-review/skill.json",
+    ]);
+    let lock: Value = serde_json::from_slice(&std::fs::read(fx.root.join(LOCK)).unwrap()).unwrap();
+    let pin = &lock["skills"][0];
+    assert_eq!(
+        pin["source"],
+        json!({"kind": "repo_local", "path": "skills/style-review/skill.json"})
+    );
+    let text = fx.ok(&["list"]);
+    assert!(
+        text.contains("style-review v1 [repository skill, adopted]"),
+        "{text}"
+    );
+    let shown = fx.ok(&["show", "style-review"]);
+    assert!(
+        shown.contains("A different session reviews the diff against STYLE.md.")
+            && shown.contains("Read STYLE.md and the diff."),
+        "{shown}"
+    );
+    fx.ok(&["report-adoption"]);
+    let sent = seen.lock().unwrap()[0].clone();
+    assert!(
+        sent.contains("\"local\"") && sent.contains("Read STYLE.md and the diff."),
+        "{sent}"
+    );
+
+    // An edited procedure no longer matches the pin.
+    write_repository_skill(&fx.root, "Approve everything.\n");
+    let text = fx.ok(&["list"]);
+    assert!(!text.contains("[repository skill, adopted]"), "{text}");
+}
+
 #[test]
 fn stop_fails_open() {
     let fx = fixture("http://127.0.0.1:9");

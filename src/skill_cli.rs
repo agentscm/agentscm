@@ -11,7 +11,7 @@ use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http;
 use agentscm::skill_workflow::supported::{
     self, AdoptionStatus, Assurance, CatalogEntry, Detail, Evidence, EvidenceKind, GateState,
-    LOCK_PATH, Params, RunView, SkillLock, SkillPin,
+    LOCK_PATH, LocalBundle, LocalSkill, Params, RunView, SkillLock, SkillPin,
 };
 use agentscm::{Error, Result};
 use clap::{Subcommand, ValueEnum};
@@ -55,6 +55,10 @@ pub enum SkillCommand {
         name: String,
         #[arg(long)]
         version: Option<u32>,
+        /// Pin a skill defined in this repository: the path of its `skill.json` manifest,
+        /// relative to the repository root. Its procedure is the manifest's entrypoint.
+        #[arg(long, conflicts_with = "version")]
+        path: Option<String>,
         /// `key=value`; `key=null` resets the parameter to its default. Repeatable.
         #[arg(long = "param")]
         params: Vec<String>,
@@ -108,8 +112,12 @@ pub async fn run(data_dir: &Path, command: SkillCommand) -> Result<()> {
         SkillCommand::Add {
             name,
             version,
+            path,
             params,
-        } => add(&name, version, &params),
+        } => match path {
+            Some(path) => add_local(&name, &path, &params),
+            None => add(&name, version, &params),
+        },
         SkillCommand::Remove { name } => remove(&name),
         SkillCommand::ReportAdoption => report_adoption().await,
         SkillCommand::Status { branch, json } => status(branch, json).await,
@@ -201,14 +209,57 @@ fn read_lock(root: &Path) -> Result<Option<SkillLock>> {
     }
 }
 
+/// One repository skill's bytes from the checkout: the manifest at `path` and the procedure
+/// its entrypoint names, each at most 64 KiB.
+fn read_bundle(root: &Path, path: &str) -> Result<LocalBundle> {
+    let read = |rel: &str| -> Result<String> {
+        agentscm::store::validate_path(rel)?;
+        let file = root.join(rel);
+        if std::fs::metadata(&file)?.len() > supported::MAX_LOCAL_FILE_BYTES as u64 {
+            return Err(invalid(format!("{rel} is larger than 64 KiB")));
+        }
+        String::from_utf8(std::fs::read(file)?).map_err(|_| invalid(format!("{rel} is not UTF-8")))
+    };
+    let manifest = read(path)?;
+    let procedure = read(&supported::local_procedure_path(manifest.as_bytes())?)?;
+    Ok(LocalBundle {
+        path: path.to_owned(),
+        manifest,
+        procedure,
+    })
+}
+
+/// The repository skills the lock's `repo_local` pins name, as this checkout has them.
+fn local_bundles(root: &Path, lock: &SkillLock) -> Vec<LocalBundle> {
+    lock.skills
+        .iter()
+        .filter_map(|p| p.source.repo_local_path())
+        .take(supported::MAX_LOCAL_SKILLS)
+        .filter_map(|path| read_bundle(root, path).ok())
+        .collect()
+}
+
+/// The lock of this checkout and its repository skills.
+fn checkout() -> Result<(Option<SkillLock>, Vec<LocalSkill>)> {
+    let Ok(root) = repo_root(&cwd()?) else {
+        return Ok((None, Vec::new()));
+    };
+    let lock = read_lock(&root)?;
+    let local = lock
+        .as_ref()
+        .map(|l| supported::local_skills(&local_bundles(&root, l)))
+        .unwrap_or_default();
+    Ok((lock, local))
+}
+
 // ---- list, show ------------------------------------------------------------------------
 
 /// "adopted", another status, "pinned at vN" or "not adopted" for one catalog entry.
-fn adoption_label(lock: Option<&SkillLock>, entry: &CatalogEntry) -> String {
+fn adoption_label(lock: Option<&SkillLock>, local: &[LocalSkill], entry: &CatalogEntry) -> String {
     let Some(lock) = lock else {
         return "not adopted".into();
     };
-    let Some(status) = supported::resolve(lock)
+    let Some(status) = supported::resolve_with(lock, local)
         .into_iter()
         .find(|p| p.pin.name == entry.name)
     else {
@@ -224,13 +275,6 @@ fn adoption_label(lock: Option<&SkillLock>, entry: &CatalogEntry) -> String {
         AdoptionStatus::InvalidParams => "invalid_params",
     }
     .into()
-}
-
-fn lock_for_cwd() -> Result<Option<SkillLock>> {
-    match repo_root(&cwd()?) {
-        Ok(root) => read_lock(&root),
-        Err(_) => Ok(None),
-    }
 }
 
 fn describe(
@@ -288,26 +332,42 @@ fn describe(
     out
 }
 
+/// Embedded skills, then this repository's own, each with its adoption label.
+fn listed(lock: Option<&SkillLock>, local: &[LocalSkill]) -> Vec<(CatalogEntry, String)> {
+    let label = |e: &CatalogEntry| {
+        let status = adoption_label(lock, local, e);
+        if e.first_party {
+            status
+        } else {
+            format!("repository skill, {status}")
+        }
+    };
+    supported::catalog()
+        .iter()
+        .chain(local.iter().map(|l| &l.entry))
+        .map(|e| (e.clone(), label(e)))
+        .collect()
+}
+
 fn list(as_json: bool) -> Result<()> {
-    let lock = lock_for_cwd()?;
+    let (lock, local) = checkout()?;
+    let rows = listed(lock.as_ref(), &local);
     if as_json {
-        let skills: Vec<Value> = supported::catalog()
+        let skills: Vec<Value> = rows
             .iter()
-            .map(|e| {
+            .map(|(e, label)| {
                 let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
-                v["status"] = json!(adoption_label(lock.as_ref(), e));
+                v["status"] = json!(adoption_label(lock.as_ref(), &local, e));
                 v["adopted"] = json!(v["status"] == "adopted");
+                v["label"] = json!(label);
                 v
             })
             .collect();
         println!("{}", json!({"skills": skills}));
         return Ok(());
     }
-    for e in supported::catalog() {
-        println!(
-            "{}",
-            describe(e, Some(&adoption_label(lock.as_ref(), e)), false, &[])
-        );
+    for (e, label) in &rows {
+        println!("{}", describe(e, Some(label), false, &[]));
     }
     Ok(())
 }
@@ -338,14 +398,21 @@ fn pick(name: &str, version: Option<u32>) -> Result<&'static CatalogEntry> {
 }
 
 fn show(name: &str, version: Option<u32>, as_json: bool) -> Result<()> {
-    let entry = pick(name, version)?;
+    let (lock, local) = checkout()?;
+    // A repository skill of that name is the one this repository means.
+    let entry = match local
+        .iter()
+        .find(|l| l.entry.name == name && version.is_none())
+    {
+        Some(l) => &l.entry,
+        None => pick(name, version)?,
+    };
     if as_json {
         println!("{}", serde_json::to_value(entry)?);
     } else {
-        let lock = lock_for_cwd()?;
         // The adopted pin's settings change the wording (CI label, merge method).
         let pin = lock.as_ref().and_then(|l| {
-            supported::resolve(l)
+            supported::resolve_with(l, &local)
                 .into_iter()
                 .find(|p| p.pin.sha256 == entry.sha256 && p.status == AdoptionStatus::Adopted)
         });
@@ -357,7 +424,7 @@ fn show(name: &str, version: Option<u32>, as_json: bool) -> Result<()> {
             "{}",
             describe(
                 entry,
-                Some(&adoption_label(lock.as_ref(), entry)),
+                Some(&adoption_label(lock.as_ref(), &local, entry)),
                 true,
                 &lines
             )
@@ -429,8 +496,35 @@ fn write_lock_file(root: &Path, lock: &SkillLock) -> Result<()> {
 }
 
 fn add(name: &str, version: Option<u32>, raw_params: &[String]) -> Result<()> {
-    let root = repo_root(&cwd()?)?;
     let entry = pick(name, version)?;
+    write_pin(name, entry, raw_params, |params| {
+        SkillPin::first_party(entry, Some(params))
+    })
+}
+
+/// Pins the repository skill whose manifest is at `path`; its name must be `name`.
+fn add_local(name: &str, path: &str, raw_params: &[String]) -> Result<()> {
+    let root = repo_root(&cwd()?)?;
+    let skill = read_bundle(&root, path)?.skill()?;
+    if skill.entry.name != name {
+        return Err(invalid(format!(
+            "the manifest at {path} names skill {}, not {name}",
+            skill.entry.name
+        )));
+    }
+    write_pin(name, &skill.entry, raw_params, |params| {
+        SkillPin::repo_local(&skill, Some(params))
+    })
+}
+
+/// Applies `raw_params` over the existing pin's, then writes the pin `make` builds.
+fn write_pin(
+    name: &str,
+    entry: &CatalogEntry,
+    raw_params: &[String],
+    make: impl FnOnce(Params) -> SkillPin,
+) -> Result<()> {
+    let root = repo_root(&cwd()?)?;
     let mut lock = read_lock(&root)?.unwrap_or(SkillLock {
         version: 1,
         skills: Vec::new(),
@@ -451,7 +545,7 @@ fn add(name: &str, version: Option<u32>, raw_params: &[String]) -> Result<()> {
         }
     }
     entry.manifest.effective_params(Some(&params))?;
-    let pin = SkillPin::first_party(entry, Some(params));
+    let pin = make(params);
     let (before, after) = (pin_text(existing.as_ref()), pin_text(Some(&pin)));
     supported::upsert_pin(&mut lock, pin);
     write_lock_file(&root, &lock)?;
@@ -558,7 +652,13 @@ async fn report_adoption() -> Result<()> {
     let lock =
         read_lock(&root)?.ok_or_else(|| invalid(format!("no {LOCK_PATH} in this repository")))?;
     let hub = Hub::for_dir(&root)?;
-    let body = serde_json::to_value(&lock)?;
+    // Repository skills travel with the lock; the Hub checks each against its pin.
+    let local = local_bundles(&root, &lock);
+    let body = if local.is_empty() {
+        serde_json::to_value(&lock)?
+    } else {
+        json!({"lock": lock, "local": local})
+    };
     let (status, reply) = hub
         .call(reqwest::Method::PUT, "adoption", &[], Some(&body))
         .await?;
