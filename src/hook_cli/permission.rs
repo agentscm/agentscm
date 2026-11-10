@@ -59,6 +59,9 @@ fn applies_with(
         && client_connection
         && switch.is_none_or(|value| value.trim() != "0")
         && payload["hook_event_name"] == "PermissionRequest"
+        // The host holds a subagent's dialog until this hook returns, so waiting here would only
+        // delay the person at the keyboard; those prompts are answered in the session.
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
         && tool_of(payload).is_some()
         && session_of(payload).is_some()
 }
@@ -593,6 +596,11 @@ mod tests {
         assert!(!applies_with("claude", true, &prompt, Some("0")));
         assert!(!applies_with("claude", false, &prompt, None));
         assert!(!applies_with("codex", true, &prompt, None));
+        let mut subagent = prompt.clone();
+        subagent["agent_id"] = json!("sub-1");
+        assert!(!applies_with("claude", true, &subagent, None));
+        subagent["agent_id"] = json!("");
+        assert!(applies_with("claude", true, &subagent, None));
         let mut question = prompt.clone();
         question["tool_name"] = json!("AskUserQuestion");
         assert!(!applies_with("claude", true, &question, None));
