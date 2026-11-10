@@ -135,6 +135,7 @@ use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
+mod provisional;
 mod repository_rename;
 mod validation_evidence;
 
@@ -10525,6 +10526,24 @@ impl Store for SqliteStore {
         let result = preflight::evaluate(&tx, &who, start, &scope, now)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    fn work_provisional_touch(
+        &self,
+        token: &str,
+        session: &str,
+        paths: &[String],
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Ok(None);
+        }
+        let item = provisional::touch(&tx, &who, session, paths, now)?;
+        tx.commit()?;
+        Ok(item)
     }
 
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {

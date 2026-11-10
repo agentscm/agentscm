@@ -137,6 +137,7 @@ use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
+mod provisional;
 mod repository_rename;
 mod validation_evidence;
 
@@ -10456,6 +10457,33 @@ impl Store for PgStore {
             let result = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
             tx.commit()?;
             Ok(result)
+        })
+    }
+
+    fn work_provisional_touch(
+        &self,
+        token: &str,
+        session: &str,
+        paths: &[String],
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Ok(None);
+            }
+            // The same locks as an automatic start, so two edits of one session open one item.
+            lock_work_capacity(&mut tx, &who)?;
+            let lock = json_string(&(token, session))?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&0x6167_6577_i32, &lock],
+            )?;
+            lock_repository(&mut tx, &who.repository)?;
+            let item = provisional::touch(&mut tx, &who, session, paths, now)?;
+            tx.commit()?;
+            Ok(item)
         })
     }
 

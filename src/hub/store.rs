@@ -859,6 +859,16 @@ pub trait Store: Send + Sync {
     ) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    /// The provisional Work of `session`: opened, unnamed and unreserved, when it edits `paths`
+    /// while it leads no unfinished Work, or widened to cover them. `None` when it leads named
+    /// unfinished Work or the token cannot write.
+    fn work_provisional_touch(
+        &self,
+        token: &str,
+        session: &str,
+        paths: &[String],
+        now: i64,
+    ) -> Result<Option<WorkItem>>;
     fn work_checkpoint(
         &self,
         token: &str,
