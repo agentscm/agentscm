@@ -1102,6 +1102,3 @@ fn prepare(
 
 #[cfg(all(test, unix))]
 mod tests;
-#[cfg(all(test, unix))]
-#[path = "slack/tests/waits.rs"]
-mod waits_tests;

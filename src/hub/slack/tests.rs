@@ -7,6 +7,7 @@ use axum::extract::OriginalUri;
 use tempfile::TempDir;
 
 mod digest;
+mod waits;
 
 const REPO: &str = "acme/widgets";
 const PATH: &str = "src/widget.rs";
@@ -434,251 +435,52 @@ async fn ingress_checks_signature_workspace_app_and_request_shape() {
     assert!(f.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
-    let f = Fixture::new().await;
-    f.edit(&f.alice, "a");
-    assert!(!f.edit(&f.alice, "b").denied.is_empty());
-    assert!(!f.edit(&f.alice, "b").repeated.is_empty());
-    f.run().await;
-    let key = &crate::hub::store::session_key(&f.alice, "a")[..8];
-    // Never a message about the repeater's own session, and not one to the holder as well.
-    assert_eq!(
-        f.sent(),
-        [(
-            "U1".to_owned(),
-            format!(
-                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | Holder: alice’s Claude Code session {key}, last active just now, Work title unknown | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
-            )
-        )]
-    );
-    // A session repeating on its own file alone says nothing.
-    let quiet = Fixture::new().await;
-    quiet.edit(&quiet.alice, "a");
-    quiet.edit(&quiet.alice, "a");
-    quiet.run().await;
-    assert!(quiet.sent().is_empty());
-}
+/// A handoff message as an earlier version sent it, still in Slack with its buttons: alice's
+/// agent holds `PATH` and bob's has asked for it. Nothing sends such a message any more, so it
+/// is put in the journal directly, and `run` delivers it.
+impl Fixture {
+    fn old_handoff_message(&self) {
+        self.contest();
+        let body = message(
+            "bob’s Codex edited src/widget.rs, which your Claude Code holds",
+            &[("File", PATH.to_owned())],
+            "Hand it over, or keep it and agree who goes first.",
+            Some((&self.alice, Some("a"), PATH)),
+            "https://hub.example.test/ui/#box-contested",
+        );
+        self.seed("old-handoff", 0, body);
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeater_is_not_told_about_its_own_mcp_session() {
-    let f = Fixture::new().await;
-    f.edit(&f.bob, "b");
-    let mcp = SessionCall {
-        session: Some("m".into()),
-        via: "mcp".into(),
-        task: None,
-        paths: vec![PATH.into()],
-        deny: false,
-        report: false,
-    };
-    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
-    assert!(!f.edit(&f.alice, "a").denied.is_empty());
-    assert!(!f.edit(&f.alice, "a").repeated.is_empty());
-    f.run().await;
-    let sent = f.sent();
-    let told: Vec<_> = sent.iter().filter(|(user, _)| user == "U1").collect();
-    assert_eq!(told.len(), 1, "{sent:?}");
-    assert!(
-        !told[0].1.contains("other agents") && !told[0].1.contains("session"),
-        "{sent:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_holder_sessions_of_one_token_message_their_person_once() {
-    let f = Fixture::new().await;
-    // A REST intent with the lowest id holds the file too, and no session could answer for it.
-    let rest = crate::hub::intent::NewIntent {
-        id: format!("int_{:032x}", 0),
-        task: "rest".into(),
-        branch: None,
-        base: None,
-        machine: None,
-        paths: vec![PATH.into()],
-        ttl_seconds: 3600,
-    };
-    tokio::task::block_in_place(|| f.store().announce_intent(&f.alice, &rest, unix_now())).unwrap();
-    f.edit(&f.alice, "a");
-    // c's refusal leaves its own request open on a: the button still answers bob, who it names.
-    f.edit(&f.alice, "c");
-    f.edit(&f.alice, "c");
-    f.run().await;
-    let before = f.sent().len();
-    let refused = f.edit(&f.bob, "b");
-    assert!(!refused.denied.is_empty());
-    let asked = refused.requested[0].1.session.clone().unwrap();
-    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
-    f.run().await;
-    let sent = f.sent();
-    let holder: Vec<_> = sent[before..]
-        .iter()
-        .filter(|(user, text)| user == "U1" && text.contains("which your"))
-        .collect();
-    assert_eq!(holder.len(), 1, "{sent:?}");
-    // Two sessions of one token read alike by label, so each side names them.
-    let key = |session: &str| crate::hub::store::session_key(&f.alice, session)[..8].to_owned();
-    let other = if asked == "a" { "c" } else { "a" };
-    assert!(
-        holder[0]
-            .1
-            .contains(&format!("Your agent: Claude Code session {}", key(&asked)))
-            && !holder[0].1.contains(&key(other)),
-        "{sent:?}"
-    );
-    let repeater = sent[before..]
-        .iter()
-        .find(|(user, _)| user == "U2")
-        .map(|(_, text)| text.as_str())
+    /// Queues `body` for binding `index` as the journal would have.
+    fn seed(&self, id: &str, index: usize, body: Value) {
+        let slack = self.slack();
+        let db = slack.database().unwrap();
+        db.execute(
+            "INSERT INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
+            params![
+                id,
+                slack.bindings[index].config.slack_user,
+                body.to_string(),
+                unix_now()
+            ],
+        )
         .unwrap();
-    assert!(
-        repeater.contains(&key("a")) && repeater.contains(&key("c")),
-        "{sent:?}"
-    );
-    // The one button answers for the session the request was filed against.
-    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
-    assert_eq!(
-        f.update().await["blocks"][3]["elements"][0]["text"],
-        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
-    );
-}
-
-/// An MCP-only session may be the same agent as a hook session of its token: one agent, one name.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_holders_hook_and_mcp_sessions_keep_the_single_agent_wording() {
-    let f = Fixture::new().await;
-    let mcp = SessionCall {
-        session: Some("m".into()),
-        via: "mcp".into(),
-        task: None,
-        paths: vec![PATH.into()],
-        deny: false,
-        report: false,
-    };
-    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
-    f.edit(&f.alice, "a");
-    f.run().await;
-    let before = f.sent().len();
-    assert!(!f.edit(&f.bob, "b").denied.is_empty());
-    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
-    f.run().await;
-    let sent = f.sent();
-    assert!(
-        sent[before..]
-            .iter()
-            .any(|(user, text)| user == "U1" && text.contains("which your Claude Code holds")),
-        "{sent:?}"
-    );
-    assert!(
-        sent[before..]
-            .iter()
-            .all(|(_, text)| !text.contains(" session ")),
-        "{sent:?}"
-    );
-    assert!(
-        sent[before..].iter().any(|(user, text)| user == "U2"
-            && text.contains("which alice’s Claude Code holds")
-            && text.contains("Their agent: alice’s Claude Code |")),
-        "{sent:?}"
-    );
-}
-
-/// Hook a and hook c are distinct, whichever session is oldest: an older MCP session of the token
-/// must not hide that from the holder's message.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_older_mcp_session_does_not_hide_two_hook_holders() {
-    let f = Fixture::new().await;
-    let mcp = SessionCall {
-        session: Some("m".into()),
-        via: "mcp".into(),
-        task: None,
-        paths: vec![PATH.into()],
-        deny: false,
-        report: false,
-    };
-    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now() - 100))
+        db.execute(
+            "INSERT INTO message_bindings(message,binding) VALUES(?1,?2)",
+            params![id, status::binding_key(&slack.bindings[index])],
+        )
         .unwrap();
-    f.edit(&f.alice, "a");
-    f.edit(&f.alice, "c");
-    tokio::task::block_in_place(|| {
-        f.store()
-            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
-            .unwrap()
-    });
-    f.edit(&f.alice, "c");
-    f.run().await;
-    let before = f.sent().len();
-    assert!(!f.edit(&f.bob, "b").denied.is_empty());
-    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
-    f.run().await;
-    let sent = f.sent();
-    let holder: Vec<_> = sent[before..]
-        .iter()
-        .filter(|(user, text)| user == "U1" && text.contains("which your"))
-        .collect();
-    assert_eq!(holder.len(), 1, "{sent:?}");
-    assert!(holder[0].1.contains(" session "), "{sent:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_decline_under_one_token_names_the_requesters_session() {
+async fn an_old_handoff_message_still_hands_over_with_its_button() {
     let f = Fixture::new().await;
-    f.edit(&f.alice, "a");
-    assert!(!f.edit(&f.alice, "b").denied.is_empty());
-    tokio::task::block_in_place(|| {
-        f.store()
-            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
-            .unwrap()
-    });
-    f.run().await;
-    let key = &crate::hub::store::session_key(&f.alice, "b")[..8];
-    assert_eq!(
-        f.sent(),
-        [(
-            "U1".to_owned(),
-            format!(
-                "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code session {key} | Their agent: alice’s Claude Code | Agree with them who goes first."
-            )
-        )]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_button() {
-    let f = Fixture::new().await;
-    f.contest();
+    f.old_handoff_message();
     f.run().await;
     let sent = f.sent();
-    assert_eq!(sent.len(), 2, "{sent:?}");
-    // Both messages carry the holder line, under the name the message already gives the holder,
-    // and the sentence every overlap alert carries.
-    let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
-    assert_eq!(
-        *holder,
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first."
-    );
-    let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
-    assert_eq!(
-        *repeater,
-        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Holder: alice’s Claude Code, last active just now, Work title unknown | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
-    );
-    // The notification names the file once.
-    assert_eq!(
-        f.sent_body("U1")["text"],
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds"
-    );
-    // Only the holder's message carries the handoff buttons; both link the Hub.
-    let buttons = |user: &str| {
-        f.sent_body(user)["blocks"][2]["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["action_id"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(buttons("U1"), [YES, NO, OPEN]);
-    assert_eq!(buttons("U2"), [OPEN]);
-    // Both buttons are the same colour, and the link goes to the contested file's box.
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    // The handoff buttons are the same colour.
     let sent_buttons = f.sent_body("U1")["blocks"][2]["elements"].clone();
     assert!(
         sent_buttons
@@ -687,8 +489,6 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
             .iter()
             .all(|b| b.get("style").is_none())
     );
-    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#box-contested");
-    assert_eq!(f.link("U2"), "https://hub.example.test/ui/#box-contested");
 
     // Bob cannot answer for alice's agent with her button: only he sees why, nothing changes.
     let alice_message = f.sent_body("U1");
@@ -732,7 +532,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     );
     assert_eq!(
         rendered(&update),
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
     assert_eq!(
         update["text"],
@@ -791,52 +591,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
         "Nothing changed. There is no open request for src/widget.rs any more: it was answered or lapsed."
     );
     f.run().await;
-    assert_eq!(f.sent().len(), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_journal_holds_events_until_queued_messages_are_sent() {
-    let f = Fixture::new().await;
-    {
-        let slack = f.slack();
-        let mut db = slack.database().unwrap();
-        let tx = db.transaction().unwrap();
-        for n in 0..CAPACITY {
-            tx.execute(
-                "INSERT INTO messages(id,user,body,state,created,due) VALUES(?1,'U9','{}','queued',?2,?3)",
-                params![format!("waiting{n}"), unix_now(), unix_now() + 86400],
-            )
-            .unwrap();
-        }
-        tx.commit().unwrap();
-    }
-    f.contest();
-    // Events before the repeat need no message and pass; the repeat waits at the cursor.
-    let (slack, state) = (f.slack(), f.state.clone());
-    let _ = tokio::task::block_in_place(|| slack.collect(&state));
-    let queued: i64 = f
-        .slack()
-        .database()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM messages WHERE id NOT LIKE 'waiting%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(queued, 0);
-    assert!(f.slack().full.load(std::sync::atomic::Ordering::Relaxed));
-    // Sent rows no longer count: the held event is collected, not lost.
-    f.slack()
-        .database()
-        .unwrap()
-        .execute(
-            "UPDATE messages SET state='done' WHERE id LIKE 'waiting%'",
-            [],
-        )
-        .unwrap();
-    f.run().await;
-    assert_eq!(f.sent().len(), 2);
+    assert_eq!(f.sent().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -855,6 +610,14 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &other, unix_now())).unwrap();
     assert!(!f.edit(&f.bob, "b").denied.is_empty());
     assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    let body = message(
+        "h",
+        &[("File", PATH.to_owned())],
+        "g",
+        Some((&f.alice, Some("a"), PATH)),
+        "https://hub.example.test/ui/#box-contested",
+    );
+    f.seed("old-handoff", 0, body);
     f.run().await;
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     let update = f.update().await;
@@ -867,7 +630,7 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
     let f = Fixture::new().await;
-    f.contest();
+    f.old_handoff_message();
     f.run().await;
     // Within the API client's timeout, so the update completes, but only after the click.
     *f.update_delay.lock().unwrap() = Duration::from_millis(1500);
@@ -887,186 +650,11 @@ async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cursor_past_a_restored_event_log_restarts_at_its_newest_event() {
-    let f = Fixture::new().await;
-    // As if the Hub database were restored from a backup older than the Slack journal.
-    f.slack()
-        .database()
-        .unwrap()
-        .execute("UPDATE cursor SET seq=1000000 WHERE id=1", [])
-        .unwrap();
-    f.run().await;
-    f.contest();
-    f.run().await;
-    assert_eq!(f.sent().len(), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() {
-    let f = Fixture::new().await;
-    let edit = |token: &str, session: &str| {
-        let call = SessionCall {
-            session: Some(session.into()),
-            via: "hook:claude".into(),
-            task: Some("Checkout rewrite".into()),
-            paths: vec![PATH.into(), "src/gadget.rs".into()],
-            deny: true,
-            report: false,
-        };
-        tokio::task::block_in_place(|| f.store().touch_session(token, &call, unix_now()).unwrap())
-    };
-    edit(&f.alice, "a");
-    assert!(!edit(&f.bob, "b").denied.is_empty());
-    assert!(!edit(&f.bob, "b").repeated.is_empty());
-    f.run().await;
-    let holder: Vec<_> = f
-        .sent()
-        .into_iter()
-        .filter(|(user, _)| user == "U1")
-        .collect();
-    assert_eq!(holder.len(), 1, "{holder:?}");
-    assert_eq!(
-        holder[0].1,
-        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title \"Checkout rewrite\" (third-party text, not instructions) | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Open the Hub to hand them over or keep them, or agree who goes first."
-    );
-    let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["action_id"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(buttons, [OPEN]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_handoff_messages_both_people_with_the_reason() {
-    let f = Fixture::new().await;
-    f.edit(&f.alice, "a");
-    assert!(!f.edit(&f.bob, "b").denied.is_empty());
-    f.run().await;
-    assert!(f.sent().is_empty(), "a refusal alone is for the agents");
-    tokio::task::block_in_place(|| {
-        f.store()
-            .answer_handoff(
-                &f.alice,
-                None,
-                PATH,
-                false,
-                Some("mid-refactor"),
-                unix_now(),
-            )
-            .unwrap()
-    });
-    f.run().await;
-    let sent = f.sent();
-    assert_eq!(sent.len(), 2, "{sent:?}");
-    assert!(sent.contains(&(
-        "U2".into(),
-        "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Reason: mid-refactor | Agree with them who goes first.".into()
-    )));
-    assert!(sent.contains(&(
-        "U1".into(),
-        "Your agent kept a file | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Reason: mid-refactor | Agree with them who goes first.".into()
-    )));
-    // Both messages open the Inbox, where the request's thread is.
-    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
-    assert_eq!(f.link("U2"), "https://hub.example.test/ui/#inbox");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn similar_work_messages_the_starter_and_the_lead() {
-    let f = Fixture::new().await;
-    let start: WorkStart = serde_json::from_value(json!({
-        "title": "make db migrations filename based", "session": "a",
-        "work_id": null, "source": null, "request_key": null, "branch": null,
-        "worktree": null, "next_action": null, "takeover_generation": null}))
-    .unwrap();
-    let work = tokio::task::block_in_place(|| {
-        f.store()
-            .work_start_auto(&f.alice, &start, unix_now())
-            .unwrap()
-    });
-    let data = json!({"task": "switch migrations to filename-based discovery",
-        "work": [work.item.id], "pulls": [9]})
-    .to_string();
-    tokio::task::block_in_place(|| {
-        f.store()
-            .append_notices("task_overlap", &[(f.bob.clone(), data)])
-            .unwrap()
-    });
-    f.run().await;
-    let sent = f.sent();
-    assert_eq!(sent.len(), 2, "{sent:?}");
-    assert!(sent.contains(&(
-        "U2".into(),
-        "Your agent started similar work | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Your agent: Codex | Reads like: alice’s Claude Code: make db migrations filename based\nOpen pull request #9 | Check whether it is the same work.".into()
-    )));
-    assert!(sent.contains(&(
-        "U1".into(),
-        "Similar work started | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Their agent: bob’s Codex | Your agent: Claude Code | Your work: make db migrations filename based | Check with them whether it is the same work.".into()
-    )));
-    // Each message opens the work it is about.
-    let page = format!("https://hub.example.test/ui/#work/{}", work.item.id);
-    assert_eq!(f.link("U1"), page);
-    assert_eq!(f.link("U2"), page);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_request_to_an_idle_lead_messages_its_person_once() {
-    let f = Fixture::new().await;
-    let start = |title: &str, session: &str, path: &str| -> WorkStart {
-        serde_json::from_value(json!({"title": title, "session": session, "scope": [path],
-            "work_id": null, "source": null, "request_key": null, "branch": null,
-            "worktree": null, "next_action": null, "takeover_generation": null}))
-        .unwrap()
-    };
-    let now = unix_now();
-    let requests = tokio::task::block_in_place(|| {
-        let store = f.store();
-        // Alice's agent stopped checking in on one task long enough for its claim to go stale,
-        // though its reservation's lease has not lapsed, and is still on the other.
-        let idle = store
-            .work_start_auto(
-                &f.alice,
-                &start("readable catch up", "a1", "ui/catchup.tsx"),
-                now - 1000,
-            )
-            .unwrap();
-        store
-            .work_start_auto(&f.alice, &start("dashboard", "a2", "ui/dashboard.tsx"), now)
-            .unwrap();
-        let live = store
-            .work_start_auto(
-                &f.bob,
-                &start("dashboard too", "b1", "ui/dashboard.tsx"),
-                now,
-            )
-            .unwrap();
-        let asked = store
-            .work_start_auto(&f.bob, &start("catch up too", "b2", "ui/catchup.tsx"), now)
-            .unwrap();
-        assert_eq!(
-            asked.coordination_request.as_ref().unwrap().targets[0].work_id,
-            idle.item.id
-        );
-        [live.coordination_request, asked.coordination_request]
-    });
-    assert!(requests.iter().all(Option::is_some));
-    f.run().await;
-    assert_eq!(f.sent(), vec![(
-        "U1".into(),
-        "Another agent asked for files your agent holds | File: ui/catchup.tsx | Repository: acme/widgets | Their agent: bob’s Codex | Your agent: Claude Code | Your work: readable catch up | Your agent isn’t running, so it can’t answer. Answer for it in the Hub Inbox.".into()
-    )]);
-    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limits_retry_and_a_wrong_bot_or_revoked_binding_sends_nothing() {
     let f = Fixture::new().await;
-    f.contest();
+    f.seed("m0", 0, json!({"text": "one", "blocks": []}));
+    f.seed("m1", 1, json!({"text": "two", "blocks": []}));
     f.replies.lock().unwrap().push((429, json!({"ok":false})));
-    let (slack, state) = (f.slack(), f.state.clone());
-    tokio::task::block_in_place(|| slack.collect(&state)).unwrap();
     f.slack().deliver(&f.state).await.unwrap();
     assert_eq!(f.state_of_messages(), ["queued", "queued"]);
 
@@ -1116,9 +704,8 @@ async fn rate_limits_retry_and_a_wrong_bot_or_revoked_binding_sends_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uninstall_stops_messages_and_survives_restart() {
     let f = Fixture::new().await;
-    f.contest();
-    let (slack, state) = (f.slack(), f.state.clone());
-    tokio::task::block_in_place(|| slack.collect(&state)).unwrap();
+    f.seed("m0", 0, json!({"text": "one", "blocks": []}));
+    f.seed("m1", 1, json!({"text": "two", "blocks": []}));
     let event = json!({"type":"event_callback","team_id":"T123","api_app_id":"A123",
         "event":{"type":"app_uninstalled"}});
     assert_eq!(f.post(event.to_string(), true).await.0, StatusCode::OK);
@@ -1129,11 +716,11 @@ async fn uninstall_stops_messages_and_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn keeping_a_file_from_slack_tells_the_requester_but_not_the_person_who_clicked() {
+async fn keeping_a_file_from_slack_tells_the_requesting_agent_and_messages_nobody() {
     let f = Fixture::new().await;
-    f.contest();
+    f.old_handoff_message();
     f.run().await;
-    assert_eq!(f.sent().len(), 2);
+    assert_eq!(f.sent().len(), 1);
     assert_eq!(f.click("U1", NO).await, StatusCode::OK);
     let update = f.update().await;
     assert_eq!(
@@ -1141,10 +728,9 @@ async fn keeping_a_file_from_slack_tells_the_requester_but_not_the_person_who_cl
         "Kept src/widget.rs for now. bob’s Codex sees that on their next edit."
     );
     f.run().await;
-    // Bob hears that alice's agent kept the file; alice, who just said so, gets nothing new.
+    // Nobody is messaged about the answer: it is between the two agents.
     let sent = f.sent();
-    assert_eq!(sent.len(), 3, "{sent:?}");
-    assert!(sent[2].0 == "U2" && sent[2].1.starts_with("Another agent kept a file"));
+    assert_eq!(sent.len(), 1, "{sent:?}");
     // The record says it was Slack, and bob's agent reads it as the person's answer.
     let told = f.listen(&f.bob, "b").handoffs;
     assert_eq!(told.len(), 1);
@@ -1161,7 +747,7 @@ async fn keeping_a_file_from_slack_tells_the_requester_but_not_the_person_who_cl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
     let f = Fixture::new().await;
-    f.contest();
+    f.old_handoff_message();
     f.run().await;
     let message = f.sent_body("U1");
     let value = message["blocks"][2]["elements"][0]["value"].clone();
@@ -1215,7 +801,7 @@ async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_message_update_still_reports_the_outcome() {
     let f = Fixture::new().await;
-    f.contest();
+    f.old_handoff_message();
     f.run().await;
     // The next Slack call after the click, the update, fails.
     f.replies
@@ -1223,7 +809,7 @@ async fn a_failed_message_update_still_reports_the_outcome() {
         .unwrap()
         .push((200, json!({"ok":false,"error":"message_not_found"})));
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
-    // The two earlier direct messages are the first postMessage calls; the report is the third.
+    // The earlier direct message is the first postMessage call; the report is the second.
     let mut reported = None;
     for _ in 0..100 {
         reported = f
@@ -1233,7 +819,7 @@ async fn a_failed_message_update_still_reports_the_outcome() {
             .iter()
             .filter(|(path, _)| path == "/api/chat.postMessage")
             .map(|(_, body)| body.clone())
-            .nth(2);
+            .nth(1);
         if reported.is_some() {
             break;
         }
@@ -1345,8 +931,9 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
     let long = format!("src/{}.rs", "a/".repeat(3000));
     let paths: Vec<String> = (0..12).map(|n| format!("{long}{n}")).collect();
     let who = label(&hostile, &hostile);
+    let shown: Vec<String> = paths.iter().map(|p| sanitize(p, TEXT_CHARS)).collect();
     let fields = [
-        files(&paths),
+        ("Files", listed(&shown)),
         ("Repository", sanitize(&hostile, TEXT_CHARS)),
         ("Your agent", sanitize(&hostile, NAME_CHARS)),
         ("Their agent", who.clone()),
@@ -1628,7 +1215,6 @@ async fn entry_disabled_never_touches_the_status_journal() {
     for table in [
         "status_episodes",
         "status_jobs",
-        "status_scans",
         "status_maintenance",
         "status_resolution_pending",
     ] {
@@ -1640,6 +1226,17 @@ async fn entry_disabled_never_touches_the_status_journal() {
             "{table}"
         );
     }
+    // Waiting-agent messages stay on with entry notices off, so their `:waits` scan rows exist;
+    // no entry scan does.
+    assert_eq!(
+        db.query_row::<i64, _, _>(
+            "SELECT count(*) FROM status_scans WHERE binding NOT LIKE '%:waits'",
+            [],
+            |row| row.get(0)
+        )
+        .unwrap(),
+        0
+    );
     assert!(status_text(&f).is_empty());
 }
 
@@ -2412,14 +2009,7 @@ async fn changed_action_suppresses_reminder_before_delivery_and_quiet_work_is_no
 async fn same_name_forge_bindings_do_not_hide_the_second_forge_request() {
     let f = Fixture::configured(None, true).await;
     let work = status_work(&f, &f.bob, "other-forge");
-    let paused = status_checkpoint(&f, &f.bob, &work, "pause");
-    let messages = tokio::task::block_in_place(|| {
-        let slack = f.slack();
-        let people = slack.people(&f.state).unwrap();
-        slack.asked(&f.state,&people,&json!({"requester":f.alice,"targets":[paused.id],"proposal":{"scope":["src/other-forge.rs"]}})).unwrap()
-    });
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].0, "U2");
+    status_checkpoint(&f, &f.bob, &work, "pause");
     f.post(status_event("EvFORGE", "U1", "status").to_string(), true)
         .await;
     f.slack().deliver(&f.state).await.unwrap();
@@ -2488,8 +2078,8 @@ async fn reminders_are_off_by_default_and_failed_retry_does_not_outlive_its_acti
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_binding_rotation_suppresses_old_coordination_jobs_and_attempts_are_bounded() {
     let f = Fixture::new().await;
-    f.contest();
-    tokio::task::block_in_place(|| f.slack().collect(&f.state)).unwrap();
+    f.seed("m0", 0, json!({"text": "one", "blocks": []}));
+    f.seed("m1", 1, json!({"text": "two", "blocks": []}));
     let owner = f.owner(0);
     let (_, secret, _) = tokio::task::block_in_place(|| {
         mint_bound_agent_token(&*f.state.store, &owner, "rotated", REPO, 101, 3600, true)
@@ -2594,7 +2184,14 @@ async fn a_new_lead_generation_suppresses_the_former_recipients_reminder() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_status_answers_unknown_privately_and_does_not_block_coordination_collection() {
     let f = Fixture::configured(Some(policy()), false).await;
-    f.contest();
+    let queued = message(
+        "h",
+        &[("File", PATH.to_owned())],
+        "g",
+        None,
+        "https://hub.example.test/ui/",
+    );
+    f.seed("queued", 0, queued);
     f.post(
         status_event("EvUNAVAILABLE", "U1", "status").to_string(),
         true,
@@ -2972,15 +2569,7 @@ async fn a_read_only_token_reads_the_slack_setup_for_its_own_live_binding_only()
     assert_eq!(alice["repository"], REPO);
     assert_eq!(alice["configured"], true);
     assert_eq!(alice["bound"], true);
-    assert_eq!(
-        alice["events"],
-        json!([
-            "edit_repeated",
-            "handoff_decline",
-            "task_overlap",
-            "coordination_requested"
-        ])
-    );
+    assert_eq!(alice["events"], json!(["session_waiting"]));
     assert_eq!(
         alice["reminders"],
         json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
