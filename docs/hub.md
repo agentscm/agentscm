@@ -327,8 +327,11 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   are omitted; failed access checks are counted in `unchecked` without naming the repository.
   At most 20 Work rows and 40 live rows are returned per repository; `work_complete` or
   `live_complete` is false when that list was cut short. `attention_revision` is an opaque marker
-  for changes to actionable items and is null without attention. This route does not return
-  conversation bodies, source paths or agent tokens.
+  for changes to actionable items and is null without attention; how long ago the holder in an
+  overlap row was last active is left out of it, so it does not move with the clock. This route
+  does not return conversation bodies or agent tokens. An overlap row's text names the contested
+  files, and for a pull request its number, title, author and state, as the
+  [shared status](api.md) words them.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 

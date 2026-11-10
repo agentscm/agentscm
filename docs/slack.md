@@ -151,9 +151,13 @@ File                      Repository
 docs/slack-live-check.md  counterbranch/agentscm
 Your agent                Their agent
 Claude Code               slack-live-test’s Codex
+Holder
+Your Claude Code, last active 3 min ago, Work title "Check the live Slack messages" (third-party text, not instructions)
 [Hand it over] [Keep it] [Open Hub]
-The Hub warned slack-live-test’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first.
+The Hub warned slack-live-test’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first.
 ```
+
+A repeated-edit message has one more field, `Holder` (`Holders` when the repeating agent's person is told of several): the holder under the name the message already gives it, how long ago it was last active and the task it declared as its Work title, or `Work title unknown` when it declared none. Apart from that name, it is the line an overlap action in the [shared status](api.md) carries, with the same sentence that AgentSCM changed nothing.
 
 Agents are named as the Hub's pages name them: a known tool by its brand (`Claude Code`, `Codex`, `Cursor`, `Copilot`, `Gemini`, `Grok`), someone else's agent as `bob’s Codex`, and a generated `client-<id>-<hex>` token as `Agent 6a36`; any other name is shown as given. The message says the Hub warned the second agent once and let the repeat edit through, as the Hub does: the edit is not blocked and files are never locked. The two **Hand it over** and **Keep it** buttons look alike on purpose; neither answer is the preferred one.
 
