@@ -207,6 +207,10 @@ struct Pending {
     dropped: BTreeMap<String, i64>,
     /// Stores with a write scheduled.
     scheduled: BTreeSet<usize>,
+    /// Totals a running write took out of the tables, by write: their repository (None when not
+    /// known) and first call. They are in neither the tables nor the store until it ends.
+    writing: BTreeMap<u64, Vec<(Option<String>, i64)>>,
+    next_write: u64,
 }
 
 impl Pending {
@@ -296,6 +300,8 @@ fn store_key(state: &super::HubState) -> usize {
 /// Whether the store holds every hook call this process saw for `repository` in the window from
 /// `since` to `until`: none dropped in it, and none waiting longer than a write takes. Calls of
 /// the last [`FLUSH_EVERY`] or two are on their way and do not make a read partial.
+// shortcut: scans every waiting total under the lock hook calls take (microseconds at 10,000);
+// keep an index by repository if it shows in hook latency.
 pub fn all_written(repository: &str, since: i64, until: i64) -> bool {
     let overdue = super::store::unix_now() - 2 * FLUSH_EVERY.as_secs() as i64;
     let guard = pending();
@@ -315,7 +321,11 @@ pub fn all_written(repository: &str, since: i64, until: i64) -> bool {
                 && waiting.first_at <= until
                 && waiting.first_at < overdue
         });
-    !dropped && !waiting
+    let writing =
+        pending.writing.values().flatten().any(|(r, first_at)| {
+            r.as_deref().is_none_or(|r| r == repository) && *first_at <= until
+        });
+    !dropped && !waiting && !writing
 }
 
 /// Adds the call to its session's in-memory total; no store call. The first call since the last
@@ -395,7 +405,7 @@ fn schedule_flush(state: &super::HubState) -> bool {
 /// failures in a row the store is taken to be unavailable and every total not written is kept.
 pub async fn flush(state: &super::HubState) {
     let store_id = store_key(state);
-    let taken: Vec<(Key, Waiting)> = {
+    let (write, taken): (u64, Vec<(Key, Waiting)>) = {
         let mut guard = pending();
         let Some(pending) = guard.as_mut() else {
             return;
@@ -409,11 +419,18 @@ pub async fn flush(state: &super::HubState) {
             *table = rest;
             taken.extend::<Vec<_>>(mine.into_iter().collect());
         }
-        taken
+        if taken.is_empty() {
+            return;
+        }
+        let write = pending.next_write;
+        pending.next_write += 1;
+        let marks = taken
+            .iter()
+            .map(|(key, waiting)| (pending.repository(key).map(str::to_owned), waiting.first_at))
+            .collect();
+        pending.writing.insert(write, marks);
+        (write, taken)
     };
-    if taken.is_empty() {
-        return;
-    }
     let store = state.store.clone();
     let writing: Vec<(Key, Sample)> = taken
         .iter()
@@ -469,17 +486,46 @@ pub async fn flush(state: &super::HubState) {
         Ok((accepted(checked), failed))
     })
     .await;
-    let (accepted, failed) = match written {
-        Ok(written) => written,
+    // None: the write task failed part-way, so which totals it stored is not known.
+    let outcome = match written {
+        Ok(written) => Some(written),
         // The store call never ran (no free permit): nothing was written.
-        Err(_) => (BTreeMap::new(), (0..taken.len()).collect()),
+        Err(super::HubError::Busy) => Some((BTreeMap::new(), (0..taken.len()).collect())),
+        Err(_) => None,
     };
-    let left = !failed.is_empty();
     let again = {
         let mut guard = pending();
         let pending = guard.get_or_insert_with(Pending::default);
+        pending.writing.remove(&write);
+        let Some((accepted, failed)) = outcome else {
+            // Putting them back could store some twice; count them as dropped instead, so
+            // reads of their repositories say partial.
+            let at = super::store::unix_now();
+            for (key, _) in &taken {
+                let repository = pending.repository(key).unwrap_or_default().to_owned();
+                pending.dropped.insert(repository, at);
+            }
+            return;
+        };
+        let left = !failed.is_empty();
         let now = Instant::now();
         for ((digest, repo), repository) in accepted {
+            // Report ids this token's sessions sent before it was verified move with them, so
+            // unverified callers cannot push them out any more.
+            let moved: Vec<Key> = pending
+                .seen_unverified
+                .keys()
+                .filter(|key| key.0 == store_id && key.1 == digest && key.2 == repo)
+                .cloned()
+                .collect();
+            for key in moved {
+                if pending.seen.len() >= MAX_PENDING {
+                    break;
+                }
+                if let Some(ids) = pending.seen_unverified.remove(&key) {
+                    pending.seen.entry(key).or_insert(ids);
+                }
+            }
             pending
                 .verified
                 .insert((store_id, digest, repo), (now, repository));
@@ -837,6 +883,28 @@ mod tests {
         let now = super::super::store::unix_now();
         assert!(!all_written("r", now - 60, i64::MAX));
         assert!(all_written("r", now + 60, i64::MAX));
+    }
+
+    #[test]
+    fn totals_a_write_has_taken_count_as_missing_until_it_ends() {
+        let (_dir, state) = hub();
+        let now = super::super::store::unix_now();
+        // A write in progress holds a total of repository "a" from just now.
+        pending()
+            .get_or_insert_with(Pending::default)
+            .writing
+            .insert(u64::MAX, vec![(Some("a".into()), now)]);
+        assert!(!all_written("a", 0, i64::MAX), "taken but not stored yet");
+        assert!(all_written("b", 0, i64::MAX));
+        pending().as_mut().unwrap().writing.remove(&u64::MAX);
+        assert!(all_written("a", 0, i64::MAX));
+        // A real write clears its own mark when it ends, whatever the store answered.
+        let token = "9".repeat(64);
+        record(&state, Some(&token), None, one("s", None));
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(flush(&state));
+        assert!(pending().as_ref().unwrap().writing.is_empty());
     }
 
     #[test]
