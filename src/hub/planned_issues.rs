@@ -477,7 +477,8 @@ impl PlannedIssuesView {
 }
 
 fn safe_label(value: &str) -> bool {
-    !value.is_empty() && super::advice::sanitize(value, 200) == value
+    // `clean`, not `sanitize`: a title stored before the Hub message rewrite must stay valid.
+    !value.is_empty() && super::advice::clean(value, 200) == value
 }
 
 fn invalid() -> GhError {

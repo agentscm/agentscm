@@ -1,5 +1,6 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod agent_messages;
 pub mod agent_rules;
 pub mod capacity;
 pub mod catchup;
@@ -13,6 +14,8 @@ pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod digest;
+pub mod digest_http;
 pub mod dismissals;
 pub mod error_envelope;
 pub mod external_runs;
@@ -34,6 +37,7 @@ pub mod login;
 pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
+mod overlap_detail;
 pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -339,6 +343,13 @@ impl HubState {
         self
     }
 
+    /// Revokes every connected-app credential whose app the apps file no longer registers, with
+    /// the tokens each minted. Run at start, after the login configuration is loaded.
+    pub fn revoke_dropped_apps(&self) -> Result<usize> {
+        self.store
+            .revoke_unregistered_apps(&self.login.app_ids(), "hub", store::unix_now())
+    }
+
     pub fn with_slack(mut self, slack: slack::Slack) -> Self {
         self.slack = Some(Arc::new(slack));
         self
@@ -491,6 +502,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())

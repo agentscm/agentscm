@@ -403,12 +403,14 @@ async fn mcp(
         return Err(ApiError::read_only());
     }
     let outcome = match method {
-        "initialize" => Ok(initialize(
-            params,
-            principal.read_only,
-            &settings,
-            all_tools,
-        )),
+        "initialize" => Ok({
+            super::agent_messages::note_initialize(
+                &principal.token_id,
+                super::onboarding::client(&headers),
+                params,
+            );
+            initialize(params, principal.read_only, &settings, all_tools)
+        }),
         "ping" => Ok(json!({})),
         "tools/list" => {
             // The skill tools matter only where the repository adopted skills. A failed read
@@ -1229,6 +1231,12 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         promise_history,
         promise_propose,
         promise_report,
+        {"name": "agentscm_hub_message",
+         "description": "Checks and answers an \"AgentSCM Hub message\" from your own person. Call it with status accepted before acting: it succeeds only for a real message to this session, and its reply carries the note and the mode to act on. Answer declined if your person says no in Manual mode, and done when finished.",
+         "inputSchema": schema(json!({
+             "id": {"type": "string", "description": "The message id (msg_...)."},
+             "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
+             "session": session}), &["id", "status"])},
         {"name": "agentscm_view_settings",
          "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -1570,7 +1578,7 @@ async fn call(
         Ok(page) if !page.requests.is_empty() || !page.complete => {
             let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
-                .map(|request| json!({"request_id":request.id,"title":request.proposal.title,
+                .map(|request| json!({"request_id":request.id,"title":super::advice::sanitize(&request.proposal.title, 120),
                     "status":request.status,"updated_seq":request.updated_seq,
                     "affected_agent_count":request.targets.len(),
                     "affected_agents_complete":request.targets.len() <= 3,
@@ -1589,6 +1597,32 @@ async fn call(
             if let Some(content) = value["content"].as_array_mut() {
                 content.push(json!({"type":"text","text":"AgentSCM coordination inbox delivery is unknown. Retry agentscm_coordination_inbox before assuming coverage."}));
             }
+        }
+    }
+    // What the session's own person sent it from the Hub page rides on its next tool call. Only a
+    // call naming its own session takes it: without one the Hub would guess the token's recent hook
+    // session. A session whose hook carries context takes it there, where subagents are excluded;
+    // an MCP call cannot say whether a subagent made it.
+    if !principal.read_only
+        && let Some(requested) = params
+            .and_then(|p| p["arguments"]["session"].as_str())
+            .map(str::to_owned)
+    {
+        let install = super::onboarding::client(headers).map(str::to_owned);
+        let (store, scope) = (state.store.clone(), principal.clone());
+        if let Ok(Some(text)) = blocking(state, move || {
+            let now = unix_now();
+            let session = store.session_name_for(&scope.token_id, Some(requested.as_str()), now)?;
+            super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
+            if super::agent_messages::hook_delivers(&scope.token_id, &session) {
+                return Ok(None);
+            }
+            super::agent_messages::take(&*store, &scope, &session, "mcp", now)
+        })
+        .await
+            && let Some(content) = value["content"].as_array_mut()
+        {
+            content.push(json!({"type": "text", "text": text}));
         }
     }
     Ok(value)
@@ -1893,6 +1927,7 @@ async fn call_inner(
             | "agentscm_work_usage"
             | "agentscm_coordination_inbox"
             | "agentscm_view_settings"
+            | "agentscm_hub_message"
             | "agentscm_coordination_ack"
             | "agentscm_coordination_reply"
             | "agentscm_coordination_resolve"
@@ -2052,6 +2087,26 @@ async fn call_inner(
                 work_failure(&error)
             }
         });
+    }
+    if name == "agentscm_hub_message" {
+        let args = match try_args::<super::agent_messages::AnswerArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let (store, scope, id) = (state.store.clone(), principal.clone(), args.id.clone());
+        return Ok(
+            match blocking(state, move || {
+                let now = unix_now();
+                let session =
+                    store.session_name_for(&scope.token_id, args.session.as_deref(), now)?;
+                super::agent_messages::answer(&*store, &scope, &session, &args.id, args.status, now)
+            })
+            .await
+            {
+                Ok(answered) => result(&answered.text(&id), false),
+                Err(error) => hub_failure(&error),
+            },
+        );
     }
     if name == "agentscm_view_settings" {
         let change = match try_args::<ViewSettingsArgs>(arguments) {

@@ -373,6 +373,35 @@ async fn hook(
                         outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
                     }
                 }
+                // What the person sent this session from the Hub page, where this reply reaches
+                // the model: a prompt or a checked tool call that is not refused. The start
+                // context is cut to fit, so a message there waits for the next call instead.
+                let context = matches!(call.kind, Kind::Prompt | Kind::Check)
+                    && matches!(call.shape, Shape::Hook(_) | Shape::Snake | Shape::Camel)
+                    && outcome.deny.is_none()
+                    && !call.child;
+                super::agent_messages::note_hook(
+                    &principal.token_id,
+                    &session,
+                    &call.via,
+                    context,
+                    unix_now(),
+                );
+                // An unknown reply loses its text after the session's first, so it takes nothing.
+                // A take that finishes past the deadline is offered again later (REOFFER_SECS).
+                if context && outcome.status != "unknown" {
+                    let (store, via) = (state.store.clone(), call.via.clone());
+                    let taken = blocking(&state, move || {
+                        super::agent_messages::take(&*store, &principal, &session, &via, unix_now())
+                    });
+                    if let Ok(Ok(Some(text))) = timeout_at(deadline, taken).await {
+                        outcome.text.push('\n');
+                        outcome.text.push_str(&text);
+                        if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
+                    }
+                }
             }
             failed if outcome.status != "unknown" => {
                 let error = match failed {

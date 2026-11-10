@@ -877,23 +877,28 @@ mod unix {
             );
         });
         let relay = Relay::spawn(address.clone());
-        for _ in 0..2 {
+        for round in 0..2 {
             let reply = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if let Some(reply) = try_forward(
+                    match try_forward(
                         &address,
                         &request(),
                         Instant::now() + Duration::from_secs(1),
                     )
                     .await
                     {
-                        break reply;
+                        Some(Ok(reply)) => break reply,
+                        // A request written before the pool sees the server's close fails, and
+                        // the relay never resends it (that could post twice). The server never
+                        // reads it, so its count of two connections still holds.
+                        Some(Err(_)) if round == 1 => {}
+                        Some(Err(error)) => panic!("{error:?}"),
+                        None => {}
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .unwrap()
             .unwrap();
             assert_eq!(reply, (200, json!({})));
         }

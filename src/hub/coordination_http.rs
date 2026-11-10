@@ -19,6 +19,7 @@ use super::coordination::{
 use super::handoff::{Answered, Asked, HandoffParty, Via};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::login::HumanSession;
+use super::login::apps::Person;
 use super::store::unix_now;
 use super::viewer::{Viewer, masked_label, shown};
 use super::{HubError, HubState, Result};
@@ -51,6 +52,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/session/handoff/ask", post(person_ask))
         .merge(super::pickup::routes())
         .merge(super::dismissals::routes())
+        .merge(super::agent_messages::routes())
         .merge(super::conversation_sharing::routes())
 }
 
@@ -217,8 +219,9 @@ async fn withdraw(
     Ok(Json(result))
 }
 
-// A signed-in person answering for their own agent from the Hub's web pages. The cookie sign-in
-// and its CSRF token are checked by `HumanSession`; each route then requires the named agent
+// A signed-in person answering for their own agent from the Hub's web pages, or a connected
+// app acting for that person. `Person` checks the cookie sign-in with its CSRF token, or the
+// app's credential; each route then requires the named agent
 // token to be an active, non-read-only token of that same person. The store applies its own
 // rules on top (the token must lead the target Work, hold the file, and so on), and records
 // that a person acted through the Hub rather than the agent itself.
@@ -261,12 +264,13 @@ struct PersonReply {
     note: Option<String>,
 }
 
+/// The web sign-in (`via: "hub"`) or a connected app's credential (the app's `via`).
 async fn person_reply(
     State(state): State<HubState>,
-    human: HumanSession,
+    person: Person,
     JsonBody(body): JsonBody<PersonReply>,
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
-    let owner = human.web_user()?.id.clone();
+    let (owner, via) = (person.user.id, person.via);
     let store = state.store.clone();
     let result = blocking(&state, move || {
         let now = unix_now();
@@ -281,7 +285,7 @@ async fn person_reply(
             expected_updated_seq: body.expected_updated_seq,
             kind: body.kind,
             note: body.note,
-            via_hub: true,
+            via,
         };
         store
             .coordination_reply(&body.token, &reply, now)
@@ -571,12 +575,13 @@ struct PersonAnswer {
     reason: Option<String>,
 }
 
+/// The web sign-in (`via` hub) or a connected app's credential (the app's `via`).
 async fn person_answer(
     State(state): State<HubState>,
-    human: HumanSession,
+    person: Person,
     JsonBody(body): JsonBody<PersonAnswer>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let owner = human.web_user()?.id.clone();
+    let (owner, via) = (person.user.id, person.via);
     let store = state.store.clone();
     let answered = blocking(&state, move || {
         let now = unix_now();
@@ -588,7 +593,7 @@ async fn person_answer(
             body.session.as_deref(),
             &body.path,
             (body.accept, body.reason.as_deref()),
-            Via::Hub,
+            via,
             now,
         )
     })

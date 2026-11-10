@@ -381,3 +381,80 @@ retains at most 32 remembered Works per session, 128 per token and 64 announceme
 Work generation; unavailable capacity is reported. Records expire after 30 days and follow Work
 and credential deletion. A provider-observed merge is a distinct observation associated through
 an explicitly recorded source commit; it does not establish acceptance, deployment or health.
+
+## Digest: stale Work and repeated collisions
+
+The digest answers two questions for one person over a period of days: what did my agents leave
+unfinished, and where do agents in this repository keep colliding. It is a read-only projection
+of records the Hub already keeps. Reading it writes nothing.
+
+`GET /v1/hub/standup/digest` accepts `days` (1 to 31, default 7) and answers for the token's
+person and repository. Any token of the repository can read it, read-only included.
+`agentscm digest show [--days N] [--json]` prints the same as text or as the JSON reply. The
+reply has `schema_version: 1`; clients ignore fields they do not know.
+
+**Your stale Work** (`stale`) lists the unfinished Work the reader owns whose lead agent last
+checked in three days ago or earlier, longest quiet first. For Work that was paused because its
+session ended, the time is the last check-in before that pause. Each item has its id, title,
+branch, state, `quiet_since`, and:
+
+- `merged`: `observed` when a pull request from its branch merged after its last check-in, `none`
+  when the Hub read the forge's pull requests back to before the Work was created and saw no
+  merge, and `unknown` otherwise (no branch, blocked Work, or the forge was not read that far).
+  `unknown` is never shown as "not merged".
+- `can_release` and `can_complete`: whether the owner, acting as a person, may make that
+  transition now, with the `generation` and `updated_seq` such a transition is fenced by.
+
+At most 10 items are listed; `total` counts all that were found, and `complete: false` says the
+person has more unfinished Work than one digest reads (200 items). Other people's Work is never
+in this list, so the digest shows no Work title the reader does not own.
+
+**Collisions** (`collisions`) cover the whole repository. A collision is one refused edit
+(`edit_denied`) or one repeated edit (`edit_repeated`). The editing side is the agent that made
+the edit. The holding side of a refusal is whoever announced the intents the refusal named; a
+repeat has the holders of the same session's latest earlier refusal over one of its paths. When
+neither names anyone, the hand-over request the refusal filed does.
+
+- `hot_paths`: paths grouped by their first two segments (`src/hub/slack.rs` counts under
+  `src/hub`), with how many edits were refused and how many repeated, most first, at most 10.
+  `typical_gap_seconds` is the median time between the holder taking the path and the other
+  agent's edit, over the collisions where the Hub knows when the holder took it (`gap_samples`
+  of them); it is absent when it knows none. A short gap means two agents started on the same
+  files at about the same time; a long one means an old hold was still in the way.
+- `pairs`: two people whose agents collided on one exact path three or more times, with the path
+  and the count, most first, at most 10. `includes_you` marks the pairs the reader is in. One
+  person's own two agents colliding is counted in `hot_paths` and is not a pair.
+- `unattributed`: collisions whose holding side could not be named, which no pair counts.
+
+Paths and logins in collisions are what every reader of the repository already sees on the
+activity page.
+
+**Missing history is unknown, not zero.** `collisions.complete` is true only when the counts
+cover the whole period. Otherwise `known_from` is the time the counts start at and `limits` says
+why: `event_history_starts_in_period` (the Hub's oldest retained event is inside the period, as
+on a new or restored Hub), `collision_history_truncated` (the period holds more than the 10,000
+activity events one digest reads), `event_history_empty`, `collision_event_unreadable` or
+`collision_event_paths_truncated` (an event named more than 32 paths). The text form says the
+same in a sentence.
+
+Titles, branch names, paths and logins are other people's text: each is cut to a bounded length
+and stripped of control and invisible characters before it enters the reply.
+
+### Weekly delivery
+
+The Hub can send each person their digest once a week as a private Slack message; see
+[the Slack adapter](slack.md#weekly-digest). Delivery has two switches, both stored by the Hub
+and keyed by the forge's repository id:
+
+- The repository's switch is off until a repository admin (GitHub `admin`, GitLab maintainer or
+  owner) or a Hub admin turns it on: `agentscm digest enable` or `disable`, which call
+  `PUT /v1/hub/standup/digest/settings` with `{enabled}` using a token that is not read-only.
+  The Hub checks the forge role when the call is made. On a Hub with no forge connection for
+  the repository only a Hub admin can change it.
+- Each person can switch their own off and on again: `agentscm digest opt-out` or `opt-in`,
+  which call `PUT /v1/hub/standup/digest/settings/me` with `{opted_out}`.
+
+`agentscm digest settings` and `GET /v1/hub/standup/digest/settings` answer
+`{repository, enabled, opted_out, delivering}` for the token's person, where `delivering` is
+`enabled` and not `opted_out`. A token minted without a forge repository id is never sent a
+digest. Reading the digest needs neither switch.

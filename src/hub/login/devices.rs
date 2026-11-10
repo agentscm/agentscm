@@ -19,6 +19,7 @@ use super::super::device::{
 };
 use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
+use super::super::handoff::Via;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
 use super::super::repository_summary::{Facts, summarize};
 use super::super::store::{
@@ -87,7 +88,32 @@ fn refused_about(kind: &'static str, repository: &str, forge: &str) -> ApiError 
     ApiError::new(status, kind).with_message(message)
 }
 
-/// A live computer credential, from `Authorization: Bearer <secret>`.
+/// A live credential from `Authorization: Bearer <secret>`: a computer's, or a connected app's
+/// whose app is still registered.
+async fn credential(parts: &Parts, state: &HubState) -> ApiResult<DevicePrincipal> {
+    let digest = device_digest(bearer(parts)?).map_err(|_| refused("sign_in_required"))?;
+    let store = state.store.clone();
+    let found = blocking(state, move || {
+        store.authenticate_device(&digest, unix_now())
+    })
+    .await?;
+    match found {
+        None => Err(refused("sign_in_required")),
+        // An app the operator no longer registers loses its credentials.
+        Some(device)
+            if device
+                .app_id
+                .as_deref()
+                .is_some_and(|app| state.login.app(app).is_none()) =>
+        {
+            Err(refused("sign_in_required"))
+        }
+        Some(device) if device.owner.disabled => Err(refused("user_disabled")),
+        Some(device) => Ok(device),
+    }
+}
+
+/// A live computer credential. A connected app's is refused (403 `app_not_allowed`).
 pub(super) struct DeviceAuth(DevicePrincipal);
 
 impl FromRequestParts<HubState> for DeviceAuth {
@@ -97,17 +123,44 @@ impl FromRequestParts<HubState> for DeviceAuth {
         parts: &mut Parts,
         state: &HubState,
     ) -> std::result::Result<Self, ApiError> {
-        let digest = device_digest(bearer(parts)?).map_err(|_| refused("sign_in_required"))?;
-        let store = state.store.clone();
-        let found = blocking(state, move || {
-            store.authenticate_device(&digest, unix_now())
-        })
-        .await?;
-        match found {
-            None => Err(refused("sign_in_required")),
-            Some(device) if device.owner.disabled => Err(refused("user_disabled")),
-            Some(device) => Ok(Self(device)),
+        let device = credential(parts, state).await?;
+        if device.app_id.is_some() {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "app_not_allowed").with_message(
+                "A connected app only reads, mints read-only tokens and answers requests for its person",
+            ));
         }
+        Ok(Self(device))
+    }
+}
+
+/// A live computer credential or a connected app's: the routes an app may also call.
+struct DeviceOrApp(DevicePrincipal);
+
+impl FromRequestParts<HubState> for DeviceOrApp {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HubState,
+    ) -> std::result::Result<Self, ApiError> {
+        credential(parts, state).await.map(Self)
+    }
+}
+
+/// The owner and `via` of a connected app's credential; None for anything that is not a live
+/// app credential, so the caller can try its other sign-ins.
+pub(super) async fn app_credential(
+    parts: &Parts,
+    state: &HubState,
+) -> ApiResult<Option<(User, Via)>> {
+    match credential(parts, state).await {
+        Ok(device) => Ok(device
+            .app_id
+            .as_deref()
+            .and_then(|app| state.login.app(app))
+            .map(|app| (device.owner, app.via))),
+        Err(error) if error.code() == "sign_in_required" => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -169,10 +222,12 @@ pub(super) struct DeviceRequest {
 }
 
 /// Creates a computer for `user` and returns `{id, secret, name}`; the secret is shown once.
+/// `app` issues a connected app's credential instead. Never from a request body.
 pub(super) async fn issue(
     state: &HubState,
     user: &User,
     request: DeviceRequest,
+    app: Option<&str>,
 ) -> ApiResult<Value> {
     let name = match request.name {
         Some(name) => name,
@@ -186,18 +241,28 @@ pub(super) async fn issue(
     let digest = device_digest(&secret)?;
     let (store, owner, stored) = (state.store.clone(), user.id.clone(), name.clone());
     let (replaces, workspace) = (request.replaces, state.workspace.clone());
+    let app = app.map(str::to_owned);
     let (id, replaced) = blocking(state, move || {
         let now = unix_now();
         // A credential that is not this person's live computer replaces nothing.
         let replaced = match replaces.as_deref().map(device_digest) {
             Some(Ok(old)) => store
                 .authenticate_device(&old, now)?
-                .filter(|device| device.owner.id == owner)
+                .filter(|device| device.owner.id == owner && device.app_id.is_none())
                 .map(|device| device.device_id),
             _ => None,
         };
         // Replacing revokes agent tokens, so it waits for native actions as revocation does.
-        let operation = || store.insert_device(&owner, &stored, &digest, replaced.as_deref(), now);
+        let operation = || {
+            store.insert_device(
+                &owner,
+                &stored,
+                &digest,
+                replaced.as_deref(),
+                app.as_deref(),
+                now,
+            )
+        };
         let id = match (&workspace, &replaced) {
             (Some(workspace), Some(_)) => workspace.with_identity_change(operation),
             _ => operation(),
@@ -235,10 +300,12 @@ pub(super) async fn record_refusal(state: &HubState, user: &User, reason: &str, 
 fn device_json(device: &Device, current: Option<&str>) -> Value {
     json!({"id": device.id, "name": device.name, "created_at": device.created_at,
         "last_used_at": device.last_used_at, "revoked_at": device.revoked_at,
-        "current": current == Some(device.id.as_str()), "repositories": device.repositories})
+        "current": current == Some(device.id.as_str()), "repositories": device.repositories,
+        // A connected app's credential is named after its app, and keeps that name.
+        "app": device.app_id.as_ref().map(|id| json!({"id": id, "name": device.name}))})
 }
 
-async fn status(DeviceAuth(device): DeviceAuth) -> Json<Value> {
+async fn status(DeviceOrApp(device): DeviceOrApp) -> Json<Value> {
     Json(json!({
         "device": {"id": device.device_id, "name": device.name,
             "created_at": device.created_at, "last_used_at": device.last_used_at},
@@ -248,7 +315,7 @@ async fn status(DeviceAuth(device): DeviceAuth) -> Json<Value> {
 
 async fn sign_out(
     State(state): State<HubState>,
-    DeviceAuth(device): DeviceAuth,
+    DeviceOrApp(device): DeviceOrApp,
 ) -> ApiResult<StatusCode> {
     revoke_device(
         &state,
@@ -300,7 +367,7 @@ async fn enroll(
             ),
         );
     }
-    let device = issue(&state, &human.user, body).await?;
+    let device = issue(&state, &human.user, body, None).await?;
     // The session now came with this computer: it cannot enroll another, and revoking this one
     // ends it.
     if let Some((_, session)) = state.login.pending().sessions.0.get_mut(&human.key) {
@@ -380,9 +447,14 @@ struct MintBody {
 /// role on the repository; a refusal mints nothing and leaves the current token alone.
 async fn mint(
     State(state): State<HubState>,
-    DeviceAuth(device): DeviceAuth,
+    DeviceOrApp(device): DeviceOrApp,
     JsonBody(body): JsonBody<MintBody>,
 ) -> ApiResult<Response> {
+    // A connected app reads as its person; it never holds a token an agent could act with.
+    if device.app_id.is_some() && (!body.read_only || body.auto) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "app_read_only")
+            .with_message("A connected app mints read-only tokens only; send read_only: true"));
+    }
     validate_agent_name(&body.name)?;
     validate_repository(&body.repository)?;
     let owner = device.owner.clone();
@@ -480,7 +552,11 @@ pub(in crate::hub) async fn mint_access(
 }
 
 /// Refuses someone the allow list leaves out, recording it under `via`.
-async fn allow_listed(state: &HubState, owner: &User, via: &'static str) -> ApiResult<()> {
+pub(super) async fn allow_listed(
+    state: &HubState,
+    owner: &User,
+    via: &'static str,
+) -> ApiResult<()> {
     let (identity, login) = (&owner.identity, &state.login);
     if login.has_allow_list()
         && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
@@ -606,10 +682,11 @@ async fn session_repositories(
 }
 
 /// A signed-in computer can inspect the same repositories for its tray work view. The server
-/// checks each repository's current forge role before returning any names or work details.
+/// checks each repository's current forge role before returning any names or work details. A
+/// connected app reads the same list for its person.
 async fn device_repositories(
     State(state): State<HubState>,
-    DeviceAuth(device): DeviceAuth,
+    DeviceOrApp(device): DeviceOrApp,
 ) -> ApiResult<Json<Value>> {
     repositories_for_owner(state, device.owner, true).await
 }
@@ -859,7 +936,7 @@ fn attention_revision(
                 a.updated_seq,
                 &a.semantic_version,
                 &a.recipients,
-                &a.action,
+                &super::super::work_http::actionable_status::steady(a).action,
             ))
             .expect("action version serializes")
         }))
@@ -1404,6 +1481,24 @@ mod tests {
             .unwrap();
         let first = read();
         let revision = attention_revision(&first, "synthetic-key");
+        // How long ago the holder was last active is in the row's text, never in the revision:
+        // a clock that moved is no new attention.
+        let later = actionable_status::read(&*store, &setup, &who, now + 300).unwrap();
+        let text = |status: &actionable_status::ActionableStatus| {
+            let row = status.actions.iter().find(|a| a.kind == "pr_overlap");
+            row.unwrap().action.clone()
+        };
+        assert!(
+            text(&first).contains(", last active just now, "),
+            "{}",
+            text(&first)
+        );
+        assert!(
+            text(&later).contains(", last active 5 min ago, "),
+            "{}",
+            text(&later)
+        );
+        assert_eq!(revision, attention_revision(&later, "synthetic-key"));
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 2000)
             .unwrap();

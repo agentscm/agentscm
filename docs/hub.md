@@ -327,8 +327,11 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   are omitted; failed access checks are counted in `unchecked` without naming the repository.
   At most 20 Work rows and 40 live rows are returned per repository; `work_complete` or
   `live_complete` is false when that list was cut short. `attention_revision` is an opaque marker
-  for changes to actionable items and is null without attention. This route does not return
-  conversation bodies, source paths or agent tokens.
+  for changes to actionable items and is null without attention; how long ago the holder in an
+  overlap row was last active is left out of it, so it does not move with the clock. This route
+  does not return conversation bodies or agent tokens. An overlap row's text names the contested
+  files, and for a pull request its number, title, author and state, as the
+  [shared status](api.md) words them.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
@@ -417,6 +420,93 @@ status shown; clients show `message` as is.
   sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
   set; the setup page links to the checkbox), so clients go straight to the browser.
 
+## Connected apps
+
+An operator can register an external app, such as a chat integration, that people connect to
+their own Hub account. A person signs in to the Hub's web pages and approves the app; the Hub then
+gives the app a revocable credential bound to that person. With it the app can read the person's
+repositories and work the way their own computer can, mint short read-only tokens for the
+repositories they can read now (the forge role is checked at every mint), and answer coordination
+and file handoff requests for the person's own agents, recorded with the app's `via`. It can
+never mint a writable agent token, enroll a computer, transition or recover Work, create
+hand-off pickups or call an administrator route.
+
+**Configuration.** `AGENTSCM_HUB_APPS_FILE` is an absolute path to a JSON file under the same
+rules as the Slack config: a regular file, not a symlink, owned by the Hub's user and not
+readable by group or others (`chmod 600`), at most 64 KiB. Unset means no apps, and every app
+route answers 404. The Hub refuses to start when the file is set but invalid, or when no GitHub or
+GitLab sign-in is configured.
+
+```json
+{"apps": [{"id": "example-app", "name": "Example App",
+  "redirect_uri": "https://app.example.com/callback",
+  "secret_file": "/etc/agentscm/example-app.secret", "via": "slack"}]}
+```
+
+- `id` (the OAuth `client_id`): 3 to 64 of `a-z`, `0-9` and `-`, unique. At most 16 apps.
+- `name`: 1 to 64 printable characters, shown on the approval page and as the credential's name
+  in the person's computers list.
+- `redirect_uri`: one exact `https` URL (`http` only on a loopback IP, for local testing),
+  without a query or fragment, written as a URL parser writes it back (a host in lower case, a
+  path of at least `/`). Requests must name it byte for byte.
+- `secret_file`: an absolute path to a private file (same rules) holding the client secret, at
+  least 32 bytes, without whitespace. The Hub keeps only its SHA-256 and compares in constant
+  time.
+- `via`: how answers through the app are recorded. Only `"slack"` exists today.
+
+**Connecting.** The standard OAuth 2.0 authorization code flow with PKCE (`S256` only):
+
+1. The app sends the person to `GET /v1/hub/apps/authorize?client_id&redirect_uri&state&code_challenge&code_challenge_method=S256`
+   (`state` 1 to 512 visible ASCII characters, `code_challenge` 43 base64url characters). An
+   unknown app, a different redirect or a bad parameter gets an error page and is never
+   redirected. Without a web sign-in the page offers the Hub's sign-in, which returns to the same
+   URL; because the sign-in cookie is `SameSite=Strict`, a browser arriving from another site
+   first reloads the page from the Hub once. Signed in, the page names the app, what it can and
+   can't do, and that it can be revoked under Computers, with Allow and Deny.
+2. Allow and Deny post the form to `POST /v1/hub/apps/authorize`, with the web sign-in's CSRF
+   token as a hidden field. Allow redirects (303) to `redirect_uri?code=…&state=…`: a one-time
+   code of 64 hex characters, held in this Hub process's memory for 60 seconds, bound to the app,
+   the redirect, the challenge and the person; a person may have 8 waiting. Deny redirects to
+   `redirect_uri?error=access_denied&state=…`. A missing or wrong CSRF field or sign-in gets a 403
+   error page.
+3. The app exchanges the code at `POST /v1/hub/apps/token` (form or JSON body:
+   `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `client_secret`,
+   `code_verifier`). The client secret is checked first, and a code issued to another app is left
+   untouched, so only its own app can spend it; the code then goes on any use by that app, even a
+   failed one. Each person has one credential per app: connecting again revokes the earlier one. Reply (200, `Cache-Control: no-store`):
+   `{"credential": "<64 hex>", "device": {"id": "dev_…", "name"}, "owner": {"provider", "host",
+   "user_id", "login"}}`. Errors are 400 `{"error": "invalid_request"}` (a bad body or grant
+   type), `invalid_client` (unknown app or wrong secret) or `invalid_grant` (a code that is
+   unknown, used, expired, for another app or redirect, or whose verifier does not match).
+
+Pages are server-rendered with everything escaped, no script, `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer` and the policy `default-src 'none'; style-src 'unsafe-inline';
+base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, plus the app's own origin on the
+approval page (browsers check a form's redirect against `form-action`).
+
+**The credential.** It is a computer credential (named migration `connected_apps` adds
+`app_id` to the computers table), sent as `Authorization: Bearer <credential>`, with the same
+digest storage, 90-day idle expiry and revocation. It works on:
+
+- `GET /v1/hub/device` and `DELETE /v1/hub/device` (the app disconnects itself);
+- `GET /v1/hub/device/repositories`;
+- `POST /v1/hub/device/tokens` with `"read_only": true` only (30 minutes); a writable mint is 403
+  `app_read_only`;
+- `POST /v1/hub/session/coordination/reply` and `POST /v1/hub/session/handoff/answer`, with the
+  same bodies, checks and replies as for the web sign-in: the named agent token must be one of
+  the person's own active writable tokens (403 `not_your_agent`), the store's lead, session,
+  `expected_updated_seq` and `operation_id` replay rules all hold, and the person must still be
+  on `AGENTSCM_ALLOWED_USERS` when it is set (403 `not_allowed`). A coordination response is
+  recorded with `"via": "slack"` (on the response and its `coordination_responded` event), and a
+  handoff answer as `answered_via_slack` with `"via": "slack"` on its event.
+
+Every other computer route refuses it with 403 `app_not_allowed`, and every other person,
+agent or administrator route with 401. `GET /v1/hub/devices` lists it among the person's
+computers with `"app": {"id", "name"}` (`null` for a computer); the person revokes it there with
+`DELETE /v1/hub/devices/{id}`, which also revokes the read-only tokens it minted. An app removed from
+the file has its credentials revoked, with the read-only tokens they minted, at the Hub's next
+start; until then they stop working (401 `sign_in_required`).
+
 ## Routes
 
 - `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"capacity":{"recent_limits":0,"last_refused_at":null},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `capacity` counts the repository limits that refused an agent write in the last day and gives the newest refusal time, without naming a repository; it is `null` when the refusal record could not be read. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
@@ -494,6 +584,8 @@ on no others:
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
+- `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
+  [weekly digest](#weekly-digest))
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
@@ -1054,6 +1146,58 @@ pre-release build of this branch must drop `hub_change_shared_bodies` and its na
 
 This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
 are pending. See [local change capture](change-capture.md) for configuration and exact limits.
+
+## Weekly digest
+
+The digest tells one person what their agents left unfinished and where agents in the repository
+keep colliding. It is computed on request from records the Hub already keeps (the person's
+unfinished Work, `edit_denied` and `edit_repeated` events, the `intent_announced` and
+`handoff_request` events that say who held a path, and merge observations) and writes nothing.
+[The digest](work-insights.md#digest-stale-work-and-repeated-collisions) defines every field.
+
+**What it contains.** For a period of 1 to 31 days (default 7):
+
+- The reader's own unfinished Work whose lead has not checked in for three days or more, with
+  whether a pull request from its branch merged (`observed`, `none` or `unknown`).
+- For the whole repository, the paths with the most refused or repeated edits, grouped by their
+  first two path segments, with both counts and the typical time between the holder taking the
+  path and the other agent's edit.
+- For the whole repository, pairs of people whose agents collided on one path three or more times.
+
+**Who sees what.** The stale Work list holds only Work the reader owns, so no Work title of
+another person appears in a digest. The collision lists name paths and logins, which every
+reader of the repository already sees in its activity. A token reads the digest of its own
+person and repository only.
+
+**Unknown is not zero.** When the Hub's retained events do not cover the whole period, or the
+period holds more events than one digest reads, the reply says from when collisions are counted
+and marks the counts incomplete. A merge the Hub could not rule out is `unknown`, never "not
+merged".
+
+**Routes** (token routes for the token's repository):
+
+- `GET /v1/hub/standup/digest?days=` (any token, read-only included) answers the digest.
+- `GET /v1/hub/standup/digest/settings` (any token) answers
+  `{repository, enabled, opted_out, delivering}` for the token's person.
+- `PUT /v1/hub/standup/digest/settings` with `{enabled}` (a token that is not read-only) switches
+  weekly delivery for the repository. The token's person must be a repository admin (GitHub
+  `admin`, GitLab maintainer or owner), checked with the forge when the call is made, or a Hub
+  admin; anyone else gets 403.
+- `PUT /v1/hub/standup/digest/settings/me` with `{opted_out}` (a token that is not read-only)
+  records the person's own choice.
+
+**Settings.** Weekly delivery is off for every repository until it is switched on, and each
+person can switch their own off. Both values live in the Hub's settings table, keyed by the
+forge's repository id so a rename keeps them; a token minted without a forge repository id is
+never sent a digest. `agentscm digest enable`, `disable`, `opt-out`, `opt-in` and `settings` call
+these routes. Reading the digest needs neither switch.
+
+**Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
+digest once a week as a private direct message to each person who has a Slack binding for the
+repository, has not switched theirs off and has something in it. Each stale Work row has buttons
+that release or complete that Work as its owner through the ordinary fenced Work transition. It
+is never posted to a channel. Without the Slack adapter nothing is sent, and the route and the
+command still answer.
 
 ## Status page
 
