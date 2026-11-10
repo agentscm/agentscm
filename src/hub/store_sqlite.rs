@@ -1251,21 +1251,6 @@ fn sqlite_record_catchup_merge(
             merge.merge_commit
         ],
     )?;
-    // Bounded like the observations it is copied from: the oldest pull requests go first.
-    tx.execute(
-        "DELETE FROM hub_catchup_pull_commits
-         WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
-           AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
-               WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
-               ORDER BY pull_number DESC LIMIT 1 OFFSET ?5)",
-        params![
-            scope.provider,
-            scope.host,
-            repository,
-            repository_key,
-            MAX_CATCHUP_MERGE_ROWS
-        ],
-    )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
     let base_upsert = "INSERT INTO hub_catchup_branch_merges
             (provider,host,repository,repository_key,branch,merged_at,is_base)
@@ -11591,11 +11576,12 @@ impl Store for SqliteStore {
         let snapshot = save_work_version(&tx, &item, seq)?;
         let link = work_links::asserted_link(&who, update, seq, now);
         let new_link = link.as_ref().map(json_string).transpose()?;
-        if let Some(snapshot) = &new_link {
+        if let (Some(snapshot), Some(link)) = (&new_link, &link) {
             tx.execute(
-                "INSERT INTO hub_work_pr_links (work,snapshot) VALUES (?1,?2)
-                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
-                params![item.id, snapshot],
+                "INSERT INTO hub_work_pr_links (work,snapshot,number,head_sha) VALUES (?1,?2,?3,?4)
+                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot,
+                        number=excluded.number,head_sha=excluded.head_sha",
+                params![item.id, snapshot, link.target.number, link.target.head_sha],
             )?;
         } else {
             tx.execute("DELETE FROM hub_work_pr_links WHERE work=?1", [&item.id])?;
@@ -11729,6 +11715,7 @@ impl Store for SqliteStore {
         let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
         let mut pulls = Vec::new();
         let more = (why::WHY_WORK + 1) as i64;
+        let mut unscanned = false;
         // (Work id, pull request), newest Work first.
         let matches: Vec<(String, Option<i64>)> = match subject {
             WhySubject::Commit(commit) => {
@@ -11761,14 +11748,11 @@ impl Store for SqliteStore {
                 drop(statement);
                 let numbers = json_string(&pulls.iter().map(|p| p.number).collect::<Vec<_>>())?;
                 let mut statement = tx.prepare(
-                    "SELECT w.id, json_extract(l.snapshot, '$.target.number'),
-                            json_extract(l.snapshot, '$.target.head_sha')
+                    "SELECT w.id, l.number, l.head_sha
                      FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
                      WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                        AND w.repository_id IS ?4
-                       AND (json_extract(l.snapshot, '$.target.head_sha') = ?5
-                         OR json_extract(l.snapshot, '$.target.number')
-                            IN (SELECT value FROM json_each(?6)))
+                       AND (l.head_sha = ?5 OR l.number IN (SELECT value FROM json_each(?6)))
                      ORDER BY w.created_at DESC, w.id DESC LIMIT ?7",
                 )?;
                 let rows = statement
@@ -11809,11 +11793,26 @@ impl Store for SqliteStore {
             }
             WhySubject::Path(path) => {
                 let entries = json_string(&why::covering_scope_entries(path))?;
+                // Only the newest WHY_SCAN Work are scanned; older ones leave the answer cut.
+                unscanned = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM hub_work_items
+                     WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+                     ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET ?5)",
+                    params![
+                        provider,
+                        host,
+                        who.repository,
+                        who.repository_id,
+                        why::WHY_SCAN as i64
+                    ],
+                    |row| row.get(0),
+                )?;
                 let mut statement = tx.prepare(
-                    "SELECT w.id FROM hub_work_items w
-                     WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
-                       AND w.repository_id IS ?4
-                       AND EXISTS (SELECT 1 FROM json_each(?5) c WHERE instr(w.scope, c.value) > 0)
+                    "SELECT w.id FROM (SELECT id, scope, created_at FROM hub_work_items
+                         WHERE provider = ?1 AND host = ?2 AND repository = ?3
+                           AND repository_id IS ?4
+                         ORDER BY created_at DESC, id DESC LIMIT ?7) w
+                     WHERE EXISTS (SELECT 1 FROM json_each(?5) c WHERE instr(w.scope, c.value) > 0)
                      ORDER BY w.created_at DESC, w.id DESC LIMIT ?6",
                 )?;
                 statement
@@ -11824,7 +11823,8 @@ impl Store for SqliteStore {
                             who.repository,
                             who.repository_id,
                             entries,
-                            more
+                            more,
+                            why::WHY_SCAN as i64
                         ],
                         |row| Ok((row.get::<_, String>(0)?, None)),
                     )?
@@ -11864,7 +11864,7 @@ impl Store for SqliteStore {
             ));
         }
         tx.commit()?;
-        Ok(why::answer(subject, pulls, work))
+        Ok(why::answer(subject, pulls, work, unscanned))
     }
 
     fn change_ingest(
@@ -14864,6 +14864,23 @@ impl Store for SqliteStore {
                     ],
                 )?;
             }
+            // The copy of which pull request a commit belongs to is bounded like the merge
+            // observations it comes from: the lowest pull request numbers go first.
+            tx.execute(
+                "DELETE FROM hub_catchup_pull_commits
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
+                   AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+                       WHERE provider=?1 AND host=?2 AND repository=?3
+                         AND repository_key=ifnull(?4,-1)
+                       ORDER BY pull_number DESC LIMIT 1 OFFSET ?5)",
+                params![
+                    scope.provider,
+                    scope.host,
+                    catchup_repository,
+                    scope.repository_id,
+                    MAX_CATCHUP_MERGE_ROWS
+                ],
+            )?;
             tx.execute(
                 "DELETE FROM hub_work_deliveries
                  WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4

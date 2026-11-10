@@ -16,6 +16,8 @@ pub const WHY_WORK: usize = 10;
 pub const WHY_DECISIONS: usize = 20;
 /// Decision checkpoints the Hub keeps per Work item for `why` and search.
 pub const MAX_WORK_DECISIONS: i64 = 100;
+/// Newest Work a path lookup scans; with more, the answer says it was cut.
+pub const WHY_SCAN: usize = 1000;
 /// Pull requests one commit can name.
 pub const WHY_PULLS: usize = 10;
 
@@ -213,13 +215,14 @@ pub(super) fn work(facts: WhyWorkFacts, viewer: Viewer<'_>) -> WhyWork {
     }
 }
 
-/// `work` was read with one past [`WHY_WORK`].
+/// `work` was read with one past [`WHY_WORK`]; `unscanned` says older Work was not looked at.
 pub(super) fn answer(
     subject: &WhySubject,
     pull_requests: Vec<WhyPullRequest>,
     mut work: Vec<WhyWork>,
+    unscanned: bool,
 ) -> WhyAnswer {
-    let work_complete = work.len() <= WHY_WORK;
+    let work_complete = work.len() <= WHY_WORK && !unscanned;
     work.truncate(WHY_WORK);
     let (commit, path) = match subject {
         WhySubject::Commit(commit) => (Some(commit.clone()), None),
@@ -260,6 +263,16 @@ mod tests {
             ["\"src/hub/\"", "\"src/\""]
         );
         assert_eq!(covering_scope_entries("README.md"), ["\"README.md\""]);
+    }
+
+    /// Work scope holds only files and directories (`dir/**` is stored as `dir/`), so matching a
+    /// path against itself and its parent directories is the whole scope rule.
+    #[test]
+    fn scope_holds_no_globs_for_a_path_lookup_to_miss() {
+        for glob in ["src/*.rs", "**/*.rs", "src/**/x.rs"] {
+            assert!(super::super::intent::spec_key(glob).is_err(), "{glob}");
+        }
+        assert_eq!(super::super::intent::spec_key("src/**").unwrap(), "src/");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 -- Work versions that first recorded them. `checkpoint` is the stored Checkpoint JSON; `summary`
 -- is its text for search. Writers keep at most the newest 100 per Work.
 CREATE TABLE hub_work_decisions (
-    work TEXT NOT NULL REFERENCES hub_work_items (id),
+    work TEXT NOT NULL REFERENCES hub_work_items (id) ON DELETE CASCADE,
     event_seq BIGINT NOT NULL,
     summary TEXT NOT NULL,
     checkpoint TEXT NOT NULL,

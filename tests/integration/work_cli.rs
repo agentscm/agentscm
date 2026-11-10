@@ -694,6 +694,43 @@ fn why_resolves_a_line_and_a_path_through_git_then_asks_the_hub() {
     assert_eq!(root["path"], serde_json::Value::Null);
     assert_eq!(root["commits"], serde_json::json!([commit]));
 
+    // An absolute path names the same file.
+    let absolute = repository.path().join("src/why.rs");
+    let absolute = client.why(repository.path(), &format!("{}:1", absolute.display()));
+    assert!(absolute.status.success(), "{absolute:?}");
+    let absolute: serde_json::Value = serde_json::from_slice(&absolute.stdout).unwrap();
+    assert_eq!(absolute["path"], "src/why.rs");
+    assert_eq!(absolute["commits"], serde_json::json!([commit]));
+
+    // A line from a merged branch also names the merge that brought it in, not a merge of the
+    // main line into the branch. A squash-merged or direct line, as above, is its own commit.
+    let main = git(&["symbolic-ref", "--short", "HEAD"]).trim().to_owned();
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        repository.path().join("src/why.rs"),
+        "fn why() {}\nfn because() {}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "feature"]);
+    let feature = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    git(&["checkout", "-q", &main]);
+    std::fs::write(repository.path().join("other.txt"), "x\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "main moves"]);
+    git(&["checkout", "-q", "feature"]);
+    git(&["merge", "-q", "--no-ff", "-m", "sync main", &main]);
+    git(&["checkout", "-q", &main]);
+    git(&["merge", "-q", "--no-ff", "-m", "merge feature", "feature"]);
+    let merge = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let merged = client.why(repository.path(), "src/why.rs:2");
+    assert!(merged.status.success(), "{merged:?}");
+    let merged: serde_json::Value = serde_json::from_slice(&merged.stdout).unwrap();
+    assert_eq!(
+        merged["commits"],
+        serde_json::json!([feature, merge]),
+        "{merged}"
+    );
+
     let unknown = client.why(repository.path(), "no-such-target");
     assert!(!unknown.status.success(), "{unknown:?}");
 }

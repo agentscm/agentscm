@@ -18,7 +18,7 @@ use agentscm::hub::store::{
 };
 use agentscm::hub::why::{self, WhyRelation, WhySubject};
 use agentscm::hub::work::{
-    BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
+    BriefingQuery, CheckpointKind, SourceRef, WorkCheckpoint, WorkItem, WorkOverviewQuery,
     WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::{
@@ -2207,7 +2207,8 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
     let now = unix_now();
     let old = now - 200_000;
     let owner = fixture.owner(46);
-    let token = fixture.token(&owner, "why-lead", 146, false);
+    // An older client's label names its host; another owner sees it masked.
+    let token = fixture.token(&owner, "client-laptop.example-a1b2c3", 146, false);
     let (old_merge, _) = merge(146, old);
     fixture
         .store
@@ -2264,7 +2265,10 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
                     branch: None,
                     worktree: None,
                     resolve_blocker: false,
-                    source_refs: Vec::new(),
+                    source_refs: vec![SourceRef::CapturedEvent {
+                        session_id: "why-session".into(),
+                        event_id: "evt-1".into(),
+                    }],
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
                 },
@@ -2347,9 +2351,18 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
         .store
         .work_why(&reader, &WhySubject::Path("src/why/answer.rs".into()), now)
         .unwrap();
-    let mine = by_path.work[0].decisions[0].session.clone();
-    assert_eq!(mine, "why-session");
-    assert_ne!(theirs.work[0].decisions[0].session, mine);
+    let (mine, other) = (&by_path.work[0], &theirs.work[0]);
+    assert_eq!(mine.decisions[0].session, "why-session");
+    assert_ne!(other.decisions[0].session, "why-session");
+    assert_eq!(mine.lead_agent, "client-laptop.example-a1b2c3");
+    assert_eq!(other.lead_agent, "client-host-a1b2c3");
+    assert_eq!(other.decisions[0].agent, "client-host-a1b2c3");
+    let captured = |work: &agentscm::hub::why::WhyWork| match &work.decisions[0].source_refs[0] {
+        SourceRef::CapturedEvent { session_id, .. } => session_id.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(captured(mine), "why-session");
+    assert_ne!(captured(other), "why-session");
     assert_eq!(
         theirs.work[0].decisions[0].summary,
         "Chose a derived pull table"
@@ -2466,6 +2479,74 @@ fn postgres_why_marks_cut_lists() {
         return;
     };
     why_marks_cut_lists(&fixture);
+}
+
+/// Compaction keeps the newest 100,000 pull-commit rows of a repository and drops the lowest pull
+/// request numbers, outside any merge transaction.
+fn compaction_bounds_pull_commits(fixture: &Fixture) {
+    let now = unix_now();
+    let (merge, _) = merge(149, now - 200_000);
+    fixture
+        .store
+        .record_catchup_merge(&scope(149), &merge, now - 200_000)
+        .unwrap();
+    // 100,001 more rows for pull requests 1000..=101000, next to the recorded one (149).
+    let (bulk, count, lowest) = (
+        "INSERT INTO hub_catchup_pull_commits
+         SELECT p.provider, p.host, p.repository, p.repository_key, n, NUMBER_HEX, NUMBER_HEX
+         FROM (SELECT * FROM hub_catchup_pull_commits WHERE pull_number = 149) p, SERIES",
+        "SELECT COUNT(*) FROM hub_catchup_pull_commits WHERE repository_key = 149",
+        "SELECT MIN(pull_number) FROM hub_catchup_pull_commits WHERE repository_key = 149",
+    );
+    let read = |sql: &str| -> i64 {
+        if let Some(database) = &fixture.database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            if sql.starts_with("INSERT") {
+                let sql = sql
+                    .replace("NUMBER_HEX", "printf('%040x', n)")
+                    .replace("SERIES", "(WITH RECURSIVE s(n) AS (SELECT 1000 UNION ALL SELECT n + 1 FROM s WHERE n < 101000) SELECT n FROM s)");
+                connection.execute(&sql, []).unwrap();
+                return 0;
+            }
+            return connection.query_row(sql, [], |row| row.get(0)).unwrap();
+        }
+        let mut client = Client::connect(&fixture._pg.as_ref().unwrap().url, NoTls).unwrap();
+        if sql.starts_with("INSERT") {
+            let sql = sql
+                .replace("NUMBER_HEX", "lpad(to_hex(n), 40, '0')")
+                .replace("SERIES", "generate_series(1000, 101000) AS n");
+            client.batch_execute(&sql).unwrap();
+            return 0;
+        }
+        client.query_one(sql, &[]).unwrap().get(0)
+    };
+    read(bulk);
+    assert_eq!(read(count), 100_002);
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(149),
+    };
+    fixture
+        .store
+        .work_compact(&work_scope, now - 86_400, true, now)
+        .unwrap();
+    assert_eq!(read(count), 100_000);
+    assert_eq!(read(lowest), 1001);
+}
+
+#[test]
+fn sqlite_compaction_bounds_pull_commits() {
+    compaction_bounds_pull_commits(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_compaction_bounds_pull_commits() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    compaction_bounds_pull_commits(&fixture);
 }
 
 #[test]
