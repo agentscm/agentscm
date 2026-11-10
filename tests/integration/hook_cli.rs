@@ -660,20 +660,18 @@ fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_th
     assert!(offered(&seen) >= 2, "it registered and polled");
     assert!(run.elapsed < Duration::from_secs(10), "{:?}", run.elapsed);
     // Never offered, even to a Hub that would allow it.
-    let allowing = || permission_hub(200, |hash| answered(hash, "allow"));
-    let cases: [(Env, fn(&mut Value)); 3] = [
-        (&[("AGENTSCM_REMOTE_ANSWERS", "0")], |_| {}),
-        (&[], |payload| payload["agent_id"] = json!("sub-1")),
-        (&[], |payload| {
-            payload["tool_name"] = json!("AskUserQuestion")
-        }),
-    ];
-    for (env, edit) in cases {
-        let (run, seen) = permission_prompt(allowing(), env, edit);
+    let never_offered = |env: Env, edit: fn(&mut Value)| {
+        let hub = permission_hub(200, |hash| answered(hash, "allow"));
+        let (run, seen) = permission_prompt(hub, env, edit);
         assert_eq!((run.stdout.as_str(), offered(&seen)), ("{}\n", 0));
         assert!(
             seen.iter()
                 .any(|seen| seen.path.starts_with("/v1/hub/hook/claude"))
         );
-    }
+    };
+    never_offered(&[("AGENTSCM_REMOTE_ANSWERS", "0")], |_| {});
+    never_offered(&[], |payload| payload["agent_id"] = json!("sub-1"));
+    never_offered(&[], |payload| {
+        payload["tool_name"] = json!("AskUserQuestion")
+    });
 }
