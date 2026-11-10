@@ -146,8 +146,14 @@ impl fmt::Display for HubError {
             Self::Busy => write!(f, "busy"),
             Self::WorkCapacity(capacity) => write!(
                 f,
-                "capacity reached: {}; operator action required",
-                capacity.limit.what()
+                "capacity reached: {} (limit {}; {})",
+                capacity.limit.what(),
+                capacity.limit.as_str(),
+                if capacity.limit.agent_remedy().is_some() {
+                    "the refused agent can clear it"
+                } else {
+                    "operator action required"
+                }
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {

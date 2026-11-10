@@ -72,8 +72,9 @@ impl CapacityLimit {
         };
         match self {
             Self::WorkStorage | Self::MergeObservations => None,
-            Self::CatchupDeliveries => Some("finish and acknowledge your open catch-up deliveries with agentscm_work_catchup_ack, or wait for them to expire".into()),
-            Self::ChangeRecords => Some("finish this Work with agentscm_done and outcome complete, then start new Work for further changes".into()),
+            // The byte cap counts every delivery kept for 24 hours, acknowledged ones included.
+            Self::CatchupDeliveries => Some("finish and acknowledge your open catch-up deliveries with agentscm_work_catchup_ack; deliveries, acknowledged ones included, count for up to 24 hours across your tokens, so the limit can last until they expire".into()),
+            Self::ChangeRecords => Some("start new Work for further changes; complete this Work only when its task is done".into()),
             Self::CoordinationRequests => Some(format!(
                 "at most {MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN} are open per agent token, {MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER} per person and {MAX_ACTIVE_COORDINATION_REQUESTS} per repository; resolve or withdraw your own open requests (agentscm_coordination_inbox lists them; agentscm_coordination_resolve or agentscm_coordination_withdraw ends one), then retry"
             )),
@@ -193,5 +194,59 @@ mod tests {
             }
         }
         assert_eq!(CapacityLimit::parse("future_limit"), None);
+    }
+
+    #[test]
+    fn each_refusal_names_who_can_clear_it() {
+        use crate::hub::error_envelope::{RecoveryAction, from_hub_error};
+        for (limit, action, says) in [
+            (
+                CapacityLimit::WorkStorage,
+                RecoveryAction::ContactOperator,
+                "compact",
+            ),
+            (
+                CapacityLimit::MergeObservations,
+                RecoveryAction::ContactOperator,
+                "compact",
+            ),
+            (
+                CapacityLimit::CatchupDeliveries,
+                RecoveryAction::InspectWork,
+                "up to 24 hours",
+            ),
+            (
+                CapacityLimit::ChangeRecords,
+                RecoveryAction::InspectWork,
+                "only when its task is done",
+            ),
+            (
+                CapacityLimit::CoordinationRequests,
+                RecoveryAction::InspectWork,
+                "agentscm_coordination_withdraw",
+            ),
+            (
+                CapacityLimit::CoordinationUpdates,
+                RecoveryAction::InspectWork,
+                "agentscm_coordination_resolve",
+            ),
+        ] {
+            let error = crate::hub::HubError::capacity(limit, None);
+            let envelope = from_hub_error(&error);
+            assert_eq!(envelope.recovery.action, action, "{limit:?}");
+            assert!(!envelope.retryable, "{limit:?}");
+            assert!(
+                envelope.message.contains(says),
+                "{limit:?}: {}",
+                envelope.message
+            );
+            assert!(error.to_string().contains(limit.as_str()), "{error}");
+            // Only an operator limit tells the agent to compact or contact the operator.
+            assert_eq!(
+                envelope.message.contains("compact"),
+                action == RecoveryAction::ContactOperator,
+                "{limit:?}"
+            );
+        }
     }
 }
