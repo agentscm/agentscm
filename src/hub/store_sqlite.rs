@@ -109,8 +109,8 @@ use super::work::{
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
-    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
-    work_overlap_pairs, work_payload_row_bytes,
+    claim_status, delivery_cuts, fit_json_budget, normalized_scope, scope_overlap_reasons,
+    uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
@@ -14645,42 +14645,6 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catchup_repository = repository_namespace(&scope.repository, scope.repository_id);
-        let active_deliveries: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM hub_work_deliveries
-             WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-               AND acknowledged = 0 AND updated_at >= ?5",
-            params![
-                scope.provider,
-                scope.host,
-                scope.repository,
-                scope.repository_id,
-                now.saturating_sub(86_400)
-            ],
-            |row| row.get(0),
-        )?;
-        if active_deliveries > 0 {
-            return Err(HubError::Invalid(
-                "work compaction is blocked by an unacknowledged briefing delivery".into(),
-            ));
-        }
-        let active_catchup_deliveries: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM hub_catchup_deliveries
-             WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
-               AND acknowledged=0 AND superseded=0 AND updated_at>=?5",
-            params![
-                scope.provider,
-                scope.host,
-                catchup_repository,
-                scope.repository_id,
-                now.saturating_sub(86_400)
-            ],
-            |row| row.get(0),
-        )?;
-        if active_catchup_deliveries > 0 {
-            return Err(HubError::Invalid(
-                "work compaction is blocked by an unacknowledged catch-up delivery".into(),
-            ));
-        }
         let (current_merge_floor, merge_highwater): (i64, i64) = tx
             .query_row(
                 "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
@@ -15063,6 +15027,43 @@ impl Store for SqliteStore {
                     )?;
                 }
             }
+            // An open delivery pages the live tables, so one whose window starts below a raised
+            // floor would skip removed records; end it, and the agent's next read reports the gap.
+            let (event_cut, merge_cut) = delivery_cuts(
+                [
+                    current_event_floor,
+                    current_snapshot_floor,
+                    current_coordination_floor,
+                ],
+                [event_floor, retention_floor, coordination_floor],
+                current_merge_floor,
+                merge_retention_floor,
+            );
+            tx.execute(
+                "DELETE FROM hub_work_deliveries
+                 WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+                   AND acknowledged = 0 AND from_seq < ?5",
+                params![
+                    scope.provider,
+                    scope.host,
+                    scope.repository,
+                    scope.repository_id,
+                    event_cut
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_catchup_deliveries
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
+                   AND acknowledged=0 AND (event_from<?5 OR merge_from<?6)",
+                params![
+                    scope.provider,
+                    scope.host,
+                    catchup_repository,
+                    scope.repository_id,
+                    event_cut,
+                    merge_cut
+                ],
+            )?;
             let charged = work_payload_bytes(
                 &tx,
                 &scope.provider,
