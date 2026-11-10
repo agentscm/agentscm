@@ -246,8 +246,9 @@ mod tests {
     fn two_unanswered_calls_at_once_keep_both_reports_and_send_each_once() {
         let dir = tempfile::tempdir().unwrap();
         let load = || Pending::load(Some(dir.path()), "claude", Some("s1"));
-        load().settle(Duration::from_millis(5000), Sent::TimedOut);
-        load().settle(Duration::from_millis(5000), Sent::TimedOut);
+        let (a, b) = (load(), load());
+        a.settle(Duration::from_millis(5000), Sent::TimedOut);
+        b.settle(Duration::from_millis(5000), Sent::TimedOut);
         // The first call takes both waiting counts; the second starts with nothing.
         let (first, second) = (load(), load());
         let carried = counts(&first);

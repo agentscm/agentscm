@@ -49,13 +49,13 @@ it. Later Hub calls settle it:
 | `pushed_through` | The same session's hook reported an edit of the file while its holder still kept it. |
 | `asked` | The session asked for the file itself (`agentscm_ask`) and no grant has followed. The holder may have declined. The Hub's own request after a refusal does not count as asking. |
 | `handed_off` | The holder granted a request for the file. |
-| `pending` | None of these, and a hold of the same holder still keeps the file. A hold renewed past its 30-minute cap under a new id still counts. |
+| `pending` | None of these, and a hold of the same holder still keeps the file. A hold renewed past its 30-minute cap under a new id still counts. The refused session's own hold never counts: two sessions of one token are two agents, so a session that waited and then took the file went elsewhere. |
 | `went_elsewhere` | None of these, and the holder no longer keeps the file. |
 | `unknown` | None of these, and the hold's record is gone. |
 
 Each overlap the Hub reported without refusing (a notice, for example to an agent whose hook runs
-after the edit, or to an MCP claim) is recorded as `proceeded`: the call that drew it took the file,
-so the agent was told and went ahead.
+after the edit, or to an MCP claim) is recorded as `proceeded`: the call that drew it took the file.
+Its hook edit went ahead, or it claimed the file over MCP.
 
 `issues.contested_edits` reports `refusals` and `notices` by outcome. Only refusals feed the issue
 totals: `pushed_through` is counted in `dismissed`, `handed_off` in `resolved`, and `pending`,
@@ -101,10 +101,12 @@ Coverage stays explicit. Both are recorded per session, so a single-Work query r
   session IDs come from the client, and a cap per repository would let one token push out everyone
   else's rows.
 - `partial` is true, with a gap, when the window reaches past the 30 days, a token's cap pruned
-  rows inside the window, more rows matched than were read, or (for overhead) this Hub process
-  dropped calls because its memory tables were full or has not written its latest totals yet. A Hub
-  restart loses totals not yet written, and forgets which report ids it counted, so a report
-  resent across a restart can be counted twice.
+  rows inside the window, or more rows matched than were read. For overhead it is also true when
+  this Hub process dropped calls of this repository inside the window because its memory tables
+  were full, or holds calls of this repository from the window that are overdue for writing. Calls
+  of the last minute are on their way to the store and do not make a read partial. A Hub restart
+  loses totals not yet written, and forgets which report ids it counted, so a report resent
+  across a restart can be counted twice.
 - A reply of "coordination unknown" from the Hub itself arrives as an answer, so the client does
   not count it as failed open; `/v1/hub/health` counts those per process.
 
