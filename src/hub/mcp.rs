@@ -155,6 +155,8 @@ struct StartArgs {
     /// nothing now.
     #[serde(default)]
     new_work: bool,
+    /// The native session ID of the session that started this one.
+    started_by: Option<String>,
     #[serde(default)]
     detail: Detail,
 }
@@ -1146,6 +1148,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1},
              "new_work": {"type": "boolean", "default": false, "description": "Start new Work although you have unfinished Work over these paths that holds nothing now; the start names that Work when this is needed."},
+             "started_by": {"type": "string", "maxLength": 128, "description": "When another session started this one for part of its task: that session's native session ID, as it gave it to you. The Hub then shows this session under it. Omit it when a person started this session."},
              "issue_choice": issue_choice_schema,
              "preflight": source_preflight_schema,
              "detail": detail("compact returns the decision, your Work, bounded conflict and preflight evidence, and counts with the paged reads for the overview, briefing and catch-up; full embeds them all, the earlier shape.")
@@ -2716,13 +2719,18 @@ async fn call_inner(
             Ok(value) => value,
             Err(error) => return Ok(invalid_args(name, &error)),
         };
-        return Ok(match start(state, principal, arguments).await {
+        let unlinked = started_by(state, principal, &arguments).await;
+        let mut reply = match start(state, principal, arguments).await {
             Ok(value) => value,
             Err(mut error) => {
                 error.show(Viewer(&principal.owner.id));
                 work_failure(&error)
             }
-        });
+        };
+        if let (Some(note), Some(content)) = (unlinked, reply["content"].as_array_mut()) {
+            content.push(json!({"type": "text", "text": note}));
+        }
+        return Ok(reply);
     }
     let outcome = match run(state, principal, name, arguments, completion_reporting).await {
         Ok(outcome) => outcome,
@@ -2989,8 +2997,9 @@ async fn work_preflight(
         related_work,
         takeover_generation,
         preflight,
-        // A preflight creates nothing, so there is no duplicate to resolve.
+        // A preflight creates nothing, so there is no duplicate to resolve and no link to record.
         new_work: _,
+        started_by: _,
         detail: _,
     } = arguments;
     super::session::check(&session_call(
@@ -3434,6 +3443,34 @@ fn released_text(end: &super::session::SessionEnd) -> &'static str {
     }
 }
 
+/// Records which session started the one that calls `agentscm_start`, when it says. That is a
+/// fact about the session, whatever becomes of the claim, so a link the Hub cannot take never
+/// refuses the start: the reply gains the returned line, which says why it was not recorded.
+async fn started_by(
+    state: &HubState,
+    principal: &Principal,
+    arguments: &StartArgs,
+) -> Option<String> {
+    let started_by = arguments.started_by.clone()?;
+    let store = state.store.clone();
+    let (token, owner) = (principal.token_id.clone(), principal.owner.id.clone());
+    let requested = arguments.session.clone();
+    let recorded = blocking(state, move || {
+        let now = unix_now();
+        let session = store.session_name_for(&token, requested.as_deref(), now)?;
+        store.session_started_by(&owner, &session, &started_by, now)
+    })
+    .await;
+    let why = match recorded {
+        Ok(()) => return None,
+        Err(HubError::Invalid(why)) => why,
+        Err(_) => "the Hub could not record it now".into(),
+    };
+    Some(format!(
+        "AgentSCM: started_by was not recorded: {why}. Nothing else about this start changed."
+    ))
+}
+
 async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) -> Result<Value> {
     let StartArgs {
         issue_choice,
@@ -3453,6 +3490,8 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         takeover_generation,
         preflight,
         new_work,
+        // Recorded apart from the claim, by `started_by`.
+        started_by: _,
         detail,
     } = arguments;
 

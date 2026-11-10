@@ -128,6 +128,10 @@ enum Kind {
     /// The session stopped to wait for its person, or on its own background work; its next call
     /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
+    /// A subagent started or stopped: only its session's roster follows it. It renews nothing
+    /// and ends no wait, because a host also reports the agents it runs for itself, such as
+    /// one that suggests the next prompt after a turn has ended.
+    Subagent,
     Done,
     Fail(&'static str),
 }
@@ -180,6 +184,32 @@ struct Call {
     /// The host's own notice that it shows a permission prompt to a person, which confirms a
     /// request to answer that prompt from the Hub (`permission_answer`).
     prompt_shown: bool,
+    /// The type of the subagent that made the call (Claude Code sends `agent_type`).
+    agent_type: Option<String>,
+    /// That subagent stopped.
+    stopped: bool,
+    /// The subagent this call started, as the hook client reported it.
+    launched: Option<Launched>,
+}
+
+/// A subagent a session started, from the hook client's `subagent` object on the call that
+/// started it: its id and type, a short excerpt of what it was started to do, and whether the
+/// call returned while it still runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Launched {
+    id: String,
+    agent_type: Option<String>,
+    does: String,
+    running: bool,
+}
+
+/// A subagent's id or type as a host sends it: short and on one line, or ignored.
+fn subagent_name(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            (1..=MAX_ASKER_BYTES).contains(&value.len()) && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
 }
 
 struct Outcome {
@@ -295,6 +325,12 @@ async fn hook(
             .onboarding
             .waiting()
             .clear(&principal.token_id, native, call.asker.as_deref(), all);
+        if all {
+            state
+                .onboarding
+                .subagents()
+                .answered(&principal.token_id, native);
+        }
     }
     if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
@@ -523,6 +559,9 @@ impl Call {
             asks: None,
             context_hook: false,
             prompt_shown: false,
+            agent_type: None,
+            stopped: false,
+            launched: None,
         }
     }
 
@@ -554,12 +593,62 @@ impl Call {
     }
 
     fn asker(mut self, id: Option<&str>) -> Self {
-        self.asker = id
-            .filter(|id| {
-                (1..=MAX_ASKER_BYTES).contains(&id.len()) && !id.chars().any(char::is_control)
-            })
-            .map(str::to_owned);
+        self.asker = subagent_name(id);
         self
+    }
+
+    fn agent_type(mut self, name: Option<&str>) -> Self {
+        self.agent_type = subagent_name(name);
+        self
+    }
+
+    /// The hook client's `subagent` object; ignored unless it names the subagent and what for.
+    fn launched(mut self, subagent: &Value) -> Self {
+        self.launched = subagent_name(str_at(subagent, "id"))
+            .zip(str_at(subagent, "does"))
+            .map(|(id, does)| Launched {
+                id,
+                agent_type: subagent_name(str_at(subagent, "type")),
+                does: does.to_owned(),
+                running: subagent["running"] == true,
+            });
+        self
+    }
+
+    /// Keeps the roster of the session's subagents: the one that made this call, and the one
+    /// this call started. Best effort and silent.
+    fn note_subagents(&self, state: &HubState, principal: &Principal) {
+        let Some(native) = self.session.as_deref() else {
+            return;
+        };
+        let (roster, now) = (state.onboarding.subagents(), unix_now());
+        match self.asker.as_deref() {
+            Some(id) if self.stopped => roster.ended(principal, native, id, now),
+            Some(id) => {
+                let waits = matches!(self.kind, Kind::Waiting(_));
+                roster.seen(
+                    principal,
+                    native,
+                    id,
+                    self.agent_type.as_deref(),
+                    waits,
+                    now,
+                );
+            }
+            None => {}
+        }
+        if let Some(sub) = &self.launched {
+            let kind = sub.agent_type.as_deref();
+            roster.described(
+                principal,
+                native,
+                &sub.id,
+                kind,
+                &sub.does,
+                sub.running,
+                now,
+            );
+        }
     }
 
     /// The wait this call ends, if any: the session's, and whether the call ends every wait
@@ -568,7 +657,7 @@ impl Call {
         let all = match self.kind {
             Kind::Start | Kind::Prompt | Kind::Done => true,
             Kind::Check | Kind::Activity(_) => false,
-            Kind::Ignore | Kind::Waiting(_) | Kind::Fail(_) => return None,
+            Kind::Ignore | Kind::Waiting(_) | Kind::Subagent | Kind::Fail(_) => return None,
         };
         Some((self.session.as_deref()?, all))
     }
@@ -657,11 +746,18 @@ impl Call {
             })),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
             Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Subagent => {
+                if let Ok(principal) = authenticate(state, token, repo).await {
+                    self.note_subagents(state, &principal);
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Activity(phase) => {
                 // Best effort and silent: the touch renews the session's own leases, and a
                 // failure must not disturb the agent. An unnamed session renews nothing.
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
+                    self.note_subagents(state, &principal);
                     let store = state.store.clone();
                     let heartbeat = call(Vec::new());
                     let heartbeat = SessionCall {
@@ -687,6 +783,7 @@ impl Call {
                 if let Some(native) = self.session.clone()
                     && let Ok(principal) = authenticate(state, token, repo).await
                 {
+                    self.note_subagents(state, &principal);
                     let store = state.store.clone();
                     let id = principal.token_id.clone();
                     let requested = native.clone();
@@ -718,6 +815,7 @@ impl Call {
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
+                self.note_subagents(state, &principal);
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
                 let requested = self.session.clone();
@@ -960,6 +1058,8 @@ impl Call {
                 // is not the call's own.
                 match self.session.clone() {
                     Some(session) => {
+                        let roster = state.onboarding.subagents();
+                        roster.forget(&principal.token_id, &session);
                         done_pausing_for(
                             state,
                             &principal,
@@ -1367,6 +1467,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             .session(str_at(v, "session_id"))
             .child(v.get("agent_id").is_some())
             .asker(str_at(v, "agent_id"))
+            .agent_type(str_at(v, "agent_type"))
     };
     let tool = str_at(v, "tool_name").unwrap_or_default();
     let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks"));
@@ -1409,10 +1510,18 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, input), scope)
         }
+        // The call that started a subagent says which one and what for; nothing else of a tool
+        // call's input or result is read.
         Some(event @ ("PreToolUse" | "PostToolUse")) => call(
             Kind::Activity(phase(tool, event == "PreToolUse")),
             Shape::Silent,
-        ),
+        )
+        .launched(&v["subagent"]),
+        Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
+            let mut call = call(Kind::Subagent, Shape::Silent);
+            call.stopped = event == "SubagentStop";
+            call
+        }
         Some("SessionEnd") => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
@@ -2165,6 +2274,70 @@ mod tests {
             parse(Agent::Generic, &json!({"event": "bogus"})).kind,
             Kind::Fail(_)
         ));
+    }
+
+    #[test]
+    fn subagent_events_follow_the_roster_and_end_no_wait() {
+        let event = |name: &str, more: Value| {
+            let mut v = json!({"hook_event_name": name, "session_id": "s"});
+            for (key, value) in more.as_object().unwrap() {
+                v[key] = value.clone();
+            }
+            parse(Agent::Claude, &v)
+        };
+        let start = event(
+            "SubagentStart",
+            json!({"agent_id": "a1", "agent_type": "Explore"}),
+        );
+        assert_eq!(
+            (start.kind, start.shape, start.stopped),
+            (Kind::Subagent, Shape::Silent, false)
+        );
+        assert_eq!(
+            (start.asker.as_deref(), start.agent_type.as_deref()),
+            (Some("a1"), Some("Explore"))
+        );
+        // The host's own agents stop after a turn has ended, with no type: that stop must not
+        // end the wait the turn's end began, and one without an id is nothing to follow.
+        let stop = event("SubagentStop", json!({"agent_id": "a1", "agent_type": ""}));
+        assert_eq!(
+            (stop.kind, stop.stopped, stop.agent_type.as_deref()),
+            (Kind::Subagent, true, None)
+        );
+        assert_eq!((start.ends_wait(), stop.ends_wait()), (None, None));
+        assert_eq!(event("SubagentStop", json!({})).kind, Kind::Ignore);
+        // A subagent's own calls name its type.
+        let tool = event(
+            "PostToolUse",
+            json!({"tool_name": "Read", "agent_id": "a1", "agent_type": "Explore"}),
+        );
+        assert_eq!(
+            (tool.agent_type.as_deref(), &tool.launched),
+            (Some("Explore"), &None)
+        );
+        // The call that started one says which and what for, as the hook client reported it.
+        let launched = |subagent: Value| {
+            event(
+                "PostToolUse",
+                json!({"tool_name": "Agent", "subagent": subagent}),
+            )
+            .launched
+        };
+        assert_eq!(
+            launched(json!({"id": "a2", "type": "Plan", "does": "Plan the read", "running": true})),
+            Some(Launched {
+                id: "a2".into(),
+                agent_type: Some("Plan".into()),
+                does: "Plan the read".into(),
+                running: true,
+            })
+        );
+        assert_eq!(
+            launched(json!({"id": "a2", "does": "Plan the read"})).map(|l| l.running),
+            Some(false)
+        );
+        assert_eq!(launched(json!({"id": "a\nb", "does": "x"})), None);
+        assert_eq!(launched(json!({"id": "a2"})), None);
     }
 
     #[test]

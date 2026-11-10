@@ -97,10 +97,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store,
-    TokenDigest, User, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
-    validate_display_name, validate_login,
+    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SLIDE_STEP_SECONDS,
+    SessionView, Store, TokenDigest, User, check_session_start, event_limit, like_pattern,
+    local_ci_label, lower_hex_of, new_id, owner_session, pending, plan_local_ci_change,
+    plan_local_ci_enroll, plan_named, search_number, session_key, unix_now, validate_display_name,
+    validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -5328,6 +5329,18 @@ fn lock_work_capacity(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Resu
     )
 }
 
+/// `owner`'s records of which session started which, as (session, started by).
+fn session_starts_in(
+    client: &mut impl postgres::GenericClient,
+    owner: &str,
+) -> Result<Vec<(String, String)>> {
+    let rows = client.query(
+        "SELECT session, started_by FROM hub_session_starts WHERE owner = $1 ORDER BY session",
+        &[&owner],
+    )?;
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+}
+
 /// Releases the session's intent and deletes its row. False when it had none.
 fn end_session_in(
     tx: &mut postgres::Transaction<'_>,
@@ -8849,16 +8862,25 @@ impl Store for PgStore {
         })
     }
 
-    fn live_sessions(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<SessionView>> {
+    fn sessions_with(
+        &self,
+        who: &Principal,
+        now: i64,
+        limit: usize,
+        also: &[String],
+    ) -> Result<Vec<SessionView>> {
         self.run(true, |client| {
             let rows = client.query(
                 &format!(
                     "SELECT s.token, t.name, u.login, s.intent, s.task, s.via, s.created_at,
-                            s.updated_at, s.session
+                            s.updated_at, s.session, t.owner, p.started_by
                      FROM hub_sessions s JOIN hub_agent_tokens t ON t.id = s.token
                      JOIN hub_users u ON u.id = t.owner
+                     LEFT JOIN hub_session_starts p
+                         ON p.owner = t.owner AND p.session = s.session
                      WHERE {TOKEN_SCOPE} AND NOT t.revoked AND t.expires_at > $5
-                       AND NOT u.disabled AND s.updated_at >= $6
+                       AND NOT u.disabled
+                       AND (s.updated_at >= $6 OR (t.owner = $8 AND s.session = ANY($9)))
                      ORDER BY s.updated_at DESC, s.token, s.session LIMIT $7"
                 ),
                 &[
@@ -8869,22 +8891,91 @@ impl Store for PgStore {
                     &now,
                     &(now - SESSION_TTL_SECONDS),
                     &(limit as i64),
+                    &who.owner.id,
+                    &also,
                 ],
             )?;
             Ok(rows
                 .iter()
-                .map(|row| SessionView {
-                    key: session_key(row.get(0), row.get(8)),
-                    token: row.get(0),
-                    agent: row.get(1),
-                    owner: row.get(2),
-                    intent: row.get(3),
-                    task: row.get(4),
-                    via: row.get(5),
-                    created_at: row.get(6),
-                    updated_at: row.get(7),
+                .map(|row| {
+                    let (session, owner): (String, String) = (row.get(8), row.get(9));
+                    let started_by: Option<String> = row.get(10);
+                    SessionView {
+                        key: session_key(row.get(0), &session),
+                        name: owner_session(&owner, &session),
+                        started_by: started_by.and_then(|by| owner_session(&owner, &by)),
+                        session,
+                        token: row.get(0),
+                        agent: row.get(1),
+                        owner: row.get(2),
+                        intent: row.get(3),
+                        task: row.get(4),
+                        via: row.get(5),
+                        created_at: row.get(6),
+                        updated_at: row.get(7),
+                    }
                 })
                 .collect())
+        })
+    }
+
+    fn session_started_by(
+        &self,
+        owner: &str,
+        session: &str,
+        started_by: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute(
+                "DELETE FROM hub_session_starts WHERE owner = $1 AND created_at < $2",
+                &[&owner, &(now - SESSION_START_RETAIN_SECONDS)],
+            )?;
+            let starts = session_starts_in(&mut tx, owner)?;
+            check_session_start(owner, &starts, session, started_by)?;
+            let known: bool = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM hub_sessions s
+                                    JOIN hub_agent_tokens t ON t.id = s.token
+                                    WHERE t.owner = $1 AND s.session = $2)
+                         OR EXISTS (SELECT 1 FROM hub_work_items w
+                                    JOIN hub_agent_tokens t ON t.id = w.lead_token
+                                    WHERE t.owner = $1 AND w.lead_session = $2)",
+                    &[&owner, &started_by],
+                )?
+                .get(0);
+            if !known {
+                return Err(HubError::Invalid(
+                    "started_by is not a session of yours that this Hub knows".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO hub_session_starts (owner, session, started_by, created_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (owner, session) DO UPDATE SET started_by = excluded.started_by,
+                     created_at = excluded.created_at",
+                &[&owner, &session, &started_by, &now],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn session_starts(&self, owner: &str) -> Result<Vec<(String, String)>> {
+        self.run(true, |client| session_starts_in(client, owner))
+    }
+
+    fn owner_lead_sessions(&self, owner: &str) -> Result<Vec<String>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                "SELECT DISTINCT w.lead_session FROM hub_work_items w
+                 JOIN hub_agent_tokens t ON t.id = w.lead_token
+                 WHERE t.owner = $1 AND w.state IN ('active', 'blocked', 'paused')
+                 ORDER BY w.lead_session",
+                &[&owner],
+            )?;
+            Ok(rows.iter().map(|row| row.get(0)).collect())
         })
     }
 

@@ -95,10 +95,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store,
-    TokenDigest, User, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
-    validate_display_name, validate_login,
+    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SLIDE_STEP_SECONDS,
+    SessionView, Store, TokenDigest, User, check_session_start, event_limit, like_pattern,
+    local_ci_label, lower_hex_of, new_id, owner_session, pending, plan_local_ci_change,
+    plan_local_ci_enroll, plan_named, search_number, session_key, unix_now, validate_display_name,
+    validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -5586,6 +5587,17 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
 }
 
 /// Releases the session's intent and deletes its row. False when it had none.
+/// `owner`'s records of which session started which, as (session, started by).
+fn session_starts_in(conn: &Connection, owner: &str) -> Result<Vec<(String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT session, started_by FROM hub_session_starts WHERE owner = ?1 ORDER BY session",
+    )?;
+    let starts = statement
+        .query_map([owner], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(starts)
+}
+
 fn end_session_in(tx: &Transaction<'_>, token: &str, name: &str, now: i64) -> Result<bool> {
     let Some(row) = session_row(tx, token, name)? else {
         return Ok(false);
@@ -8945,15 +8957,23 @@ impl Store for SqliteStore {
         Ok(events)
     }
 
-    fn live_sessions(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<SessionView>> {
+    fn sessions_with(
+        &self,
+        who: &Principal,
+        now: i64,
+        limit: usize,
+        also: &[String],
+    ) -> Result<Vec<SessionView>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
             "SELECT s.token, t.name, u.login, s.intent, s.task, s.via, s.created_at, s.updated_at,
-                    s.session
+                    s.session, t.owner, p.started_by
              FROM hub_sessions s JOIN hub_agent_tokens t ON t.id = s.token
              JOIN hub_users u ON u.id = t.owner
+             LEFT JOIN hub_session_starts p ON p.owner = t.owner AND p.session = s.session
              WHERE {TOKEN_SCOPE} AND t.revoked = 0 AND t.expires_at > ?5 AND u.disabled = 0
-               AND s.updated_at >= ?6
+               AND (s.updated_at >= ?6 OR (t.owner = ?8
+                    AND s.session IN (SELECT value FROM json_each(?9))))
              ORDER BY s.updated_at DESC, s.token, s.session LIMIT ?7"
         ))?;
         let sessions = statement
@@ -8965,12 +8985,18 @@ impl Store for SqliteStore {
                     who.owner.identity.provider,
                     now,
                     now - SESSION_TTL_SECONDS,
-                    limit as i64
+                    limit as i64,
+                    who.owner.id,
+                    serde_json::json!(also).to_string()
                 ],
                 |row| {
                     let (token, session): (String, String) = (row.get(0)?, row.get(8)?);
+                    let (owner, started_by): (String, Option<String>) = (row.get(9)?, row.get(10)?);
                     Ok(SessionView {
                         key: session_key(&token, &session),
+                        name: owner_session(&owner, &session),
+                        started_by: started_by.and_then(|by| owner_session(&owner, &by)),
+                        session,
                         token,
                         agent: row.get(1)?,
                         owner: row.get(2)?,
@@ -8983,6 +9009,63 @@ impl Store for SqliteStore {
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(sessions)
+    }
+
+    fn session_started_by(
+        &self,
+        owner: &str,
+        session: &str,
+        started_by: &str,
+        now: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM hub_session_starts WHERE owner = ?1 AND created_at < ?2",
+            params![owner, now - SESSION_START_RETAIN_SECONDS],
+        )?;
+        check_session_start(owner, &session_starts_in(&tx, owner)?, session, started_by)?;
+        let known: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM hub_sessions s JOIN hub_agent_tokens t ON t.id = s.token
+                            WHERE t.owner = ?1 AND s.session = ?2)
+                 OR EXISTS (SELECT 1 FROM hub_work_items w
+                            JOIN hub_agent_tokens t ON t.id = w.lead_token
+                            WHERE t.owner = ?1 AND w.lead_session = ?2)",
+            params![owner, started_by],
+            |row| row.get(0),
+        )?;
+        if !known {
+            return Err(HubError::Invalid(
+                "started_by is not a session of yours that this Hub knows".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO hub_session_starts (owner, session, started_by, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (owner, session) DO UPDATE SET started_by = excluded.started_by,
+                 created_at = excluded.created_at",
+            params![owner, session, started_by, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn session_starts(&self, owner: &str) -> Result<Vec<(String, String)>> {
+        session_starts_in(&self.conn(), owner)
+    }
+
+    fn owner_lead_sessions(&self, owner: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT w.lead_session FROM hub_work_items w
+             JOIN hub_agent_tokens t ON t.id = w.lead_token
+             WHERE t.owner = ?1 AND w.state IN ('active', 'blocked', 'paused')
+             ORDER BY w.lead_session",
+        )?;
+        let sessions = statement
+            .query_map([owner], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(sessions)
     }
 

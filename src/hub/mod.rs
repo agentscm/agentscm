@@ -52,6 +52,7 @@ mod repo_setup;
 mod repository_summary;
 mod retention;
 pub mod session;
+pub mod session_subagents;
 pub mod session_waiting;
 pub mod setup_attention;
 pub mod skill_workflow;
