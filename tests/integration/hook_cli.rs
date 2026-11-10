@@ -557,11 +557,21 @@ fn permission_hub(register: u16, poll: Poll) -> (String, Receiver<Seen>) {
 /// returns the run and the paths it called.
 #[cfg(unix)]
 fn permission_prompt(
+    hub: (String, Receiver<Seen>),
+    env: Env,
+    edit: fn(&mut Value),
+) -> (Run, Vec<Seen>) {
+    permission_prompt_in(home(), hub, env, edit)
+}
+
+/// [`permission_prompt`] in a home the caller made, whose agent token is `client.token` in it.
+#[cfg(unix)]
+fn permission_prompt_in(
+    dir: TempDir,
     (hub, seen): (String, Receiver<Seen>),
     env: Env,
     edit: fn(&mut Value),
 ) -> (Run, Vec<Seen>) {
-    let dir = home();
     let root = connected_checkout(&dir, &hub);
     let mut payload = json!({"hook_event_name": "PermissionRequest", "session_id": "s1",
         "cwd": root, "tool_name": "Bash",
@@ -798,4 +808,99 @@ fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_th
         .expect("the subagent's prompt was offered");
     let body: Value = serde_json::from_slice(&registered.body).unwrap();
     assert_eq!(body["agent_id"], "sub-1");
+}
+
+/// The agent token ends while the prompt is up. The hook goes on under the token this computer
+/// holds by then, and leaves the prompt to the session when there is no other.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_goes_on_under_the_renewed_agent_token() {
+    const OLD: &str = "Bearer synthetic-private-token";
+    let polls = |seen: &[Seen]| -> Vec<String> {
+        seen.iter()
+            .filter(|seen| seen.path.starts_with("/v1/hub/permission/poll"))
+            .map(|seen| seen.authorization.clone())
+            .collect()
+    };
+    // The stub refuses the first token on a poll; `renew` says whether this computer holds a
+    // new one by then.
+    let ended = |renew: bool| {
+        let dir = home();
+        let token = dir.path().join("client.token");
+        let hub = serve(move |seen| {
+            let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+            let hash = &body["input_hash"];
+            if seen.path.starts_with("/v1/hub/permission/register") {
+                let made = json!({"request_id": "00ff", "input_hash": hash, "state": "pending"});
+                (200, made)
+            } else if !seen.path.starts_with("/v1/hub/permission/poll") {
+                (200, json!({}))
+            } else if seen.authorization == OLD {
+                if renew {
+                    std::fs::write(&token, "renewed-private-token\n").unwrap();
+                }
+                (401, json!({"error": "unauthorized"}))
+            } else {
+                (200, answered(hash, "allow"))
+            }
+        });
+        permission_prompt_in(dir, hub, &[], |_| {})
+    };
+    let (run, seen) = ended(true);
+    assert!(
+        run.stdout.contains("\"behavior\":\"allow\""),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(polls(&seen), [OLD, "Bearer renewed-private-token"]);
+    let (run, seen) = ended(false);
+    assert_eq!(run.stdout, "{}\n");
+    assert_eq!(polls(&seen), [OLD]);
+}
+
+/// A Hub that restarted does not know the request. The hook offers the prompt again with the id
+/// it holds, and leaves a Hub alone that forgets it again at once.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_is_offered_again_to_a_hub_that_forgot_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The stub answers the first `forgets` polls as a Hub does that never heard of the request.
+    let forgetting = |forgets: usize| {
+        let polls = AtomicUsize::new(0);
+        serve(move |seen| {
+            let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+            let hash = &body["input_hash"];
+            if seen.path.starts_with("/v1/hub/permission/register") {
+                let made = json!({"request_id": "00ff", "input_hash": hash, "state": "pending"});
+                (200, made)
+            } else if !seen.path.starts_with("/v1/hub/permission/poll") {
+                (200, json!({}))
+            } else if polls.fetch_add(1, Ordering::Relaxed) < forgets {
+                (404, json!({"error": "not_found"}))
+            } else {
+                (200, answered(hash, "allow"))
+            }
+        })
+    };
+    let offers = |seen: &[Seen]| -> Vec<Value> {
+        seen.iter()
+            .filter(|seen| seen.path.starts_with("/v1/hub/permission/register"))
+            .map(|seen| serde_json::from_slice(&seen.body).unwrap())
+            .collect()
+    };
+    let (run, seen) = permission_prompt(forgetting(1), &[], |_| {});
+    assert!(
+        run.stdout.contains("\"behavior\":\"allow\""),
+        "{}",
+        run.stdout
+    );
+    let offered = offers(&seen);
+    assert_eq!(offered.len(), 2);
+    assert_eq!(
+        (offered[0].get("again"), &offered[1]["again"]),
+        (None, &json!("00ff"))
+    );
+    let (run, seen) = permission_prompt(forgetting(2), &[], |_| {});
+    assert_eq!(run.stdout, "{}\n");
+    assert_eq!(offers(&seen).len(), 2);
 }

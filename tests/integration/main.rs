@@ -131,6 +131,8 @@ mod hub_change_record_http;
 #[cfg(unix)]
 mod hub_change_record_migration;
 #[cfg(unix)]
+mod hub_context_source;
+#[cfg(unix)]
 mod hub_coordination;
 #[cfg(unix)]
 mod hub_devices;

@@ -10,7 +10,7 @@ Only real asks reach a person. Agents get every coordination warning in their ow
 
 | Moment | When | Who gets a direct message |
 |---|---|---|
-| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace), or for more than five minutes when it only finished its turn. This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
+| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace), or for more than five minutes when it only finished its turn. A turn whose last message ends asking nothing is not a wait and sends nothing. This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
 | Work enters `blocked` | The shared status first observes a personal blocker; experimental, requires `reminders.enabled`. | The lead agent's person named by the shared status, with an **Open Hub** link to `#work/<id>`. |
 | Work enters `handover` | The shared status first observes a handover with an unresolved blocker; experimental, requires `reminders.enabled`. | The work owner's person named by the shared status, not necessarily the current lead's person, with an **Open Hub** link to `#work/<id>`. |
 
@@ -279,7 +279,7 @@ above, and a button that carries Work the clicker does not own gets
 
 ## Delivery and recovery behavior
 
-The journal holds the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day, which is longer than the Hub believes a wait; the journal holds at most 4096 queued rows, and past that new waits are not queued until deliveries drain. A Hub that restarts forgets its waits, so nothing is sent for them until the sessions stop again.
+The journal holds the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day, which is longer than the Hub believes a wait; the journal holds at most 4096 queued rows, and past that new waits are not queued until deliveries drain. A Hub that is stopped leaves its waits for the process that starts next, each with the start it had, so nothing is sent twice for them. A Hub that died forgets its waits, so nothing is sent for them until the sessions stop again.
 
 `chat.postMessage` retries Slack rate limits and server errors up to eight attempts; then a message becomes `failed` for operator inspection. A mismatched workspace or bot token fails a message without sending it. A message whose send was interrupted by a restart is sent again, so a person may get it twice. A Hub store failure while reading the status leaves the wait unqueued, and the next pass reads it again.
 

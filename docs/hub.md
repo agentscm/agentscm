@@ -422,6 +422,13 @@ status shown; clients show `message` as is.
   sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
   set; the setup page links to the checkbox), so clients go straight to the browser.
 
+## Context source
+
+An operator can register one HTTP endpoint that gives agent sessions a few extra lines of context
+when a session starts and when it starts Work. `AGENTSCM_CONTEXT_SOURCE_FILE` names the private
+file that sets it; unset means no source and no change anywhere. The Hub marks the lines as
+third-party text, and a source that fails adds nothing. See [Context source](context-source.md).
+
 ## Connected apps
 
 An operator can register an external app, such as a chat integration, that people connect to

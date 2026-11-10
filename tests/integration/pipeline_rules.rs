@@ -880,6 +880,8 @@ struct PollFakeState {
     files: BTreeMap<i64, Vec<String>>,
     /// After that pull request's files are read, its head moves to this commit.
     move_after_files: Option<(i64, String)>,
+    /// Commit statuses posted, as (commit, body).
+    statuses: Vec<(String, Value)>,
 }
 fn raw_poll_pull(provider: &str, number: i64, sha: &str, merged: bool) -> Value {
     if provider == "github" {
@@ -901,7 +903,7 @@ async fn poll_fake(
         extract::State,
         http::{StatusCode, Uri, header::HeaderValue},
         response::IntoResponse,
-        routing::get,
+        routing::any,
     };
     let state = Arc::new(std::sync::Mutex::new(PollFakeState {
         provider: provider.into(),
@@ -910,11 +912,15 @@ async fn poll_fake(
         ..Default::default()
     }));
     let app = Router::new()
-        .fallback(get(
-            |State(state): State<Arc<std::sync::Mutex<PollFakeState>>>, uri: Uri| async move {
+        .fallback(any(
+            |State(state): State<Arc<std::sync::Mutex<PollFakeState>>>,
+             uri: Uri,
+             body: axum::body::Bytes| async move {
                 let mut s = state.lock().unwrap();
                 let path = uri.path();
-                let kind = if path.ends_with("/files") {
+                let kind = if path.contains("/statuses/") {
+                    "status"
+                } else if path.ends_with("/files") {
                     "files"
                 } else if path.ends_with("/pulls") && uri.query().is_some_and(|q| q.contains("state=open")) {
                     "open"
@@ -964,6 +970,12 @@ async fn poll_fake(
                         json!({"id":42,"path_with_namespace":"acme/widgets"})
                     })
                     .into_response();
+                }
+                if kind == "status" {
+                    let posted: Value = serde_json::from_slice(&body).unwrap();
+                    let sha = path.rsplit('/').next().unwrap().to_owned();
+                    s.statuses.push((sha, posted.clone()));
+                    return (StatusCode::CREATED, Json(posted)).into_response();
                 }
                 if kind == "open" {
                     return Json(s.open.iter().map(|n| s.pulls[n].clone()).collect::<Vec<_>>())
@@ -1989,4 +2001,267 @@ fn writes_stop_at_the_row_caps_that_open_enforces() {
     let j = journal(&f);
     assert!(j.pending(8).unwrap().is_empty());
     assert_eq!(j.quarantined().unwrap()["count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fired_head_shows_pending_then_its_result_on_that_exact_commit_only() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    {
+        let mut s = state.lock().unwrap();
+        s.pulls.insert(9, open_pull(9, &f.commit, false, 42));
+        s.open = vec![9];
+        s.files.insert(9, vec!["src/lib.rs".into()]);
+    }
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    let posted = |sha: &str| -> Vec<String> {
+        state
+            .lock()
+            .unwrap()
+            .statuses
+            .iter()
+            .filter(|(at, _)| at == sha)
+            .map(|(_, body)| body["state"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    poll_merges(api, "synthetic", &connected(), &mut j, observation_now())
+        .await
+        .unwrap();
+    // A fired rule shows pending at once, on the head it fired for.
+    let reports = report_results(api, "synthetic", &connected(), &mut j)
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(posted(&f.commit), vec!["pending"]);
+    let (_, body) = state.lock().unwrap().statuses[0].clone();
+    assert_eq!(body["context"], "agentscm/pipeline/scan");
+    // Once per state.
+    assert!(
+        report_results(api, "synthetic", &connected(), &mut j)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The posted status does not re-trigger the rule.
+    state.lock().unwrap().requests.clear();
+    poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.lock().unwrap().requests, vec!["repo", "open"]);
+    let pending = j.pending(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    let claim = j.claim(&pending[0].dispatch_id).unwrap();
+    let run = tokio::task::block_in_place(|| deliver(&f.data, &mut j, &claim, &f.work)).unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    // A failed post is kept, shown and retried, never dropped.
+    state.lock().unwrap().failure = Some(("status".into(), 502));
+    let reports = report_results(api, "synthetic", &connected(), &mut j)
+        .await
+        .unwrap();
+    assert_eq!(reports[0]["posted"], false, "{reports:?}");
+    let failures = j.report_failures(8).unwrap();
+    assert_eq!(
+        (
+            failures[0]["state"].as_str(),
+            failures[0]["attempts"].as_i64()
+        ),
+        (Some("success"), Some(1))
+    );
+    state.lock().unwrap().failure = None;
+    report_results(api, "synthetic", &connected(), &mut j)
+        .await
+        .unwrap();
+    assert_eq!(posted(&f.commit), vec!["pending", "success"]);
+    assert!(j.report_failures(8).unwrap().is_empty());
+    // A new head gets its own status; the old head's result never covers it.
+    let next = "e".repeat(40);
+    state
+        .lock()
+        .unwrap()
+        .pulls
+        .insert(9, open_pull(9, &next, false, 42));
+    poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 2,
+    )
+    .await
+    .unwrap();
+    report_results(api, "synthetic", &connected(), &mut j)
+        .await
+        .unwrap();
+    assert_eq!(posted(&next), vec!["pending"]);
+    // That head is not in the local checkout, so its run fails, and the head says so.
+    let pending = j.pending(8).unwrap();
+    let claim = j.claim(&pending[0].dispatch_id).unwrap();
+    assert!(tokio::task::block_in_place(|| deliver(&f.data, &mut j, &claim, &f.work)).is_err());
+    if j.dispatch(&claim.dispatch.dispatch_id).unwrap().state == "claimed" {
+        j.finish(&claim, "blocked", Some("synthetic failure"))
+            .unwrap();
+    }
+    report_results(api, "synthetic", &connected(), &mut j)
+        .await
+        .unwrap();
+    assert_eq!(posted(&next), vec!["pending", "failure"]);
+    assert_eq!(posted(&f.commit), vec!["pending", "success"]);
+    // Every description is fixed text, never pull request content.
+    for (_, body) in &state.lock().unwrap().statuses {
+        assert!(
+            body["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("AgentSCM rule ")
+        );
+    }
+    // The journal reopens with its reports.
+    drop(j);
+    assert!(journal(&f).report_failures(8).unwrap().is_empty());
+    task.abort();
+}
+
+/// One poll that accepts head `sha` on each pull request in `pulls`.
+async fn fire(
+    api: ForgeApi<'_>,
+    j: &mut RuleJournal,
+    state: &Arc<std::sync::Mutex<PollFakeState>>,
+    pulls: &[(i64, &str)],
+) {
+    {
+        let mut s = state.lock().unwrap();
+        s.open = pulls.iter().map(|(n, _)| *n).collect();
+        for (n, sha) in pulls {
+            s.pulls.insert(*n, open_pull(*n, sha, false, 42));
+            s.files.insert(*n, vec!["src/lib.rs".into()]);
+        }
+    }
+    let report = poll_merges(api, "synthetic", &connected(), j, observation_now())
+        .await
+        .unwrap();
+    assert!(report.blocked.is_none(), "{report:?}");
+}
+async fn post_all(api: ForgeApi<'_>, j: &mut RuleJournal) -> Vec<Value> {
+    report_results(api, "synthetic", &connected(), j)
+        .await
+        .unwrap()
+}
+fn finish_as(j: &mut RuleJournal, dispatch_id: &str, state: &str) {
+    let claim = j.claim(dispatch_id).unwrap();
+    j.finish(&claim, state, Some("synthetic")).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_of_one_rule_on_one_commit_share_a_status_and_failing_posts_do_not_starve() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    let posted = |sha: &str| -> Vec<String> {
+        state
+            .lock()
+            .unwrap()
+            .statuses
+            .iter()
+            .filter(|(at, _)| at == sha)
+            .map(|(_, body)| body["state"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // Two pull requests with the same head: one status for the commit, not one per run.
+    let shared = "1".repeat(40);
+    fire(api, &mut j, &state, &[(9, &shared), (10, &shared)]).await;
+    let runs = j.pending(8).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(post_all(api, &mut j).await.len(), 1);
+    assert_eq!(posted(&shared), vec!["pending"]);
+    // One run succeeds; the other is still running: still pending, not green.
+    finish_as(&mut j, &runs[0].dispatch_id, "complete");
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared), vec!["pending", "pending"]);
+    // The other fails while posts fail; the retry posts the combined state, never a stale success.
+    state.lock().unwrap().failure = Some(("status".into(), 502));
+    finish_as(&mut j, &runs[1].dispatch_id, "blocked");
+    assert_eq!(post_all(api, &mut j).await[0]["posted"], false);
+    state.lock().unwrap().failure = None;
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared), vec!["pending", "pending", "failure"]);
+    assert!(post_all(api, &mut j).await.is_empty());
+    // Recovering the failed run sets the commit back to pending.
+    let view = j.dispatch(&runs[1].dispatch_id).unwrap();
+    j.recover(&runs[1].dispatch_id, view.claim_generation)
+        .unwrap();
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared).last().unwrap(), "pending");
+    // A refusal for the whole token stops the cycle; a 422 only skips that commit.
+    let (a, b) = ("2".repeat(40), "3".repeat(40));
+    fire(api, &mut j, &state, &[(11, &a), (12, &b)]).await;
+    state.lock().unwrap().failure = Some(("status".into(), 403));
+    assert_eq!(post_all(api, &mut j).await.len(), 1);
+    state.lock().unwrap().failure = Some(("status".into(), 422));
+    assert_eq!(post_all(api, &mut j).await.len(), 2);
+    // An answer that cannot change is given up after three attempts and stays visible, and
+    // it never starves a new head.
+    post_all(api, &mut j).await;
+    post_all(api, &mut j).await;
+    let failures = j.report_failures(8).unwrap();
+    assert!(
+        failures.iter().all(|f| f["gave_up"] == true),
+        "{failures:?}"
+    );
+    assert!(post_all(api, &mut j).await.is_empty());
+    state.lock().unwrap().failure = None;
+    let fresh = "4".repeat(40);
+    fire(api, &mut j, &state, &[(13, &fresh)]).await;
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&fresh), vec!["pending"]);
+    assert!(posted(&a).is_empty() && posted(&b).is_empty());
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrading_to_reports_posts_nothing_for_old_runs_and_quarantine_drops_their_reports() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    fire(api, &mut j, &state, &[(9, &"5".repeat(40))]).await;
+    drop(j);
+    // A version 2 journal that already holds a pull request run.
+    let db = raw_journal(&f);
+    db.execute("DROP TABLE pipeline_reports", []).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
+    drop(db);
+    let mut j = journal(&f);
+    assert!(
+        report_results(api, "synthetic", &connected(), &mut j)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.lock().unwrap().statuses.is_empty());
+    // A run whose row is quarantined takes its report row with it, and the journal opens.
+    drop(j);
+    raw_journal(&f)
+        .execute("UPDATE pipeline_dispatches SET body='{'", [])
+        .unwrap();
+    let j = journal(&f);
+    assert_eq!(j.quarantined().unwrap()["count"], 1);
+    let reports: i64 = raw_journal(&f)
+        .query_row("SELECT count(*) FROM pipeline_reports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reports, 0);
+    task.abort();
 }

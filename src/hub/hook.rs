@@ -32,7 +32,7 @@ use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
     done_pausing_for, others_for, record_hook_ms,
 };
-use super::session_waiting::WaitReason;
+use super::session_waiting::{WaitReason, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
@@ -316,16 +316,20 @@ async fn hook(
         }
     };
     // The session is moving again, so its person no longer holds it up. Only a session that
-    // waits costs the authentication; another token's call cannot end it.
+    // waits costs the authentication. Any token of the same person ends the wait of a session
+    // its host named (the session's token may have been renewed meanwhile); another person's
+    // call cannot.
     if let Some((native, all)) = call.ends_wait()
         && state.onboarding.waiting().has_session(native)
         && let Ok(Ok(principal)) =
             timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
     {
-        state
-            .onboarding
-            .waiting()
-            .clear(&principal.token_id, native, call.asker.as_deref(), all);
+        state.onboarding.waiting().clear(
+            holder(&principal, native),
+            native,
+            call.asker.as_deref(),
+            all,
+        );
         if all {
             state
                 .onboarding
@@ -823,7 +827,7 @@ impl Call {
                         eprintln!("hub: waiting hook not recorded: {error}");
                     } else if self.prompt_shown {
                         let requests = state.onboarding.permissions();
-                        requests.confirm(&principal.token_id, &native, unix_now());
+                        requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
                 }
                 Ok(Outcome::clean())
@@ -1025,13 +1029,30 @@ impl Call {
                             unix_now(),
                         )
                     }),
-                )
-                .await;
+                );
+                // The operator's context source is asked while the status is read, never after
+                // it, and not for a subagent's session.
+                let session_name = advice.touched.session.as_str();
+                let operator_context = async {
+                    match &state.context_source {
+                        Some(source) if !self.child => {
+                            let moment = super::context_source::Moment::SessionStart;
+                            source.lines(moment, &principal, session_name).await
+                        }
+                        _ => Vec::new(),
+                    }
+                };
+                let (current_status, operator_context) =
+                    tokio::join!(current_status, operator_context);
                 // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
                 text.push('\n');
                 match current_status {
                     Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
                     _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
+                if let Some(block) = super::context_source::render(&operator_context) {
+                    text.push('\n');
+                    text.push_str(&block);
                 }
                 text.push('\n');
                 text.push_str(&match briefing {
@@ -1519,7 +1540,14 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         {
             call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
-        Some("Stop") => waiting(WaitReason::Idle),
+        // A turn whose last message asked nothing is read, not answered: nobody is shown that
+        // wait, so what the turn ended on is not kept. The client says whether the whole
+        // message asked; where that is not known, the session is shown.
+        Some("Stop") => match WaitReason::turn_end(v["asked_nothing"].as_bool(), str_at(v, "asks"))
+        {
+            WaitReason::Finished => call(Kind::Waiting(WaitReason::Finished), Shape::Silent),
+            reason => waiting(reason),
+        },
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
@@ -2358,7 +2386,7 @@ mod tests {
 
     #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
-        use WaitReason::{Background, Idle, Permission, Question};
+        use WaitReason::{Background, Finished, Idle, Permission, Question};
         let wait = |agent, v: Value| {
             let call = parse(agent, &v);
             assert_eq!(
@@ -2400,6 +2428,37 @@ mod tests {
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
+                Some(Idle),
+            ),
+            // The client says whether the whole last message asked its person anything. An
+            // older client sends only the excerpt, which decides when it is not cut.
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asked_nothing":true,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Finished),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asked_nothing":false,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Idle),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s",
+                    "asks":"The fix is merged and the tests pass for both stores."}),
+                Some(Finished),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s",
+                    "asks":"…The fix is merged and the tests pass for both stores."}),
+                Some(Idle),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asks":"Shall I merge it?"}),
                 Some(Idle),
             ),
             // Paused for its own background work: the client's count and a legacy hook's list.

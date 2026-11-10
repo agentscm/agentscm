@@ -9,9 +9,10 @@
 //! text of the Hub's that reaches the model is what the person typed: a reason with a deny, or
 //! an answer to a question.
 //!
-//! In memory only, like the waits beside it ([`super::session_waiting`]): bounded, lost on a Hub
-//! restart (a hook then reads an unknown request and leaves the prompt to the session), and never
-//! written to either store, a log, a notification or a status read. A request is live only while
+//! In memory only: bounded, and never written to either store, a log, a notification or a status
+//! read. A Hub restart loses every request. A hook then reads an unknown request and offers its
+//! prompt again, which the Hub takes while it still knows the session's wait at that prompt
+//! ([`super::session_waiting`] keeps the waits of a Hub that was stopped). A request is live only while
 //! the permission wait it was made for is still the session's current wait, so a prompt answered
 //! in the session, or replaced by anything else, ends it.
 //!
@@ -34,15 +35,16 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
 use super::advice::invisible;
-use super::coordination_http::{not_your_agent, owns_agent};
+use super::coordination_http::not_your_agent;
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
-use super::session_waiting::{WaitReason, Waiting, wait_key};
-use super::store::{Principal, unix_now, validate_repository};
+use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
+use super::store::{AgentToken, Principal, unix_now, validate_repository};
 use super::{HubError, HubState};
 
 /// A person may be away for hours; the hook's own bound is a little shorter than this.
@@ -298,9 +300,12 @@ pub(super) enum Phase {
 
 // No `Debug`: a row holds the person's tool request.
 struct Pending {
+    /// The agent token the request's hook polls under.
     token: String,
     native: String,
     asker: Option<String>,
+    /// Whose wait the request is for: [`holder`] of the session's wait.
+    holder: String,
     owner: String,
     repository_id: Option<i64>,
     item_key: String,
@@ -447,7 +452,7 @@ impl Pending {
     /// The start of the wait this request was made for, while that is still the session's wait.
     fn attached(&self, waiting: &Waiting, now: i64) -> Option<i64> {
         waiting
-            .dialog_wait(&self.token, &self.native, now)
+            .dialog_wait(&self.holder, &self.native, now)
             .filter(|(since, asker, kind)| {
                 *since <= self.created && *asker == self.asker && *kind == self.kind
             })
@@ -458,7 +463,7 @@ impl Pending {
 #[derive(Default)]
 struct Inner {
     rows: BTreeMap<String, Pending>,
-    /// When the host last said it shows a permission prompt, per token and session.
+    /// When the host last said it shows a permission prompt, per wait holder and session.
     prompts: BTreeMap<(String, String), i64>,
 }
 
@@ -535,6 +540,22 @@ impl From<Refusal> for ApiError {
             Refusal::Hub(error) => error.into(),
         }
     }
+}
+
+/// The id of the request for one prompt of one wait: the same when the same hook offers the same
+/// prompt again, also to a Hub process that started since and never issued it. It says which
+/// prompt a request is for and proves nothing about who asks: the caller is known by its agent
+/// token, and whether the host showed the prompt by the wait.
+fn request_id(holder: &str, native: &str, since: i64, input_hash: &str, offer: &Offer) -> String {
+    const DOMAIN: &str = "agentscm.hub.permission-request.v1";
+    let (reason, choices, questions) = (offer.takes_reason, &offer.choices, &offer.questions);
+    let parts = (
+        DOMAIN, holder, native, since, input_hash, reason, choices, questions,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&parts).unwrap_or_default())
+    )
 }
 
 /// What a hook registers: the facts of one prompt, all made on the machine.
@@ -681,19 +702,30 @@ impl Requests {
         registration: Registration,
         now: i64,
     ) -> Outcome<(String, Phase)> {
-        self.register_with(waiting, principal, registration, Offer::default(), now)
+        self.register_with(
+            waiting,
+            principal,
+            registration,
+            Offer::default(),
+            None,
+            now,
+        )
     }
 
     /// Records a prompt the hook is showing. Needs the session's current wait at that kind of
     /// dialog (a question for an offer with questions, a permission prompt otherwise), asked by
     /// the same subagent. A repeat for the same prompt returns the same request; a different
-    /// prompt of the session ends the older request.
+    /// prompt of the session ends the older request. `again` is the request id a hook holds
+    /// from an earlier registration that the Hub no longer knows (it restarted): the prompt is
+    /// taken only as that same request, and is confirmed at once when the host's notice for
+    /// its wait is on record.
     pub(super) fn register_with(
         &self,
         waiting: &Waiting,
         principal: &Principal,
         registration: Registration,
         offer: Offer,
+        again: Option<&str>,
         now: i64,
     ) -> Outcome<(String, Phase)> {
         if principal.read_only || now >= principal.expires_at {
@@ -778,31 +810,40 @@ impl Requests {
         let (summary, folder) = (label(summary), label(folder));
         let mut inner = self.lock()?;
         inner.settle(waiting, now);
-        match waiting.dialog_wait(&principal.token_id, &session, now) {
-            Some((_, asker, waits)) if asker == agent_id && waits == kind => {}
+        // A request is its session's, like the wait it is for: of a session its host named, it
+        // is the person's, whichever of their agent tokens registered it.
+        let kept_by = holder(principal, &session);
+        let since = match waiting.dialog_wait(kept_by, &session, now) {
+            Some((since, asker, waits)) if asker == agent_id && waits == kind => since,
             _ => return Err(Refusal::NotWaiting),
-        }
-        let same = |row: &Pending| {
-            row.token == principal.token_id && row.native == session && row.asker == agent_id
         };
+        // The id names this prompt of this wait. A hook that offers again a prompt of an earlier
+        // wait (it outlived an answer in the session) holds another id, and is not heard. Two
+        // prompts of one wait that never ended between them share its start, so there the last
+        // offer wins, as it does without `again`.
+        let made = request_id(kept_by, &session, since, &input_hash, &offer);
+        if again.is_some_and(|held| held != made) {
+            return Err(Refusal::NotWaiting);
+        }
+        let session_of = |row: &Pending| row.holder == kept_by && row.native == session;
         // The same prompt offers the same things: the hash covers the tool input, not what the
-        // host suggests with it, and an answer names a choice by its position.
+        // host suggests with it, and an answer names a choice by its position. Registered again
+        // under the person's renewed token, it is the same request, which that token now polls.
         for (id, row) in &mut inner.rows {
-            if same(row)
+            if session_of(row)
+                && row.repository_id == principal.repository_id
+                && row.asker == agent_id
                 && row.input_hash == input_hash
                 && row.offer == offer
                 && row.wake(waiting, now)
             {
+                row.token.clone_from(&principal.token_id);
                 return Ok((id.clone(), row.state));
             }
         }
         // A session shows one prompt at a time: its other requests are over, also one that is
         // asleep, which must not wake beside this one.
-        for row in inner
-            .rows
-            .values_mut()
-            .filter(|row| row.token == principal.token_id && row.native == session)
-        {
+        for row in inner.rows.values_mut().filter(|row| session_of(row)) {
             if row.open() || row.asleep(waiting, now) {
                 row.end(Ended::Superseded, now);
             }
@@ -815,11 +856,14 @@ impl Requests {
         if inner.rows.len() >= MAX_LIVE {
             return Err(Refusal::Busy);
         }
-        let confirmed = inner
-            .prompts
-            .get(&(principal.token_id.clone(), session.clone()))
-            .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
-        let id = super::login::random_hex()?;
+        // A prompt offered again was confirmed by a notice this process may never have heard:
+        // the wait remembers it, also across a restart.
+        let confirmed = (again.is_some() && waiting.noticed(kept_by, &session, now))
+            || inner
+                .prompts
+                .get(&(kept_by.to_owned(), session.clone()))
+                .is_some_and(|at| *at + CONFIRM_SLACK_SECONDS >= now);
+        let id = made;
         let state = if confirmed {
             Phase::Pending
         } else {
@@ -829,7 +873,8 @@ impl Requests {
             id.clone(),
             Pending {
                 token: principal.token_id.clone(),
-                item_key: wait_key(&principal.token_id, &session),
+                item_key: wait_key(kept_by, &session),
+                holder: kept_by.to_owned(),
                 native: session,
                 asker: agent_id,
                 owner: principal.owner.id.clone(),
@@ -858,12 +903,12 @@ impl Requests {
 
     /// The host showed (or is about to show) a permission prompt for `native`: its unconfirmed
     /// request becomes pending, and a request registered within a few seconds after it is
-    /// confirmed on arrival.
-    pub(super) fn confirm(&self, token: &str, native: &str, now: i64) {
+    /// confirmed on arrival. `holder` is [`holder`] of the token that reported it.
+    pub(super) fn confirm(&self, holder: &str, native: &str, now: i64) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        let key = (token.to_owned(), native.to_owned());
+        let key = (holder.to_owned(), native.to_owned());
         inner
             .prompts
             .retain(|_, at| now - *at < CONFIRM_KEEP_SECONDS);
@@ -874,7 +919,7 @@ impl Requests {
         }
         let mut changed = false;
         for row in inner.rows.values_mut() {
-            if row.token != token || row.native != native {
+            if row.holder != holder || row.native != native {
                 continue;
             }
             if row.state == Phase::Unconfirmed {
@@ -911,6 +956,26 @@ impl Requests {
         }
         row.wake(waiting, now);
         Some(row.state)
+    }
+
+    /// The hook that made a request calls under another agent token of the same person and
+    /// repository: this computer renewed its token while the prompt was up. The request is that
+    /// token's from here on. Only the hook holds the request's hash, and only a request kept
+    /// under its person moves.
+    pub(super) fn follow(&self, caller: &Principal, id: &str, hash: &str, now: i64) {
+        if caller.read_only || now >= caller.expires_at {
+            return;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(row) = inner.rows.get_mut(id)
+            && row.holder == caller.owner.id
+            && row.repository_id == caller.repository_id
+            && row.input_hash == hash
+        {
+            row.token.clone_from(&caller.token_id);
+        }
     }
 
     /// [`Self::check`], held for up to `wait_seconds` until the state changes. A change wakes
@@ -1148,6 +1213,10 @@ struct RegisterBody {
     choices: Vec<Choice>,
     #[serde(default)]
     questions: Vec<Question>,
+    /// The request id the hook holds for this prompt, when the Hub answered a poll of it with
+    /// 404.
+    #[serde(default)]
+    again: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1184,6 +1253,7 @@ async fn register(
             choices: body.choices,
             questions: body.questions,
         },
+        body.again.as_deref(),
         unix_now(),
     )?;
     Ok(Json(Registered {
@@ -1223,9 +1293,9 @@ async fn poll(
     if body.wait_seconds > MAX_WAIT_SECONDS {
         return Err(ApiError::invalid().with_message("wait_seconds must be 0..=25"));
     }
-    let polled = state
-        .onboarding
-        .permissions()
+    let requests = state.onboarding.permissions();
+    requests.follow(&principal, &body.request_id, &body.input_hash, unix_now());
+    let polled = requests
         .poll(
             state.onboarding.waiting(),
             &principal.token_id,
@@ -1311,9 +1381,20 @@ struct Answered {
     decision: &'static str,
 }
 
+/// Whether `agent`, one of the person's agent tokens, can take the answer to a request that
+/// `token` polls in a repository: that token, or another one for the repository. A computer that
+/// renews its token revokes the old one, and the hook polls under the new one only from its next
+/// poll on.
+fn takes_answer(agent: &AgentToken, token: &str, repository_id: Option<i64>, now: i64) -> bool {
+    !agent.revoked
+        && !agent.read_only
+        && agent.expires_at > now
+        && (agent.id == token || agent.repository_id == repository_id)
+}
+
 /// A signed-in person allows or denies one prompt of their own agent. The web sign-in and its
-/// CSRF token are checked by [`HumanSession`]; the agent token must still be an active token of
-/// the same person.
+/// CSRF token are checked by [`HumanSession`]; the person must still hold an active agent token
+/// that can take the answer: the request's own, or another for the same repository.
 async fn answer(
     State(state): State<HubState>,
     human: HumanSession,
@@ -1346,7 +1427,12 @@ async fn answer(
     let store = state.store.clone();
     let owner = user.id.clone();
     blocking(&state, move || {
-        if owns_agent(&*store, &owner, &token, unix_now())? {
+        let now = unix_now();
+        let live = store
+            .list_agent_tokens(&owner)?
+            .iter()
+            .any(|agent| takes_answer(agent, &token, repository_id, now));
+        if live {
             Ok(())
         } else {
             Err(HubError::Unauthorized)
@@ -1375,6 +1461,9 @@ async fn answer(
 mod tests {
     use super::*;
     use crate::hub::session_waiting::GRACE_SECONDS;
+
+    /// A session its host named, as the native hooks report one.
+    const NAMED: &str = "0a1b2c3d-0000-4000-8000-000000000001";
     use crate::hub::store::{ForgeIdentity, User};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -2150,8 +2239,14 @@ mod tests {
             questions: Vec::new(),
         };
         let register = |offer: Offer, hash: &str, at| {
-            let made =
-                requests.register_with(&waiting, &mine, registration("s", None, hash), offer, at);
+            let made = requests.register_with(
+                &waiting,
+                &mine,
+                registration("s", None, hash),
+                offer,
+                None,
+                at,
+            );
             requests.confirm("tok_a", "s", at);
             made
         };
@@ -2226,7 +2321,14 @@ mod tests {
         wait(&waiting, &mine, "t", WaitReason::Permission, None, at);
         let again = |offer: Offer| {
             requests
-                .register_with(&waiting, &mine, registration("t", None, HASH), offer, at)
+                .register_with(
+                    &waiting,
+                    &mine,
+                    registration("t", None, HASH),
+                    offer,
+                    None,
+                    at,
+                )
                 .unwrap()
                 .0
         };
@@ -2346,6 +2448,7 @@ mod tests {
                 &mine,
                 registration("s", None, HASH),
                 offer.clone(),
+                None,
                 at,
             )
         };
@@ -2410,6 +2513,209 @@ mod tests {
         assert_eq!(
             requests.sent_with("tok_a", &id),
             picked(vec![Picked::Text("Green, typed by hand".into()), sizes()])
+        );
+    }
+
+    #[test]
+    fn a_request_follows_its_session_to_the_persons_renewed_token() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let old = principal("tok_old", "usr_me", "acme/widgets");
+        let new = principal("tok_new", "usr_me", "acme/widgets");
+        wait(&waiting, &old, NAMED, WaitReason::Permission, None, 1_000);
+        let id = requests
+            .register(&waiting, &old, registration(NAMED, None, HASH), 1_001)
+            .unwrap()
+            .0;
+        requests.confirm(holder(&old, NAMED), NAMED, 1_002);
+        // Nobody else's token takes the request over, nor a read-only one, another repository's
+        // or a caller without the hook's hash.
+        let theirs = principal("tok_x", "usr_them", "acme/widgets");
+        let mut reader = new.clone();
+        reader.read_only = true;
+        let mut elsewhere = new.clone();
+        elsewhere.repository_id = Some(8);
+        requests.follow(&theirs, &id, HASH, 1_005);
+        requests.follow(&reader, &id, HASH, 1_005);
+        requests.follow(&elsewhere, &id, HASH, 1_005);
+        requests.follow(&new, &id, OTHER_HASH, 1_005);
+        assert_eq!(
+            requests.token_for("usr_me", Some(7), &id).unwrap(),
+            "tok_old"
+        );
+        // The hook polls under the renewed token: the same request, still pending, which the
+        // new token polls from here on and the old one no longer does.
+        requests.follow(&new, &id, HASH, 1_010);
+        assert_eq!(
+            requests.check(&waiting, "tok_new", &id, HASH, 1_011),
+            Some(Phase::Pending)
+        );
+        assert_eq!(requests.check(&waiting, "tok_old", &id, HASH, 1_011), None);
+        assert_eq!(
+            requests.token_for("usr_me", Some(7), &id).unwrap(),
+            "tok_new"
+        );
+        // The same prompt registered again under the new token is the same request too.
+        assert_eq!(
+            requests
+                .register(&waiting, &new, registration(NAMED, None, HASH), 1_012)
+                .unwrap(),
+            (id.clone(), Phase::Pending)
+        );
+        // Another person's token with the same session ID and hash has no wait to offer for.
+        assert!(matches!(
+            requests.register(&waiting, &theirs, registration(NAMED, None, HASH), 1_012),
+            Err(Refusal::NotWaiting)
+        ));
+        // The session's next call under the new token ends the wait, and the request with it.
+        waiting.clear(holder(&new, NAMED), NAMED, None, false);
+        assert_eq!(
+            requests.check(&waiting, "tok_new", &id, HASH, 1_013),
+            Some(Phase::Ended(Ended::SessionMovedOn))
+        );
+        // The request of a session whose name a client chose stays with its token.
+        wait(
+            &waiting,
+            &old,
+            "default",
+            WaitReason::Permission,
+            None,
+            2_000,
+        );
+        let kept = requests
+            .register(&waiting, &old, registration("default", None, HASH), 2_001)
+            .unwrap()
+            .0;
+        requests.follow(&new, &kept, HASH, 2_002);
+        assert_eq!(
+            requests.token_for("usr_me", Some(7), &kept).unwrap(),
+            "tok_old"
+        );
+    }
+
+    #[test]
+    fn a_hook_offers_its_prompt_again_to_a_hub_that_restarted() {
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, NAMED, WaitReason::Permission, None, 1_000);
+        let before = Requests::default();
+        let id = before
+            .register(&waiting, &mine, registration(NAMED, None, HASH), 1_001)
+            .unwrap()
+            .0;
+        // The Hub restarted: it kept the session's wait and none of the requests.
+        let after = Requests::default();
+        assert_eq!(after.check(&waiting, "tok_a", &id, HASH, 1_100), None);
+        let again = |requests: &Requests, held: &str, hash: &str, at| {
+            let prompt = registration(NAMED, None, hash);
+            requests.register_with(&waiting, &mine, prompt, Offer::default(), Some(held), at)
+        };
+        // Another id, or another prompt under that id, is not the request the hook holds.
+        assert!(matches!(
+            again(&after, &"0".repeat(64), HASH, 1_101),
+            Err(Refusal::NotWaiting)
+        ));
+        assert!(matches!(
+            again(&after, &id, OTHER_HASH, 1_101),
+            Err(Refusal::NotWaiting)
+        ));
+        // The same prompt of the same wait is the same request. Saying `again` confirms
+        // nothing: while the host has not said it shows the prompt, the request is not offered.
+        assert_eq!(
+            again(&after, &id, HASH, 1_101).unwrap(),
+            (id.clone(), Phase::Unconfirmed)
+        );
+        // The host's notice is kept with the wait, so the Hub that started next still knows of
+        // it and needs no second one: the request is listed and can be answered at once.
+        waiting
+            .notice(&mine, NAMED, NAMED, "claude", 1_002)
+            .unwrap();
+        let after = Requests::default();
+        assert_eq!(
+            again(&after, &id, HASH, 1_102).unwrap(),
+            (id.clone(), Phase::Pending)
+        );
+        assert!(matches!(
+            after.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, 1_103),
+            Ok(Decision::Allow)
+        ));
+        // The session answered there and stopped at its next prompt: a hook of the earlier
+        // prompt that is still running is not heard, so it cannot stand in for the new one.
+        waiting.clear(holder(&mine, NAMED), NAMED, None, false);
+        wait(&waiting, &mine, NAMED, WaitReason::Permission, None, 1_200);
+        let restarted = Requests::default();
+        assert!(matches!(
+            again(&restarted, &id, HASH, 1_201),
+            Err(Refusal::NotWaiting)
+        ));
+    }
+
+    #[test]
+    fn an_answer_needs_a_live_agent_of_the_person_for_the_repository() {
+        let agent = |id: &str, repository_id| AgentToken {
+            id: id.into(),
+            name: "laptop".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(repository_id),
+            expires_at: 2_000,
+            revoked: false,
+            read_only: false,
+            created_at: 0,
+        };
+        let takes = |agent: &AgentToken| takes_answer(agent, "tok_old", Some(7), 1_000);
+        // The request's own token, or the one this computer renewed it to.
+        assert!(takes(&agent("tok_old", 7)));
+        assert!(takes(&agent("tok_new", 7)));
+        // Not a token for another repository, and none that is revoked, read-only or ended.
+        assert!(!takes(&agent("tok_new", 8)));
+        let mut revoked = agent("tok_old", 7);
+        revoked.revoked = true;
+        let mut reader = agent("tok_new", 7);
+        reader.read_only = true;
+        assert!(!takes(&revoked) && !takes(&reader));
+        assert!(!takes_answer(
+            &agent("tok_old", 7),
+            "tok_old",
+            Some(7),
+            2_000
+        ));
+    }
+
+    #[test]
+    fn a_notice_routed_to_the_persons_other_repository_confirms_the_prompt() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        // An edit in another repository's checkout: the prompt's hook calls for the repository
+        // of the file, the host's notice for the one the session runs in.
+        let file = principal("tok_file", "usr_me", "acme/widgets");
+        let mut runs = principal("tok_runs", "usr_me", "acme/site");
+        runs.repository_id = Some(8);
+        wait(&waiting, &file, NAMED, WaitReason::Permission, None, 1_000);
+        let id = requests
+            .register(&waiting, &file, registration(NAMED, None, HASH), 1_001)
+            .unwrap()
+            .0;
+        waiting
+            .notice(&runs, NAMED, NAMED, "claude", 1_006)
+            .unwrap();
+        requests.confirm(holder(&runs, NAMED), NAMED, 1_006);
+        assert_eq!(
+            requests.check(&waiting, "tok_file", &id, HASH, 1_007),
+            Some(Phase::Pending)
+        );
+        // The session has one wait, listed with its request in the repository of the file.
+        assert_eq!(waiting.owned(&file, 1_100).unwrap().len(), 1);
+        assert!(waiting.owned(&runs, 1_100).unwrap().is_empty());
+        // It shows one prompt at a time, whichever repository the next one is offered for.
+        requests
+            .register(
+                &waiting,
+                &runs,
+                registration(NAMED, None, OTHER_HASH),
+                1_101,
+            )
+            .unwrap();
+        assert_eq!(
+            requests.check(&waiting, "tok_file", &id, HASH, 1_102),
+            Some(Phase::Ended(Ended::Superseded))
         );
     }
 
