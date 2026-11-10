@@ -245,6 +245,44 @@ fn installed_agents(
     .collect()
 }
 
+/// The installed agents for which no AgentSCM setup is found: not among `configured`, the agents
+/// set up in this checkout, and without user-scope entries according to `set_up`.
+#[cfg(unix)]
+fn unwired(
+    installed: Vec<crate::client_setup::Agent>,
+    configured: &[String],
+    set_up: &dyn Fn(crate::client_setup::Agent) -> bool,
+) -> Vec<crate::client_setup::Agent> {
+    installed
+        .into_iter()
+        .filter(|agent| !configured.iter().any(|name| name == agent.name()) && !set_up(*agent))
+        .collect()
+}
+
+#[cfg(unix)]
+fn unwired_line(agent: crate::client_setup::Agent) -> String {
+    format!(
+        "{} is installed on this computer and no AgentSCM setup was found for it, so its edits may not be coordinated. Run `agentscm client setup --agent {}` in this checkout (safe to run again), then restart it.",
+        agent.label(),
+        agent.name()
+    )
+}
+
+/// One line for each coding agent installed on this computer for which no AgentSCM setup is
+/// found, with the command that sets it up. Setup wires only the agents it is run for, so an
+/// agent installed afterwards shows up here. `configured` names the agents set up in `root`.
+#[cfg(unix)]
+pub(crate) fn unwired_notice(root: &Path, configured: &[String]) -> Vec<String> {
+    unwired(
+        installed_agents(&|name| which(name).is_some(), &|path| path.is_dir()),
+        configured,
+        &|agent| crate::client_setup::user_scope_installed(agent, root),
+    )
+    .into_iter()
+    .map(unwired_line)
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +297,34 @@ mod tests {
         assert_eq!(dirs, [Agent::Cursor, Agent::Copilot, Agent::Gemini]);
         let programs = installed_agents(&|name| matches!(name, "claude" | "codex"), &|_| false);
         assert_eq!(programs, [Agent::Claude, Agent::Codex]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_agent_without_setup_is_named_with_its_command() {
+        use crate::client_setup::Agent;
+        let installed = || vec![Agent::Claude, Agent::Cursor, Agent::Gemini];
+        // Set up in this checkout, set up for the user, and neither.
+        let found = unwired(installed(), &["claude".to_owned()], &|agent| {
+            agent == Agent::Cursor
+        });
+        assert_eq!(found, [Agent::Gemini]);
+        // An agent set up in the checkout is not looked up in the user configuration.
+        let asked = std::cell::RefCell::new(Vec::new());
+        unwired(installed(), &["claude".to_owned()], &|agent| {
+            asked.borrow_mut().push(agent);
+            true
+        });
+        assert_eq!(*asked.borrow(), [Agent::Cursor, Agent::Gemini]);
+        assert!(unwired(Vec::new(), &[], &|_| false).is_empty());
+        assert!(unwired(installed(), &[], &|_| true).is_empty());
+        let line = unwired_line(Agent::Gemini);
+        assert!(
+            line.starts_with(
+                "Gemini CLI is installed on this computer and no AgentSCM setup was found"
+            ) && line.contains("`agentscm client setup --agent gemini`"),
+            "{line}"
+        );
     }
 
     fn remote(url: &str) -> Option<(Forge, String, String)> {
