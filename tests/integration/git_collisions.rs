@@ -17,9 +17,15 @@ fn git_path() -> PathBuf {
     path
 }
 
+/// Every git call the fixtures make carries this: a commit can start background
+/// maintenance or auto gc, which outlives the call and writes `.git/objects`
+/// (for example `maintenance.lock`) while a test compares repository states.
+const NO_MAINTENANCE: [&str; 4] = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new(git_path())
         .current_dir(dir)
+        .args(NO_MAINTENANCE)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
         .args([
             "-c",
@@ -554,6 +560,7 @@ fn active_days_skips_and_counts_stale_branches() {
     fs::write(repo.join("h"), "1\nS\n3\n").unwrap();
     let out = Command::new(git_path())
         .current_dir(&repo)
+        .args(NO_MAINTENANCE)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
         .args(["-c", "commit.gpgsign=false", "commit", "-qam", "stale"])
         .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
@@ -654,6 +661,7 @@ fn durable_branch_advisory_survives_claim_lifetime_and_includes_dirty_peers() {
     // A committed path remains visible long after any live claim TTL has elapsed.
     let out = Command::new(git_path())
         .current_dir(&peer)
+        .args(NO_MAINTENANCE)
         .args([
             "-c",
             "user.name=t",
@@ -817,6 +825,7 @@ fn branch_advisory_prioritizes_dirty_worktrees_and_newest_refs_under_cap() {
     let text = |args: &[&str]| {
         let out = Command::new(git_path())
             .current_dir(&repo)
+            .args(NO_MAINTENANCE)
             .args(args)
             .output()
             .unwrap();
@@ -831,6 +840,7 @@ fn branch_advisory_prioritizes_dirty_worktrees_and_newest_refs_under_cap() {
         let date = format!("2020-01-01T00:00:{index:02}Z");
         let out = Command::new(git_path())
             .current_dir(&repo)
+            .args(NO_MAINTENANCE)
             .args([
                 "-c",
                 "user.name=t",
@@ -973,6 +983,7 @@ fn git_as(repo: &Path, author: &str, hours_ago: u64, args: &[&str]) {
     let email = format!("user.email={author}@example.invalid");
     let out = Command::new(git_path())
         .current_dir(repo)
+        .args(NO_MAINTENANCE)
         .args(["-c", "user.name=t", "-c", &email])
         .args([
             "-c",

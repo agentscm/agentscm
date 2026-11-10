@@ -401,7 +401,28 @@ fn route(
             start.display()
         ));
     }
-    Ok((!here).then_some((connection, checkout)))
+    // Another connection of the default's own repository, such as a linked worktree's, is still
+    // another agent: the call goes through it, as the edit hooks do.
+    let same_connection = default.is_some_and(|default| default.root == connection.root);
+    Ok((!(here && same_connection)).then_some((connection, checkout)))
+}
+
+/// The other connection of the default's repository that `session`'s hooks route to, such as a
+/// linked worktree's own. The record is only a hint: the connection must still be saved, in the
+/// same Hub and repository, and current for its checkout, or the default serves the call.
+fn session_connection(default: &Connection, session: &str) -> Option<(Connection, PathBuf)> {
+    let root = client_session::route_of(
+        &crate::hub_cli::config_dir().ok()?,
+        session,
+        &default.hub,
+        &default.repo,
+    )?;
+    if root == default.root {
+        return None;
+    }
+    let connection = selected(&root, &load().ok()?).ok()?;
+    (same_repository(default, &connection) && is_current_in(&connection, &root))
+        .then_some((connection, root))
 }
 
 /// The token of another repository's connection, after the checks the default connection gets.
@@ -527,11 +548,30 @@ impl Client {
             // Anything else is for the Hub to refuse.
             Some(_) => return Ok(None),
         };
-        let target = route(&mut arguments, &self.start, default)?;
-        if !arguments.contains_key("session")
-            && self.session_tools.contains(&tool)
-            && let Some(session) = self.session()
+        let named = arguments.contains_key("session");
+        let session = if !self.session_tools.contains(&tool) {
+            None
+        } else if let Some(Value::String(session)) = arguments.get("session") {
+            Some(session.clone())
+        } else if named {
+            None
+        } else {
+            self.session()
+        };
+        // A call that names a checkout of its own is sent there, whatever the session recorded.
+        let explicit = arguments.get(ROOT).is_some_and(|root| !root.is_null())
+            || arguments
+                .get("worktree")
+                .and_then(Value::as_str)
+                .is_some_and(|worktree| Path::new(worktree).is_absolute());
+        let mut target = route(&mut arguments, &self.start, default)?;
+        if target.is_none()
+            && !explicit
+            && let (Some(default), Some(session)) = (default, &session)
         {
+            target = session_connection(default, session);
+        }
+        if !named && let Some(session) = session {
             arguments.insert("session".into(), json!(session));
         }
         if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut)
@@ -620,6 +660,7 @@ impl Client {
         // A call that left the default repository says so: a later call about the same Work
         // names no path, and needs `root` to follow it.
         if let Some((connection, checkout)) = &elsewhere
+            && default.is_none_or(|sent| !same_repository(sent.connection, connection))
             && let Some(content) = reply
                 .pointer_mut("/result/content")
                 .and_then(Value::as_array_mut)
@@ -1203,6 +1244,177 @@ mod tests {
                 token("other", "other-token"),
             )]);
             assert!(current_token(&own, &linked, "own-token", &mut verified).is_err());
+        });
+    }
+
+    /// A main checkout and a linked worktree of it, both connected to one Hub and repository
+    /// with their own tokens, plus a main checkout of another repository, connected.
+    #[cfg(unix)]
+    fn worktrees(config: &Path) -> (tempfile::TempDir, [PathBuf; 3]) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let make = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let origin = format!("https://github.com/acme/{name}.git");
+            git(&root, &["init", "--quiet"]);
+            git(&root, &["remote", "add", "origin", &origin]);
+            git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "t",
+                ],
+            );
+            root
+        };
+        let (main, other) = (make("widgets"), make("gadgets"));
+        let linked = dir.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let roots = [main, linked, other].map(|root| root.canonicalize().unwrap());
+        let connections: Vec<Connection> = [
+            ("main", "acme/widgets", &roots[0]),
+            ("linked", "acme/widgets", &roots[1]),
+            ("other", "acme/gadgets", &roots[2]),
+        ]
+        .into_iter()
+        .map(|(name, repo, root)| {
+            let token_file = config.join(format!("token-{name}"));
+            std::fs::write(&token_file, format!("token-{name}")).unwrap();
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            Connection {
+                token_file,
+                ..saved("https://hub.example".into(), root.to_str().unwrap(), repo)
+            }
+        })
+        .collect();
+        std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::write(
+            config.join("agentscm").join("connections.json"),
+            json!({"version": 1, "connections": connections}).to_string(),
+        )
+        .unwrap();
+        (dir, roots)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_with_its_own_connection_is_the_agent_its_hooks_name() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let (_dir, [main, linked, other]) = worktrees(config);
+            let default = selected(&main, &load().unwrap()).unwrap();
+            let mut client = client(&main);
+            let mut call = |arguments: Value| {
+                let mut message = json!({"method": "tools/call",
+                    "params": {"name": "agentscm_start", "arguments": arguments}});
+                let target = client.prepare(&mut message, Some(&default))?;
+                Ok::<_, String>((
+                    target.map(|(connection, root)| (connection.root, root)),
+                    message["params"]["arguments"].take(),
+                ))
+            };
+            let here = Some((linked.clone(), linked.clone()));
+
+            // No record: the default serves a call that names no path.
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                None
+            );
+            // The hook's record sends the session's calls through the worktree's connection,
+            // and only that session's.
+            let record = |root: &Path, repo: &str| {
+                client_session::record_route(config, "native-1", "https://hub.example", repo, root)
+                    .unwrap()
+            };
+            record(&linked, "acme/widgets");
+            let (target, forwarded) = call(json!({"task": "t", "session": "native-1"})).unwrap();
+            assert_eq!(target, here);
+            assert_eq!(forwarded, json!({"task": "t", "session": "native-1"}));
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-2"})).unwrap().0,
+                None
+            );
+            // A path in the main checkout is still the session's own agent.
+            assert_eq!(
+                call(json!({"session": "native-1", "paths": [main.join("a.rs")]}))
+                    .unwrap()
+                    .0,
+                here
+            );
+            // An explicit root or worktree is honoured: the session's record never overrides it.
+            record(&linked, "acme/widgets");
+            for key in ["root", "worktree"] {
+                let (target, forwarded) =
+                    call(json!({"task": "t", "session": "native-1", key: main.to_str().unwrap()}))
+                        .unwrap();
+                assert_eq!(target, None, "{key}");
+                assert_eq!(forwarded["session"], "native-1");
+            }
+            // A route recorded for another repository is not this repository's.
+            record(&linked, "acme/gadgets");
+            record(&main, "acme/widgets");
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                None
+            );
+            record(&linked, "acme/widgets");
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                here
+            );
+            // A record naming the default's own root, another repository, or a connection that
+            // is not saved is ignored.
+            for root in [main.clone(), other.clone(), main.join("missing")] {
+                record(&root, "acme/widgets");
+                assert_eq!(
+                    call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                    None,
+                    "{root:?}"
+                );
+            }
+            // A record that is not a path is ignored too.
+            let file = config.join("agentscm/session-routes");
+            for entry in std::fs::read_dir(&file).unwrap().flatten() {
+                std::fs::write(entry.path(), "not json").unwrap();
+            }
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                None
+            );
+
+            // An absolute path in the worktree goes to its connection even with no record,
+            // made repo-relative; one in the main checkout stays with the default.
+            let (target, forwarded) = call(json!({"paths": [linked.join("src/a.rs")]})).unwrap();
+            assert_eq!(target, here);
+            assert_eq!(forwarded, json!({"paths": ["src/a.rs"]}));
+            assert_eq!(
+                call(json!({"paths": [main.join("src/a.rs")]})).unwrap(),
+                (None, json!({"paths": ["src/a.rs"]}))
+            );
         });
     }
 

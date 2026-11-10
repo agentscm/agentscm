@@ -16,15 +16,32 @@ fn main() {
 }
 
 /// The commit is `AGENTSCM_BUILD_COMMIT` from the build environment (the Docker build has no
-/// `.git`), else Git's HEAD. The install version is the package version for a release build (the
-/// release workflow runs on the tag `v<version>`), else `<version>+<commit>`: every build from main
-/// carries the release's version, and a dev build must not take, or be refused, the release's
-/// file name. Without a commit, the plain version.
+/// `.git`), else Git's HEAD, but Git is asked only in a release-profile build: a debug or test
+/// build that read HEAD would recompile the whole crate on every commit, checkout or branch
+/// switch. The install version is the package version for a release build (the release workflow
+/// runs on the tag `v<version>`), else `<version>+<commit>`: every build from main carries the
+/// release's version, and a dev build must not take, or be refused, the release's file name. A
+/// debug or test build without a commit is `<version>+dev` for the same reason; any other build
+/// without a commit gets the plain version.
 fn install_version() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=AGENTSCM_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    let release = std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
+        && std::env::var("GITHUB_REF_NAME").ok() == Some(format!("v{version}"));
+    let explicit = std::env::var("AGENTSCM_BUILD_COMMIT").ok();
+    // PROFILE is "release" for --release and profiles that inherit it, "debug" for dev and test.
+    if std::env::var("PROFILE").as_deref() != Ok("release") && explicit.is_none() {
+        let name = if release {
+            version
+        } else {
+            format!("{version}+dev")
+        };
+        println!("cargo:rustc-env=AGENTSCM_BUILD_COMMIT=");
+        println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={name}");
+        return;
+    }
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
@@ -45,10 +62,7 @@ fn install_version() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    let release = std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
-        && std::env::var("GITHUB_REF_NAME").ok() == Some(format!("v{version}"));
-    let commit = std::env::var("AGENTSCM_BUILD_COMMIT")
-        .ok()
+    let commit = explicit
         .or_else(|| git(&["rev-parse", "HEAD"]))
         .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
         .map(|commit| commit.to_ascii_lowercase())

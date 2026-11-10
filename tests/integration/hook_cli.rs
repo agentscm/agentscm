@@ -584,16 +584,35 @@ fn answered(hash: &Value, decision: &str) -> Value {
     polled(hash, "answered", Some(decision))
 }
 
-/// The hook prints one of two fixed decisions, and only for an exact answer to its own request.
+/// The hook prints a decision only for an exact answer to its own request, in a shape it knows.
 /// Anything else leaves the prompt to the session: the ordinary reply, which has no decision.
 #[cfg(unix)]
 #[test]
 fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
     const ALLOW: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}\n";
     const DENY: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"deny\",\"message\":\"Denied from the AgentSCM Hub by its person.\"},\"hookEventName\":\"PermissionRequest\"}}\n";
-    let cases: [(Poll, &str); 6] = [
+    const DENY_SAYING: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"deny\",\"message\":\"Denied from the AgentSCM Hub by its person, who says: use the staging key\"},\"hookEventName\":\"PermissionRequest\"}}\n";
+    let cases: [(Poll, &str); 8] = [
         (|hash| answered(hash, "allow"), ALLOW),
         (|hash| answered(hash, "deny"), DENY),
+        // What the person typed with a deny reaches the agent.
+        (
+            |hash| {
+                let mut reply = answered(hash, "deny");
+                reply["reason"] = json!("use the staging key");
+                reply
+            },
+            DENY_SAYING,
+        ),
+        // A choice this prompt did not offer fits nothing.
+        (
+            |hash| {
+                let mut reply = answered(hash, "allow");
+                reply["choice"] = json!(0);
+                reply
+            },
+            "{}\n",
+        ),
         // Another prompt's hash, input the hook never takes, a decision it does not know, and a
         // request that ended because the session moved on.
         (|_| answered(&json!("b".repeat(64)), "allow"), "{}\n"),
@@ -628,6 +647,7 @@ fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
                 "missing",
                 "session",
                 "summary",
+                "takes_reason",
                 "tool"
             ]
         );
@@ -646,8 +666,79 @@ fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
     }
 }
 
+/// A choice is the host's own suggestion, returned whole. A Hub from before choices is still
+/// offered the plain prompt.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_offers_the_hosts_own_choices_and_saves_the_one_picked() {
+    fn suggest(payload: &mut Value) {
+        payload["permission_suggestions"] = json!([
+            {"type": "setMode", "mode": "bypassPermissions", "destination": "session"},
+            {"type": "addRules", "behavior": "allow", "destination": "localSettings",
+                "rules": [{"toolName": "Bash", "ruleContent": "deploy"}]},
+        ]);
+    }
+    let registered = |seen: &[Seen]| -> Vec<Value> {
+        seen.iter()
+            .filter(|seen| seen.path.starts_with("/v1/hub/permission/register"))
+            .map(|seen| serde_json::from_slice(&seen.body).unwrap())
+            .collect()
+    };
+    let hub = permission_hub(200, |hash| {
+        let mut reply = answered(hash, "allow");
+        reply["choice"] = json!(0);
+        reply
+    });
+    let (run, seen) = permission_prompt(hub, &[], suggest);
+    // The mode this hook cannot describe is not offered, so the rule is choice 0.
+    let printed: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(
+        printed["hookSpecificOutput"]["decision"],
+        json!({"behavior": "allow", "updatedPermissions": [{"type": "addRules",
+            "behavior": "allow", "destination": "localSettings",
+            "rules": [{"toolName": "Bash", "ruleContent": "deploy"}]}]})
+    );
+    let bodies = registered(&seen);
+    assert_eq!(
+        (&bodies[0]["takes_reason"], &bodies[0]["choices"]),
+        (
+            &json!(true),
+            &json!([{"label": "Allow, and do not ask again for this",
+                "saves": "the rule Bash(deploy), in this checkout's local settings (.claude/settings.local.json)"}])
+        )
+    );
+    // An older Hub refuses the fields it does not know, and then takes the plain prompt.
+    let older = serve(|seen| {
+        let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+        let hash = &body["input_hash"];
+        if seen.path.starts_with("/v1/hub/permission/register") {
+            if body.get("takes_reason").is_some() || body.get("choices").is_some() {
+                return (400, json!({"error": "invalid_request"}));
+            }
+            let made = json!({"request_id": "00ff", "input_hash": hash, "state": "pending"});
+            (200, made)
+        } else if seen.path.starts_with("/v1/hub/permission/poll") {
+            (200, answered(hash, "allow"))
+        } else {
+            (200, json!({}))
+        }
+    });
+    let (run, seen) = permission_prompt(older, &[], suggest);
+    assert_eq!(
+        run.stdout,
+        "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}\n"
+    );
+    let bodies = registered(&seen);
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the plain prompt was offered after the refusal"
+    );
+    assert!(bodies[1].get("choices").is_none() && bodies[1].get("takes_reason").is_none());
+}
+
 /// A Hub without these routes, a request nobody answers, the off switch, a subagent's prompt and
-/// a question all leave the prompt to the session.
+/// a question whose questions cannot be read all leave the prompt to the session.
 #[cfg(unix)]
 #[test]
 fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_the_hub() {

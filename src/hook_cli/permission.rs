@@ -1,14 +1,19 @@
-//! Letting the person allow or deny a Claude Code permission prompt from the Hub.
+//! Letting the person answer a Claude Code permission prompt or question from the Hub.
 //!
 //! The `PermissionRequest` hook already told the Hub the session waits (see `coordinate`). Here
-//! the hook goes on to register the prompt it is showing and to wait for a decision, all while
+//! the hook goes on to register the prompt it is showing and to wait for an answer, all while
 //! the dialog stays usable in the session. Everything the Hub is told about the tool is made on
 //! this machine: its name, what to show of it (a command, a path, an address, with secrets
-//! redacted) and a salted hash of the tool input.
+//! redacted), what the person can pick (the host's own "do not ask again" suggestions, a
+//! question's options) and a salted hash of the tool input.
 //!
-//! The Hub is never trusted to compose the answer. The hook prints one of two fixed decisions,
-//! and only for a reply that names this hook's own request id and input hash; anything else, and
-//! every failure, prints the ordinary reply, which carries no decision, so the dialog decides.
+//! The Hub is never trusted to compose the answer. The hook prints a decision only for a reply
+//! that names this hook's own request id and input hash, and makes it from its own copies: a
+//! choice or an option arrives as a position, and the rule that is saved or the label that is
+//! returned is the one the host gave this hook. The only words taken from the Hub are what the
+//! person typed (a reason with a deny, an answer to a question), bounded and without control
+//! characters. Anything else, and every failure, prints the ordinary reply, which carries no
+//! decision, so the dialog decides.
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,7 +35,8 @@ const UNCONFIRMED_GIVE_UP: Duration = Duration::from_secs(20);
 const POLL_SECONDS: u64 = 25;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 3;
+/// The longest pause between tries while the Hub cannot be reached.
+const MAX_RETRY_PAUSE: Duration = Duration::from_secs(60);
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
@@ -45,8 +51,20 @@ const MAX_UNSHOWN_CHARS: usize = 64;
 const WHOLE_INPUT: &str = "the request's input";
 /// Input fields that name what a call is about, in the order tried.
 const TITLE_FIELDS: [&str; 4] = ["title", "name", "subject", "description"];
-/// What the model sees when the person denies from the Hub: fixed here, never taken from the Hub.
+/// What the model sees when the person denies from the Hub with nothing typed.
 const DENY_MESSAGE: &str = "Denied from the AgentSCM Hub by its person.";
+/// What goes before the reason the person typed with a deny.
+const DENY_WITH_REASON: &str = "Denied from the AgentSCM Hub by its person, who says:";
+/// The host's tool for asking the person a question.
+const QUESTION_TOOL: &str = "AskUserQuestion";
+/// How many of the host's suggestions are offered with Allow, how many questions and options one
+/// prompt may have, and the characters sent of a question, an option or what a choice saves.
+const MAX_CHOICES: usize = 8;
+const MAX_QUESTIONS: usize = 4;
+const MAX_OPTIONS: usize = 8;
+const MAX_OFFER_CHARS: usize = 500;
+/// Characters taken of what the person typed on the Hub: a reason with a deny, or an answer.
+const MAX_TYPED_CHARS: usize = 2000;
 const HASH_DOMAIN: &[u8] = b"agentscm.permission.v1\0";
 
 /// Whether this hook call should offer its prompt to the Hub.
@@ -82,11 +100,10 @@ fn session_of(payload: &Value) -> Option<&str> {
     })
 }
 
-/// The tool, except for a question: answering those from the Hub is not offered.
+/// The tool the prompt is for. The host's question tool is one of them.
 fn tool_of(payload: &Value) -> Option<&str> {
     payload["tool_name"].as_str().filter(|tool| {
-        *tool != "AskUserQuestion"
-            && (1..=MAX_TOOL_BYTES).contains(&tool.len())
+        (1..=MAX_TOOL_BYTES).contains(&tool.len())
             && tool
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
@@ -275,6 +292,12 @@ fn summary(tool: &str, input: &Value) -> String {
             "start a subagent".to_owned(),
             field("description").map(str::to_owned),
         ),
+        QUESTION_TOOL => (
+            "ask you a question".to_owned(),
+            input["questions"][0]["question"]
+                .as_str()
+                .map(str::to_owned),
+        ),
         _ => {
             // An MCP tool is `mcp__<server>__<tool>`; its words read better without underscores.
             let what = match tool
@@ -292,14 +315,196 @@ fn summary(tool: &str, input: &Value) -> String {
         Some(about) => format!("{what}: {about}"),
         None => what,
     };
-    let mut line = Value::String(line.split_whitespace().collect::<Vec<_>>().join(" "));
+    one_line(&line, MAX_SUMMARY_CHARS)
+}
+
+/// A label as it leaves the machine: one line, secrets redacted like the display's, at most
+/// `max` characters.
+fn one_line(text: &str, max: usize) -> String {
+    let mut line = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
     redact_json(&mut line);
     let line = line.as_str().unwrap_or_default();
-    if line.chars().count() <= MAX_SUMMARY_CHARS {
+    if line.chars().count() <= max {
         return line.to_owned();
     }
-    let kept: String = line.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+    let kept: String = line.chars().take(max - 1).collect();
     format!("{kept}…")
+}
+
+/// What the person can pick beyond a plain allow or deny, read on this machine from the host's
+/// own hook input. An answer from the Hub names one of these by position only: the rule that is
+/// saved and the input that is returned are this hook's own copies.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Offer {
+    /// The host's suggestions that can go with an allow: each one's position in
+    /// `permission_suggestions`, what it is called, and exactly what it saves and where.
+    choices: Vec<(usize, &'static str, String)>,
+    /// The questions of a question prompt, as the host wrote them.
+    questions: Vec<Asked>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Asked {
+    question: String,
+    header: String,
+    /// Each option's label and description.
+    options: Vec<(String, String)>,
+    multiple: bool,
+}
+
+/// `None` for a question prompt whose questions are not in the shape the host documents: it
+/// could not be answered, so it is left to the session.
+fn offer(tool: &str, payload: &Value) -> Option<Offer> {
+    let choices = payload["permission_suggestions"]
+        .as_array()
+        .map_or_else(Vec::new, |all| {
+            all.iter()
+                .enumerate()
+                .filter_map(|(index, suggestion)| {
+                    let (label, saves) = choice(suggestion)?;
+                    Some((index, label, saves))
+                })
+                .take(MAX_CHOICES)
+                .collect()
+        });
+    let questions = if tool == QUESTION_TOOL {
+        asked(&payload["tool_input"])?
+    } else {
+        Vec::new()
+    };
+    Some(Offer { choices, questions })
+}
+
+/// What one of the host's suggestions is called, and exactly what it saves and where. `None` for
+/// a kind this hook cannot describe, which is then not offered: a button must say what it does.
+fn choice(suggestion: &Value) -> Option<(&'static str, String)> {
+    let text = |key: &str| suggestion[key].as_str();
+    let kept = match text("destination")? {
+        "session" => "for this session only",
+        "localSettings" => "in this checkout's local settings (.claude/settings.local.json)",
+        "projectSettings" => "in this project's shared settings (.claude/settings.json)",
+        "userSettings" => "in your user settings (~/.claude/settings.json)",
+        _ => return None,
+    };
+    let (label, what) = match text("type")? {
+        "addRules" if text("behavior") == Some("allow") => {
+            let rules = suggestion["rules"]
+                .as_array()
+                .filter(|rules| !rules.is_empty())?;
+            let rules: Option<Vec<String>> = rules
+                .iter()
+                .map(|rule| {
+                    let tool = rule["toolName"].as_str()?;
+                    Some(match rule["ruleContent"].as_str() {
+                        Some(content) => format!("{tool}({content})"),
+                        None => tool.to_owned(),
+                    })
+                })
+                .collect();
+            (
+                "Allow, and do not ask again for this",
+                format!("the rule {}", rules?.join(", ")),
+            )
+        }
+        "addDirectories" => {
+            let folders = suggestion["directories"]
+                .as_array()
+                .filter(|folders| !folders.is_empty())?;
+            let folders: Option<Vec<&str>> = folders.iter().map(Value::as_str).collect();
+            (
+                "Allow, and allow access to the folder",
+                format!("access to {}", folders?.join(", ")),
+            )
+        }
+        "setMode" if text("mode") == Some("acceptEdits") => (
+            "Allow, and accept edits without asking",
+            "accept edits mode".to_owned(),
+        ),
+        _ => return None,
+    };
+    // The person must read all of what they save. A description that redaction, the cut or a
+    // line break changed says less than the rule holds, so that suggestion is not offered.
+    let saves = format!("{what}, {kept}");
+    let hidden = saves
+        .chars()
+        .any(|c| c.is_control() || (c.is_whitespace() && c != ' '));
+    (!hidden && one_line(&saves, MAX_OFFER_CHARS) == saves).then_some((label, saves))
+}
+
+fn asked(input: &Value) -> Option<Vec<Asked>> {
+    let filled = |value: &Value| {
+        value
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let questions = input["questions"]
+        .as_array()
+        .filter(|all| (1..=MAX_QUESTIONS).contains(&all.len()))?;
+    // Answers go back keyed by the question's text, so two questions cannot share one.
+    let texts: Vec<&Value> = questions.iter().map(|q| &q["question"]).collect();
+    if texts
+        .iter()
+        .enumerate()
+        .any(|(n, text)| texts[..n].contains(text))
+    {
+        return None;
+    }
+    questions
+        .iter()
+        .map(|question| {
+            let options = question["options"]
+                .as_array()
+                .filter(|all| (1..=MAX_OPTIONS).contains(&all.len()))?;
+            let options: Option<Vec<(String, String)>> = options
+                .iter()
+                .map(|option| {
+                    let description = option["description"].as_str().unwrap_or_default();
+                    Some((filled(&option["label"])?, description.to_owned()))
+                })
+                .collect();
+            Some(Asked {
+                question: filled(&question["question"])?,
+                header: question["header"].as_str().unwrap_or_default().to_owned(),
+                options: options?,
+                multiple: question["multiSelect"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// The offer as the Hub is told it: labels for the person's page, redacted and cut like every
+/// other label. Positions stay those of [`Offer`].
+fn offer_fields(offer: &Offer, body: &mut Value) {
+    let text = |text: &str| one_line(text, MAX_OFFER_CHARS);
+    if !offer.choices.is_empty() {
+        body["choices"] = offer
+            .choices
+            .iter()
+            .map(|(_, label, saves)| json!({"label": label, "saves": saves}))
+            .collect();
+    }
+    if !offer.questions.is_empty() {
+        body["questions"] = offer
+            .questions
+            .iter()
+            .map(|asked| {
+                let options: Vec<Value> = asked
+                    .options
+                    .iter()
+                    .map(|(label, description)| {
+                        json!({"label": text(label), "description": text(description)})
+                    })
+                    .collect();
+                json!({
+                    "question": text(&asked.question),
+                    "header": text(&asked.header),
+                    "options": options,
+                    "multiple": asked.multiple,
+                })
+            })
+            .collect();
+    }
 }
 
 /// `scheme://host/path` without userinfo, query or fragment, and the names of the parts dropped.
@@ -354,19 +559,103 @@ fn input_hash(
     format!("{:x}", hasher.finalize())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the person decided, as the Hub reports it. A choice and an option are positions in this
+/// hook's own [`Offer`]; only typed text is the Hub's to send.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Answer {
     Allow,
-    Deny,
+    /// Allow, with one of the offered choices.
+    AllowWith(usize),
+    /// The answers to a question prompt, one per question.
+    Answers(Vec<Picked>),
+    /// Deny, with what the person typed for the agent, if anything.
+    Deny(Option<String>),
 }
 
-/// The only two decisions this hook ever prints.
-fn decision_output(answer: Answer) -> Value {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Picked {
+    Options(Vec<usize>),
+    Text(String),
+}
+
+/// Text the person typed on the Hub for the agent, bounded here too: no control characters but
+/// line breaks, and at most [`MAX_TYPED_CHARS`]. `None` when nothing is left or it is longer.
+fn typed(text: &str) -> Option<String> {
+    let text: String = text
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect();
+    let text = text.trim();
+    (!text.is_empty() && text.chars().count() <= MAX_TYPED_CHARS).then(|| text.to_owned())
+}
+
+fn picked(answer: &Value) -> Option<Picked> {
+    if !only_keys(answer, &["options", "text"]) {
+        return None;
+    }
+    match (answer.get("options"), answer.get("text")) {
+        (Some(options), None) => options
+            .as_array()
+            .filter(|all| !all.is_empty())?
+            .iter()
+            .map(|option| usize::try_from(option.as_u64()?).ok())
+            .collect::<Option<Vec<_>>>()
+            .map(Picked::Options),
+        (None, Some(text)) => typed(text.as_str()?).map(Picked::Text),
+        _ => None,
+    }
+}
+
+/// The decision this hook prints for an answer, made from its own copies of what was offered:
+/// the host's own suggestion for a choice, the host's own questions and labels for answers. The
+/// only words from the Hub are what the person typed. `None` when the answer does not fit this
+/// prompt, which leaves it to the session.
+fn decision_output(answer: &Answer, offer: &Offer, payload: &Value) -> Option<Value> {
+    let question = !offer.questions.is_empty();
     let decision = match answer {
-        Answer::Allow => json!({"behavior": "allow"}),
-        Answer::Deny => json!({"behavior": "deny", "message": DENY_MESSAGE}),
+        // A question is answered, never just allowed: the host needs its answers.
+        Answer::Allow if !question => json!({"behavior": "allow"}),
+        Answer::AllowWith(choice) if !question => {
+            let (index, ..) = offer.choices.get(*choice)?;
+            let saved = payload["permission_suggestions"].get(*index)?;
+            json!({"behavior": "allow", "updatedPermissions": [saved]})
+        }
+        Answer::Answers(picked) if question && picked.len() == offer.questions.len() => {
+            let mut answers = serde_json::Map::new();
+            for (asked, picked) in offer.questions.iter().zip(picked) {
+                let answer = match picked {
+                    Picked::Text(text) => text.clone(),
+                    Picked::Options(options) => {
+                        if options.len() > 1 && !asked.multiple {
+                            return None;
+                        }
+                        let labels: Option<Vec<&str>> = options
+                            .iter()
+                            .map(|option| {
+                                asked.options.get(*option).map(|(label, _)| label.as_str())
+                            })
+                            .collect();
+                        labels?.join(", ")
+                    }
+                };
+                answers.insert(asked.question.clone(), Value::String(answer));
+            }
+            // The whole input again, as the host asks, with the answers added.
+            let mut input = payload["tool_input"].clone();
+            input
+                .as_object_mut()?
+                .insert("answers".to_owned(), Value::Object(answers));
+            json!({"behavior": "allow", "updatedInput": input})
+        }
+        Answer::Deny(None) => json!({"behavior": "deny", "message": DENY_MESSAGE}),
+        Answer::Deny(Some(reason)) => {
+            json!({"behavior": "deny", "message": format!("{DENY_WITH_REASON} {reason}")})
+        }
+        _ => return None,
     };
-    json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}})
+    Some(
+        json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}),
+    )
 }
 
 /// What a reply to register or poll means for the hook.
@@ -376,7 +665,7 @@ enum Step {
         unconfirmed: bool,
     },
     Decide(Answer),
-    /// A busy or unreachable Hub: try again shortly, a few times.
+    /// A busy or unreachable Hub: try again shortly, for as long as the hook waits.
     Retry,
     Stop,
 }
@@ -410,29 +699,57 @@ fn registered(reply: Option<(u16, Value)>, hash: &str) -> Option<(String, bool)>
     }
 }
 
+/// The answer in an answered reply: `allow` or `deny`, and at most what goes with it (a typed
+/// reason with a deny; with an allow one choice, or the answers to a question). Anything else is
+/// no answer.
+fn answer_in(reply: &Value) -> Option<Answer> {
+    let extra = |key: &str| reply.get(key).filter(|value| !value.is_null());
+    let (reason, choice, answers) = (extra("reason"), extra("choice"), extra("answers"));
+    match (reply["decision"].as_str()?, reason, choice, answers) {
+        ("deny", None, None, None) => Some(Answer::Deny(None)),
+        ("deny", Some(reason), None, None) => Some(Answer::Deny(Some(typed(reason.as_str()?)?))),
+        ("allow", None, None, None) => Some(Answer::Allow),
+        ("allow", None, Some(choice), None) => {
+            Some(Answer::AllowWith(usize::try_from(choice.as_u64()?).ok()?))
+        }
+        ("allow", None, None, Some(answers)) => answers
+            .as_array()?
+            .iter()
+            .map(picked)
+            .collect::<Option<Vec<_>>>()
+            .map(Answer::Answers),
+        _ => None,
+    }
+}
+
 /// Accepts a decision only from a 200 reply for this hook's own request id and hash, with exactly
-/// `allow` or `deny` and nothing else in it.
+/// one answer this hook knows and nothing else in it.
 fn classify(reply: Option<(u16, Value)>, id: &str, hash: &str) -> Step {
     let Some((status, reply)) = reply else {
         return Step::Retry;
     };
     match status {
         200 => {}
-        429 | 503 => return Step::Retry,
+        // 502 and 504 are a proxy in front of a Hub that is being replaced.
+        429 | 502 | 503 | 504 => return Step::Retry,
         _ => return Step::Stop,
     }
-    if !only_keys(&reply, &["request_id", "input_hash", "state", "decision"])
-        || reply["request_id"] != id
-        || reply["input_hash"] != hash
-    {
+    const KEYS: [&str; 7] = [
+        "request_id",
+        "input_hash",
+        "state",
+        "decision",
+        "reason",
+        "choice",
+        "answers",
+    ];
+    if !only_keys(&reply, &KEYS) || reply["request_id"] != id || reply["input_hash"] != hash {
         return Step::Stop;
     }
-    let decision = &reply["decision"];
-    match (reply["state"].as_str(), decision.as_str()) {
-        (Some("pending"), None) if decision.is_null() => Step::Wait { unconfirmed: false },
-        (Some("unconfirmed"), None) if decision.is_null() => Step::Wait { unconfirmed: true },
-        (Some("answered"), Some("allow")) => Step::Decide(Answer::Allow),
-        (Some("answered"), Some("deny")) => Step::Decide(Answer::Deny),
+    match (reply["state"].as_str(), reply["decision"].is_null()) {
+        (Some("pending"), true) => Step::Wait { unconfirmed: false },
+        (Some("unconfirmed"), true) => Step::Wait { unconfirmed: true },
+        (Some("answered"), false) => answer_in(&reply).map_or(Step::Stop, Step::Decide),
         _ => Step::Stop,
     }
 }
@@ -500,6 +817,7 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     let (session, tool) = (session_of(payload)?, tool_of(payload)?);
     let agent_id = agent_id_of(payload);
     let input = &payload["tool_input"];
+    let offer = offer(tool, payload)?;
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).ok()?;
     let hash = input_hash(&salt, session, agent_id, tool, input);
@@ -516,7 +834,10 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         },
         "content_hidden": shown.content_hidden,
         "input_hash": hash,
+        // This hook passes on a reason the person types with a deny.
+        "takes_reason": true,
     });
+    offer_fields(&offer, &mut body);
     if let Some(agent_id) = agent_id {
         body["agent_id"] = json!(agent_id);
     }
@@ -530,13 +851,26 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         repo: routed.connection.repo.clone(),
         token,
     };
-    let (id, mut unconfirmed) =
-        registered(hub.post("/v1/hub/permission/register", &body).await, &hash)?;
+    let mut reply = hub.post("/v1/hub/permission/register", &body).await;
+    let mut offer = offer;
+    // A Hub from before choices and typed reasons refuses the fields it does not know. It can
+    // still take a plain allow or deny, so it is offered the prompt without them. A question
+    // cannot be answered that way and is left to the session.
+    if matches!(reply, Some((400, _))) && offer.questions.is_empty() {
+        let fields = body.as_object_mut()?;
+        fields.remove("takes_reason");
+        fields.remove("choices");
+        offer = Offer::default();
+        reply = hub.post("/v1/hub/permission/register", &body).await;
+    }
+    let (id, mut unconfirmed) = registered(reply, &hash)?;
     let until = started + bound();
-    // Never past the bound, so the hook ends on time.
-    let pause =
-        || tokio::time::sleep(RETRY_PAUSE.min(until.saturating_duration_since(Instant::now())));
-    let mut failures = 0;
+    // Longer after each failure in a row, and never past the bound, so the hook ends on time.
+    let pause = |tries: u32| {
+        let wait = (RETRY_PAUSE * tries.max(1)).min(MAX_RETRY_PAUSE);
+        tokio::time::sleep(wait.min(until.saturating_duration_since(Instant::now())))
+    };
+    let mut failures: u32 = 0;
     loop {
         let now = Instant::now();
         if now >= until || parent_gone(started_under) {
@@ -560,16 +894,16 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
                 let quick = asked.elapsed() < Duration::from_secs(1) && next == unconfirmed;
                 unconfirmed = next;
                 if quick {
-                    pause().await;
+                    pause(1).await;
                 }
             }
-            Step::Decide(answer) => return Some(decision_output(answer)),
+            Step::Decide(answer) => return decision_output(&answer, &offer, payload),
+            // The computer slept, the network dropped or the Hub is being replaced. The prompt
+            // may still be on screen, so the hook keeps trying for its whole bound; the Hub
+            // offers the request again once it hears this hook again.
             Step::Retry => {
-                failures += 1;
-                if failures > MAX_RETRIES {
-                    return None;
-                }
-                pause().await;
+                failures = failures.saturating_add(1);
+                pause(failures).await;
             }
             Step::Stop => return None,
         }
@@ -601,7 +935,7 @@ mod tests {
         assert!(applies_with("claude", true, &subagent, None));
         let mut question = prompt.clone();
         question["tool_name"] = json!("AskUserQuestion");
-        assert!(!applies_with("claude", true, &question, None));
+        assert!(applies_with("claude", true, &question, None));
         let mut other = prompt.clone();
         other["hook_event_name"] = json!("Notification");
         assert!(!applies_with("claude", true, &other, None));
@@ -858,19 +1192,213 @@ mod tests {
         }
     }
 
+    /// The decision a hook prints for `answer` to a prompt with this hook input.
+    fn printed(payload: &Value, answer: &Answer) -> Option<Value> {
+        let tool = payload["tool_name"].as_str().unwrap_or("Bash");
+        let decision = decision_output(answer, &offer(tool, payload)?, payload)?;
+        Some(decision["hookSpecificOutput"]["decision"].clone())
+    }
+
     #[test]
-    fn only_the_two_fixed_decisions_are_ever_printed() {
+    fn a_decision_is_made_from_the_hooks_own_copy_of_what_was_offered() {
+        let rule = json!({"type": "addRules", "behavior": "allow", "destination": "localSettings",
+            "rules": [{"toolName": "Bash", "ruleContent": "python3 -c \"print(1)\""}]});
+        let prompt = json!({"tool_name": "Bash", "tool_input": {"command": "python3 -c \"print(1)\""},
+            // A kind this hook cannot describe is not offered, so the rule is choice 0.
+            "permission_suggestions": [{"type": "setMode", "mode": "bypassPermissions",
+                "destination": "session"}, rule]});
         assert_eq!(
-            decision_output(Answer::Allow),
-            json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                "decision": {"behavior": "allow"}}})
+            printed(&prompt, &Answer::Allow),
+            Some(json!({"behavior": "allow"}))
         );
         assert_eq!(
-            decision_output(Answer::Deny),
-            json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                "decision": {"behavior": "deny",
-                    "message": "Denied from the AgentSCM Hub by its person."}}})
+            printed(&prompt, &Answer::Deny(None)),
+            Some(json!({"behavior": "deny",
+                "message": "Denied from the AgentSCM Hub by its person."}))
         );
+        assert_eq!(
+            printed(&prompt, &Answer::Deny(Some("use uv run".into()))),
+            Some(json!({"behavior": "deny",
+                "message": "Denied from the AgentSCM Hub by its person, who says: use uv run"}))
+        );
+        // A choice returns the host's own suggestion, whole.
+        assert_eq!(
+            printed(&prompt, &Answer::AllowWith(0)),
+            Some(json!({"behavior": "allow", "updatedPermissions": [rule]}))
+        );
+        // A choice that was not offered, and answers to a prompt that asks nothing, fit nothing.
+        assert_eq!(printed(&prompt, &Answer::AllowWith(1)), None);
+        assert_eq!(
+            printed(&prompt, &Answer::Answers(vec![Picked::Text("x".into())])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_choice_says_exactly_what_it_saves_and_where() {
+        let offered = |suggestion: Value| choice(&suggestion);
+        assert_eq!(
+            offered(json!({"type": "addRules", "behavior": "allow", "destination": "localSettings",
+                "rules": [{"toolName": "Bash", "ruleContent": "npm test"}, {"toolName": "mcp__srv__do"}]})),
+            Some((
+                "Allow, and do not ask again for this",
+                "the rule Bash(npm test), mcp__srv__do, in this checkout's local settings (.claude/settings.local.json)".to_owned()
+            ))
+        );
+        assert_eq!(
+            offered(
+                json!({"type": "addDirectories", "directories": ["/work/acme"],
+                "destination": "session"})
+            ),
+            Some((
+                "Allow, and allow access to the folder",
+                "access to /work/acme, for this session only".to_owned()
+            ))
+        );
+        assert_eq!(
+            offered(json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"})),
+            Some((
+                "Allow, and accept edits without asking",
+                "accept edits mode, for this session only".to_owned()
+            ))
+        );
+        // Not offered: a rule that does not allow, a mode or a place this hook does not know,
+        // and a suggestion with nothing in it.
+        for unknown in [
+            json!({"type": "addRules", "behavior": "deny", "destination": "session",
+                "rules": [{"toolName": "Bash"}]}),
+            json!({"type": "addRules", "behavior": "allow", "destination": "session", "rules": []}),
+            json!({"type": "setMode", "mode": "bypassPermissions", "destination": "session"}),
+            json!({"type": "setMode", "mode": "acceptEdits", "destination": "cloud"}),
+            json!({"type": "removeRules", "destination": "session"}),
+            json!("addRules"),
+        ] {
+            assert_eq!(choice(&unknown), None, "{unknown}");
+        }
+        // Not offered either: a rule the person could not read in full, because it is longer
+        // than the label, holds a secret that would be redacted, or runs over several lines.
+        for content in [
+            "x".repeat(MAX_OFFER_CHARS),
+            "deploy TOKEN=abc123xyz".to_owned(),
+            "echo a\necho b".to_owned(),
+        ] {
+            let rule = json!({"type": "addRules", "behavior": "allow", "destination": "session",
+                "rules": [{"toolName": "Bash", "ruleContent": content}]});
+            assert_eq!(choice(&rule), None, "{rule}");
+        }
+    }
+
+    #[test]
+    fn a_question_is_answered_with_the_hosts_own_questions_and_labels() {
+        let questions = json!([
+            {"question": "Which color?", "header": "Color", "multiSelect": false,
+                "options": [{"label": "Red", "description": "Pick red"}, {"label": "Blue"}]},
+            {"question": "Which sizes?", "header": "Size", "multiSelect": true,
+                "options": [{"label": "S"}, {"label": "M"}, {"label": "L"}]},
+        ]);
+        let prompt = json!({"tool_name": "AskUserQuestion",
+            "tool_input": {"questions": questions, "metadata": {"source": "x"}}});
+        let answers = Answer::Answers(vec![
+            Picked::Text("Green,\ntyped by hand".into()),
+            Picked::Options(vec![0, 2]),
+        ]);
+        assert_eq!(
+            printed(&prompt, &answers),
+            Some(
+                json!({"behavior": "allow", "updatedInput": {"questions": questions,
+                "metadata": {"source": "x"},
+                "answers": {"Which color?": "Green,\ntyped by hand", "Which sizes?": "S, L"}}})
+            )
+        );
+        // A deny works as for a tool; an allow without answers, too few answers, two options
+        // for a question that takes one and an option that does not exist fit nothing.
+        assert!(printed(&prompt, &Answer::Deny(None)).is_some());
+        let one = |options: Vec<usize>| {
+            Answer::Answers(vec![Picked::Options(options), Picked::Options(vec![1])])
+        };
+        assert!(printed(&prompt, &one(vec![1])).is_some());
+        for wrong in [
+            Answer::Allow,
+            Answer::AllowWith(0),
+            Answer::Answers(vec![Picked::Options(vec![0])]),
+            one(vec![0, 1]),
+            one(vec![2]),
+        ] {
+            assert_eq!(printed(&prompt, &wrong), None, "{wrong:?}");
+        }
+        // Questions in another shape are not offered at all.
+        for odd in [
+            json!({}),
+            json!({"questions": []}),
+            json!({"questions": [{"question": "Q?", "options": []}]}),
+            json!({"questions": [{"question": " ", "options": [{"label": "A"}]}]}),
+            json!({"questions": [{"question": "Q?", "options": [{"label": ""}]}]}),
+            json!({"questions": [{"question": "Q?", "options": [{"label": "A"}]},
+                {"question": "Q?", "options": [{"label": "B"}]}]}),
+        ] {
+            let prompt = json!({"tool_name": "AskUserQuestion", "tool_input": odd});
+            assert_eq!(offer("AskUserQuestion", &prompt), None, "{odd}");
+        }
+        // What the Hub is told: labels for the page, one line each, with secrets redacted.
+        let mut body = json!({});
+        let mut secret = prompt.clone();
+        secret["tool_input"]["questions"][0]["options"][1]["label"] =
+            json!("use TOKEN=abc123xyz\nnow");
+        offer_fields(&offer("AskUserQuestion", &secret).unwrap(), &mut body);
+        assert_eq!(body["questions"][0]["question"], "Which color?");
+        assert_eq!(body["questions"][1]["multiple"], true);
+        let label = body["questions"][0]["options"][1]["label"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !label.contains("abc123xyz") && !label.contains('\n'),
+            "{label}"
+        );
+        assert!(body.get("choices").is_none());
+    }
+
+    #[test]
+    fn an_answer_is_read_only_in_the_shapes_this_hook_knows() {
+        let reply = |more: Value| {
+            let mut reply = json!({"request_id": "00ff", "input_hash": "h", "state": "answered"});
+            for (key, value) in more.as_object().unwrap() {
+                reply[key] = value.clone();
+            }
+            answer_in(&reply)
+        };
+        assert_eq!(reply(json!({"decision": "allow"})), Some(Answer::Allow));
+        assert_eq!(
+            reply(json!({"decision": "allow", "choice": 1, "reason": null})),
+            Some(Answer::AllowWith(1))
+        );
+        assert_eq!(
+            reply(json!({"decision": "deny", "reason": " not\u{1b} today\n"})),
+            Some(Answer::Deny(Some("not today".into())))
+        );
+        assert_eq!(
+            reply(json!({"decision": "allow",
+                "answers": [{"options": [0, 2]}, {"text": "typed"}]})),
+            Some(Answer::Answers(vec![
+                Picked::Options(vec![0, 2]),
+                Picked::Text("typed".into())
+            ]))
+        );
+        for wrong in [
+            json!({"decision": "allow", "reason": "because"}),
+            json!({"decision": "deny", "choice": 0}),
+            json!({"decision": "deny", "reason": 7}),
+            json!({"decision": "deny", "reason": " \n"}),
+            json!({"decision": "deny", "reason": "x".repeat(MAX_TYPED_CHARS + 1)}),
+            json!({"decision": "allow", "choice": -1}),
+            json!({"decision": "allow", "choice": "0"}),
+            json!({"decision": "allow", "choice": 0, "answers": []}),
+            json!({"decision": "allow", "answers": [{"options": []}]}),
+            json!({"decision": "allow", "answers": [{"options": [0], "text": "both"}]}),
+            json!({"decision": "allow", "answers": [{"label": "Red"}]}),
+            json!({"decision": "allow", "answers": {"0": "Red"}}),
+        ] {
+            assert_eq!(reply(wrong.clone()), None, "{wrong}");
+        }
     }
 
     #[test]
@@ -888,7 +1416,7 @@ mod tests {
         );
         assert_eq!(
             classify(reply(200, "answered", json!("deny")), id, &hash),
-            Step::Decide(Answer::Deny)
+            Step::Decide(Answer::Deny(None))
         );
         assert_eq!(
             classify(reply(200, "pending", Value::Null), id, &hash),
@@ -928,8 +1456,12 @@ mod tests {
         ] {
             assert_eq!(classify(stop.clone(), id, &hash), Step::Stop, "{stop:?}");
         }
-        // Transient trouble is retried, a few times.
+        // Transient trouble is retried.
         assert_eq!(classify(None, id, &hash), Step::Retry);
+        assert_eq!(
+            classify(reply(502, "pending", Value::Null), id, &hash),
+            Step::Retry
+        );
         assert_eq!(
             classify(reply(429, "pending", Value::Null), id, &hash),
             Step::Retry

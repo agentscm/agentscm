@@ -1105,6 +1105,20 @@ impl Machine {
 
     /// One SessionStart hook in the checkout; returns the hook's JSON reply.
     fn session_start(&self, session: &str) -> Value {
+        self.session_start_in(&self.root(), session)
+    }
+
+    /// One SessionStart hook whose working directory is `cwd`.
+    fn session_start_in(&self, cwd: &std::path::Path, session: &str) -> Value {
+        self.hook_in(
+            cwd,
+            session,
+            json!({"hook_event_name": "SessionStart", "source": "startup"}),
+        )
+    }
+
+    /// One hook event, `event` plus the session and `cwd`; returns the hook's JSON reply.
+    fn hook_in(&self, cwd: &std::path::Path, session: &str, event: Value) -> Value {
         use std::io::Write;
         let mut child = self
             .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
@@ -1112,8 +1126,9 @@ impl Machine {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": self.root(), "source": "startup"});
+        let mut payload = event;
+        payload["session_id"] = json!(session);
+        payload["cwd"] = json!(cwd);
         child
             .stdin
             .take()
@@ -1148,11 +1163,11 @@ impl Machine {
     }
 
     fn mcp(&self) -> Mcp {
-        self.mcp_with(&[])
+        self.mcp_at(&self.root(), &[])
     }
 
-    fn mcp_with(&self, env: &[(&str, &str)]) -> Mcp {
-        let root = self.root();
+    /// A `client mcp` server started with `--root root` and `env` added to its environment.
+    fn mcp_at(&self, root: &std::path::Path, env: &[(&str, &str)]) -> Mcp {
         let mut child = self
             .command(&[
                 "--no-telemetry",
@@ -1366,7 +1381,7 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert!(after.contains("\"result\""), "{after}");
     assert!(!after.contains("agentscm_promises_list"), "{after}");
     // AGENTSCM_MCP_TOOLS=all asks the Hub for the full list, opt-in tools included.
-    let mut full = machine.mcp_with(&[("AGENTSCM_MCP_TOOLS", "all")]);
+    let mut full = machine.mcp_at(&machine.root(), &[("AGENTSCM_MCP_TOOLS", "all")]);
     full.call("agentscm_work_status", json!({}));
     let listed = full.tools_list();
     assert!(listed.contains("agentscm_promises_list"), "{listed}");
@@ -1417,6 +1432,57 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// Signing in again replaces this computer's credential, which revokes the agent tokens it
+/// issued; the sign-in renews each connected checkout, and names one it could not renew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_in_again_keeps_connected_checkouts_working() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let login = [
+        "hub",
+        "login",
+        "--hub",
+        hub.as_str(),
+        "--provider",
+        "github",
+    ];
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    assert_eq!(env.whoami(&first).await, 200);
+
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("was not renewed"), "{stderr}");
+    let second = machine.token();
+    assert_ne!(first, second);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&second).await, 200);
+
+    // A checkout that cannot be renewed is named with its fix; the sign-in, allowed by a role
+    // on another connected repository, still succeeds.
+    env.connect_repo("acme/gadgets", 4343, ALICE);
+    env.drop_role(ALICE);
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let root = machine.root();
+    assert!(
+        stderr.contains(&format!(
+            "The connection of {} was not renewed (",
+            root.display()
+        )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
+        "{stderr}"
+    );
+    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    let reply = machine.session_start("s2");
+    assert!(context(&reply).contains("was not renewed"), "{reply}");
 }
 
 /// A session that starts in one repository and edits another declares its Work in the other:
@@ -1518,6 +1584,90 @@ async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
     );
     assert_eq!(work(OTHER).len(), 1);
     assert!(work(REPO).is_empty());
+}
+
+/// A Claude Code session in a linked worktree that has its own connection is one agent: the
+/// MCP server, started in the main checkout, declares Work under the worktree connection the
+/// session's hooks use, not under the main checkout's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_agent() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let main = machine.root();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let linked = machine.home.path().join("linked");
+    git(&["worktree", "add", "-q", linked.to_str().unwrap()]);
+    let linked = linked.canonicalize().unwrap();
+    for (root, own) in [(&main, false), (&linked, true)] {
+        let mut args = vec!["--no-telemetry", "client", "connect"];
+        if own {
+            args.push("--own-connection");
+        }
+        args.extend(["--hub", &env.hub, "--provider", "github", "--root"]);
+        args.push(root.to_str().unwrap());
+        let (ok, _, stderr) = machine.run(&args);
+        assert!(ok, "{stderr}");
+    }
+
+    machine.session_start_in(&linked, "native-1");
+    let mut mcp = machine.mcp_at(&main, &[]);
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the worktree", "session": "native-1"}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    // The same repository, so the reply does not claim it left the session's repository.
+    assert!(!started["content"].to_string().contains("this call went to"));
+    // A session no hook routed stays on the main checkout's connection.
+    let default = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the main checkout", "session": "native-2"}),
+    );
+    assert_ne!(default["isError"], true, "{default}");
+
+    let connections = machine.file("connections.json");
+    let token = connections["connections"][0]["owned_token_id"]
+        .as_str()
+        .unwrap();
+    let query = agentscm::hub::work::WorkOverviewQuery::default();
+    let current = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let lead = |task: &str| {
+        let work = current.iter().find(|work| work.title == task).unwrap();
+        work.lead_agent.clone()
+    };
+    let (worktree_agent, main_agent) = (
+        lead("Work in the worktree"),
+        lead("Work in the main checkout"),
+    );
+    assert_ne!(worktree_agent, main_agent, "{current:?}");
+    // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
+    // that could be compared with it, so the two agents are told apart by name only.
+
+    // Ending the session drops its route record, and the hook does not write it back.
+    let routes = machine.config.path().join("agentscm/session-routes");
+    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
+    assert_eq!(recorded(), 1);
+    machine.hook_in(
+        &linked,
+        "native-1",
+        json!({"hook_event_name": "SessionEnd"}),
+    );
+    assert_eq!(recorded(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3391,7 +3541,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
 
     // Catalog counts, recipient and next action are exactly the shared person/token projection.
     let mut work = started["item"].clone();
-    let mut previous_marker = Value::Null;
+    let mut previous_marker = None;
     for (operation, summary) in [
         ("catalog-handover-1", "Synthetic handover"),
         ("catalog-handover-2", "Synthetic updated handover"),
@@ -3431,13 +3581,16 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         assert_eq!(row["work"][0]["state"], "awaiting_party");
         assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
         assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
-        assert_eq!(row["work"][0]["needs_you"], true);
-        assert!(row["attention_revision"].as_str().is_some());
-        assert_ne!(
-            row["attention_revision"], previous_marker,
-            "same count with changed action evidence changes attention identity"
-        );
-        previous_marker = row["attention_revision"].clone();
+        assert_eq!(row["work"][0]["needs_you"], false);
+        assert_eq!(row["status_counts"]["needs_you"], 0);
+        assert_eq!(row["attention_revision"], Value::Null);
+        if let Some(previous) = &previous_marker {
+            assert_eq!(
+                &row["attention_revision"], previous,
+                "routine handover updates do not create a personal obligation"
+            );
+        }
+        previous_marker = Some(row["attention_revision"].clone());
         let (_, again) = env
             .call(
                 &env.hub,
@@ -3454,7 +3607,8 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .find(|r| r["repository"] == REPO)
             .unwrap();
         assert_eq!(
-            again["attention_revision"], previous_marker,
+            Some(again["attention_revision"].clone()),
+            previous_marker,
             "poll time does not create new attention"
         );
     }
@@ -4434,13 +4588,59 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
     let late = made["request_id"].clone();
     agent("/v1/hub/hook/claude", shown.clone()).await;
-    agent("/v1/hub/hook/claude", ran).await;
+    agent("/v1/hub/hook/claude", ran.clone()).await;
     let (status, refused) =
         page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
     assert_eq!(
         (status, refused["reason"].as_str()),
         (409, Some("answered_in_session"))
     );
+
+    // A hook that offers one of the session's own choices and passes a typed reason on: what
+    // the person picks or types is what that hook's poll hears, and nothing else is added.
+    let offering = |hash: &str| {
+        let mut body = register(hash, true);
+        body["takes_reason"] = json!(true);
+        body["choices"] = json!([{"label": "Allow, and do not ask again for this",
+            "saves": "the rule Bash(cargo publish), for this session only"}]);
+        body
+    };
+    let heard = |id: &Value, hash: &str| {
+        let poll = json!({"request_id": id, "input_hash": hash.repeat(64), "wait_seconds": 0});
+        agent("/v1/hub/permission/poll", poll)
+    };
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("e")).await;
+    let chosen = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut pick = answer(&chosen, "allow");
+    pick["reason"] = json!("because");
+    let unfit = page_post(&env, &alice, true, PERMISSION_ANSWER, pick.clone()).await;
+    assert_eq!(unfit.0, 400, "{}", unfit.1);
+    pick.as_object_mut().unwrap().remove("reason");
+    pick["choice"] = json!("0");
+    let picked = page_post(&env, &alice, true, PERMISSION_ANSWER, pick).await;
+    assert_eq!(picked.0, 200, "{}", picked.1);
+    let (_, polled) = heard(&chosen, "e").await;
+    assert_eq!(
+        (&polled["decision"], &polled["choice"], polled.get("reason")),
+        (&json!("allow"), &json!(0), None)
+    );
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("f")).await;
+    let denied = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut no = answer(&denied, "deny");
+    no["reason"] = json!("use the staging key");
+    let said = page_post(&env, &alice, true, PERMISSION_ANSWER, no).await;
+    assert_eq!(said.0, 200, "{}", said.1);
+    let (_, polled) = heard(&denied, "f").await;
+    assert_eq!(
+        (&polled["decision"], &polled["reason"], polled.get("choice")),
+        (&json!("deny"), &json!("use the staging key"), None)
+    );
+    agent("/v1/hub/hook/claude", ran).await;
 
     // A person no longer answers for an agent whose token was revoked.
     agent("/v1/hub/hook/claude", prompt).await;

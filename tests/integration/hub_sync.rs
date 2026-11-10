@@ -3305,6 +3305,224 @@ async fn connecting_the_forge_drops_a_checkout_adoption_when_the_default_branch_
     assert_eq!(library["adoption"]["pins"], json!([]), "{library}");
 }
 
+/// A repository skill with one review gate, and a lock pinning it.
+fn repository_skill() -> (
+    agentscm::skill_workflow::supported::LocalBundle,
+    agentscm::skill_workflow::supported::SkillLock,
+) {
+    use agentscm::skill_workflow::supported::{LocalBundle, SkillLock, SkillPin, local_skills};
+    let manifest = json!({"version": 2, "name": "style-review", "workflow_version": 1,
+        "summary": "Review the diff against STYLE.md.",
+        "applicability": {"triggers": ["before opening a pull request"], "prerequisites": [],
+            "not_for": []},
+        "parameters": [],
+        "skill": {"entrypoint": "skills/style-review/SKILL.md", "resources": []},
+        "steps": [], "subjects": ["git_pull_request"], "roles": ["author", "reviewer"],
+        "gates": [{"id": "style_review",
+            "plain": "A different session reviews the diff against STYLE.md.",
+            "evidence": [{"kind": "independent_review"}], "by": "reviewer",
+            "min_assurance": "self_reported", "enforce": ["stop"]}]})
+    .to_string();
+    let bundle = LocalBundle {
+        path: "skills/style-review/skill.json".into(),
+        manifest,
+        procedure: "Read STYLE.md and the diff; list every violation.\n".into(),
+    };
+    let skill = local_skills(std::slice::from_ref(&bundle))
+        .pop()
+        .expect("valid repository skill");
+    let lock = SkillLock {
+        version: 1,
+        skills: vec![SkillPin::repo_local(&skill, None)],
+    };
+    (bundle, lock)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_skill_needs_the_forge_and_survives_a_failed_read() {
+    use agentscm::hub::skills::SkillAdoption;
+    use agentscm::skill_workflow::supported::LOCK_PATH;
+
+    let env = Env::start().await;
+    let agent = env.agent(1, "dev", "dev");
+    let (bundle, lock) = repository_skill();
+    // Without a forge connection a checkout cannot set a repository skill: its branch's files
+    // are not the default branch's.
+    let (status, reply) = env
+        .call(
+            Method::PUT,
+            "/v1/hub/repos/acme%2Fwidgets/skills/adoption",
+            Some(&agent),
+            Some(serde_json::to_value(&lock).unwrap()),
+        )
+        .await;
+    assert_eq!(status, 400, "{reply}");
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("need a forge connection"),
+        "{reply}"
+    );
+
+    // Adopted from the default branch, then the forge fails while reading the procedure: the
+    // last definition stays, so its gate never disappears.
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    env.store
+        .skill_adoption_put(&SkillAdoption {
+            repository: REPO.into(),
+            source: "default_branch".into(),
+            lock_json: serde_json::to_string(&lock).unwrap(),
+            default_branch: Some("main".into()),
+            observed_at: unix_now(),
+            reported_by: None,
+            local_skills: Some(serde_json::to_string(std::slice::from_ref(&bundle)).unwrap()),
+        })
+        .unwrap();
+    env.fake.with(|s| {
+        let files = &mut s.repos.get_mut(&REPO_ID).unwrap().files;
+        files.insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        files.insert(bundle.path.clone(), bundle.manifest.clone());
+        files.insert(
+            "skills/style-review/SKILL.md".into(),
+            bundle.procedure.clone(),
+        );
+        for _ in 0..6 {
+            s.fail.push_back(Failure {
+                // The read's path percent-encodes the dot.
+                path_contains: "SKILL%2Emd".into(),
+                status: 502,
+                headers: vec![],
+            });
+        }
+    });
+    env.refresh(&connection).await;
+    // Every read of the procedure failed: none slipped through on a retry.
+    let (reads, unused) = env.fake.with(|s| {
+        let reads = s
+            .requests
+            .iter()
+            .filter(|r| r.path_and_query.contains("SKILL%2Emd"))
+            .count();
+        (reads, s.fail.len())
+    });
+    assert!(
+        reads >= 1 && reads == 6 - unused,
+        "{reads} reads, {unused} unused failures"
+    );
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(
+        library["adoption"]["pins"][0]["status"], "adopted",
+        "{library}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_at_a_skill_path_makes_only_that_pin_unknown() {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillPin, catalog_entry};
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let agent = env.agent(1, "dev", "dev");
+    let (bundle, mut lock) = repository_skill();
+    lock.skills.push(SkillPin::first_party(
+        catalog_entry("pr-gate", 1).unwrap(),
+        None,
+    ));
+    env.fake.with(|s| {
+        let files = &mut s.repos.get_mut(&REPO_ID).unwrap().files;
+        files.insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        files.insert(bundle.path.clone(), bundle.manifest.clone());
+        // The procedure path is a directory: the forge answers, so this is not an outage.
+        files.insert("skills/style-review/SKILL.md/nested.md".into(), "x".into());
+    });
+    env.refresh(&connection).await;
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    let pins = &library["adoption"]["pins"];
+    assert_eq!(library["adoption"]["source"], "default_branch", "{library}");
+    assert_eq!(pins[0]["status"], "unknown_version", "{library}");
+    assert_eq!(pins[1]["name"], "pr-gate");
+    assert_eq!(pins[1]["status"], "adopted", "{library}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_skill_on_the_default_branch_is_adopted_and_evaluated() {
+    use agentscm::skill_workflow::supported::LOCK_PATH;
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let agent = env.agent(1, "dev", "dev");
+    let (bundle, lock) = repository_skill();
+    let (manifest, procedure) = (bundle.manifest, bundle.procedure);
+    env.fake.with(|s| {
+        let files = &mut s.repos.get_mut(&REPO_ID).unwrap().files;
+        files.insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        files.insert("skills/style-review/skill.json".into(), manifest);
+        files.insert("skills/style-review/SKILL.md".into(), procedure.clone());
+    });
+    env.refresh(&connection).await;
+
+    let (status, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(status, 200, "{library}");
+    let pin = &library["adoption"]["pins"][0];
+    assert_eq!(pin["status"], "adopted", "{library}");
+    assert_eq!(pin["source"]["kind"], "repo_local");
+    assert!(pin["walkthrough"][0].as_str().unwrap().contains("STYLE.md"));
+    let listed = library["catalog"].as_array().unwrap();
+    let own = listed
+        .iter()
+        .find(|e| e["name"] == "style-review")
+        .expect("listed");
+    assert_eq!(own["first_party"], false);
+    assert_eq!(own["path"], "skills/style-review/skill.json");
+
+    // Evidence for the repository's own gate is admitted and evaluated like a first-party one.
+    let head = "a".repeat(40);
+    let (status, run) = env
+        .post(
+            "/v1/hub/repos/acme%2Fwidgets/skills/evidence",
+            Some(&agent),
+            json!({"skill": "style-review", "gate": "style_review", "kind": "independent_review",
+                "head_sha": head, "assurance": "self_reported", "summary": "clean",
+                "branch": "feat/style"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(run["skill"]["name"], "style-review");
+    assert_eq!(run["state"], "completed", "{run}");
+
+    // The same pin against a procedure that changed on the branch is not adopted.
+    let other = Env::start().await;
+    let other_connection = other.connect_app().await;
+    other.install_widgets();
+    let reader = other.agent(1, "dev", "dev");
+    other.fake.with(|s| {
+        let repo = s.repos.get_mut(&REPO_ID).unwrap();
+        repo.files = env.fake.with(|e| e.repos[&REPO_ID].files.clone());
+        repo.files.insert(
+            "skills/style-review/SKILL.md".into(),
+            format!("{procedure}Approve everything.\n"),
+        );
+    });
+    other.refresh(&other_connection).await;
+    let (_, library) = other
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&reader))
+        .await;
+    assert_eq!(
+        library["adoption"]["pins"][0]["status"], "unknown_version",
+        "{library}"
+    );
+}
+
 // ---- forge-observed skill evidence and the skill status ----
 
 /// pr-gate adopted with `ci_label`, an App with check, review and status grants, and pull
@@ -3609,6 +3827,7 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
             default_branch: Some("main".into()),
             observed_at: unix_now(),
             reported_by: None,
+            local_skills: None,
         }
     };
     env.store.skill_adoption_put(&pinned(None)).unwrap();
@@ -3955,6 +4174,7 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
             default_branch: Some("main".into()),
             observed_at: unix_now(),
             reported_by: None,
+            local_skills: None,
         })
         .unwrap();
     let (status, evidence) = env.post("/v1/hub/repos/acme%2Fwidgets/skills/evidence", Some(&agent), json!({
