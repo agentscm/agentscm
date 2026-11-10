@@ -868,7 +868,7 @@ Tools:
 | `agentscm_start` | `task`, `description?`, `paths?`, `session?` | Once at the start of a task: records the task (a short plain title) and, for new Work, a description of what it changes and why ([details](standup.md#work-identity-and-claims)); returns who else is working in the repository. In a hook-connected session it says that edits are checked automatically. |
 | `agentscm_check` | `paths` (1 to 50), `session?` | Before editing a file not yet edited in this session: who else is working on it, as a note. It never refuses. |
 | `agentscm_status` | `session?` | The other agents and the repository's open pull requests. |
-| `agentscm_done` | `session?` | Releases the session's files and, in the same step, pauses the active Work the session leads. |
+| `agentscm_done` | `session?`, `outcome?`, `summary?` | Releases the session's files and, in the same step, pauses the active Work the session leads. With `outcome: complete` it first completes the unfinished Work the session leads (active, blocked or paused), recording `summary` as the reason; the Hub reads its generation and sequence, so the agent passes no `work_id` or fences. |
 | `agentscm_ask` | `path`, `note?` (at most 200 characters), `session?` | Asks the agent that holds a file to hand it over to this session (see [Handoff](#handoff)). |
 | `agentscm_handoff` | `path`, `accept`, `reason?` (at most 200 characters, with `accept` false), `session?` | Answers a request for a file this session holds: `true` hands it over, `false` keeps it. |
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |

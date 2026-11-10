@@ -69,7 +69,8 @@ In automatic mode, supported substantive paths append a receipt after a reported
 checkpoint, source-bound `revision_tests` or `hosted_ci` skill evidence, and source-bound
 `human_approval` skill evidence (the pre-merge phase). Skill evidence must match the current
 session's Work, declared branch and checkpoint commit. These reports remain self-reported.
-An ordinary stop or `agentscm_done` release does not announce successful completion. Native
+An ordinary stop or a plain `agentscm_done` release does not announce successful completion;
+`agentscm_done` with `outcome: complete` does. Native
 hooks, the separate native task MCP and other clients do not acquire receipt support merely
 because completion reporting is enabled.
 

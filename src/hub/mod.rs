@@ -44,6 +44,7 @@ pub mod promise;
 mod promise_http;
 pub mod provider_context;
 pub mod publish;
+pub mod reply;
 mod repository_summary;
 pub mod session;
 pub mod session_waiting;
