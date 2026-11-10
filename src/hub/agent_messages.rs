@@ -10,11 +10,13 @@
 //!
 //! A Claude Code session also runs a background hook (`agentscm hook-wait`, served by `wait` here) that
 //! holds a request open here while the session is idle or busy; a new message answers it at
-//! once and the hook wakes the session with it. Otherwise delivery rides on calls the session
-//! makes anyway: the hook reply's added context where the client's hook can carry it ([`take`]
-//! from `hook.rs`), else the next AgentSCM tool result (from `mcp.rs`). A closed session gets
-//! nothing until it runs again. The agent answers with `agentscm_hub_message`, and the Hub page
-//! reads the receipts: queued, delivered, accepted or declined, done.
+//! once and the hook wakes the session with it. The same wait wakes a lead, once, for a
+//! coordination request to its Work that it has not acknowledged. Otherwise delivery rides on
+//! calls the session makes anyway: the hook reply's added context where the client's hook can
+//! carry it ([`take`] from `hook.rs`), else the next AgentSCM tool result (from `mcp.rs`). A
+//! closed session gets nothing until it runs again. The agent answers with
+//! `agentscm_hub_message`, and the Hub page reads the receipts: queued, delivered, accepted or
+//! declined, done.
 //!
 //! The delivered text is only a notice and carries no mode: other people's text rides the same
 //! channels, so an agent acts only on the note and mode in the reply to its `accepted` answer,
@@ -39,6 +41,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 
+use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
 use super::store::{Principal, Store, new_id, unix_now, validate_repository};
@@ -67,8 +70,16 @@ const WAKE_VIA: &str = "wake:claude";
 /// Counted per Hub process; the total is large so the per-person cap is the one that binds.
 const MAX_WAITS: usize = 4096;
 const MAX_WAITS_PER_PERSON: usize = 64;
+/// The words that open a wake for a coordination request to the session's Work.
+pub const REQUEST_FRAME: &str = "AgentSCM coordination request";
 /// Wakes waiting hooks in this process when a message is sent.
 static SENT: Notify = Notify::const_new();
+/// The coordination requests each (token, session, request) was woken for, so a lead that does
+/// not acknowledge one is woken once, not at every turn. Per Hub process: after a restart a
+/// request still unacknowledged wakes its lead once more.
+static WOKEN: Mutex<Woken> = Mutex::new(BTreeMap::new());
+/// When each (token, session, request) was woken.
+type Woken = BTreeMap<(String, String, String), i64>;
 static WAITS: Mutex<Waits> = Mutex::new(Waits {
     total: 0,
     per_person: BTreeMap::new(),
@@ -520,6 +531,74 @@ fn deliver(
     Ok((!blocks.is_empty()).then(|| blocks.join("\n")))
 }
 
+/// A coordination request to Work this session leads that its lead has neither acknowledged
+/// nor answered, as the wake's notice, once per request. The notice is the Hub's own words:
+/// names and paths filtered, no request title.
+fn request_wake(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    use super::advice::{agent_name, ascii_name, sanitize};
+    let inbox = store.coordination_inbox(
+        &principal.token_id,
+        &CoordinationInboxQuery {
+            session: Some(session.to_owned()),
+            ..Default::default()
+        },
+        now,
+    )?;
+    let mut woken = WOKEN.lock().unwrap_or_else(PoisonError::into_inner);
+    for request in &inbox.requests {
+        if !matches!(
+            request.status,
+            CoordinationStatus::Pending | CoordinationStatus::Responded
+        ) {
+            continue;
+        }
+        for target in &request.targets {
+            let lead = &target.lead;
+            if lead.token != principal.token_id || lead.session != session {
+                continue;
+            }
+            let seen = request.acknowledgements.iter().any(|a| {
+                a.target_work_id.as_deref() == Some(target.work_id.as_str())
+                    && a.generation == target.generation
+                    && a.agent == *lead
+            }) || request.responses.iter().any(|r| {
+                r.target_work_id == target.work_id
+                    && r.target_generation == target.generation
+                    && r.responder == *lead
+            });
+            let key = (lead.token.clone(), session.to_owned(), request.id.clone());
+            if seen || woken.contains_key(&key) {
+                continue;
+            }
+            woken.insert(key, now);
+            bounded(&mut woken, |at| *at);
+            let mut files = target
+                .reasons
+                .iter()
+                .map(|reason| sanitize(&reason.your_path, 100))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if files.is_empty() {
+                files = "files it reserves".into();
+            }
+            return Ok(Some(format!(
+                "{REQUEST_FRAME} {} for your Work {}: {}'s {} asks for {files}, which this Work reserves. Read it with agentscm_coordination_inbox, acknowledge it with agentscm_coordination_ack, then reply with agentscm_coordination_reply: split, join, handover or decline. If it is still not acknowledged {} minutes after it was made, your person is asked in the Hub's Needs you. A subagent leaves it for the session that started it.",
+                request.id,
+                target.work_id,
+                ascii_name(&request.requester.login),
+                ascii_name(&agent_name(&request.requester.agent)),
+                super::coordination::ACK_BOUND_SECS / 60,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Answer {
@@ -658,7 +737,9 @@ struct WaitBody {
 }
 
 /// The session's background hook waits here for a message, with its agent token: 200 `{text}`
-/// with the notice when one comes, 204 when none came in [`WAIT_SECS`] or a newer wait for the
+/// with the notice when one comes, or when a coordination request to Work the session leads
+/// waits for its acknowledgement ([`request_wake`], rechecked every few seconds), 204 when
+/// neither came in [`WAIT_SECS`] or a newer wait for the
 /// session took over, 403 for a token that can never receive one, 410 while the person's mode is
 /// `ignore`, 429 when the Hub or the person holds too many waits. Delivery is [`deliver`], the
 /// hook path's own: the same token and session check, marked delivered once.
@@ -700,7 +781,11 @@ async fn wait(
             let state = state.clone();
             async move {
                 blocking(&state, move || {
-                    deliver(&*store, &principal, &session, WAKE_VIA, unix_now(), wakes)
+                    let now = unix_now();
+                    match deliver(&*store, &principal, &session, WAKE_VIA, now, wakes)? {
+                        Some(text) => Ok(Some(text)),
+                        None => request_wake(&*store, &principal, &session, now),
+                    }
                 })
                 .await
             }
@@ -1111,6 +1196,85 @@ mod tests {
                 wakes,
             ))
         }
+    }
+
+    /// #486: the wait wakes a lead once for a coordination request to its Work that it has
+    /// neither acknowledged nor answered. Another session of the token, the asker, and a request
+    /// already acknowledged are not woken.
+    #[test]
+    fn a_lead_is_woken_once_for_a_request_it_has_not_acknowledged() {
+        use crate::hub::coordination::CoordinationAck;
+        use crate::hub::store::{ForgeIdentity, agent_token_digest, mint_bound_agent_token};
+        use crate::hub::work::WorkStart;
+        let (_dir, store) = temp_store();
+        let now = unix_now();
+        let token = |user_id: i64, login: &str| {
+            let identity = ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id,
+            };
+            let user = store.upsert_user(&identity, login).unwrap();
+            let (_, secret, _) =
+                mint_bound_agent_token(&*store, &user.id, login, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let start = |who: &Principal, key: &str| {
+            let request: WorkStart = serde_json::from_value(serde_json::json!({
+                "request_key": key, "title": key, "session": format!("{key}-session"),
+                "scope": ["src/client_plugin.rs"]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap()
+        };
+        let (lead, asker, other) = (
+            token(601, "releaser"),
+            token(602, "fixer"),
+            token(603, "helper"),
+        );
+        let release = start(&lead, "release").item;
+        let request = start(&asker, "fix").coordination_request.unwrap();
+        let session = release.lead_session.clone();
+        let text = request_wake(&*store, &lead, &session, now)
+            .unwrap()
+            .unwrap();
+        assert!(text.starts_with(REQUEST_FRAME), "{text}");
+        for named in [
+            request.id.as_str(),
+            release.id.as_str(),
+            "src/client_plugin.rs",
+            "fixer's",
+        ] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
+        assert_eq!(request_wake(&*store, &lead, &session, now).unwrap(), None);
+        assert_eq!(
+            request_wake(&*store, &lead, "another-session", now).unwrap(),
+            None
+        );
+        assert_eq!(
+            request_wake(&*store, &asker, "fix-session", now).unwrap(),
+            None
+        );
+        // A second request, acknowledged before any wait, never wakes the lead.
+        let second = start(&other, "help").coordination_request.unwrap();
+        store
+            .coordination_ack(
+                &lead.token_id,
+                &CoordinationAck {
+                    request_id: second.id.clone(),
+                    target_work_id: Some(release.id.clone()),
+                    session: session.clone(),
+                    expected_updated_seq: second.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(request_wake(&*store, &lead, &session, now).unwrap(), None);
     }
 
     #[tokio::test(start_paused = true)]

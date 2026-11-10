@@ -14,6 +14,9 @@ pub const MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN: i64 = 8;
 pub const MAX_COORDINATION_UPDATES: i64 = 500;
 pub const MAX_PROJECTED_COORDINATION_UPDATES: i64 = 128;
 pub const MAX_COORDINATION_REASONS_PER_TARGET: usize = 4;
+/// A request that a live lead has not acknowledged this long after it was made is raised to
+/// that Work's owner. Shorter than a claim going stale, so the lead is still live when it is.
+pub const ACK_BOUND_SECS: i64 = 10 * 60;
 const MAX_NOTE_BYTES: usize = 500;
 
 pub(super) fn is_automatic_request_key(value: &str) -> bool {
