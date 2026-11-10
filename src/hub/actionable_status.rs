@@ -711,7 +711,7 @@ fn setup_actions(
                     work_ids,
                     recipients: vec![viewer.clone()],
                     action: format!(
-                        "Your agent {} {}. {}",
+                        "Your {} {}. {}",
                         crate::hub::advice::sanitize(&problem.agent, 64),
                         problem.reason.what(),
                         problem.reason.next_action()
@@ -759,9 +759,10 @@ fn waiting_actions(
         if wait.reason == WaitReason::Idle && led.is_empty() {
             continue;
         }
-        let brand = match wait.agent.as_str() {
-            "" | "generic" => String::new(),
-            agent => format!(" ({})", crate::hub::advice::agent_name(agent)),
+        // By brand ("your Claude Code"); a generated `client-<hex>` label is never shown.
+        let who = match wait.agent.as_str() {
+            "" | "generic" => crate::hub::advice::agent_name(&wait.name),
+            agent => crate::hub::advice::agent_name(agent),
         };
         let on = led
             .first()
@@ -792,8 +793,8 @@ fn waiting_actions(
             recipients: vec![viewer.clone()],
             needs_you: true,
             action: format!(
-                "Your agent {}{brand} {}{on}.{asks}{asker} Answer it in that session; the Hub cannot answer it for you.",
-                crate::hub::advice::sanitize(&wait.name, 64),
+                "Your {} {}{on}.{asks}{asker} Answer it in that session; the Hub cannot answer it for you.",
+                crate::hub::advice::sanitize(&who, 64),
                 wait.reason.what(),
             ),
             updated_seq: 0,
@@ -1852,7 +1853,31 @@ mod tests {
             Some("quiet-session"),
             observations.epoch(),
         );
-        let status = super::read(store, &observations, &viewer, now).unwrap();
+        // Observations stamp the wall clock, and a read leaves out rows stamped after its time.
+        let read_at = crate::hub::store::unix_now();
+        // Right after MCP verifies, an unseen edit hook is not yet a problem.
+        let early = super::read(store, &observations, &viewer, read_at).unwrap();
+        assert!(
+            !early
+                .actions
+                .iter()
+                .any(|a| a.id.starts_with("setup:edit_hook_unverified:"))
+        );
+        let status = super::read(
+            store,
+            &observations,
+            &viewer,
+            read_at + crate::hub::setup_attention::EDIT_HOOK_GRACE_SECONDS,
+        )
+        .unwrap();
+        assert!(
+            status
+                .actions
+                .iter()
+                .filter(|a| a.kind == "agent_setup")
+                .all(|a| a.action.starts_with("Your Claude Code ")),
+            "needs-you text names the agent by brand"
+        );
         let mut setup_rows = status
             .actions
             .iter()
@@ -2077,7 +2102,7 @@ mod tests {
         assert_eq!(idle.work_ids, vec![work.id.clone()]);
         assert!(
             idle.action
-                .contains("viewer-laptop (Claude Code) finished its turn"),
+                .starts_with("Your Claude Code finished its turn"),
             "{}",
             idle.action
         );

@@ -13,7 +13,7 @@
 3 src/change_capture_client.rs        the capture config file, the recipe file, the agent's settings file as untyped JSON
 1 src/client_cli/computer.rs          the local attention file as untyped JSON
 1 src/client_config.rs                connections.json
-2 src/client_mcp.rs                   JSON-RPC messages as untyped JSON, passed on unchanged
+3 src/client_mcp.rs                  JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged
 2 src/continuity.rs                   rows of the local continuity database
 3 src/demo_cli.rs                     Hub replies and the health file as untyped JSON
 1 src/git_export/remote/network.rs    the Git credential file

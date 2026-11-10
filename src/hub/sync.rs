@@ -1347,20 +1347,20 @@ async fn reconcile_provider_context(
                 stamp,
                 super::provider_context::error_availability(&error),
             ),
-            Ok(_) => match current {
+            Ok(_) => match &current {
                 None => {
                     super::provider_context::unavailable_snapshot(repo, pr, stamp, "unavailable")
                 }
                 Some(current) => match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    super::provider_context::collect(state, conn, repo, token, &current, stamp),
+                    super::provider_context::collect(state, conn, repo, token, current, stamp),
                 )
                 .await
                 {
                     Ok(Ok(snapshot)) => snapshot,
                     result => super::provider_context::unavailable_snapshot(
                         repo,
-                        &current,
+                        current,
                         stamp,
                         if result.is_err() {
                             "timed_out"
@@ -1397,6 +1397,9 @@ async fn reconcile_provider_context(
             Ok(())
         })
         .await?;
+        if let Some(current) = &current {
+            super::skills::observe_open_pull(state, conn, repo, token, current).await;
+        }
         lock(&state.sync.provider_cursors).insert(repo.id.clone(), **number);
     }
     // A generic failed PR read is already replaced above. Without a confirmed grant
@@ -1416,6 +1419,19 @@ async fn reconcile_provider_context(
         .await?;
     }
     Ok(())
+}
+
+/// Label names of a pull request, bounded: at most 32 of at most 100 bytes each.
+fn labels(value: &Value) -> Value {
+    let names: Vec<&str> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label["name"].as_str())
+        .filter(|name| name.len() <= 100 && !name.chars().any(char::is_control))
+        .take(32)
+        .collect();
+    json!(names)
 }
 
 /// Observes a pull request from its API JSON; true when the observation changed.
@@ -1459,7 +1475,8 @@ async fn observe_pull(
         "state": item["state"], "draft": item["draft"].as_bool().unwrap_or(false),
         "repository_id": repo.repository_id,
         "head_ref": item["head"]["ref"], "head_sha": head_sha, "base_ref": item["base"]["ref"],
-        "base_sha": item["base"]["sha"],
+        "base_sha": item["base"]["sha"], "head_repository_id": item["head"]["repo"]["id"],
+        "labels": labels(&item["labels"]),
         "author": {"login": item["user"]["login"], "id": item["user"]["id"]},
         "html_url": item["html_url"],
         "files": files, "files_truncated": truncated});
@@ -1490,12 +1507,14 @@ async fn reread_pull(
     if let Some(pull) = pull.as_ref().filter(|pull| pull["state"] == "open") {
         return observe_pull(state, conn, repo, token, pull, stored.get(&number), started).await;
     }
-    if let Some(pull) = pull.as_ref().filter(|pull| pull["merged"] == true)
-        && let Err(error) =
+    if let Some(pull) = pull.as_ref().filter(|pull| pull["merged"] == true) {
+        if let Err(error) =
             super::catchup_sync::observe(state, conn, repo, token, number, pull).await
-    {
-        super::catchup_sync::unavailable(state, conn, repo).await?;
-        crate::hub::error_envelope::log_internal(&error);
+        {
+            super::catchup_sync::unavailable(state, conn, repo).await?;
+            crate::hub::error_envelope::log_internal(&error);
+        }
+        super::skills::observe_merge(state, conn, repo, token, pull).await;
     }
     let data = match &pull {
         None => json!({"number": number, "state": "gone", "merged": false}),

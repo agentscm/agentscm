@@ -212,6 +212,8 @@ pub struct Pull {
     pub head_repo: Option<Option<i64>>,
     /// Overrides `base.repo.id`, which is otherwise the repository's own.
     pub base_repo_id: Option<i64>,
+    /// Label names, reported as `labels: [{"name": …}]`.
+    pub labels: Vec<String>,
 }
 
 impl Pull {
@@ -235,6 +237,7 @@ impl Pull {
             body: String::new(),
             head_repo: None,
             base_repo_id: None,
+            labels: Vec::new(),
         }
     }
 }
@@ -347,6 +350,8 @@ pub struct FakeState {
     pub users: HashMap<String, (String, i64, BTreeSet<i64>)>,
     /// The first entry whose `path_contains` matches a request is consumed and answered.
     pub fail: VecDeque<Failure>,
+    /// Repository permission by login, for `collaborators/{login}/permission`; others are 404.
+    pub collaborator_permissions: HashMap<String, String>,
     /// Answer the actions and deployments lists with 200 and an empty object, no array.
     pub arrayless_external_lists: bool,
     /// Answer every GET whose path contains this with 200 and an empty object, no array.
@@ -719,6 +724,7 @@ fn pull_json(ctx: &Ctx, repo: &Repo, p: &Pull) -> Value {
         "head": {"ref": p.head_ref, "sha": p.head_sha, "repo": head_repo},
         "base": {"ref": p.base_ref, "sha": repo.branches.iter().find(|b| b.name == p.base_ref).map(|b| &b.sha), "repo": repo_ref(p.base_repo_id.unwrap_or(repo.id))},
         "user": {"login": p.author_login, "id": p.author_id},
+        "labels": p.labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
         "updated_at": p.updated_at,
         "html_url": format!("{}/{}/pull/{}", ctx.base, repo.full_name, p.number),
     })
@@ -1457,8 +1463,39 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .get(&(id, sha.to_string()))
                         .cloned()
                         .unwrap_or_default();
+                    let total = rows.len();
                     let (page, link) = paginate(ctx, uri, &query, rows);
-                    reply(200, &link, Some(json!({"check_runs":page})))
+                    reply(
+                        200,
+                        &link,
+                        Some(json!({"total_count": total, "check_runs": page})),
+                    )
+                }
+                (&Method::GET, ["collaborators", login, "permission"]) => {
+                    match state.collaborator_permissions.get(*login) {
+                        Some(permission) => json_reply(200, json!({"permission": permission})),
+                        None => not_found(),
+                    }
+                }
+                (&Method::GET, ["commits", sha, "status"]) => {
+                    let repo = &state.repos[&id];
+                    let mut seen = std::collections::BTreeSet::new();
+                    let latest: Vec<Value> = repo
+                        .statuses
+                        .iter()
+                        .rev()
+                        .filter(|(at, v)| at == sha && seen.insert(v["context"].to_string()))
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    let state = if latest.iter().any(|v| v["state"] != "success") {
+                        "pending"
+                    } else {
+                        "success"
+                    };
+                    json_reply(
+                        200,
+                        json!({"state": state, "total_count": latest.len(), "statuses": latest}),
+                    )
                 }
                 (&Method::GET, ["commits", sha, "statuses"]) => {
                     let repo = &state.repos[&id];

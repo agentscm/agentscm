@@ -1,5 +1,6 @@
-//! Private deterministic status queries and opt-in action reminders. No Slack message text is
-//! retained. Jobs bind an exact configured identity and re-read their facts before every send.
+//! Private deterministic status queries, opt-in action reminders and the weekly digest's jobs
+//! (built in `digest.rs`). No Slack message text is retained. Jobs bind an exact configured
+//! identity and re-read their facts before every send.
 use super::*;
 use crate::hub::work::{WorkItem, WorkState};
 use crate::hub::work_http::actionable_status::{self, ActionableStatus, StatusState};
@@ -79,7 +80,7 @@ pub(super) fn initialize(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS status_maintenance (binding TEXT PRIMARY KEY, last_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS status_resolution_pending (episode TEXT PRIMARY KEY);
         UPDATE status_jobs SET state='queued' WHERE state='sending';")?;
-    Ok(())
+    super::digest::initialize(db)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -381,6 +382,11 @@ impl Slack {
                 }
             }
         }
+        // A busy store only delays the weekly digest: the next pass looks again.
+        match self.queue_digests(state, now) {
+            Ok(()) | Err(HubError::Busy) => {}
+            Err(error) => return Err(error),
+        }
         for binding in &self.bindings {
             if !binding.config.reminders.enabled {
                 continue;
@@ -633,6 +639,10 @@ impl Slack {
         if kind == "query" && user != binding.config.slack_user {
             return Err(HubError::Unauthorized);
         }
+        // The weekly digest has its own switches and reads its own facts.
+        if kind == "digest" {
+            return self.prepare_digest_job(state, binding, &principal, (id, user, attempts), now);
+        }
         if kind != "query" && !binding.config.reminders.enabled {
             self.obsolete_status_job(&id)?;
             return Ok(None);
@@ -790,7 +800,7 @@ impl Slack {
         }
         Ok(Some((id, user, payload, attempts)))
     }
-    fn obsolete_status_job(&self, id: &str) -> Result<()> {
+    pub(super) fn obsolete_status_job(&self, id: &str) -> Result<()> {
         self.database()?.execute(
             "UPDATE status_jobs SET state='suppressed' WHERE id=?1 AND state='queued'",
             [id],

@@ -1037,29 +1037,34 @@ struct Machine {
     checkout: TempDir,
 }
 
+/// A checkout of `repo` whose origin is on the fake forge's host.
+fn checkout_of(repo: &str) -> TempDir {
+    let checkout = TempDir::new().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            &format!("http://127.0.0.1/{repo}.git"),
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(checkout.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    checkout
+}
+
 impl Machine {
     fn new(repo: &str) -> Self {
-        let checkout = TempDir::new().unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec![
-                "remote",
-                "add",
-                "origin",
-                &format!("http://127.0.0.1/{repo}.git"),
-            ],
-        ] {
-            let status = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(checkout.path())
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
         Self {
             config: TempDir::new().unwrap(),
             home: TempDir::new().unwrap(),
-            checkout,
+            checkout: checkout_of(repo),
         }
     }
 
@@ -1192,6 +1197,18 @@ impl Mcp {
         self.stdout.read_line(&mut line).unwrap();
         line
     }
+
+    /// One tool call; the reply's result.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.next += 1;
+        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}});
+        writeln!(self.stdin, "{request}").unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()["result"].take()
+    }
 }
 
 impl Drop for Mcp {
@@ -1282,7 +1299,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // The next session connects the checkout and says so in one line, writing no file in it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO}.")),
+        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+            && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
     let connection = machine.connection();
@@ -1381,6 +1399,107 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// A session that starts in one repository and edits another declares its Work in the other:
+/// the MCP server sends the call to the repository of the file it names, under that
+/// repository's token and the session the start hook recorded for this agent host.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
+    const OTHER: &str = "acme/gadgets";
+    const OTHER_ID: i64 = 4343;
+    let env = Env::start("github").await;
+    env.connect_repo(OTHER, OTHER_ID, ALICE);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.insert((OTHER.into(), ALICE), ("write", "write"));
+        fake.levels.insert((OTHER_ID, ALICE), 30);
+        fake.approve = ALICE;
+    }
+    let machine = Machine::new(REPO);
+    let other = checkout_of(OTHER);
+    let other = other.path().canonicalize().unwrap();
+    for root in [machine.root(), other.clone()] {
+        let (ok, _, stderr) = machine.run(&[
+            "--no-telemetry",
+            "client",
+            "connect",
+            "--hub",
+            &env.hub,
+            "--provider",
+            "github",
+            "--root",
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{stderr}");
+    }
+
+    // The start context names the second repository, so the agent knows it is covered.
+    let reply = machine.session_start("native-1");
+    assert!(
+        context(&reply).contains(&format!("Also connected on this computer: {OTHER}.")),
+        "{reply}"
+    );
+
+    // No session and no root in the call: the file's path and the hook's record decide both.
+    let mut mcp = machine.mcp();
+    let file = other.join("src/lib.rs");
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Change the gadget", "paths": [file]}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    let said = started["content"].to_string();
+    assert!(
+        said.contains(&format!("this call went to {OTHER}")),
+        "{said}"
+    );
+    let connections = machine.file("connections.json");
+    let work = |repo: &str| {
+        let token = connections["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connection| connection["repo"] == repo)
+            .unwrap()["owned_token_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let query = agentscm::hub::work::WorkOverviewQuery::default();
+        env.store
+            .work_overview(&token, &query, unix_now())
+            .unwrap()
+            .current
+    };
+    let recorded = work(OTHER);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].title, "Change the gadget");
+    assert_eq!(recorded[0].scope, ["src/lib.rs"]);
+    assert_eq!(recorded[0].lead_session, "native-1");
+    assert!(work(REPO).is_empty());
+
+    // A read reaches the same repository by root; without it the start checkout answers.
+    let there = mcp.call(
+        "agentscm_work_overview",
+        json!({"root": other, "detail": "full"}),
+    );
+    assert!(there.to_string().contains("Change the gadget"), "{there}");
+    let here = mcp.call("agentscm_work_overview", json!({"detail": "full"}));
+    assert!(!here.to_string().contains("Change the gadget"), "{here}");
+
+    // One call cannot declare files of both repositories.
+    let both = mcp.call(
+        "agentscm_start",
+        json!({"task": "Change both", "paths": [machine.root().join("a.rs"), file]}),
+    );
+    assert_eq!(both["isError"], true, "{both}");
+    assert!(
+        both.to_string().contains("Call once per repository"),
+        "{both}"
+    );
+    assert_eq!(work(OTHER).len(), 1);
+    assert!(work(REPO).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4005,6 +4124,85 @@ async fn a_hand_off_is_picked_up_only_by_its_own_persons_agent_start() {
         .unwrap();
     let found = pickup(&env, &alice, &json!(expired.id)).await;
     assert_eq!(found["state"], "expired");
+}
+
+const SKILL_STATUS: &str = "/v1/hub/session/skill-forge-status";
+
+/// A PUT of the skill-status setting from a web page; `csrf` is withheld to play another site.
+async fn put_skill_status(env: &Env, page: &Page, csrf: bool, enabled: bool) -> (u16, Value) {
+    let mut request = browser()
+        .put(format!("{}{SKILL_STATUS}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"repository": REPO, "enabled": enabled}).to_string());
+    if csrf {
+        request = request.header("x-csrf-token", &page.csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn only_a_repository_or_hub_admin_sets_the_skill_status() {
+    let env = Env::start("github").await;
+    let (alice, admin) = (page(&env, ALICE).await, page(&env, ADMIN).await);
+    let read = |page: &Page| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        let path = format!("{SKILL_STATUS}?repository={REPO}");
+        async move { with_cookie(&hub, Method::GET, &path, &cookie, None).await }
+    };
+    // Off by default; a writer sees it but may not change it.
+    let (status, seen) = read(&alice).await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(
+        (seen["enabled"].clone(), seen["can_change"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(put_skill_status(&env, &alice, true, true).await.0, 403);
+    assert_eq!(read(&alice).await.1["enabled"], false);
+
+    // A Hub admin sets and unsets it; without the page's CSRF token nothing changes.
+    assert_eq!(put_skill_status(&env, &admin, false, true).await.0, 403);
+    let (status, set) = put_skill_status(&env, &admin, true, true).await;
+    assert_eq!(
+        (status, set["enabled"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+    assert_eq!(read(&alice).await.1["enabled"], true);
+    assert_eq!(
+        put_skill_status(&env, &admin, true, false).await.1["enabled"],
+        false
+    );
+
+    // A repository admin may change it too.
+    env.role(ALICE, "admin", "admin", 50);
+    let (status, set) = put_skill_status(&env, &alice, true, true).await;
+    assert_eq!(
+        (status, set["can_change"].clone()),
+        (200, json!(true)),
+        "{set}"
+    );
+
+    // No agent or read-only token writes it.
+    for read_only in [false, true] {
+        let (_, secret) = agent_for(&env, &alice.id, "skill-status", read_only);
+        let response = browser()
+            .put(format!("{}{SKILL_STATUS}", env.hub))
+            .bearer_auth(&secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"repository": REPO, "enabled": false}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401, "read_only={read_only}");
+    }
+    assert_eq!(read(&alice).await.1["enabled"], true);
 }
 
 const DISMISSALS: &str = "/v1/hub/session/dismissals";

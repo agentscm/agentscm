@@ -13,6 +13,8 @@ pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod digest;
+pub mod digest_http;
 pub mod dismissals;
 pub mod error_envelope;
 pub mod external_runs;
@@ -147,8 +149,14 @@ impl fmt::Display for HubError {
             Self::Busy => write!(f, "busy"),
             Self::WorkCapacity(capacity) => write!(
                 f,
-                "capacity reached: {}; operator action required",
-                capacity.limit.what()
+                "capacity reached: {} (limit {}; {})",
+                capacity.limit.what(),
+                capacity.limit.as_str(),
+                if capacity.limit.agent_remedy().is_some() {
+                    "the refused agent can clear it"
+                } else {
+                    "operator action required"
+                }
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {
@@ -213,8 +221,9 @@ const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
 
 /// Applies the operator `work compact` to every repository scope with history older than
 /// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
-/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
-/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+/// results and how many scopes were skipped: refused by a guard or the store stayed busy. An open
+/// delivery the pass would cut is ended, not a reason to skip, so a busy repository still
+/// compacts. Each scope is a separate bounded store call.
 pub async fn compact_work_history(
     state: &HubState,
     now: i64,
@@ -482,6 +491,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())

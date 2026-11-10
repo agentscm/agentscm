@@ -48,6 +48,7 @@ mod client_config;
 mod client_mcp;
 #[cfg(unix)]
 mod client_plugin;
+mod client_session;
 #[cfg(unix)]
 mod client_setup;
 mod client_status;
@@ -58,6 +59,7 @@ mod continuity_cli;
 #[cfg(unix)]
 mod continuity_remote;
 mod demo_cli;
+mod digest_cli;
 mod distribution;
 #[cfg(unix)]
 mod git_collisions_cli;
@@ -334,6 +336,11 @@ enum Command {
     Work {
         #[command(subcommand)]
         command: work_cli::WorkCommand,
+    },
+    /// Read your stale unfinished Work and repeated collisions, and switch its weekly delivery.
+    Digest {
+        #[command(subcommand)]
+        command: digest_cli::DigestCommand,
     },
     /// Read durable promises and submit advisory agent proposals or reports.
     Promise {
@@ -1061,6 +1068,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::IntentReview(args) => print_json(&intent_review_cli::run(args)?),
         Command::Why(args) => print_json(&why_cli::run(args).await?),
         Command::Work { command } => work_cli::run(command).await?,
+        Command::Digest { command } => digest_cli::run(command).await?,
         Command::Promise { command } => promise_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
         Command::Quickstart(args) => {
