@@ -46,6 +46,39 @@ impl<'a> Contested<'a> {
     }
 }
 
+/// Whether a holder's `specs` overlap any of a pull request's `files`, and whether the scan was
+/// cut short. Every overlapping file found goes into `overlapping`. Finding the first one
+/// spends `comparisons`; listing the rest spends `listing`, so a spent listing budget never
+/// stops a later holder from being found.
+fn held_files<'a>(
+    files: impl Iterator<Item = &'a str>,
+    specs: &[String],
+    comparisons: &mut usize,
+    listing: &mut usize,
+    overlapping: &mut BTreeSet<&'a str>,
+) -> (bool, bool) {
+    let mut hit = false;
+    for file in files {
+        for spec in specs {
+            let spent = if hit {
+                &mut *listing
+            } else {
+                &mut *comparisons
+            };
+            *spent += 1;
+            if *spent > COMPARISONS {
+                return (hit, true);
+            }
+            if overlaps(key_of(file), key_of(spec)) {
+                hit = true;
+                overlapping.insert(file);
+                break;
+            }
+        }
+    }
+    (hit, false)
+}
+
 fn action(
     id: String,
     kind: &str,
@@ -426,31 +459,20 @@ pub(super) fn read(
                 )? {
                     continue;
                 }
-                let mut hit = false;
-                'files: for file in files
+                let files = files
                     .iter()
                     .filter_map(Value::as_str)
-                    .filter(|p| !p.chars().any(char::is_control))
-                {
-                    for spec in &intent.paths {
-                        if hit {
-                            listing += 1;
-                        } else {
-                            comparisons += 1;
-                        }
-                        if comparisons > COMPARISONS {
-                            limits.insert("conflict_comparison_limit".into());
-                        }
-                        if comparisons > COMPARISONS || listing > COMPARISONS {
-                            rest_unknown = true;
-                            break 'files;
-                        }
-                        if overlaps(key_of(file), key_of(spec)) {
-                            hit = true;
-                            overlapping.insert(file);
-                            break;
-                        }
-                    }
+                    .filter(|p| !p.chars().any(char::is_control));
+                let (hit, cut) = held_files(
+                    files,
+                    &intent.paths,
+                    &mut comparisons,
+                    &mut listing,
+                    &mut overlapping,
+                );
+                rest_unknown |= cut;
+                if comparisons > COMPARISONS {
+                    limits.insert("conflict_comparison_limit".into());
                 }
                 if hit {
                     recipients.insert(intent.owner.id.clone(), recipient(intent));
@@ -507,6 +529,51 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spent_listing_budget_still_finds_the_next_holder() {
+        let specs = ["src/a.rs".to_owned()];
+        let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
+        let (mut comparisons, mut listing) = (0, COMPARISONS);
+        let mut overlapping = BTreeSet::new();
+        // The holder is found with the check budget; listing its other files is cut short.
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &specs,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (true, true)
+        );
+        assert_eq!(comparisons, 1);
+        // The next holder is still found, though the listing budget is spent.
+        let next = ["src/c.rs".to_owned()];
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &next,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (true, false)
+        );
+        assert_eq!(overlapping, BTreeSet::from(["src/a.rs", "src/c.rs"]));
+        // A spent check budget finds nobody and says the scan was cut.
+        comparisons = COMPARISONS;
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &next,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (false, true)
+        );
+    }
 
     #[test]
     fn equal_length_evidence_changes_beyond_sixteen_mib_change_the_digest() {
