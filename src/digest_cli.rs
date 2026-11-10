@@ -5,6 +5,7 @@ use std::time::Duration;
 use agentscm::Result;
 use agentscm::hub::digest::{DEFAULT_DAYS, WorkDigestV1, render_text};
 use agentscm::hub::digest_http::DigestSettings;
+use agentscm::hub::reply;
 use clap::Subcommand;
 use reqwest::Method;
 use serde_json::json;
@@ -72,12 +73,7 @@ pub async fn run(command: DigestCommand) -> Result<()> {
             let reply = hub
                 .call(Method::GET, &format!("{DIGEST}?days={days}"), None)
                 .await?;
-            if json {
-                println!("{reply}");
-            } else {
-                let digest: WorkDigestV1 = serde_json::from_value(reply)?;
-                println!("{}", render_text(&digest));
-            }
+            reply::print::<WorkDigestV1>(&reply, json, render_text)?;
             return Ok(());
         }
         DigestCommand::Settings { json } => (hub.call(Method::GET, SETTINGS, None).await?, json),
@@ -93,12 +89,7 @@ pub async fn run(command: DigestCommand) -> Result<()> {
             (hub.call(Method::PUT, &path, Some(body)).await?, false)
         }
     };
-    if as_json {
-        println!("{reply}");
-    } else {
-        let settings: DigestSettings = serde_json::from_value(reply)?;
-        println!("{}", settings_text(&settings));
-    }
+    reply::print::<DigestSettings>(&reply, as_json, settings_text)?;
     Ok(())
 }
 
