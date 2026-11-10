@@ -3704,6 +3704,7 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
             default_branch: Some("main".into()),
             observed_at: unix_now(),
             reported_by: None,
+            local_skills: None,
         }
     };
     env.store.skill_adoption_put(&pinned(None)).unwrap();

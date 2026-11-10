@@ -1533,7 +1533,7 @@ pub fn admit(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";

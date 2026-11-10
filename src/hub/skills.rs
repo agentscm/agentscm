@@ -418,20 +418,34 @@ struct Report {
     local: Vec<supported::LocalBundle>,
 }
 
+/// Most bytes the stored repository skills take, as the `local_skills` column allows.
+const MAX_LOCAL_JSON: usize = 2 * 1024 * 1024;
+
 /// The stored form of repository skills: only the bundles that validate and that a
-/// `repo_local` pin names, at most `MAX_LOCAL_SKILLS`, or `None` when there are none.
+/// `repo_local` pin names, at most `MAX_LOCAL_SKILLS` and `MAX_LOCAL_JSON` bytes once encoded
+/// (the last bundles are left out, so their pins are unknown), or `None` when there are none.
 fn stored_local(lock: &SkillLock, bundles: Vec<supported::LocalBundle>) -> Option<String> {
     let wanted: BTreeSet<&str> = lock
         .skills
         .iter()
         .filter_map(|p| p.source.repo_local_path())
         .collect();
-    let kept: Vec<supported::LocalBundle> = bundles
+    let mut kept: Vec<supported::LocalBundle> = bundles
         .into_iter()
         .filter(|b| wanted.contains(b.path.as_str()) && b.skill().is_ok())
         .take(supported::MAX_LOCAL_SKILLS)
         .collect();
-    (!kept.is_empty()).then(|| serde_json::to_string(&kept).unwrap_or_default())
+    // Escaping can grow the text; never hand the store a value its bound refuses.
+    loop {
+        let text = serde_json::to_string(&kept).ok()?;
+        if kept.is_empty() {
+            return None;
+        }
+        if text.len() <= MAX_LOCAL_JSON {
+            return Some(text);
+        }
+        kept.pop();
+    }
 }
 
 /// Stores a lock a checkout reported; the forge's own reading, when there is one, still wins.
@@ -1492,7 +1506,8 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/skills", get(library_route))
         .route(
             "/v1/hub/repos/{repo}/skills/adoption",
-            put(adoption_route).layer(DefaultBodyLimit::max(300 * 1024)),
+            // A lock (256 KiB) with up to 8 repository skills of 128 KiB each.
+            put(adoption_route).layer(DefaultBodyLimit::max(1536 * 1024)),
         )
         .route("/v1/hub/repos/{repo}/skills/runs", get(runs_route))
         .route(
@@ -1986,6 +2001,28 @@ pub(super) async fn mcp_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_repository_skills_fit_the_column() {
+        let mut bundle = supported::tests::local_bundle("skills/s.json");
+        let skill = bundle.skill().unwrap();
+        let lock = SkillLock {
+            version: 1,
+            skills: vec![supported::SkillPin::repo_local(&skill, None)],
+        };
+        assert!(stored_local(&lock, vec![bundle.clone()]).is_some());
+        // An unpinned path is not kept.
+        let other = supported::tests::local_bundle("elsewhere.json");
+        assert_eq!(stored_local(&lock, vec![other]), None);
+        // Control characters escape six-fold: a valid 64 KiB procedure of them is kept only
+        // while the encoded total stays within the column's bound.
+        bundle.procedure = "\u{1}".repeat(supported::MAX_LOCAL_FILE_BYTES);
+        let many = vec![bundle; 8];
+        let text = stored_local(&lock, many).expect("some bundles fit");
+        assert!(text.len() <= MAX_LOCAL_JSON);
+        let kept: Vec<supported::LocalBundle> = serde_json::from_str(&text).unwrap();
+        assert!((1..8).contains(&kept.len()), "{}", kept.len());
+    }
 
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
