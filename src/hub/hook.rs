@@ -125,8 +125,8 @@ enum Kind {
     /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
     /// A shell call's start and end keep the lease live while it runs.
     Activity(CallPhase),
-    /// The session stopped to wait for its person; its next call ends the wait. Writes nothing
-    /// to the store and says nothing.
+    /// The session stopped to wait for its person, or on its own background work; its next call
+    /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
     Done,
     Fail(&'static str),
@@ -1382,7 +1382,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             }
             None => call(Kind::Ignore, Shape::Silent),
         },
-        // Paused on its own background work, which will resume it, not on the person.
+        // Paused on its own background work, which will resume it, not on the person: nobody
+        // is asked, but the Work it leads is not quiet.
         // The client sends the count; a legacy hook sends Claude Code's own list.
         Some("Stop")
             if v["background_tasks"].as_u64().is_some_and(|n| n > 0)
@@ -1390,7 +1391,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                     .as_array()
                     .is_some_and(|tasks| !tasks.is_empty()) =>
         {
-            call(Kind::Ignore, Shape::Silent)
+            call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
         Some("Stop") => waiting(WaitReason::Idle),
         Some("PreToolUse") if is_edit(tool) => {
@@ -2139,7 +2140,7 @@ mod tests {
 
     #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
-        use WaitReason::{Idle, Permission, Question};
+        use WaitReason::{Background, Idle, Permission, Question};
         let wait = |agent, v: Value| {
             let call = parse(agent, &v);
             assert_eq!(
@@ -2187,12 +2188,12 @@ mod tests {
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":2}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":[{"id":"b"}]}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
