@@ -309,6 +309,25 @@ pub struct WorkCompaction {
     pub merge_retention_floor: i64,
 }
 
+/// Which open deliveries a compaction ends: those whose event window starts below the first
+/// returned seq, or whose merge window starts below the second. A floor this pass did not raise
+/// returns 0, so a delivery that reads nothing removed keeps paging.
+pub fn delivery_cuts(
+    old_event_floors: [i64; 3],
+    new_event_floors: [i64; 3],
+    old_merge_floor: i64,
+    new_merge_floor: i64,
+) -> (i64, i64) {
+    let raised = |old: i64, new: i64| if new > old { new } else { 0 };
+    (
+        raised(
+            old_event_floors.into_iter().max().unwrap_or(0),
+            new_event_floors.into_iter().max().unwrap_or(0),
+        ),
+        raised(old_merge_floor, new_merge_floor),
+    )
+}
+
 /// A lapsed hold whose scope an admission took. Its lead's branch may hold edits it never pushed;
 /// the Hub cannot see them.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1188,8 +1207,17 @@ pub(super) fn check_work_delivery_page(page: &str) -> Result<()> {
 mod tests {
     use super::{
         WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_ROW_BYTES, check_work_delivery_page,
-        check_work_payload_capacity,
+        check_work_payload_capacity, delivery_cuts,
     };
+
+    #[test]
+    fn compaction_ends_only_deliveries_below_a_raised_floor() {
+        // Nothing raised: no delivery ends.
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 4), (0, 0));
+        // Any raised event floor cuts at the highest new floor; merges are separate.
+        assert_eq!(delivery_cuts([5, 9, 2], [12, 9, 2], 4, 4), (12, 0));
+        assert_eq!(delivery_cuts([5, 9, 2], [5, 9, 2], 4, 7), (0, 7));
+    }
 
     #[test]
     fn overlap_witnesses_bound_dense_scope_expansions() {

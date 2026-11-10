@@ -212,8 +212,9 @@ const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
 
 /// Applies the operator `work compact` to every repository scope with history older than
 /// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
-/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
-/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+/// results and how many scopes were skipped: refused by a guard or the store stayed busy. An open
+/// delivery the pass would cut is ended, not a reason to skip, so a busy repository still
+/// compacts. Each scope is a separate bounded store call.
 pub async fn compact_work_history(
     state: &HubState,
     now: i64,

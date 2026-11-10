@@ -63,6 +63,23 @@ impl CapacityLimit {
             Self::CoordinationUpdates => "one coordination request reached its update cap",
         }
     }
+
+    /// What the refused agent can do itself, or `None` when only the operator can help.
+    pub fn agent_remedy(self) -> Option<String> {
+        use crate::hub::coordination::{
+            MAX_ACTIVE_COORDINATION_REQUESTS, MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER,
+            MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
+        };
+        match self {
+            Self::WorkStorage | Self::MergeObservations => None,
+            Self::CatchupDeliveries => Some("finish and acknowledge your open catch-up deliveries with agentscm_work_catchup_ack, or wait for them to expire".into()),
+            Self::ChangeRecords => Some("finish this Work with agentscm_done and outcome complete, then start new Work for further changes".into()),
+            Self::CoordinationRequests => Some(format!(
+                "at most {MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN} are open per agent token, {MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER} per person and {MAX_ACTIVE_COORDINATION_REQUESTS} per repository; resolve or withdraw your own open requests (agentscm_coordination_inbox lists them; agentscm_coordination_resolve or agentscm_coordination_withdraw ends one), then retry"
+            )),
+            Self::CoordinationUpdates => Some("resolve this coordination request with agentscm_coordination_resolve and open a new one if more coordination is needed".into()),
+        }
+    }
 }
 
 /// The repository whose limit refused, as `agentscm work compact` names it.
