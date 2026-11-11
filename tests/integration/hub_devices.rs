@@ -4745,6 +4745,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     let seen = read().await;
     let session = seen["sessions"][0].clone();
     assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["reach"], "next_step", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4780,6 +4781,10 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(status, 201, "{message}");
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
+    // Due ten minutes after it was sent, as a session reached at its next step is.
+    let sent_at = message["created_at"].as_i64().unwrap();
+    assert_eq!(message["deadline_at"], sent_at + 600, "{message}");
+    assert_eq!(message["not_picked_up"], false, "{message}");
 
     // A call that names no session never takes it.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
@@ -4798,8 +4803,15 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert!(!text.contains("their yes"), "{text}");
     let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
     assert!(!again.contains(&id), "{again}");
-    assert_eq!(read().await["messages"][0]["state"], "delivered");
-    assert_eq!(read().await["messages"][0]["via"], "mcp");
+    let delivered = read().await["messages"][0].clone();
+    assert_eq!(delivered["state"], "delivered", "{delivered}");
+    assert_eq!(delivered["via"], "mcp", "{delivered}");
+    assert!(delivered["delivered_at"].as_i64().unwrap() >= sent_at);
+    assert_eq!(
+        delivered["read_at"],
+        Value::Null,
+        "only an answer is a read"
+    );
 
     // Its hook's start carries no subagent marker, and that hook cannot carry context.
     let response = browser()
@@ -4848,7 +4860,12 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
         "{verified}"
     );
     mcp_call(&env, &alice_secret, "tools/call", answer("done")).await;
-    assert_eq!(read().await["messages"][0]["state"], "done");
+    let done = read().await["messages"][0].clone();
+    assert_eq!(done["state"], "done", "{done}");
+    let (read_at, done_at) = (done["read_at"].as_i64(), done["done_at"].as_i64());
+    assert!(read_at.is_some() && done_at >= read_at, "{done}");
+    assert_eq!(done["via"], "mcp", "the first delivery's way stays");
+    assert_eq!(done["not_picked_up"], false, "{done}");
 
     // A hook client gets it in the next prompt's added context, with no tool call.
     let hook = |session: &str, subagent: bool| {
@@ -4949,6 +4966,125 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 400);
+}
+
+/// How a message reaches each session, from what its own calls showed: woken soon only while a
+/// Codex waiter's wait is open, at its next step once that wait delivered, ended from its
+/// `SessionEnd` hook until its next own call.
+#[tokio::test]
+async fn a_session_reads_as_woken_only_while_its_waiter_waits() {
+    let env = Env::start("github").await;
+    let alice = page(&env, ALICE).await;
+    let (alice_token, alice_secret) = agent_for(&env, &alice.id, "laptop", false);
+    let list = format!("{AGENT_MESSAGES}?repository={REPO}");
+    let read = || {
+        let (hub, cookie, list) = (env.hub.clone(), alice.cookie.clone(), list.clone());
+        async move { with_cookie(&hub, Method::GET, &list, &cookie, None).await.1 }
+    };
+    let reach = |page: &Value, hook: Option<&str>| {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["hook"].as_str() == hook)
+            .map(|s| (s["session"].clone(), s["reach"].clone()))
+    };
+    let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+    let waiting = tokio::spawn(async move {
+        let response = browser()
+            .post(format!("{hub}/v1/hub/agent-messages/wait"))
+            .bearer_auth(secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"session": "c1", "agent": "codex"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    });
+    let mut seen = Value::Null;
+    for _ in 0..100 {
+        seen = read().await;
+        if reach(&seen, None).is_some_and(|(_, r)| r == "wake_soon") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (c1, now) = reach(&seen, None).expect("the waiting session is listed");
+    assert_eq!(now, "wake_soon", "{seen}");
+    assert_eq!(seen["sessions"][0]["waker"], "codex", "{seen}");
+
+    // Taken by the open wait, recorded as the Codex waker's, due five minutes after it was sent.
+    let note = json!({"repository": REPO, "token": alice_token, "session": c1, "note": "Wake up"});
+    let (status, message) = page_post(&env, &alice, true, AGENT_MESSAGES, note).await;
+    assert_eq!(status, 201, "{message}");
+    let sent_at = message["created_at"].as_i64().unwrap();
+    assert_eq!(message["deadline_at"], sent_at + 300, "{message}");
+    let (status, text) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains(message["id"].as_str().unwrap()), "{text}");
+    let page = read().await;
+    assert_eq!(page["messages"][0]["via"], "wake:codex", "{page}");
+    assert_eq!(
+        reach(&page, None).map(|(_, r)| r),
+        Some(json!("next_step")),
+        "it woke its session and stopped waiting: {page}"
+    );
+
+    // A Claude Code session's own end, then its own next prompt.
+    let hook = |event: &str| {
+        let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+        let body = json!({"hook_event_name": event, "session_id": "h1", "prompt": "hi"});
+        async move {
+            let response = browser()
+                .post(format!("{hub}/v1/hub/hook/claude"))
+                .bearer_auth(secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+        }
+    };
+    hook("UserPromptSubmit").await;
+    let claude = Some("hook:claude");
+    let (h1, now) = reach(&read().await, claude).unwrap();
+    assert_eq!(now, "next_step");
+    // Its waiter waits; then the session ends while that wait is still open.
+    let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+    let waiting = tokio::spawn(async move {
+        let response = browser()
+            .post(format!("{hub}/v1/hub/agent-messages/wait"))
+            .bearer_auth(secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"session": "h1"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        response.status().as_u16()
+    });
+    for _ in 0..100 {
+        if reach(&read().await, claude).is_some_and(|(_, r)| r == "wake_now") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(reach(&read().await, claude).unwrap().1, "wake_now");
+    hook("SessionEnd").await;
+    let page = read().await;
+    assert_eq!(reach(&page, claude).unwrap().1, "ended", "{page}");
+    // A message sent now is not taken by the ended session's wait: it stays queued, due soon.
+    let note = json!({"repository": REPO, "token": alice_token, "session": h1, "note": "Gone"});
+    let (status, message) = page_post(&env, &alice, true, AGENT_MESSAGES, note).await;
+    assert_eq!(status, 201, "{message}");
+    assert_eq!(
+        message["deadline_at"],
+        message["created_at"].as_i64().unwrap() + 120
+    );
+    assert_eq!(waiting.await.unwrap(), 204);
+    assert_eq!(read().await["messages"][0]["state"], "queued");
+    hook("UserPromptSubmit").await;
+    assert_eq!(reach(&read().await, claude).unwrap().1, "next_step");
 }
 
 const APP_SECRET: &str = "example-app-client-secret-0123456789abcdef";

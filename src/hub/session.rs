@@ -1014,7 +1014,16 @@ pub async fn done_pausing_for(
     let token = principal.token_id.clone();
     let via = via.to_owned();
     let end = blocking(state, move || {
-        store.end_session_pausing(&token, session.as_deref(), &via, unix_now())
+        let now = unix_now();
+        // The session's own end hook, not an MCP `done`: a Hub message no longer reaches it.
+        // Best effort, read before the end removes the session's row.
+        if via.starts_with("hook:")
+            && let Some(native) = session.as_deref()
+            && let Ok(name) = store.session_name_for(&token, Some(native), now)
+        {
+            super::agent_messages::note_end(&token, &name);
+        }
+        store.end_session_pausing(&token, session.as_deref(), &via, now)
     })
     .await?;
     if completion_reporting && let Some(item) = end.work.clone() {
