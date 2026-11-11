@@ -1344,6 +1344,10 @@ struct RepositoryQuery {
 #[derive(Serialize)]
 struct Page {
     requests: Vec<Listed>,
+    /// For a connected app: how many repositories the forge could not confirm in time, whose
+    /// requests the list leaves out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchecked: Option<usize>,
 }
 
 /// The person's own page, or a connected app they approved ([`Person`]), lists their requests:
@@ -1376,9 +1380,8 @@ async fn list(
         repository_id,
         unix_now(),
     )?;
-    if !via.hub() && !requests.is_empty() {
-        // An app lists only repositories its person can read now: the forge's role check, kept
-        // for a short while, fails closed.
+    let mut unchecked = None;
+    if !requests.is_empty() {
         let mut ids: Vec<i64> = requests.iter().filter_map(|r| r.repository_id).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -1391,14 +1394,34 @@ async fn list(
             Ok(found)
         })
         .await?;
-        let (readable, _) = super::login::devices::readable(&state, &user, candidates, true).await;
-        requests.retain(|r| {
+        // An app lists only repositories its person can read now: the forge's role check, kept
+        // for a short while, fails closed.
+        let current = if via.hub() {
+            candidates
+        } else {
+            let (readable, missed) =
+                super::login::devices::readable(&state, &user, candidates, true).await;
+            unchecked = (missed > 0).then_some(missed);
             readable
+        };
+        // The agent token keeps the name it was minted under; an answer needs the current one.
+        requests.retain_mut(|r| {
+            match current
                 .iter()
-                .any(|repo| Some(repo.repository_id) == r.repository_id)
+                .find(|repo| Some(repo.repository_id) == r.repository_id)
+            {
+                Some(repo) => {
+                    r.repository.clone_from(&repo.full_name);
+                    true
+                }
+                None => via.hub(),
+            }
         });
     }
-    Ok(Json(Page { requests }))
+    Ok(Json(Page {
+        requests,
+        unchecked,
+    }))
 }
 
 #[derive(Deserialize)]

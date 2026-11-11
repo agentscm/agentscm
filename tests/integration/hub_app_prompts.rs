@@ -263,7 +263,11 @@ async fn a_connected_app_lists_and_answers_its_persons_prompt_and_nothing_else_d
     assert_eq!((status, hidden), (200, json!({"requests": []})));
     let secret = json!({"repository": SECRET, "request_id": secret_id, "decision": "allow"});
     let (status, refused) = call(&hub, Method::POST, ANSWER, &app, Some(secret)).await;
-    assert_eq!(status, 403, "{refused}");
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{refused}"
+    );
     // Another person's app sees none of it and cannot answer it.
     let (status, theirs) = call(&hub, Method::GET, PERMISSIONS, &bobs_app, None).await;
     assert_eq!((status, theirs), (200, json!({"requests": []})));
