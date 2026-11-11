@@ -201,7 +201,7 @@ fn a_start_on_another_persons_issue_is_recorded_once(db: &Db) {
             .observed,
         1
     );
-    // The status page's activity shows it.
+    // The repository events feed carries it.
     let digest = agent_token_digest(&bob.secret).unwrap();
     let principal = store.authenticate(&digest, unix_now()).unwrap().unwrap();
     let activity = store.repository_events(&principal, None, 100).unwrap();
