@@ -3,8 +3,9 @@
 //!
 //! One row is written the first time a session's lead `agentscm_start` names such an issue and is
 //! not admitted: the claim is held, the preflight is not clear, or a takeover was refused. A
-//! helper or reviewer join, a start by `work_id`, a takeover that went through and a start on one
-//! person's own Work (by any of their agents) write nothing. Reads (overview, search, preflight,
+//! helper or reviewer join, a start by `work_id`, a takeover that went through, a start on Work
+//! offered with a handover checkpoint and a start on one person's own Work (by any of their
+//! agents) write nothing. Reads (overview, search, preflight,
 //! planned issues) are not recorded.
 //!
 //! Outcomes are worked out when a row is read, from what the Hub already keeps. `proceeded`: within
@@ -33,16 +34,16 @@ pub(super) struct Seen {
     pub source: ForgeWorkRef,
 }
 
-/// None unless a lead start named a forge source that resolved to unfinished Work whose owner
-/// and lead owner both differ from the caller's owner: one person's two agents are not someone
-/// else.
+/// None unless a lead start named a forge source that resolved to unfinished Work, not offered
+/// for handover, whose owner and lead owner both differ from the caller's owner: one person's two
+/// agents are not someone else.
 pub(super) fn seen(who: &WorkWho, start: &WorkStart, subject: Option<&WorkItem>) -> Option<Seen> {
     let item = subject?;
     let source = start.source.clone()?;
     if who.read_only
         || start.role != WorkRole::Lead
         || start.work_id.is_some()
-        || item.state == WorkState::Finished
+        || matches!(item.state, WorkState::Finished | WorkState::Handover)
         || item.owner == who.owner.id
     {
         return None;

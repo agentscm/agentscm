@@ -125,6 +125,18 @@ fn lead(issue: &str, session: &str) -> WorkStart {
     start(Some(issue), None, session, WorkRole::Lead)
 }
 
+/// The start with a preflight the Hub cannot call clear, so it is refused before `start_in`.
+fn not_clear(mut start: WorkStart) -> WorkStart {
+    start.preflight = Some(WorkPreflightRequest {
+        source_revision: format!("{:040x}", 7),
+        merge_after: 0,
+        merge_through: 0,
+        source_relation_checked: false,
+        checked_merges: Vec::new(),
+    });
+    start
+}
+
 fn hold(store: &dyn Store, who: &Agent, issue: &str, session: &str) -> WorkItem {
     let started = store
         .work_start(&who.token, &lead(issue, session), T0)
@@ -204,15 +216,7 @@ fn a_start_refused_by_its_preflight_is_still_recorded(db: &Db) {
     let store = db.open();
     let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
     hold(&*store, &alice, "7", "sa");
-    let mut checked = lead("7", "sb");
-    checked.preflight = Some(WorkPreflightRequest {
-        source_revision: format!("{:040x}", 7),
-        merge_after: 0,
-        merge_through: 0,
-        source_relation_checked: false,
-        checked_merges: Vec::new(),
-    });
-    let refused = store.work_start(&bob.token, &checked, T0 + 10);
+    let refused = store.work_start(&bob.token, &not_clear(lead("7", "sb")), T0 + 10);
     assert!(
         matches!(refused, Err(HubError::WorkPreflight(_))),
         "{refused:?}"
@@ -238,6 +242,12 @@ fn one_persons_second_agent_is_not_someone_else(db: &Db) {
         .work_start(&alice_two.token, &lead("7", "sa2"), T0 + 10)
         .unwrap();
     assert!(answer.conflict.is_some());
+    // Refused by its preflight, the owner check still decides.
+    let refused = store.work_start(&alice_two.token, &not_clear(lead("7", "sa3")), T0 + 20);
+    assert!(
+        matches!(refused, Err(HubError::WorkPreflight(_))),
+        "{refused:?}"
+    );
     assert!(duplicate_events(&*store).is_empty());
     let block = metrics(&*store, &alice.token, T0 + 30)
         .issues
@@ -293,10 +303,21 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
             T0 + 3,
         )
         .unwrap();
+    // A pickup's first try without takeover_generation is refused, but the Work was offered.
+    let first = store
+        .work_start(&carol.token, &lead("7", "sc"), T0 + 4)
+        .unwrap();
+    assert!(first.conflict.is_some(), "{first:?}");
     let mut take = lead("7", "sc");
     take.takeover_generation = Some(held.generation);
-    let taken = store.work_start(&carol.token, &take, T0 + 4).unwrap();
+    let taken = store.work_start(&carol.token, &take, T0 + 5).unwrap();
     assert!(taken.took_over, "{taken:?}");
+    // Alice still owns the Work; Carol leads it, so Carol's second agent is not someone else.
+    let carol_two = another_token(&*store, &carol.owner, "agent3-b");
+    let again = store
+        .work_start(&carol_two.token, &lead("7", "sc2"), T0 + 6)
+        .unwrap();
+    assert!(again.conflict.is_some(), "{again:?}");
     assert!(duplicate_events(&*store).is_empty());
     assert_eq!(
         metrics(&*store, &carol.token, T0 + 30)
@@ -305,6 +326,13 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
             .observed,
         0
     );
+    // Bob's start is recorded against the lead, not the owner.
+    store
+        .work_start(&bob.token, &lead("7", "sb-again"), T0 + 7)
+        .unwrap();
+    let events = duplicate_events(&*store);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].1["holder"]["login"], "user3");
 }
 
 fn outcomes_follow_what_the_asking_person_did_next(db: &Db) {

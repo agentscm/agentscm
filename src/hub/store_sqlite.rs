@@ -11198,7 +11198,8 @@ impl Store for SqliteStore {
             if let Some(seen) = &seen {
                 let answer = json!("work_preflight_required");
                 duplicate_start_in(&tx, &who, start, seen, answer, now)?;
-                // Only the observation is committed: start_in has not run.
+                // Commit the observation (and the catch-up backfill above, as work_preflight
+                // does); start_in has not run.
                 tx.commit()?;
             }
             return Err(error);

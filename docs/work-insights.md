@@ -132,7 +132,8 @@ session and Work, with a `duplicate_start` activity event. The row keeps the ask
 and person, the holder's Work and person, and the time.
 
 Nothing is recorded for a helper or reviewer join, a start by `work_id`, a takeover that went
-through, or a start on Work you own or lead: two agents of one person are not someone else. Files
+through, a start on Work its lead offered with a handover checkpoint, or a start on Work you own
+or lead: two agents of one person are not someone else. Files
 another person's Work declared are counted as contested edits, not here. Reads (overview, search,
 preflight and planned issues) record nothing, so an agent that read about the other Work and
 stopped is not counted.
@@ -149,8 +150,8 @@ stopped is not counted.
 `observed` is the sum of the four. The outcome is worked out when the metrics are read, not
 stored. `stood_down` is inferred from what the Hub did not see: a session that ended, a hook that
 failed open, or work done without Work or hooks looks the same. It is not counted as resolved.
-None of these counts feed `resolved`, `unresolved` or `dismissed`, and none is turned into time,
-money or a claim that a duplicate was avoided. `coverage.gaps` always says that reads are not
+None of these counts feed `resolved`, `unresolved` or `dismissed`, and none is turned into time
+saved or a claim that a duplicate was avoided. `coverage.gaps` always says that reads are not
 recorded, and says what stood down means when the window has one.
 
 Rows are kept 30 days and at most 1,000 per token, and `partial` is set as for contested edits. A
