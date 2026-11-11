@@ -595,7 +595,7 @@ connected to is not watched, and `provider` is then the token owner's.
 
 ## Hub: requests and replies across versions
 
-The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
+The Hub and the programs that call it are upgraded separately: the `agentscm` commands, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
 
 **The Hub refuses what it does not know.** A request with a field the Hub does not have, or with a value outside the set a field takes, gets `400` with `invalid_request` and changes nothing. The Hub never ignores part of a request, because the ignored part could be the part that mattered. A client must not send a field to a Hub that does not have it yet.
 
@@ -607,7 +607,6 @@ A later Hub can also add a value to a reply field that takes one of a set of val
 |---|---|
 | A command that prints the reply as JSON (`--json`, `work start`, `work transitions`, `promise`) | Prints the reply as the Hub sent it. `work start` also exits non-zero when `item.state` is unknown, because the claim is not confirmed |
 | `work status`, `work recovery` and `skill status` as text | Print the reply as JSON, and on standard error name the field and the value |
-| The menu bar app | Shows the Hub's own text for an unknown state, claim status or recipient kind. Its counts do not change |
 | A client that acts on the whole reply (managed Work, change capture, agent tasks, the hosted workflow client) | Stops with an error that names the field and the value |
 
 If you write your own client, do the same: ignore a field you do not know, and treat a value you do not know as unknown.

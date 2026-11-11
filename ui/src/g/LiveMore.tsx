@@ -77,7 +77,6 @@ const FEATURES: { job: string; icon: string; blurb: string; items: { name: strin
     { name: 'Sign in once per computer', status: 'Experimental', where: 'Setup › Computers', href: '#computers' },
     { name: 'Workspace members and runs', status: 'Experimental', where: 'Setup › Access', href: '#workspace' },
     { name: 'Hub health', status: 'Implemented', where: 'Setup › Hub', href: '#health' },
-    { name: 'Menu-bar companion (macOS)', status: 'Experimental', where: 'Desktop app' },
     { name: 'All repositories', status: 'Experimental', where: 'All repositories', href: '#repositories' },
   ] },
   { job: 'Native source control (opt-in)', icon: 'box', blurb: 'Immutable revisions and gates for teams that turn them on.', items: [

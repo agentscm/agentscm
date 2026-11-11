@@ -1498,7 +1498,7 @@ async fn issue_choices_and_link_mutations_cross_http_and_mcp() {
     assert!(removed["result"]["structuredContent"]["item"]["issue_link"].is_null());
 }
 
-/// The replies the command-line tool, the menu bar app and managed execution read as typed
+/// The replies the command-line tool and managed execution read as typed
 /// values, taken from a live Hub and read as a client reads them after a newer Hub adds to them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clients_read_work_replies_a_newer_hub_adds_to() {

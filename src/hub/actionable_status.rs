@@ -2943,8 +2943,8 @@ mod tests {
         let other_user = person(502, "other");
         let short = token(&other_user, "other-laptop", 60, false);
         let other_work = start(&short, "other-work");
-        // A read-only web or menu-bar token never stands in for an agent token.
-        token(&other_user, "agentscm-tray-attention", 3600, true);
+        // A read-only web token never stands in for an agent token.
+        token(&other_user, "agentscm-read-attention", 3600, true);
         let later = now + 120;
         let theirs = super::read_person(
             store,
@@ -3604,7 +3604,7 @@ mod tests {
 
     /// The #290 cases from a real store: the viewer's paused Work with a stale claim, a request
     /// to it, a request between two other people, and file and pull request crossings with and
-    /// without the viewer. The shared fixture the companion and Hub tests count must match.
+    /// without the viewer. The shared fixture the page and Hub tests count must match.
     fn needs_you_contract(store: &dyn Store) {
         use crate::hub::connection::NewConnection;
         use crate::hub::intent::NewIntent;

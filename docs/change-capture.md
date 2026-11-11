@@ -219,7 +219,7 @@ Linked worktrees each get their own binding and private spool. A checkout counts
 limit of 128 capture bindings; at the limit, followed bindings of worktrees that no longer exist
 are dropped to make room (their spools stay on disk). `unconfigure` and `forget` remove a
 followed binding like any other, and a disabled one is never re-created by the plugin hook;
-re-enabling it from the menu bar or the local page gives it hooks of its own.
+re-enabling it from the local page gives it hooks of its own.
 
 From the plugin hook, capture shares the hook's time: it gives up at 2.5 seconds (4 at session
 start). A target lookup that runs out leaves a sanitized deferred fact instead of the event, and
@@ -243,8 +243,8 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 `effective_mode` (the mode a session starting now captures in; `off` when no hook captures for
 this binding, null when the Hub did not answer) and `session_start`, the sentence that session
 would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not
-`shared-conversation`, this checkout's local setting is what keeps sharing off. The macOS menu-bar companion and the
-Hub page opened from this computer (**Settings → Conversation sharing**) have the same switch per
+`shared-conversation`, this checkout's local setting is what keeps sharing off. The
+Hub page opened from this computer (**Settings → Conversation sharing**) has the same switch per
 checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
 `configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
 some checkout is in `shared-conversation` mode or a binding records a non-default Claude settings
@@ -252,17 +252,17 @@ path (see below); an older binary refuses a version 6 file instead of silently d
 and the file returns to version 5 when neither applies. Downgrading the client after this release is
 unsupported: older binaries cannot read the new session association records.
 
-### One-step setup from the menu bar and the local page
+### One-step setup from the local page
 
-Turning sharing on from either surface calls one library function, `enable_capture`, for a
-checkout that has a current client connection; turning it off calls `set_capture_mode`. All three
-surfaces read the setting through one function, `capture_setting` (configured, enabled, mode, and
+Turning sharing on from the page calls one library function, `enable_capture`, for a
+checkout that has a current client connection; turning it off calls `set_capture_mode`. The page
+and `client status` read the setting through one function, `capture_setting` (configured, enabled, mode, and
 `lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
 copy of it. The page shows the distinct states Not set up (no binding), Off (disabled binding),
 Metadata only, Local only and Shared with Hub.
 
-**Consent is bound to what was shown.** The menu bar app and the page pass the repository and Hub
-they displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
+**Consent is bound to what was shown.** The page passes the repository and Hub
+it displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
 checkout's connection (connections lock, then the capture config lock) and refuse with `this checkout is now connected
 to <repository> on <hub>; refresh and confirm again` if it is not that one, so a checkout
 reconnected to another Hub between the consequences and the click is never shared there. Turning
@@ -270,11 +270,8 @@ sharing off and the `set-mode` and `configure` commands (where you typed the com
 expectation. Whether to create the binding, re-enable it or only change the mode is decided from
 the bindings read under that same lock, so a concurrent `configure` is not overwritten.
 
-The menu bar app asks before it acts. Clicking **Share agent conversations with Hub** only opens
-the status window with the consequences and adds **Confirm: share conversations with <hub>** to
-that checkout's menu; only that item turns sharing on, and it disappears if the checkout, its Hub
-or its mode changes, or after two minutes. Turning sharing off needs no confirmation. The page does the same with its own
-confirmation panel.
+The page asks before it acts: it shows the consequences in a confirmation panel, and only the
+confirmation turns sharing on. Turning sharing off needs no confirmation.
 
 - With an enabled binding it only changes the mode, exactly like `set-mode`.
 - With a disabled binding (after `unconfigure`) it re-enables through the `configure` code path with
@@ -334,8 +331,8 @@ another repository or Hub) also lowers a `shared-conversation` binding for that 
 confirmation. This includes a binding that follows the Hub; its session-start context then names
 `unconfigure` and `forget`, which let the next session follow the repository again. Capture hooks
 and delivery do nothing for a binding whose connection is absent.
-The tray and the page then say "Sharing was set for <hub>; this checkout is now connected to
-<other>" and offer only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
+The page then says "Sharing was set for <hub>; this checkout is now connected to
+<other>" and offers only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
 `export` or delete it yourself. The next enable creates a new spool and new random ids.
 
 What leaves the machine, and when:
@@ -404,12 +401,12 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
 number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
-`client status --check` carries it in the connection's `hub_check` (when the check is valid), the
-menu bar app reads it from there, and the local page's `GET /v1/local/capture` lists it per
-checkout (looked up with the checkout's own agent token and reused for a minute). Both surfaces
-then say "kept N days on <hub>". When the number is unknown (an older Hub, an unreachable or slow
-Hub, or no Hub check yet) they say "kept for as long as the Hub operator sets (30 days unless
-changed)" and never name a number they were not given. The deadline is set when the body
+`client status --check` carries it in the connection's `hub_check` (when the check is valid), and the
+local page's `GET /v1/local/capture` lists it per
+checkout (looked up with the checkout's own agent token and reused for a minute). The page
+then says "kept N days on <hub>". When the number is unknown (an older Hub, an unreachable or slow
+Hub, or no Hub check yet) it says "kept for as long as the Hub operator sets (30 days unless
+changed)" and never names a number it was not given. The deadline is set when the body
 is uploaded. A sweep every ten minutes expires due bodies and deletes their objects, in batches of
 100 until none are due or 30 seconds are spent (the rest waits for the next pass); an object whose
 removal fails is retried after 1 hour, doubling to at most a day, without holding up others. The author

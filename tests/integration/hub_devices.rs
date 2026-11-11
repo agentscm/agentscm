@@ -1480,7 +1480,7 @@ async fn signing_in_again_keeps_connected_checkouts_working() {
         )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
         "{stderr}"
     );
-    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    // The next agent in the checkout is told too.
     let reply = machine.session_start("s2");
     assert!(context(&reply).contains("was not renewed"), "{reply}");
 }
