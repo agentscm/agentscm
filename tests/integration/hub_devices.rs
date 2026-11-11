@@ -4477,9 +4477,9 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
 const PERMISSIONS: &str = "/v1/hub/session/permissions";
 const PERMISSION_ANSWER: &str = "/v1/hub/session/permissions/answer";
 
-/// A person allows or denies a permission prompt their own agent's session waits at: only with
-/// the web sign-in and its CSRF token, only for their own active agent, once, and only while the
-/// session still waits at that prompt.
+/// A person allows or denies a permission prompt their own agent's session waits at: on the web
+/// sign-in only with its CSRF token (a connected app is in `hub_app_prompts`), only for their own
+/// active agent, once, and only while the session still waits at that prompt.
 #[tokio::test]
 async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let env = Env::start("github").await;
