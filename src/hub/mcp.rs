@@ -1649,10 +1649,15 @@ async fn call(
         if let Ok(session) = resolved {
             let moment = super::context_source::Moment::WorkStart;
             let lines = source.lines(moment, principal, &session).await;
-            if let Some(block) = super::context_source::render(&lines)
-                && let Some(content) = value["content"].as_array_mut()
-            {
-                content.push(json!({"type": "text", "text": block}));
+            if let Some(block) = super::context_source::render(&lines) {
+                // A host that gives its agent the structured reply shows no text block, so
+                // the block is in both.
+                if let Some(object) = value["structuredContent"].as_object_mut() {
+                    object.insert("operator_context".into(), json!(block));
+                }
+                if let Some(content) = value["content"].as_array_mut() {
+                    content.push(json!({"type": "text", "text": block}));
+                }
             }
         }
     }

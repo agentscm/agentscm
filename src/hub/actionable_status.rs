@@ -2767,10 +2767,11 @@ mod tests {
         let after = super::read(store, &observations, &viewer, now).unwrap();
         assert_eq!(waits(&viewer, now).len(), 1);
         assert_ne!(after.digest, status.digest);
-        // A host that stops the idle session ends it, which pauses its Work. When the session
-        // resumes and stops for its person again, that wait still reaches them, with what it asks.
+        // A host that stops the idle session ends it; its Work's hold is live, so the Work goes
+        // on. When the session resumes and stops for its person again, that wait still reaches
+        // them, with what it asks.
         assert!(
-            store
+            !store
                 .end_session_pausing(&viewer.token_id, Some("working"), "hook:claude", now)
                 .unwrap()
                 .paused
