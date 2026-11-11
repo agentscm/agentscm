@@ -690,9 +690,10 @@ pub fn agent_tools() -> Value {
     tools(false, &ViewSettings::default(), false, true)
 }
 
-/// Every tool a read-write agent may call, opt-in tools included (`/mcp?tools=all`).
-pub fn all_agent_tools() -> Value {
-    tools(false, &ViewSettings::default(), true, true)
+/// Every tool whose own arguments take `session`: what a Hub released before every tool listed
+/// it accepts `session` on. The local client sends `session` only to these until a Hub lists more.
+pub fn session_agent_tools() -> Value {
+    tool_list(false, &ViewSettings::default(), true, true)
 }
 
 /// Agents are told to pass `session` on every call, so every tool lists it; `try_args` drops it

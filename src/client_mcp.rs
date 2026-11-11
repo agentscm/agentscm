@@ -275,7 +275,8 @@ fn with_root(tools: &mut Value) {
 }
 
 /// The tools that list `session`: every tool on a current Hub, which ignores it where unused.
-/// An older Hub refuses it on a tool that does not list it, so it is sent only where listed.
+/// An older Hub refuses it on a tool that does not list it, so it is sent only where a Hub listed
+/// it or where the tool's own arguments take it.
 fn session_tools(tools: &Value) -> HashSet<String> {
     tools
         .as_array()
@@ -507,7 +508,7 @@ impl Client {
             ancestors: None,
             own_session: None,
             // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
-            session_tools: session_tools(&agentscm::hub::mcp::all_agent_tools()),
+            session_tools: session_tools(&agentscm::hub::mcp::session_agent_tools()),
         })
     }
 
@@ -1620,7 +1621,8 @@ mod tests {
                 "params": {"name": "agentscm_work_transitions", "arguments": {}}});
             hooked.prepare(&mut transitions, None).unwrap();
             assert_eq!(transitions["params"]["arguments"]["session"], "native-1");
-            // A session the agent names itself stands, and every tool this Hub lists it on gets it.
+            // A session the agent names itself stands. A tool whose arguments take none gets none
+            // until a Hub lists `session` on it, since an older Hub refuses it there.
             assert_eq!(
                 session(&mut hooked, json!({"task": "t", "session": "mine"})),
                 "mine"
@@ -1628,7 +1630,7 @@ mod tests {
             let mut status =
                 json!({"method": "tools/call", "params": {"name": "agentscm_work_status"}});
             hooked.prepare(&mut status, None).unwrap();
-            assert_eq!(status["params"]["arguments"]["session"], "native-1");
+            assert_eq!(status["params"].get("arguments"), None);
             // A host with two conversations open cannot say whose call this is.
             client_session::record_under(&records, &host, "native-2").unwrap();
             assert_eq!(session(&mut hooked, json!({"task": "t"})), Value::Null);
@@ -1936,9 +1938,12 @@ mod tests {
     #[test]
     fn every_listed_tool_takes_a_root_and_only_the_first_calls_explain_it() {
         let mut tools = agentscm::hub::mcp::agent_tools();
-        // This Hub lists `session` on every tool; an older one lists it only where it is used.
+        // This Hub lists `session` on every tool; an older one lists it only where it is used,
+        // which is where the client sends it before any Hub has listed its tools.
         let sessions = session_tools(&tools);
         assert!(sessions.contains("agentscm_start") && sessions.contains("agentscm_work_status"));
+        let own = session_tools(&agentscm::hub::mcp::session_agent_tools());
+        assert!(own.contains("agentscm_start") && !own.contains("agentscm_work_status"));
         with_root(&mut tools);
         for tool in tools.as_array().unwrap() {
             let name = tool["name"].as_str().unwrap();
