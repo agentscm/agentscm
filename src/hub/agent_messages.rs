@@ -32,8 +32,9 @@
 //! of the session never does, since none shows that the model read it.
 //!
 //! What each session's client is and what it can receive is kept in memory from its own calls
-//! (MCP `initialize` `clientInfo`, the hook it reports through, the token's label) and lost on a
-//! restart, after which its tier reads as unknown until it calls again.
+//! (MCP `initialize` `clientInfo`, the hook it reports through, the token's label). A stopping
+//! Hub saves it for the next process, each fact with an expiry ([`save`], [`restore`]); a Hub
+//! that dies without stopping loses it, and its sessions read unreachable until they call again.
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
@@ -95,54 +96,57 @@ type Woken = BTreeMap<(String, String, String), i64>;
 static WAITS: Mutex<Waits> = Mutex::new(Waits {
     total: 0,
     per_person: BTreeMap::new(),
-    latest: BTreeMap::new(),
-    next: 0,
+    open: std::collections::BTreeSet::new(),
 });
 
 struct Waits {
     total: usize,
     per_person: BTreeMap<String, usize>,
-    /// The newest wait of each (token, session); an older one for the same session ends.
-    latest: BTreeMap<(String, String), u64>,
-    next: u64,
+    /// The (token, session) each open wait is for: one at a time, so a second waiter can never
+    /// take over a session's wakes.
+    open: std::collections::BTreeSet<(String, String)>,
 }
 
 /// One open wait, counted until it is dropped.
 struct WaitSlot {
     owner: String,
     key: (String, String),
-    id: u64,
     /// It ran to its deadline with nothing for a session still running, so its waiter asks again
     /// at once. One that delivered (its waiter wakes the session and stops), was dropped or whose
     /// session ended leaves no grace.
     asks_again: bool,
 }
 
+/// Why a wait was not opened.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// The Hub or this person holds as many waits as it allows.
+    Full,
+    /// A wait for this session is open already.
+    Waiting,
+}
+
 impl WaitSlot {
-    /// `None` when the Hub or this person already holds as many waits as it allows.
-    fn open(owner: &str, token: &str, session: &str) -> Option<Self> {
+    /// Refused while a wait for the same token and session is open: the first waiter keeps the
+    /// session's wakes, and the second asks again later.
+    fn open(owner: &str, token: &str, session: &str) -> std::result::Result<Self, Refused> {
         let mut waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (token.to_owned(), session.to_owned());
+        if waits.open.contains(&key) {
+            return Err(Refused::Waiting);
+        }
         let held = waits.per_person.get(owner).copied().unwrap_or(0);
         if waits.total >= MAX_WAITS || held >= MAX_WAITS_PER_PERSON {
-            return None;
+            return Err(Refused::Full);
         }
         waits.total += 1;
         waits.per_person.insert(owner.to_owned(), held + 1);
-        waits.next += 1;
-        let (key, id) = ((token.to_owned(), session.to_owned()), waits.next);
-        waits.latest.insert(key.clone(), id);
-        Some(Self {
+        waits.open.insert(key.clone());
+        Ok(Self {
             owner: owner.to_owned(),
             key,
-            id,
             asks_again: false,
         })
-    }
-
-    /// A later wait for the same session took over; this one returns empty.
-    fn replaced(&self) -> bool {
-        let waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
-        waits.latest.get(&self.key) != Some(&self.id)
     }
 }
 
@@ -157,9 +161,7 @@ impl Drop for WaitSlot {
                     waits.per_person.remove(&self.owner);
                 }
             }
-            if waits.latest.get(&self.key) == Some(&self.id) {
-                waits.latest.remove(&self.key);
-            }
+            waits.open.remove(&self.key);
         }
         // Also when the request was dropped mid-wait.
         let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -380,7 +382,7 @@ fn pushed(messages: &mut Vec<Message>, message: Message) {
 }
 
 /// What a session's client is and what it can receive, from its own calls.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Client {
     /// MCP `initialize` `clientInfo.name`.
     pub name: Option<String>,
@@ -473,6 +475,72 @@ type Initialized = BTreeMap<(String, String), (String, String, i64)>;
 /// Per agent token and the proxy's installation id: the last `initialize` `clientInfo`, which
 /// names no session (the endpoint is stateless) until a tool call from the same proxy does.
 static INITIALIZED: Mutex<Initialized> = Mutex::new(BTreeMap::new());
+
+/// Where a stopping Hub leaves its sessions' facts for the process that starts next.
+const SAVED_KEY: &str = "hub.agent_messages.sessions.v1";
+/// A saved fact is believed this long after its session's last call.
+const SAVED_FOR_SECS: i64 = 24 * 60 * 60;
+
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    at: i64,
+    sessions: Vec<SavedSession>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    token: String,
+    session: String,
+    client: Client,
+    /// Past this the fact is dropped, not believed.
+    expires_at: i64,
+}
+
+/// Leaves the sessions' facts in the store for the next Hub process, each with its expiry, so a
+/// restart does not leave every session unreachable until it calls again. Whether a waiter
+/// waits is not saved: a waiter must wait at the next process to count.
+pub(super) fn save(store: &dyn Store, now: i64) -> Result<()> {
+    let sessions = SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|(_, client)| now - client.seen_at < SAVED_FOR_SECS)
+        .map(|((token, session), client)| SavedSession {
+            token: token.clone(),
+            session: session.clone(),
+            client: client.clone(),
+            expires_at: client.seen_at + SAVED_FOR_SECS,
+        })
+        .collect();
+    let text = serde_json::to_string(&Saved { at: now, sessions })
+        .map_err(|_| HubError::Unavailable("session facts encoding failed".into()))?;
+    store.set_setting(SAVED_KEY, &text, "hub")
+}
+
+/// Takes the facts the previous Hub process left when it stopped, once, so a Hub that later dies
+/// without saving does not start from an old list. A fact past its expiry, or from a list dated
+/// after now, is dropped; a session that called this process already keeps what it showed.
+pub(super) fn restore(store: &dyn Store, now: i64) {
+    let Ok(Some(text)) = store.get_setting(SAVED_KEY) else {
+        return;
+    };
+    if text.is_empty() || store.set_setting(SAVED_KEY, "", "hub").is_err() {
+        return;
+    }
+    let Some(saved) = serde_json::from_str::<Saved>(&text)
+        .ok()
+        .filter(|saved| saved.at <= now)
+    else {
+        return;
+    };
+    let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    for fact in saved.sessions.into_iter().take(MAX_SESSIONS) {
+        if fact.expires_at > now {
+            map.entry((fact.token, fact.session)).or_insert(fact.client);
+            bounded(&mut map, |client| client.seen_at);
+        }
+    }
+}
 
 /// Past the cap, drops the entry seen longest ago.
 fn bounded<K: Ord + Clone, V>(map: &mut BTreeMap<K, V>, seen: impl Fn(&V) -> i64) {
@@ -1020,11 +1088,11 @@ pub fn routes() -> Router<HubState> {
 
 /// Returns the first `check` that finds something, rechecking whenever a message is sent in this
 /// process and at least every few seconds (another Hub process may have sent it); `None` at
-/// `deadline` or once `replaced` says a newer wait for the session took over. A busy Hub only
+/// `deadline` or once `stop` says the session ended. A busy Hub only
 /// skips one check.
 async fn waited<F, Fut>(
     deadline: Instant,
-    replaced: impl Fn() -> bool,
+    stop: impl Fn() -> bool,
     mut check: F,
 ) -> Result<Option<String>>
 where
@@ -1036,8 +1104,8 @@ where
         let notified = SENT.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        // Checked before each delivery, so a replaced wait never takes a message.
-        if replaced() {
+        // Checked before each delivery, so a wait for a session that ended never takes a message.
+        if stop() {
             return Ok(None);
         }
         match check().await {
@@ -1069,9 +1137,10 @@ struct WaitBody {
 /// with the notice when one comes, or when a coordination request to Work the session leads
 /// waits for its acknowledgement ([`request_wake`], then [`request_wake_elsewhere`] for Work it
 /// leads with another of its person's tokens; read once per wait), 204 when
-/// neither came in [`WAIT_SECS`] or a newer wait for the
-/// session took over or the session ended, 403 for a token that can never receive one, 410 while
-/// the person's mode is `ignore`, 429 when the Hub or the person holds too many waits. Delivery
+/// neither came in [`WAIT_SECS`] or the session ended, 403 for a token that can never receive one
+/// or the shared `default` session, 409 while another wait for the session is open (refused, not
+/// swapped in), 410 while the person's mode is `ignore`, 429 when the Hub or the person holds too
+/// many waits. Delivery
 /// is [`deliver`], the hook path's own: the same token and session check, marked delivered once,
 /// via `wake:<agent>`.
 async fn wait(
@@ -1099,8 +1168,18 @@ async fn wait(
     if mode == Mode::Ignore {
         return Ok(StatusCode::GONE.into_response());
     }
-    let Some(mut slot) = WaitSlot::open(&principal.owner.id, &principal.token_id, &session) else {
-        return Ok(StatusCode::TOO_MANY_REQUESTS.into_response());
+    // `default` names no one conversation, so a wait under it could wake any of the token's.
+    if session == super::session::DEFAULT_SESSION {
+        return Ok(StatusCode::FORBIDDEN.into_response());
+    }
+    let mut slot = match WaitSlot::open(&principal.owner.id, &principal.token_id, &session) {
+        Ok(slot) => slot,
+        Err(Refused::Full) => return Ok(StatusCode::TOO_MANY_REQUESTS.into_response()),
+        Err(Refused::Waiting) => {
+            return Err(ApiError::new(StatusCode::CONFLICT, "waiter_present").with_message(
+                "Another waiter already waits for this session, so this one is refused, not swapped in. Ask again later.",
+            ));
+        }
     };
     note_wait(&principal.token_id, &session, waker, unix_now());
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
@@ -1109,7 +1188,7 @@ async fn wait(
     let text = waited(
         deadline,
         // A session that ended meanwhile takes nothing: its waiter is leaving.
-        || slot.replaced() || reach_of(&principal.token_id, &session, unix_now()) == Reach::Ended,
+        || reach_of(&principal.token_id, &session, unix_now()) == Reach::Ended,
         || {
             let asks = std::mem::take(&mut requests);
             let (store, principal, session, reported) = (
@@ -2091,7 +2170,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_wait_takes_nothing_for_another_token_person_or_session_or_once_replaced() {
+    async fn a_wait_takes_nothing_for_another_token_person_or_session_or_once_stopped() {
         let (_dir, store) = temp_store();
         sent(&*store, "u1", message("msg_1", unix_now()));
         let deadline = || Instant::now() + Duration::from_secs(WAIT_SECS);
@@ -2103,7 +2182,7 @@ mod tests {
             let check = wake_check(store.clone(), principal(token, owner), session);
             assert_eq!(waited(deadline(), || false, check).await.unwrap(), None);
         }
-        // A wait a newer one replaced never takes the message.
+        // A wait for a session that ended never takes the message.
         let check = wake_check(store.clone(), principal("tok_a", "u1"), "s");
         assert_eq!(waited(deadline(), || true, check).await.unwrap(), None);
         let kept = load(&*store, &messages_key("u1", 7)).unwrap();
@@ -2117,21 +2196,32 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_wait_replaces_the_older_and_each_person_has_a_cap() {
+    fn a_second_wait_for_a_session_is_refused_and_each_person_has_a_cap() {
         let first = WaitSlot::open("u_slots", "tok_a", "s").unwrap();
-        assert!(!first.replaced());
-        let second = WaitSlot::open("u_slots", "tok_a", "s").unwrap();
-        assert!(first.replaced() && !second.replaced());
+        assert_eq!(
+            WaitSlot::open("u_slots", "tok_a", "s").err(),
+            Some(Refused::Waiting),
+            "the first waiter keeps the session"
+        );
+        assert!(
+            WaitSlot::open("u_slots", "tok_b", "s").is_ok(),
+            "another token"
+        );
         drop(first);
-        assert!(!second.replaced(), "the older one ending leaves the newer");
-        drop(second);
+        assert!(
+            WaitSlot::open("u_slots", "tok_a", "s").is_ok(),
+            "free again once the first ends"
+        );
         let held: Vec<_> = (0..MAX_WAITS_PER_PERSON)
             .map(|i| WaitSlot::open("u_cap", "tok_a", &format!("s{i}")).unwrap())
             .collect();
-        assert!(WaitSlot::open("u_cap", "tok_a", "one more").is_none());
-        assert!(WaitSlot::open("u_other", "tok_a", "s").is_some());
+        assert_eq!(
+            WaitSlot::open("u_cap", "tok_a", "one more").err(),
+            Some(Refused::Full)
+        );
+        assert!(WaitSlot::open("u_other", "tok_a", "s").is_ok());
         drop(held);
-        assert!(WaitSlot::open("u_cap", "tok_a", "s").is_some());
+        assert!(WaitSlot::open("u_cap", "tok_a", "s").is_ok());
     }
 
     #[test]
@@ -2190,6 +2280,47 @@ mod tests {
             None
         );
         assert!(Instant::now() >= deadline);
+    }
+
+    /// A restart keeps each session's facts until they expire, never that a waiter waits, and the
+    /// saved list is taken once.
+    #[test]
+    fn session_facts_survive_a_restart_until_they_expire() {
+        let (_dir, store) = temp_store();
+        let now = unix_now();
+        let fresh = ("tok_saved".to_owned(), "s_fresh".to_owned());
+        let old = ("tok_saved".to_owned(), "s_old".to_owned());
+        note_hook(&fresh.0, &fresh.1, "hook:claude", true, true, now);
+        note_hook(
+            &old.0,
+            &old.1,
+            "hook:codex",
+            true,
+            true,
+            now - SAVED_FOR_SECS,
+        );
+        let slot = WaitSlot::open("u_saved", &fresh.0, &fresh.1).unwrap();
+        note_wait(&fresh.0, &fresh.1, Waker::Claude, now);
+        save(&*store, now).unwrap();
+        drop(slot);
+        {
+            let mut map = SESSIONS.lock().unwrap();
+            map.remove(&fresh);
+            map.remove(&old);
+        }
+        restore(&*store, now + 60);
+        let map = SESSIONS.lock().unwrap();
+        let back = map.get(&fresh).expect("a fresh fact comes back");
+        assert_eq!(back.hook.as_deref(), Some("hook:claude"));
+        assert!(back.top_level && back.hook_context);
+        assert_eq!(back.open_waits, 0, "never a waiter");
+        assert_eq!(back.reach(now + 60), Reach::NextStep);
+        assert!(!map.contains_key(&old), "a fact past its expiry is dropped");
+        drop(map);
+        assert_eq!(store.get_setting(SAVED_KEY).unwrap().as_deref(), Some(""));
+        SESSIONS.lock().unwrap().remove(&fresh);
+        restore(&*store, now + 120);
+        assert!(!SESSIONS.lock().unwrap().contains_key(&fresh), "taken once");
     }
 
     #[test]

@@ -159,6 +159,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let waiting = restoring.onboarding.waiting();
         waiting.restore(&*restoring.store, unix_now());
+        super::agent_messages::restore(&*restoring.store, unix_now());
     })
     .await
     .map_err(|_| HubError::Unavailable("startup task failed".into()))?;
@@ -256,15 +257,17 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     Ok(())
 }
 
-/// Saves the waits of sessions for the next Hub process. A failure is logged and costs only
-/// what a Hub that died costs: those sessions read as not known to wait.
+/// Saves the waits of sessions, and how a Hub message reaches each, for the next Hub process. A
+/// failure is logged and costs only what a Hub that died costs: those sessions read as not known
+/// to wait, or as unreachable, until they call again.
 async fn save_waits(state: HubState) {
     let saved = tokio::task::spawn_blocking(move || {
-        let waiting = state.onboarding.waiting();
-        waiting.save(&*state.store, unix_now())
+        let now = unix_now();
+        let waits = state.onboarding.waiting().save(&*state.store, now);
+        [waits, super::agent_messages::save(&*state.store, now)]
     })
     .await;
-    if let Ok(Err(error)) = saved {
+    for error in saved.into_iter().flatten().filter_map(Result::err) {
         crate::hub::error_envelope::log_internal(&error);
     }
 }

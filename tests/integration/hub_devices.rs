@@ -4969,7 +4969,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
 }
 
 /// How a message reaches each session, from what its own calls showed: woken soon only while a
-/// Codex waiter's wait is open, at its next step once that wait delivered, ended from its
+/// Codex waiter's wait is open (a second waiter is refused meanwhile), at its next step once that wait delivered, ended from its
 /// `SessionEnd` hook until its next own call.
 #[tokio::test]
 async fn a_session_reads_as_woken_only_while_its_waiter_waits() {
@@ -5012,6 +5012,28 @@ async fn a_session_reads_as_woken_only_while_its_waiter_waits() {
     let (c1, now) = reach(&seen, None).expect("the waiting session is listed");
     assert_eq!(now, "wake_soon", "{seen}");
     assert_eq!(seen["sessions"][0]["waker"], "codex", "{seen}");
+    // One waiter per session: a second is refused while the first waits, never swapped in; the
+    // shared default session never waits.
+    let again = |session: &str| {
+        let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+        let body = json!({"session": session, "agent": "codex"});
+        async move {
+            let response = browser()
+                .post(format!("{hub}/v1/hub/agent-messages/wait"))
+                .bearer_auth(secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.text().await.unwrap())
+        }
+    };
+    let (status, refused) = again("c1").await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(refused.contains("waiter_present"), "{refused}");
+    assert_eq!(again("default").await.0, 403);
 
     // Taken by the open wait, recorded as the Codex waker's, due five minutes after it was sent.
     let note = json!({"repository": REPO, "token": alice_token, "session": c1, "note": "Wake up"});
