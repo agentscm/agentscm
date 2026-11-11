@@ -3586,17 +3586,17 @@ mod shared_bodies {
             assert!(output.status.success());
         }
 
-        /// Frees the shared bodies upkeep could free once every grace has passed.
+        /// Compacts what the Hub acknowledged and frees the shared bodies upkeep could then free
+        /// once every grace has passed, as upkeep does.
         fn free_bodies(&self) -> usize {
             let later = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64
                 + agentscm::change_capture::spool::BODY_GRACE_SECONDS;
-            agentscm::change_capture::LocalSpool::open(&self.spool)
-                .unwrap()
-                .free_uploaded_bodies(later)
-                .unwrap()
+            let spool = agentscm::change_capture::LocalSpool::open(&self.spool).unwrap();
+            spool.compact_acknowledged(100).unwrap();
+            spool.free_uploaded_bodies(later).unwrap()
         }
 
         fn pending(&self) -> u64 {

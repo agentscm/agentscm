@@ -2473,8 +2473,8 @@ impl LocalSpool {
     /// (`expire_claims`), compacts one page of envelopes the Hub has accepted
     /// (`compact_acknowledged`, which never touches anything unaccepted), and frees one page of
     /// shared bodies the Hub holds (`free_uploaded_bodies`). Answers whether the spool is still
-    /// full afterwards. A failed prune does not stop compaction; its error is returned after
-    /// compaction has run.
+    /// full afterwards. A failed step does not stop the later ones; the first error is returned
+    /// after every step has run.
     pub fn upkeep(&self, now: i64) -> Result<bool> {
         if !self.usage()?.needs_upkeep() {
             return Ok(false);
@@ -2486,12 +2486,18 @@ impl LocalSpool {
         // is skipped.
         let accepted = fs::read_dir(self.root.join("acknowledged"))
             .is_ok_and(|mut entries| entries.next().is_some());
-        if accepted {
-            self.compact_acknowledged(MAX_COMPACTION_PAGE)?;
-        }
-        self.free_uploaded_bodies(now)?;
+        let compacted = if accepted {
+            self.compact_acknowledged(MAX_COMPACTION_PAGE).map(drop)
+        } else {
+            Ok(())
+        };
+        // Runs even when compaction fails: a compaction index at its bound must not keep the
+        // bodies the Hub holds from being freed.
+        let freed = self.free_uploaded_bodies(now);
         pruned?;
         expired?;
+        compacted?;
+        freed?;
         Ok(self.usage()?.is_full())
     }
 
@@ -2686,14 +2692,14 @@ impl LocalSpool {
         }
         let shared = retention == RetentionClassV1::SharedApproved;
         let ledger_path = self.root.join(BODY_LEDGER);
-        // The body ledger exists before the first body it tracks and is never deleted, so without
-        // it no file found here can be freed.
+        // The body ledger exists before the first body it tracks and is only ever moved to
+        // quarantine, which leaves every body untracked, so without it no file found here can be
+        // freed.
         if !shared && found.iter().all(|exists| *exists) && !ledger_path.exists() {
             return Ok(references);
         }
         let _lock = self.lock()?;
-        let ledger_bytes = read_body_ledger(&ledger_path, self.limits.max_total_bytes)?;
-        let ledger = BodyLedger::parse(&ledger_bytes)?;
+        let (ledger_bytes, ledger) = self.load_body_ledger()?;
         let mut new = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut recorded = BTreeSet::<String>::new();
@@ -2748,6 +2754,22 @@ impl LocalSpool {
         Ok(references)
     }
 
+    /// Reads the body ledger; the caller holds the spool lock. A ledger that does not parse is
+    /// moved to quarantine and an empty one takes its place, which is safe: a body the ledger does
+    /// not name is never freed.
+    fn load_body_ledger(&self) -> Result<(Vec<u8>, BodyLedger)> {
+        let path = self.root.join(BODY_LEDGER);
+        let bytes = read_body_ledger(&path, self.limits.max_total_bytes)?;
+        match BodyLedger::parse(&bytes) {
+            Ok(ledger) => Ok((bytes, ledger)),
+            Err(CaptureError::Invalid(_)) => {
+                quarantine_entry(&self.root, &path, BODY_LEDGER)?;
+                Ok((Vec::new(), BodyLedger::default()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Records that the Hub answered 204 to the upload of the shared body `digest` for `work_id`,
     /// the proof `free_uploaded_bodies` needs. Only bodies the ledger tracks are recorded. It
     /// uses the headroom ordinary content cannot, so a full store can still record what frees it.
@@ -2761,8 +2783,7 @@ impl LocalSpool {
         }
         let work = sha256(work_id.as_bytes());
         let _lock = self.lock()?;
-        let ledger_bytes = read_body_ledger(&ledger_path, self.limits.max_total_bytes)?;
-        let ledger = BodyLedger::parse(&ledger_bytes)?;
+        let (ledger_bytes, ledger) = self.load_body_ledger()?;
         if !ledger.shared.contains(digest)
             || ledger.uploaded.contains(&(digest.to_owned(), work.clone()))
         {
@@ -2777,23 +2798,20 @@ impl LocalSpool {
     /// `MAX_BODY_REMOVALS` a pass. A body goes only when all of these hold, checked and removed
     /// under the spool lock: a shared-conversation retain created its file (the ledger's `s`);
     /// nothing ever retained the same bytes as local content (no `l`); nothing retained it for
-    /// `BODY_GRACE_SECONDS`; and every envelope that still holds it, in the outbox or kept whole
-    /// by compaction, belongs to a Work for which the Hub answered 204 to its upload (`r`). An
-    /// acknowledgement alone is not that proof: delivery acknowledges without uploading once a
-    /// binding stops sharing. An envelope compacted to a digest holds no reference any more, so
-    /// nothing on this computer can read or upload its body. Bodies retained before the ledger
-    /// existed are never freed: nothing says whether local content shares their file. Returns
-    /// how many were deleted.
+    /// `BODY_GRACE_SECONDS`; and for every Work an appended event batch declared it for (`d`,
+    /// written before the batch), the Hub answered 204 to its upload (`r`). A body no batch ever
+    /// declared (its append failed or never came) goes after the grace. An acknowledgement alone
+    /// is not proof, and neither is compaction: delivery acknowledges without uploading once a
+    /// binding stops sharing, so a body declared without a 204 stays. Bodies retained before the
+    /// ledger existed are never freed: nothing says whether local content shares their file.
+    /// Returns how many were deleted.
     pub fn free_uploaded_bodies(&self, now: i64) -> Result<usize> {
         let ledger_path = self.root.join(BODY_LEDGER);
         if !ledger_path.exists() {
             return Ok(0);
         }
         let _lock = self.lock()?;
-        let ledger = BodyLedger::parse(&read_body_ledger(
-            &ledger_path,
-            self.limits.max_total_bytes,
-        )?)?;
+        let (_, ledger) = self.load_body_ledger()?;
         let artifacts = self.root.join("artifacts");
         let mut candidates = BTreeSet::new();
         for digest in ledger.shared.difference(&ledger.local) {
@@ -2809,33 +2827,9 @@ impl LocalSpool {
                 candidates.insert(digest.clone());
             }
         }
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-        let state = self.compaction_state()?;
-        let outbox = retained_envelopes(&self.root, self.limits)?;
-        for envelope in outbox.iter().map(|(_, envelope)| envelope).chain(
-            state
-                .entries
-                .values()
-                .filter_map(|compacted| compacted.envelope.as_ref()),
-        ) {
-            let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
-                continue;
-            };
-            let work = sha256(batch.work_id.as_bytes());
-            for artifact in batch
-                .events
-                .iter()
-                .filter_map(|event| event.artifact.as_ref())
-            {
-                if artifact.retention != RetentionClassV1::SharedApproved
-                    || !ledger
-                        .uploaded
-                        .contains(&(artifact.digest.clone(), work.clone()))
-                {
-                    candidates.remove(&artifact.digest);
-                }
+        for declared in &ledger.declared {
+            if !ledger.uploaded.contains(declared) {
+                candidates.remove(&declared.0);
             }
         }
         let removed: BTreeSet<String> = candidates.into_iter().take(MAX_BODY_REMOVALS).collect();
@@ -2849,9 +2843,11 @@ impl LocalSpool {
         for digest in &ledger.local {
             kept.push_str(&format!("l {digest}\n"));
         }
-        for (digest, work) in &ledger.uploaded {
-            if ledger.shared.contains(digest) && !removed.contains(digest) {
-                kept.push_str(&format!("r {digest} {work}\n"));
+        for (tag, facts) in [("d", &ledger.declared), ("r", &ledger.uploaded)] {
+            for (digest, work) in facts {
+                if ledger.shared.contains(digest) && !removed.contains(digest) {
+                    kept.push_str(&format!("{tag} {digest} {work}\n"));
+                }
             }
         }
         // The ledger shrinks before the files go, so a crash between leaves untracked files,
@@ -3107,23 +3103,49 @@ impl LocalSpool {
             };
         }
         // Upkeep frees shared bodies under this lock, so a body retained before it may be gone.
+        // Each tracked body is declared for this batch's Work before the batch is written, so
+        // upkeep keeps it until the Hub has answered 204 for that Work.
+        let mut declared = String::new();
+        let ledger_path = self.root.join(BODY_LEDGER);
+        let mut ledger_bytes = Vec::new();
         if let CaptureEnvelopeV1::EventBatch(batch) = envelope {
-            for artifact in batch
-                .events
-                .iter()
-                .filter_map(|event| event.artifact.as_ref())
-            {
-                if artifact.retention == RetentionClassV1::SharedApproved
-                    && artifact.availability == ContentAvailabilityV1::Local
-                    && !self.root.join("artifacts").join(&artifact.digest).exists()
-                {
-                    return Err(CaptureError::Conflict(
+            let work = sha256(batch.work_id.as_bytes());
+            let mut ledger = None;
+            for artifact in batch.events.iter().filter_map(|event| {
+                event.artifact.as_ref().filter(|artifact| {
+                    artifact.retention == RetentionClassV1::SharedApproved
+                        && artifact.availability == ContentAvailabilityV1::Local
+                })
+            }) {
+                if !self.root.join("artifacts").join(&artifact.digest).exists() {
+                    // A Limit, so the capture hook records a gap for the event.
+                    return Err(CaptureError::Limit(
                         "a conversation body this event names is no longer retained".into(),
                     ));
                 }
+                if ledger.is_none() && ledger_path.exists() {
+                    let (bytes, loaded) = self.load_body_ledger()?;
+                    ledger_bytes = bytes;
+                    ledger = Some(loaded);
+                }
+                let Some(ledger) = ledger.as_mut() else {
+                    continue;
+                };
+                if ledger.freeable(&artifact.digest)
+                    && ledger
+                        .declared
+                        .insert((artifact.digest.clone(), work.clone()))
+                {
+                    declared.push_str(&format!("d {} {work}\n", artifact.digest));
+                }
             }
         }
-        self.reserve_envelope(envelope, bytes.len() as u64, priority)?;
+        self.reserve_envelope(
+            envelope,
+            (bytes.len() as u64).saturating_add(declared.len() as u64),
+            priority,
+        )?;
+        append_body_records(&self.root, &ledger_path, &ledger_bytes, &declared)?;
         atomic_write(&path, &bytes)?;
         Ok(AppendOutcome::Stored)
     }
@@ -7965,11 +7987,13 @@ fn usage_with_outbox(root: &Path) -> Result<(usize, u64, usize)> {
 
 /// The body ledger's facts, one line each: `s DIGEST` a shared-conversation retain created the
 /// body file; `l DIGEST` the same bytes were retained as local content too, so the file is never
-/// freed; `r DIGEST WORK` the Hub answered 204 to its upload for the Work whose id hashes to WORK.
+/// freed; `d DIGEST WORK` an event batch of the Work whose id hashes to WORK named the body;
+/// `r DIGEST WORK` the Hub answered 204 to its upload for that Work.
 #[derive(Default)]
 struct BodyLedger {
     shared: BTreeSet<String>,
     local: BTreeSet<String>,
+    declared: BTreeSet<(String, String)>,
     uploaded: BTreeSet<(String, String)>,
 }
 
@@ -7995,10 +8019,13 @@ impl BodyLedger {
                 ["l", digest] if valid_digest(digest) => {
                     ledger.local.insert((*digest).to_owned());
                 }
-                ["r", digest, work] if valid_digest(digest) && valid_digest(work) => {
-                    ledger
-                        .uploaded
-                        .insert(((*digest).to_owned(), (*work).to_owned()));
+                [tag @ ("d" | "r"), digest, work] if valid_digest(digest) && valid_digest(work) => {
+                    let facts = if *tag == "d" {
+                        &mut ledger.declared
+                    } else {
+                        &mut ledger.uploaded
+                    };
+                    facts.insert(((*digest).to_owned(), (*work).to_owned()));
                 }
                 _ => {
                     return Err(CaptureError::Invalid(

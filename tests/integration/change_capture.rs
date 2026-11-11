@@ -5654,22 +5654,26 @@ fn a_body_the_hub_holds_for_every_work_that_names_it_is_freed_and_never_named_ag
     spool
         .record_body_uploaded("wrk_one", &shared_twice.digest)
         .unwrap();
+    // Retained, but its event was never written: nothing names it.
+    let orphan = retain_shared(&spool, r#"{"prompt":"orphan"}"#);
 
     assert_eq!(
         spool.free_uploaded_bodies(unix_seconds()).unwrap(),
         0,
         "nothing goes inside its grace"
     );
-    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 1);
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 2);
     assert!(spool.read_artifact(&accepted).is_err());
+    assert!(spool.read_artifact(&orphan).is_err());
     assert_eq!(
         spool.read_artifact(&shared_twice).unwrap(),
         br#"{"prompt":"twice"}"#
     );
-    // A batch can no longer name the freed body; retaining it again first makes it whole.
+    // A batch can no longer name the freed body, and the refusal is a Limit, so the capture hook
+    // records a gap; retaining it again first makes it whole.
     assert!(matches!(
         spool.append(&shared_body_batch("accepted:2", "wrk_one", &accepted)),
-        Err(agentscm::change_capture::CaptureError::Conflict(_))
+        Err(agentscm::change_capture::CaptureError::Limit(_))
     ));
     let again = retain_shared(&spool, r#"{"prompt":"accepted"}"#);
     spool
@@ -5682,14 +5686,18 @@ fn a_body_the_hub_holds_for_every_work_that_names_it_is_freed_and_never_named_ag
 }
 
 #[test]
-fn an_acknowledged_body_the_hub_never_answered_for_is_kept() {
-    // Delivery acknowledges without uploading once the binding stops sharing.
+fn an_acknowledged_body_the_hub_never_answered_for_is_kept_after_compaction() {
+    // Delivery acknowledges without uploading once the binding stops sharing, and upkeep then
+    // compacts the envelope to a digest that no longer names the body.
     let temp = TempDir::new().unwrap();
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
     let body = retain_shared(&spool, r#"{"prompt":"not shared any more"}"#);
     let envelope = shared_body_batch("stopped:1", "wrk_fixture", &body);
     spool.append(&envelope).unwrap();
     spool.acknowledge(&envelope).unwrap();
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
+    spool.compact_acknowledged(100).unwrap();
+    assert!(spool.pending(100).unwrap().is_empty());
     assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
     assert!(spool.read_artifact(&body).is_ok());
 }
@@ -5728,6 +5736,33 @@ fn a_body_also_kept_as_local_content_is_never_freed_in_either_order() {
     assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
     assert!(spool.read_artifact(&twin).is_ok());
     assert!(spool.read_artifact(&local_first).is_ok());
+}
+
+#[test]
+fn a_body_ledger_that_cannot_be_read_is_set_aside_and_its_bodies_are_kept() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let before = retain_shared(&spool, r#"{"prompt":"before"}"#);
+    spool
+        .append(&shared_body_batch("ledger:1", "wrk_fixture", &before))
+        .unwrap();
+    spool
+        .record_body_uploaded("wrk_fixture", &before.digest)
+        .unwrap();
+    let ledger = spool.root().join("bodies-v1.log");
+    let mut bytes = b"not a fact\n".to_vec();
+    bytes.extend(fs::read(&ledger).unwrap());
+    fs::write(&ledger, bytes).unwrap();
+
+    // Retains and appends go on; the old ledger goes to quarantine, so its bodies are never freed.
+    let after = retain_shared(&spool, r#"{"prompt":"after"}"#);
+    spool
+        .append(&shared_body_batch("ledger:2", "wrk_fixture", &after))
+        .unwrap();
+    assert_eq!(spool.quarantine(100).unwrap().len(), 1);
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
+    assert!(spool.read_artifact(&before).is_ok());
+    assert!(spool.read_artifact(&after).is_ok());
 }
 
 #[test]
@@ -5779,7 +5814,7 @@ fn a_body_reused_before_upkeep_frees_it_is_kept() {
             &body,
         )) {
             Ok(_) => stored += 1,
-            Err(agentscm::change_capture::CaptureError::Conflict(_)) => {}
+            Err(agentscm::change_capture::CaptureError::Limit(_)) => {}
             Err(error) => panic!("{error}"),
         }
     }
@@ -5791,34 +5826,56 @@ fn a_body_reused_before_upkeep_frees_it_is_kept() {
     assert!(spool.read_artifact(&raced).is_ok());
 }
 
-#[test]
-fn a_store_full_of_uploaded_bodies_becomes_writable_after_upkeep() {
-    let temp = TempDir::new().unwrap();
-    let spool = small_spool(&temp);
-    let mut filled = false;
+/// Fills `spool` with delivered shared bodies, recording the Hub's 204 for each when `uploaded`.
+/// Returns the bodies an event names.
+fn fill_with_delivered_bodies(spool: &LocalSpool, uploaded: bool) -> Vec<ArtifactRefV1> {
+    let mut named = Vec::new();
     for index in 0..100 {
         let Ok(body) = spool.retain_artifact(
             format!(r#"{{"prompt":{index}}}"#).as_bytes(),
             ArtifactMediaV1::Json,
             RetentionClassV1::SharedApproved,
         ) else {
-            filled = true;
             break;
         };
         let envelope = shared_body_batch(&format!("full:{index}"), "wrk_fixture", &body);
         if spool.append(&envelope).is_err() {
-            filled = true;
             break;
         }
         spool.acknowledge(&envelope).unwrap();
-        spool
-            .record_body_uploaded("wrk_fixture", &body.digest)
-            .unwrap();
+        if uploaded {
+            spool
+                .record_body_uploaded("wrk_fixture", &body.digest)
+                .unwrap();
+        }
         // Accepted envelopes go at once, so only bodies fill the store.
         spool.compact_acknowledged(100).unwrap();
+        named.push(body);
     }
-    assert!(filled, "the spool reached its limit");
-    assert!(spool.usage().unwrap().is_full());
+    assert!(
+        spool.usage().unwrap().is_full(),
+        "the spool reached its limit"
+    );
+    named
+}
+
+#[test]
+fn a_store_full_of_bodies_the_hub_never_answered_for_keeps_them_through_upkeep() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    let named = fill_with_delivered_bodies(&spool, false);
+    assert!(!named.is_empty());
+    spool.upkeep(after_grace()).unwrap();
+    for body in &named {
+        assert!(spool.read_artifact(body).is_ok());
+    }
+}
+
+#[test]
+fn a_store_full_of_uploaded_bodies_becomes_writable_after_upkeep() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    fill_with_delivered_bodies(&spool, true);
 
     assert!(!spool.upkeep(after_grace()).unwrap(), "upkeep made room");
     assert!(!spool.usage().unwrap().needs_upkeep());
