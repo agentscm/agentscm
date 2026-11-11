@@ -371,7 +371,7 @@ fn summary(tool: &str, input: &Value) -> String {
         ),
         "apply_patch" => {
             let names: Vec<&str> = patch_files(input)
-                .iter()
+                .into_iter()
                 .filter_map(|(_, file)| Path::new(file).file_name()?.to_str())
                 .collect();
             (
