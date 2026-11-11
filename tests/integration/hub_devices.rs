@@ -5338,7 +5338,7 @@ async fn a_connected_app_is_approved_through_sign_in_consent_and_a_single_use_pk
     let (status, _, page) = authorize_page(&env, &notifier, Some(&cookie)).await;
     assert_eq!(status, 200, "{page}");
     assert!(
-        page.contains("It can read your work")
+        page.contains("It can see which repositories you can read")
             && page.contains("it can't answer for you or change anything")
             && !page.contains("via Slack")
             && !page.contains("allow or deny"),

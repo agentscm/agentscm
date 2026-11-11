@@ -409,7 +409,7 @@ async fn authorize(
              pick one of its \u{201c}don't ask again\u{201d} choices, and send it the reason or answer you give.</li></ul>\
              <p>It can't write code or start your agents itself, or change Work; what it allows, your agent runs.</p>"
         ),
-        None => "<p>It can read your work across the repositories you can read on this Hub, and your agents' \
+        None => "<p>It can see which repositories you can read on this Hub, and read your agents' \
                  permission prompts and questions there; it can't answer for you or change anything.</p>"
             .to_owned(),
     };
