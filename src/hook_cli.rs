@@ -16,6 +16,8 @@ use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_rep
 use crate::{client_config, client_config::Connection};
 
 mod permission;
+#[cfg(unix)]
+mod shell_observation;
 
 const LIMIT: Duration = Duration::from_secs(3);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
@@ -217,6 +219,7 @@ async fn hook(
     // Events only capture needs never reach the Hub's hook.
     let reply = if client_connection
         && CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+        && !observes_shell(agent, &payload)
     {
         fail_open(agent, &payload, None)
     } else {
@@ -322,6 +325,60 @@ fn record_session_route_in(config: &Path, payload: &Value, connection: &Connecti
             &connection.root,
         );
     }
+}
+
+/// A shell tool call of an agent whose before and after events the client observes the working
+/// tree around (Claude Code and Codex). Its failure event is then sent to the Hub too.
+fn observes_shell(agent: &str, payload: &Value) -> bool {
+    matches!(agent, "claude" | "codex")
+        && matches!(
+            payload["hook_event_name"].as_str(),
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        )
+        && agentscm::hub::hook::is_shell_tool(payload["tool_name"].as_str().unwrap_or(""))
+}
+
+/// Stores the working tree before a shell call, or on its end returns what changed in it as the
+/// `observed` field of the Hub payload (none when nothing did). Runs Git, so off the async
+/// threads, and within its own bounded deadline.
+#[cfg(unix)]
+async fn observe_shell(agent: &str, payload: &Value, checkout: &Path) -> Option<Value> {
+    use shell_observation::{POST_DIFF, PRE_SNAPSHOT, post, pre};
+    let config = config_dir().ok()?;
+    let session = session_of(payload)?.to_owned();
+    let id = bounded_string(&payload["tool_use_id"], 256).map(str::to_owned);
+    let before = payload["hook_event_name"] == "PreToolUse";
+    let (agent, checkout) = (agent.to_owned(), checkout.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let git = git_exe();
+        if before {
+            let deadline = Instant::now() + PRE_SNAPSHOT;
+            pre(
+                &config,
+                &agent,
+                &session,
+                id.as_deref(),
+                &checkout,
+                &git,
+                deadline,
+            );
+            return None;
+        }
+        let deadline = Instant::now() + POST_DIFF;
+        post(
+            &config,
+            &agent,
+            &session,
+            id.as_deref(),
+            &checkout,
+            &git,
+            deadline,
+        )
+        .to_json()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
@@ -566,6 +623,12 @@ async fn call_hub(
                 routed.edits.retain(|edit| !conflicted.contains(&edit.path));
                 routed.payload = sanitized_client(&agent, &payload, &routed.edits)?;
                 note = Some(conflict_note(&conflicted));
+            }
+            #[cfg(unix)]
+            if observes_shell(&agent, &payload)
+                && let Some(observation) = observe_shell(&agent, &payload, &routed.checkout).await
+            {
+                routed.payload["observed"] = observation;
             }
             if session_start {
                 // Every connected session says where it coordinates, unless something stops it.

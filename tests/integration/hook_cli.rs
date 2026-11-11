@@ -1062,3 +1062,249 @@ fn a_permission_prompt_is_offered_again_to_a_hub_that_forgot_it() {
     assert_eq!(run.stdout, "{}\n");
     assert_eq!(offers(&seen).len(), 2);
 }
+
+/// A stub Hub that answers every hook with an empty reply.
+#[cfg(unix)]
+fn empty_hub() -> (String, Receiver<Seen>) {
+    serve(|_| (200, json!({})))
+}
+
+#[cfg(unix)]
+fn git_in(root: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.test"])
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+/// One shell tool event for `hook` (`CLAUDE` or `CODEX`); returns the request the Hub saw for it.
+#[cfg(unix)]
+fn shell_event(
+    hook: &[&str],
+    dir: &TempDir,
+    seen: &Receiver<Seen>,
+    root: &std::path::Path,
+    (event, tool, id): (&str, &str, &str),
+    path: &str,
+) -> Option<Value> {
+    let payload = json!({"hook_event_name": event, "session_id": "s1", "cwd": root,
+        "tool_name": tool, "tool_use_id": id,
+        "tool_input": {"command": "echo SYNTHETIC-COMMAND-TEXT > out.txt"},
+        "tool_response": {"stdout": "SYNTHETIC-OUTPUT-TEXT"}});
+    let run = run_with(hook, &[("PATH", path)], dir, payload.to_string().as_bytes());
+    assert_eq!(run.code, Some(0), "{event}");
+    assert!(run.json().is_object());
+    let seen = seen.try_iter().last()?;
+    let text = String::from_utf8_lossy(&seen.body).into_owned();
+    assert!(!text.contains("SYNTHETIC-"), "{text}");
+    Some(serde_json::from_slice(&seen.body).unwrap())
+}
+
+/// A `git` that behaves except that `status`, which a snapshot needs and routing does not,
+/// stalls for eight seconds.
+#[cfg(unix)]
+fn status_stalling_git(dir: &TempDir) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let bin = dir.path().join("status-stall-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("git");
+    let text = format!(
+        "#!/bin/sh\ncase \"$*\" in *status*) /bin/sleep 8;; *) exec {} \"$@\";; esac\n",
+        real.trim()
+    );
+    std::fs::write(&script, text).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin.display().to_string()
+}
+
+#[cfg(unix)]
+fn real_path() -> String {
+    std::env::var("PATH").unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_call_that_writes_a_file_reports_the_path() {
+    for (hook, tool) in [
+        (CLAUDE, "Bash"),
+        (CODEX, "Bash"),
+        (CODEX, "exec_command"),
+        (CODEX, "local_shell"),
+    ] {
+        let dir = home();
+        let (hub, seen) = empty_hub();
+        let root = connected_checkout(&dir, &hub);
+        let path = real_path();
+        shell_event(hook, &dir, &seen, &root, ("PreToolUse", tool, "t1"), &path);
+        std::fs::write(root.join("out.txt"), "x").unwrap();
+        let post = shell_event(hook, &dir, &seen, &root, ("PostToolUse", tool, "t1"), &path)
+            .expect("a post request");
+        assert_eq!(
+            post["observed"],
+            json!({"outcome": "changed", "paths": ["out.txt"], "truncated": false}),
+            "{post}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_commit_made_inside_the_call_reports_its_paths() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    git_in(&root, &["commit", "--allow-empty", "-m", "base", "--quiet"]);
+    let path = real_path();
+    let at = |event| (event, "Bash", "t1");
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse"), &path);
+    std::fs::write(root.join("done.txt"), "x").unwrap();
+    git_in(&root, &["add", "done.txt"]);
+    git_in(&root, &["commit", "-m", "work", "--quiet"]);
+    let post = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse"), &path).unwrap();
+    assert_eq!(post["observed"]["outcome"], "changed", "{post}");
+    assert_eq!(post["observed"]["paths"], json!(["done.txt"]), "{post}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_call_that_changes_nothing_sends_no_observation() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let at = |event| (event, "Bash", "t1");
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse"), &path);
+    let post = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse"), &path).unwrap();
+    assert!(post.get("observed").is_none(), "{post}");
+    assert_eq!(post["hook_event_name"], "PostToolUse");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_post_without_a_pre_is_unknown_and_a_snapshot_is_used_once() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let at = |event, id| (event, "Bash", id);
+    let post = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "t0"), &path).unwrap();
+    assert_eq!(
+        post["observed"],
+        json!({"outcome": "unknown", "reason": "missing_snapshot"})
+    );
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse", "t1"), &path);
+    let first = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "t1"), &path).unwrap();
+    assert!(first.get("observed").is_none(), "{first}");
+    let again = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "t1"), &path).unwrap();
+    assert_eq!(again["observed"]["reason"], "missing_snapshot", "{again}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_call_without_a_tool_use_id_is_unknown() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let payload = json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": root,
+        "tool_name": "Bash", "tool_input": {"command": "true"}});
+    let path = real_path();
+    let run = run_with(
+        CLAUDE,
+        &[("PATH", &path)],
+        &dir,
+        payload.to_string().as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    let seen = seen.try_iter().last().unwrap();
+    let body: Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(
+        body["observed"],
+        json!({"outcome": "unknown", "reason": "no_tool_use_id"})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interleaved_calls_keep_their_own_snapshots() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let at = |event, id| (event, "Bash", id);
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse", "a"), &path);
+    std::fs::write(root.join("one.txt"), "1").unwrap();
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse", "b"), &path);
+    std::fs::write(root.join("two.txt"), "2").unwrap();
+    let b = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "b"), &path).unwrap();
+    assert_eq!(b["observed"]["paths"], json!(["two.txt"]), "{b}");
+    let a = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "a"), &path).unwrap();
+    assert_eq!(a["observed"]["paths"], json!(["one.txt", "two.txt"]), "{a}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stalled_git_after_a_shell_call_is_unknown_within_the_limit() {
+    let warm = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let real = real_path();
+    let at = |event| (event, "Bash", "t1");
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse"), &real);
+    let stalled = status_stalling_git(&dir);
+    let started = Instant::now();
+    let post = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse"), &stalled);
+    assert!(started.elapsed() < Duration::from_millis(4000));
+    let post = post.expect("the Hub still hears of the call");
+    assert_eq!(
+        post["observed"],
+        json!({"outcome": "unknown", "reason": "git_failed"})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_pre_snapshot_is_reported_as_such() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let stalled = status_stalling_git(&dir);
+    let at = |event| (event, "Bash", "t1");
+    shell_event(CLAUDE, &dir, &seen, &root, at("PreToolUse"), &stalled);
+    let post = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse"), &real_path()).unwrap();
+    assert_eq!(
+        post["observed"],
+        json!({"outcome": "unknown", "reason": "pre_snapshot_failed"}),
+        "{post}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_shell_tool_failure_reaches_the_hub() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let at = |tool, id| ("PostToolUseFailure", tool, id);
+    let other = shell_event(CLAUDE, &dir, &seen, &root, at("Edit", "t2"), &path);
+    assert!(other.is_none(), "{other:?}");
+    let shell = shell_event(CLAUDE, &dir, &seen, &root, at("Bash", "t3"), &path).unwrap();
+    assert_eq!(shell["hook_event_name"], "PostToolUseFailure");
+    assert_eq!(shell["observed"]["reason"], "missing_snapshot", "{shell}");
+}
