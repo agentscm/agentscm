@@ -690,12 +690,31 @@ pub fn agent_tools() -> Value {
     tools(false, &ViewSettings::default(), false, true)
 }
 
-/// Every tool a read-write agent may call, opt-in tools included (`/mcp?tools=all`).
-pub fn all_agent_tools() -> Value {
-    tools(false, &ViewSettings::default(), true, true)
+/// Every tool a read-write agent may call, listed before `session` is added to each: its schemas
+/// list `session` only where the tool's arguments take it, as a Hub released before #530 accepts
+/// it. The local client sends `session` only to those until a Hub lists more.
+pub fn session_agent_tools() -> Value {
+    tool_list(false, &ViewSettings::default(), true, true)
 }
 
+/// Agents are told to pass `session` on every call, so every tool lists it; `try_args` drops it
+/// where the tool's arguments have no use for it.
 fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
+    let mut listed = tool_list(read_only, settings, all, skills);
+    for tool in listed.as_array_mut().into_iter().flatten() {
+        if let Some(properties) = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties
+                .entry("session")
+                .or_insert_with(|| json!({"type": "string"}));
+        }
+    }
+    listed
+}
+
+fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
     let session = json!({"type": "string", "description": "Your native session ID (the AgentSCM SessionStart context shows it). Pass it on every call; omitting it is refused while this agent token has more than one hook session or only an idle one."});
     let paths = |description: &str| json!({"type": "array", "items": {"type": "string"}, "description": description});
     let detail = |description: &str| json!({"type": "string", "enum": ["compact", "full"], "default": "compact", "description": description});
@@ -1583,7 +1602,19 @@ pub(super) fn try_args<T: DeserializeOwned>(
         None | Some(Value::Null) => json!({}),
         Some(other) => other.clone(),
     };
-    serde_json::from_value(arguments).map_err(|error| safe_detail(&error.to_string()))
+    let decoded = match T::deserialize(&arguments) {
+        // Every tool lists `session` (see `tools`); one whose arguments do not take it ignores it.
+        // Only that exact refusal retries, so a tool that takes `session` decodes it as before.
+        Err(error) if error.to_string().starts_with("unknown field `session`") => {
+            let mut arguments = arguments;
+            if let Some(map) = arguments.as_object_mut() {
+                map.remove("session");
+            }
+            T::deserialize(&arguments)
+        }
+        decoded => decoded,
+    };
+    decoded.map_err(|error| safe_detail(&error.to_string()))
 }
 
 /// A detail built from the error's kind and the schema's own words only. Serde renders input
@@ -4645,6 +4676,69 @@ mod tests {
         let args: super::StartArgs =
             serde_json::from_value(serde_json::json!({"task": "t", "new_work": true})).unwrap();
         assert!(args.new_work);
+    }
+
+    #[test]
+    fn every_tool_lists_and_accepts_session() {
+        use super::*;
+        for read_only in [false, true] {
+            let tools = tools(read_only, &ViewSettings::default(), true, true);
+            for tool in tools.as_array().unwrap() {
+                assert!(
+                    tool.pointer("/inputSchema/properties/session").is_some(),
+                    "{} does not list session",
+                    tool["name"]
+                );
+            }
+        }
+        fn accepts<T: serde::de::DeserializeOwned>(arguments: serde_json::Value) {
+            let mut arguments = arguments;
+            arguments["session"] = serde_json::json!("native-1");
+            if let Err(detail) = try_args::<T>(Some(&arguments)) {
+                panic!("{}: {detail}", std::any::type_name::<T>());
+            }
+        }
+        use serde_json::json;
+        accepts::<OverviewArgs>(json!({}));
+        accepts::<BriefingArgs>(json!({}));
+        accepts::<CatchupArgs>(json!({}));
+        accepts::<ViewSettingsArgs>(json!({}));
+        accepts::<WorkflowStatusArgs>(json!({"run_id": "r"}));
+        accepts::<WorkInsightArgs>(json!({"work_id": "w"}));
+        accepts::<ChangeRecordArgs>(json!({"work_id": "w"}));
+        accepts::<SharedConversationArgs>(json!({"work_id": "w"}));
+        accepts::<PickerArgs>(json!({}));
+        accepts::<PromiseListArgs>(json!({}));
+        accepts::<PromiseIdArgs>(json!({"promise_id": "p"}));
+        accepts::<PromiseHistoryArgs>(json!({"promise_id": "p"}));
+        accepts::<PromiseProposalArgs>(json!({"operation_id": "o", "repository_id": "r",
+            "original_request": "q", "commitment": "c", "criteria": [], "constraints": []}));
+        accepts::<PromiseReportArgs>(json!({"operation_id": "o", "promise_id": "p",
+            "promise_version": 1, "promise_digest": "d", "repository_id": "r", "summary": "s"}));
+        accepts::<EmptyArgs>(json!({}));
+        accepts::<NarrativePendingArgs>(json!({}));
+    }
+
+    #[test]
+    fn session_is_still_decoded_and_other_unknown_fields_still_refused() {
+        use super::*;
+        let args: CheckArgs = try_args(Some(
+            &serde_json::json!({"paths": ["a"], "session": "native-1"}),
+        ))
+        .unwrap();
+        assert_eq!(args.session.as_deref(), Some("native-1"));
+        // A tool that takes `session` still refuses one of the wrong type.
+        assert!(
+            try_args::<CheckArgs>(Some(&serde_json::json!({"paths": ["a"], "session": 1})))
+                .is_err()
+        );
+        let refused = try_args::<WorkInsightArgs>(Some(
+            &serde_json::json!({"work_id": "w", "session": "s", "sekrit": 1}),
+        ))
+        .err()
+        .unwrap();
+        assert!(refused.starts_with("unknown field"), "{refused}");
+        assert!(!refused.contains("sekrit"));
     }
 
     #[test]
