@@ -2006,8 +2006,8 @@ const KEPT_REPLY: &str = "agentscm_kept_reply";
 /// Cursor says what a reply was (`afterAgentResponse`) apart from the end of its turn (`stop`),
 /// and each hook call is its own process. So the end of the reply and whether the whole of it
 /// asked anything wait on this machine, in a file named by a hash of the conversation, and the
-/// `stop` of the same generation takes them. True for a call that only kept a reply: nothing of
-/// a reply is sent before its turn ends.
+/// `stop` of the same generation takes them. True for every `afterAgentResponse`, kept or not:
+/// nothing of a reply is sent before its turn ends.
 fn keep_reply(config: &Path, payload: &mut Value) -> bool {
     // Only this hook hands a kept reply over: one that came with the payload is not one.
     if let Some(sent) = payload.as_object_mut() {
@@ -2062,16 +2062,24 @@ fn write_kept(path: &Path, value: &Value) {
 }
 
 /// What a Gemini CLI permission prompt is for, from the details it gives its hooks: the command
-/// of a shell call, the file of an edit (never what it writes), the tool and server of an MCP
-/// call, or what a fetch asks. Else the notification's own message.
+/// of a shell call, the file of an edit (never what it writes, and no path outside the session's
+/// folder), the tool and server of an MCP call, or what a fetch asks. Else the notification's
+/// own message.
 fn gemini_prompt_for(payload: &Value) -> Option<String> {
     let details = &payload["details"];
     let text = |key: &str| details[key].as_str().filter(|text| !text.trim().is_empty());
     let what = match details["type"].as_str() {
         Some("exec") => text("command").map(command_head),
+        // Inside the session's folder the path from there, else only the file's name: a path
+        // elsewhere on the machine says where its person keeps things.
         Some("edit") => text("filePath")
-            .or_else(|| text("fileName"))
-            .map(str::to_owned),
+            .and_then(|file| {
+                let inside = Path::new(file)
+                    .strip_prefix(payload["cwd"].as_str()?)
+                    .ok()?;
+                Some(inside.to_str()?.to_owned()).filter(|inside| !inside.is_empty())
+            })
+            .or_else(|| text("fileName").map(str::to_owned)),
         Some("mcp") => text("toolName").map(|tool| match text("serverName") {
             Some(server) => format!("{tool} ({server})"),
             None => tool.to_owned(),
@@ -2989,6 +2997,11 @@ mod tests {
         assert!(!call("sessionEnd", "g5", None).0);
         assert_eq!(call("stop", "g5", None).1, bare);
         assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+        // A kept reply comes only from this hook: one the payload itself carries is dropped.
+        let mut forged = json!({"hook_event_name":"stop","conversation_id":"c1",
+            "agentscm_kept_reply":{"asks":"PRIVATE","asked_nothing":true}});
+        assert!(!keep_reply(config.path(), &mut forged));
+        assert_eq!(sanitized_client("cursor", &forged, &[]).unwrap(), bare);
         // Other events pass untouched, and a reply with no conversation is still not sent.
         let mut edit = json!({"hook_event_name":"postToolUse","conversation_id":"c1"});
         assert!(!keep_reply(config.path(), &mut edit));
@@ -3096,9 +3109,11 @@ mod tests {
         // else its own message; its turn's end is excerpted and judged like Claude Code's.
         let gemini = |v: Value| sanitized_client("gemini", &v, &[]).unwrap();
         let prompt = |details: Value| {
-            gemini(json!({"hook_event_name":"Notification","session_id":"s",
+            gemini(
+                json!({"hook_event_name":"Notification","session_id":"s","cwd":"/r",
                 "notification_type":"ToolPermission","message":"Tool Shell requires execution",
-                "details":details}))
+                "details":details}),
+            )
         };
         assert_eq!(
             prompt(
@@ -3112,7 +3127,11 @@ mod tests {
                 json!({"type":"edit","fileName":"a.rs","filePath":"/r/src/a.rs",
                 "fileDiff":"PRIVATE","newContent":"PRIVATE"})
             )["asks"],
-            "/r/src/a.rs"
+            "src/a.rs"
+        );
+        assert_eq!(
+            prompt(json!({"type":"edit","fileName":"hosts","filePath":"/etc/hosts"}))["asks"],
+            "hosts"
         );
         assert_eq!(
             prompt(json!({"type":"mcp","serverName":"github","toolName":"create_issue"}))["asks"],
@@ -3132,6 +3151,15 @@ mod tests {
             json!({"agent":"gemini","event":"waiting","reason":"idle","session":"s",
                 "asks":"All done. Which branch next?","asked_nothing":false})
         );
+        // The whole reply is judged, not its excerpt: an ask before the cut still counts.
+        let long = format!(
+            "It is your call whether to delete them. {}",
+            "The fix is merged and the tests pass for both stores. ".repeat(12)
+        );
+        let ended = gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
+            "prompt_response":long}));
+        assert!(ended["asks"].as_str().unwrap().starts_with('…'), "{ended}");
+        assert_eq!(ended["asked_nothing"], false);
         // A notification Gemini adds later goes without a reason, which the Hub ignores.
         assert_eq!(
             gemini(json!({"hook_event_name":"Notification","session_id":"s",
