@@ -140,6 +140,7 @@ mod preflight;
 mod repository_rename;
 mod validation_evidence;
 mod work_dependencies;
+mod work_intent;
 mod work_overlap;
 
 fn require_clear_preflight(
@@ -11575,6 +11576,15 @@ impl Store for SqliteStore {
             rows: recovery,
             forge_window_from,
         })
+    }
+
+    fn work_intent(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_intent::WorkIntentV1>> {
+        work_intent::read(self, token, id, now)
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {

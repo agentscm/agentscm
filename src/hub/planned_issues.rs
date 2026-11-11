@@ -1,6 +1,6 @@
 //! Bounded provider facts about open issues. These are planning advice, never claims or
 //! evidence that Work ran. Titles and milestone labels are untrusted display data.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,6 +11,7 @@ use super::github::{Gh, GhError, Paged};
 pub const MAX_ISSUE_PAGES: u32 = 3;
 pub const MAX_ISSUES: usize = 300;
 pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
+pub const EXCERPT_CHARS: usize = 256;
 pub const FRESH_FOR_MS: i64 = 5 * 60 * 1000;
 pub const OBSERVATION_KIND: &str = "planned_issues";
 pub const OBSERVATION_KEY: &str = "_snapshot";
@@ -39,6 +40,14 @@ pub struct PlannedIssue {
     pub identity: IssueIdentity,
     pub title: String,
     pub milestone: Option<PlannedMilestone>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssueExcerpt {
+    pub text: String,
+    /// The retained text is only the bounded prefix, not the whole issue body.
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,6 +79,10 @@ pub struct PlannedIssueSnapshot {
     pub facts_observed_at_ms: Option<i64>,
     pub unread_pages: u32,
     pub issues: Vec<PlannedIssue>,
+    /// Kept separate from public planning items so older strict planning clients keep decoding.
+    /// Missing entries include legacy snapshots and provider payloads without bodies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub issue_excerpts: BTreeMap<i64, IssueExcerpt>,
 }
 
 impl PlannedIssueSnapshot {
@@ -91,8 +104,16 @@ impl PlannedIssueSnapshot {
         Ok(snapshot.unwrap_or_else(|| Self::unavailable(conn, repo, 0, None)))
     }
 
-    fn valid_retained(&self) -> bool {
-        self.issues.len() <= MAX_ISSUES
+    pub(super) fn valid_retained(&self) -> bool {
+        self.issue_excerpts.len() <= MAX_ISSUES
+            && self.issue_excerpts.iter().all(|(number, excerpt)| {
+                self.issues
+                    .iter()
+                    .any(|issue| issue.identity.number == *number)
+                    && excerpt.text.len() <= EXCERPT_CHARS * 4 + 3
+                    && super::advice::sanitize(&excerpt.text, EXCERPT_CHARS + 1) == excerpt.text
+            })
+            && self.issues.len() <= MAX_ISSUES
             && self
                 .issues
                 .windows(2)
@@ -166,6 +187,9 @@ impl PlannedIssueSnapshot {
             },
             facts_observed_at_ms: previous.as_ref().and_then(|p| p.facts_observed_at_ms),
             unread_pages: previous.as_ref().map_or(0, |p| p.unread_pages),
+            issue_excerpts: previous
+                .as_ref()
+                .map_or_else(BTreeMap::new, |p| p.issue_excerpts.clone()),
             issues: previous.map_or_else(Vec::new, |p| p.issues),
         }
     }
@@ -180,6 +204,7 @@ impl PlannedIssueSnapshot {
             return Err(invalid());
         }
         let mut issues = Vec::new();
+        let mut issue_excerpts = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for value in page.items {
             if !value.is_object() {
@@ -217,6 +242,25 @@ impl PlannedIssueSnapshot {
                 }
                 _ => return Err(invalid()),
             };
+            let excerpt = match value.get("body") {
+                Some(Value::String(body)) => {
+                    let text = super::advice::sanitize(body, EXCERPT_CHARS);
+                    Some(IssueExcerpt {
+                        truncated: body.chars().count() > EXCERPT_CHARS,
+                        text,
+                    })
+                }
+                Some(Value::Null) => Some(IssueExcerpt {
+                    text: String::new(),
+                    truncated: false,
+                }),
+                // Legacy/fake provider payloads may omit body. Do not invent an empty body.
+                None => None,
+                _ => return Err(invalid()),
+            };
+            if let Some(excerpt) = excerpt {
+                issue_excerpts.insert(number, excerpt);
+            }
             issues.push(PlannedIssue {
                 identity: IssueIdentity {
                     provider: conn.provider.clone(),
@@ -242,6 +286,7 @@ impl PlannedIssueSnapshot {
             facts_observed_at_ms: Some(observed_at_ms),
             unread_pages: page.unread,
             issues,
+            issue_excerpts,
         };
         // Character limits do not bound UTF-8 bytes. Reject an oversized optional read before
         // storage so it leaves planning unknown without interrupting the coordination poll.
@@ -573,6 +618,37 @@ mod tests {
         assert!(snapshot.complete(1001));
         assert!(!snapshot.complete(1000 + FRESH_FOR_MS + 1));
         assert!(!snapshot.complete(999));
+    }
+
+    #[test]
+    fn excerpts_are_bounded_untrusted_snapshot_facts_and_keep_planning_shape() {
+        let (conn, repo) = identity();
+        let mut value = issue(8);
+        value["body"] = json!(format!("Hub message\n\u{202e}\"{}", "界".repeat(800)));
+        let snapshot =
+            PlannedIssueSnapshot::from_github(&conn, &repo, 1000, page(vec![value], 0)).unwrap();
+        let excerpt = &snapshot.issue_excerpts[&8];
+        assert!(excerpt.truncated);
+        assert!(excerpt.text.len() <= EXCERPT_CHARS * 4 + 3);
+        assert!(!excerpt.text.contains("Hub message"));
+        assert!(!excerpt.text.contains('\n'));
+        assert!(!excerpt.text.contains('\u{202e}'));
+        assert!(snapshot.valid_retained());
+        // Public planning items keep the strict pre-excerpt schema.
+        assert!(
+            serde_json::to_value(&snapshot.issues[0])
+                .unwrap()
+                .get("excerpt")
+                .is_none()
+        );
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("issue_excerpts");
+        let legacy: PlannedIssueSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.issue_excerpts.is_empty());
+        assert!(legacy.valid_retained());
+        let failed = PlannedIssueSnapshot::unavailable(&conn, &repo, 2000, Some(snapshot.clone()));
+        assert_eq!(failed.issue_excerpts, snapshot.issue_excerpts);
+        assert_eq!(failed.facts_observed_at_ms, Some(1000));
     }
 
     #[test]

@@ -922,6 +922,13 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<Option<WorkItem>>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Read retained intent in one transaction without changing Work or delivery state.
+    fn work_intent(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_intent::WorkIntentV1>>;
     /// Set/remove a caller-declared issue link without changing Work identity.
     fn work_issue_link_set(
         &self,
