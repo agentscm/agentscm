@@ -419,11 +419,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// `wake`: its background hook waited in the last 90 seconds ([`Client::reach`] says whether a
-    /// waiter waits now). `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
-    /// its next AgentSCM tool call, as an extra text block in the result. `unknown`: since the
-    /// Hub started, nothing from the session itself, only its subagents' hook calls; copy and
-    /// paste instead.
+    /// `wake`: its background hook waited in the last 90 seconds ([`Client::reach`] says whether
+    /// a waiter waits now). `hook`: delivered at its next prompt or tool call, no tool call
+    /// needed. `mcp`: at its next AgentSCM tool call, as an extra text block in the result.
+    /// `unknown`: since the Hub started, nothing from the session itself, only its subagents'
+    /// hook calls; copy and paste instead.
     pub fn tier(&self, now: i64) -> &'static str {
         let woken = self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS);
         match (self.top_level, self.hook_context) {

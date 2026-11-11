@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::change_capture::redact::redact_json;
 use crate::change_capture::spool::{
     LocalSpool, ManagedInvocationV1, NativeOccurrenceReceiptV1, NativeOccurrenceRouteV1,
-    ProviderHistoryCursorV1,
+    ProviderHistoryCursorV1, limit_gap_reason,
 };
 use crate::change_capture::{
     AppendOutcome, CaptureError, DeferredHookV1, DeferredReasonV1, GitSourceRequest, OpenedGitRoot,
@@ -410,7 +410,7 @@ fn capture_hook_with_identity_mode(
             subagent: None,
         });
     }
-    if retention_missing {
+    if let Some(reason) = retention_missing {
         let gap_id = format!(
             "gap:{}",
             sha256(format!("{event_id}\0local-retention").as_bytes())
@@ -427,7 +427,7 @@ fn capture_hook_with_identity_mode(
             gap: Some(GapFactV1 {
                 first_missing: sequence,
                 last_missing: sequence,
-                reason: GapReasonV1::CaptureInterrupted,
+                reason,
             }),
             boundary: None,
             subagent: None,
@@ -446,7 +446,7 @@ fn capture_hook_with_identity_mode(
     };
     let appended = match append(&envelope) {
         Ok(outcome) => outcome,
-        Err(CaptureError::Limit(_)) => {
+        Err(CaptureError::Limit(message)) => {
             let gap_id = format!(
                 "gap:{}",
                 sha256(format!("{operation_id}\0quota-paused").as_bytes())
@@ -462,7 +462,7 @@ fn capture_hook_with_identity_mode(
                 gap: Some(GapFactV1 {
                     first_missing,
                     last_missing,
-                    reason: GapReasonV1::CaptureInterrupted,
+                    reason: limit_gap_reason(&message),
                 }),
                 boundary: None,
                 subagent: None,
@@ -726,7 +726,11 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
     Ok(())
 }
 
-fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> Result<()> {
+fn record_action_capture_pause(
+    request: &CaptureRequest,
+    reason: GapReasonV1,
+    spool: &LocalSpool,
+) -> Result<()> {
     let event_id = format!(
         "gap:{}",
         sha256(
@@ -750,7 +754,7 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
         gap: Some(GapFactV1 {
             first_missing: sequence,
             last_missing: sequence,
-            reason: GapReasonV1::CaptureInterrupted,
+            reason,
         }),
         boundary: None,
         subagent: None,
@@ -1264,7 +1268,7 @@ fn capture_ordinary_claimed_action(
                 warnings: Vec::new(),
             }),
             Err(CaptureError::Limit(error)) => {
-                let pause = record_action_capture_pause(request, spool);
+                let pause = record_action_capture_pause(request, limit_gap_reason(&error), spool);
                 let warning = match pause {
                     Ok(()) => format!("native action capture paused: {error}"),
                     Err(pause_error) => format!(
@@ -1283,6 +1287,8 @@ fn capture_ordinary_claimed_action(
 
     let Some(start) = spool.action_start(&start_operation_id)? else {
         let event = capture_claimed_event(input, request, claim, "post", false, spool)?;
+        // Both phases are seen and no start can follow, so nothing completes this claim later.
+        spool.remove_managed_invocation(marker_id)?;
         return Ok(NativeHookReport {
             event,
             action: NativeActionOutcome::MissingStart,
@@ -2373,7 +2379,7 @@ pub fn import_jsonl(
             let retained = retain_selected(event, request, spool)?;
             selected.push(retained.event);
             selected.extend(retained.redacted_gap);
-            missing = missing.saturating_add(u64::from(retained.retention_missing));
+            missing = missing.saturating_add(u64::from(retained.retention_missing.is_some()));
         }
     }
     let history_anchor = selected
@@ -2561,7 +2567,8 @@ fn select_line(
 
 struct Retained {
     event: CapturedEventV1,
-    retention_missing: bool,
+    /// The gap reason when the body could not be retained locally.
+    retention_missing: Option<GapReasonV1>,
     /// Present when redaction changed the retained body.
     redacted_gap: Option<CapturedEventV1>,
 }
@@ -2600,18 +2607,21 @@ fn retain_selected(
                 RetentionClassV1::WorkLocal
             };
             match spool.retain_artifact(&bytes, ArtifactMediaV1::Json, retention) {
-                Ok(reference) => (Some(reference), false),
-                Err(_) => (
+                Ok(reference) => (Some(reference), None),
+                Err(error) => (
                     Some(spool.missing_artifact_reference(
                         &bytes,
                         ArtifactMediaV1::Json,
                         RetentionClassV1::WorkLocal,
                     )),
-                    true,
+                    Some(match error {
+                        CaptureError::Limit(message) => limit_gap_reason(&message),
+                        _ => GapReasonV1::CaptureInterrupted,
+                    }),
                 ),
             }
         }
-        None => (None, false),
+        None => (None, None),
     };
     let redacted_gap = if redactions > 0 {
         let gap_id = format!(

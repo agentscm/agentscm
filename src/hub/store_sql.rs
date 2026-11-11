@@ -49,9 +49,26 @@ mod tests {
         );
         assert_eq!(sqlite("SELECT $ FROM t"), "SELECT $ FROM t");
         assert!(matches!(sqlite("SELECT 1"), Cow::Borrowed(_)));
-        assert_eq!(
-            sqlite(GET_SETTING),
-            "SELECT value FROM hub_settings WHERE key = ?1"
-        );
+    }
+
+    #[test]
+    fn each_shared_statement_renders_the_old_sqlite_text() {
+        // The SQLite text each statement replaced, compared with whitespace collapsed.
+        let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (shared, old) in [
+            (GET_SETTING, "SELECT value FROM hub_settings WHERE key = ?1"),
+            (
+                SET_SETTING,
+                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4",
+            ),
+            (
+                CREATE_SETTING,
+                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (key) DO NOTHING",
+            ),
+        ] {
+            assert_eq!(words(&sqlite(shared)), words(old));
+        }
     }
 }
