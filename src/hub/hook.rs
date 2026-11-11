@@ -710,7 +710,11 @@ impl Call {
         let scope = scope(&v, root);
         let (mut call, context_hook) = match agent {
             Agent::Claude | Agent::Codex => (pascal(agent, &v, &scope), true),
-            Agent::Copilot if v.get("hook_event_name").is_some() => {
+            // Copilot CLI's camelCase notification may also name its event; `sessionId` says
+            // which shape it is.
+            Agent::Copilot
+                if v.get("hook_event_name").is_some() && v.get("sessionId").is_none() =>
+            {
                 (pascal(agent, &v, &scope), true)
             }
             Agent::Copilot => (copilot(&v, &scope), false),
@@ -2535,6 +2539,12 @@ mod tests {
             ),
             (
                 Agent::Copilot,
+                json!({"sessionId":"s","hook_event_name":"Notification",
+                    "notification_type":"permission_prompt","message":"m"}),
+                Some(Permission),
+            ),
+            (
+                Agent::Copilot,
                 json!({"sessionId":"s","notification_type":"agent_idle"}),
                 Some(Idle),
             ),
@@ -2590,6 +2600,9 @@ mod tests {
         ] {
             assert_eq!(wait(agent, v.clone()), want, "{agent:?} {v}");
         }
+        let named = json!({"sessionId":"s","hook_event_name":"Notification",
+            "notification_type":"permission_prompt","asks":"Run x"});
+        assert_eq!(parse(Agent::Copilot, &named).session.as_deref(), Some("s"));
         // What a wait asks is kept from every client that excerpts it; what a finished turn
         // ended on is not.
         let asks = |agent, v: Value| parse(agent, &v).asks;

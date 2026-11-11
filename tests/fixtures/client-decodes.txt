@@ -42,9 +42,10 @@ src/demo_cli.rs let reply: Value = serde_json::from_str(&reply.text().await.unwr
 # src/git_export/remote/network.rs: the Git credential file
 src/git_export/remote/network.rs serde_json::from_slice(&bytes).map_err(|_| invalid("invalid Git credential file"))?;
 
-# src/hook_cli.rs: the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, a helper process's answer
+# src/hook_cli.rs: the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, the Cursor reply this hook keeps in a local file, a helper process's answer
 src/hook_cli.rs Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| {
-src/hook_cli.rs let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+src/hook_cli.rs let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+src/hook_cli.rs .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
 src/hook_cli.rs let snapshot: AdvisorySnapshot = serde_json::from_slice(&bytes).ok()?;
 src/hook_cli.rs serde_json::from_str(text.trim()).ok()
 

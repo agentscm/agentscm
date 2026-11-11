@@ -2205,7 +2205,11 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
             }
             Ok(out)
         }
-        "copilot" if payload.get("hook_event_name").is_some() => {
+        // Copilot CLI's camelCase notification may also name its event; `sessionId` says
+        // which shape it is.
+        "copilot"
+            if payload.get("hook_event_name").is_some() && payload.get("sessionId").is_none() =>
+        {
             sanitized_codex(payload, Some(paths))
         }
         "copilot" => {
@@ -3096,6 +3100,11 @@ mod tests {
                 "message":"Which branch?"})
             ),
             json!({"sessionId":"s","notification_type":"elicitation_dialog","asks":"Which branch?"})
+        );
+        assert_eq!(
+            copilot(json!({"sessionId":"s","hook_event_name":"Notification",
+                "notification_type":"permission_prompt","message":"Run x"})),
+            json!({"sessionId":"s","notification_type":"permission_prompt","asks":"Run x"})
         );
         assert_eq!(
             copilot(json!({"sessionId":"s","notification_type":"shell_completed","message":"m"})),
