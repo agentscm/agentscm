@@ -15,7 +15,6 @@ fn override_key(owner_id: &str) -> String {
 pub struct ViewSettings {
     pub enabled: bool,
     pub work_overview: bool,
-    pub coordination_inbox: bool,
 }
 
 /// A user's own choices; `None` inherits the hub default.
@@ -24,7 +23,6 @@ pub struct ViewSettings {
 pub struct ViewOverride {
     pub enabled: Option<bool>,
     pub work_overview: Option<bool>,
-    pub coordination_inbox: Option<bool>,
 }
 
 impl ViewOverride {
@@ -33,7 +31,6 @@ impl ViewOverride {
         Self {
             enabled: change.enabled.or(self.enabled),
             work_overview: change.work_overview.or(self.work_overview),
-            coordination_inbox: change.coordination_inbox.or(self.coordination_inbox),
         }
     }
 
@@ -41,7 +38,6 @@ impl ViewOverride {
         ViewSettings {
             enabled: self.enabled.unwrap_or(base.enabled),
             work_overview: self.work_overview.unwrap_or(base.work_overview),
-            coordination_inbox: self.coordination_inbox.unwrap_or(base.coordination_inbox),
         }
     }
 }
@@ -51,9 +47,16 @@ impl Default for ViewSettings {
         Self {
             enabled: true,
             work_overview: true,
-            coordination_inbox: true,
         }
     }
+}
+
+/// Retired fields are accepted only while loading persisted settings. Active API inputs
+/// remain strict, and saving settings drops the obsolete inbox switch.
+fn stored<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value.as_object_mut()?.remove("coordination_inbox");
+    serde_json::from_value(value).ok()
 }
 
 impl ViewSettings {
@@ -61,7 +64,7 @@ impl ViewSettings {
     pub fn load(store: &dyn Store) -> Result<Self> {
         Ok(store
             .get_setting(KEY)?
-            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .and_then(|raw| stored(&raw))
             .unwrap_or_default())
     }
 
@@ -75,7 +78,7 @@ impl ViewSettings {
     pub fn load_override(store: &dyn Store, owner_id: &str) -> Result<Option<ViewOverride>> {
         Ok(store
             .get_setting(&override_key(owner_id))?
-            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .and_then(|raw| stored(&raw))
             .filter(|o| *o != ViewOverride::default()))
     }
 
