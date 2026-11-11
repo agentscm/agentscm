@@ -2050,3 +2050,533 @@ fn postgres_publication_heads_require_provider_confirmation() {
         publication_head_provenance(&fixture);
     }
 }
+
+fn behavior_dependencies_without_shared_paths(fixture: &StoreFixture) {
+    use agentscm::hub::work_dependencies::WorkDependencyNoticeQuery;
+    use agentscm::hub::work_reconciliation::{
+        ConditionState, PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations,
+        WorkDeclarationsUpdate,
+    };
+    let ctx = setup(fixture);
+    let prerequisite = ctx.start("behavior-provider", "src/provider.rs", &[]);
+    let proposal = start("behavior-consumer", "docs/consumer.md", &[&prerequisite]);
+    let checked = ctx
+        .store
+        .work_preflight(ctx.token(), &proposal, unix_now())
+        .unwrap();
+    assert!(checked.scope_overlaps.is_empty());
+    let conditions = &checked.dependencies.unwrap().conditions;
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions[0].disposition.state, ConditionState::Unknown);
+    let admitted = ctx
+        .store
+        .work_start(ctx.token(), &proposal, unix_now())
+        .unwrap();
+    assert_eq!(
+        admitted.preflight.unwrap().dependencies.unwrap().conditions[0]
+            .disposition
+            .state,
+        ConditionState::Unknown
+    );
+    let work = admitted.item;
+    let read = |session: &str, after| {
+        ctx.store
+            .work_dependency_notices(
+                ctx.token(),
+                &WorkDependencyNoticeQuery {
+                    session: session.into(),
+                    after,
+                    through: None,
+                    limit: 100,
+                },
+                unix_now(),
+            )
+            .unwrap()
+    };
+    let consumer = read(&work.lead_session, 0);
+    let provider = read(&prerequisite.lead_session, 0);
+    assert_eq!(consumer.notices.len(), 1);
+    assert_eq!(consumer.notices[0].sequence, provider.notices[0].sequence);
+    assert!(read("unrelated-session", 0).notices.is_empty());
+    assert!(
+        read(&work.lead_session, consumer.next_after)
+            .notices
+            .is_empty()
+    );
+    assert_eq!(
+        read(&work.lead_session, 0).notices[0].sequence,
+        consumer.notices[0].sequence
+    );
+    // Completion is an agent report, never proof of delivery of an unbound prerequisite.
+    ctx.checkpoint(&prerequisite, CheckpointKind::Finish);
+    let after_finish = read(&work.lead_session, 0);
+    assert!(after_finish.notices[0].sequence > consumer.notices[0].sequence);
+    assert_eq!(
+        after_finish.notices[0].current.conditions[0]
+            .disposition
+            .state,
+        ConditionState::Unknown
+    );
+    // An exact retained provider merge qualifies the existing structured condition.
+    ctx.merge(321);
+    let current = ctx.item(&work.id);
+    let update = WorkDeclarationsUpdate {
+        work_id: work.id.clone(),
+        operation_id: "declare-behavior".into(),
+        generation: current.generation,
+        session: current.lead_session.clone(),
+        expected_updated_seq: current.updated_seq,
+        declarations: WorkDeclarations {
+            links: vec![],
+            prerequisites: vec![PrerequisiteCondition {
+                id: "behavior-change".into(),
+                requirement: PrerequisiteRequirement::MergedPullRequest {
+                    work_id: prerequisite.id.clone(),
+                    target: WorkPrLinkTarget {
+                        repository_id: REPOSITORY_ID,
+                        number: 321,
+                        head_sha: HEAD_A.into(),
+                    },
+                },
+            }],
+        },
+    };
+    ctx.store
+        .work_declarations_set(ctx.token(), &update, unix_now())
+        .unwrap();
+    let qualified = read(&work.lead_session, 0);
+    assert_eq!(
+        qualified.notices[0].current.conditions[0].disposition.state,
+        ConditionState::Satisfied
+    );
+    let same = ctx
+        .store
+        .work_declarations_set(ctx.token(), &update, unix_now())
+        .unwrap();
+    assert!(same.receipt.replayed);
+    assert_eq!(
+        read(&work.lead_session, 0).notices[0].sequence,
+        qualified.notices[0].sequence
+    );
+    let mut existing = proposal;
+    existing.work_id = Some(work.id.clone());
+    existing.request_key = None;
+    let preflight = ctx
+        .store
+        .work_preflight(ctx.token(), &existing, unix_now())
+        .unwrap();
+    assert_eq!(
+        preflight.dependencies.unwrap().conditions[0]
+            .disposition
+            .state,
+        ConditionState::Satisfied
+    );
+
+    // Fresh reads expose provider changes separately from the retained notice; an explicit
+    // reconciliation mutation records that evidence version for both leads.
+    let mut changed = update.clone();
+    changed.operation_id = "new-provider-head".into();
+    changed.expected_updated_seq = ctx.item(&work.id).updated_seq;
+    if let PrerequisiteRequirement::MergedPullRequest { target, .. } =
+        &mut changed.declarations.prerequisites[0].requirement
+    {
+        target.number = 322;
+    }
+    ctx.store
+        .work_declarations_set(ctx.token(), &changed, unix_now())
+        .unwrap();
+    let pending = read(&work.lead_session, 0).notices.remove(0);
+    assert_eq!(
+        pending.recorded.conditions[0].state,
+        ConditionState::Unknown
+    );
+    ctx.merge(322);
+    let fresh = read(&work.lead_session, 0).notices.remove(0);
+    assert_eq!(fresh.sequence, pending.sequence);
+    assert_eq!(fresh.recorded.conditions[0].state, ConditionState::Unknown);
+    assert_eq!(
+        fresh.current.conditions[0].disposition.state,
+        ConditionState::Satisfied
+    );
+    let reconcile = durable_request(&ctx, &work.id, "record-provider-version");
+    ctx.store
+        .work_reconciliation_apply(ctx.token(), &reconcile, unix_now())
+        .unwrap();
+    let applied = read(&work.lead_session, 0).notices.remove(0);
+    assert!(applied.sequence > fresh.sequence);
+    assert_eq!(
+        applied.recorded.conditions[0].state,
+        ConditionState::Satisfied
+    );
+    ctx.store
+        .work_reconciliation_apply(ctx.token(), &reconcile, unix_now())
+        .unwrap();
+    assert_eq!(
+        read(&work.lead_session, 0).notices[0].sequence,
+        applied.sequence
+    );
+}
+
+fn dependency_routing_removal_and_legacy_checkpoint(fixture: &StoreFixture) {
+    use agentscm::hub::work_dependencies::WorkDependencyNoticeQuery;
+    use agentscm::hub::work_reconciliation::{WorkDeclarations, WorkDeclarationsUpdate};
+    let ctx = setup(fixture);
+    let prerequisite = ctx.start("routing-provider", "src/routing-provider", &[]);
+    let work = ctx.start("routing-consumer", "src/routing-consumer", &[&prerequisite]);
+    let read = |token: &str, session: &str| {
+        ctx.store
+            .work_dependency_notices(
+                token,
+                &WorkDependencyNoticeQuery {
+                    session: session.into(),
+                    after: 0,
+                    through: None,
+                    limit: 100,
+                },
+                unix_now(),
+            )
+            .unwrap()
+    };
+    let second = ctx.start(
+        "routing-second-consumer",
+        "docs/routing-second",
+        &[&prerequisite],
+    );
+    let page = ctx
+        .store
+        .work_dependency_notices(
+            ctx.token(),
+            &WorkDependencyNoticeQuery {
+                session: prerequisite.lead_session.clone(),
+                after: 0,
+                through: None,
+                limit: 1,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(!page.complete);
+    let next = ctx
+        .store
+        .work_dependency_notices(
+            ctx.token(),
+            &WorkDependencyNoticeQuery {
+                session: prerequisite.lead_session.clone(),
+                after: page.next_after,
+                through: Some(page.through),
+                limit: 1,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(next.complete);
+    assert_ne!(
+        page.notices[0].recorded.work_id,
+        next.notices[0].recorded.work_id
+    );
+    // Remove the extra edge so subsequent routing assertions concern exactly one relationship.
+    ctx.store
+        .work_declarations_set(
+            ctx.token(),
+            &WorkDeclarationsUpdate {
+                work_id: second.id.clone(),
+                operation_id: "remove-extra".into(),
+                generation: second.generation,
+                session: second.lead_session.clone(),
+                expected_updated_seq: second.updated_seq,
+                declarations: WorkDeclarations::default(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    ctx.checkpoint(&prerequisite, CheckpointKind::Handover);
+    let mut takeover = start("routing-provider", "src/routing-provider", &[]);
+    takeover.work_id = Some(prerequisite.id.clone());
+    takeover.request_key = None;
+    takeover.session = "replacement-lead".into();
+    takeover.takeover_generation = Some(1);
+    let replaced = ctx
+        .store
+        .work_start(ctx.token(), &takeover, unix_now())
+        .unwrap();
+    assert!(replaced.took_over);
+    assert!(
+        read(ctx.token(), &prerequisite.lead_session)
+            .notices
+            .is_empty()
+    );
+    assert_eq!(read(ctx.token(), "replacement-lead").notices.len(), 1);
+    // A current lead credential carry redirects the mailbox; an old valid token is not enough.
+    let (_, secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &ctx.principal.owner.id,
+        "replacement-agent",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let new = principal(&*ctx.store, secret.expose());
+    let current = ctx.item(&prerequisite.id);
+    let carry = WorkCheckpoint {
+        work_id: current.id.clone(),
+        operation_id: "carry-dependency-lead".into(),
+        generation: current.generation,
+        session: "replacement-lead".into(),
+        expected_updated_seq: Some(current.updated_seq),
+        kind: CheckpointKind::Progress,
+        summary: "Continue the same dependency Work session".into(),
+        next_action: None,
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: vec![],
+        depends_on: vec![],
+        related_work: vec![],
+    };
+    let carried = ctx
+        .store
+        .work_checkpoint(&new.token_id, &carry, unix_now())
+        .unwrap();
+    assert_eq!(carried.item.lead_token, new.token_id);
+    assert!(read(ctx.token(), "replacement-lead").notices.is_empty());
+    assert_eq!(read(&new.token_id, "replacement-lead").notices.len(), 1);
+    // Explicit replacement removes routing and reverse edges despite stale legacy hints.
+    let item = ctx.item(&work.id);
+    ctx.store
+        .work_declarations_set(
+            ctx.token(),
+            &WorkDeclarationsUpdate {
+                work_id: item.id.clone(),
+                operation_id: "remove-behavior".into(),
+                generation: item.generation,
+                session: item.lead_session.clone(),
+                expected_updated_seq: item.updated_seq,
+                declarations: WorkDeclarations::default(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(read(&new.token_id, "replacement-lead").notices.is_empty());
+    let removed = read(ctx.token(), &work.lead_session);
+    assert!(removed.notices[0].current.conditions.is_empty());
+    // An unchanged stale compatibility hint cannot resurrect an explicit removal.
+    ctx.checkpoint(&work, CheckpointKind::Progress);
+    assert!(
+        read(ctx.token(), &work.lead_session).notices[0]
+            .current
+            .conditions
+            .is_empty()
+    );
+    // Omission changes only legacy hints. A later newly added hint declares a fresh unbound edge.
+    let item = ctx.item(&work.id);
+    let checkpoint = WorkCheckpoint {
+        work_id: item.id.clone(),
+        operation_id: "legacy-add".into(),
+        generation: item.generation,
+        session: item.lead_session.clone(),
+        expected_updated_seq: Some(item.updated_seq),
+        kind: CheckpointKind::Progress,
+        summary: "Declare behavior dependency".into(),
+        next_action: None,
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: vec![],
+        depends_on: vec![prerequisite.id.clone()],
+        related_work: vec![],
+    };
+    let mut clearing = checkpoint.clone();
+    clearing.operation_id = "legacy-clear-hints".into();
+    clearing.depends_on.clear();
+    let cleared = ctx
+        .store
+        .work_checkpoint(ctx.token(), &clearing, unix_now())
+        .unwrap();
+    let mut checkpoint = checkpoint;
+    checkpoint.expected_updated_seq = Some(cleared.item.updated_seq);
+    let added = ctx
+        .store
+        .work_checkpoint(ctx.token(), &checkpoint, unix_now())
+        .unwrap();
+    let mut omission = checkpoint;
+    omission.operation_id = "legacy-omission".into();
+    omission.expected_updated_seq = Some(added.item.updated_seq);
+    omission.depends_on.clear();
+    ctx.store
+        .work_checkpoint(ctx.token(), &omission, unix_now())
+        .unwrap();
+    assert_eq!(
+        read(ctx.token(), &work.lead_session).notices[0]
+            .current
+            .conditions
+            .len(),
+        1
+    );
+    assert_eq!(read(&new.token_id, "replacement-lead").notices.len(), 1);
+}
+
+#[test]
+fn behavior_dependencies_sqlite_without_shared_paths() {
+    behavior_dependencies_without_shared_paths(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_behavior_dependencies_without_shared_paths() {
+    if let Some(f) = StoreFixture::postgres() {
+        behavior_dependencies_without_shared_paths(&f);
+    }
+}
+#[test]
+fn behavior_dependency_routing_sqlite() {
+    dependency_routing_removal_and_legacy_checkpoint(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_behavior_dependency_routing() {
+    if let Some(f) = StoreFixture::postgres() {
+        dependency_routing_removal_and_legacy_checkpoint(&f);
+    }
+}
+
+fn dependency_fanout_does_not_block_cleanup(fixture: &StoreFixture) {
+    use agentscm::hub::work_dependencies::WorkDependencyNoticeQuery;
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let ctx = setup(fixture);
+    let provider = ctx.start("fanout-provider", "src/fanout-provider", &[]);
+    // Released unfinished Work remains a declared dependent. More than one notification batch
+    // must never stop the provider's existing finish/release operation.
+    for index in 0..101 {
+        let work = ctx.start(
+            &format!("fanout-{index}"),
+            &format!("src/fanout-{index}"),
+            &[&provider],
+        );
+        ctx.store
+            .work_transition(
+                &WorkTransitionActor::Agent { token: ctx.token() },
+                &WorkTransitionRequest {
+                    work_id: work.id.clone(),
+                    operation_id: "release-for-fanout".into(),
+                    generation: work.generation,
+                    expected_updated_seq: work.updated_seq,
+                    session: Some(work.lead_session),
+                    transition: WorkTransitionKind::Release,
+                    reason: "Keep the declared dependency while releasing scope".into(),
+                    superseded_by: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    ctx.checkpoint(&provider, CheckpointKind::Finish);
+    assert_eq!(
+        ctx.item(&provider.id).state,
+        agentscm::hub::work::WorkState::Finished
+    );
+    let page = ctx
+        .store
+        .work_dependency_notices(
+            ctx.token(),
+            &WorkDependencyNoticeQuery {
+                session: provider.lead_session.clone(),
+                after: 0,
+                through: None,
+                limit: 100,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(!page.coverage_complete);
+    assert!(
+        page.notices
+            .iter()
+            .any(|notice| !notice.recorded.notification_fanout_complete)
+    );
+}
+#[test]
+fn dependency_fanout_sqlite_preserves_cleanup() {
+    dependency_fanout_does_not_block_cleanup(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_dependency_fanout_preserves_cleanup() {
+    if let Some(f) = StoreFixture::postgres() {
+        dependency_fanout_does_not_block_cleanup(&f);
+    }
+}
+
+fn dependency_summary_attempt_is_serialized(fixture: &StoreFixture) {
+    use agentscm::hub::session::SessionCall;
+    use agentscm::hub::work_dependencies::WorkDependencyNoticeQuery;
+    let ctx = setup(fixture);
+    let prerequisite = ctx.start("delivery-source", "src/source.rs", &[]);
+    ctx.store
+        .touch_session(
+            ctx.token(),
+            &SessionCall {
+                session: Some(prerequisite.lead_session.clone()),
+                via: "mcp".into(),
+                task: None,
+                paths: vec![],
+                deny: false,
+                report: false,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let _dependent = ctx.start("delivery-dependent", "docs/dependent.md", &[&prerequisite]);
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let store = ctx.store.clone();
+            let token = ctx.token().to_owned();
+            let session = prerequisite.lead_session.clone();
+            std::thread::spawn(move || {
+                store
+                    .work_dependency_notice_delivery(&token, &session, unix_now())
+                    .unwrap()
+            })
+        })
+        .collect();
+    let pages: Vec<_> = handles
+        .into_iter()
+        .filter_map(|h| h.join().unwrap())
+        .collect();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].notices.len(), 1);
+    assert!(
+        ctx.store
+            .work_dependency_notice_delivery(ctx.token(), &prerequisite.lead_session, unix_now())
+            .unwrap()
+            .is_none()
+    );
+    // Explicit history reads are independent of attempted advisory delivery.
+    let page = ctx
+        .store
+        .work_dependency_notices(
+            ctx.token(),
+            &WorkDependencyNoticeQuery {
+                session: prerequisite.lead_session,
+                after: 0,
+                through: None,
+                limit: 20,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(page.notices.len(), 1);
+}
+
+#[test]
+fn dependency_summary_delivery_sqlite() {
+    dependency_summary_attempt_is_serialized(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_dependency_summary_delivery() {
+    let Some(fixture) = StoreFixture::postgres() else {
+        return;
+    };
+    dependency_summary_attempt_is_serialized(&fixture);
+}

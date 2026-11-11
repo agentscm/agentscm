@@ -94,13 +94,13 @@ pub(super) fn summarize(
     }
 }
 
-/// An overlap where both tasks hold an active claim and are active or blocked.
+/// An unresolved overlap where both tasks hold an active claim and are active or blocked.
 pub(super) fn is_live_overlap(pair: &WorkOverlapPair) -> bool {
     let live = |item: &WorkItem| {
         item.claim_status == ClaimStatus::Active
             && matches!(item.state, WorkState::Active | WorkState::Blocked)
     };
-    live(&pair.left) && live(&pair.right)
+    live(&pair.left) && live(&pair.right) && pair.unresolved()
 }
 
 /// One per live session, plus one per live intent no session holds, as the status page lists them.
@@ -193,7 +193,7 @@ mod tests {
             lead_agent: "agent".into(),
             lead_session: "session".into(),
             participants: vec![],
-            scope: vec![],
+            scope: vec!["src/shared.rs".into()],
             branch: None,
             worktree: None,
             next_action: None,
@@ -210,6 +210,7 @@ mod tests {
 
     fn pair(left: (WorkState, ClaimStatus), right: (WorkState, ClaimStatus)) -> WorkOverlapPair {
         WorkOverlapPair {
+            agreed_paths: Vec::new(),
             left: work_item(left.0, left.1),
             right: work_item(right.0, right.1),
             reasons: vec![],
@@ -231,6 +232,15 @@ mod tests {
         assert_eq!(pairs.iter().filter(|p| is_live_overlap(p)).count(), 1);
         assert!(is_live_overlap(&pairs[0]));
         assert!(pairs[1..].iter().all(|p| !is_live_overlap(p)));
+        let mut agreed = pairs[0].clone();
+        agreed.agreed_paths = vec!["src/shared.rs".into()];
+        assert!(!is_live_overlap(&agreed));
+        agreed.left.scope.push("src/other.rs".into());
+        agreed.right.scope.push("src/other.rs".into());
+        assert!(
+            is_live_overlap(&agreed),
+            "an unagreed intersection still needs attention"
+        );
     }
 
     #[test]

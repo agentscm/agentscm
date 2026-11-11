@@ -85,6 +85,7 @@ pub struct Intent {
 /// A live intent of someone else that overlaps an announce; paths are display specs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Overlap {
+    pub agreed_paths: Vec<String>,
     pub intent: Intent,
     pub their_paths: Vec<String>,
     pub your_paths: Vec<String>,
@@ -494,6 +495,7 @@ pub(super) fn announced(own: &str, keys: &[String], intents: Vec<Intent>) -> Res
             .map(|key| display(key))
             .collect();
         found.push(Overlap {
+            agreed_paths: Vec::new(),
             intent,
             their_paths,
             your_paths,
@@ -646,8 +648,10 @@ async fn announce(
         .overlaps
         .iter()
         .map(|o| {
-            json!({"intent": o.intent.json_for(&principal.owner.id), "their_paths": o.their_paths,
-                "your_paths": o.your_paths})
+            let mut value=json!({"intent": o.intent.json_for(&principal.owner.id), "their_paths": o.their_paths,
+                "your_paths": o.your_paths});
+            if !o.agreed_paths.is_empty() {value["agreed_paths"]=json!(o.agreed_paths);}
+            value
         })
         .collect();
     Ok(Json(

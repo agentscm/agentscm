@@ -395,10 +395,19 @@ pub struct WorkPathOverlap {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeOverlap {
+    /// Exact files covered by a current mutually accepted agreement. Other intersections remain contested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agreed_paths: Vec<String>,
     pub item: WorkItem,
     pub your_scope: Vec<String>,
     pub their_scope: Vec<String>,
     pub reasons: Vec<WorkPathOverlap>,
+}
+
+impl WorkScopeOverlap {
+    pub fn unresolved(&self) -> bool {
+        super::work_overlap::unresolved(&self.your_scope, &self.their_scope, &self.agreed_paths)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -502,10 +511,20 @@ pub struct WorkPathPair {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverlapPair {
+    /// Named files covered by current consent; every other intersection stays contested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agreed_paths: Vec<String>,
     pub left: WorkItem,
     pub right: WorkItem,
     pub reasons: Vec<WorkPathPair>,
     pub reasons_complete: bool,
+}
+
+impl WorkOverlapPair {
+    /// Physical overlap remains visible even when every intersection is mutually agreed.
+    pub fn unresolved(&self) -> bool {
+        super::work_overlap::unresolved(&self.left.scope, &self.right.scope, &self.agreed_paths)
+    }
 }
 
 /// One work item found by [`Store::work_search`]; enough to pick it, not to read it.
@@ -1029,6 +1048,7 @@ pub(super) fn work_overlap_pairs(items: &[WorkItem], max: usize) -> Vec<WorkOver
                 .collect::<Vec<_>>();
             if !reasons.is_empty() {
                 pairs.push(WorkOverlapPair {
+                    agreed_paths: Vec::new(),
                     left: left.clone(),
                     right: right.clone(),
                     reasons,

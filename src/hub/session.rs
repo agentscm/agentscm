@@ -385,6 +385,7 @@ fn contested(token: &str, via: &[String], keys: &[String], intents: Vec<Intent>)
                 .cloned()
                 .collect();
             (!both.is_empty()).then(|| Overlap {
+                agreed_paths: Vec::new(),
                 intent,
                 their_paths: both.clone(),
                 your_paths: both,

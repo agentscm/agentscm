@@ -1836,7 +1836,7 @@ mod tests {
             lead_agent: "agent".into(),
             lead_session: "session".into(),
             participants: vec![],
-            scope: vec![],
+            scope: vec!["src/shared.rs".into()],
             branch: None,
             worktree: None,
             next_action: None,
@@ -1854,6 +1854,7 @@ mod tests {
     #[test]
     fn startup_recap_lists_only_overlaps_between_live_tasks() {
         let pair = |left: (&str, WorkState), right: (&str, WorkState)| WorkOverlapPair {
+            agreed_paths: Vec::new(),
             left: overlap_side(left.0, left.1, ClaimStatus::Active),
             right: overlap_side(right.0, right.1, ClaimStatus::Active),
             reasons: vec![],

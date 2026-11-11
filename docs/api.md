@@ -182,6 +182,12 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
 | `POST /v1/hub/standup/issue-link` | Current native Work lead; fenced, idempotent set or explicit `link:null` removal of a caller-declared issue relationship |
 | `GET /v1/hub/standup/work/{id}/reconciliation` | Repository-scoped reader, read-only tokens allowed; read-only PR evidence and prerequisite report for one Work item, `404` for Work the token cannot read; see [design](design/work-reconciliation.md) |
+| `POST /v1/hub/standup/overlap/consent` | Current target lead; exact named-file consent against request and Work fences, not requester acceptance |
+| `GET /v1/hub/standup/overlap/consents?request_id=…&session=…` | Requester or current affected lead; current consent state and redacted identities |
+| `POST /v1/hub/standup/overlap/preflight` | Requesting lead; pure acceptance projection, no reservation mutation |
+| `POST /v1/hub/standup/overlap/start` | Requesting lead; atomically accept consent IDs and admit Work |
+| `POST /v1/hub/standup/overlap/checkpoint` | Requesting lead; atomically accept consent IDs and expand scope |
+| `GET /v1/hub/standup/dependency-notices?session=…&after=0&limit=20` | Repository reader; notices routed only to the exact current lead token/session, latest-version retention and explicit coverage |
 | `GET /v1/hub/standup/work/{id}/declarations` | Repository-scoped reader; durable v2 caller-declared PR links and prerequisites, not provider facts |
 | `POST /v1/hub/standup/declarations` | Current lead; fenced, retry-safe replacement of durable declarations |
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
@@ -770,3 +776,11 @@ it does not create or migrate the authority database (`state.sqlite`); run
 a CLI command that opens it after upgrading, or `/v1/workflow` returns an
 error. The routes do not establish a read-only mount or hostile-host isolation guarantee.
 Authenticated sessions, approval and landing over HTTP remain unimplemented.
+
+### Named-file consent and prerequisite projections
+
+The [agreed-overlap contract](design/work-overlaps.md) defines request fences, independent requester acceptance, lifecycle invalidation and synthetic qualification. `POST overlap/consent` takes `request_id`, `target_work_id`, `operation_id`, `session`, `expected_updated_seq` (coordination request), `target_generation`, `target_updated_seq` and exact file `paths`. Acceptance start/preflight takes `{ "start": WORK_START, "consent_ids": [ID] }`; scope expansion takes `{ "checkpoint": WORK_CHECKPOINT, "consent_ids": [ID] }`. Full true scope and original stable proposal identity must match. Only all-covered intersections can proceed; `agreed_paths` is visible alongside overlap evidence. A requester cannot create the target's consent.
+
+Compatibility `POST /v1/hub/standup/preflight` and `/start` include fresh `dependencies` only with `?dependencies=1` (0 or omission preserves the old shape; other values are invalid). Dedicated overlap routes include it directly. The projection reuses structured prerequisite evaluation, including explicit unknown legacy conditions and exact provider-head evidence. It creates no semantic conflict inference or completion authority.
+
+Dependency notice reads require `session`, `after` and `limit`, with optional `through`. Continue with returned `next_after` and `through`. `recorded` and `current` distinguish retained notice state from a fresh evaluation. `latest_only: true`, `atomic_snapshot: false` and `coverage_complete` describe the mailbox's limits; reads emit and acknowledge nothing. Refresh is mutation-driven, not a background worker. MCP's next writable-session-call advisory summary has a separate durable attempted-delivery cursor per existing native token/session; a lost response can always be reread explicitly.

@@ -1312,6 +1312,54 @@ pub trait Store: Send + Sync {
         ack: &CoordinationAck,
         now: i64,
     ) -> Result<CoordinationRequest>;
+    fn work_overlap_start(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult>;
+    fn work_overlap_preflight(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<super::work_preflight::WorkPreflightResult>;
+    fn work_overlap_checkpoint(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult>;
+    /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
+    /// Latest durable prerequisite notices for this session's current lead Work items.
+    /// Atomically reserves one bounded advisory summary attempt for this existing native session.
+    /// Does not acknowledge the retained notices; explicit reads remain independent and pure.
+    fn work_dependency_notice_delivery(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<super::work_dependencies::WorkDependencyNoticePage>>;
+    fn work_dependency_notices(
+        &self,
+        token: &str,
+        query: &super::work_dependencies::WorkDependencyNoticeQuery,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
+    fn work_overlap_consent(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView>;
+    /// Bounded current consent state, visible to the requester and affected current leads.
+    fn work_overlap_consents(
+        &self,
+        token: &str,
+        request_id: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::work_overlap::WorkOverlapConsentView>>;
     fn coordination_reply(
         &self,
         token: &str,

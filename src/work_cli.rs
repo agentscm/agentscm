@@ -47,6 +47,43 @@ pub enum WorkCommand {
         #[arg(long, default_value = "-")]
         request: PathBuf,
     },
+    /// Grant named-file overlap consent as the current target lead.
+    OverlapConsent {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Read current consent state for one coordination request.
+    OverlapConsents {
+        request_id: String,
+        #[arg(long)]
+        session: String,
+    },
+    /// Inspect explicit requester acceptance without claiming Work.
+    OverlapPreflight {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Accept consent IDs and atomically admit the requesting Work.
+    OverlapStart {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Accept consent IDs and atomically update the requesting Work scope.
+    OverlapCheckpoint {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Read the latest dependency notice versions addressed to the current lead.
+    DependencyNotices {
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        through: Option<i64>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Read a fixed return-to-work delivery without marking it reviewed.
     Catchup {
         /// Strict CatchupQuery JSON for a subscriber or page continuation; - reads stdin.
@@ -344,6 +381,9 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Overview { .. }
         | WorkCommand::Briefing { .. }
         | WorkCommand::Catchup { .. }
+        | WorkCommand::OverlapPreflight { .. }
+        | WorkCommand::OverlapConsents { .. }
+        | WorkCommand::DependencyNotices { .. }
         | WorkCommand::Preflight { .. }
         | WorkCommand::PrLink { .. }
         | WorkCommand::Reconcile { .. }
@@ -360,6 +400,9 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::CoordinationReply { .. }
         | WorkCommand::CoordinationResolve { .. }
         | WorkCommand::CoordinationWithdraw { .. }
+        | WorkCommand::OverlapConsent { .. }
+        | WorkCommand::OverlapStart { .. }
+        | WorkCommand::OverlapCheckpoint { .. }
         | WorkCommand::Start { .. }
         | WorkCommand::Usage { .. }
         | WorkCommand::PrLinkSet { .. }
@@ -474,6 +517,78 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 agentscm::hub::work_http::actionable_status::render_text,
             )?;
             return Ok(());
+        }
+        WorkCommand::OverlapConsent { request } => {
+            let request: agentscm::hub::work_overlap::WorkOverlapConsentRequest =
+                read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/overlap/consent",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::OverlapConsents {
+            request_id,
+            session,
+        } => {
+            let path = query_path(
+                "/v1/hub/standup/overlap/consents",
+                json!({"request_id":request_id,"session":session}),
+            )?;
+            (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::OverlapPreflight { request } => {
+            let request: agentscm::hub::work_overlap::WorkOverlapStart = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/overlap/preflight",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::OverlapStart { request } => {
+            let request: agentscm::hub::work_overlap::WorkOverlapStart = read_request(&request)?;
+            let reply = hub
+                .call(
+                    Method::POST,
+                    "/v1/hub/standup/overlap/start",
+                    Some(json!(request)),
+                )
+                .await?;
+            let conflict = reply.get("conflict").is_some_and(|v| !v.is_null());
+            (reply, conflict)
+        }
+        WorkCommand::OverlapCheckpoint { request } => {
+            let request: agentscm::hub::work_overlap::WorkOverlapCheckpoint =
+                read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/overlap/checkpoint",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::DependencyNotices {
+            session,
+            after,
+            through,
+            limit,
+        } => {
+            let path = query_path(
+                "/v1/hub/standup/dependency-notices",
+                json!({"session":session,"after":after,"through":through,"limit":limit}),
+            )?;
+            (hub.call(Method::GET, &path, None).await?, false)
         }
         WorkCommand::Usage { request } => {
             let request: UsageRecord = read_request(&request)?;
@@ -723,7 +838,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/preflight",
+                    "/v1/hub/standup/preflight?dependencies=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -805,7 +920,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/start?reclaimed=1",
+                    "/v1/hub/standup/start?reclaimed=1&dependencies=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;

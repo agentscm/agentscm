@@ -699,7 +699,37 @@ fn read_scoped(
         .map(|w| w.work_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut actions = request_actions(&requests, &items, &holding, &principal.owner.id, now);
+    let pair_is_current = |pair: &crate::hub::work::WorkOverlapPair| {
+        [&pair.left, &pair.right].iter().all(|old| {
+            items
+                .get(&old.id)
+                .is_some_and(|current| current.updated_seq == old.updated_seq)
+        })
+    };
+    // Acceptance answers the overlap ask even before the requester closes its history thread.
+    // Do not keep asking the granting lead to acknowledge a request it explicitly consented to.
+    actions.retain(|action| {
+        action.kind != "directed_request"
+            || !overview.overlaps.iter().any(|pair| {
+                !pair.unresolved()
+                    && pair_is_current(pair)
+                    && [(&pair.left, &pair.right), (&pair.right, &pair.left)]
+                        .iter()
+                        .any(|(source, target)| {
+                            requests.requests.iter().any(|request| {
+                                request.proposal.work_id.as_deref() == Some(source.id.as_str())
+                                    && request.proposal.scope == source.scope
+                                    && request.requester.token == source.lead_token
+                                    && request.requester.session == source.lead_session
+                                    && action.id == format!("request:{}:{}", request.id, target.id)
+                            })
+                        })
+            })
+    });
     for overlap in &overview.overlaps {
+        if !overlap.unresolved() && pair_is_current(overlap) {
+            continue;
+        }
         let ids = [&overlap.left.id, &overlap.right.id];
         let pair = ids
             .iter()
@@ -743,7 +773,7 @@ fn read_scoped(
         actions.retain(|a| a.kind != "directed_request");
     }
     let (conflicts, conflict_limits, conflict_evidence_digest) =
-        conflicts::read(store, principal, reader, &items, now)?;
+        conflicts::read(store, principal, reader, &items, &overview.overlaps, now)?;
     actions.extend(conflicts);
     limits.extend(conflict_limits);
     let (checks, check_limits, check_evidence_digest) =
@@ -4355,5 +4385,183 @@ mod tests {
         let after = read(&*store, &outsider, now).unwrap();
         assert_eq!(after.counts.needs_you, 0);
         assert_ne!(before, after.digest);
+    }
+
+    fn agreed_overlaps_do_not_request_settlement(store: &dyn Store) {
+        use crate::hub::coordination::{
+            CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+        };
+        use crate::hub::session::SessionCall;
+        use crate::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapStart};
+        let now = crate::hub::store::unix_now();
+        let principal = |id| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id: id,
+                    },
+                    &format!("synthetic-{id}"),
+                )
+                .unwrap();
+            let (_, secret, _) = mint_bound_agent_token(
+                store,
+                &user.id,
+                "synthetic",
+                "acme/widgets",
+                101,
+                3600,
+                false,
+            )
+            .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let a = principal(971);
+        let b = principal(972);
+        let third = principal(973);
+        let start = |key: &str| {
+            serde_json::from_value::<WorkStart>(
+                json!({"request_key":key,"title":key,"session":key,"scope":["src/shared.rs"]}),
+            )
+            .unwrap()
+        };
+        let target = store
+            .work_start(&a.token_id, &start("first"), now)
+            .unwrap()
+            .item;
+        let touch = |who: &Principal, session: &str, deny| {
+            store
+                .touch_session(
+                    &who.token_id,
+                    &SessionCall {
+                        session: Some(session.into()),
+                        via: "hook:codex".into(),
+                        task: None,
+                        paths: vec!["src/shared.rs".into()],
+                        deny,
+                        report: true,
+                    },
+                    now,
+                )
+                .unwrap()
+        };
+        touch(&a, "first", false);
+        assert!(!touch(&b, "second", true).denied.is_empty());
+        touch(&b, "second", true);
+        let before = read(store, &a, now).unwrap();
+        assert!(before.actions.iter().any(|a| a.kind == "file_conflict"));
+        let proposal = start("second");
+        let request = store
+            .work_start(&b.token_id, &proposal, now)
+            .unwrap()
+            .coordination_request
+            .unwrap();
+        let consent = store
+            .work_overlap_consent(
+                &a.token_id,
+                &WorkOverlapConsentRequest {
+                    request_id: request.id.clone(),
+                    target_work_id: target.id.clone(),
+                    operation_id: "consent".into(),
+                    session: "first".into(),
+                    expected_updated_seq: request.updated_seq,
+                    target_generation: target.generation,
+                    target_updated_seq: target.updated_seq,
+                    paths: vec!["src/shared.rs".into()],
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .work_overlap_start(
+                &b.token_id,
+                &WorkOverlapStart {
+                    start: proposal,
+                    consent_ids: vec![consent.consent.id],
+                },
+                now,
+            )
+            .unwrap();
+        let agreed = read(store, &a, now).unwrap();
+        assert!(
+            !agreed.actions.iter().any(|a| matches!(
+                a.kind.as_str(),
+                "file_conflict" | "scope_overlap" | "directed_request"
+            )),
+            "{:?}",
+            agreed.actions
+        );
+        assert_ne!(before.digest, agreed.digest);
+        touch(&third, "third", false);
+        let contested = read(store, &a, now).unwrap();
+        assert!(contested.actions.iter().any(|a| a.kind == "file_conflict"));
+        store
+            .end_session(&third.token_id, Some("third"), now)
+            .unwrap();
+        assert!(
+            !read(store, &a, now)
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict")
+        );
+        let requests = store
+            .coordination_inbox(
+                &a.token_id,
+                &CoordinationInboxQuery {
+                    session: Some("first".into()),
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        let current = requests
+            .requests
+            .iter()
+            .find(|r| r.id == request.id)
+            .unwrap();
+        store
+            .coordination_reply(
+                &a.token_id,
+                &CoordinationReply {
+                    request_id: current.id.clone(),
+                    operation_id: "decline".into(),
+                    target_work_id: target.id,
+                    session: "first".into(),
+                    expected_updated_seq: current.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: Some("Stop sharing this file".into()),
+                    via: crate::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(
+            read(store, &a, now)
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict"),
+            "invalidated agreement cannot suppress retained live intents"
+        );
+    }
+
+    #[test]
+    fn agreed_overlaps_clear_shared_status_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        agreed_overlaps_do_not_request_settlement(&*store);
+    }
+    #[test]
+    fn agreed_overlaps_clear_shared_status_actions_on_postgres() {
+        on_postgres(agreed_overlaps_do_not_request_settlement);
     }
 }

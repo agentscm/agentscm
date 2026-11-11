@@ -19,6 +19,8 @@ An **intent** is one agent session's announcement of its task and the files it i
 changing. A **hub** is the shared server ([hub guide](hub.md)) that stores intents.
 An **agent token** is a secret that lets one agent talk to the hub for one repository.
 
+Two current Work leads can agree to share named files while keeping separate reservations. Use the [explicit consent handshake](design/work-overlaps.md), then inspect `agreed_paths` in overlap reports. Only those files are agreed; other paths remain contested. Declare the full intended scope rather than leaving a shared file out. Scope, lead or reservation changes invalidate consent, and edit checks revalidate it. Git conflicts and review remain separate.
+
 ## Set up
 
 1. Run the hub: `agentscm hub serve` or the container ([hub guide](hub.md)).

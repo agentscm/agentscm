@@ -3502,6 +3502,21 @@ fn assert_scope_overlap(result: &agentscm::hub::work::WorkStartResult) {
     );
 }
 
+/// Rewind the newer migration that references reservation columns before replaying an older
+/// reservation migration. Reopening the Store recreates its paired current-schema objects.
+fn rewind_overlap_migration(db: &Db) {
+    if db._pg.is_some() {
+        db.sql("DROP TRIGGER hub_work_overlap_epoch ON hub_work_items; DROP FUNCTION hub_work_overlap_epoch_update();");
+    } else {
+        db.sql("DROP TRIGGER hub_work_overlap_epoch;");
+    }
+    db.sql(
+        "DROP TABLE hub_work_overlap_consents;
+        ALTER TABLE hub_work_items DROP COLUMN overlap_epoch;
+        DELETE FROM hub_named_migrations WHERE name='work_overlap';",
+    );
+}
+
 fn reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -3546,6 +3561,7 @@ fn reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated(
         now + 1,
     );
     drop(store);
+    rewind_overlap_migration(db);
 
     // Rebuild the schema a binary without this change leaves behind: no columns, no marker.
     db.sql(
@@ -6807,6 +6823,7 @@ fn lease_migration_starts_existing_reservations_now(db: &Db) {
         )
         .unwrap();
     drop(store);
+    rewind_overlap_migration(db);
 
     // Rebuild the schema a binary without this change leaves behind.
     db.sql(

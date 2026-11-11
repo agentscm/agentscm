@@ -139,6 +139,8 @@ use crate::local_ci::DeviceAuthorization;
 mod preflight;
 mod repository_rename;
 mod validation_evidence;
+mod work_dependencies;
+mod work_overlap;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -2054,7 +2056,8 @@ fn work_scope_overlaps(
     }
     // A lapsed lease blocks nobody, unless the clock is stale and its lapse is not yet known.
     let stale = !lease_clock_fresh(tx, now)?;
-    // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
+    // Check the indexed reservation scope, retaining that exact evidence even if a stored
+    // snapshot differs. Only overlapping snapshots need decoding.
     let mut statement = tx.prepare(
         "SELECT id, scope FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
@@ -2081,7 +2084,8 @@ fn work_scope_overlaps(
     }
     let mut found = Vec::new();
     for (id, their_scope) in scopes {
-        let reasons = scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?);
+        let their_scope = json_value::<Vec<String>>(&their_scope)?;
+        let reasons = scope_overlap_reasons(scope, &their_scope);
         if !reasons.is_empty() {
             let snapshot: String = tx.query_row(
                 "SELECT snapshot FROM hub_work_items WHERE id = ?1",
@@ -2090,14 +2094,17 @@ fn work_scope_overlaps(
             )?;
             let mut item: WorkItem = json_value(&snapshot)?;
             project_claim(tx, &mut item, now)?;
-            let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
+                agreed_paths: Vec::new(),
                 item,
                 your_scope: scope.to_vec(),
                 their_scope,
                 reasons,
             });
         }
+    }
+    if let Some(id) = exclude {
+        work_overlap::annotate_existing(tx, who, id, scope, &mut found, now)?;
     }
     Ok(found)
 }
@@ -2423,6 +2430,7 @@ fn lapse_reservations(
             .and_then(|bytes| bytes.checked_add(released))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         record_work_payload_delta(tx, who, delta, now)?;
+        work_dependencies::changed(tx, who, &item, now)?;
         reclaimed.push(reclaimed_hold(&item, expires_at));
     }
     Ok(reclaimed)
@@ -2598,17 +2606,9 @@ fn open_requests_by_work(
     Ok(by_work)
 }
 
-/// The unfinished Work that depends on `id`, bounded to one past `MAX_RECOVERY_LISTED`.
+/// The unfinished Work that depends on `id`; recovery applies its own smaller projection bound.
 fn work_dependents(tx: &Transaction<'_>, id: &str) -> Result<Vec<String>> {
-    let limit = i64::try_from(MAX_RECOVERY_LISTED + 1).unwrap_or(i64::MAX);
-    Ok(tx
-        .prepare(
-            "SELECT r.work FROM hub_work_relations r JOIN hub_work_items w ON w.id = r.work
-             WHERE r.related = ?1 AND r.kind = 'depends_on' AND w.state <> 'finished'
-             ORDER BY r.work LIMIT ?2",
-        )?
-        .query_map(params![id, limit], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+    work_dependencies::dependents(tx, id)
 }
 
 fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
@@ -2698,6 +2698,9 @@ fn work_payload_bytes(
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
              UNION ALL
+             SELECT length(CAST(n.snapshot AS BLOB)) + 256 FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work
+              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3 AND w.repository_id IS ?4
+             UNION ALL
              SELECT length(CAST(d.snapshot AS BLOB)) + 256 FROM hub_work_declarations d
               JOIN hub_work_items w ON w.id = d.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
@@ -2752,6 +2755,10 @@ fn work_payload_bytes(
                JOIN hub_coordination_requests r ON r.id = s.request
               WHERE r.provider = ?1 AND r.host = ?2 AND r.repository = ?3
                 AND r.repository_id IS ?4
+             UNION ALL
+             SELECT length(CAST(c.payload AS BLOB)) + length(CAST(c.snapshot AS BLOB)) + 512
+               FROM hub_work_overlap_consents c JOIN hub_coordination_requests r ON r.id=c.request
+              WHERE r.provider = ?1 AND r.host = ?2 AND r.repository = ?3 AND r.repository_id IS ?4
              UNION ALL
              SELECT length(CAST(o.payload AS BLOB)) + 256
                FROM hub_coordination_operations o
@@ -2950,6 +2957,7 @@ fn carry_lead_credential(
         .checked_sub(previous_item_bytes)
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, who, delta, now)?;
+    work_dependencies::changed(tx, who, item, now)?;
     Ok(())
 }
 
@@ -4400,6 +4408,17 @@ fn start_in(
     named: bool,
     now: i64,
 ) -> Result<WorkStartResult> {
+    start_overlap_in(tx, who, start, named, &[], now)
+}
+
+fn start_overlap_in(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    named: bool,
+    consents: &[super::work_overlap::WorkOverlapConsent],
+    now: i64,
+) -> Result<WorkStartResult> {
     if who.read_only {
         return Err(HubError::Unauthorized);
     }
@@ -4498,6 +4517,7 @@ fn start_in(
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             adjust_work_payload_capacity(tx, who, delta, now)?;
+            work_dependencies::changed(tx, who, &item, now)?;
             return Ok(WorkStartResult {
                 reclaimed: Vec::new(),
                 item,
@@ -4552,11 +4572,18 @@ fn start_in(
                     preflight: None,
                 });
             }
-            let overlaps = if work_holds_reservation(tx, &item.id)? {
+            let mut overlaps = if work_holds_reservation(tx, &item.id)? {
                 work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?
             } else {
                 Vec::new()
             };
+            super::work_overlap::annotate(&mut overlaps, consents);
+            if start.takeover_generation.is_some() {
+                for overlap in &mut overlaps {
+                    overlap.agreed_paths.clear();
+                }
+            }
+            overlaps.retain(WorkScopeOverlap::unresolved);
             // The lead asking again for its own lapsed Work is a fresh admission. A call that named
             // no session is not the lead's own, so it cannot hold the scope again.
             let mut reclaimed = Vec::new();
@@ -4683,9 +4710,16 @@ fn start_in(
             None
         };
         let mut lapsed = Vec::new();
-        if !held || own_lapse.is_some() {
+        if !held || own_lapse.is_some() || start.takeover_generation.is_some() {
             lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
-            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            let mut overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            super::work_overlap::annotate(&mut overlaps, consents);
+            if start.takeover_generation.is_some() {
+                for overlap in &mut overlaps {
+                    overlap.agreed_paths.clear();
+                }
+            }
+            overlaps.retain(WorkScopeOverlap::unresolved);
             if let Some(first) = overlaps.first() {
                 return Ok(WorkStartResult {
                     reclaimed: Vec::new(),
@@ -4812,6 +4846,7 @@ fn start_in(
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(tx, who, delta, now)?;
+        work_dependencies::changed(tx, who, &item, now)?;
         return Ok(WorkStartResult {
             reclaimed,
             item,
@@ -4846,7 +4881,14 @@ fn start_in(
         });
     }
     let lapsed = lapsed_overlapping(tx, who, &scope, None, now)?;
-    let overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
+    let mut overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
+    super::work_overlap::annotate(&mut overlaps, consents);
+    if start.takeover_generation.is_some() {
+        for overlap in &mut overlaps {
+            overlap.agreed_paths.clear();
+        }
+    }
+    overlaps.retain(WorkScopeOverlap::unresolved);
     if let Some(first) = overlaps.first() {
         let coordination_request = create_coordination_request(
             tx,
@@ -5020,6 +5062,7 @@ fn start_in(
             + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
+    work_dependencies::changed(tx, who, &item, now)?;
     let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
     Ok(WorkStartResult {
@@ -5587,7 +5630,20 @@ fn announce_in(
     let mut ids = probe(tx, who, &intent.id, keys, now)?;
     ids.insert(intent.id.clone());
     let ids: Vec<String> = ids.into_iter().collect();
-    let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
+    let mut announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
+    if let Some(session) = session {
+        let work = work_who(tx, &who.token, now)?;
+        for overlap in &mut announced.overlaps {
+            let agreed =
+                work_overlap::agreed_intent_paths(tx, &work, session, &overlap.intent, now)?;
+            overlap.agreed_paths = overlap
+                .your_paths
+                .iter()
+                .filter(|path| agreed.contains(path))
+                .cloned()
+                .collect();
+        }
+    }
     if let Plan::Write { previous, .. } = &plan {
         for event in notice_events(who, intent, (session, via), previous, &announced)? {
             append(tx, &event)?;
@@ -6175,7 +6231,8 @@ fn touch_in(
     };
     let step = plan_touch(row.as_ref(), current.as_ref(), call, now)?;
     let own = current.as_ref().map_or("", |held| held.id.as_str());
-    let guarded = guard(
+    let mut agreement_rechecks = Vec::new();
+    let mut guarded = guard(
         token,
         row.as_ref(),
         current.as_ref(),
@@ -6184,9 +6241,24 @@ fn touch_in(
         now,
         |keys| {
             let ids: Vec<String> = probe(tx, who, own, keys, now)?.into_iter().collect();
-            load_intents(tx, &ids)
+            let mut intents = load_intents(tx, &ids)?;
+            let work = work_who(tx, token, now)?;
+            for intent in &mut intents {
+                let agreed = work_overlap::agreed_intent_paths(tx, &work, &name, intent, now)?;
+                agreement_rechecks.extend(keys.iter().filter(|key| agreed.contains(key)).cloned());
+                intent.paths.retain(|path| !agreed.contains(path));
+            }
+            Ok(intents)
         },
     )?;
+    // Agreed edits must revalidate consent on their next call, even while this intent holds the file.
+    if !agreement_rechecks.is_empty() && !guarded.refused() {
+        let mut unchecked: Vec<String> = json_value(&guarded.unchecked_json)?;
+        unchecked.extend(agreement_rechecks);
+        unchecked.sort();
+        unchecked.dedup();
+        guarded.unchecked_json = json_string(&unchecked)?;
+    }
     let step = &guarded.step;
     let cursor = row.as_ref().map_or(0, |row| row.cursor);
     // A refused call reports nothing else, so the notices wait for the next one.
@@ -7421,6 +7493,20 @@ impl SqliteStore {
             .cloned()
             .collect::<Vec<_>>();
         let mut overlaps = work_overlap_pairs(&reserved, query.limit + 1);
+        for pair in &mut overlaps {
+            for consent in work_overlap::agreements(&tx, &who, &pair.left.id, now)? {
+                let other = if consent.target.work_id == pair.left.id {
+                    consent.accepted.as_ref().map(|f| f.work_id.as_str())
+                } else {
+                    Some(consent.target.work_id.as_str())
+                };
+                if other == Some(pair.right.id.as_str()) {
+                    pair.agreed_paths.extend(consent.paths);
+                }
+            }
+            pair.agreed_paths.sort();
+            pair.agreed_paths.dedup();
+        }
         // A continuation page sees only its own items, so its overlaps are never the whole set.
         let mut overlaps_complete =
             query.after.is_none() && current_complete && overlaps.len() <= query.limit;
@@ -7454,8 +7540,24 @@ fn work_checkpoint_in(
     checkpoint: &WorkCheckpoint,
     now: i64,
 ) -> Result<WorkCheckpointResult> {
+    checkpoint_overlap_in(tx, token, checkpoint, &[], now)
+}
+
+fn checkpoint_overlap_in(
+    tx: &Transaction<'_>,
+    token: &str,
+    checkpoint: &WorkCheckpoint,
+    consents: &[super::work_overlap::WorkOverlapConsent],
+    now: i64,
+) -> Result<WorkCheckpointResult> {
     checkpoint.validate()?;
-    let request = json_string(checkpoint)?;
+    let request = if consents.is_empty() {
+        json_string(checkpoint)?
+    } else {
+        let mut ids: Vec<_> = consents.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        json_string(&json!({"checkpoint":checkpoint,"consent_ids":ids}))?
+    };
     let who = work_who(tx, token, now)?;
     if who.read_only {
         return Err(HubError::Unauthorized);
@@ -7590,12 +7692,14 @@ fn work_checkpoint_in(
     let mut lapsed = Vec::new();
     if let Some(scope) = checkpoint.normalized_scope()? {
         // Work without a reservation claims nothing, so its scope change has nothing to check.
-        let overlaps = if held {
+        let mut overlaps = if held {
             lapsed = lapsed_overlapping(tx, &who, &scope, Some(&item.id), now)?;
             work_scope_overlaps(tx, &who, &scope, Some(&item.id), now)?
         } else {
             Vec::new()
         };
+        super::work_overlap::annotate(&mut overlaps, consents);
+        overlaps.retain(WorkScopeOverlap::unresolved);
         if !overlaps.is_empty() {
             let request = create_coordination_request(
                 tx,
@@ -7678,12 +7782,26 @@ fn work_checkpoint_in(
         item.blocker = None;
     }
     item.current = Some(current);
+    let added_legacy: Vec<String> = checkpoint
+        .depends_on
+        .iter()
+        .filter(|id| !item.depends_on.contains(id))
+        .cloned()
+        .collect();
     item.depends_on = checkpoint.depends_on.clone();
     item.related_work = checkpoint.related_work.clone();
     item.updated_at = now;
     let event = work_event("work_checkpoint", &item)?;
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
+    if matches!(
+        checkpoint.kind,
+        super::work::CheckpointKind::Progress
+            | super::work::CheckpointKind::Decision
+            | super::work::CheckpointKind::Blocker
+    ) {
+        work_dependencies::add_legacy(tx, &who, &item, &added_legacy, seq, now)?;
+    }
     let snapshot = save_work_version(tx, &item, seq)?;
     if checkpoint.kind == super::work::CheckpointKind::Decision {
         record_decision(tx, &item, seq)?;
@@ -7721,6 +7839,7 @@ fn work_checkpoint_in(
         .and_then(|bytes| bytes.checked_add(request_bytes))
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, &who, delta, now)?;
+    work_dependencies::changed(tx, &who, &item, now)?;
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
         // records its own size without one, so a finish is never refused for the cleanup.
@@ -11279,6 +11398,7 @@ impl Store for SqliteStore {
         } else {
             adjust_work_payload_capacity(&tx, &who, delta, now)?;
         }
+        work_dependencies::changed(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(WorkTransitionResult {
             reclaimed,
@@ -11641,6 +11761,7 @@ impl Store for SqliteStore {
             })
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = reconciliation_read(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(declarations::ReconciliationResult {
@@ -11738,6 +11859,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_sub(work_payload_row_bytes(old.len()).ok()?))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = declaration_view(&tx, &item)?;
         tx.commit()?;
         Ok(WorkDeclarationsResult {
@@ -11837,6 +11959,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(WorkCheckpointResult {
             item,
@@ -12041,6 +12164,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_sub(old_bytes))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
         tx.commit()?;
         Ok(WorkPrLinkResult {
@@ -15292,6 +15416,15 @@ impl Store for SqliteStore {
                        'coordination_resolved','coordination_withdrawn','coordination_target_released'))
                  FROM hub_coordination_requests r
                  WHERE r.provider=?1 AND r.host=?2 AND r.repository=?3 AND r.repository_id IS ?4
+                   AND NOT EXISTS (SELECT 1 FROM hub_work_overlap_consents c
+                       JOIN hub_work_items t ON t.id=c.target_work
+                       JOIN hub_work_items a ON a.id=c.accepted_work
+                       WHERE c.request=r.id AND r.status='resolved'
+                         AND t.reservation_basis IS NOT NULL AND a.reservation_basis IS NOT NULL
+                         AND t.reservation_expires_at>?6 AND a.reservation_expires_at>?6
+                         AND t.overlap_epoch=json_extract(c.snapshot,'$.target.epoch') AND a.overlap_epoch=json_extract(c.snapshot,'$.accepted.epoch')
+                         AND NOT EXISTS (SELECT 1 FROM hub_coordination_responses q WHERE q.request=r.id
+                             AND q.target_work=c.target_work AND q.kind='decline' AND q.event_seq>json_extract(c.snapshot,'$.event_seq')))
                    AND r.status IN ('resolved','withdrawn') AND r.updated_at < ?5
                    AND EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                        'coordination_requested','coordination_bound','coordination_retargeted',
@@ -15310,7 +15443,8 @@ impl Store for SqliteStore {
                         scope.host,
                         scope.repository,
                         scope.repository_id,
-                        before
+                        before,
+                        now
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )?
@@ -16007,6 +16141,69 @@ impl Store for SqliteStore {
         Ok(updated)
     }
 
+    fn work_dependency_notice_delivery(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<super::work_dependencies::WorkDependencyNoticePage>> {
+        self.dependency_notice_delivery(token, session, now)
+    }
+    fn work_dependency_notices(
+        &self,
+        token: &str,
+        query: &super::work_dependencies::WorkDependencyNoticeQuery,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage> {
+        self.dependency_notices(token, query, now)
+    }
+    fn work_overlap_start(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult> {
+        self.overlap_start(token, request, false, now)
+    }
+    fn work_overlap_preflight(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<super::work_preflight::WorkPreflightResult> {
+        match self.overlap_start(token, request, true, now) {
+            Err(HubError::WorkPreflight(result)) => Ok(*result),
+            Err(e) => Err(e),
+            Ok(_) => Err(HubError::Invalid(
+                "unexpected overlap preflight mutation".into(),
+            )),
+        }
+    }
+    fn work_overlap_checkpoint(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.overlap_checkpoint(token, request, now)
+    }
+    fn work_overlap_consent(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView> {
+        self.overlap_consent(token, request, now)
+    }
+    fn work_overlap_consents(
+        &self,
+        token: &str,
+        request_id: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::work_overlap::WorkOverlapConsentView>> {
+        self.overlap_consents(token, request_id, session, now)
+    }
     fn coordination_reply(
         &self,
         token: &str,
@@ -16197,6 +16394,9 @@ impl Store for SqliteStore {
         )?;
         let mut needs_coordination = Vec::new();
         for overlap in unresolved.drain(..) {
+            if !overlap.unresolved() {
+                continue;
+            }
             let participating = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM hub_work_participants
                  WHERE work = ?1 AND token = ?2 AND session = ?3 AND generation = ?4)",

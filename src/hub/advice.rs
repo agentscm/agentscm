@@ -282,9 +282,14 @@ fn ask_option(path: &str, session: Option<&str>) -> String {
 pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
     let mut stop = BTreeSet::new();
     let mut fyi = BTreeSet::new();
+    let mut agreed = BTreeSet::new();
     let mut lines = Vec::new();
     for overlap in &touched.overlaps {
         for path in &overlap.your_paths {
+            if overlap.agreed_paths.contains(path) {
+                agreed.insert(path.clone());
+                continue;
+            }
             let exact = !path.ends_with("/**") && overlap.their_paths.contains(path);
             if exact { &mut stop } else { &mut fyi }.insert(path.clone());
         }
@@ -314,6 +319,12 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
         .any(|note| !matches!(note.kind, "request" | "grant"));
     fyi.retain(|path| !stop.contains(path));
     let mut out = Vec::new();
+    if !agreed.is_empty() {
+        out.push(format!(
+            "AgentSCM: agreed shared overlap on {}.",
+            specs(&json!(agreed))
+        ));
+    }
     if !stop.is_empty() {
         out.push(format!(
             "AgentSCM: another agent is already working on {}. Options, in order: {OTHER_LINES}, \
@@ -326,7 +337,7 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
             ))
         ));
     }
-    if !fyi.is_empty() || (stop.is_empty() && !lines.is_empty()) {
+    if !fyi.is_empty() || (stop.is_empty() && !lines.is_empty() && agreed.is_empty()) {
         out.push(format!(
             "AgentSCM: other work overlaps {}.",
             specs(&json!(fyi))
@@ -793,6 +804,7 @@ mod tests {
 
     fn overlap(theirs: &[&str], yours: &[&str]) -> Overlap {
         Overlap {
+            agreed_paths: Vec::new(),
             intent: intent("int_a", "refactor", theirs),
             their_paths: theirs.iter().map(|p| (*p).to_owned()).collect(),
             your_paths: yours.iter().map(|p| (*p).to_owned()).collect(),
@@ -913,6 +925,7 @@ mod tests {
         // Whole reply: one warning line, however hostile the teammate text.
         let theirs = vec![paths[0].clone()];
         let overlap = Overlap {
+            agreed_paths: Vec::new(),
             intent: hostile,
             their_paths: theirs.clone(),
             your_paths: theirs,
@@ -1205,6 +1218,7 @@ mod tests {
     fn overlap_of(intent: Intent, paths: &[&str]) -> Overlap {
         let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
         Overlap {
+            agreed_paths: Vec::new(),
             intent,
             their_paths: paths.clone(),
             your_paths: paths,
@@ -1441,5 +1455,14 @@ mod tests {
             handoff_line(&request)
         );
         assert!(!named.contains("raw-id") && !named.contains("label-for-the-token"));
+    }
+    #[test]
+    fn agreed_overlap_is_reported_without_stop_or_an_empty_path_warning() {
+        let mut shared = overlap(&["src/a.rs"], &["src/a.rs"]);
+        shared.agreed_paths = vec!["src/a.rs".into()];
+        let (message, stop) = warn(&touched(vec![shared], vec![]), &[], 0);
+        assert!(!stop);
+        assert!(message.contains("agreed shared overlap on src/a.rs"));
+        assert!(!message.contains("overlaps ."));
     }
 }

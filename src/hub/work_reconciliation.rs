@@ -566,19 +566,17 @@ fn disposition(
         limits,
     }
 }
-pub(super) fn evaluate(
-    item: &WorkItem,
+pub(super) fn prerequisite_dispositions(
     view: &WorkDeclarationsView,
-    evidence: ReconciliationEvidence,
-    basis: Option<&str>,
-) -> DurableReconciliation {
+    evidence: &ReconciliationEvidence,
+) -> Vec<ConditionDisposition> {
     let mut conditions = Vec::new();
     for c in &view.declarations.prerequisites {
         let target = match &c.requirement {
             PrerequisiteRequirement::MergedPullRequest { target, .. } => Some(target),
             _ => None,
         };
-        let mut row = disposition(&c.id, target, &evidence);
+        let mut row = disposition(&c.id, target, evidence);
         if evidence
             .prerequisites
             .iter()
@@ -590,6 +588,16 @@ pub(super) fn evaluate(
         }
         conditions.push(row);
     }
+    conditions
+}
+
+pub(super) fn evaluate(
+    item: &WorkItem,
+    view: &WorkDeclarationsView,
+    evidence: ReconciliationEvidence,
+    basis: Option<&str>,
+) -> DurableReconciliation {
+    let conditions = prerequisite_dispositions(view, &evidence);
     let mut links: Vec<_> = view
         .declarations
         .links

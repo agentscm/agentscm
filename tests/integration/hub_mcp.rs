@@ -150,6 +150,118 @@ impl Hub {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_overlap_tools_and_dependency_summary_delivery() {
+    let hub = Hub::start().await;
+    let (a_token, a) = hub.secret_with_id(801, "first");
+    let (_, b) = hub.secret_with_id(802, "second");
+    let listed = hub
+        .rpc(&a, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await
+        .json();
+    for tool in [
+        "agentscm_work_overlap_consent",
+        "agentscm_work_overlap_consents",
+        "agentscm_work_overlap_start",
+        "agentscm_work_overlap_preflight",
+        "agentscm_work_overlap_checkpoint",
+        "agentscm_work_dependency_notices",
+    ] {
+        assert!(
+            listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == tool),
+            "{tool}"
+        );
+    }
+    let first=hub.tool_result(&a,"agentscm_start",json!({"request_key":"first","task":"First behavior","session":"first","paths":["src/shared.rs"]})).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let target = &first["structuredContent"]["work"]["item"];
+    let second=hub.tool_result(&b,"agentscm_start",json!({"request_key":"second","task":"Second behavior","session":"second","paths":["src/shared.rs"]})).await;
+    let request = &second["structuredContent"]["work"]["coordination_request"];
+    let grant=hub.tool_result(&a,"agentscm_work_overlap_consent",json!({"request_id":request["id"],"target_work_id":target["id"],"operation_id":"grant","session":"first","expected_updated_seq":request["updated_seq"],"target_generation":target["generation"],"target_updated_seq":target["updated_seq"],"paths":["src/shared.rs"]})).await;
+    assert_eq!(grant["isError"], false, "{grant}");
+    assert_eq!(grant["structuredContent"]["state"], "awaiting_requester");
+    let envelope = json!({"start":{"request_key":"second","title":"Second behavior","session":"second","scope":["src/shared.rs"]},"consent_ids":[grant["structuredContent"]["id"]]});
+    let inspected = hub
+        .tool_result(&b, "agentscm_work_overlap_preflight", envelope.clone())
+        .await;
+    assert_eq!(inspected["isError"], false, "{inspected}");
+    assert_eq!(
+        inspected["structuredContent"]["scope_overlaps"][0]["agreed_paths"],
+        json!(["src/shared.rs"])
+    );
+    let accepted = hub
+        .tool_result(&b, "agentscm_work_overlap_start", envelope)
+        .await;
+    assert_eq!(accepted["isError"], false, "{accepted}");
+    assert_eq!(accepted["structuredContent"]["created"], true);
+    let read = hub
+        .tool_result(
+            &b,
+            "agentscm_work_overlap_consents",
+            json!({"request_id":request["id"],"session":"second"}),
+        )
+        .await;
+    assert_eq!(read["structuredContent"]["consents"][0]["state"], "agreed");
+    assert!(!read["structuredContent"].to_string().contains(&a_token));
+    let dependent=hub.tool_result(&b,"agentscm_start",json!({"request_key":"dependent","task":"Use first behavior","session":"dependent","paths":["docs/dependent.md"],"depends_on":[target["id"]]})).await;
+    assert_eq!(dependent["isError"], false, "{dependent}");
+    assert_eq!(
+        dependent["structuredContent"]["work"]["preflight"]["dependencies"]["conditions"][0]["disposition"]
+            ["state"],
+        "unknown"
+    );
+    let pure=hub.tool_result(&a,"agentscm_work_preflight",json!({"request_key":"first","task":"First behavior","session":"first","paths":["src/shared.rs"]})).await;
+    assert_eq!(pure["isError"], false, "{pure}");
+    assert!(
+        pure["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none(),
+        "{pure}"
+    );
+    let once = hub
+        .tool_result(&a, "agentscm_status", json!({"session":"first"}))
+        .await;
+    assert_eq!(
+        once["_meta"]["agentscm"]["dependency_notifications"]["notices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{once}"
+    );
+    let twice = hub
+        .tool_result(&a, "agentscm_status", json!({"session":"first"}))
+        .await;
+    assert!(
+        twice["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none(),
+        "{twice}"
+    );
+    // Attempting an advisory summary does not acknowledge or hide the explicit retained read.
+    for _ in 0..2 {
+        let read = hub
+            .tool_result(
+                &a,
+                "agentscm_work_dependency_notices",
+                json!({"session":"first","after":0,"limit":20}),
+            )
+            .await;
+        assert_eq!(read["isError"], false, "{read}");
+        assert_eq!(
+            read["structuredContent"]["notices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
     let hub = Hub::start().await;
     let secret = hub.secret(1, "member-agent");
@@ -598,6 +710,12 @@ async fn protocol_basics() {
             "agentscm_coordination_reply",
             "agentscm_coordination_resolve",
             "agentscm_coordination_withdraw",
+            "agentscm_work_overlap_consents",
+            "agentscm_work_dependency_notices",
+            "agentscm_work_overlap_consent",
+            "agentscm_work_overlap_start",
+            "agentscm_work_overlap_preflight",
+            "agentscm_work_overlap_checkpoint",
         ]
     );
     // Without adopted skills, the default list leaves out the skill tools and the tools nothing
@@ -2840,7 +2958,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 38] = [
+    const CORE: [&str; 44] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -2867,9 +2985,15 @@ async fn default_tool_list_cost() {
         "agentscm_work_catchup",
         "agentscm_work_catchup_ack",
         "agentscm_work_checkpoint",
+        "agentscm_work_dependency_notices",
         "agentscm_work_insight",
         "agentscm_work_insights",
         "agentscm_work_issue_link_set",
+        "agentscm_work_overlap_checkpoint",
+        "agentscm_work_overlap_consent",
+        "agentscm_work_overlap_consents",
+        "agentscm_work_overlap_preflight",
+        "agentscm_work_overlap_start",
         "agentscm_work_overview",
         "agentscm_work_preflight",
         "agentscm_work_recovery",
