@@ -3,7 +3,7 @@
 //! hooks of each supported agent where its host exposes the moment, and the generic hook's
 //! `waiting` event for the rest. The session's next tool call, prompt or start clears it, so it
 //! never outlives the wait it describes. So does the session's end, except for the end of a turn
-//! that may ask its person something: a host that ends its session after every turn still waits
+//! that says what it asks its person: a host that ends its session after every turn still waits
 //! for that person's reply ([`Waiting::ended`]).
 //!
 //! Short-lived like the setup observations beside it: in memory and bounded. A Hub that is
@@ -12,11 +12,11 @@
 //! waiting. The wait of a session its host named belongs to its person, not to the agent token
 //! that reported it (see [`holder`]). The only text kept is the short excerpt of what the wait
 //! asks that the hook client sends, with secrets redacted: the end of the agent's last message,
-//! its question, or what a permission prompt is for. That last is an excerpt of the tool's input,
-//! never what an edit writes or what a command feeds a program. It is shown to that session's own
-//! person alone. No prompt, other tool input or transcript is kept here, and this table cannot
-//! answer a prompt. A wait at a permission prompt or a question may have a
-//! pending request in `permission_answer`, which lets that person answer it from the Hub.
+//! its question, or, for a permission prompt, the tool input's own `description`: never the
+//! command, an edit's file content or anything a command feeds a program. It is shown to that
+//! session's own person alone. No prompt, other tool input or transcript is kept here, and this
+//! table cannot answer a prompt. A wait at a permission prompt or a question may have a pending
+//! request in `permission_answer`, which lets that person answer it from the Hub.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -584,8 +584,9 @@ impl Waiting {
             .is_ok_and(|rows| rows.keys().any(|(_, session)| session == native))
     }
 
-    /// Ends the wait of `native` after a call from it: `all` for a prompt or the session's start
-    /// (its end goes through [`Self::ended`]); otherwise a tool call by `by` (a subagent, or
+    /// Ends the wait of `native` after a call from it: `all` for a prompt, the session's start, or
+    /// an end its person caused by clearing the session (any other end goes through
+    /// [`Self::ended`]); otherwise a tool call by `by` (a subagent, or
     /// `None` for the lead), which ends only a wait that subagent asked, or one whose asker the
     /// host did not name. Another subagent working on in parallel does not end it. `holder` is
     /// [`holder`] of the token that made the call: any of a person's tokens ends the wait of a
@@ -603,10 +604,12 @@ impl Waiting {
         }
     }
 
-    /// Ends the wait of `native` when its session ends, except the end of a turn that may ask its
-    /// person something: a host that ends its session after every turn still waits for that
+    /// Ends the wait of `native` when its session ends, except the end of a turn that says what
+    /// it asks its person: a host that ends its session after every turn still waits for that
     /// person's reply. That wait lasts until a prompt, start or tool call in that session, or 24
-    /// hours. A dialog closes with its session, and a stop that asks nobody is over.
+    /// hours. A dialog closes with its session, and a stop that asks nobody is over, as is a
+    /// turn's end with no text (a client that cannot tell what its turn asked, or one restored
+    /// after a Hub restart, which keeps no text).
     pub(super) fn ended(&self, holder: &str, native: &str) {
         let Ok(mut rows) = self.0.lock() else {
             return;
@@ -614,7 +617,7 @@ impl Waiting {
         let key = (holder.to_owned(), native.to_owned());
         if rows
             .get(&key)
-            .is_some_and(|row| row.reason != WaitReason::Idle)
+            .is_some_and(|row| row.reason != WaitReason::Idle || row.asks.is_none())
         {
             rows.remove(&key);
         }
@@ -1058,7 +1061,7 @@ mod tests {
         stopping
             .notice(&mine, NATIVE, NATIVE, "claude", STOP - 94)
             .unwrap();
-        record("idle", WaitReason::Idle, None);
+        record("idle", WaitReason::Idle, Some("Shall I merge it?"));
         record("busy", WaitReason::Background, None);
         record("done", WaitReason::Finished, None);
         // A turn's end whose session then ended is kept, and is saved like any other wait.
@@ -1148,30 +1151,32 @@ mod tests {
                 .unwrap();
             waiting.ended("tok_a", "s");
         };
-        // The person's answer (the session resumed, a start), a new prompt in that session, and
-        // the agent's next tool call each end it.
-        for (by, all) in [(None, true), (None, true), (None, false)] {
+        // The person's answer (the session resumed, a start) or a new prompt in that session ends
+        // it, as does the agent's next tool call. The hook route's tests show which call is which.
+        for (call, all) in [("a start or a prompt", true), ("a tool call", false)] {
             turn(1_000);
             let kept = shown(1_000 + GRACE_SECONDS);
-            assert_eq!(kept.len(), 1);
+            assert_eq!(kept.len(), 1, "{call}");
             assert_eq!(
                 (kept[0].reason, kept[0].asks.as_deref()),
                 (WaitReason::Idle, Some(ASK))
             );
-            waiting.clear("tok_a", "s", by, all);
-            assert!(shown(1_000 + GRACE_SECONDS).is_empty());
+            waiting.clear("tok_a", "s", None, all);
+            assert!(shown(1_000 + GRACE_SECONDS).is_empty(), "{call}");
         }
         // Unanswered, it is kept for the table's 24 hours.
         turn(2_000);
         assert_eq!(shown(2_000 + MAX_AGE_SECONDS - 1).len(), 1);
         assert!(shown(2_000 + MAX_AGE_SECONDS).is_empty());
         waiting.clear("tok_a", "s", None, true);
-        // A dialog closes with its session, and a stop that asks nobody is over.
+        // A dialog closes with its session, a stop that asks nobody is over, and so is a turn's
+        // end that says nothing it asks.
         for reason in [
             WaitReason::Permission,
             WaitReason::Question,
             WaitReason::Finished,
             WaitReason::Background,
+            WaitReason::Idle,
         ] {
             waiting
                 .record(&mine, "s", "s", "claude", reason, None, None, 3_000)

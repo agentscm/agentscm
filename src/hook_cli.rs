@@ -1856,6 +1856,10 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
             out.insert(key.into(), json!(value));
         }
     }
+    // A session its person cleared (`/clear`) waits for nobody; no other end reason leaves.
+    if payload["hook_event_name"] == "SessionEnd" && payload["reason"] == "clear" {
+        out.insert("reason".into(), json!("clear"));
+    }
     // A stop that background work will resume is not a wait; only the count leaves.
     if let Some(tasks) = payload["background_tasks"].as_array() {
         out.insert("background_tasks".into(), json!(tasks.len()));
@@ -2735,6 +2739,12 @@ mod tests {
             sanitized_codex(&stop, Some(&[])).unwrap(),
             json!({"hook_event_name":"Stop","session_id":"s","background_tasks":1})
         );
+        // A session's end says why only when its person cleared it.
+        for (reason, sent) in [("clear", Some("clear")), ("other", None)] {
+            let end = json!({"hook_event_name":"SessionEnd","session_id":"s","reason":reason});
+            let out = sanitized_codex(&end, Some(&[])).unwrap();
+            assert_eq!(out["reason"].as_str(), sent, "{reason}");
+        }
         let camel = json!({"sessionId":"s","notification_type":"permission_prompt",
             "message":"m","agentId":"sub"});
         assert_eq!(

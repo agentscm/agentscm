@@ -32,7 +32,7 @@ use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
     done_pausing_for, others_for, record_hook_ms,
 };
-use super::session_waiting::{WaitReason, holder};
+use super::session_waiting::{WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
@@ -188,6 +188,8 @@ struct Call {
     agent_type: Option<String>,
     /// That subagent stopped.
     stopped: bool,
+    /// The session ended because its person cleared it (`/clear`), so it asks them nothing more.
+    cleared: bool,
     /// The subagent this call started, as the hook client reported it.
     launched: Option<Launched>,
 }
@@ -324,13 +326,12 @@ async fn hook(
         && let Ok(Ok(principal)) =
             timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
     {
-        let (waiting, kept_by) = (state.onboarding.waiting(), holder(&principal, native));
-        // A session's end keeps a turn's end that may ask its person something.
-        if matches!(call.kind, Kind::Done) {
-            waiting.ended(kept_by, native);
-        } else {
-            waiting.clear(kept_by, native, call.asker.as_deref(), all);
-        }
+        call.end_wait(
+            state.onboarding.waiting(),
+            holder(&principal, native),
+            native,
+            all,
+        );
         if all {
             state
                 .onboarding
@@ -577,6 +578,7 @@ impl Call {
             prompt_shown: false,
             agent_type: None,
             stopped: false,
+            cleared: false,
             launched: None,
         }
     }
@@ -661,7 +663,7 @@ impl Call {
 
     /// The wait this call ends, if any: the session's, and whether the call ends every wait
     /// there (the person typed, or the session started or ended) or only one its caller asked.
-    /// An end still keeps a turn's end that may ask its person something (`Waiting::ended`).
+    /// An end still keeps a turn's end that asks its person something ([`Self::end_wait`]).
     fn ends_wait(&self) -> Option<(&str, bool)> {
         let all = match self.kind {
             Kind::Start | Kind::Prompt | Kind::Done => true,
@@ -669,6 +671,16 @@ impl Call {
             Kind::Ignore | Kind::Waiting(_) | Kind::Subagent | Kind::Fail(_) => return None,
         };
         Some((self.session.as_deref()?, all))
+    }
+
+    /// Ends the wait of `native` that [`Self::ends_wait`] names. A session's end keeps a turn's
+    /// end that asks its person something, unless the person cleared that session and moved on.
+    fn end_wait(&self, waiting: &Waiting, holder: &str, native: &str, all: bool) {
+        if self.kind == Kind::Done && !self.cleared {
+            waiting.ended(holder, native);
+        } else {
+            waiting.clear(holder, native, self.asker.as_deref(), all);
+        }
     }
 
     fn task(mut self, task: Option<&str>) -> Self {
@@ -1568,7 +1580,12 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             call.stopped = event == "SubagentStop";
             call
         }
-        Some("SessionEnd") => call(Kind::Done, Shape::Silent),
+        // The client sends why it ended only when its person cleared it (`/clear`).
+        Some("SessionEnd") => {
+            let mut call = call(Kind::Done, Shape::Silent);
+            call.cleared = v["reason"] == "clear";
+            call
+        }
         _ => call(Kind::Ignore, Shape::Silent),
     }
 }
@@ -2575,8 +2592,8 @@ mod tests {
             .render(&Outcome::clean()),
             json!({})
         );
-        // What ends a wait: a prompt, start or end ends all of it, except that an end keeps a
-        // turn's end that may ask (`Waiting::ended`); a tool call ends only its asker's.
+        // Which wait a call ends: a prompt, start or end all of the session's; a tool call only
+        // its asker's. An end still keeps a turn's end that asks (see the next test).
         let ends = |agent, v: Value| {
             parse(agent, &v)
                 .ends_wait()
@@ -2618,6 +2635,73 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_session_end_keeps_its_ask_unless_its_person_cleared_it() {
+        use crate::hub::store::{ForgeIdentity, User};
+        let principal = Principal {
+            token_id: "tok_a".into(),
+            name: "laptop".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(7),
+            expires_at: i64::MAX,
+            read_only: false,
+            owner: User {
+                id: "usr_me".into(),
+                identity: ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: "me".into(),
+                name: None,
+                disabled: false,
+            },
+        };
+        let waiting = Waiting::default();
+        let wait = |native: &str, reason, asks| {
+            waiting
+                .record(
+                    &principal, native, native, "claude", reason, None, asks, 1_000,
+                )
+                .unwrap();
+        };
+        // What the hook route does with the wait of the session a call names.
+        let post = |agent, v: Value| {
+            let call = parse(agent, &v);
+            let (native, all) = call.ends_wait().unwrap();
+            call.end_wait(&waiting, holder(&principal, native), native, all);
+        };
+        let end = |native: &str, reason: Option<&str>| {
+            let mut v = json!({"hook_event_name":"SessionEnd","session_id":native});
+            if let Some(reason) = reason {
+                v["reason"] = json!(reason);
+            }
+            post(Agent::Claude, v);
+        };
+        // A turn's end that asks is kept by its session's end; a permission prompt is not.
+        wait("asks", WaitReason::Idle, Some("Shall I merge it?"));
+        wait("prompt", WaitReason::Permission, Some("Run the tests"));
+        end("asks", Some("other"));
+        end("prompt", Some("other"));
+        assert!(waiting.has_session("asks"));
+        assert!(!waiting.has_session("prompt"));
+        // A prompt or a tool call in that session then ends it.
+        for v in [
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"asks"}),
+            json!({"hook_event_name":"PostToolUse","session_id":"asks","tool_name":"Read"}),
+        ] {
+            wait("asks", WaitReason::Idle, Some("Shall I merge it?"));
+            end("asks", None);
+            assert!(waiting.has_session("asks"), "{v}");
+            post(Agent::Claude, v.clone());
+            assert!(!waiting.has_session("asks"), "{v}");
+        }
+        // A person who clears the session (`/clear`) moves on in a new one: nothing is kept.
+        wait("asks", WaitReason::Idle, Some("Shall I merge it?"));
+        end("asks", Some("clear"));
+        assert!(!waiting.has_session("asks"));
     }
 
     #[test]
