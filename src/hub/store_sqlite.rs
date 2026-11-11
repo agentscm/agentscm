@@ -6531,6 +6531,114 @@ fn contested_facts(
     ))
 }
 
+/// Records a lead start that named another person's unfinished Work (see `duplicate_starts`),
+/// once per session and Work, with its activity event. Rows are kept 30 days and at most 1,000
+/// per token.
+fn duplicate_start_in(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    seen: &super::duplicate_starts::Seen,
+    answer: serde_json::Value,
+    now: i64,
+) -> Result<()> {
+    use super::duplicate_starts::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS, event};
+    let inserted = tx
+        .prepare_cached(
+            "INSERT INTO hub_duplicate_starts
+                 (repository, token, session, owner, holder_work, holder_owner, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
+        )?
+        .execute(params![
+            who.repository,
+            who.token,
+            start.session,
+            who.owner.id,
+            seen.holder_work,
+            seen.holder_owner,
+            now
+        ])?;
+    if inserted == 0 {
+        return Ok(());
+    }
+    append(tx, &event(&who.token, seen, answer, now)?)?;
+    tx.execute(
+        "DELETE FROM hub_duplicate_starts WHERE repository = ?1 AND observed_at < ?2",
+        params![who.repository, now - RETAIN_SECONDS],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_duplicate_starts WHERE (token, session, holder_work) IN (
+             SELECT token, session, holder_work FROM hub_duplicate_starts
+             WHERE token = ?1 ORDER BY observed_at DESC, session, holder_work
+             LIMIT -1 OFFSET ?2)",
+        params![who.token, MAX_ROWS_PER_TOKEN],
+    )?;
+    Ok(())
+}
+
+/// The window's duplicate-start rows, each settled as it stands now, and whether all are there.
+/// The asking person proceeded when, within the window, they joined or led the holder's Work,
+/// created Work of their own linked to the issue, or drew a contested-edit row on a holder's file.
+fn duplicate_start_facts(
+    tx: &Transaction<'_>,
+    repository: &str,
+    since: i64,
+    until: i64,
+    now: i64,
+) -> Result<(Vec<super::duplicate_starts::Outcome>, bool)> {
+    use super::duplicate_starts::{
+        MAX_READ, MAX_ROWS_PER_TOKEN, WINDOW_SECONDS, complete, outcome,
+    };
+    // shortcut: a holder token's other holds count as the holder's (as refusal_outcomes); key
+    // holds by Work if that ever misleads.
+    let rows = tx
+        .prepare(
+            "SELECT d.observed_at, w.id IS NOT NULL,
+                 EXISTS (SELECT 1 FROM hub_work_participants p
+                     WHERE p.work = d.holder_work AND p.owner = d.owner
+                       AND p.updated_at >= d.observed_at AND p.created_at <= d.observed_at + ?4)
+                 OR EXISTS (SELECT 1 FROM hub_work_items o
+                     WHERE o.provider = w.provider AND o.host = w.host
+                       AND o.repository = w.repository AND o.repository_id IS w.repository_id
+                       AND o.owner = d.owner
+                       AND o.created_at BETWEEN d.observed_at AND d.observed_at + ?4
+                       AND lower(w.source_repository) = lower(w.repository)
+                       AND json_extract(o.snapshot, '$.issue_link.repository_id')
+                           = w.repository_id
+                       AND json_extract(o.snapshot, '$.issue_link.number')
+                           = CAST(w.source_issue AS INTEGER))
+                 OR EXISTS (SELECT 1 FROM hub_contested_edits c
+                     JOIN hub_agent_tokens t ON t.id = c.token
+                     JOIN hub_intents i ON i.id = c.hold
+                     WHERE t.owner = d.owner AND c.repository = d.repository
+                       AND i.token = w.lead_token
+                       AND c.observed_at BETWEEN d.observed_at AND d.observed_at + ?4)
+             FROM hub_duplicate_starts d LEFT JOIN hub_work_items w ON w.id = d.holder_work
+             WHERE d.repository = ?1 AND d.observed_at >= ?2 AND d.observed_at <= ?3
+             ORDER BY d.observed_at, d.token, d.session, d.holder_work LIMIT ?5",
+        )?
+        .query_map(
+            params![
+                repository,
+                since,
+                until,
+                WINDOW_SECONDS,
+                MAX_READ as i64 + 1
+            ],
+            |r| Ok(outcome(r.get(0)?, r.get(1)?, r.get(2)?, now)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
+    let pruned: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hub_duplicate_starts WHERE repository = ?1
+             GROUP BY token HAVING COUNT(*) >= ?2 AND MIN(observed_at) > ?3)",
+        params![repository, MAX_ROWS_PER_TOKEN, since],
+        |r| r.get(0),
+    )?;
+    let complete = complete(rows.len(), since, now, pruned);
+    Ok((rows.into_iter().take(MAX_READ).collect(), complete))
+}
+
 /// The hook overhead rows of sessions active in the window, and whether all are there.
 fn overhead_facts(
     tx: &Transaction<'_>,
@@ -11077,6 +11185,7 @@ impl Store for SqliteStore {
         }
         let scope = start.validate(&who)?;
         let preflight = preflight::evaluate(&tx, &who, start, &scope, now)?;
+        let seen = super::duplicate_starts::seen(&who, start, preflight.subject_match.as_ref());
         if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
             let mut result = start_in(&tx, &who, start, named, now)?;
             super::work_preflight::require_overlap_coordination(&result, &preflight)?;
@@ -11085,8 +11194,23 @@ impl Store for SqliteStore {
             tx.commit()?;
             return Ok(result);
         }
-        require_clear_preflight(&who, start, &preflight)?;
+        if let Err(error) = require_clear_preflight(&who, start, &preflight) {
+            if let Some(seen) = &seen {
+                let answer = json!("work_preflight_required");
+                duplicate_start_in(&tx, &who, start, seen, answer, now)?;
+                // Commit the observation (and the catch-up backfill above, as work_preflight
+                // does); start_in has not run.
+                tx.commit()?;
+            }
+            return Err(error);
+        }
         let mut result = start_in(&tx, &who, start, named, now)?;
+        if let Some(seen) = &seen
+            && let Some(conflict) = &result.conflict
+            && !result.took_over
+        {
+            duplicate_start_in(&tx, &who, start, seen, json!(conflict.kind), now)?;
+        }
         pickup_in(&tx, &who, start, &result, now)?;
         result.preflight = Some(preflight);
         tx.commit()?;
@@ -14039,6 +14163,8 @@ impl Store for SqliteStore {
         .into();
         let (contested, contested_complete) =
             contested_facts(&tx, &scope.repository, since, until, now)?;
+        let (duplicate_starts, duplicate_starts_complete) =
+            duplicate_start_facts(&tx, &scope.repository, since, until, now)?;
         let (overhead, overhead_complete) =
             overhead_facts(&tx, &scope.repository, since, until, now)?;
         tx.commit()?;
@@ -14060,6 +14186,8 @@ impl Store for SqliteStore {
             context_population,
             contested,
             contested_complete,
+            duplicate_starts,
+            duplicate_starts_complete,
             overhead,
             overhead_complete,
         })

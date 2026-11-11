@@ -18,6 +18,7 @@ pub mod device;
 pub mod digest;
 pub mod digest_http;
 pub mod dismissals;
+pub mod duplicate_starts;
 pub mod error_envelope;
 pub mod external_runs;
 pub mod forge_api;

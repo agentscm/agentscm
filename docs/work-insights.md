@@ -122,6 +122,43 @@ currency conversion or inferred savings is performed. Structured request usage i
 where a usable identity exists. Cumulative session totals are not added to request totals;
 missing identity, contradictory reports and incomplete collection are reported as gaps.
 
+## Duplicate starts
+
+A lead `agentscm_start` that names a forge issue whose unfinished Work another person leads is
+recorded when the Hub does not let it in: the claim is held (`claim_held`,
+`stale_takeover_required`, or `generation_changed` for an old `takeover_generation`), or a
+`preflight` that is not clear refused it (`work_preflight_required`). It is recorded once per
+session and Work, with a `duplicate_start` activity event. The row keeps the asking token, session
+and person, the holder's Work and person, and the time.
+
+Nothing is recorded for a helper or reviewer join, a start by `work_id`, a takeover that went
+through, a start on Work its lead offered with a handover checkpoint, or a start on Work you own
+or lead: two agents of one person are not someone else. Files
+another person's Work declared are counted as contested edits, not here. Reads (overview, search,
+preflight and planned issues) record nothing, so an agent that read about the other Work and
+stopped is not counted.
+
+`issues.duplicate_starts` counts the window's rows by what the Hub saw the asking person do next:
+
+| Outcome | What the Hub observed |
+|---|---|
+| `proceeded` | Within 24 hours of the start, the asking person joined or led the holder's Work, created Work of their own linked to the issue, or one of their agents drew a contested-edit refusal or notice on a file a hold of the holder's token kept. |
+| `pending` | None of these yet, and the 24 hours are not over. It stays pending for the whole 24 hours, even if the holder finishes sooner. |
+| `stood_down` | None of these within the 24 hours. |
+| `unknown` | The holder's Work record is gone. |
+
+`observed` is the sum of the four. The outcome is worked out when the metrics are read, not
+stored. `stood_down` is inferred from what the Hub did not see: a session that ended, a hook that
+failed open, or work done without Work or hooks looks the same. It is not counted as resolved.
+None of these counts feed `resolved`, `unresolved` or `dismissed`, and none is turned into time
+saved or a claim that a duplicate was avoided. `coverage.gaps` always says that reads are not
+recorded, and says what stood down means when the window has one.
+
+Rows are kept 30 days and at most 1,000 per token, and `partial` is set as for contested edits. A
+single-Work query reports `availability: "not_scoped_to_work"`, because a row names the holder's
+Work, not the asker's. A Hub older than this block leaves `issues.duplicate_starts` out: read that
+as not recorded, not as zero.
+
 ## Contribution receipts in agent context
 
 `agentscm_contribution_receipt` explicitly reads one Work's compact receipt. Receipt settings

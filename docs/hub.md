@@ -686,7 +686,12 @@ changes), `connection_outbound`, `repository_connected` and
 and `pr_status_written`, and `pr_notice` (addressed to an intent, like
 `intent_notice`; `"merged": true` when the pull request was just merged). An `agentscm_start`
 whose task reads like other work adds `task_overlap` (subject: the starting token; data: `task`,
-the matching `work` ids and pull request numbers `pulls`). Publishing adds the `publication_*` events described under
+the matching `work` ids and pull request numbers `pulls`). A lead `agentscm_start` that names a
+forge issue whose unfinished Work another person leads, and is not let in, adds `duplicate_start`
+once per session and Work (subject: the starting token; data: `token`, `issue`, `source`, the
+holder's `work` id, `holder: {login}` and `answer`, which is the conflict kind or
+`work_preflight_required`). A join, a takeover, a start by `work_id` and a start on your own Work
+add none. Publishing adds the `publication_*` events described under
 [Publishing a revision](#publishing-a-revision). An unchanged observation, a repeated delivery and a
 poll that finds nothing new write no event.
 
@@ -760,7 +765,8 @@ body or query string is a 400 with a fixed body.
   anything else is 400): `{seq, id, at, kind, agent: {token, name}, owner:
   {login}, data}`. The kinds are `session_started`, `session_connected`,
   `session_ended`, `edit_denied`, `edit_repeated`, `hold_expired`,
-  `intent_announced`, `intent_released`, `intent_notice`, `pr_notice` and `task_overlap`;
+  `intent_announced`, `intent_released`, `intent_notice`, `pr_notice`, `task_overlap` and
+  `duplicate_start`;
   `agent` and `owner` are the token's that the event is about (for a notice,
   its recipient's), and `data` is the event's JSON without its `session` field.
   It is what the [status page](#status-page) reads.
@@ -1129,6 +1135,10 @@ an id and is counted once per session. Hook-call totals are held in memory and w
 seconds after the first call since the last write; only tokens the store has accepted get totals
 of their own. A Hub restart loses totals not yet written and forgets which report ids it counted,
 so a report resent across a restart can be counted twice.
+
+Each `duplicate_start` is also kept in `hub_duplicate_starts`, 30 days and at most 1,000 rows per
+token, and read by [value metrics](work-insights.md#duplicate-starts). Its outcome is worked out
+when it is read, not stored.
 
 ## Change-record capture and handoff
 

@@ -140,6 +140,7 @@ mod hub_coordination;
 mod hub_devices;
 #[cfg(unix)]
 mod hub_digest;
+mod hub_duplicate_starts;
 #[cfg(unix)]
 mod hub_external_runs;
 #[cfg(unix)]
