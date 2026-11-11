@@ -2008,22 +2008,23 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
     use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
     let (lead_id, lead) = hub.token(1, "acme/widgets", false).await;
     let (_, reader) = hub.token(2, "acme/widgets", true).await;
-    let now = unix_now();
-    // (branch, merged_at, pull number, same repository head, explicit link number)
+    // Merge times are offsets from a clock read after the Work starts, so no merge predates
+    // its Work when a second passes during setup.
+    // (branch, merged_at offset, pull number, same repository head, explicit link number)
     let cases: [(&str, i64, i64, bool, Option<i64>); 10] = [
-        ("feat/shipped", now, 30, true, None),
-        ("feat/matched", now, 32, true, Some(32)),
-        ("feat/fork", now, 33, false, None),
-        ("feat/future", now + 1000, 34, true, None),
-        ("feat/early", now - 1000, 35, true, None),
-        ("feat/other", now, 31, true, Some(99)),
+        ("feat/shipped", 0, 30, true, None),
+        ("feat/matched", 0, 32, true, Some(32)),
+        ("feat/fork", 0, 33, false, None),
+        ("feat/future", 1000, 34, true, None),
+        ("feat/early", -1000, 35, true, None),
+        ("feat/other", 0, 31, true, Some(99)),
         // One branch reused for two pull requests: inference picks neither, so none is listed.
-        ("feat/reused", now, 36, true, None),
-        ("feat/reused", now, 37, true, None),
+        ("feat/reused", 0, 36, true, None),
+        ("feat/reused", 0, 37, true, None),
         // An open same-repository pull request on the branch: inference picks neither.
-        ("feat/reopened", now, 38, true, None),
+        ("feat/reopened", 0, 38, true, None),
         // A merge base, but explicitly linked: listed, as its stage reads merged.
-        ("feat/stack-base", now, 40, true, Some(40)),
+        ("feat/stack-base", 0, 40, true, Some(40)),
     ];
     let mut ids = Vec::new();
     for (index, (branch, _, _, _, _)) in cases.iter().enumerate() {
@@ -2037,6 +2038,7 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
         let started: WorkStartResult = serde_json::from_value(started).unwrap();
         ids.push(started.item);
     }
+    let now = unix_now();
     let store = hub.store.clone();
     let token = lead_id.clone();
     let work = ids.clone();
@@ -2107,7 +2109,7 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
                         same_repository_head: same,
                         source: CatchupMergeSource::ForgePull,
                         source_id: format!("pull:{number}"),
-                        occurred_at: Some(at),
+                        occurred_at: Some(now + at),
                         title: Some("Untrusted title".into()),
                         branch: branch.into(),
                         base: "main".into(),
