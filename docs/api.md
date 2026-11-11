@@ -124,9 +124,11 @@ computer routes are 403 `app_not_allowed`; every other route is 401. It is liste
 `GET /v1/hub/devices` with `"app": {"id", "name"}`.
 
 An app registered with `"read_only": true` reads the same way, `GET /v1/hub/session/permissions`
-included, and answers nothing: `POST /v1/hub/session/coordination/reply`,
-`POST /v1/hub/session/handoff/answer` and `POST /v1/hub/session/permissions/answer` are 403
-`app_cannot_answer` for its credential.
+included, mints no agent token and answers nothing: `POST /v1/hub/device/tokens`,
+`POST /v1/hub/session/coordination/reply`, `POST /v1/hub/session/handoff/answer` and
+`POST /v1/hub/session/permissions/answer` are 403 `app_cannot_answer` for its credential. Its
+kind is read at each Hub start, for credentials already issued too; register a new app id
+rather than making a read-only app full.
 
 ## Hub: Work recovery
 

@@ -447,7 +447,7 @@ not want that revokes it under Computers.
 
 An operator can also register an app as read-only, for an app that only tells the person what
 is waiting. Its credential reads what any connected app reads, the list of the person's agents'
-prompts and questions included, and answers nothing: every answer route refuses it with 403
+prompts and questions included, but mints no agent token, and answers nothing: the mint and every answer route refuse it with 403
 `app_cannot_answer`, and its approval page says it can read but can't answer for the person or
 change anything.
 
@@ -474,7 +474,10 @@ GitLab sign-in is configured.
   time.
 - `via`: how answers through the app are recorded. Only `"slack"` exists today.
 - `read_only`: `true` registers a read-only app, which takes no `via`. Leave it out (or set
-  `false`) for an app that answers; such an app needs `via`, as before.
+  `false`) for an app that answers; such an app needs `via`, as before. The kind is read at each
+  Hub start and applies to credentials already issued: making a full app read-only only takes
+  rights away, but making a read-only app full lets every credential it holds answer without
+  asking its person again. Register a new app id instead.
 
 ```json
 {"apps": [{"id": "example-reader", "name": "Example Reader",
@@ -519,7 +522,7 @@ digest storage, 90-day idle expiry and revocation. It works on:
 - `GET /v1/hub/device` and `DELETE /v1/hub/device` (the app disconnects itself);
 - `GET /v1/hub/device/repositories`;
 - `POST /v1/hub/device/tokens` with `"read_only": true` only (30 minutes); a writable mint is 403
-  `app_read_only`;
+  `app_read_only`, and a read-only app's mint is 403 `app_cannot_answer`;
 - `POST /v1/hub/session/coordination/reply` and `POST /v1/hub/session/handoff/answer`, with the
   same bodies, checks and replies as for the web sign-in: the named agent token must be one of
   the person's own active writable tokens (403 `not_your_agent`), the store's lead, session,
@@ -533,10 +536,11 @@ digest storage, 90-day idle expiry and revocation. It works on:
   the forge says they can read now, and an answer makes the forge's role check for its
   repository.
 
-A read-only app's credential works on the same routes except the three that answer:
-`POST /v1/hub/session/coordination/reply`, `POST /v1/hub/session/handoff/answer` and
-`POST /v1/hub/session/permissions/answer` refuse it with 403 `app_cannot_answer` before reading
-the body, so it never records an answer. It still lists the person's prompts with
+A read-only app's credential works on the same routes except the mint and the three that answer:
+`POST /v1/hub/device/tokens`, `POST /v1/hub/session/coordination/reply`,
+`POST /v1/hub/session/handoff/answer` and `POST /v1/hub/session/permissions/answer` refuse it
+with 403 `app_cannot_answer` before reading the body, so it holds no agent token (one could
+acknowledge the person's catch-up) and never records an answer. It still lists the person's prompts with
 `GET /v1/hub/session/permissions` and can disconnect itself.
 
 Every other computer route refuses it with 403 `app_not_allowed`, and every other person,

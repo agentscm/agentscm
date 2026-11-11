@@ -307,18 +307,25 @@ async fn a_connected_app_lists_and_answers_its_persons_prompt_and_nothing_else_d
     let tokens = "/v1/hub/device/tokens";
     let mint =
         |read_only: bool| json!({"name": "notifier", "repository": REPO, "read_only": read_only});
-    let (status, minted) = call(&hub, Method::POST, tokens, &notifier, Some(mint(true))).await;
-    assert_eq!(status, 201, "{minted}");
-    let (status, refused) = call(&hub, Method::POST, tokens, &notifier, Some(mint(false))).await;
-    assert_eq!(
-        refused["error"].as_str(),
-        Some("app_read_only"),
-        "{status} {refused}"
-    );
+    // It mints no agent token at all: even a read-only one could ack her catch-up.
+    for read_only in [true, false] {
+        let (status, refused) =
+            call(&hub, Method::POST, tokens, &notifier, Some(mint(read_only))).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("app_cannot_answer")),
+            "{refused}"
+        );
+    }
+    let reply = json!({"token": agent, "request_id": "req_1", "operation_id": "op_1",
+        "target_work_id": "work_1", "session": "s1", "expected_updated_seq": 1,
+        "kind": "decline", "note": null});
+    let handoff = json!({"token": agent, "session": null, "path": "src/lib.rs",
+        "accept": true, "reason": null});
     for (path, body) in [
         (ANSWER, answer.clone()),
-        ("/v1/hub/session/coordination/reply", json!({})),
-        ("/v1/hub/session/handoff/answer", json!({})),
+        ("/v1/hub/session/coordination/reply", reply),
+        ("/v1/hub/session/handoff/answer", handoff),
     ] {
         let (status, refused) = call(&hub, Method::POST, path, &notifier, Some(body)).await;
         assert_eq!(
