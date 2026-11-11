@@ -1907,3 +1907,94 @@ async fn holder_intent_encounter_aggregate_is_bounded_and_pure() {
         before
     );
 }
+
+/// Each current Work's stage is opt-in with `stages=1`, so a strict older client still decodes
+/// the plain overview. A Work whose branch has a same-repository open pull request is
+/// `pull_request_open` with that number; one without is `working`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_stages_are_opt_in_and_name_the_open_pull_request() {
+    let hub = Hub::start(None).await;
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, reader) = hub.token(2, "acme/widgets", true).await;
+    let mut ids = Vec::new();
+    for (key, path, branch, session) in [
+        ("shipped", "src/shipped.rs", "feat/shipped", "s-a"),
+        ("plain", "src/plain.rs", "feat/plain", "s-b"),
+    ] {
+        let body = json!({"request_key": key, "title": "Stage", "session": session,
+            "scope": [path], "branch": branch, "next_action": "Continue"});
+        let (status, started) = hub
+            .call(Method::POST, "/v1/hub/standup/start", &lead, Some(body))
+            .await;
+        assert_eq!(status, 200, "{started}");
+        ids.push(started["item"]["id"].as_str().unwrap().to_owned());
+    }
+    let store = hub.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let connection = store
+            .insert_connection(
+                &agentscm::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repository = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let data = json!({"number": 12, "state": "open", "repository_id": 101,
+            "head_ref": "feat/shipped", "head_sha": "a".repeat(40), "base_ref": "main",
+            "head_repository_id": 101})
+        .to_string();
+        store
+            .observe(&repository.id, "pull_request", "12", &data, unix_now())
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let (status, plain) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("stages").is_none(), "{plain}");
+    serde_json::from_value::<WorkOverview>(plain).unwrap();
+
+    let (status, staged) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=1",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(
+        staged["stages"][&ids[0]],
+        json!({"stage": "pull_request_open", "pull_request": 12, "basis": "branch_observed"}),
+        "{staged}"
+    );
+    assert_eq!(staged["stages"][&ids[1]]["stage"], "working", "{staged}");
+    let bad = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=2",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(bad.0, 400);
+}

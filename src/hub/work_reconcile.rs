@@ -829,6 +829,36 @@ pub(super) fn work_stages(
     (stages, limits)
 }
 
+/// The overview as JSON with each current Work's `stages` (keyed by Work id) and any
+/// `stage_limits` beside it. They stay out of `WorkOverview`, which older clients decode strictly.
+pub(super) fn overview_with_stages(
+    store: &dyn Store,
+    principal: &Principal,
+    overview: &super::work::WorkOverview,
+    now: i64,
+) -> (serde_json::Value, BTreeMap<String, WorkStageV1>) {
+    let items: Vec<_> = overview
+        .current
+        .iter()
+        .map(|item| (item, OutcomeValue::None))
+        .collect();
+    let reader = WorkLifecycleReader::Token(&principal.token_id);
+    let (stages, limits) = work_stages(store, principal, &reader, &items, now);
+    let mut value = serde_json::to_value(overview).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        if !stages.is_empty() {
+            object.insert(
+                "stages".to_owned(),
+                serde_json::to_value(&stages).unwrap_or_default(),
+            );
+        }
+        if !limits.is_empty() {
+            object.insert("stage_limits".to_owned(), serde_json::json!(limits));
+        }
+    }
+    (value, stages)
+}
+
 #[derive(Default)]
 struct PullObservation {
     merged: Option<(String, String)>,

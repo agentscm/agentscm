@@ -99,6 +99,7 @@ pub(super) struct Page {
 pub(super) fn overview(
     overview: &WorkOverview,
     held: &OperationalOverviewV1,
+    stages: &std::collections::BTreeMap<String, super::work_reconcile::WorkStageV1>,
     page: &Page,
 ) -> Value {
     let reservation = |id: &str| {
@@ -127,6 +128,10 @@ pub(super) fn overview(
         .map(|item| {
             let mut value = brief(item);
             value["reservation"] = reservation(&item.id);
+            if let Some(stage) = stages.get(&item.id) {
+                value["stage"] = json!(stage.stage);
+                value["pull_request"] = json!(stage.pull_request);
+            }
             value
         })
         .collect();
@@ -399,13 +404,28 @@ mod tests {
             recent_before: None,
         };
         // Cut here: the next page starts after the last item shown.
-        let cut = super::overview(&listed(&[3, 2, 1], true), &held, &page(None));
+        let cut = super::overview(
+            &listed(&[3, 2, 1], true),
+            &held,
+            &Default::default(),
+            &page(None),
+        );
         assert_eq!(cut["next_after"], id(2));
         // Cut by the store's own bound: its last item is where the next read starts.
-        let bounded = super::overview(&listed(&[3, 2], false), &held, &page(None));
+        let bounded = super::overview(
+            &listed(&[3, 2], false),
+            &held,
+            &Default::default(),
+            &page(None),
+        );
         assert_eq!(bounded["next_after"], id(2));
         // A continuation shows what the store read after the cursor; ids are in no order.
-        let rest = super::overview(&listed(&[1], true), &held, &page(Some(id(2))));
+        let rest = super::overview(
+            &listed(&[1], true),
+            &held,
+            &Default::default(),
+            &page(Some(id(2))),
+        );
         assert_eq!(rest["current"][0]["id"], id(1));
         assert!(rest["next_after"].is_null());
     }

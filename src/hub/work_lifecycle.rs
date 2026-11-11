@@ -849,15 +849,14 @@ fn fit_operational(operational: &OperationalOverviewV1, budget: usize) -> Operat
     fitted
 }
 
-/// A `WorkOverview` with the operational projection beside it, as the HTTP and MCP surfaces
-/// emit it when asked. The projection stays out of `WorkOverview` itself, which older clients
-/// decode strictly. It gets what the overview left of `MAX_BRIEFING_BYTES`; entries that do not
+/// An overview value (a serialized `WorkOverview`, perhaps with `stages`) with the operational
+/// projection beside it, as the HTTP and MCP surfaces emit it when asked. The projection stays out of `WorkOverview`
+/// itself, which older clients decode strictly. It gets what the overview left of `MAX_BRIEFING_BYTES`; entries that do not
 /// fit are shed and `complete` turns false, so the response never grows past the briefing bound.
-pub(super) fn overview_with_operational(
-    overview: &super::work::WorkOverview,
+pub(super) fn attach_operational(
+    mut value: serde_json::Value,
     operational: &OperationalOverviewV1,
 ) -> serde_json::Value {
-    let mut value = serde_json::to_value(overview).unwrap_or(serde_json::Value::Null);
     let used = value.to_string().len();
     let budget = super::work::MAX_BRIEFING_BYTES
         .saturating_sub(used)

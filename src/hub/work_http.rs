@@ -19,7 +19,6 @@ use super::work::{
     WorkSearchPage, WorkStart, WorkState,
 };
 use super::work_intent::{self, IntentFlag};
-use super::work_lifecycle::overview_with_operational;
 use super::work_preflight::WorkPreflightResult;
 use super::work_transition::{
     OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkOperationalV1,
@@ -862,6 +861,11 @@ async fn overview(
         operational: params.operational,
     }
     .requested()?;
+    let stages = match params.stages {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(ApiError::invalid()),
+    };
     let query = WorkOverviewQuery {
         recent_since: params.recent_since,
         limit: params
@@ -876,15 +880,21 @@ async fn overview(
             let now = unix_now();
             let mut overview = store.work_overview(&token, &query, now)?;
             overview.show(Viewer(&principal.owner.id));
+            // Stages are opt-in: an older client decodes the overview strictly.
+            let value = if stages {
+                super::work_reconcile::overview_with_stages(&*store, &principal, &overview, now).0
+            } else {
+                serde_json::to_value(&overview).unwrap_or(Value::Null)
+            };
             if !operational {
-                return Ok(serde_json::to_value(&overview).unwrap_or(Value::Null));
+                return Ok(value);
             }
             let held = store.work_operational(
                 &WorkLifecycleReader::Token(&token),
                 &OperationalSelect::Holders,
                 now,
             )?;
-            Ok(overview_with_operational(&overview, &held))
+            Ok(super::work_lifecycle::attach_operational(value, &held))
         })
         .await?,
     ))
@@ -899,6 +909,7 @@ struct OverviewParams {
     limit: Option<usize>,
     after: Option<String>,
     operational: Option<u8>,
+    stages: Option<u8>,
 }
 
 async fn briefing(
