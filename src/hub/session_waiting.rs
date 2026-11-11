@@ -12,9 +12,9 @@
 //! waiting. The wait of a session its host named belongs to its person, not to the agent token
 //! that reported it (see [`holder`]). The only text kept is the short excerpt of what the wait
 //! asks that the hook client sends, with secrets redacted: the end of the agent's last message,
-//! its question, or, for a permission prompt, the tool input's own `description`: never the
-//! command, an edit's file content or anything a command feeds a program. It is shown to that
-//! session's own person alone. No prompt, other tool input or transcript is kept here, and this
+//! its question, or what a permission prompt is for. That last is the host's description of the
+//! call, the files an edit names or a shell's command cut before any text it feeds a program;
+//! never what an edit writes. It is shown to that session's own person alone. No prompt, other tool input or transcript is kept here, and this
 //! table cannot answer a prompt. A wait at a permission prompt or a question may have a pending
 //! request in `permission_answer`, which lets that person answer it from the Hub.
 use std::collections::BTreeMap;

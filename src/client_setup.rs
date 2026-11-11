@@ -330,6 +330,9 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             vec![
                 ("sessionStart", vec![hook(5)]),
                 ("postToolUse", vec![hook(5)]),
+                // Cursor names a reply's text here and not at `stop`; the hook keeps the end of
+                // it on the machine until the turn ends, so `stop` can say what was asked.
+                ("afterAgentResponse", vec![hook(3)]),
                 ("stop", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
@@ -1968,7 +1971,13 @@ mod tests {
         };
         assert_eq!(
             events(Agent::Cursor),
-            ["sessionStart", "postToolUse", "stop", "sessionEnd"]
+            [
+                "sessionStart",
+                "postToolUse",
+                "afterAgentResponse",
+                "stop",
+                "sessionEnd"
+            ]
         );
         assert_eq!(
             events(Agent::Copilot),

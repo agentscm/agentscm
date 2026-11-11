@@ -674,6 +674,7 @@ Registered codes:
 | `promise_conflict` | 409 | no | `inspect_work` |
 | `too_many_publications` | 429 | no | `contact_operator` |
 | `already_connected` | 409 | no | `none` |
+| `waiter_present` | 409 | yes | `wait` |
 | `not_configured` | 404 | no | `contact_operator` |
 | `work_not_found` | 404 | no | `inspect_work` |
 | `generation_conflict` | 409 | no | `inspect_work` |
