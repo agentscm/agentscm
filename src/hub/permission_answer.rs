@@ -500,7 +500,14 @@ impl Inner {
             if now - row.created >= TTL_SECONDS {
                 row.end(Ended::Expired, now);
             } else if now - row.last_poll >= HOOK_GONE_SECONDS {
-                row.end(Ended::HookGone, now);
+                // A host that holds its prompt shows it once the hook is gone, killed or not:
+                // the prompt is on the computer, never asleep here.
+                let why = if row.offer.held {
+                    Ended::HandedBack
+                } else {
+                    Ended::HookGone
+                };
+                row.end(why, now);
             } else if row.attached(waiting, now).is_none() {
                 row.end(Ended::SessionMovedOn, now);
             }
@@ -2358,13 +2365,26 @@ mod tests {
             requests.release(&waiting, "tok_a", &next, OTHER_HASH, later),
             Some(Phase::Answered(Decision::Deny))
         );
+        // A held hook that goes quiet with no release (its host stopped it) has left the prompt
+        // on the computer: still listed, and an answer is refused rather than lost.
+        let (quiet, _) = register(HASH, later + 1);
+        let gone = later + 1 + HOOK_GONE_SECONDS;
+        let shown = requests.list(&waiting, "usr_me", Some(7), gone).unwrap();
+        assert_eq!(
+            (shown.len(), shown[0].request_id.as_str(), shown[0].state),
+            (1, quiet.as_str(), "on_computer")
+        );
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &quiet, Decision::Allow, gone),
+            Err(Refusal::OnComputer)
+        ));
         // Once the session moves on it is no longer listed.
-        let (last, _) = register(HASH, later + 1);
-        requests.release(&waiting, "tok_a", &last, HASH, later + 1);
+        let (last, _) = register(OTHER_HASH, gone + 1);
+        requests.release(&waiting, "tok_a", &last, OTHER_HASH, gone + 1);
         waiting.clear("tok_a", "s", None, true);
         assert!(
             requests
-                .list(&waiting, "usr_me", Some(7), later + 2)
+                .list(&waiting, "usr_me", Some(7), gone + 2)
                 .unwrap()
                 .is_empty()
         );

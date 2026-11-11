@@ -58,6 +58,9 @@ fn metadata() -> Value {
     })
 }
 
+/// Seconds Codex gives the `PermissionRequest` hook; the hook is told the same.
+const PERMISSION_LIMIT: u64 = 600;
+
 fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
     let command = format!(
         "{} --no-telemetry hook codex --client-connection",
@@ -85,8 +88,12 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
         // Tell the Hub this chat waits for its person, and offer them the approval there. Codex
         // shows its own prompt only after this hook returns, so the hook waits only while
-        // nobody is at the computer and ends half a minute inside this limit (Codex's default).
-        "PermissionRequest":[{"hooks":[hook("AgentSCM: your Hub can answer; touch the keyboard to answer here", 600)]}],
+        // nobody is at the computer and ends half a minute inside this limit (Codex's default),
+        // which its command states: a hook run by an older entry never holds the prompt.
+        "PermissionRequest":[{"hooks":[{"type":"command",
+            "command":format!("{command} --hold-limit {PERMISSION_LIMIT}"),
+            "timeout":PERMISSION_LIMIT,
+            "statusMessage":"AgentSCM: your Hub can answer; move the mouse to answer here"}]}],
         "Stop":[{"hooks":[hook("AgentSCM: note this chat's turn ended", 3), wait]}],
         "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3), wait_end]}]
     }});
@@ -1173,10 +1180,13 @@ mod tests {
         assert_eq!(compat["interface"]["displayName"], "AgentSCM");
         let hooks = read("agentscm/hooks/hooks.json");
         assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
-        // Codex's default limit, half a minute past the hook's own bound for a held approval.
+        // Codex's default limit, half a minute past the hook's own bound for a held approval,
+        // and the command tells the hook that limit.
+        let permission = &hooks["hooks"]["PermissionRequest"][0]["hooks"][0];
+        assert_eq!(permission["timeout"], 600);
         assert_eq!(
-            hooks["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
-            600
+            permission["command"],
+            "'/opt/team'\\''s bin/agentscm' --no-telemetry hook codex --client-connection --hold-limit 600"
         );
         // The background waiter starts with the chat and again after each turn, only there.
         for event in ["SessionStart", "Stop"] {
@@ -1202,7 +1212,7 @@ mod tests {
             for group in groups.as_array().unwrap() {
                 let command = group["hooks"][0]["command"].as_str().unwrap();
                 assert_eq!(
-                    command,
+                    command.trim_end_matches(" --hold-limit 600"),
                     "'/opt/team'\\''s bin/agentscm' --no-telemetry hook codex --client-connection"
                 );
                 assert!(!command.contains("token"));

@@ -87,8 +87,9 @@ preflight or a conflict refused does not count.
 
 ### Permission prompts
 
-A person allows once or denies a Claude Code permission prompt of their own agent's session. The
-session's hook registers the prompt and waits; the person answers with the web sign-in, or through
+A person allows once or denies a Claude Code permission prompt or a Codex approval request of
+their own agent's session. The session's hook registers the prompt and waits (for Codex, only
+while nobody is at the computer); the person answers with the web sign-in, or through
 a connected app they approved, with its credential. See
 [Answer a permission prompt from the Hub](agents.md#answer-a-permission-prompt-from-the-hub) for
 the bodies, replies and rules. Requests live in the memory of one Hub process.
@@ -96,7 +97,7 @@ the bodies, replies and rules. Requests live in the memory of one Hub process.
 | Route | Caller | Effect |
 |---|---|---|
 | `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
-| `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
+| `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered. With `release` the hook takes a held prompt back to its session instead |
 | `GET /v1/hub/session/permissions?repository=…` | Web sign-in, or a connected app's credential | `{"requests": [...]}`: the person's own requests there (in every repository without `repository`) that a prompt on screen confirmed, each with its `repository` and what of it is not shown; for a connected app, only in repositories the person can read now |
 | `POST /v1/hub/session/permissions/answer` | Web sign-in with `x-csrf-token`, or a connected app's credential | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
 

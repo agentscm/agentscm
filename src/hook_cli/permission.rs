@@ -36,9 +36,12 @@ const OFF_SWITCH: &str = "AGENTSCM_REMOTE_ANSWERS";
 const BOUND_OVERRIDE: &str = "AGENTSCM_TEST_PERMISSION_BOUND_MS";
 /// The host's hook timeout is 12 hours; the hook ends itself a minute earlier.
 const HOOK_BOUND: Duration = Duration::from_secs(43_140);
-/// Codex stops this hook after the 10 minutes its plugin entry gives it. A hook that holds the
-/// prompt gives it back half a minute earlier, so the person is never left without one.
-const HELD_BOUND: Duration = Duration::from_secs(570);
+/// A hook that holds the prompt stops asking the Hub this long before the host's limit for it,
+/// which the plugin entry states (`--hold-limit`), so its last poll and its release are done
+/// half a minute before the host would stop it and the person is never left without a prompt.
+const HELD_MARGIN: Duration = Duration::from_secs(40);
+/// The most a held hook's call takes past the wait it asks for, and its release in all.
+const HELD_CALL_SLACK: Duration = Duration::from_secs(5);
 /// The Hub confirms a shown prompt within seconds; a request still unconfirmed this long after
 /// the hook started belongs to a run with nobody at a dialog.
 const UNCONFIRMED_GIVE_UP: Duration = Duration::from_secs(20);
@@ -300,14 +303,25 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
     }
 }
 
-/// A shell call's command: one string, or the words of one (Codex may send either).
+/// A shell call's command: one string, or the words of one (Codex may send either), each word
+/// quoted the way a shell would need it, so the person reads what will run.
 fn command_line(input: &Value) -> Option<String> {
+    let plain = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c))
+    };
     match &input["command"] {
         Value::String(command) => Some(command.clone()),
         Value::Array(words) => Some(
             words
                 .iter()
-                .filter_map(Value::as_str)
+                .map(|word| match word.as_str() {
+                    Some(word) if plain(word) => word.to_owned(),
+                    Some(word) => format!("'{}'", word.replace('\'', "'\\''")),
+                    None => word.to_string(),
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
         ),
@@ -877,6 +891,15 @@ struct Hub {
 impl Hub {
     /// `None` when the call failed in transit; the reply otherwise, whatever its status.
     async fn post(&self, route: &str, body: &Value) -> Option<(u16, Value)> {
+        self.post_within(route, body, CALL_TIMEOUT).await
+    }
+
+    async fn post_within(
+        &self,
+        route: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Option<(u16, Value)> {
         let mut url = reqwest::Url::parse(&format!("{}{route}", self.base)).ok()?;
         url.query_pairs_mut().append_pair("repo", &self.repo);
         let request = self
@@ -885,17 +908,14 @@ impl Hub {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .bearer_auth(&self.token)
             .body(serde_json::to_vec(body).ok()?)
-            .timeout(CALL_TIMEOUT);
+            .timeout(timeout);
         send(request, REPLY_BYTES).await.ok()
     }
 }
 
-fn bound(agent: &str) -> Duration {
-    let bound = if holds_prompt(agent) {
-        HELD_BOUND
-    } else {
-        HOOK_BOUND
-    };
+/// How long the hook waits: for a held prompt, up to [`HELD_MARGIN`] before the host's limit.
+fn bound(held_for: Option<Duration>) -> Duration {
+    let bound = held_for.map_or(HOOK_BOUND, |limit| limit.saturating_sub(HELD_MARGIN));
     std::env::var(BOUND_OVERRIDE)
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
@@ -926,17 +946,28 @@ pub(super) async fn await_answer(
     payload: &Value,
     started: Instant,
     fallback: Value,
+    hold_limit: Option<Duration>,
 ) -> Value {
-    run(agent, payload, started).await.unwrap_or(fallback)
+    run(agent, payload, started, hold_limit)
+        .await
+        .unwrap_or(fallback)
 }
 
-async fn run(agent: &str, payload: &Value, started: Instant) -> Option<Value> {
+async fn run(
+    agent: &str,
+    payload: &Value,
+    started: Instant,
+    hold_limit: Option<Duration>,
+) -> Option<Value> {
     let started_under = parent();
     // Waiting would hide the prompt from a person at the computer: it is theirs at once, also
     // where the computer cannot say whether anyone is there, and always for a subagent. The Hub
-    // still lists it, as answered at the computer.
+    // still lists it, as answered at the computer. An entry that does not state the host's limit
+    // for this hook (one written before the hook held prompts) may be stopped at any time, so
+    // its hook never holds.
     let held = holds_prompt(agent);
-    let hold = may_hold(agent, payload) && presence::away().await;
+    let limit = hold_limit.filter(|limit| held && *limit > HELD_MARGIN);
+    let hold = limit.is_some() && may_hold(agent, payload) && presence::away().await;
     let routed = super::route_client(agent, payload).ok()?;
     let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
     if token.is_empty() {
@@ -996,96 +1027,109 @@ async fn run(agent: &str, payload: &Value, started: Instant) -> Option<Value> {
         reply = hub.post("/v1/hub/permission/register", &body).await;
     }
     let (mut id, mut unconfirmed) = registered(reply, &hash)?;
-    if held && unconfirmed {
-        return None;
-    }
-    if held && !hold {
+    // From here every way a held prompt ends without a decision takes it back from the Hub, so
+    // its page never offers what only the session's own prompt can answer now.
+    if held && (unconfirmed || !hold) {
         return released(&hub, &id, &hash, &offer, payload).await;
     }
     let mut offered_again: Option<Instant> = None;
-    let until = started + bound(agent);
+    let until = started + bound(limit.filter(|_| hold));
     // Longer after each failure in a row, and never past the bound, so the hook ends on time.
     let pause = |tries: u32| {
         let wait = (RETRY_PAUSE * tries.max(1)).min(MAX_RETRY_PAUSE);
         tokio::time::sleep(wait.min(until.saturating_duration_since(Instant::now())))
     };
     let mut failures: u32 = 0;
-    loop {
-        let now = Instant::now();
-        if parent_gone(started_under) {
-            return None;
-        }
-        if now >= until {
-            // A held prompt goes back to the session before the host stops this hook.
-            if held {
-                return released(&hub, &id, &hash, &offer, payload).await;
-            }
-            return None;
-        }
-        let mut wait = POLL_SECONDS.min(until.saturating_duration_since(now).as_secs());
-        if unconfirmed {
-            let left = UNCONFIRMED_GIVE_UP.checked_sub(started.elapsed())?;
-            if left.is_zero() {
-                return None;
-            }
-            wait = wait.min(left.as_secs() + 1);
-        }
-        let poll = json!({"request_id": id, "input_hash": hash, "wait_seconds": wait});
-        let asked = Instant::now();
-        let polled = hub.post("/v1/hub/permission/poll", &poll);
-        let reply = if held {
-            tokio::select! {
-                reply = polled => reply,
-                // Someone is at the computer: the prompt is theirs again at once.
-                () = presence::returned() => {
-                    return released(&hub, &id, &hash, &offer, payload).await;
-                }
-            }
-        } else {
-            polled.await
-        };
-        match classify(reply, &id, &hash) {
-            Step::Wait { unconfirmed: next } => {
-                failures = 0;
-                // A Hub with its poll slots full answers at once with nothing new; pause
-                // rather than ask again immediately.
-                let quick = asked.elapsed() < Duration::from_secs(1) && next == unconfirmed;
-                unconfirmed = next;
-                if quick {
-                    pause(1).await;
-                }
-            }
-            Step::Decide(answer) => return decision_output(&answer, &offer, payload),
-            // The computer slept, the network dropped or the Hub is being replaced. The prompt
-            // may still be on screen, so the hook keeps trying for its whole bound; the Hub
-            // offers the request again once it hears this hook again.
-            Step::Retry => {
-                failures = failures.saturating_add(1);
-                pause(failures).await;
-            }
-            // The agent token ended while the prompt was up. The Hub keeps the request for the
-            // same person's next token, so the hook goes on with the one this computer holds
-            // now, and stops when that is the token the Hub just refused.
-            Step::Renew => hub.token = renewed(agent, payload, &hub.token)?,
-            // A Hub that restarted keeps the session's wait and not the request. The same
-            // prompt offered again, with the id this hook holds, is the same request while the
-            // session still waits at it. Only a prompt the host confirmed is offered again.
-            Step::Again => {
-                if unconfirmed || offered_again.is_some_and(|at| at.elapsed() < AGAIN_PAUSE) {
+    let decided = {
+        let waited = async {
+            loop {
+                let now = Instant::now();
+                if parent_gone(started_under) || now >= until {
                     return None;
                 }
-                body["again"] = json!(id);
-                let reply = hub.post("/v1/hub/permission/register", &body).await;
-                (id, unconfirmed) = registered(reply, &hash)?;
-                offered_again = Some(Instant::now());
+                let mut wait = POLL_SECONDS.min(until.saturating_duration_since(now).as_secs());
+                if unconfirmed {
+                    let left = UNCONFIRMED_GIVE_UP.checked_sub(started.elapsed())?;
+                    if left.is_zero() {
+                        return None;
+                    }
+                    wait = wait.min(left.as_secs() + 1);
+                }
+                let poll = json!({"request_id": id, "input_hash": hash, "wait_seconds": wait});
+                let asked = Instant::now();
+                // A held prompt's poll ends a few seconds past its wait, so the release that
+                // follows still lands before the host's limit.
+                let within = if held {
+                    Duration::from_secs(wait) + HELD_CALL_SLACK
+                } else {
+                    CALL_TIMEOUT
+                };
+                let reply = hub
+                    .post_within("/v1/hub/permission/poll", &poll, within)
+                    .await;
+                match classify(reply, &id, &hash) {
+                    Step::Wait { unconfirmed: next } => {
+                        failures = 0;
+                        // A Hub with its poll slots full answers at once with nothing new; pause
+                        // rather than ask again immediately.
+                        let quick = asked.elapsed() < Duration::from_secs(1) && next == unconfirmed;
+                        unconfirmed = next;
+                        if quick {
+                            pause(1).await;
+                        }
+                    }
+                    Step::Decide(answer) => return decision_output(&answer, &offer, payload),
+                    // The computer slept, the network dropped or the Hub is being replaced. The
+                    // prompt may still be on screen, so the hook keeps trying for its whole
+                    // bound; the Hub offers the request again once it hears this hook again. A
+                    // held prompt is nobody's to answer meanwhile, so it goes back at once.
+                    Step::Retry if held => return None,
+                    Step::Retry => {
+                        failures = failures.saturating_add(1);
+                        pause(failures).await;
+                    }
+                    // The agent token ended while the prompt was up. The Hub keeps the request
+                    // for the same person's next token, so the hook goes on with the one this
+                    // computer holds now, and stops when that is the token the Hub just refused.
+                    Step::Renew => hub.token = renewed(agent, payload, &hub.token)?,
+                    // A Hub that restarted keeps the session's wait and not the request. The
+                    // same prompt offered again, with the id this hook holds, is the same request
+                    // while the session still waits at it. Only a prompt the host confirmed is
+                    // offered again.
+                    Step::Again => {
+                        if unconfirmed || offered_again.is_some_and(|at| at.elapsed() < AGAIN_PAUSE)
+                        {
+                            return None;
+                        }
+                        body["again"] = json!(id);
+                        let reply = hub.post("/v1/hub/permission/register", &body).await;
+                        (id, unconfirmed) = registered(reply, &hash)?;
+                        offered_again = Some(Instant::now());
+                    }
+                    Step::Stop => return None,
+                }
             }
-            Step::Stop => return None,
+        };
+        if hold {
+            tokio::select! {
+                decided = waited => decided,
+                // Someone is at the computer, also while the hook pauses between tries: the
+                // prompt is theirs again at once.
+                () = presence::returned() => None,
+            }
+        } else {
+            waited.await
         }
+    };
+    match decided {
+        None if held => released(&hub, &id, &hash, &offer, payload).await,
+        decided => decided,
     }
 }
 
 /// Takes a held prompt back from the Hub, so its page stops offering what the session's own
-/// prompt now asks. An answer the person gave first still counts.
+/// prompt now asks. An answer the person gave first still counts. Bounded by
+/// [`HELD_CALL_SLACK`], to end before the host's limit for the hook.
 async fn released(
     hub: &Hub,
     id: &str,
@@ -1095,7 +1139,8 @@ async fn released(
 ) -> Option<Value> {
     let release = json!({"request_id": id, "input_hash": hash, "release": true});
     match classify(
-        hub.post("/v1/hub/permission/poll", &release).await,
+        hub.post_within("/v1/hub/permission/poll", &release, HELD_CALL_SLACK)
+            .await,
         id,
         hash,
     ) {
@@ -1223,7 +1268,11 @@ mod tests {
         );
         assert_eq!(
             line("Bash", json!({"command": ["bash", "-lc", "cargo publish"]})).text,
-            "bash -lc cargo publish"
+            "bash -lc 'cargo publish'"
+        );
+        assert_eq!(
+            line("Bash", json!({"command": ["rm", "-rf", "a b", "it's", ""]})).text,
+            "rm -rf 'a b' 'it'\\''s' ''"
         );
         let outside = line("Write", json!({"file_path": "/etc/hosts", "content": "x"}));
         assert_eq!(outside.text, "/etc/hosts");

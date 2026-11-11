@@ -572,13 +572,19 @@ fn permission_prompt_in(
     env: Env,
     edit: fn(&mut Value),
 ) -> (Run, Vec<Seen>) {
-    prompt_of("claude", dir, (hub, seen), env, edit)
+    prompt_of(CLAUDE, dir, (hub, seen), env, edit)
 }
 
-/// [`permission_prompt_in`] for the hook of `agent`.
+/// The hook commands the plugins write: Claude Code's, and Codex's for its approval request.
+#[cfg(unix)]
+const CLAUDE: &[&str] = &["claude", "--client-connection"];
+#[cfg(unix)]
+const CODEX: &[&str] = &["codex", "--client-connection", "--hold-limit", "600"];
+
+/// [`permission_prompt_in`] for the hook command `hook`.
 #[cfg(unix)]
 fn prompt_of(
-    agent: &str,
+    hook: &[&str],
     dir: TempDir,
     (hub, seen): (String, Receiver<Seen>),
     env: Env,
@@ -592,12 +598,7 @@ fn prompt_of(
     let path = std::env::var("PATH").unwrap_or_default();
     let mut env = env.to_vec();
     env.push(("PATH", &path));
-    let run = run_with(
-        &[agent, "--client-connection"],
-        &env,
-        &dir,
-        payload.to_string().as_bytes(),
-    );
+    let run = run_with(hook, &env, &dir, payload.to_string().as_bytes());
     assert_eq!(run.code, Some(0));
     (run, seen.try_iter().collect())
 }
@@ -714,7 +715,7 @@ fn a_codex_approval_is_held_for_the_hub_only_while_nobody_is_at_the_computer() {
     // prompt is not on screen meanwhile. Its answer is printed in Codex's own form.
     let away: Env = &[(IDLE, "600000")];
     let hub = permission_hub(200, |hash| answered(hash, "allow"));
-    let (run, seen) = prompt_of("codex", home(), hub, away, |_| {});
+    let (run, seen) = prompt_of(CODEX, home(), hub, away, |_| {});
     assert_eq!(run.stdout, ALLOW);
     let registered = offered(&seen, "/v1/hub/permission/register");
     assert_eq!(registered.len(), 1);
@@ -729,16 +730,23 @@ fn a_codex_approval_is_held_for_the_hub_only_while_nobody_is_at_the_computer() {
         reply["reason"] = json!("use the staging key");
         reply
     });
-    let (run, _) = prompt_of("codex", home(), hub, away, |_| {});
+    let (run, _) = prompt_of(CODEX, home(), hub, away, |_| {});
     assert_eq!(run.stdout, DENY_SAYING);
-    // Someone is at the computer, the computer cannot say, or a subagent asks: the request is
-    // offered and taken back at once, so the Hub lists it as answered at the computer, and
-    // Codex shows its own prompt.
+    // Someone is at the computer, the computer cannot say, a subagent asks, or the plugin entry
+    // is one from before it stated Codex's limit for the hook: the request is offered and taken
+    // back at once, so the Hub lists it as answered at the computer, and Codex shows its own
+    // prompt.
     let lead: fn(&mut Value) = |_| {};
     let subagent: fn(&mut Value) = |payload| payload["agent_id"] = json!("sub-1");
-    for (idle, edit) in [("1000", lead), ("unknown", lead), ("600000", subagent)] {
+    let older = &["codex", "--client-connection"][..];
+    for (hook, idle, edit) in [
+        (CODEX, "1000", lead),
+        (CODEX, "unknown", lead),
+        (CODEX, "600000", subagent),
+        (older, "600000", lead),
+    ] {
         let hub = permission_hub(200, |hash| polled(hash, "ended", None));
-        let (run, seen) = prompt_of("codex", home(), hub, &[(IDLE, idle)], edit);
+        let (run, seen) = prompt_of(hook, home(), hub, &[(IDLE, idle)], edit);
         assert_eq!(run.stdout, "{}\n", "{idle}");
         let registered = offered(&seen, "/v1/hub/permission/register");
         assert_eq!(registered.len(), 1, "{idle}");
@@ -755,7 +763,7 @@ fn a_codex_approval_is_held_for_the_hub_only_while_nobody_is_at_the_computer() {
         ("AGENTSCM_TEST_PERMISSION_BOUND_MS", "1500"),
     ];
     let hub = permission_hub(200, |hash| polled(hash, "pending", None));
-    let (run, seen) = prompt_of("codex", home(), hub, &waiting, |_| {});
+    let (run, seen) = prompt_of(CODEX, home(), hub, &waiting, |_| {});
     assert_eq!(run.stdout, "{}\n");
     let polls = offered(&seen, "/v1/hub/permission/poll");
     assert_eq!(polls.last().unwrap()["release"], true);
@@ -764,15 +772,67 @@ fn a_codex_approval_is_held_for_the_hub_only_while_nobody_is_at_the_computer() {
             .iter()
             .all(|poll| poll.get("release").is_none())
     );
+    // The person comes back while the prompt is held: within a look or two the hook takes it
+    // back from the Hub and Codex shows it.
+    let warm = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+    let idle_dir = TempDir::new().unwrap();
+    let idle_file = idle_dir.path().join("idle-ms");
+    std::fs::write(&idle_file, "600000").unwrap();
+    let flip = {
+        let idle_file = idle_file.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            std::fs::write(idle_file, "1000").unwrap();
+        })
+    };
+    let hub = permission_hub(200, |hash| polled(hash, "pending", None));
+    let idle_path = idle_file.display().to_string();
+    let (run, seen) = prompt_of(CODEX, home(), hub, &[(IDLE, idle_path.as_str())], |_| {});
+    flip.join().unwrap();
+    assert_eq!(run.stdout, "{}\n");
+    let polls = offered(&seen, "/v1/hub/permission/poll");
+    let releases = polls.iter().filter(|poll| poll["release"] == true).count();
+    assert_eq!(releases, 1, "{polls:?}");
+    assert_eq!(polls.last().unwrap()["release"], true);
+    assert!(polls.len() >= 2, "it held the prompt first: {polls:?}");
+    assert!(run.elapsed < Duration::from_secs(6), "{:?}", run.elapsed);
+    // The Hub cannot be reached while the prompt is held: nobody can answer it there, so the
+    // hook gives it back at once instead of trying again.
+    let unreachable = serve(|seen| {
+        let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+        let hash = &body["input_hash"];
+        if seen.path.starts_with("/v1/hub/permission/register") {
+            (
+                200,
+                json!({"request_id": "00ff", "input_hash": hash, "state": "pending"}),
+            )
+        } else if seen.path.starts_with("/v1/hub/permission/poll") && body["release"] == true {
+            (200, polled(hash, "ended", None))
+        } else if seen.path.starts_with("/v1/hub/permission/poll") {
+            (503, json!({"error": "unavailable"}))
+        } else {
+            (200, json!({}))
+        }
+    });
+    let (run, seen) = prompt_of(CODEX, home(), unreachable, away, |_| {});
+    assert_eq!(run.stdout, "{}\n");
+    let polls = offered(&seen, "/v1/hub/permission/poll");
+    assert_eq!(polls.len(), 2, "{polls:?}");
+    assert_eq!(polls[1]["release"], true);
+    assert!(run.elapsed < Duration::from_secs(5), "{:?}", run.elapsed);
     // A Hub that does not know a held prompt is asked once and no more.
     let hub = permission_hub(400, |hash| answered(hash, "allow"));
-    let (run, seen) = prompt_of("codex", home(), hub, away, |_| {});
+    let (run, seen) = prompt_of(CODEX, home(), hub, away, |_| {});
     assert_eq!(run.stdout, "{}\n");
     assert_eq!(offered(&seen, "/v1/hub/permission/register").len(), 1);
     // Claude Code shows its dialog beside the hook, so its prompt is offered wherever its
     // person is, and is not said to be held.
     let hub = permission_hub(200, |hash| answered(hash, "allow"));
-    let (run, seen) = prompt_of("claude", home(), hub, &[(IDLE, "1000")], |_| {});
+    let (run, seen) = prompt_of(CLAUDE, home(), hub, &[(IDLE, "1000")], |_| {});
     assert_eq!(run.stdout, ALLOW);
     assert!(
         offered(&seen, "/v1/hub/permission/register")[0]

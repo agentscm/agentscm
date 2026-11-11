@@ -3,9 +3,11 @@
 //!
 //! Some hosts show their own permission prompt only after the hook that offers it to the Hub
 //! returns. Such a hook may hold the prompt only while nobody is at the computer, and gives it
-//! back the moment someone is. This reads how long the computer has gone without input: the
-//! whole machine's keyboard and pointer on macOS, and the terminal the hook runs under on any
-//! Unix. Where neither can be read the answer is not known, which is never taken as away.
+//! back the moment someone is. Only the whole machine's keyboard and pointer can say nobody is
+//! there, and that is read on macOS alone. Input in the terminal the hook runs under (on any
+//! Unix) says someone is, but its quiet does not say they are gone: they may be in another
+//! window. Where the machine's idle time cannot be read the answer is not known, which is never
+//! taken as away.
 use std::time::Duration;
 
 /// Without input for this long, the person is taken to be away.
@@ -14,12 +16,14 @@ const AWAY_AFTER: Duration = Duration::from_secs(60);
 const LOOK_EVERY: Duration = Duration::from_secs(2);
 /// A program asked for the idle time must answer within this.
 const ASK_TIMEOUT: Duration = Duration::from_secs(2);
-/// Test-only: the idle time in milliseconds, in place of the system's.
+/// Debug builds only: the idle time in milliseconds in place of the system's, or the path of a
+/// file holding it, read at each look.
 const IDLE_OVERRIDE: &str = "AGENTSCM_TEST_IDLE_MS";
 
 /// Whether nobody has been at this computer for [`AWAY_AFTER`]. False when that is not known.
 pub(super) async fn away() -> bool {
-    idle().await.is_some_and(|idle| idle >= AWAY_AFTER)
+    let asked = tokio::task::spawn_blocking(nobody_there);
+    matches!(tokio::time::timeout(ASK_TIMEOUT, asked).await, Ok(Ok(true)))
 }
 
 /// Resolves when someone is at the computer again, or when that can no longer be told.
@@ -32,21 +36,28 @@ pub(super) async fn returned() {
     }
 }
 
-/// How long this computer has gone without its person's input, where that can be read.
-async fn idle() -> Option<Duration> {
-    if let Ok(ms) = std::env::var(IDLE_OVERRIDE) {
-        return ms.parse().ok().map(Duration::from_millis);
+/// The machine has gone without input for [`AWAY_AFTER`], and so has this hook's terminal where
+/// it has one.
+fn nobody_there() -> bool {
+    let quiet = |idle: Option<Duration>| idle.is_some_and(|idle| idle >= AWAY_AFTER);
+    // The override never takes effect in a release build, so it cannot hide a prompt there.
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var(IDLE_OVERRIDE)
+    {
+        return quiet(test_idle(&value));
     }
-    let asked = tokio::task::spawn_blocking(system_idle);
-    tokio::time::timeout(ASK_TIMEOUT, asked).await.ok()?.ok()?
+    quiet(machine_idle()) && terminal_idle().is_none_or(|idle| idle >= AWAY_AFTER)
 }
 
-/// The least of what can be read: input anywhere on the machine, or in this hook's terminal.
-fn system_idle() -> Option<Duration> {
-    [machine_idle(), terminal_idle()]
-        .into_iter()
-        .flatten()
-        .min()
+fn test_idle(value: &str) -> Option<Duration> {
+    let ms = value.parse().ok().or_else(|| {
+        std::fs::read_to_string(value)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })?;
+    Some(Duration::from_millis(ms))
 }
 
 #[cfg(target_os = "macos")]
@@ -119,6 +130,8 @@ mod tests {
         );
         assert_eq!(hid_idle("\"HIDIdleTime\" = soon"), None);
         assert_eq!(hid_idle("no input system"), None);
+        assert_eq!(test_idle("1500"), Some(Duration::from_millis(1500)));
+        assert_eq!(test_idle("/nonexistent/idle"), None);
 
         let device = |name: &str| terminal_device(name);
         assert_eq!(device("ttys004"), Some("/dev/ttys004".into()));

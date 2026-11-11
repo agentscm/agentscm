@@ -103,7 +103,15 @@ pub async fn run_unparsed(args: Vec<String>) -> ! {
                     .is_some_and(|rest| rest.starts_with('='))
         })
     });
-    let reply = hook(&agent, flag_url, repo, client_connection, destination_args).await;
+    let reply = hook(
+        &agent,
+        flag_url,
+        repo,
+        client_connection,
+        destination_args,
+        hold_limit(&args),
+    )
+    .await;
     let mut out = std::io::stdout();
     // Ignore write errors (a closed pipe must not panic or change the exit code).
     let _ = writeln!(out, "{reply}");
@@ -138,12 +146,28 @@ fn parse_args(args: &[String]) -> (String, Option<String>, Option<String>) {
     )
 }
 
+/// `--hold-limit SECS`: the host's limit for this hook, which the plugin entry states beside the
+/// timeout it gives the hook. An entry written before it has none, so its hook never holds.
+fn hold_limit(args: &[String]) -> Option<Duration> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let value = match arg.strip_prefix("--hold-limit") {
+            Some("") => rest.next().map(String::as_str),
+            Some(value) => value.strip_prefix('='),
+            None => continue,
+        };
+        return value?.parse().ok().map(Duration::from_secs);
+    }
+    None
+}
+
 async fn hook(
     agent: &str,
     flag_url: Option<String>,
     repo: Option<String>,
     client_connection: bool,
     destination_args: bool,
+    hold_limit: Option<Duration>,
 ) -> Value {
     let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
@@ -229,7 +253,7 @@ async fn hook(
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
     if permission::applies(agent, client_connection, &payload) {
-        return permission::await_answer(agent, &payload, started, reply).await;
+        return permission::await_answer(agent, &payload, started, reply, hold_limit).await;
     }
     reply
 }
@@ -4217,6 +4241,28 @@ mod tests {
             ("codex".into(), None, None)
         );
         assert_eq!(parsed(&[]), (String::new(), None, None));
+        // The limit a plugin entry states does not read as the agent.
+        assert_eq!(
+            parsed(&["codex", "--client-connection", "--hold-limit", "600"]),
+            ("codex".into(), None, None)
+        );
+        let limit = |list: &[&str]| hold_limit(&args(list));
+        assert_eq!(
+            limit(&["codex", "--hold-limit", "600"]),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            limit(&["codex", "--hold-limit=600"]),
+            Some(Duration::from_secs(600))
+        );
+        for none in [
+            &["codex", "--client-connection"][..],
+            &["codex", "--hold-limit"],
+            &["codex", "--hold-limit", "soon"],
+            &["codex", "--hold-limitx"],
+        ] {
+            assert_eq!(limit(none), None, "{none:?}");
+        }
         let repo = |list: &[&str]| parsed(list).2;
         assert_eq!(
             repo(&["x", "--repo", "acme/widgets"]),
