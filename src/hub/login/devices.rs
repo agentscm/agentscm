@@ -151,18 +151,18 @@ impl FromRequestParts<HubState> for DeviceOrApp {
     }
 }
 
-/// The owner and `via` of a connected app's credential; None for anything that is not a live
-/// app credential, so the caller can try its other sign-ins.
+/// The owner and `via` of a connected app's credential (`via` None for a read-only app); None for
+/// anything that is not a live app credential, so the caller can try its other sign-ins.
 pub(super) async fn app_credential(
     parts: &Parts,
     state: &HubState,
-) -> ApiResult<Option<(User, Via)>> {
+) -> ApiResult<Option<(User, Option<Via>)>> {
     match credential(parts, state).await {
         Ok(device) => Ok(device
             .app_id
             .as_deref()
             .and_then(|app| state.login.app(app))
-            .map(|app| (device.owner, app.via))),
+            .map(|app| (device.owner, app.via.map(|(via, _)| via)))),
         Err(error) if error.code() == "sign_in_required" => Ok(None),
         Err(error) => Err(error),
     }

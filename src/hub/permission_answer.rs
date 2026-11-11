@@ -41,8 +41,9 @@ use tokio::time::Instant;
 
 use super::advice::invisible;
 use super::coordination_http::not_your_agent;
+use super::handoff::Via;
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
-use super::login::apps::Person;
+use super::login::apps::{Person, PersonReader};
 use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
 use super::store::{AgentToken, Principal, unix_now, validate_repository};
 use super::{HubError, HubState};
@@ -1350,16 +1351,17 @@ struct Page {
     unchecked: Option<usize>,
 }
 
-/// The person's own page, or a connected app they approved ([`Person`]), lists their requests:
-/// in one repository, or in all of them without `repository`. The Hub-wide [`MAX_LIVE`] bounds
-/// the list.
+/// The person's own page, or a connected app they approved, read-only or not ([`PersonReader`]),
+/// lists their requests: in one repository, or in all of them without `repository`. The
+/// Hub-wide [`MAX_LIVE`] bounds the list.
 async fn list(
     State(state): State<HubState>,
-    person: Person,
+    reader: PersonReader,
     query: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Page>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let Person { user, via } = person;
+    let PersonReader { user, via } = reader;
+    let hub = via.is_some_and(Via::hub);
     // A page polls this, and it shows only the caller's own requests, so it needs the
     // repository's id alone. The answer makes the forge's role check; a connected app's list
     // makes it too, below.
@@ -1396,7 +1398,7 @@ async fn list(
         .await?;
         // An app lists only repositories its person can read now: the forge's role check, kept
         // for a short while, fails closed.
-        let current = if via.hub() {
+        let current = if hub {
             candidates
         } else {
             let (readable, missed) =
@@ -1414,7 +1416,7 @@ async fn list(
                     r.repository.clone_from(&repo.full_name);
                     true
                 }
-                None => via.hub(),
+                None => hub,
             }
         });
     }

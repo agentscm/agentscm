@@ -141,6 +141,7 @@ error_codes! {
     DeviceRevoked => ("device_revoked", 403, false, SignIn, "This computer is no longer signed in; sign in again."),
     AppNotAllowed => ("app_not_allowed", 403, false, None, "A connected app only reads, mints read-only tokens and answers requests for its person."),
     AppReadOnly => ("app_read_only", 403, false, ProvideField, "A connected app mints read-only tokens only; send read_only: true."),
+    AppCannotAnswer => ("app_cannot_answer", 403, false, None, "This connected app only reads; it can't answer for its person or change anything."),
     // The OAuth token endpoint's own codes (RFC 6749 section 5.2).
     InvalidClient => ("invalid_client", 400, false, ContactOperator, "The app's client ID or secret was not accepted; check what the Hub operator registered for it."),
     InvalidGrant => ("invalid_grant", 400, false, SignIn, "The authorization code is invalid, expired or already used; connect the app again."),

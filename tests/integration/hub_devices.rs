@@ -5128,15 +5128,22 @@ async fn apps_env() -> Env {
     apps_env_with(&[]).await
 }
 
-/// The same, plus a second app for each id in `more`.
-async fn apps_env_with(more: &[&str]) -> Env {
+/// The same, plus another app for each `(id, read_only)` in `more`.
+async fn apps_env_with(more: &[(&str, bool)]) -> Env {
     let mut env = Env::start("github").await;
     let secret = private_file(&env, "app-secret", &format!("{APP_SECRET}\n"));
     let mut list = vec![json!({"id": "example-app", "name": "Example <App>",
         "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"})];
-    for id in more {
-        list.push(json!({"id": id, "name": id,
-            "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"}));
+    for &(id, read_only) in more {
+        let access = if read_only {
+            ("read_only", json!(true))
+        } else {
+            ("via", json!("slack"))
+        };
+        let mut app = json!({"id": id, "name": id,
+            "redirect_uri": APP_REDIRECT, "secret_file": secret});
+        app[access.0] = access.1;
+        list.push(app);
     }
     let apps = json!({ "apps": list });
     env.apps = Some(private_file(&env, "apps.json", &apps.to_string()));
@@ -5265,7 +5272,7 @@ async fn a_connected_app_is_approved_through_sign_in_consent_and_a_single_use_pk
     let fields = token_fields("x", APP_SECRET, VERIFIER);
     assert_eq!(exchange(&plain, false, &fields).await.0, 404);
 
-    let env = apps_env().await;
+    let env = apps_env_with(&[("notifier", true)]).await;
     // An unknown app, a different redirect or no PKCE gets an error page and never a redirect.
     for bad in [
         authorize_query("other-app", APP_REDIRECT),
@@ -5325,6 +5332,17 @@ async fn a_connected_app_is_approved_through_sign_in_consent_and_a_single_use_pk
     assert!(
         body.contains("via Slack") && body.contains("Computers"),
         "{body}"
+    );
+    // A read-only app's page says it only reads.
+    let notifier = authorize_query("notifier", APP_REDIRECT);
+    let (status, _, page) = authorize_page(&env, &notifier, Some(&cookie)).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(
+        page.contains("It can read your work")
+            && page.contains("it can't answer for you or change anything")
+            && !page.contains("via Slack")
+            && !page.contains("allow or deny"),
+        "{page}"
     );
     let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
     assert!(
@@ -5764,7 +5782,7 @@ async fn reconnecting_leaves_one_credential_per_person_and_app() {
 
 #[tokio::test]
 async fn another_apps_credentials_cannot_spend_a_code_and_a_dropped_app_stays_revoked() {
-    let mut env = apps_env_with(&["other-app"]).await;
+    let mut env = apps_env_with(&[("other-app", false)]).await;
     let alice = page(&env, ALICE).await;
     let code = app_code(&env, &alice).await;
     let mut stranger = token_fields(&code, APP_SECRET, VERIFIER);

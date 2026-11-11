@@ -98,7 +98,7 @@ the bodies, replies and rules. Requests live in the memory of one Hub process.
 | `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
 | `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
 | `GET /v1/hub/session/permissions?repository=…` | Web sign-in, or a connected app's credential | `{"requests": [...]}`: the person's own requests there (in every repository without `repository`) that a prompt on screen confirmed, each with its `repository` and what of it is not shown; for a connected app, only in repositories the person can read now |
-| `POST /v1/hub/session/permissions/answer` | Web sign-in with `x-csrf-token`, or a connected app's credential | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
+| `POST /v1/hub/session/permissions/answer` | Web sign-in with `x-csrf-token`, or a connected app's credential (403 `app_cannot_answer` for a read-only app) | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
 
 ## Hub: connected apps
 
@@ -122,6 +122,11 @@ to run, with one of the session's own choices, or deny it, and send the agent a 
 answer. Other
 computer routes are 403 `app_not_allowed`; every other route is 401. It is listed in
 `GET /v1/hub/devices` with `"app": {"id", "name"}`.
+
+An app registered with `"read_only": true` reads the same way, `GET /v1/hub/session/permissions`
+included, and answers nothing: `POST /v1/hub/session/coordination/reply`,
+`POST /v1/hub/session/handoff/answer` and `POST /v1/hub/session/permissions/answer` are 403
+`app_cannot_answer` for its credential.
 
 ## Hub: Work recovery
 
@@ -674,6 +679,7 @@ Registered codes:
 | `device_revoked` | 403 | no | `sign_in` |
 | `app_not_allowed` | 403 | no | `none` |
 | `app_read_only` | 403 | no | `provide_field` |
+| `app_cannot_answer` | 403 | no | `none` |
 | `invalid_client` | 400 | no | `contact_operator` |
 | `invalid_grant` | 400 | no | `sign_in` |
 | `promise_conflict` | 409 | no | `inspect_work` |

@@ -445,6 +445,12 @@ recover Work, create hand-off pickups or call an administrator route. An app con
 Hub version with prompt answering can answer prompts too once that Hub runs; a person who does
 not want that revokes it under Computers.
 
+An operator can also register an app as read-only, for an app that only tells the person what
+is waiting. Its credential reads what any connected app reads, the list of the person's agents'
+prompts and questions included, and answers nothing: every answer route refuses it with 403
+`app_cannot_answer`, and its approval page says it can read but can't answer for the person or
+change anything.
+
 **Configuration.** `AGENTSCM_HUB_APPS_FILE` is an absolute path to a JSON file under the same
 rules as the Slack config: a regular file, not a symlink, owned by the Hub's user and not
 readable by group or others (`chmod 600`), at most 64 KiB. Unset means no apps, and every app
@@ -467,6 +473,14 @@ GitLab sign-in is configured.
   least 32 bytes, without whitespace. The Hub keeps only its SHA-256 and compares in constant
   time.
 - `via`: how answers through the app are recorded. Only `"slack"` exists today.
+- `read_only`: `true` registers a read-only app, which takes no `via`. Leave it out (or set
+  `false`) for an app that answers; such an app needs `via`, as before.
+
+```json
+{"apps": [{"id": "example-reader", "name": "Example Reader",
+  "redirect_uri": "https://reader.example.com/callback",
+  "secret_file": "/etc/agentscm/example-reader.secret", "read_only": true}]}
+```
 
 **Connecting.** The standard OAuth 2.0 authorization code flow with PKCE (`S256` only):
 
@@ -518,6 +532,12 @@ digest storage, 90-day idle expiry and revocation. It works on:
   and the same allow-list check. The list holds only the person's own requests in repositories
   the forge says they can read now, and an answer makes the forge's role check for its
   repository.
+
+A read-only app's credential works on the same routes except the three that answer:
+`POST /v1/hub/session/coordination/reply`, `POST /v1/hub/session/handoff/answer` and
+`POST /v1/hub/session/permissions/answer` refuse it with 403 `app_cannot_answer` before reading
+the body, so it never records an answer. It still lists the person's prompts with
+`GET /v1/hub/session/permissions` and can disconnect itself.
 
 Every other computer route refuses it with 403 `app_not_allowed`, and every other person,
 agent or administrator route with 401. `GET /v1/hub/devices` lists it among the person's

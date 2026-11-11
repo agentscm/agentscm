@@ -4,7 +4,8 @@
 //! `app_id` set. The credential reads what the person's computer reads and mints read-only
 //! tokens only; on the person routes it answers coordination and file requests for the person,
 //! recorded with the app's `via`, and lists and answers the permission prompts and questions of
-//! the person's agents. Every other route refuses it.
+//! the person's agents. An app registered `read_only` only reads: every answer refuses it. Every
+//! other route refuses it.
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -50,9 +51,9 @@ pub(super) struct App {
     pub(super) name: String,
     redirect_uri: String,
     secret: [u8; 32],
-    pub(super) via: Via,
-    /// How the Hub names the app's answers to people, as in "via Slack".
-    via_label: &'static str,
+    /// How the app's answers are recorded, and how the Hub names them to people, as in "via
+    /// Slack". None for a read-only app, which answers nothing.
+    pub(super) via: Option<(Via, &'static str)>,
 }
 
 impl App {
@@ -74,7 +75,11 @@ struct AppEntry {
     name: String,
     redirect_uri: String,
     secret_file: PathBuf,
-    via: String,
+    #[serde(default)]
+    via: Option<String>,
+    /// Reads for its person and answers nothing; such an app has no `via`.
+    #[serde(default)]
+    read_only: bool,
 }
 
 /// The apps in the file `AGENTSCM_HUB_APPS_FILE` names, under the Slack config's file rules: an
@@ -92,7 +97,7 @@ pub(super) fn load(lookup: &impl Fn(&str) -> Option<String>) -> Result<Vec<App>>
         bad("must be an absolute path to a regular file of at most 64 KiB, owned by this user and not readable by group or others".into())
     })?;
     let file: AppsFile = serde_json::from_slice(&bytes).map_err(|_| {
-        bad(r#"must be {"apps": [{"id", "name", "redirect_uri", "secret_file", "via"}]}"#.into())
+        bad(r#"must be {"apps": [{"id", "name", "redirect_uri", "secret_file", and "via" or "read_only": true}]}"#.into())
     })?;
     if file.apps.len() > MAX_APPS {
         return Err(bad(format!("lists more than {MAX_APPS} apps")));
@@ -115,8 +120,14 @@ pub(super) fn load(lookup: &impl Fn(&str) -> Option<String>) -> Result<Vec<App>>
                 "app {id}: redirect_uri must be an exact https URL (http only on a loopback IP), without a query or fragment"
             )));
         }
-        let (via, via_label) = match entry.via.as_str() {
-            "slack" => (Via::Slack, "Slack"),
+        let via = match (entry.via.as_deref(), entry.read_only) {
+            (None, true) => None,
+            (Some("slack"), false) => Some((Via::Slack, "Slack")),
+            (Some(_), true) => {
+                return Err(bad(format!(
+                    "app {id}: a read_only app answers nothing, so it takes no via"
+                )));
+            }
             _ => return Err(bad(format!("app {id}: via must be \"slack\""))),
         };
         let secret = super::super::slack::secret(&entry.secret_file)
@@ -133,7 +144,6 @@ pub(super) fn load(lookup: &impl Fn(&str) -> Option<String>) -> Result<Vec<App>>
             redirect_uri: entry.redirect_uri,
             secret: Sha256::digest(secret.as_bytes()).into(),
             via,
-            via_label,
         });
     }
     Ok(apps)
@@ -390,16 +400,22 @@ async fn authorize(
         )
     })
     .collect();
-    let via = grant.app.via_label;
+    let can = match grant.app.via {
+        Some((_, via)) => format!(
+            "<p>{name} will be able to:</p><ul>\
+             <li>read your work across the repositories you can read on this Hub;</li>\
+             <li>answer coordination requests and file requests for you, shown as \u{201c}via {via}\u{201d};</li>\
+             <li>answer your agents' permission prompts and questions in those repositories: allow or deny what an agent asks to run, \
+             pick one of its \u{201c}don't ask again\u{201d} choices, and send it the reason or answer you give.</li></ul>\
+             <p>It can't write code or start your agents itself, or change Work; what it allows, your agent runs.</p>"
+        ),
+        None => "<p>It can read your work across the repositories you can read on this Hub, and your agents' \
+                 permission prompts and questions there; it can't answer for you or change anything.</p>"
+            .to_owned(),
+    };
     let body = format!(
         "<h1>Connect {name}?</h1>\
-         <p>You are signed in to this Hub as <strong>{login}</strong>.</p>\
-         <p>{name} will be able to:</p><ul>\
-         <li>read your work across the repositories you can read on this Hub;</li>\
-         <li>answer coordination requests and file requests for you, shown as \u{201c}via {via}\u{201d};</li>\
-         <li>answer your agents' permission prompts and questions in those repositories: allow or deny what an agent asks to run, \
-         pick one of its \u{201c}don't ask again\u{201d} choices, and send it the reason or answer you give.</li></ul>\
-         <p>It can't write code or start your agents itself, or change Work; what it allows, your agent runs.</p>\
+         <p>You are signed in to this Hub as <strong>{login}</strong>.</p>{can}\
          <p>You can revoke it at any time under Computers.</p>\
          <form method=\"post\" action=\"{AUTHORIZE}\">{hidden}\
          <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\
@@ -574,8 +590,9 @@ async fn token(State(state): State<HubState>, request: Request) -> ApiResult<Res
     Ok(response)
 }
 
-/// The person behind a person route: the web sign-in with its CSRF token (`via` hub), or a
-/// connected app's credential (the app's `via`). Any other credential is refused as before.
+/// The person behind a person route that answers or changes something: the web sign-in with its
+/// CSRF token (`via` hub), or a connected app's credential (the app's `via`). A read-only app's
+/// credential is refused (403 `app_cannot_answer`), and any other credential as before.
 pub(in crate::hub) struct Person {
     pub(in crate::hub) user: User,
     pub(in crate::hub) via: Via,
@@ -588,17 +605,41 @@ impl FromRequestParts<HubState> for Person {
         parts: &mut Parts,
         state: &HubState,
     ) -> std::result::Result<Self, ApiError> {
+        let PersonReader { user, via } = PersonReader::from_request_parts(parts, state).await?;
+        let via = via.ok_or_else(|| {
+            ApiError::new(StatusCode::FORBIDDEN, "app_cannot_answer").with_message(
+                "This connected app only reads; it can't answer for its person or change anything",
+            )
+        })?;
+        Ok(Self { user, via })
+    }
+}
+
+/// The person behind a person route that only reads: everyone [`Person`] lets in, and a
+/// read-only app's credential (`via` None).
+pub(in crate::hub) struct PersonReader {
+    pub(in crate::hub) user: User,
+    pub(in crate::hub) via: Option<Via>,
+}
+
+impl FromRequestParts<HubState> for PersonReader {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HubState,
+    ) -> std::result::Result<Self, ApiError> {
         if parts.headers.contains_key(header::AUTHORIZATION)
             && let Some((user, via)) = devices::app_credential(parts, state).await?
         {
-            // A write as the person, so leaving the allow list stops it, as for the web sign-in.
+            // Acting as the person, so leaving the allow list stops it, as for the web sign-in.
             devices::allow_listed(state, &user, "app_answer").await?;
             return Ok(Self { user, via });
         }
         let human = HumanSession::from_request_parts(parts, state).await?;
         Ok(Self {
             user: human.web_user()?.clone(),
-            via: Via::Hub,
+            via: Some(Via::Hub),
         })
     }
 }
