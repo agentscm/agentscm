@@ -495,8 +495,9 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Waiting for its person** (a permission prompt, a question, or the end of a turn that may have asked for something): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
 - **Ended its turn and asked nothing**: a finished turn is read, not answered. The session's
   hook judges its whole last message where it is and sends only the answer. The message asked
-  nothing when it is English prose with no question mark, no word to the person and no word
-  for waiting, needing or being stuck; a wrong "asked" only shows a session, a wrong "asked
+  nothing when it is English prose or only identifiers (an id, a path, a number), with no
+  question mark, no word to the person, no offer or choice and no word for waiting, needing or
+  being stuck; a wrong "asked" only shows a session, a wrong "asked
   nothing" hides a request, so anything else counts as an ask. A hook that sends no answer
   leaves the Hub its excerpt, which decides only when it is the whole message and not its cut
   end. Where the turn asked nothing, no `session_waiting` action is listed, and the row stays
