@@ -5470,6 +5470,51 @@ fn pruning_keeps_only_recent_unassociated_deferred_facts_and_frees_the_spool() {
     assert!(!spool.usage().unwrap().is_full());
 }
 
+#[test]
+fn pruning_drops_a_fact_bound_to_a_plain_session_and_keeps_one_bound_to_an_alias() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    // Two sessions that had Work: one plain, one observed under an alias of another session.
+    let plain = capture_request(CaptureModeV1::MetadataOnly);
+    let aliased = CaptureRequest {
+        observed_session_id: "session_alias".into(),
+        canonical_session_id: "session_canonical".into(),
+        ..capture_request(CaptureModeV1::MetadataOnly)
+    };
+    for (request, session) in [(&plain, "session_fixture"), (&aliased, "session_alias")] {
+        let prompt = format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","session_id":"{session}","prompt_id":"p1","prompt":"hello"}}"#
+        );
+        capture_hook(prompt.as_bytes(), request, &spool).unwrap();
+    }
+    // Then each runs without Work: its facts are bound to the Work it had, two days ago.
+    let now = 1_782_284_400;
+    for (n, session) in [(1_001_u64, "session_fixture"), (1_002, "session_alias")] {
+        spool
+            .retain_deferred(&DeferredHookV1 {
+                occurrence_id: format!("evt:{n}"),
+                reserved_sequence: Some(n),
+                session_id: session.into(),
+                hook_event_name: "SessionStart".into(),
+                observed_at: now - 2 * 24 * 60 * 60,
+                reason: DeferredReasonV1::NoCurrentAuthorizedWork,
+                input_digest: format!("{n:064x}"),
+                event_kind: Some(CapturedEventKindV1::SessionStarted),
+                tool_kind: None,
+                source: None,
+                recipe_digest: None,
+                action_kind: None,
+            })
+            .unwrap();
+    }
+
+    // Only the aliased one still becomes a gap; the plain one is a day past diagnosis.
+    assert_eq!(spool.prune_deferred(now).unwrap(), 1);
+    let kept = spool.deferred(10).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].session_id, "session_alias");
+}
+
 fn small_spool(temp: &TempDir) -> LocalSpool {
     LocalSpool::open_with_limits(
         temp.path().join("spool"),
