@@ -133,6 +133,16 @@ pub type BranchMergeRows = (
     std::collections::BTreeSet<String>,
 );
 
+/// A same-repository merge that postdates a Work on the merged branch, as the store reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentMergeRow {
+    pub work_id: String,
+    pub pull_number: i64,
+    pub merged_at: i64,
+    /// The Work carries an explicit link naming this pull request.
+    pub explicit_link: bool,
+}
+
 /// A provider-confirmed merge of a pull request whose head branch is a given branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchMerge {

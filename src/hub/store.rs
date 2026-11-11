@@ -892,6 +892,17 @@ pub trait Store: Send + Sync {
         scope: &CatchupRepositoryScope,
         branches: &[String],
     ) -> Result<super::catchup::BranchMergeRows>;
+    /// Same-repository merges in `since..=until` whose head branch is the branch of a Work in
+    /// the repository that was created before the merge, newest first, at most `limit`. A merge
+    /// of a merge base is skipped, and so is one for a Work whose explicit link names another
+    /// pull request. The flag is false when more rows matched than `limit`.
+    fn recent_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<(Vec<super::catchup::RecentMergeRow>, bool)>;
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,

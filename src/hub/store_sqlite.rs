@@ -24,7 +24,7 @@ use super::catchup::{
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge, RecentMergeRow,
     TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
     repository_namespace, source_name, tracked_publication_merge,
 };
@@ -11071,6 +11071,61 @@ impl Store for SqliteStore {
             }
         }
         Ok((rows, bases))
+    }
+
+    fn recent_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<(Vec<RecentMergeRow>, bool)> {
+        scope.validate()?;
+        let conn = self.conn();
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        let key = catchup_repository_key(scope.repository_id);
+        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut statement = conn.prepare(
+            "SELECT w.id, m.pull_number, m.occurred_at, l.number IS NOT NULL
+             FROM hub_catchup_merges m
+             JOIN hub_work_items w ON w.branch = m.branch AND m.occurred_at >= w.created_at
+             LEFT JOIN hub_work_pr_links l ON l.work = w.id
+             WHERE m.provider=?1 AND m.host=?2 AND m.repository=?3 AND m.repository_key=?4
+               AND m.same_repository_head = ?5 AND m.occurred_at >= ?6 AND m.occurred_at <= ?7
+               AND w.provider=?1 AND w.host=?2 AND w.repository=?8 AND w.repository_id IS ?9
+               AND (l.number IS NULL OR l.number = m.pull_number)
+               AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
+                 WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
+                   AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)
+             ORDER BY m.occurred_at DESC, m.pull_number DESC, w.id ASC LIMIT ?10",
+        )?;
+        let mut rows = statement
+            .query_map(
+                params![
+                    scope.provider,
+                    scope.host,
+                    repository,
+                    key,
+                    1,
+                    since,
+                    until,
+                    scope.repository,
+                    scope.repository_id,
+                    fetch
+                ],
+                |row| {
+                    Ok(RecentMergeRow {
+                        work_id: row.get(0)?,
+                        pull_number: row.get(1)?,
+                        merged_at: row.get(2)?,
+                        explicit_link: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let complete = rows.len() <= limit;
+        rows.truncate(limit);
+        Ok((rows, complete))
     }
 
     fn record_catchup_source_status(

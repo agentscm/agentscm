@@ -100,6 +100,7 @@ pub(super) fn overview(
     overview: &WorkOverview,
     held: &OperationalOverviewV1,
     stages: &std::collections::BTreeMap<String, super::work_reconcile::WorkStageV1>,
+    merges: &super::work_reconcile::RecentMerges,
     page: &Page,
 ) -> Value {
     let reservation = |id: &str| {
@@ -165,6 +166,15 @@ pub(super) fn overview(
                 "reasons_complete": pair.reasons_complete && pair.reasons.len() <= 3})
         })
         .collect();
+    let recent_merges: Vec<Value> = merges
+        .list
+        .iter()
+        .take(if first { LIST } else { 0 })
+        .map(|merge| {
+            json!({"work": merge.work_id, "pull_request": merge.pull_number,
+                "merged_at": merge.merged_at})
+        })
+        .collect();
     json!({
         "detail": "compact",
         "recent_since": overview.recent_since, "until": overview.until,
@@ -179,6 +189,8 @@ pub(super) fn overview(
         "overlaps": overlaps, "overlaps_listed": overview.overlaps.len(),
         "history_retention_gap": overview.history_retention_gap,
         "settled_count": overview.settled_count,
+        "recent_merges": recent_merges, "recent_merges_listed": merges.list.len(),
+        "recent_merges_complete": merges.complete && first && recent_merges.len() == merges.list.len(),
         "held_reservations": held.work.len(), "held_reservations_complete": held.complete,
         "planned_issues": first.then(|| planned(&overview.planned_issues)),
         "pages": "The first page lists current Work, recent outcomes and at most five overlap pairs (all of them with detail full). Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
@@ -408,6 +420,7 @@ mod tests {
             &listed(&[3, 2, 1], true),
             &held,
             &Default::default(),
+            &Default::default(),
             &page(None),
         );
         assert_eq!(cut["next_after"], id(2));
@@ -416,6 +429,7 @@ mod tests {
             &listed(&[3, 2], false),
             &held,
             &Default::default(),
+            &Default::default(),
             &page(None),
         );
         assert_eq!(bounded["next_after"], id(2));
@@ -423,6 +437,7 @@ mod tests {
         let rest = super::overview(
             &listed(&[1], true),
             &held,
+            &Default::default(),
             &Default::default(),
             &page(Some(id(2))),
         );

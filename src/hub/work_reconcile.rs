@@ -874,14 +874,80 @@ pub(super) fn work_stages(
     (stages, limits)
 }
 
-/// The overview as JSON with each current Work's `stages` (keyed by Work id) and any
-/// `stage_limits` beside it. They stay out of `WorkOverview`, which older clients decode strictly.
+/// The most recent merges `recent_merges` lists.
+const RECENT_MERGES_LIMIT: usize = 20;
+
+/// Where a recent merge fact came from. Always the provider: the Hub read it from a merged pull
+/// request, and the Work's own reported outcome is not changed by it.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    Provider,
+}
+
+/// A Work whose branch's pull request merged inside the overview's recent window. The pull
+/// request title is untrusted text and is not carried.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RecentBranchMerge {
+    pub work_id: String,
+    pub pull_number: i64,
+    pub merged_at: i64,
+    pub basis: LinkBasis,
+    pub provenance: Provenance,
+}
+
+/// `recent_merges` and whether the read listed every match.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RecentMerges {
+    pub list: Vec<RecentBranchMerge>,
+    pub complete: bool,
+}
+
+/// Same-repository merges over the overview's recent window for Work on the merged branch.
+/// An unreadable store reports an empty, incomplete list.
+fn recent_merges(
+    store: &dyn Store,
+    principal: &Principal,
+    overview: &super::work::WorkOverview,
+) -> RecentMerges {
+    let Ok((rows, complete)) = store.recent_branch_merges(
+        &catchup_scope(principal),
+        overview.recent_since,
+        overview.until,
+        RECENT_MERGES_LIMIT,
+    ) else {
+        return RecentMerges::default();
+    };
+    let list = rows
+        .into_iter()
+        .map(|row| RecentBranchMerge {
+            work_id: row.work_id,
+            pull_number: row.pull_number,
+            merged_at: row.merged_at,
+            basis: if row.explicit_link {
+                LinkBasis::CallerReported
+            } else {
+                LinkBasis::BranchObserved
+            },
+            provenance: Provenance::Provider,
+        })
+        .collect();
+    RecentMerges { list, complete }
+}
+
+/// The overview as JSON with each current Work's `stages` (keyed by Work id), any
+/// `stage_limits`, and `recent_merges` beside it. They stay out of `WorkOverview`, which older
+/// clients decode strictly.
 pub(super) fn overview_with_stages(
     store: &dyn Store,
     principal: &Principal,
     overview: &super::work::WorkOverview,
     now: i64,
-) -> (serde_json::Value, BTreeMap<String, WorkStageV1>) {
+) -> (
+    serde_json::Value,
+    BTreeMap<String, WorkStageV1>,
+    RecentMerges,
+) {
     let items: Vec<_> = overview
         .current
         .iter()
@@ -889,6 +955,7 @@ pub(super) fn overview_with_stages(
         .collect();
     let reader = WorkLifecycleReader::Token(&principal.token_id);
     let (stages, limits) = work_stages(store, principal, &reader, &items, now);
+    let merges = recent_merges(store, principal, overview);
     let mut value = serde_json::to_value(overview).unwrap_or(serde_json::Value::Null);
     if let Some(object) = value.as_object_mut() {
         if !stages.is_empty() {
@@ -900,8 +967,16 @@ pub(super) fn overview_with_stages(
         if !limits.is_empty() {
             object.insert("stage_limits".to_owned(), serde_json::json!(limits));
         }
+        object.insert(
+            "recent_merges".to_owned(),
+            serde_json::to_value(&merges.list).unwrap_or_default(),
+        );
+        object.insert(
+            "recent_merges_complete".to_owned(),
+            serde_json::json!(merges.complete),
+        );
     }
-    (value, stages)
+    (value, stages, merges)
 }
 
 #[derive(Default)]

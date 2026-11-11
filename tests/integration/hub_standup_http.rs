@@ -1998,3 +1998,167 @@ async fn overview_stages_are_opt_in_and_name_the_open_pull_request() {
         .await;
     assert_eq!(bad.0, 400);
 }
+
+/// A Work whose same-repository branch merged inside the recent window is listed in
+/// `recent_merges` with provider provenance, while its reported outcome stays as the agent left
+/// it. A fork merge, one outside the window or before the Work, and one for a Work explicitly
+/// linked to another pull request are not listed.
+async fn recent_merges_list_provider_observed_merges(hub: Hub) {
+    use agentscm::hub::work::WorkState;
+    use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
+    let (lead_id, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, reader) = hub.token(2, "acme/widgets", true).await;
+    let now = unix_now();
+    // (branch, merged_at, pull number, same repository head, explicit link number)
+    let cases: [(&str, i64, i64, bool, Option<i64>); 6] = [
+        ("feat/shipped", now, 30, true, None),
+        ("feat/matched", now, 32, true, Some(32)),
+        ("feat/fork", now, 33, false, None),
+        ("feat/future", now + 1000, 34, true, None),
+        ("feat/early", now - 1000, 35, true, None),
+        ("feat/other", now, 31, true, Some(99)),
+    ];
+    let mut ids = Vec::new();
+    for (index, (branch, _, _, _, _)) in cases.iter().enumerate() {
+        let body = json!({"request_key": format!("rm{index}"), "title": "Merged",
+            "session": format!("s-{index}"), "scope": [format!("src/rm{index}.rs")],
+            "branch": branch, "next_action": "Continue"});
+        let (status, started) = hub
+            .call(Method::POST, "/v1/hub/standup/start", &lead, Some(body))
+            .await;
+        assert_eq!(status, 200, "{started}");
+        let started: WorkStartResult = serde_json::from_value(started).unwrap();
+        ids.push(started.item);
+    }
+    let store = hub.store.clone();
+    let token = lead_id.clone();
+    let work = ids.clone();
+    tokio::task::spawn_blocking(move || {
+        let connection = store
+            .insert_connection(
+                &agentscm::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let scope = CatchupRepositoryScope {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(101),
+        };
+        for (item, (branch, at, number, same, link)) in work.iter().zip(cases) {
+            store
+                .record_catchup_merge(
+                    &scope,
+                    &NewCatchupMerge {
+                        same_repository_head: same,
+                        source: CatchupMergeSource::ForgePull,
+                        source_id: format!("pull:{number}"),
+                        occurred_at: Some(at),
+                        title: Some("Untrusted title".into()),
+                        branch: branch.into(),
+                        base: "main".into(),
+                        head_commit: "7".repeat(40),
+                        merge_commit: format!("{number:040x}"),
+                        pull_number: number,
+                        paths: vec!["src/a.rs".into()],
+                        paths_complete: true,
+                    },
+                    now,
+                )
+                .unwrap();
+            if let Some(number) = link {
+                store
+                    .work_pr_link_set(
+                        &token,
+                        &WorkPrLinkUpdate {
+                            work_id: item.id.clone(),
+                            operation_id: format!("link-{}", item.id),
+                            generation: item.generation,
+                            session: item.lead_session.clone(),
+                            expected_updated_seq: item.updated_seq,
+                            link: Some(WorkPrLinkTarget {
+                                repository_id: 101,
+                                number,
+                                head_sha: "7".repeat(40),
+                            }),
+                        },
+                        unix_now(),
+                    )
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let (status, plain) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("recent_merges").is_none(), "{plain}");
+    let (status, staged) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=1",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(staged["recent_merges_complete"], true, "{staged}");
+    let listed = staged["recent_merges"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{staged}");
+    let by_work = |id: &str| listed.iter().find(|m| m["work_id"] == id).unwrap();
+    assert_eq!(by_work(&ids[0].id)["pull_number"], 30, "{staged}");
+    assert_eq!(by_work(&ids[0].id)["basis"], "branch_observed");
+    assert_eq!(by_work(&ids[1].id)["pull_number"], 32);
+    assert_eq!(by_work(&ids[1].id)["basis"], "caller_reported");
+    for merge in listed {
+        assert_eq!(merge["provenance"], "provider", "{staged}");
+        assert!(!merge.to_string().contains("Untrusted"), "{staged}");
+    }
+    // The agent's outcome is untouched: nothing was reported, so nothing is recent.
+    assert!(staged["recent"].as_array().unwrap().is_empty(), "{staged}");
+    let store = hub.store.clone();
+    let (token, id) = (lead_id.clone(), ids[0].id.clone());
+    let item = tokio::task::spawn_blocking(move || {
+        store.work_get(&token, &id, unix_now()).unwrap().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_ne!(item.state, WorkState::Finished);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_merges_list_provider_observed_merges_sqlite() {
+    recent_merges_list_provider_observed_merges(Hub::start(None).await).await;
+}
+
+#[test]
+fn recent_merges_list_provider_observed_merges_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        recent_merges_list_provider_observed_merges(Hub::start(Some(pg.url.clone())).await).await;
+    });
+}

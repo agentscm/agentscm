@@ -2621,7 +2621,7 @@ async fn call_inner(
                     &OperationalSelect::Holders,
                     now,
                 )?;
-                let (with_stages, stages) = super::work_reconcile::overview_with_stages(
+                let (with_stages, stages, merges) = super::work_reconcile::overview_with_stages(
                     &*store, &principal, &overview, now,
                 );
                 Ok(match detail {
@@ -2630,7 +2630,7 @@ async fn call_inner(
                         &held,
                     )),
                     Detail::Compact => {
-                        let value = compact::overview(&overview, &held, &stages, &page);
+                        let value = compact::overview(&overview, &held, &stages, &merges, &page);
                         json!({"content": [{"type": "text", "text": compact::overview_text(&value)}],
                             "structuredContent": value, "isError": false})
                     }
