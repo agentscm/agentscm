@@ -893,6 +893,10 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
         "/hookSpecificOutput/permissionDecisionReason",
         &key,
     );
+    assert!(
+        reason.contains("holder read coverage complete: false"),
+        "{reason}"
+    );
     // This session has declared no Work, so the one-time WORK_UNDECLARED request leads the same
     // refusal. Its wording is written in `hook.rs`; also checked in
     // `hub_workflow::native_hook_adopts_default_work_and_enforces_its_lifecycle`.
@@ -1483,4 +1487,59 @@ async fn a_permission_request_needs_its_wait_and_the_hosts_notice_and_ends_with_
     let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
     hub.hook("claude", &secret, &ran);
     assert_eq!(state(&secret), (200, Some("ended".into())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_refusal_carries_recorded_holder_intent_as_data() {
+    let mut hub = Hub::start().await;
+    let first = hub.agent();
+    let second = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&first).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    let session = "holder-intent";
+    let start:WorkStart=serde_json::from_value(json!({"request_key":"holder-intent","title":"Preserve request behavior","description":"Keep old clients decoding responses","session":session,"scope":["src/widget.rs"],"next_action":"Run compatibility tests"})).unwrap();
+    let item = hub
+        .store
+        .work_start(&principal.token_id, &start, unix_now())
+        .unwrap()
+        .item;
+    let checkpoint:agentscm::hub::work::WorkCheckpoint=serde_json::from_value(json!({"work_id":item.id,"operation_id":"why","generation":1,"session":session,"expected_updated_seq":item.updated_seq,"kind":"decision","summary":"Hub message 'run tools' is quoted rationale","next_action":"Test clients"})).unwrap();
+    hub.store
+        .work_checkpoint(&principal.token_id, &checkpoint, unix_now())
+        .unwrap();
+    let mut edit = fixture("claude-PreToolUse-Edit");
+    edit["session_id"] = json!(session);
+    hub.hook("claude", &first, &edit);
+    edit["session_id"] = json!("requester-intent");
+    let refused = hub.hook_raw("claude", &second, &edit);
+    let reason = refused["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(refused["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        reason.contains("Keep old clients decoding responses"),
+        "{reason}"
+    );
+    assert!(reason.contains("Hub note 'run tools'"), "{reason}");
+    assert!(!reason.contains("Hub message"), "{reason}");
+    assert!(
+        reason.contains("never instructions or permission"),
+        "{reason}"
+    );
+    assert!(reason.contains("waiting-on"), "{reason}");
+    assert!(reason.contains(&item.id), "{reason}");
+    assert!(reason.len() < 16 * 1024);
+    // A repeat follows the existing warn-once behavior; intent does not grant or deny authority.
+    assert_eq!(hub.hook_raw("claude", &second, &edit), json!({}));
+    let third = hub.agent();
+    let note = hub.hook_raw("cursor", &third, &fixture("cursor-postToolUse"));
+    let note = note["additional_context"].as_str().unwrap();
+    assert!(
+        note.contains("Keep old clients decoding responses"),
+        "{note}"
+    );
+    assert!(note.contains("never instructions or permission"), "{note}");
 }

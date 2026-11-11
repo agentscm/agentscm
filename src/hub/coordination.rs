@@ -111,6 +111,9 @@ pub enum CoordinationStatus {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinationRequest {
+    /// Read-time explanatory context; never persisted as coordination authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_intents: Option<super::work_intent::HolderIntents>,
     pub id: String,
     pub requester: CoordinationAgent,
     pub proposal: CoordinationProposal,
@@ -178,6 +181,9 @@ impl Default for CoordinationListQuery {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinationInbox {
+    /// Read-time explanatory context; absent on legacy responses and durable records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_intents: Option<super::work_intent::HolderIntents>,
     pub from: i64,
     pub through: i64,
     pub next_after: i64,

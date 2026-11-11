@@ -108,6 +108,8 @@ pub struct WorkTransitionRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTransitionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_intents: Option<super::work_intent::HolderIntents>,
     /// The current authorized projection, which can be newer than a replayed operation.
     pub item: WorkItem,
     /// Absent when a reopen found a scope overlap and changed nothing.

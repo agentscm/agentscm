@@ -87,6 +87,7 @@ pub(super) fn evaluate(
             reasons.push(WorkPreflightReason::ActiveScopeOverlap);
         }
         return Ok(WorkPreflightResult {
+            holder_intents: None,
             dependencies: super::work_dependencies::for_start(
                 tx,
                 who,
@@ -304,6 +305,7 @@ pub(super) fn evaluate(
         && !reasons.contains(&WorkPreflightReason::CheckedMergeUnknown)
         && source_relation_checked;
     Ok(WorkPreflightResult {
+        holder_intents: None,
         dependencies: super::work_dependencies::for_start(
             tx,
             who,

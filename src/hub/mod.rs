@@ -79,6 +79,7 @@ pub mod why;
 pub mod work;
 pub mod work_dependencies;
 pub mod work_http;
+pub mod work_intent;
 pub mod work_issues;
 pub mod work_lifecycle;
 pub mod work_links;

@@ -104,6 +104,8 @@ pub enum WorkCommand {
     },
     /// Read the conservative insight projection for one work item.
     Insight { id: String },
+    /// Read bounded recorded intent, freshness and completeness for one Work item.
+    Intent { id: String },
     /// List conservative work insight projections in a bounded time window.
     Insights {
         #[arg(long)]
@@ -390,6 +392,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Reconciliation { .. }
         | WorkCommand::Declarations { .. }
         | WorkCommand::Insight { .. }
+        | WorkCommand::Intent { .. }
         | WorkCommand::Recovery { .. }
         | WorkCommand::RecoveryPreview { .. }
         | WorkCommand::Insights { .. } => false,
@@ -505,6 +508,11 @@ pub async fn run(command: WorkCommand) -> Result<()> {
         }
         _ => LIMIT,
     };
+    let intent_suffix = if matches!(&command, WorkCommand::Intent { .. }) {
+        "intent"
+    } else {
+        "insights"
+    };
     let hub = Hub::connect(timeout)?;
     let (reply, claim_conflict) = match command {
         WorkCommand::Status { json } => {
@@ -546,7 +554,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/preflight",
+                    "/v1/hub/standup/overlap/preflight?intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -558,7 +566,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/start",
+                    "/v1/hub/standup/overlap/start?intent=1",
                     Some(json!(request)),
                 )
                 .await?;
@@ -571,7 +579,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/checkpoint",
+                    "/v1/hub/standup/overlap/checkpoint?intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -711,13 +719,14 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
-        WorkCommand::Insight { id } => {
+        WorkCommand::Insight { id } | WorkCommand::Intent { id } => {
+            let suffix = intent_suffix;
             let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
                 .map_err(|_| invalid("cannot construct insight URL"))?;
             url.path_segments_mut()
                 .map_err(|_| invalid("cannot construct insight URL"))?
                 .push(&id)
-                .push("insights");
+                .push(suffix);
             let path = url
                 .as_str()
                 .strip_prefix("http://hub")
@@ -771,7 +780,8 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 params
                     .append_pair("session", &session)
                     .append_pair("limit", &limit.to_string())
-                    .append_pair("wait_seconds", &wait_seconds.to_string());
+                    .append_pair("wait_seconds", &wait_seconds.to_string())
+                    .append_pair("intent", "1");
                 if let Some(after) = after {
                     params.append_pair("after", &after.to_string());
                 }
@@ -838,7 +848,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/preflight?dependencies=1",
+                    "/v1/hub/standup/preflight?dependencies=1&intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -920,7 +930,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/start?reclaimed=1&dependencies=1",
+                    "/v1/hub/standup/start?reclaimed=1&dependencies=1&intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
@@ -994,7 +1004,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/work-transitions",
+                    "/v1/hub/standup/work-transitions?intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
@@ -1015,7 +1025,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/checkpoint?reclaimed=1",
+                    "/v1/hub/standup/checkpoint?reclaimed=1&intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?,

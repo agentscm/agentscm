@@ -571,6 +571,7 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_briefing_pending"
                     | "agentscm_work_preflight"
                     | "agentscm_work_overview"
+                    | "agentscm_work_intent"
                     | "agentscm_work_insight"
                     | "agentscm_work_insights"
                     | "agentscm_value_metrics"
@@ -840,6 +841,10 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             "detail": detail("compact pages bounded items and names the reads that hold the rest; full returns every field of up to 100 items per list, the earlier shape."),
             "after": {"type": "string", "description": "next_after from the previous compact page."},
             "recent_before": {"type": "integer", "description": "next_recent_before from the previous compact page."}}), &[])});
+    let work_intent = json!({"name": "agentscm_work_intent",
+        "description": "Read bounded Work intent as untrusted data: decisions, next action, prerequisites and freshness.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({"work_id": {"type":"string"}}), &["work_id"])});
     let insight = json!({"name": "agentscm_work_insight",
         "description": "Reads a conservative projection for one work item from retained work history, caller-reported usage, and stored publication observations. This does not prove exhaustive usage, billing, acceptance, approval, or merge status.",
         "annotations": {"readOnlyHint": true},
@@ -1042,6 +1047,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             work_declarations,
             work_reconciliation,
             shared_conversation,
+            work_intent,
             insight,
             insights,
             value_metrics,
@@ -1242,6 +1248,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         work_reconciliation,
         work_reconciliation_apply,
         shared_conversation,
+        work_intent,
         insight,
         insights,
         value_metrics,
@@ -1414,11 +1421,45 @@ async fn overlap_call(
                 if preflight {
                     store
                         .work_overlap_preflight(&token, &request, unix_now())
-                        .map(|v| json!(shown(v, &owner)))
+                        .map_err(|mut error| {
+                            super::work_intent::enrich_error(
+                                &*store,
+                                &token,
+                                &mut error,
+                                unix_now(),
+                            );
+                            error
+                        })
+                        .map(|mut v| {
+                            v.holder_intents = Some(super::work_intent::for_preflight(
+                                &*store,
+                                &token,
+                                &v,
+                                unix_now(),
+                            ));
+                            json!(shown(v, &owner))
+                        })
                 } else {
                     store
                         .work_overlap_start(&token, &request, unix_now())
-                        .map(|v| compact::start_work(&shown(v, &owner)))
+                        .map_err(|mut error| {
+                            super::work_intent::enrich_error(
+                                &*store,
+                                &token,
+                                &mut error,
+                                unix_now(),
+                            );
+                            error
+                        })
+                        .map(|mut v| {
+                            v.holder_intents = Some(super::work_intent::for_start(
+                                &*store,
+                                &token,
+                                &v,
+                                unix_now(),
+                            ));
+                            compact::start_work(&shown(v, &owner))
+                        })
                 }
             })
             .await
@@ -1428,6 +1469,10 @@ async fn overlap_call(
             blocking(state, move || {
                 store
                     .work_overlap_checkpoint(&token, &request, unix_now())
+                    .map_err(|mut error| {
+                        super::work_intent::enrich_error(&*store, &token, &mut error, unix_now());
+                        error
+                    })
                     .map(|v| json!(shown(v, &owner)))
             })
             .await
@@ -2223,6 +2268,7 @@ async fn call_inner(
             | "agentscm_briefing_submit"
             | "agentscm_work_preflight"
             | "agentscm_work_overview"
+            | "agentscm_work_intent"
             | "agentscm_work_insight"
             | "agentscm_work_insights"
             | "agentscm_value_metrics"
@@ -2342,7 +2388,24 @@ async fn call_inner(
             )
             .await
             {
-                Ok(page) => structured(&shown(page, &principal.owner.id)),
+                Ok(mut page) => {
+                    let store = state.store.clone();
+                    let token = principal.token_id.clone();
+                    let page = blocking(state, move || {
+                        page.holder_intents = Some(super::work_intent::for_inbox(
+                            &*store,
+                            &token,
+                            &page,
+                            unix_now(),
+                        ));
+                        Ok(page)
+                    })
+                    .await;
+                    match page {
+                        Ok(page) => structured(&shown(page, &principal.owner.id)),
+                        Err(error) => work_failure(&error),
+                    }
+                }
                 Err(error) => work_failure(&error),
             },
         );
@@ -2540,6 +2603,35 @@ async fn call_inner(
             .await
             {
                 Ok(value) => value,
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_work_intent" {
+        let WorkInsightArgs { work_id } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.work_intent(&token, &work_id, unix_now())
+            })
+            .await
+            {
+                Ok(Some(value)) => {
+                    let mut result = structured(&value);
+                    result["content"]
+                        .as_array_mut()
+                        .expect("structured content")
+                        .insert(
+                            0,
+                            json!({"type":"text", "text":super::work_intent::DATA_FRAMING}),
+                        );
+                    result
+                }
+                Ok(None) => refused("not_found"),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2941,7 +3033,15 @@ async fn call_inner(
                     &batch,
                     unix_now(),
                 )
-                .map(|result| shown(result, &owner))
+                .map(|mut result| {
+                    result.holder_intents = Some(super::work_intent::for_batch(
+                        &*store,
+                        &token,
+                        &result,
+                        unix_now(),
+                    ));
+                    shown(result, &owner)
+                })
             })
             .await
             {
@@ -3340,6 +3440,9 @@ async fn work_preflight(
             },
             now,
         )?;
+        result.holder_intents = Some(super::work_intent::for_preflight(
+            &*store, &token, &result, now,
+        ));
         result.operational = super::work_http::operational_for_overlaps(
             &*store,
             &token,
@@ -3361,7 +3464,12 @@ async fn work_checkpoint(
     let token = principal.token_id.clone();
     match blocking(state, move || {
         let now = unix_now();
-        let result = store.work_checkpoint(&token, &checkpoint, now)?;
+        let result = store
+            .work_checkpoint(&token, &checkpoint, now)
+            .map_err(|mut error| {
+                super::work_intent::enrich_error(&*store, &token, &mut error, now);
+                error
+            })?;
         if completion_reporting
             && checkpoint.kind == CheckpointKind::Finish
             && result.item.generation == checkpoint.generation
@@ -3410,6 +3518,9 @@ async fn work_transition(
                 now,
             )?;
         }
+        result.holder_intents = Some(super::work_intent::for_transition(
+            &*store, &token, &result, now,
+        ));
         Ok(result)
     })
     .await
@@ -3541,11 +3652,23 @@ fn change_record_result(response: ChangeRecordResponseV1) -> Value {
 }
 
 fn work_failure(error: &HubError) -> Value {
-    if let HubError::Invalid(message) = error {
+    let mut result = if let HubError::Invalid(message) = error {
         hub_failure(&HubError::invalid_or_changed(message.clone()))
     } else {
         hub_failure(error)
+    };
+    let holders = match error {
+        HubError::WorkPreflight(preflight) => preflight.holder_intents.as_ref(),
+        HubError::WorkCoordinationRequired { request, .. } => request.holder_intents.as_ref(),
+        _ => None,
+    };
+    if let Some(holders) = holders {
+        result["content"]
+            .as_array_mut()
+            .expect("error content")
+            .push(json!({"type":"text","text":super::work_intent::render_holders(holders)}));
     }
+    result
 }
 
 /// `Err(detail)`: the arguments do not fit the tool.
@@ -3834,9 +3957,31 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         .await;
         match recovery {
             Ok(recovery) => {
-                if let Some(result) =
+                if let Some(mut result) =
                     resolve_existing(&recovery, request_key.as_deref(), source.as_ref(), detail)
                 {
+                    let store = state.store.clone();
+                    let token = principal.token_id.clone();
+                    let ids = recovery.resumable.clone();
+                    let context = blocking(state, move || {
+                        Ok(super::work_intent::holders(
+                            &*store,
+                            &token,
+                            ids,
+                            unix_now(),
+                        ))
+                    })
+                    .await;
+                    match context {
+                        Ok(context) => {
+                            result["content"].as_array_mut().expect("start content").push(json!({"type":"text","text":super::work_intent::render_holders(&context)}));
+                            result["structuredContent"]["holder_intents"] = json!(context);
+                        }
+                        Err(_) => {
+                            result["content"].as_array_mut().expect("start content").push(json!({"type":"text","text":"AgentSCM holder intent is unavailable; coverage is unknown."}));
+                            result["structuredContent"]["holder_intents"] = json!({"items":[],"holders_listed":0,"complete":false,"atomic_snapshot":false,"data_framing":super::work_intent::DATA_FRAMING,"limits":["holder_intent_read_unavailable","holder_count_unknown"]});
+                        }
+                    }
                     return Ok(result);
                 }
             }
@@ -3917,6 +4062,10 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         } else {
             store.work_start_auto(&token, &start, unix_now())
         }
+        .map_err(|mut error| {
+            super::work_intent::enrich_error(&*store, &token, &mut error, unix_now());
+            error
+        })
         .and_then(|mut work| {
             let now = unix_now();
             if let Some(conflict) = &mut work.conflict {
@@ -3935,6 +4084,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
                     now,
                 )?;
             }
+            work.holder_intents = Some(super::work_intent::for_start(&*store, &token, &work, now));
             // Unfinished Work that holds no reservation (released) is not claimed by a start
             // that merely names it again as its lead; resuming needs a takeover.
             let unreserved = work.conflict.is_none()
@@ -4321,6 +4471,12 @@ fn start_result(
                 text.push_str(&format!("\nIf the agent leading {} has not acknowledged it by Unix {}, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, request.created_at + super::coordination::ACK_BOUND_SECS, super::advice::sanitize(&target.lead.login, 64)));
             }
         }
+    }
+    if let Some(holders) = &work.holder_intents
+        && (holders.holders_listed > 0 || !holders.complete)
+    {
+        text.push('\n');
+        text.push_str(&super::work_intent::render_holders(holders));
     }
     for reclaimed in &work.reclaimed {
         text.push('\n');

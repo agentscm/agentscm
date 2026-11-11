@@ -22,6 +22,7 @@ use super::login::HumanSession;
 use super::login::apps::Person;
 use super::store::unix_now;
 use super::viewer::{Viewer, masked_label, shown};
+use super::work_intent::{self, IntentFlag};
 use super::{HubError, HubState, Result};
 
 pub(super) static CHANGED: Notify = Notify::const_new();
@@ -67,6 +68,7 @@ struct InboxQuery {
     limit: usize,
     #[serde(default)]
     wait_seconds: u64,
+    intent: Option<u8>,
 }
 
 const fn page_limit() -> usize {
@@ -118,18 +120,50 @@ pub(super) async fn poll_inbox(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    after: Option<i64>,
+    through: Option<i64>,
+    #[serde(default)]
+    active_only: bool,
+    #[serde(default = "page_limit")]
+    limit: usize,
+    intent: Option<u8>,
+}
+
 async fn list(
     State(state): State<HubState>,
     Reader(principal): Reader,
-    query: std::result::Result<Query<CoordinationListQuery>, QueryRejection>,
+    query: std::result::Result<Query<ListQuery>, QueryRejection>,
 ) -> std::result::Result<Json<CoordinationInbox>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let intent = IntentFlag {
+        intent: query.intent,
+    }
+    .requested()?;
+    let query = CoordinationListQuery {
+        after: query.after,
+        through: query.through,
+        active_only: query.active_only,
+        limit: query.limit,
+    };
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
             store
                 .coordination_list(&principal.token_id, &query, unix_now())
-                .map(|page| shown(page, &principal.owner.id))
+                .map(|mut page| {
+                    if intent {
+                        page.holder_intents = Some(work_intent::for_inbox(
+                            &*store,
+                            &principal.token_id,
+                            &page,
+                            unix_now(),
+                        ));
+                    }
+                    shown(page, &principal.owner.id)
+                })
         })
         .await?,
     ))
@@ -141,7 +175,12 @@ async fn inbox(
     query: std::result::Result<Query<InboxQuery>, QueryRejection>,
 ) -> std::result::Result<Json<CoordinationInbox>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let page = poll_inbox(
+    let intent = IntentFlag {
+        intent: query.intent,
+    }
+    .requested()?;
+    let token = principal.token_id.clone();
+    let mut page = poll_inbox(
         &state,
         principal.token_id,
         CoordinationInboxQuery {
@@ -153,6 +192,14 @@ async fn inbox(
         query.wait_seconds,
     )
     .await?;
+    if intent {
+        let store = state.store.clone();
+        page = blocking(&state, move || {
+            page.holder_intents = Some(work_intent::for_inbox(&*store, &token, &page, unix_now()));
+            Ok(page)
+        })
+        .await?;
+    }
     Ok(Json(shown(page, &principal.owner.id)))
 }
 

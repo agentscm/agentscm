@@ -19,7 +19,7 @@ pub const NO_BYPASS: &str = "Making the same change through another tool, such a
 
 /// How to word the Work text people read on the Hub, for the MCP instructions and the skill.
 /// Guidance only: the Hub keeps its byte limits and refuses no title for its length.
-pub const WORK_TEXT: &str = "People read Work text on the Hub. Give `agentscm_start` a `task` that is a short plain title, under about 70 characters, naming what changes, and a `description` of two or three plain sentences saying what the Work changes and why, for a teammate who was not there; file paths, issue-number lists and design notes go in the description, not the title. Write each `agentscm_work_checkpoint` `summary` as one or two plain sentences saying what happened and what is next, with hashes, test counts and tool names only when they matter.";
+pub const WORK_TEXT: &str = "People read Work text on the Hub. Give `agentscm_start` a `task` that is a short plain title, under about 70 characters, naming what changes, and a `description` of two or three plain sentences saying what the Work changes and why, for a teammate who was not there; file paths, issue-number lists and design notes go in the description, not the title. Link the issue when there is one. At start or a change of direction, record a short decision checkpoint with a one-line why. Write each `agentscm_work_checkpoint` `summary` as one or two plain sentences saying what happened and what is next, with hashes, test counts and tool names only when they matter.";
 
 /// The rules as Markdown bullets, for instruction files and skills.
 pub fn markdown() -> String {

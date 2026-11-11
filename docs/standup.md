@@ -38,9 +38,21 @@ To link existing native Work later, use `agentscm_work_issue_link_set`, HTTP `PO
 
 Qualification is limited to synthetic fixtures and local fake GitHub HTTP, with SQLite and disposable PostgreSQL conformance. Live GitHub permissions and pagination, installed harness behavior, multi-machine delivery and hosted deployment remain unqualified.
 
+## Read a Work's recorded intent
+
+`agentscm_work_intent` with `work_id`, `agentscm work intent WORK_ID`, and `GET /v1/hub/standup/work/WORK_ID/intent` return the same bounded read-only projection. It combines the recorded title and description, latest retained decision checkpoints, next action, blocker, explicit structured prerequisites, scope, branch and PR links. Decisions are ordered by event sequence, newest first. The response labels every string as third-party data; it grants no edit, release, completion or merge authority.
+
+The dedicated read uses one database transaction on SQLite or PostgreSQL and returns at most five decisions, twelve scope paths, sixteen PR links and sixteen prerequisites within 64 KiB of serialized JSON. `completeness` distinguishes omitted fields, truncated text and retained-decision coverage; lifetime decision history is always unknown because decisions can be pruned or never reported. Claim status and last check-in describe the agent report, while linked-issue coverage, freshness and provider observation times remain separate from read time.
+
+Issue context reuses retained planned-issue observations: a title and a sanitized excerpt with at most 256 prefix characters plus a truncation ellipsis, with explicit excerpt completeness. It makes no provider request. Existing snapshots without excerpts, closed or missing issues and stale observations remain unavailable or incomplete; issue context from providers other than the existing GitHub discovery is unsupported. Private reasoning and conversation bodies are not part of this projection.
+
+Current MCP/CLI start, preflight, coordination and transition reads include smaller `holder_intents` where Work meets other Work; supported edit checks append quoted holder advice. Compatibility HTTP responses include this optional context with `?intent=1` (omit it or use `0` for the old shape; other values are invalid). Context is capped at three holders, 8 KiB each and 32 KiB in all, with explicit missing/truncated coverage. A batch shares one context. Encounter facts and intent are separate reads (`atomic_snapshot: false`); an optional read failure cannot undo an already committed mutation. Read the dedicated intent endpoint for the larger retained projection.
+
+Link an issue when one exists. Record a short decision checkpoint with a one-line why when starting or changing direction, so another lead can understand the recorded purpose without private reasoning or transcripts.
+
 ## Work identity and claims
 
-Every work item has a stable `wrk_…` identifier. New work can use a caller-supplied request key for durable retries, or link to an issue in the token's configured GitHub or GitLab repository. The forge remains authoritative for issue content and state; AgentSCM owns the claim and checkpoint history. It does not mirror issue descriptions or publish checkpoint text to the forge.
+Every work item has a stable `wrk_…` identifier. New work can use a caller-supplied request key for durable retries, or link to an issue in the token's configured GitHub or GitLab repository. The forge remains authoritative for issue content and state; AgentSCM owns the claim and checkpoint history. It retains only bounded excerpts from existing issue observations, not full issue descriptions, and does not publish checkpoint text to the forge.
 
 For compatible tasks sharing a file, use [mutually agreed named-file overlaps](design/work-overlaps.md). Declare the full scope, obtain the coordination proposal, have its holding lead grant exact files, then explicitly accept the consent IDs while admitting or expanding your own Work. Each Work retains its reservation. One-sided consent, prose replies and acknowledgements grant no edit authority. Overview, preflight and edit checks retain agreed paths explicitly.
 
@@ -131,6 +143,8 @@ A person does the same from the Hub. A task's page shows **Release or end this t
 ## Shared actionable status
 
 Ask your agent what is happening, what needs you and what can proceed. `agentscm_work_status`, `agentscm work status` (or `--json`) and `GET /v1/hub/standup/status` read one deterministic Rust projection. MCP overview, start, briefing, catch-up and cached-briefing reads also include `actionable_status` and useful bounded text. Native session-start hooks append the same status best effort within a short deadline; a failed read says unavailable and does not undo the committed touch. Generated prose is optional. HTTP overview remains strict and compatible; existing HTTP/CLI catch-up readers can explicitly read status alongside their fixed historical delivery.
+
+An explicit outstanding structured prerequisite also produces a `waiting_on` action in the prerequisite Work owner's queue. This projects the existing latest dependency notice version, not a new dependency or delivery system. Repeated reads and the same recorded version create no duplicate notice. Current condition evaluation clears a satisfied or removed edge; a finish report or release alone does not prove delivery, and a prerequisite can still need attention while it holds no files. Agent and role-checked person reads use the same owner routing. The read checks at most 100 latest notices and 100 additional prerequisite Works; incomplete fanout, missing Works or a read cap remain coverage limits. Existing dismissal/snooze versions apply to these actions too.
 
 The shared states are active, awaiting a named party, blocked, reassessment needed and retired. Every held reservation remains visible, including legacy Work omitted by merge filtering. Current actions name stable Hub recipients, and personal counts use that identity. Repository lists and computer catalogs use the same role-checked person projection without minting a read token; detailed catalog rows include recipients, states, next actions and coverage. Companion rows use those server booleans. A catalog’s attention marker changes with actual actionable facts rather than poll time.
 
@@ -509,6 +523,7 @@ All scope comes from the bearer token. There is no repository selector in these 
 | `POST /v1/hub/standup/coordination/resolve` | Writable agent | Validate actual coordination before recording resolution. |
 | `POST /v1/hub/standup/coordination/withdraw` | Writable agent | Withdraw your proposal; a current affected lead may withdraw it only if the requester token is revoked/expired or its owner is disabled. This cleanup is audited; an optional `target` fences it to the Work and generation the lead saw. |
 | `GET /v1/hub/standup/briefing` | Read-only or writable | Retrieve a bounded current-work page and ordered change page. Continuations use `after`, `work_after`, `work_done`, `through` and `limit`. |
+| `GET /v1/hub/standup/work/{id}/intent` | Read-only or writable | Bounded recorded intent, decisions, prerequisites, issue context and explicit freshness/completeness; changes no state. |
 | `GET /v1/hub/standup/work/{id}` | Read-only or writable | Inspect one authorized work item, including finished work retained for drill-down. |
 | `POST /v1/hub/standup/start` | Writable agent | Create/reuse, join or generation-checked take over a work item. |
 | `POST /v1/hub/standup/checkpoint` | Writable agent | Append one idempotent, generation-checked checkpoint. |

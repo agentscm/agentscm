@@ -419,6 +419,7 @@ fn planned_projection(f: Fixture) {
         .upsert_repository(&connection.id, "github.com", REPO_ID, REPO, None, None)
         .unwrap();
     let mut snapshot = PlannedIssueSnapshot {
+        issue_excerpts: Default::default(),
         provider: "github".into(),
         host: "github.com".into(),
         repository_id: REPO_ID,

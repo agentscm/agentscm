@@ -750,10 +750,24 @@ async fn announce_with<T: Send + 'static>(
 ) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
-    let (touched, read) = blocking(state, move || {
+    let (touched, read, holder_intents) = blocking(state, move || {
         let touched = store.touch_session_named(&token, &call, named, unix_now())?;
         let read = read(&*store, &touched);
-        Ok((touched, read))
+        let holder_intents = if touched.denied.is_empty() && touched.overlaps.is_empty() {
+            None
+        } else {
+            Some(super::work_intent::for_overlaps(
+                &*store,
+                &token,
+                touched
+                    .denied
+                    .iter()
+                    .chain(&touched.overlaps)
+                    .map(|overlap| overlap.intent.clone()),
+                unix_now(),
+            ))
+        };
+        Ok((touched, read, holder_intents))
     })
     .await?;
     wake_notice_waiters(&NOTICES, &touched);
@@ -793,7 +807,7 @@ async fn announce_with<T: Send + 'static>(
         }
         text.push_str(note);
     }
-    let deny = (!touched.denied.is_empty()).then(|| {
+    let mut deny = (!touched.denied.is_empty()).then(|| {
         // Say the holder was asked only when every refused file was.
         let requested = !touched.requested.is_empty()
             && touched
@@ -811,6 +825,18 @@ async fn announce_with<T: Send + 'static>(
             unix_now(),
         )
     });
+    if let Some(holders) = holder_intents {
+        let data = super::work_intent::render_holders(&holders);
+        if let Some(deny) = &mut deny {
+            deny.push('\n');
+            deny.push_str(&data);
+        } else {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&data);
+        }
+    }
     Ok((
         Advice {
             touched,

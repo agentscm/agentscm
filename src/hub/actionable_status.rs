@@ -780,6 +780,10 @@ fn read_scoped(
         checks::read(store, principal, &items, now)?;
     actions.extend(checks);
     limits.extend(check_limits);
+    let (dependency_actions, dependency_limits) =
+        dependency_actions(store, reader, &items, &principal.owner.id, now)?;
+    actions.extend(dependency_actions);
+    limits.extend(dependency_limits);
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
     actions.extend(waiting_actions(store, setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
@@ -1206,6 +1210,100 @@ pub fn render_text(status: &ActionableStatus) -> String {
     lines.join("\n")
 }
 
+/// Project the existing latest notice versions into the holder owner's attention queue.
+/// This reads no agent mailbox cursor and creates no new relationship or notice.
+fn dependency_actions(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    items: &BTreeMap<String, WorkItem>,
+    viewer: &str,
+    now: i64,
+) -> Result<(Vec<StatusAction>, BTreeSet<String>)> {
+    let mut limits = BTreeSet::new();
+    let page = match store.work_dependency_owner_notices(reader, now) {
+        Ok(page) => page,
+        Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+        Err(_) => {
+            limits.insert("dependency_notices_unavailable".into());
+            return Ok((vec![], limits));
+        }
+    };
+    if !page.complete || !page.coverage_complete {
+        limits.insert("dependency_notices_incomplete".into());
+    }
+    let mut actions = Vec::new();
+    let mut extra_items = BTreeMap::new();
+    let mut checked_targets = BTreeMap::new();
+    'notices: for notice in page.notices {
+        let targets = notice
+            .current
+            .conditions
+            .iter()
+            .filter(|condition| condition.disposition.obstructing)
+            .map(|condition| condition.condition.requirement.work_id())
+            .collect::<BTreeSet<_>>();
+        for target in targets {
+            if !items.contains_key(target) && !extra_items.contains_key(target) {
+                if extra_items.len() >= MAX_STATUS_WORK {
+                    limits.insert("dependency_target_reads_truncated".into());
+                    continue;
+                }
+                extra_items.insert(
+                    target.to_owned(),
+                    store.work_get_scoped(reader, target, now)?,
+                );
+            }
+            let Some(item) = items
+                .get(target)
+                .or_else(|| extra_items.get(target).and_then(Option::as_ref))
+            else {
+                limits.insert("dependency_target_work_not_read".into());
+                continue;
+            };
+            if item.owner != viewer || target == notice.recorded.work_id {
+                continue;
+            }
+            if !checked_targets.contains_key(target) {
+                if checked_targets.len() >= MAX_STATUS_WORK {
+                    limits.insert("dependency_target_reads_truncated".into());
+                    continue;
+                }
+                let unchanged =
+                    store
+                        .work_get_scoped(reader, target, now)?
+                        .is_some_and(|current| {
+                            current.updated_seq == item.updated_seq
+                                && current.generation == item.generation
+                        });
+                checked_targets.insert(target.to_owned(), unchanged);
+            }
+            if !checked_targets[target] {
+                limits.insert("dependency_target_changed_during_read".into());
+                continue;
+            }
+            if actions.len() >= 200 {
+                limits.insert("dependency_actions_truncated".into());
+                break 'notices;
+            }
+            actions.push(StatusAction {
+                id: format!("waiting_on:{}:{}", notice.recorded.work_id, target),
+                kind: "waiting_on".into(),
+                work_ids: vec![notice.recorded.work_id.clone(), target.to_owned()],
+                recipients: vec![StatusRecipient { kind: RecipientKind::Person,
+                    owner: Some(item.owner.clone()), login: Some(item.owner_login.clone()), agent: None }],
+                needs_you: true,
+                action: format!("Work {} records an outstanding prerequisite on your Work {}. Review its recorded intent and coordinate the next step; this notice grants no release or completion authority.", notice.recorded.work_id, target),
+                updated_seq: notice.sequence,
+                semantic_version: Some(identity(&[&notice.sequence.to_string(), &notice.current.evidence_digest,
+                    &item.generation.to_string(), &item.updated_seq.to_string()])),
+                session: None,
+                limits: vec!["recorded_dependency_not_execution_evidence".into()],
+            });
+        }
+    }
+    Ok((actions, limits))
+}
+
 /// Requests still waiting for an answer from the lead agent they were sent to. An answer is
 /// that agent's to give, not its person's, and `holding` is the Work that still holds its scope:
 /// once the target holds nothing the asker's next start takes the scope, so nothing waits. The
@@ -1418,6 +1516,267 @@ mod tests {
             now: 100,
         })
     }
+    fn owner_dependency_queue_contract(store: &dyn Store) {
+        use crate::hub::catchup::{CatchupMergeSource, CatchupRepositoryScope, NewCatchupMerge};
+        use crate::hub::work_dependencies::WorkDependencyNoticeQuery;
+        use crate::hub::work_links::WorkPrLinkTarget;
+        use crate::hub::work_reconciliation::{
+            PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations,
+            WorkDeclarationsUpdate,
+        };
+        use crate::hub::work_transition::{
+            WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+        };
+        let now = crate::hub::store::unix_now();
+        let principal = |id, repo: &str, repository_id| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id: id,
+                    },
+                    &format!("synthetic-{id}"),
+                )
+                .unwrap();
+            let (_, secret, _) = mint_bound_agent_token(
+                store,
+                &user.id,
+                "synthetic",
+                repo,
+                repository_id,
+                3600,
+                false,
+            )
+            .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let holder = principal(981, "acme/widgets", 101);
+        let dependent_owner = principal(982, "acme/widgets", 101);
+        let outsider = principal(983, "acme/widgets", 101);
+        let foreign = principal(981, "acme/other", 202);
+        let start = |key: &str, dependencies: Vec<String>| {
+            serde_json::from_value::<WorkStart>(json!({
+                "request_key":key,"title":key,"session":key,"scope":[format!("src/{key}.rs")],
+                "depends_on":dependencies
+            }))
+            .unwrap()
+        };
+        let mut prerequisite = store
+            .work_start(&holder.token_id, &start("holder", vec![]), now)
+            .unwrap()
+            .item;
+        let mut dependent = store
+            .work_start(
+                &dependent_owner.token_id,
+                &start("dependent", vec![prerequisite.id.clone()]),
+                now,
+            )
+            .unwrap()
+            .item;
+        let own = || {
+            store
+                .work_dependency_owner_notices(&WorkLifecycleReader::Token(&holder.token_id), now)
+                .unwrap()
+        };
+        let queue = |who: &Principal| {
+            read(store, who, now)
+                .unwrap()
+                .actions
+                .into_iter()
+                .filter(|action| action.kind == "waiting_on")
+                .collect::<Vec<_>>()
+        };
+        let first = own();
+        assert_eq!(first.notices.len(), 1);
+        let actions = queue(&holder);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].needs_you);
+        assert_eq!(actions[0].recipients[0].kind, RecipientKind::Person);
+        assert_eq!(
+            actions[0].recipients[0].owner.as_deref(),
+            Some(holder.owner.id.as_str())
+        );
+        assert_eq!(actions[0].updated_seq, first.notices[0].sequence);
+        let person = read_person(store, &holder.owner, "acme/widgets", 101, now).unwrap();
+        assert_eq!(
+            person
+                .actions
+                .into_iter()
+                .filter(|a| a.kind == "waiting_on")
+                .collect::<Vec<_>>(),
+            actions
+        );
+        for who in [&dependent_owner, &outsider, &foreign] {
+            assert!(queue(who).is_empty());
+        }
+        // Reads neither issue another notice nor consume the lead's mailbox delivery cursor.
+        let notice_query = WorkDependencyNoticeQuery {
+            session: "holder".into(),
+            after: 0,
+            through: None,
+            limit: 100,
+        };
+        let mailbox = store
+            .work_dependency_notices(&holder.token_id, &notice_query, now)
+            .unwrap();
+        let sequence = store.latest_event_seq().unwrap();
+        assert_eq!(queue(&holder), actions);
+        assert_eq!(own(), first);
+        assert_eq!(store.latest_event_seq().unwrap(), sequence);
+        assert_eq!(
+            store
+                .work_dependency_notices(&holder.token_id, &notice_query, now)
+                .unwrap(),
+            mailbox
+        );
+        // A changed target version is recorded once by the existing shared notice refresh.
+        let progress: WorkCheckpoint = serde_json::from_value(json!({"work_id":prerequisite.id,
+            "operation_id":"progress","generation":prerequisite.generation,"session":"holder",
+            "expected_updated_seq":prerequisite.updated_seq,"kind":"progress","summary":"Synthetic progress"})).unwrap();
+        prerequisite = store
+            .work_checkpoint(&holder.token_id, &progress, now)
+            .unwrap()
+            .item;
+        let changed = own();
+        assert_eq!(changed.notices.len(), 1);
+        assert!(changed.notices[0].sequence > first.notices[0].sequence);
+        store
+            .work_checkpoint(&holder.token_id, &progress, now)
+            .unwrap();
+        assert_eq!(own(), changed);
+        assert_ne!(
+            queue(&holder)[0].semantic_version,
+            actions[0].semantic_version
+        );
+        // Behavior prerequisites are independent of a held file reservation or a finish report.
+        for (operation, transition) in [
+            ("release", WorkTransitionKind::Release),
+            ("complete", WorkTransitionKind::Complete),
+        ] {
+            prerequisite = store
+                .work_transition(
+                    &WorkTransitionActor::Agent {
+                        token: &holder.token_id,
+                    },
+                    &WorkTransitionRequest {
+                        work_id: prerequisite.id.clone(),
+                        operation_id: operation.into(),
+                        generation: prerequisite.generation,
+                        expected_updated_seq: prerequisite.updated_seq,
+                        session: Some("holder".into()),
+                        transition,
+                        reason: "Synthetic disposition".into(),
+                        superseded_by: None,
+                    },
+                    now,
+                )
+                .unwrap()
+                .item;
+            assert_eq!(
+                queue(&holder).len(),
+                1,
+                "a disposition does not prove prerequisite delivery"
+            );
+        }
+        // An exact-head condition clears only when the existing evaluator finds matching evidence.
+        let target = WorkPrLinkTarget {
+            repository_id: 101,
+            number: 7,
+            head_sha: "a".repeat(40),
+        };
+        let declarations = WorkDeclarations {
+            links: vec![],
+            prerequisites: vec![PrerequisiteCondition {
+                id: "delivered".into(),
+                requirement: PrerequisiteRequirement::MergedPullRequest {
+                    work_id: prerequisite.id.clone(),
+                    target: target.clone(),
+                },
+            }],
+        };
+        store
+            .work_declarations_set(
+                &dependent_owner.token_id,
+                &WorkDeclarationsUpdate {
+                    work_id: dependent.id.clone(),
+                    operation_id: "exact-target".into(),
+                    generation: dependent.generation,
+                    session: "dependent".into(),
+                    expected_updated_seq: dependent.updated_seq,
+                    declarations,
+                },
+                now,
+            )
+            .unwrap();
+        dependent = store
+            .work_get(&dependent_owner.token_id, &dependent.id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue(&holder).len(), 1);
+        store
+            .record_catchup_merge(
+                &CatchupRepositoryScope {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository: "acme/widgets".into(),
+                    repository_id: Some(101),
+                },
+                &NewCatchupMerge {
+                    source: CatchupMergeSource::ForgePull,
+                    source_id: "pull:7".into(),
+                    occurred_at: Some(now),
+                    title: Some("Synthetic delivery".into()),
+                    branch: "feat/delivery".into(),
+                    base: "main".into(),
+                    head_commit: target.head_sha,
+                    merge_commit: "b".repeat(40),
+                    pull_number: 7,
+                    paths: vec![],
+                    paths_complete: true,
+                    same_repository_head: true,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(
+            queue(&holder).is_empty(),
+            "current qualified evidence clears a recorded wait without writing a new notice"
+        );
+        // Explicit replacement removes the edge and its owner routing; prose cannot restore it.
+        store
+            .work_declarations_set(
+                &dependent_owner.token_id,
+                &WorkDeclarationsUpdate {
+                    work_id: dependent.id,
+                    operation_id: "remove".into(),
+                    generation: dependent.generation,
+                    session: "dependent".into(),
+                    expected_updated_seq: dependent.updated_seq,
+                    declarations: WorkDeclarations::default(),
+                },
+                now,
+            )
+            .unwrap();
+        assert!(own().notices.is_empty());
+        assert!(queue(&holder).is_empty());
+    }
+
+    #[test]
+    fn sqlite_dependency_notices_reach_the_holder_owner_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            store::open(&format!("sqlite://{}", dir.path().join("hub.db").display())).unwrap();
+        owner_dependency_queue_contract(&*store);
+    }
+    #[test]
+    fn dependency_notices_reach_the_holder_owner_queue_on_postgres() {
+        on_postgres(owner_dependency_queue_contract);
+    }
+
     #[test]
     fn other_persons_blocker_is_not_a_viewer_obligation() {
         let item = item(WorkState::Blocked);
@@ -3606,6 +3965,7 @@ mod tests {
         })).unwrap();
         let items = BTreeMap::from([(item.id.clone(), item)]);
         let inbox = |request| CoordinationInbox {
+            holder_intents: None,
             from: 0,
             through: 1,
             next_after: 1,
@@ -3669,6 +4029,7 @@ mod tests {
         })).unwrap();
         let id = item.id.clone();
         let inbox = |request| CoordinationInbox {
+            holder_intents: None,
             from: 0,
             through: 1,
             next_after: 1,

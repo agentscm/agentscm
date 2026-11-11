@@ -922,6 +922,13 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<Option<WorkItem>>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Read retained intent in one transaction without changing Work or delivery state.
+    fn work_intent(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_intent::WorkIntentV1>>;
     /// Set/remove a caller-declared issue link without changing Work identity.
     fn work_issue_link_set(
         &self,
@@ -1223,6 +1230,14 @@ pub trait Store: Send + Sync {
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
+    /// Resolve a recorded holder identity within the caller's authorized repository. Never impersonates the holder.
+    fn work_id_for_holder(
+        &self,
+        token: &str,
+        holder_token: &str,
+        holder_session: &str,
+        now: i64,
+    ) -> Result<Option<String>>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
     /// The token/session's unique current-generation participant Work for native change capture.
@@ -1344,6 +1359,13 @@ pub trait Store: Send + Sync {
         &self,
         token: &str,
         query: &super::work_dependencies::WorkDependencyNoticeQuery,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
+    /// Pure bounded read of the shared latest notices addressed to this repository viewer's own Work.
+    /// Person readers must already have the current repository role, as for other scoped reads.
+    fn work_dependency_owner_notices(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
         now: i64,
     ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
     fn work_overlap_consent(
