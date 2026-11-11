@@ -120,6 +120,10 @@ read is moved to quarantine and a new one is started, which leaves the bodies it
 good. Bodies kept before this ledger existed are never freed, because nothing says whether local
 content shares their file. Once a body is freed, the local [repository
 explorer](repository-explorer.md) shows it as missing; the Hub copy is the one to read.
+`import-claude` retains every body before it appends any batch, so a very long import on raised
+limits, whose store a live session tidies meanwhile, can stop with a refusal; run it again. A later
+batch of the same Work that names a body already answered 204 adds no new fact, so the body can be
+freed while that batch is still pending; this matters only if the Hub then loses its copy.
 
 If the spool is still full after upkeep (inside the
 headroom kept for gaps, where new facts are refused), the session-start context says so instead of

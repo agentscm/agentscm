@@ -2684,10 +2684,15 @@ impl LocalSpool {
         let mut found = Vec::with_capacity(items.len());
         for (bytes, reference) in items.iter().zip(&references) {
             let path = artifacts.join(&reference.digest);
-            let exists = path.exists();
-            if exists {
-                verify(&path, bytes)?;
-            }
+            // Upkeep in another process may free a body before this read; the locked pass below
+            // checks again and writes it.
+            let exists = match verify(&path, bytes) {
+                Ok(()) => true,
+                Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    false
+                }
+                Err(error) => return Err(error),
+            };
             found.push(exists);
         }
         let shared = retention == RetentionClassV1::SharedApproved;
