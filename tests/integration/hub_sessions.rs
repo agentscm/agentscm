@@ -1237,6 +1237,7 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
             && !reason.contains("alice-agent"),
         "{reason}"
     );
+    assert!(reason.contains("AgentSCM holder intent"), "{reason}");
     assert!(refused.text.is_empty() && !refused.stop);
     assert!(refused.touched.intent.is_none());
 

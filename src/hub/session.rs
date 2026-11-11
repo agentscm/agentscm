@@ -827,13 +827,14 @@ async fn announce_with<T: Send + 'static>(
     });
     if let Some(holders) = holder_intents {
         let data = super::work_intent::render_holders(&holders);
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&data);
         if let Some(deny) = &mut deny {
             deny.push('\n');
             deny.push_str(&data);
+        } else {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&data);
         }
     }
     Ok((
