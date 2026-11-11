@@ -11091,7 +11091,7 @@ impl Store for SqliteStore {
         let key = catchup_repository_key(scope.repository_id);
         let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut statement = conn.prepare(
-            "SELECT w.id, m.pull_number, m.occurred_at, l.number IS NOT NULL
+            "SELECT w.id, m.pull_number, m.occurred_at, l.number IS NOT NULL, m.branch
              FROM hub_catchup_merges m
              JOIN hub_work_items w ON w.branch = m.branch AND m.occurred_at >= w.created_at
              LEFT JOIN hub_work_pr_links l ON l.work = w.id
@@ -11103,10 +11103,10 @@ impl Store for SqliteStore {
                  WHERE o.provider=m.provider AND o.host=m.host AND o.repository=m.repository
                    AND o.repository_key=m.repository_key AND o.branch=m.branch
                    AND o.same_repository_head = 1 AND o.pull_number <> m.pull_number
-                   AND o.occurred_at >= w.created_at)))
-               AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
-                 WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
-                   AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)
+                   AND o.occurred_at >= w.created_at)
+                 AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
+                   WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
+                     AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)))
              ORDER BY m.occurred_at DESC, m.pull_number DESC, w.id ASC LIMIT ?10",
         )?;
         let mut rows = statement
@@ -11129,6 +11129,7 @@ impl Store for SqliteStore {
                         pull_number: row.get(1)?,
                         merged_at: row.get(2)?,
                         explicit_link: row.get(3)?,
+                        branch: row.get(4)?,
                     })
                 },
             )?

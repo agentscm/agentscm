@@ -4459,6 +4459,14 @@ mod tests {
         assert!(text.contains("3 actions need you"));
         assert!(text.contains("awaiting a named party"));
         assert!(text.contains("Coverage incomplete"));
+        assert!(!text.contains("Stage:"));
+        let mut staged = fixture.clone();
+        staged.work[0].stage = Some(crate::hub::work_reconcile::WorkStageV1 {
+            stage: WorkStage::PullRequestOpen,
+            pull_request: Some(7),
+            basis: None,
+        });
+        assert!(render_text(&staged).contains("Stage: pull request #7 open."));
     }
     #[test]
     fn compact_status_keeps_full_scope_identity_without_serializing_paths() {

@@ -452,4 +452,78 @@ mod tests {
         assert_eq!(rest["current"][0]["id"], id(1));
         assert!(rest["next_after"].is_null());
     }
+
+    #[test]
+    fn a_page_labels_stages_and_recent_merges_and_caps_stage_limits() {
+        use crate::hub::work_reconcile::{
+            LinkBasis, Provenance, RecentBranchMerge, RecentMerges, StagedOverview, WorkStage,
+            WorkStageV1,
+        };
+        let id = |n: u8| format!("wrk_{}", n.to_string().repeat(32));
+        let work = |n: u8| {
+            json!({
+                "id": id(n), "repository": "acme/widgets", "owner": "usr_alice",
+                "owner_login": "alice", "title": "Staged", "state": "active",
+                "source": {"kind": "native", "request_key": "synthetic"},
+                "claim_status": "active", "last_checkin_at": 1, "generation": 1,
+                "lead_token": "tok_alice", "lead_agent": "client-a", "lead_session": "s",
+                "participants": [], "scope": [], "branch": null, "worktree": null,
+                "next_action": null, "current": null, "blocker": null,
+                "depends_on": [], "related_work": [], "created_at": 1, "updated_at": 1,
+                "created_seq": 1, "updated_seq": 1
+            })
+        };
+        let overview: super::WorkOverview = serde_json::from_value(json!({
+            "recent_since": 0, "until": 1, "current": [work(1), work(2)], "recent": [],
+            "overlaps": [], "current_complete": true, "recent_complete": true,
+            "overlaps_complete": true, "history_retention_gap": false
+        }))
+        .unwrap();
+        let held = super::OperationalOverviewV1 {
+            schema_version: 1,
+            work: vec![],
+            complete: true,
+        };
+        let read = StagedOverview {
+            stages: [(
+                id(1),
+                WorkStageV1 {
+                    stage: WorkStage::PullRequestOpen,
+                    pull_request: Some(12),
+                    basis: Some(LinkBasis::BranchObserved),
+                },
+            )]
+            .into(),
+            limits: (0..11).map(|n| format!("limit_{n:02}")).collect(),
+            merges: RecentMerges {
+                list: vec![RecentBranchMerge {
+                    work_id: id(1),
+                    pull_number: 30,
+                    merged_at: 5,
+                    basis: LinkBasis::CallerReported,
+                    provenance: Provenance::Provider,
+                }],
+                complete: true,
+            },
+            ..Default::default()
+        };
+        let page = super::Page {
+            size: 5,
+            after: None,
+            recent_before: None,
+        };
+        let value = super::overview(&overview, &held, &read, &page);
+        assert_eq!(value["current"][0]["stage"], "pull_request_open");
+        assert_eq!(value["current"][0]["pull_request"], 12);
+        assert_eq!(value["current"][0]["basis"], "branch_observed");
+        // A Work the read did not stage carries no stage.
+        assert!(value["current"][1].get("stage").is_none(), "{value}");
+        let merge = &value["recent_merges"][0];
+        assert_eq!(merge["pull_request"], 30);
+        assert_eq!(merge["basis"], "caller_reported");
+        assert_eq!(merge["provenance"], "provider");
+        assert_eq!(value["recent_merges_complete"], true);
+        assert_eq!(value["stage_limits"].as_array().unwrap().len(), 10);
+        assert_eq!(value["stage_limits_listed"], 11);
+    }
 }

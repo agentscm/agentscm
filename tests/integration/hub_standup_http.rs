@@ -2010,7 +2010,7 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
     let (_, reader) = hub.token(2, "acme/widgets", true).await;
     let now = unix_now();
     // (branch, merged_at, pull number, same repository head, explicit link number)
-    let cases: [(&str, i64, i64, bool, Option<i64>); 8] = [
+    let cases: [(&str, i64, i64, bool, Option<i64>); 10] = [
         ("feat/shipped", now, 30, true, None),
         ("feat/matched", now, 32, true, Some(32)),
         ("feat/fork", now, 33, false, None),
@@ -2020,6 +2020,10 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
         // One branch reused for two pull requests: inference picks neither, so none is listed.
         ("feat/reused", now, 36, true, None),
         ("feat/reused", now, 37, true, None),
+        // An open same-repository pull request on the branch: inference picks neither.
+        ("feat/reopened", now, 38, true, None),
+        // A merge base, but explicitly linked: listed, as its stage reads merged.
+        ("feat/stack-base", now, 40, true, Some(40)),
     ];
     let mut ids = Vec::new();
     for (index, (branch, _, _, _, _)) in cases.iter().enumerate() {
@@ -2051,7 +2055,7 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
                 "usr_admin",
             )
             .unwrap();
-        store
+        let repository = store
             .upsert_repository(
                 &connection.id,
                 "github.com",
@@ -2061,12 +2065,40 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
                 None,
             )
             .unwrap();
+        let open = json!({"number": 39, "state": "open", "repository_id": 101,
+            "head_ref": "feat/reopened", "head_sha": "b".repeat(40), "base_ref": "main",
+            "head_repository_id": 101})
+        .to_string();
+        store
+            .observe(&repository.id, "pull_request", "39", &open, now)
+            .unwrap();
         let scope = CatchupRepositoryScope {
             provider: "github".into(),
             host: "github.com".into(),
             repository: "acme/widgets".into(),
             repository_id: Some(101),
         };
+        // A pull request that merged into `feat/stack-base` makes it a merge base.
+        store
+            .record_catchup_merge(
+                &scope,
+                &NewCatchupMerge {
+                    same_repository_head: true,
+                    source: CatchupMergeSource::ForgePull,
+                    source_id: "pull:41".into(),
+                    occurred_at: Some(now),
+                    title: None,
+                    branch: "feat/stack-tip".into(),
+                    base: "feat/stack-base".into(),
+                    head_commit: "8".repeat(40),
+                    merge_commit: format!("{:040x}", 41),
+                    pull_number: 41,
+                    paths: vec!["src/a.rs".into()],
+                    paths_complete: true,
+                },
+                now,
+            )
+            .unwrap();
         for (item, (branch, at, number, same, link)) in work.iter().zip(cases) {
             store
                 .record_catchup_merge(
@@ -2129,8 +2161,11 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
     assert_eq!(status, 200, "{staged}");
     assert_eq!(staged["recent_merges_complete"], true, "{staged}");
     let listed = staged["recent_merges"].as_array().unwrap();
-    assert_eq!(listed.len(), 2, "{staged}");
+    assert_eq!(listed.len(), 3, "{staged}");
     let by_work = |id: &str| listed.iter().find(|m| m["work_id"] == id).unwrap();
+    assert!(listed.iter().all(|m| m["work_id"] != ids[8].id), "{staged}");
+    assert_eq!(by_work(&ids[9].id)["pull_number"], 40, "{staged}");
+    assert_eq!(by_work(&ids[9].id)["basis"], "caller_reported");
     assert_eq!(by_work(&ids[0].id)["pull_number"], 30, "{staged}");
     assert_eq!(by_work(&ids[0].id)["basis"], "branch_observed");
     assert_eq!(by_work(&ids[1].id)["pull_number"], 32);

@@ -928,8 +928,29 @@ fn recent_merges(
     ) else {
         return RecentMerges::default();
     };
+    // Inference refuses a merged pull request while another same-repository one is open on the
+    // branch, so an inferred row is dropped under the same rule. An unreadable observation read
+    // cannot show the branch has none, so it drops them too and the list is incomplete.
+    let mut complete = complete;
+    let observed = rows
+        .iter()
+        .any(|row| !row.explicit_link)
+        .then(|| read_open_observations(store, principal));
     let list = rows
         .into_iter()
+        .filter(|row| {
+            let Some(observed) = observed.as_ref().filter(|_| !row.explicit_link) else {
+                return true;
+            };
+            let Ok(observed) = observed else {
+                complete = false;
+                return false;
+            };
+            !observed
+                .by_branch
+                .get(&row.branch)
+                .is_some_and(|open| open.iter().any(|(number, _)| *number != row.pull_number))
+        })
         .map(|row| RecentBranchMerge {
             work_id: row.work_id,
             pull_number: row.pull_number,

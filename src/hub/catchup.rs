@@ -141,6 +141,7 @@ pub struct RecentMergeRow {
     pub merged_at: i64,
     /// The Work carries an explicit link naming this pull request.
     pub explicit_link: bool,
+    pub branch: String,
 }
 
 /// A provider-confirmed merge of a pull request whose head branch is a given branch.
