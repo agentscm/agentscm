@@ -183,6 +183,9 @@ impl Shown for super::work_overlap::WorkOverlapConsentView {
     fn show(&mut self, viewer: Viewer<'_>) {
         viewer.coordination_agent(&mut self.consent.requester);
         viewer.coordination_agent(&mut self.consent.target.lead);
+        if let Some(pending) = &mut self.consent.pending_requester {
+            viewer.coordination_agent(&mut pending.lead);
+        }
         if let Some(accepted) = &mut self.consent.accepted {
             viewer.coordination_agent(&mut accepted.lead);
         }

@@ -49,6 +49,9 @@ pub struct WorkOverlapConsent {
     pub requester: CoordinationAgent,
     pub proposal: CoordinationProposal,
     pub target: WorkOverlapFence,
+    /// Existing requester state when the target granted consent; absent for initial admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_requester: Option<WorkOverlapFence>,
     pub paths: Vec<String>,
     /// Set atomically with requester acceptance and admission, never by the target lead.
     pub accepted: Option<WorkOverlapFence>,

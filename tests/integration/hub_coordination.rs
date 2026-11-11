@@ -2681,3 +2681,243 @@ parity_case!(
     agreed_overlap_retention,
     agreed_overlap_retention_keeps_live_agreement_and_reclaims_invalidated
 );
+
+fn pending_requester_lifecycle_requires_fresh_consent(db: &Db) {
+    use agentscm::hub::work_overlap::{
+        WorkOverlapCheckpoint, WorkOverlapConsentRequest, WorkOverlapConsentState,
+    };
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    let store = db.open();
+    let now = unix_now();
+    for (index, change) in ["scope", "release", "expiry", "legacy"]
+        .into_iter()
+        .enumerate()
+    {
+        let a = token(&*store, 801 + index as i64 * 2, "target");
+        let b = token(&*store, 802 + index as i64 * 2, "requester");
+        let target_session = format!("target-{change}");
+        let own_session = format!("requester-{change}");
+        let shared = format!("src/{change}.rs");
+        let own_path = format!("docs/{change}.md");
+        let changed_path = format!("docs/{change}-changed.md");
+        let own_start = start_scope(
+            &own_session,
+            &own_session,
+            WorkRole::Lead,
+            None,
+            &[&own_path],
+        );
+        let target = store
+            .work_start(
+                &a,
+                &start_scope(
+                    &target_session,
+                    &target_session,
+                    WorkRole::Lead,
+                    None,
+                    &[&shared],
+                ),
+                now,
+            )
+            .unwrap()
+            .item;
+        let own = store.work_start(&b, &own_start, now).unwrap().item;
+        let desired = [own_path.as_str(), shared.as_str()];
+        let proposed = checkpoint(
+            &own.id,
+            "propose",
+            &own_session,
+            own.updated_seq,
+            CheckpointKind::Progress,
+            Some(&desired),
+        );
+        let request = match store.work_checkpoint(&b, &proposed, now + 1).unwrap_err() {
+            HubError::WorkCoordinationRequired { request, .. } => *request,
+            e => panic!("{e:?}"),
+        };
+        let input = WorkOverlapConsentRequest {
+            request_id: request.id.clone(),
+            target_work_id: target.id.clone(),
+            operation_id: "grant".into(),
+            session: target_session.clone(),
+            expected_updated_seq: request.updated_seq,
+            target_generation: target.generation,
+            target_updated_seq: target.updated_seq,
+            paths: vec![shared.clone()],
+        };
+        let grant = store.work_overlap_consent(&a, &input, now + 2).unwrap();
+        assert!(grant.consent.pending_requester.is_some());
+        let progressed = store
+            .work_checkpoint(
+                &b,
+                &checkpoint(
+                    &own.id,
+                    "progress",
+                    &own_session,
+                    own.updated_seq,
+                    CheckpointKind::Progress,
+                    None,
+                ),
+                now + 3,
+            )
+            .unwrap()
+            .item;
+        assert_eq!(
+            store
+                .work_overlap_consent(&a, &input, now + 4)
+                .unwrap()
+                .state,
+            WorkOverlapConsentState::AwaitingRequester,
+            "progress must preserve pending consent"
+        );
+        let (current, at) = match change {
+            "legacy" => {
+                let expression = if db._pg.is_some() {
+                    "(snapshot::jsonb - 'pending_requester')::text"
+                } else {
+                    "json_remove(snapshot, '$.pending_requester')"
+                };
+                db.exec(&format!(
+                    "UPDATE hub_work_overlap_consents SET snapshot={expression} WHERE id='{}'",
+                    grant.consent.id
+                ));
+                (progressed.clone(), now + 6)
+            }
+            "scope" => (
+                store
+                    .work_checkpoint(
+                        &b,
+                        &checkpoint(
+                            &own.id,
+                            "change",
+                            &own_session,
+                            progressed.updated_seq,
+                            CheckpointKind::Progress,
+                            Some(&[&changed_path]),
+                        ),
+                        now + 5,
+                    )
+                    .unwrap()
+                    .item,
+                now + 6,
+            ),
+            "release" => {
+                let release: WorkTransitionRequest = serde_json::from_value(serde_json::json!({"work_id":own.id,"operation_id":"release","generation":progressed.generation,"expected_updated_seq":progressed.updated_seq,"session":own_session,"transition":"release","reason":"synthetic release"})).unwrap();
+                let released = store
+                    .work_transition(&WorkTransitionActor::Agent { token: &b }, &release, now + 5)
+                    .unwrap()
+                    .item;
+                let resume = WorkStart {
+                    work_id: Some(own.id.clone()),
+                    request_key: None,
+                    takeover_generation: Some(released.generation),
+                    ..own_start.clone()
+                };
+                let resumed = store.work_start(&b, &resume, now + 6).unwrap().item;
+                assert!(resumed.generation > own.generation);
+                (resumed, now + 7)
+            }
+            "expiry" => {
+                // Keep only the target live, then exercise the requester's expired lease and revival.
+                store
+                    .work_checkpoint(
+                        &a,
+                        &checkpoint(
+                            &target.id,
+                            "renew-target",
+                            &target_session,
+                            target.updated_seq,
+                            CheckpointKind::Progress,
+                            None,
+                        ),
+                        now + 1100,
+                    )
+                    .unwrap();
+                store.observe_lease_clock(now + 1100).unwrap();
+                assert_eq!(
+                    store
+                        .work_overlap_consent(&a, &input, now + 1204)
+                        .unwrap()
+                        .state,
+                    WorkOverlapConsentState::Invalidated
+                );
+                let revived = store.work_start(&b, &own_start, now + 1205).unwrap();
+                assert!(revived.conflict.is_none());
+                (revived.item, now + 1206)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            store.work_overlap_consent(&a, &input, at).unwrap().state,
+            WorkOverlapConsentState::Invalidated,
+            "old receipt cannot restore requester consent after {change}"
+        );
+        let accepting = WorkOverlapCheckpoint {
+            checkpoint: WorkCheckpoint {
+                generation: current.generation,
+                ..checkpoint(
+                    &own.id,
+                    "accept-old",
+                    &own_session,
+                    current.updated_seq,
+                    CheckpointKind::Progress,
+                    Some(&desired),
+                )
+            },
+            consent_ids: vec![grant.consent.id],
+        };
+        assert!(
+            store.work_overlap_checkpoint(&b, &accepting, at).is_err(),
+            "old consent must refuse {change}"
+        );
+        let request = store
+            .coordination_inbox(
+                &a,
+                &CoordinationInboxQuery {
+                    session: Some(target_session.clone()),
+                    ..Default::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .into_iter()
+            .find(|r| r.id == request.id)
+            .unwrap();
+        let target = store
+            .work_for_session(&a, &target_session, at)
+            .unwrap()
+            .unwrap();
+        let fresh = store
+            .work_overlap_consent(
+                &a,
+                &WorkOverlapConsentRequest {
+                    operation_id: "fresh".into(),
+                    expected_updated_seq: request.updated_seq,
+                    target_updated_seq: target.updated_seq,
+                    ..input
+                },
+                at + 1,
+            )
+            .unwrap();
+        let accepting = WorkOverlapCheckpoint {
+            consent_ids: vec![fresh.consent.id],
+            ..accepting
+        };
+        let accepted = store
+            .work_overlap_checkpoint(&b, &accepting, at + 2)
+            .unwrap();
+        assert_eq!(accepted.item.scope, desired);
+        assert!(
+            store
+                .work_overlap_checkpoint(&b, &accepting, at + 3)
+                .unwrap()
+                .receipt
+                .replayed
+        );
+    }
+}
+parity_case!(
+    pending_requester_lifecycle,
+    pending_requester_lifecycle_requires_fresh_consent
+);

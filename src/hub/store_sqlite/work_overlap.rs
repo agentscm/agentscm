@@ -28,6 +28,25 @@ pub(super) fn view(
         "SELECT status='withdrawn' OR (status='resolved' AND ?3) OR EXISTS(SELECT 1 FROM hub_coordination_responses WHERE request=?1 AND target_work=?2 AND kind='decline' AND event_seq>?4) FROM hub_coordination_requests WHERE id=?1",
         params![consent.request_id,consent.target.work_id,consent.accepted.is_none(),consent.event_seq], |row| row.get(0))?;
     let valid_target = valid_target && !withdrawn;
+    // Once accepted, the resulting scope/epoch replaces the pre-expansion requester fence.
+    let pending_valid = if consent.accepted.is_some() || consent.proposal.work_id.is_none() {
+        true
+    } else if let Some(pending) = &consent.pending_requester {
+        if consent.proposal.work_id.as_deref() != Some(pending.work_id.as_str()) {
+            false
+        } else if let Some(item) = scoped_work(tx, who, &pending.work_id, now)? {
+            let (epoch, live) = reservation(tx, &item.id, now)?;
+            contract::matches(pending, &item, epoch, live)
+                && pending.lead.token == consent.requester.token
+                && pending.lead.session == consent.requester.session
+        } else {
+            false
+        }
+    } else {
+        // An older pending grant without its requester fence cannot establish permission.
+        false
+    };
+    let valid_target = valid_target && pending_valid;
     let mut state = if valid_target {
         WorkOverlapConsentState::AwaitingRequester
     } else {
@@ -106,6 +125,23 @@ impl SqliteStore {
         }
         let (epoch, live) = reservation(&tx, &item.id, now)?;
         contract::validate_target(&request, input, &item, &who.token, live, &paths)?;
+        let pending_requester = if let Some(id) = &request.proposal.work_id {
+            let requester = scoped_work(&tx, &who, id, now)?
+                .ok_or_else(|| contract::invalid("requester Work is unavailable"))?;
+            let (epoch, live) = reservation(&tx, id, now)?;
+            let fence = contract::fence(&requester, epoch);
+            if requester.lead_token != request.requester.token
+                || requester.lead_session != request.requester.session
+                || !contract::matches(&fence, &requester, epoch, live)
+            {
+                return Err(contract::invalid(
+                    "requester lead changed or reservation lapsed",
+                ));
+            }
+            Some(fence)
+        } else {
+            None
+        };
         let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_work_overlap_consents WHERE request=?1",
             [&request.id],
@@ -129,6 +165,7 @@ impl SqliteStore {
             requester: request.requester,
             proposal: request.proposal,
             target: contract::fence(&item, epoch),
+            pending_requester,
             paths,
             accepted: None,
             created_at: now,
