@@ -1,8 +1,11 @@
-//! Letting the person answer a Claude Code permission prompt or question from the Hub.
+//! Letting the person answer a Claude Code permission prompt or question, or a Codex approval
+//! request, from the Hub.
 //!
 //! The `PermissionRequest` hook already told the Hub the session waits (see `coordinate`). Here
 //! the hook goes on to register the prompt it is showing and to wait for an answer, all while
-//! the dialog stays usable in the session. Everything the Hub is told about the tool is made on
+//! the dialog stays usable in the session. Codex shows its own prompt only after this hook
+//! returns, so there the hook holds the prompt only while nobody is at the computer
+//! ([`presence`]), gives it back the moment someone is, and ends before Codex's limit for it. Everything the Hub is told about the tool is made on
 //! this machine: its name, what to show of it (a command, a path, an address, with secrets
 //! redacted), what the person can pick (the host's own "do not ask again" suggestions, a
 //! question's options) and a salted hash of the tool input.
@@ -23,12 +26,17 @@ use agentscm::redact::redact_json;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod presence;
+
 /// Local switch for a machine that does not want its Hub to approve anything. There is no opt-in.
 const OFF_SWITCH: &str = "AGENTSCM_REMOTE_ANSWERS";
 /// Test-only way to shorten (never lengthen) the hook's bound.
 const BOUND_OVERRIDE: &str = "AGENTSCM_TEST_PERMISSION_BOUND_MS";
 /// The host's hook timeout is 12 hours; the hook ends itself a minute earlier.
 const HOOK_BOUND: Duration = Duration::from_secs(43_140);
+/// Codex stops this hook after the 10 minutes its plugin entry gives it. A hook that holds the
+/// prompt gives it back half a minute earlier, so the person is never left without one.
+const HELD_BOUND: Duration = Duration::from_secs(570);
 /// The Hub confirms a shown prompt within seconds; a request still unconfirmed this long after
 /// the hook started belongs to a run with nobody at a dialog.
 const UNCONFIRMED_GIVE_UP: Duration = Duration::from_secs(20);
@@ -81,15 +89,23 @@ pub(super) fn applies(agent: &str, client_connection: bool, payload: &Value) -> 
         client_connection,
         payload,
         env(OFF_SWITCH).as_deref(),
-    ) && asker_fits(payload, env(ENTRYPOINT).as_deref())
+    ) && asker_fits(agent, payload, env(ENTRYPOINT).as_deref())
+}
+
+/// Whether the host shows its own prompt only after this hook returns, so that waiting hides
+/// the prompt from a person at the computer. Codex awaits the hook first; Claude Code shows its
+/// dialog beside it.
+fn holds_prompt(agent: &str) -> bool {
+    agent == "codex"
 }
 
 /// Whether the prompt's asker can be offered: the lead always; a subagent only with an id the
-/// Hub takes, and only where its dialog is on screen while this hook waits.
-fn asker_fits(payload: &Value, entrypoint: Option<&str>) -> bool {
+/// Hub takes, only where its dialog is on screen while this hook waits, and only in Claude
+/// Code, the one host that was measured for.
+fn asker_fits(agent: &str, payload: &Value, entrypoint: Option<&str>) -> bool {
     match payload["agent_id"].as_str() {
         None | Some("") => true,
-        Some(_) => agent_id_of(payload).is_some() && asks_its_app(entrypoint),
+        Some(_) => agent == "claude" && agent_id_of(payload).is_some() && asks_its_app(entrypoint),
     }
 }
 
@@ -111,7 +127,7 @@ fn applies_with(
     payload: &Value,
     switch: Option<&str>,
 ) -> bool {
-    agent == "claude"
+    matches!(agent, "claude" | "codex")
         && client_connection
         && switch.is_none_or(|value| value.trim() != "0")
         && payload["hook_event_name"] == "PermissionRequest"
@@ -180,10 +196,22 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
     // is shown, or `content_hidden` already says the change is not.
     let (mut shown, covered, content_hidden) = match tool {
         "Bash" => (
-            text(field("command").map(str::to_owned)),
+            text(command_line(input)),
             Some(&["command", "description", "timeout", "run_in_background"][..]),
             false,
         ),
+        // Codex's edit: the files its patch names, never what it writes to them.
+        "apply_patch" => {
+            let files: Vec<String> = patch_files(input)
+                .iter()
+                .map(|(does, file)| format!("{does}: {file}"))
+                .collect();
+            (
+                text(Some(files.join("\n")).filter(|files| !files.is_empty())),
+                None,
+                true,
+            )
+        }
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => (
             text(field("file_path").or(field("notebook_path")).map(relative)),
             None,
@@ -259,6 +287,37 @@ fn display_line(tool: &str, input: &Value, cwd: &str) -> Display {
     }
 }
 
+/// A shell call's command: one string, or the words of one (Codex may send either).
+fn command_line(input: &Value) -> Option<String> {
+    match &input["command"] {
+        Value::String(command) => Some(command.clone()),
+        Value::Array(words) => Some(
+            words
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// What a Codex patch does to which file, one pair per header: (`Update File`, `src/a.rs`).
+fn patch_files(input: &Value) -> Vec<(&str, &str)> {
+    let patch = input.as_str().or_else(|| input["command"].as_str());
+    patch
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| {
+            let header = super::PATCH_HEADERS
+                .iter()
+                .find(|header| line.starts_with(**header))?;
+            let does = header.trim_start_matches("*** ").trim_end_matches(": ");
+            Some((does, line[header.len()..].trim()))
+        })
+        .collect()
+}
+
 /// The names of what is not shown, as they leave the machine: at most [`MAX_UNSHOWN`], each a
 /// short line with secrets redacted like the display's. Also returns how many were replaced.
 fn named(mut names: Vec<String>) -> (Vec<String>, usize) {
@@ -297,6 +356,16 @@ fn summary(tool: &str, input: &Value) -> String {
             "run a shell command".to_owned(),
             field("description").map(str::to_owned),
         ),
+        "apply_patch" => {
+            let names: Vec<&str> = patch_files(input)
+                .iter()
+                .filter_map(|(_, file)| Path::new(file).file_name()?.to_str())
+                .collect();
+            (
+                "change files".to_owned(),
+                Some(names.join(", ")).filter(|names| !names.is_empty()),
+            )
+        }
         "Edit" | "MultiEdit" => ("edit a file".to_owned(), file("file_path")),
         "NotebookEdit" => ("edit a notebook".to_owned(), file("notebook_path")),
         "Write" => ("write a file".to_owned(), file("file_path")),
@@ -808,11 +877,16 @@ impl Hub {
     }
 }
 
-fn bound() -> Duration {
+fn bound(agent: &str) -> Duration {
+    let bound = if holds_prompt(agent) {
+        HELD_BOUND
+    } else {
+        HOOK_BOUND
+    };
     std::env::var(BOUND_OVERRIDE)
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
-        .map_or(HOOK_BOUND, |ms| HOOK_BOUND.min(Duration::from_millis(ms)))
+        .map_or(bound, |ms| bound.min(Duration::from_millis(ms)))
 }
 
 fn parent() -> u32 {
@@ -834,13 +908,24 @@ fn parent_gone(started_under: u32) -> bool {
 /// Registers the prompt with the Hub and waits for the person's decision. Returns the decision
 /// to print, or `fallback` (the ordinary reply, with no decision) on any failure, timeout or
 /// when the session moved on.
-pub(super) async fn await_answer(payload: &Value, started: Instant, fallback: Value) -> Value {
-    run(payload, started).await.unwrap_or(fallback)
+pub(super) async fn await_answer(
+    agent: &str,
+    payload: &Value,
+    started: Instant,
+    fallback: Value,
+) -> Value {
+    run(agent, payload, started).await.unwrap_or(fallback)
 }
 
-async fn run(payload: &Value, started: Instant) -> Option<Value> {
+async fn run(agent: &str, payload: &Value, started: Instant) -> Option<Value> {
     let started_under = parent();
-    let routed = super::route_client("claude", payload).ok()?;
+    // Waiting would hide the prompt from a person at the computer: it is theirs at once, and
+    // also where the computer cannot say whether anyone is there.
+    let held = holds_prompt(agent);
+    if held && !presence::away().await {
+        return None;
+    }
+    let routed = super::route_client(agent, payload).ok()?;
     let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
     if token.is_empty() {
         return None;
@@ -869,6 +954,9 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         "takes_reason": true,
     });
     offer_fields(&offer, &mut body);
+    if held {
+        body["held"] = json!(true);
+    }
     if let Some(agent_id) = agent_id {
         body["agent_id"] = json!(agent_id);
     }
@@ -886,8 +974,9 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     let mut offer = offer;
     // A Hub from before choices and typed reasons refuses the fields it does not know. It can
     // still take a plain allow or deny, so it is offered the prompt without them. A question
-    // cannot be answered that way and is left to the session.
-    if matches!(reply, Some((400, _))) && offer.questions.is_empty() {
+    // cannot be answered that way and is left to the session. So is a held prompt: a Hub that
+    // does not know one would wait for a notice of it that never comes.
+    if matches!(reply, Some((400, _))) && offer.questions.is_empty() && !held {
         let fields = body.as_object_mut()?;
         fields.remove("takes_reason");
         fields.remove("choices");
@@ -895,8 +984,11 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         reply = hub.post("/v1/hub/permission/register", &body).await;
     }
     let (mut id, mut unconfirmed) = registered(reply, &hash)?;
+    if held && unconfirmed {
+        return None;
+    }
     let mut offered_again: Option<Instant> = None;
-    let until = started + bound();
+    let until = started + bound(agent);
     // Longer after each failure in a row, and never past the bound, so the hook ends on time.
     let pause = |tries: u32| {
         let wait = (RETRY_PAUSE * tries.max(1)).min(MAX_RETRY_PAUSE);
@@ -905,7 +997,14 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     let mut failures: u32 = 0;
     loop {
         let now = Instant::now();
-        if now >= until || parent_gone(started_under) {
+        if parent_gone(started_under) {
+            return None;
+        }
+        if now >= until {
+            // A held prompt goes back to the session before the host stops this hook.
+            if held {
+                return released(&hub, &id, &hash, &offer, payload).await;
+            }
             return None;
         }
         let mut wait = POLL_SECONDS.min(until.saturating_duration_since(now).as_secs());
@@ -918,7 +1017,19 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         }
         let poll = json!({"request_id": id, "input_hash": hash, "wait_seconds": wait});
         let asked = Instant::now();
-        match classify(hub.post("/v1/hub/permission/poll", &poll).await, &id, &hash) {
+        let polled = hub.post("/v1/hub/permission/poll", &poll);
+        let reply = if held {
+            tokio::select! {
+                reply = polled => reply,
+                // Someone is at the computer: the prompt is theirs again at once.
+                () = presence::returned() => {
+                    return released(&hub, &id, &hash, &offer, payload).await;
+                }
+            }
+        } else {
+            polled.await
+        };
+        match classify(reply, &id, &hash) {
             Step::Wait { unconfirmed: next } => {
                 failures = 0;
                 // A Hub with its poll slots full answers at once with nothing new; pause
@@ -940,7 +1051,7 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
             // The agent token ended while the prompt was up. The Hub keeps the request for the
             // same person's next token, so the hook goes on with the one this computer holds
             // now, and stops when that is the token the Hub just refused.
-            Step::Renew => hub.token = renewed(payload, &hub.token)?,
+            Step::Renew => hub.token = renewed(agent, payload, &hub.token)?,
             // A Hub that restarted keeps the session's wait and not the request. The same
             // prompt offered again, with the id this hook holds, is the same request while the
             // session still waits at it. Only a prompt the host confirmed is offered again.
@@ -958,9 +1069,29 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     }
 }
 
+/// Takes a held prompt back from the Hub, so its page stops offering what the session's own
+/// prompt now asks. An answer the person gave first still counts.
+async fn released(
+    hub: &Hub,
+    id: &str,
+    hash: &str,
+    offer: &Offer,
+    payload: &Value,
+) -> Option<Value> {
+    let release = json!({"request_id": id, "input_hash": hash, "release": true});
+    match classify(
+        hub.post("/v1/hub/permission/poll", &release).await,
+        id,
+        hash,
+    ) {
+        Step::Decide(answer) => decision_output(&answer, offer, payload),
+        _ => None,
+    }
+}
+
 /// The agent token this checkout holds now, when it is not `old`.
-fn renewed(payload: &Value, old: &str) -> Option<String> {
-    let routed = super::route_client("claude", payload).ok()?;
+fn renewed(agent: &str, payload: &Value, old: &str) -> Option<String> {
+    let routed = super::route_client(agent, payload).ok()?;
     let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
     (!token.is_empty() && token != old).then_some(token)
 }
@@ -974,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_only_to_claude_prompts_on_the_plugin_route_with_the_switch_not_off() {
+    fn applies_only_to_prompts_on_the_plugin_route_with_the_switch_not_off() {
         let prompt = json!({
             "hook_event_name": "PermissionRequest", "session_id": "s", "tool_name": "Bash",
         });
@@ -982,7 +1113,11 @@ mod tests {
         assert!(applies_with("claude", true, &prompt, Some("1")));
         assert!(!applies_with("claude", true, &prompt, Some("0")));
         assert!(!applies_with("claude", false, &prompt, None));
-        assert!(!applies_with("codex", true, &prompt, None));
+        // Codex's approval request is offered too; no other host's is.
+        assert!(applies_with("codex", true, &prompt, None));
+        assert!(!applies_with("codex", true, &prompt, Some("0")));
+        assert!(!applies_with("cursor", true, &prompt, None));
+        assert!(holds_prompt("codex") && !holds_prompt("claude"));
         // A subagent's prompt is offered only where the host asks its app while the hook waits.
         let mut subagent = prompt.clone();
         subagent["agent_id"] = json!("sub-1");
@@ -994,15 +1129,25 @@ mod tests {
             (Some(" "), false),
             (None, false),
         ] {
-            assert_eq!(asker_fits(&subagent, entrypoint), offered, "{entrypoint:?}");
+            assert_eq!(
+                asker_fits("claude", &subagent, entrypoint),
+                offered,
+                "{entrypoint:?}"
+            );
             // The lead's prompt is offered wherever the host runs.
-            assert!(asker_fits(&prompt, entrypoint), "{entrypoint:?}");
+            assert!(asker_fits("claude", &prompt, entrypoint), "{entrypoint:?}");
+            // Only Claude Code was measured for a subagent's prompt.
+            assert!(
+                !asker_fits("codex", &subagent, entrypoint),
+                "{entrypoint:?}"
+            );
+            assert!(asker_fits("codex", &prompt, entrypoint), "{entrypoint:?}");
         }
         // An empty id is the lead; an id the Hub would not take is nobody's prompt to offer.
         subagent["agent_id"] = json!("");
-        assert!(asker_fits(&subagent, Some("cli")));
+        assert!(asker_fits("claude", &subagent, Some("cli")));
         subagent["agent_id"] = json!("sub\n1");
-        assert!(!asker_fits(&subagent, Some("claude-desktop")));
+        assert!(!asker_fits("claude", &subagent, Some("claude-desktop")));
         let mut question = prompt.clone();
         question["tool_name"] = json!("AskUserQuestion");
         assert!(applies_with("claude", true, &question, None));
@@ -1039,6 +1184,26 @@ mod tests {
                 content_hidden: true,
                 ..Display::default()
             }
+        );
+        // Codex's patch shows the files it names, never what it writes to them, and its shell
+        // call may come as words.
+        let patch = json!({"command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-secret\n+x\n*** Add File: docs/b.md\n+secret\n*** End Patch"});
+        assert_eq!(
+            line("apply_patch", patch.clone()),
+            Display {
+                text: "Update File: src/a.rs\nAdd File: docs/b.md".into(),
+                content_hidden: true,
+                ..Display::default()
+            }
+        );
+        assert_eq!(summary("apply_patch", &patch), "change files: a.rs, b.md");
+        assert_eq!(
+            line("apply_patch", json!({"command": "no headers"})).unshown,
+            [WHOLE_INPUT]
+        );
+        assert_eq!(
+            line("Bash", json!({"command": ["bash", "-lc", "cargo publish"]})).text,
+            "bash -lc cargo publish"
         );
         let outside = line("Write", json!({"file_path": "/etc/hosts", "content": "x"}));
         assert_eq!(outside.text, "/etc/hosts");

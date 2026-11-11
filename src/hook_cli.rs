@@ -220,7 +220,7 @@ async fn hook(
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
     if permission::applies(agent, client_connection, &payload) {
-        return permission::await_answer(&payload, started, reply).await;
+        return permission::await_answer(agent, &payload, started, reply).await;
     }
     reply
 }
