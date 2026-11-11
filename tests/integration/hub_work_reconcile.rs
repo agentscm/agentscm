@@ -749,6 +749,42 @@ fn branch_inference(fixture: &StoreFixture) {
     assert!(out.link.is_none() && has(&out, "branch_pull_requests_multiple"));
 }
 
+fn status_stage(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    let setup_observations = agentscm::hub::onboarding::Observations::default();
+    let plain = branch_work(&ctx, "p", "src/p", "feature/p");
+    let open = branch_work(&ctx, "o", "src/o", "feature/o");
+    branch_pull(&mut ctx, 31, "feature/o", HEAD_A, REPOSITORY_ID);
+    let many = branch_work(&ctx, "m", "src/m", "feature/m");
+    branch_pull(&mut ctx, 32, "feature/m", HEAD_A, REPOSITORY_ID);
+    branch_pull(&mut ctx, 33, "feature/m", HEAD_B, REPOSITORY_ID);
+    let status = agentscm::hub::work_http::actionable_status::read(
+        &*ctx.store,
+        &setup_observations,
+        &ctx.principal,
+        unix_now(),
+    )
+    .unwrap();
+    let stage = |work: &WorkItem| {
+        let row = status.work.iter().find(|w| w.work_id == work.id).unwrap();
+        serde_json::to_value(row.stage.as_ref().unwrap()).unwrap()
+    };
+    assert_eq!(
+        stage(&plain),
+        json!({"stage": "working", "pull_request": null, "basis": null})
+    );
+    assert_eq!(
+        stage(&open),
+        json!({"stage": "pull_request_open", "pull_request": 31, "basis": "branch_observed"})
+    );
+    assert_eq!(stage(&many)["stage"], "unknown");
+}
+
+#[test]
+fn work_reconcile_status_stage() {
+    run_both(status_stage);
+}
+
 fn run_both(case: fn(&StoreFixture)) {
     case(&StoreFixture::sqlite());
     if let Some(fixture) = StoreFixture::postgres() {

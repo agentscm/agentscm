@@ -14,7 +14,7 @@
 //! blocker is not assessed. `reservation` carries the caller-chosen `holder_agent` and
 //! `holder_session` labels, which are untrusted text, as `/operational` does. The digest covers
 //! coverage, so it can change during a poll with no PR change.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -558,6 +558,107 @@ fn infer_branch_link(
     out
 }
 
+/// Same-repository pull-request observations, read once: open pull requests keyed by head
+/// branch, the numbers of all open ones, and the branches some open pull request targets.
+#[derive(Default)]
+struct OpenObservations {
+    by_branch: BTreeMap<String, Vec<(i64, String)>>,
+    open_numbers: BTreeSet<i64>,
+    base_refs: BTreeSet<String>,
+    truncated: bool,
+}
+
+fn read_open_observations(
+    store: &dyn Store,
+    principal: &Principal,
+) -> std::result::Result<OpenObservations, &'static str> {
+    let Ok(Some(repository)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return Err("observation_unavailable");
+    };
+    let Ok(rows) = store.observations(&repository.id, "pull_request") else {
+        return Err("observation_unavailable");
+    };
+    let mut out = OpenObservations {
+        truncated: rows.len() >= 1000,
+        ..OpenObservations::default()
+    };
+    for row in &rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.data) else {
+            continue;
+        };
+        if value["state"] != "open" {
+            continue;
+        }
+        if let Some(base) = value["base_ref"].as_str() {
+            out.base_refs.insert(base.to_owned());
+        }
+        let (Some(number), Some(repository_id), Some(head_repository_id)) = (
+            value["number"].as_i64().filter(|n| *n > 0),
+            value["repository_id"].as_i64(),
+            value["head_repository_id"].as_i64(),
+        ) else {
+            continue;
+        };
+        if row.key != number.to_string()
+            || principal
+                .repository_id
+                .is_some_and(|id| id != repository_id)
+        {
+            continue;
+        }
+        out.open_numbers.insert(number);
+        let head = value["head_sha"].as_str().unwrap_or_default();
+        if let Some(branch) = value["head_ref"].as_str()
+            && head_repository_id == repository_id
+            && matches!(head.len(), 40 | 64)
+            && head.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            out.by_branch
+                .entry(branch.to_owned())
+                .or_default()
+                .push((number, head.to_owned()));
+        }
+    }
+    Ok(out)
+}
+
+/// Infer a Work's link from the observations; no branch or no observation is no link.
+fn infer_from(
+    item: &WorkItem,
+    observed: &std::result::Result<OpenObservations, &'static str>,
+) -> BranchInference {
+    let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
+        return BranchInference::default();
+    };
+    let Ok(observed) = observed else {
+        return BranchInference {
+            limits: vec!["observation_unavailable"],
+            ..BranchInference::default()
+        };
+    };
+    let open = observed
+        .by_branch
+        .get(branch)
+        .map_or(&[][..], Vec::as_slice);
+    // One spot for a later phase to plug in the branch's merge rows.
+    let merges: &[BranchMerge] = &[];
+    let mut inference = infer_branch_link(
+        item.created_at,
+        open,
+        merges,
+        observed.base_refs.contains(branch),
+    );
+    if observed.truncated {
+        inference.limits.push("pr_observations_truncated");
+    }
+    inference
+}
+
 /// Infer the link of a Work with no explicit one from observed pull requests on its branch.
 fn infer_for_work(
     store: &dyn Store,
@@ -568,57 +669,164 @@ fn infer_for_work(
     let Ok(Some(item)) = store.work_get(&principal.token_id, work_id, now) else {
         return BranchInference::default();
     };
-    let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
+    if item.branch.as_deref().is_none_or(str::is_empty) {
         return BranchInference::default();
-    };
-    let unavailable = || BranchInference {
-        limits: vec!["observation_unavailable"],
-        ..BranchInference::default()
-    };
-    let Ok(Some(repository)) = super::sync::find_repository(
-        store,
-        &principal.owner.identity.host,
-        &principal.repository,
-        principal.repository_id,
-    ) else {
-        return unavailable();
-    };
-    let Ok(rows) = store.observations(&repository.id, "pull_request") else {
-        return unavailable();
-    };
-    let mut open = Vec::new();
-    let mut branch_is_base = false;
-    for row in &rows {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.data) else {
-            continue;
-        };
-        if value["state"] != "open" {
-            continue;
-        }
-        branch_is_base |= value["base_ref"] == branch;
-        let (Some(number), Some(repository_id), Some(head_repository_id)) = (
-            value["number"].as_i64().filter(|n| *n > 0),
-            value["repository_id"].as_i64(),
-            value["head_repository_id"].as_i64(),
-        ) else {
-            continue;
-        };
-        let head = value["head_sha"].as_str().unwrap_or_default();
-        if value["head_ref"] == branch
-            && row.key == number.to_string()
-            && head_repository_id == repository_id
-            && principal.repository_id.is_none_or(|id| id == repository_id)
-            && matches!(head.len(), 40 | 64)
-            && head.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            open.push((number, head.to_owned()));
+    }
+    infer_from(&item, &read_open_observations(store, principal))
+}
+
+/// A Work's stage as the status shows it: working, pull request open or merged, complete.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStage {
+    Working,
+    PullRequestOpen,
+    PullRequestMerged,
+    Complete,
+    /// Finished without completing: abandoned, superseded or unstated.
+    Ended,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkStageV1 {
+    pub stage: WorkStage,
+    #[serde(default)]
+    pub pull_request: Option<i64>,
+    #[serde(default)]
+    pub basis: Option<LinkBasis>,
+}
+
+impl WorkStageV1 {
+    fn bare(stage: WorkStage) -> Self {
+        Self {
+            stage,
+            pull_request: None,
+            basis: None,
         }
     }
-    let mut inference = infer_branch_link(item.created_at, &open, &[], branch_is_base);
-    if rows.len() >= 1000 {
-        inference.limits.push("pr_observations_truncated");
+}
+
+/// What is known of a Work's pull request link.
+enum StageLink {
+    /// Reading the explicit link failed: never infer over a link that might exist.
+    Unreadable,
+    Link(PrLinkV1),
+    /// No link; the inference's limits say whether that is certain.
+    None {
+        limited: bool,
+    },
+}
+
+/// The stage decision. `merged` and `open` are the exact merge lookup (`None` unavailable) and
+/// whether a same-repository open observation of the number exists.
+fn stage_for(
+    finished: Option<OutcomeValue>,
+    link: StageLink,
+    merged: impl FnOnce(i64) -> Option<bool>,
+    open: impl FnOnce(i64) -> bool,
+) -> WorkStageV1 {
+    match finished {
+        Some(OutcomeValue::Completed) => return WorkStageV1::bare(WorkStage::Complete),
+        Some(_) => return WorkStageV1::bare(WorkStage::Ended),
+        None => {}
     }
-    inference
+    let link = match link {
+        StageLink::Unreadable => return WorkStageV1::bare(WorkStage::Unknown),
+        StageLink::None { limited } => {
+            return WorkStageV1::bare(if limited {
+                WorkStage::Unknown
+            } else {
+                WorkStage::Working
+            });
+        }
+        StageLink::Link(link) => link,
+    };
+    let stage = match merged(link.number) {
+        Some(true) => WorkStage::PullRequestMerged,
+        Some(false) if open(link.number) => WorkStage::PullRequestOpen,
+        Some(false) | None => WorkStage::Unknown,
+    };
+    WorkStageV1 {
+        stage,
+        pull_request: Some(link.number),
+        basis: Some(link.basis),
+    }
+}
+
+/// The stage of each Work, with the limits found while reading. Each item is the Work and its
+/// outcome (`OutcomeValue::None` while unfinished). Observations are read once for all Work.
+pub(super) fn work_stages(
+    store: &dyn Store,
+    principal: &Principal,
+    reader: &WorkLifecycleReader<'_>,
+    items: &[(&WorkItem, OutcomeValue)],
+    now: i64,
+) -> (BTreeMap<String, WorkStageV1>, BTreeSet<String>) {
+    let mut limits = BTreeSet::new();
+    let mut stages = BTreeMap::new();
+    let scope = CatchupRepositoryScope {
+        provider: principal.owner.identity.provider.clone(),
+        host: principal.owner.identity.host.clone(),
+        repository: principal.repository.clone(),
+        repository_id: principal.repository_id,
+    };
+    let observed = if items
+        .iter()
+        .any(|(_, outcome)| *outcome == OutcomeValue::None)
+    {
+        read_open_observations(store, principal)
+    } else {
+        Ok(OpenObservations::default())
+    };
+    if let Err(limit) = &observed {
+        limits.insert((*limit).to_owned());
+    }
+    for (item, outcome) in items {
+        let finished = (*outcome != OutcomeValue::None).then_some(*outcome);
+        let link = if finished.is_some() {
+            StageLink::None { limited: false }
+        } else {
+            match store.work_pr_target_scoped(reader, &item.id, now) {
+                Ok(Some(target)) => StageLink::Link(PrLinkV1 {
+                    basis: LinkBasis::CallerReported,
+                    number: target.number,
+                    head_sha: target.head_sha,
+                }),
+                Ok(None) => {
+                    let inference = infer_from(item, &observed);
+                    limits.extend(inference.limits.iter().map(|l| (*l).to_owned()));
+                    match inference.link {
+                        Some(link) => StageLink::Link(link),
+                        None => StageLink::None {
+                            limited: !inference.limits.is_empty(),
+                        },
+                    }
+                }
+                Err(_) => {
+                    limits.insert("work_link_unavailable".to_owned());
+                    StageLink::Unreadable
+                }
+            }
+        };
+        let stage = stage_for(
+            finished,
+            link,
+            |number| {
+                store
+                    .catchup_merges_for_pull(&scope, number)
+                    .ok()
+                    .map(|merges| !merges.is_empty())
+            },
+            |number| {
+                observed
+                    .as_ref()
+                    .is_ok_and(|o| o.open_numbers.contains(&number))
+            },
+        );
+        stages.insert(item.id.clone(), stage);
+    }
+    (stages, limits)
 }
 
 #[derive(Default)]
@@ -831,6 +1039,73 @@ pub fn read(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage_decision() {
+        let link = |basis| {
+            StageLink::Link(PrLinkV1 {
+                basis,
+                number: 7,
+                head_sha: String::new(),
+            })
+        };
+        let stage = |finished, link, merged: Option<bool>, open: bool| {
+            stage_for(finished, link, |_| merged, |_| open)
+        };
+        let none = StageLink::None { limited: false };
+        assert_eq!(
+            stage(None, none, None, false),
+            WorkStageV1::bare(WorkStage::Working)
+        );
+        assert_eq!(
+            stage(None, StageLink::None { limited: true }, None, false).stage,
+            WorkStage::Unknown
+        );
+        assert_eq!(
+            stage(None, StageLink::Unreadable, None, false).stage,
+            WorkStage::Unknown
+        );
+        let open = stage(None, link(LinkBasis::BranchObserved), Some(false), true);
+        assert_eq!(
+            (open.stage, open.pull_request, open.basis),
+            (
+                WorkStage::PullRequestOpen,
+                Some(7),
+                Some(LinkBasis::BranchObserved)
+            )
+        );
+        assert_eq!(
+            stage(None, link(LinkBasis::CallerReported), Some(true), true).stage,
+            WorkStage::PullRequestMerged
+        );
+        // Neither merged nor observed open (closed or unseen), or no merge lookup: unknown.
+        let closed = stage(None, link(LinkBasis::CallerReported), Some(false), false);
+        assert_eq!(
+            (closed.stage, closed.pull_request),
+            (WorkStage::Unknown, Some(7))
+        );
+        assert_eq!(
+            stage(None, link(LinkBasis::CallerReported), None, true).stage,
+            WorkStage::Unknown
+        );
+        assert_eq!(
+            stage(
+                Some(OutcomeValue::Completed),
+                link(LinkBasis::CallerReported),
+                Some(true),
+                true
+            ),
+            WorkStageV1::bare(WorkStage::Complete)
+        );
+        assert_eq!(
+            stage(Some(OutcomeValue::Abandoned), none_link(), None, false).stage,
+            WorkStage::Ended
+        );
+    }
+
+    fn none_link() -> StageLink {
+        StageLink::None { limited: false }
+    }
+
     use super::super::work::{Checkpoint, ClaimStatus, WorkSource, WorkState};
     use super::super::work_lifecycle::{
         MergeStatus, OperationalFacts, OutcomeFact, OutcomeProvenance, RenewalCoverage,

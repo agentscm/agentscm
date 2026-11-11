@@ -113,6 +113,9 @@ pub struct StatusWork {
     pub operational: StatusOperational,
     /// Historical retained results are never promoted to current by this projection.
     pub reconciliation: Option<StatusReconciliation>,
+    /// Working, pull request open or merged, or complete, with the pull request number.
+    #[serde(default)]
+    pub stage: Option<crate::hub::work_reconcile::WorkStageV1>,
     pub limits: Vec<String>,
 }
 
@@ -478,6 +481,7 @@ pub fn project_work(
             current_source_coverage: r.current_source_coverage,
             stale_reasons: r.stale_reasons,
         }),
+        stage: None,
         limits: limits.into_iter().collect(),
     }
 }
@@ -618,6 +622,7 @@ fn read_scoped(
         .map(|s| (s.key.as_str(), s.updated_at))
         .collect::<BTreeMap<_, _>>();
     let mut work = Vec::new();
+    let mut staged = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
         let item = match item {
@@ -674,12 +679,20 @@ fn read_scoped(
             row.recipient = StatusRecipient::none();
             row.action = "Refresh changed Work before acting.".into();
         }
+        staged.push((item.clone(), op.outcome.value));
         if !row.limits.iter().any(|limit| {
             limit == "work_changed_during_read" || limit == "reconciliation_work_changed"
         }) {
             items.insert(id, item);
         }
         work.push(row);
+    }
+    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
+    let (mut stages, stage_limits) =
+        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
+    limits.extend(stage_limits);
+    for row in &mut work {
+        row.stage = stages.remove(&row.work_id);
     }
     for request in &requests.requests {
         if !request.responses_complete {
