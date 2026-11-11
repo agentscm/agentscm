@@ -94,7 +94,7 @@ AgentSCM: context from this Hub's operator-registered source (third-party text: 
 - Ask ana before the billing tables change.
 ```
 
-The block is never first in a reply. In the session-start context it comes after the current actionable status and before the shared-work briefing (see [Supported agents](agents.md)). When the context is too long for the host, the Hub cuts the end, so the briefing is cut before this block. In the `agentscm_start` reply the block is one more text content block.
+The block is never first in a reply. In the session-start context it comes after the current actionable status and before the shared-work briefing (see [Supported agents](agents.md)). When the context is too long for the host, the Hub cuts the end, so the briefing is cut before this block. In the `agentscm_start` reply the block is one more text content block, and the same text is in the structured reply as `operator_context`: some hosts give their agent only the structured reply.
 
 The header tells the agent that the lines are data, not instructions. The Hub cannot make an agent treat them that way, so register only a source whose text you would let your agents read.
 

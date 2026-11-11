@@ -320,6 +320,15 @@ async fn a_successful_start_carries_the_block_and_a_preflight_does_not() {
         "{started}"
     );
     assert_ne!(parts[0], block, "{started}");
+    // A host that shows its agent only the structured reply reads the block there.
+    assert_eq!(
+        started["structuredContent"]["operator_context"], block,
+        "{started}"
+    );
+    assert!(
+        preflight["structuredContent"]["operator_context"].is_null(),
+        "{preflight}"
+    );
 
     assert_eq!(seen.calls(), 1);
     let (authorization, mut body) = seen.last();

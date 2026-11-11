@@ -1850,6 +1850,78 @@ fn concurrent_deliveries_and_acks_are_monotonic_and_retryable(db: &Db) {
     }
 }
 
+fn a_reader_past_the_floor_is_not_ended_by_later_compactions(db: &Db) {
+    let store = db.open();
+    let lead = agent(&*store, 1);
+    let now = unix_now();
+    let old = now - 200_000;
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let started = store
+        .work_start(
+            &lead.token,
+            &native_start("floor", "Floor work", "floor-session"),
+            old,
+        )
+        .unwrap()
+        .item;
+    let mut seq = started.updated_seq;
+    let mut progress = |id: &str, at: i64| {
+        let mut request = checkpoint(
+            &started.id,
+            id,
+            1,
+            "floor-session",
+            CheckpointKind::Progress,
+            id,
+        );
+        request.expected_updated_seq = Some(seq);
+        seq = store
+            .work_checkpoint(&lead.token, &request, at)
+            .unwrap()
+            .item
+            .updated_seq;
+    };
+    progress("first", old + 10);
+    progress("second", old + 100);
+    progress("third", old + 200);
+    progress("fourth", now - 10);
+    // The first pass raises the floor; then a reader whose cursor is still at 0, below it, reads
+    // its whole delivery and is told of the gap.
+    let first = store.work_compact(&scope, old + 50, true, now).unwrap();
+    assert!(first.applied);
+    let read = store
+        .work_briefing(&lead.token, &BriefingQuery::default(), now)
+        .unwrap();
+    assert!(read.complete);
+    assert!(
+        read.retention_gap,
+        "the reader learns its cursor is below the floor"
+    );
+    // Two later passes raise the floor again. Its window still starts at 0, but it read past each
+    // floor, so it is not ended and can be acknowledged.
+    let mut floor = first.retention_floor;
+    for before in [old + 150, old + 250] {
+        let pass = store.work_compact(&scope, before, true, now).unwrap();
+        assert!(pass.applied);
+        assert!(pass.retention_floor > floor, "each pass raises the floor");
+        floor = pass.retention_floor;
+    }
+    store
+        .work_ack(
+            &lead.token,
+            &BriefingAck {
+                delivery: read.delivery.unwrap(),
+            },
+            now,
+        )
+        .unwrap();
+}
+
 fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     let store = db.open();
     let lead = agent(&*store, 1);
@@ -1953,10 +2025,17 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
         repository_id: Some(REPOSITORY_ID),
     };
     let open = store
-        .work_briefing(&lead.token, &BriefingQuery::default(), now)
+        .work_briefing(
+            &lead.token,
+            &BriefingQuery {
+                limit: 1,
+                ..BriefingQuery::default()
+            },
+            now,
+        )
         .unwrap();
-    assert!(open.complete);
-    // An open delivery no longer blocks compaction; the delivery it cuts is ended below.
+    assert!(!open.complete);
+    // An open delivery no longer blocks compaction; this half-read one is ended below.
     let open_delivery = open.delivery.unwrap();
 
     let preview = store
@@ -1979,7 +2058,7 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     assert_eq!(compacted.deleted_operations, 1);
     assert_eq!(compacted.deleted_versions, 1);
     assert_eq!(compacted.retention_floor, baseline.receipt.event_seq);
-    // Its window started below the raised floor, so acknowledging it now fails.
+    // It has unread records below the raised floor, so acknowledging it now fails.
     assert_invalid(
         store.work_ack(
             &lead.token,
@@ -2545,6 +2624,7 @@ conformance!(
     forge_issue_ids_are_canonical_positive_decimals,
     concurrent_deliveries_and_acks_are_monotonic_and_retryable,
     compaction_preserves_baselines_and_expires_old_receipts,
+    a_reader_past_the_floor_is_not_ended_by_later_compactions,
     checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline,
     compaction_delete_exception_is_exact_and_updates_remain_prohibited,
     postgres_read_briefings_share_the_repository_maintenance_lock,
