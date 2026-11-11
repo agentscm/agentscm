@@ -61,7 +61,8 @@ function mount(file: string, tool: string) {
       message({ source: parent, data: { jsonrpc: '2.0', id, error: { code: -1, message: 'x' } } })
       await vi.advanceTimersByTimeAsync(0)
     },
-    push: (data: Data) => message({ source: parent, data: { jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: data } } }),
+    result: (result: Data) => message({ source: parent, data: { jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: result } }),
+    push: (data: Data) => host.result({ structuredContent: data }),
     hide: async (value: boolean) => {
       hidden = value
       listeners.visibilitychange?.()
@@ -81,14 +82,6 @@ function mount(file: string, tool: string) {
 
 const item = (over: Data) => ({ id: 'wrk_a', title: 'Task', state: 'active', claim_status: 'active', last_checkin_at: now - 60, lead_agent: 'claude-code', owner_login: 'maria', repository: 'acme/widgets', ...over })
 const overview = (current: Data[]) => ({ actionable_status: { ...statusFixture, counts: { ...statusFixture.counts, active: current.filter((w) => w.state === 'active').length, needs_you: current.filter((w) => w.state === 'blocked').length }, actions: [], work: current.map((w) => ({ ...statusFixture.work[0], title: w.title, state: w.state, needs_you: w.state === 'blocked' })) } })
-const request = (id: string, status: string) => ({
-  id, status, updated_at: now - 120, proposal: { title: id }, requester: { agent: 'a' },
-  targets: [{ lead: { agent: 'b' }, reasons: [{ your_path: 'p1' }], reasons_complete: true }],
-  acknowledgements: [{ agent: { agent: 'b' }, target_work_id: 'w', acknowledged_at: now - 60 }], acknowledgements_complete: true,
-  responses: [{ responder: { agent: 'b' }, kind: 'join', note: 'On it', created_at: now - 30 }], responses_complete: true,
-})
-const inbox = (requests: Data[], over: Data = {}) => ({ requests, complete: true, ...over })
-
 const views = [
   {
     name: 'work overview', file: 'work-overview.html', tool: 'agentscm_work_overview', fold: 'All work', args: { detail: 'full' },
@@ -96,12 +89,7 @@ const views = [
     after: overview([item({}), item({ id: 'wrk_b', title: 'Stuck', state: 'blocked', blocker: { summary: 'needs api' } })]),
     said: '1 action needs you',
   },
-  {
-    name: 'coordination inbox', file: 'coordination-inbox.html', tool: 'agentscm_coordination_inbox', fold: 'Receipts', args: {},
-    before: inbox([request('crq_1', 'pending')]),
-    after: inbox([request('crq_1', 'responded')]),
-    said: '1 replied',
-  },
+
 ]
 
 describe('MCP views auto-refresh', () => {
@@ -239,21 +227,70 @@ describe('MCP views auto-refresh', () => {
     expect(read(v.file)).not.toMatch(/ui\/message|ui\/update-model-context/)
   })
 
-  it('inbox refreshes the page the person is on, and Refresh returns to the first page', async () => {
-    const v = views[1]!
-    const host = mount(v.file, v.tool)
-    host.push(inbox([request('crq_1', 'pending')], { complete: false, next_after: 5, through: 9 }))
-    Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Next page')!.click()
-    expect(host.calls()[0]!.params!.arguments).toEqual({ after: 5, through: 9 })
-    await host.answer(inbox([request('crq_2', 'pending')]))
-    expect(host.root.textContent).toContain('Showing a later page')
-
-    await host.wait(30_000)
-    expect(host.calls()[1]!.params!.arguments).toEqual({ after: 5, through: 9 })
-    await host.answer(inbox([request('crq_2', 'responded')]))
-    expect(host.root.textContent).toContain('Showing a later page')
-
+  it('distinguishes loading, a rejected first result and empty success', async () => {
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    expect(host.root.textContent).toContain('Loading work overview…')
+    const text = 'Rejected <img src=x onerror=alert(1)> argument'
+    host.result({ isError: true, content: [{ type: 'text', text }] })
+    expect(host.root.textContent).toContain(text)
+    expect(host.root.textContent).toContain('Unavailable')
+    expect(host.root.querySelector('img')).toBeNull()
+    expect(host.root.textContent).not.toMatch(/Loading work overview|No data returned|No current work/)
     host.refreshButton().click()
-    expect(host.calls()[2]!.params!.arguments).toEqual({})
+    await host.answer({ actionable_status: { ...statusFixture, complete: true, work: [], actions: [], counts: { active: 0, needs_you: 0, awaiting_party: 0, blocked: 0, reassessment_needed: 0, held_reservations: 0 } } })
+    expect(host.root.textContent).toContain('No current work in this overview.')
+    expect(host.root.textContent).not.toContain(text)
+  })
+
+  it('shows a first RPC error and retries using the data-only tool', async () => {
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    host.refreshButton().click()
+    await host.reject()
+    expect(host.root.textContent).toContain('Unavailable')
+    expect(host.root.textContent).toContain('x')
+    expect(host.root.textContent).not.toContain('Showing data from')
+    await host.wait(60_000)
+    expect(host.calls()).toHaveLength(2)
+    expect(host.calls()[1]!.params).toEqual({ name: 'agentscm_work_overview', arguments: { detail: 'full' } })
+    await host.answer(views[0]!.before)
+    expect(host.root.textContent).not.toContain('Unavailable')
+  })
+
+  it('preserves the last success and error text after a failed notification, then recovers', () => {
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    host.push(views[0]!.before)
+    host.result({ isError: true, content: [{ type: 'text', text: 'Read refused' }] })
+    expect(host.root.textContent).toMatch(/Showing data from \d\d:\d\d:\d\d/)
+    expect(host.root.textContent).toContain('Read refused')
+    expect(host.root.textContent).toContain('Task')
+    host.push(views[0]!.after)
+    expect(host.root.textContent).not.toContain('Read refused')
+    expect(host.root.textContent).not.toContain('Could not refresh')
+  })
+
+  it('keeps the last rendered data and timestamp when nested refresh data is malformed', async () => {
+    vi.setSystemTime(new Date(2026, 0, 1, 12, 0, 0))
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    host.push(views[0]!.before)
+    const summary = host.root.querySelector('.big')!.textContent
+    await host.wait(5_000)
+    host.refreshButton().click()
+    await host.answer({ actionable_status: { ...statusFixture, counts: { ...statusFixture.counts, active: 99 }, actions: [null] } })
+    expect(host.root.querySelector('.big')!.textContent).toBe(summary)
+    expect(host.root.textContent).toContain('Showing data from 12:00:00')
+    expect(host.root.textContent).toContain('Task')
+    host.refreshButton().click()
+    await host.answer(views[0]!.after)
+    expect(host.root.textContent).toContain('Stuck')
+    expect(host.root.textContent).not.toContain('Could not refresh')
+  })
+
+  it('treats malformed results as errors, never empty work', () => {
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    host.result({ content: [{ type: 'text', text: 'not JSON' }] })
+    expect(host.root.textContent).toContain('incomplete work overview')
+    host.result({ structuredContent: { actionable_status: { work: [null], counts: {} } } })
+    expect(host.root.textContent).toContain('incomplete work overview')
+    expect(host.root.textContent).not.toContain('No current work')
   })
 })

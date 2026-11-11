@@ -15,8 +15,7 @@ const unavailable = (status?: number): { title: string; body: string } =>
   : { title: 'Could not load this setting', body: 'The hub did not answer properly. Retry in a moment.' }
 const FIELDS: { id: string; field: keyof ViewSettings; label: string; hint: string; child: boolean }[] = [
   { id: 'master', field: 'enabled', label: 'Show views in agent apps', hint: 'Turns inline views on or off everywhere.', child: false },
-  { id: 'work', field: 'work_overview', label: 'Work overview', hint: 'Who is working on what, as a card.', child: true },
-  { id: 'inbox', field: 'coordination_inbox', label: 'Coordination inbox', hint: 'Requests waiting for an answer, as a card.', child: true },
+  { id: 'work', field: 'work_overview', label: 'Work overview', hint: 'Work overview and value metrics cards, when requested.', child: true },
 ]
 
 /** Per-user views. Reading needs the status-page token; any signed-in member changes their own, an administrator the hub default. */
@@ -71,7 +70,7 @@ export function ViewSettingsBox({ token }: { token: string }) {
   })
   const settled = session.kind !== 'loading'
   return (
-    <Box id="view-settings" icon="window-stack" title="Inline agent views" tone="warn" explain="Shared with everyone on this hub. Where an agent app supports it, the work overview and coordination inbox appear as cards in the conversation. Off keeps plain text answers.">
+    <Box id="view-settings" icon="window-stack" title="Inline agent views" tone="warn" explain="Where an agent app supports it, ask to see the work overview to open a card. Agent reads stay in plain text. These switches also control value metrics cards.">
       {load.kind === 'loading' && <Skeleton rows={3} />}
       {load.kind === 'error' && <Notice title={unavailable(load.status).title} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>{unavailable(load.status).body}</Notice>}
       {load.kind === 'ready' && load.refreshError && <Notice title="Showing the last value. The latest refresh failed.">The hub did not answer; this page tries again.</Notice>}

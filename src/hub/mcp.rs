@@ -119,10 +119,8 @@ const HOOKED: &str = "Edits are checked automatically by hooks in this session; 
 const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
 const UI_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_URI: &str = "ui://agentscm/work-overview";
-const INBOX_URI: &str = "ui://agentscm/coordination-inbox";
 const VALUE_URI: &str = "ui://agentscm/value-metrics";
 const OVERVIEW_HTML: &str = include_str!("mcp_views/work-overview.html");
-const INBOX_HTML: &str = include_str!("mcp_views/coordination-inbox.html");
 const VALUE_HTML: &str = include_str!("mcp_views/value-metrics.html");
 
 #[path = "contribution_receipt.rs"]
@@ -244,7 +242,6 @@ struct ViewSettingsArgs {
     reset: Option<bool>,
     enabled: Option<bool>,
     work_overview: Option<bool>,
-    coordination_inbox: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +568,7 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_briefing_pending"
                     | "agentscm_work_preflight"
                     | "agentscm_work_overview"
+                    | "agentscm_show_overview"
                     | "agentscm_work_intent"
                     | "agentscm_work_insight"
                     | "agentscm_work_insights"
@@ -617,9 +615,6 @@ fn views(settings: &ViewSettings) -> Vec<(&'static str, &'static str)> {
     if settings.enabled && settings.work_overview {
         views.push((OVERVIEW_URI, OVERVIEW_HTML));
         views.push((VALUE_URI, VALUE_HTML));
-    }
-    if settings.enabled && settings.coordination_inbox {
-        views.push((INBOX_URI, INBOX_HTML));
     }
     views
 }
@@ -852,7 +847,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "preflight": source_preflight_schema.clone()
          }), &["task"])}
     );
-    let mut overview = json!({"name": "agentscm_work_overview",
+    let overview = json!({"name": "agentscm_work_overview",
         "description": "Read before planning: ongoing assignments, outcomes from the last 24 hours and declared scope overlaps. Pure read; check its completeness flags. A path overlap is not proof of a Git conflict.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"recent_since": {"type": "integer", "minimum": 0},
@@ -1003,18 +998,19 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             "branch": {"type": "string"}, "pull_request": {"type": "integer", "minimum": 1},
             "detail": {"type": "object", "description": "command, exit_code, findings [{id, blocking, summary}], resolved [ids], dismissed [{id, reason}], label, method."},
             "session": session}), &["repo", "skill", "gate", "kind", "head_sha", "summary", "branch"])});
-    let mut inbox = json!({"name": "agentscm_coordination_inbox",
+    let inbox = json!({"name": "agentscm_coordination_inbox",
         "description": "Read durable coordination requests addressed to your session, including affected work, path overlaps and replies. Requests remain pending until explicit acknowledgement and response. On reconnect read a fresh inbox, then page the fixed watermark. Reading does not acknowledge delivery.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"session": session,
             "after": {"type": "integer", "minimum": 0}, "through": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
             "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 0}}), &[])});
+    let mut show_overview = json!({"name": "agentscm_show_overview",
+        "description": "Show the full work overview only when the person asks to see it. Use agentscm_work_overview for agent reads. Views obey your settings.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({}), &[])});
     if settings.enabled && settings.work_overview {
-        overview["_meta"] = json!({"ui": {"resourceUri": OVERVIEW_URI}});
-    }
-    if settings.enabled && settings.coordination_inbox {
-        inbox["_meta"] = json!({"ui": {"resourceUri": INBOX_URI}});
+        show_overview["_meta"] = json!({"ui": {"resourceUri": OVERVIEW_URI}});
     }
     let coordination_mutations = json!([
         {"name":"agentscm_coordination_ack", "description":"Acknowledge that this session received a specific coordination request version. This is a receipt, not agreement or resolution. Omit target_work_id to acknowledge a response as the requester.",
@@ -1052,6 +1048,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             recovery,
             recovery_preview,
             overview,
+            show_overview,
             briefing,
             catchup,
             catchup_ack,
@@ -1248,6 +1245,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "session": session}), &["path", "accept"])},
         status,
         overview,
+        show_overview,
         briefing,
         catchup,
         catchup_ack,
@@ -1303,12 +1301,11 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
              "session": session}), &["id", "status", "session"])},
         {"name": "agentscm_view_settings",
-         "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
+         "description": "Read or change your inline work and value-metrics views. Your choices override the Hub default for your agents only. Omit arguments to read effective, hub_default and override.",
          "inputSchema": schema(json!({
              "reset": {"type": "boolean", "description": "Clear your own choices and follow the hub default."},
              "enabled": {"type": "boolean", "description": "Master switch for all inline views."},
-             "work_overview": {"type": "boolean"},
-             "coordination_inbox": {"type": "boolean"}}), &[])},
+             "work_overview": {"type": "boolean"}}), &[])},
     ]);
     if let (Some(tools), Some(mutations)) =
         (listed.as_array_mut(), coordination_mutations.as_array())
@@ -1759,12 +1756,14 @@ async fn call(
     }
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or("");
     // Enrichment is compact unless the call asked for every field.
-    let full = params.is_some_and(|p| p["arguments"]["detail"] == "full");
+    let full = name == "agentscm_show_overview"
+        || params.is_some_and(|p| p["arguments"]["detail"] == "full");
     if value["isError"] != true
         && matches!(
             name,
             "agentscm_start"
                 | "agentscm_work_overview"
+                | "agentscm_show_overview"
                 | "agentscm_work_briefing"
                 | "agentscm_work_catchup"
                 | "agentscm_briefing_read"
@@ -1797,19 +1796,14 @@ async fn call(
     .await;
     if matches!(
         name,
-        "agentscm_work_overview" | "agentscm_coordination_inbox"
+        "agentscm_work_overview" | "agentscm_coordination_inbox" | "agentscm_show_overview"
     ) {
         let store = state.store.clone();
         let owner = principal.owner.id.clone();
         let settings = blocking(state, move || ViewSettings::effective(&*store, &owner))
             .await
             .unwrap_or_default();
-        let on = settings.enabled
-            && if name == "agentscm_work_overview" {
-                settings.work_overview
-            } else {
-                settings.coordination_inbox
-            };
+        let on = settings.enabled && settings.work_overview;
         let hint = if on {
             "Inline views: on (your setting). Change with agentscm_view_settings."
         } else {
@@ -2299,6 +2293,7 @@ async fn call_inner(
             | "agentscm_briefing_submit"
             | "agentscm_work_preflight"
             | "agentscm_work_overview"
+            | "agentscm_show_overview"
             | "agentscm_work_intent"
             | "agentscm_work_insight"
             | "agentscm_work_insights"
@@ -2532,7 +2527,6 @@ async fn call_inner(
                 let change_set = ViewOverride {
                     enabled: change.enabled,
                     work_overview: change.work_overview,
-                    coordination_inbox: change.coordination_inbox,
                 };
                 if change.reset == Some(true) || change_set != ViewOverride::default() {
                     let current = ViewSettings::load_override(&*store, &owner)?.unwrap_or_default();
@@ -2573,10 +2567,23 @@ async fn call_inner(
             },
         );
     }
-    if name == "agentscm_work_overview" {
-        let args = match try_args::<OverviewArgs>(arguments) {
-            Ok(value) => value,
-            Err(error) => return Ok(invalid_args(name, &error)),
+    if matches!(name, "agentscm_work_overview" | "agentscm_show_overview") {
+        let args = if name == "agentscm_show_overview" {
+            if let Err(error) = try_args::<EmptyArgs>(arguments) {
+                return Ok(invalid_args(name, &error));
+            }
+            OverviewArgs {
+                recent_since: None,
+                limit: None,
+                detail: Detail::Full,
+                after: None,
+                recent_before: None,
+            }
+        } else {
+            match try_args::<OverviewArgs>(arguments) {
+                Ok(value) => value,
+                Err(error) => return Ok(invalid_args(name, &error)),
+            }
         };
         if args
             .limit

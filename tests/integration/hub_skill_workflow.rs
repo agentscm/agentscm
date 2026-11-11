@@ -406,6 +406,7 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
             "agentscm_promises_list",
             "agentscm_publications_list",
             "agentscm_shared_conversation",
+            "agentscm_show_overview",
             "agentscm_skill_list",
             "agentscm_skill_status",
             "agentscm_value_metrics",

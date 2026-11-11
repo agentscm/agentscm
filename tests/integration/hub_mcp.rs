@@ -659,6 +659,7 @@ async fn protocol_basics() {
             "agentscm_handoff",
             "agentscm_work_status",
             "agentscm_work_overview",
+            "agentscm_show_overview",
             "agentscm_work_briefing",
             "agentscm_work_catchup",
             "agentscm_work_catchup_ack",
@@ -2341,11 +2342,7 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
     assert_eq!(
         with_meta,
         [
-            ("agentscm_work_overview", "ui://agentscm/work-overview"),
-            (
-                "agentscm_coordination_inbox",
-                "ui://agentscm/coordination-inbox"
-            ),
+            ("agentscm_show_overview", "ui://agentscm/work-overview"),
             ("agentscm_value_metrics", "ui://agentscm/value-metrics")
         ]
     );
@@ -2362,11 +2359,7 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         .collect();
     assert_eq!(
         uris,
-        [
-            "ui://agentscm/work-overview",
-            "ui://agentscm/value-metrics",
-            "ui://agentscm/coordination-inbox"
-        ]
+        ["ui://agentscm/work-overview", "ui://agentscm/value-metrics"]
     );
     let read = hub
         .rpc(
@@ -2385,6 +2378,39 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
             || content["text"].as_str().unwrap().contains("<!doctype")
     );
 
+    let gone = hub
+        .rpc(
+            &secret,
+            &rpc_body(
+                "resources/read",
+                json!({"uri":"ui://agentscm/coordination-inbox"}),
+            ),
+        )
+        .await
+        .json();
+    assert_eq!(gone["error"]["code"], -32602);
+    for route in ["/mcp", "/mcp?tools=all"] {
+        let list = hub
+            .rpc_at(route, &secret, &rpc_body("tools/list", json!({})))
+            .await
+            .json();
+        for name in ["agentscm_work_overview", "agentscm_coordination_inbox"] {
+            let tool = list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(tool.get("_meta").is_none(), "{name} mounts no view");
+        }
+    }
+    let shown = hub
+        .tool_result(&secret, "agentscm_show_overview", json!({}))
+        .await;
+    assert_eq!(shown["isError"], false);
+    assert!(shown["structuredContent"]["current"].is_array());
+    assert!(shown["structuredContent"]["actionable_status"]["work"].is_array());
+    assert!(shown["structuredContent"].get("agent_briefing").is_none());
     let overview = hub
         .tool_result(&secret, "agentscm_work_overview", json!({}))
         .await;
@@ -2413,8 +2439,8 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
     assert_eq!(
         http.json(),
         json!({
-            "effective": {"enabled": true, "work_overview": true, "coordination_inbox": true},
-            "hub_default": {"enabled": true, "work_overview": true, "coordination_inbox": true},
+            "effective": {"enabled": true, "work_overview": true},
+            "hub_default": {"enabled": true, "work_overview": true},
             "override": null
         })
     );
@@ -2434,6 +2460,32 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
     let (_, reader, _) =
         mint_bound_agent_token(&*hub.store, &user.id, "reader", REPO, 1, 600, true).unwrap();
     let reader = reader.expose().to_owned();
+    let tools = hub
+        .rpc(&reader, &rpc_body("tools/list", json!({})))
+        .await
+        .json();
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "agentscm_show_overview"
+                && tool["_meta"]["ui"]["resourceUri"] == "ui://agentscm/work-overview")
+    );
+    for name in ["agentscm_work_overview", "agentscm_coordination_inbox"] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert!(tool.get("_meta").is_none());
+    }
+    let shown = hub
+        .tool_result(&reader, "agentscm_show_overview", json!({}))
+        .await;
+    assert_eq!(shown["isError"], false);
+    assert!(shown["structuredContent"]["actionable_status"]["work"].is_array());
     let read = hub
         .rpc(&reader, &rpc_body("resources/list", json!({})))
         .await;
@@ -2457,11 +2509,11 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         .tool_result(
             &secret,
             "agentscm_view_settings",
-            json!({"coordination_inbox": false}),
+            json!({"work_overview": false}),
         )
         .await;
     assert_eq!(
-        changed["structuredContent"]["effective"]["coordination_inbox"],
+        changed["structuredContent"]["effective"]["work_overview"],
         false
     );
     let list = hub
@@ -2474,9 +2526,17 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         .iter()
         .map(|resource| resource["uri"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        remaining_uris,
-        ["ui://agentscm/work-overview", "ui://agentscm/value-metrics"]
+    assert!(remaining_uris.is_empty());
+    let tools = hub
+        .rpc(&secret, &rpc_body("tools/list", json!({})))
+        .await
+        .json();
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("_meta").is_none())
     );
     let off = hub
         .tool_result(&secret, "agentscm_view_settings", json!({"enabled": false}))
@@ -2538,6 +2598,81 @@ async fn resources(hub: &Hub, secret: &str) -> usize {
 }
 
 #[tokio::test]
+async fn legacy_inbox_view_settings_preserve_other_switches() {
+    use agentscm::hub::view_settings::{ViewOverride, ViewSettings};
+    let hub = Hub::start().await;
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 23,
+            },
+            "settings-owner",
+        )
+        .unwrap();
+    for inbox in [json!(false), json!(true), Value::Null] {
+        hub.store
+            .set_setting(
+                "mcp_views",
+                &json!({
+                    "enabled": false, "work_overview": false, "coordination_inbox": inbox
+                })
+                .to_string(),
+                "test",
+            )
+            .unwrap();
+        let base = ViewSettings::load(&*hub.store).unwrap();
+        assert!(!base.enabled);
+        assert!(!base.work_overview);
+        ViewSettings::save(&*hub.store, &base, "test").unwrap();
+        let saved: Value =
+            serde_json::from_str(&hub.store.get_setting("mcp_views").unwrap().unwrap()).unwrap();
+        assert_eq!(saved, json!({"enabled":false,"work_overview":false}));
+
+        let key = format!("mcp_views:{}", owner.id);
+        hub.store
+            .set_setting(
+                &key,
+                &json!({
+                    "enabled": false, "work_overview": null, "coordination_inbox": inbox
+                })
+                .to_string(),
+                "test",
+            )
+            .unwrap();
+        let choices = ViewSettings::load_override(&*hub.store, &owner.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            choices,
+            ViewOverride {
+                enabled: Some(false),
+                work_overview: None
+            }
+        );
+        assert!(
+            !ViewSettings::effective(&*hub.store, &owner.id)
+                .unwrap()
+                .enabled
+        );
+        ViewSettings::save_override(&*hub.store, &owner.id, &choices).unwrap();
+        let saved: Value =
+            serde_json::from_str(&hub.store.get_setting(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(saved, json!({"enabled":false,"work_overview":null}));
+    }
+    // Retiring one known field must not relax active API decoding or unrelated fields.
+    assert!(
+        serde_json::from_value::<ViewSettings>(
+            json!({"enabled":false,"work_overview":false,"coordination_inbox":true})
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_value::<ViewOverride>(json!({"unknown":false})).is_err());
+}
+
+#[tokio::test]
 async fn view_settings_are_per_user_over_a_hub_default() {
     use agentscm::hub::view_settings::ViewSettings;
     let hub = Hub::start().await;
@@ -2556,7 +2691,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
     assert_eq!(on["structuredContent"]["effective"]["enabled"], true);
     assert_eq!(on["structuredContent"]["hub_default"]["enabled"], false);
     assert_eq!(on["structuredContent"]["override"]["enabled"], true);
-    assert_eq!(resources(&hub, &a).await, 3);
+    assert_eq!(resources(&hub, &a).await, 2);
     assert_eq!(resources(&hub, &b).await, 0);
 
     // Partial updates merge; a user's off beats a default that is on.
@@ -2569,8 +2704,8 @@ async fn view_settings_are_per_user_over_a_hub_default() {
         )
         .await;
     assert_eq!(merged["structuredContent"]["override"]["enabled"], true);
-    assert_eq!(resources(&hub, &a).await, 1);
-    assert_eq!(resources(&hub, &b).await, 3);
+    assert_eq!(resources(&hub, &a).await, 0);
+    assert_eq!(resources(&hub, &b).await, 2);
     let tools = hub.rpc(&b, &rpc_body("tools/list", json!({}))).await.json();
     assert!(
         tools["result"]["tools"]
@@ -2585,7 +2720,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
         .tool_result(&a, "agentscm_view_settings", json!({"reset": true}))
         .await;
     assert_eq!(reset["structuredContent"]["override"], Value::Null);
-    assert_eq!(resources(&hub, &a).await, 3);
+    assert_eq!(resources(&hub, &a).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2960,7 +3095,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 45] = [
+    const CORE: [&str; 46] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -2977,6 +3112,7 @@ async fn default_tool_list_cost() {
         "agentscm_hub_message",
         "agentscm_pr_context",
         "agentscm_setup_status",
+        "agentscm_show_overview",
         "agentscm_start",
         "agentscm_status",
         "agentscm_value_metrics",
@@ -3076,7 +3212,6 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         include_str!("../../src/hub/onboarding.rs"),
         include_str!("../../src/hub/narrative.rs"),
         include_str!("../../src/hub/mcp_views/work-overview.html"),
-        include_str!("../../src/hub/mcp_views/coordination-inbox.html"),
         include_str!("../../src/hub/mcp_views/value-metrics.html"),
         include_str!("../../skills/intent-review/SKILL.md"),
         include_str!("../../skills/native-workflow/SKILL.md"),

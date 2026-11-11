@@ -233,12 +233,12 @@ export async function fetchSkillWorkflows(token: string, signal: AbortSignal, be
 
 const viewSettings = (v: unknown): ViewSettings => {
   const j = rec(v)
-  return { enabled: j['enabled'] === true, work_overview: j['work_overview'] === true, coordination_inbox: j['coordination_inbox'] === true }
+  return { enabled: j['enabled'] === true, work_overview: j['work_overview'] === true }
 }
 
 export async function fetchViewSettings(token: string, signal: AbortSignal): Promise<ViewSettingsReport> {
   const j = rec(await getJson('/v1/hub/view-settings', signal, token))
   const raw = j['override']
-  const override: ViewOverride | null = raw && typeof raw === 'object' ? Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'boolean')) : null
+  const override: ViewOverride | null = raw && typeof raw === 'object' ? Object.fromEntries(Object.entries(raw).filter(([k, v]) => (k === 'enabled' || k === 'work_overview') && (typeof v === 'boolean' || v === null))) : null
   return { effective: viewSettings(j['effective']), hub_default: viewSettings(j['hub_default']), override }
 }

@@ -14,7 +14,7 @@ html{scrollbar-gutter:stable}*{box-sizing:border-box}body{margin:0;padding:4px;b
 .live{width:7px;height:7px;flex:none;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(111,219,166,.15)}.live.off{background:var(--amber);box-shadow:0 0 0 4px rgba(246,189,122,.15)}
 .ib{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:9px;background:transparent;color:var(--dim);cursor:pointer}.ib:hover{background:rgba(255,255,255,.08);color:#fff}
 button:focus-visible,summary:focus-visible{outline:2px solid var(--hi);outline-offset:2px;border-radius:6px}
-.msg{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-size:12.5px;color:var(--dim)}.msg .i{width:14px;height:14px;margin-top:2px}.msg.warn{color:var(--amber)}.msg.bad{color:var(--coral)}
+.msg{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-size:12.5px;color:var(--dim)}.msg span{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}.msg .i{width:14px;height:14px;margin-top:2px}.msg.warn{color:var(--amber)}.msg.bad{color:var(--coral)}
 .note{margin:6px 0;font-size:12.5px;color:var(--dim)}.mut{color:var(--dim)}
 ul{margin:0;padding:0;list-style:none}
 details.f{border-top:1px solid var(--line)}details.f>summary{display:flex;align-items:center;gap:8px;padding:10px 0;cursor:pointer;list-style:none;font-weight:500;font-size:13.5px}details.f>summary::-webkit-details-marker{display:none}
@@ -45,27 +45,38 @@ function ago(at){var s=Math.max(0,Math.floor(Date.now()/1000-at));if(s<60)return
 function msg(tone,text){return add(h('p','msg '+tone),ic('alert'),h('span',null,text))}
 function keep(d,s,key){d.open=!!OPEN[key];s.setAttribute('data-k',key);d.addEventListener('toggle',function(){OPEN[key]=d.open;size()})}
 function fold(key,label,meta){var d=h('details','f'),s=h('summary');keep(d,s,key);add(s,ic('chev','chev'),h('span',null,label),meta?h('span','n',meta):null);d.appendChild(s);return d}
-function bar(label,meta){var t=h('div','top');add(t,h('span','live'+(failedAt?' off':'')),h('span',null,label),h('span','sp'),meta?h('span',null,meta):null,refreshBtn());return t}
+function bar(label,meta){var t=h('div','top');add(t,h('span','live'+(errorText?' off':'')),h('span',null,label),h('span','sp'),meta?h('span',null,meta):null,refreshBtn());return t}
 function refreshBtn(){var b=h('button','ib');b.type='button';b.setAttribute('aria-label','Refresh');b.setAttribute('data-k','refresh');b.title='Refresh';b.appendChild(ic('refresh'));b.addEventListener('click',onRefresh);return b}
-function failNote(){return failedAt?msg('warn','Could not refresh. Showing data from '+hms(failedAt)):null}
-var nextId=1,pending={},last=null,lastAt=null,lastH=0,failedAt=null;
+function failNote(){return errorText?msg('warn','Could not refresh. Showing data from '+hms(lastAt)+'. '+errorText):null}
+var nextId=1,pending={},last=null,lastAt=null,lastH=0,errorText=null;
 function send(m){window.parent.postMessage(m,'*')}
 function rpc(method,params){return new Promise(function(ok,no){var id=nextId++;pending[id]={ok:ok,no:no};send({jsonrpc:'2.0',id:id,method:method,params:params})})}
-function parse(r){if(!r||r.isError)return null;var s=r.structuredContent;if(s&&typeof s==='object')return s;var c=r.content;if(c&&c[0]&&typeof c[0].text==='string'){try{var v=JSON.parse(c[0].text);if(v&&typeof v==='object')return v}catch(e){}}return null}
+function errorMessage(e){if(e&&typeof e.message==='string'&&e.message.trim())return e.message;return 'The host did not return a work overview. Try Refresh.'}
+function parse(r){
+if(r&&r.isError){var text=(Array.isArray(r.content)?r.content:[]).filter(function(c){return c&&c.type==='text'&&typeof c.text==='string'}).map(function(c){return c.text}).join('\n');throw new Error(text.trim()?text:'The work overview request failed. Try Refresh.')}
+var d=r&&r.structuredContent;
+if(!d&&r&&Array.isArray(r.content)){r.content.some(function(c){if(c&&typeof c.text==='string'){try{d=JSON.parse(c.text)}catch(e){}}return d&&typeof d==='object'})}
+if(d&&d.detail==='compact')return d;
+var s=d&&d.actionable_status;
+if(!s||!Array.isArray(s.work)||!s.counts||!['active','needs_you','awaiting_party','blocked','reassessment_needed','held_reservations'].every(function(k){return typeof s.counts[k]==='number'&&Number.isFinite(s.counts[k])&&s.counts[k]>=0})||!s.work.every(function(w){return w&&w.operational&&w.operational.reservation})||(s.actions!=null&&!Array.isArray(s.actions)))throw new Error('The host returned an incomplete work overview. Try Refresh.');
+return d}
 function theme(c){if(c&&(c.theme==='dark'||c.theme==='light'))document.documentElement.setAttribute('data-theme',c.theme)}
 function size(){var v=Math.ceil(document.body.scrollHeight);if(v!==lastH){lastH=v;send({jsonrpc:'2.0',method:'ui/notifications/size-changed',params:{height:v}})}}
-function paint(){var root=document.getElementById('app'),sc=document.documentElement,y=sc.scrollTop,a=document.activeElement,k=a&&root.contains(a)?a.getAttribute('data-k'):null;root.textContent='';if(!last){add(root,h('p','note','No data returned.'))}else render(root,last,lastAt);sc.scrollTop=y;if(k)Array.prototype.some.call(root.querySelectorAll('[data-k]'),function(n){if(n.getAttribute('data-k')!==k)return false;n.focus({preventScroll:true});return true});size()}
+function paint(){var root=document.getElementById('app'),sc=document.documentElement,y=sc.scrollTop,a=document.activeElement,k=a&&root.contains(a)?a.getAttribute('data-k'):null;root.textContent='';if(!last){add(root,bar('AgentSCM · Work overview',errorText?'Unavailable':'Loading'),errorText?msg('bad',errorText):h('p','note','Loading work overview…'))}else render(root,last,lastAt);sc.scrollTop=y;if(k)Array.prototype.some.call(root.querySelectorAll('[data-k]'),function(n){if(n.getAttribute('data-k')!==k)return false;n.focus({preventScroll:true});return true});size()}
 var AUTO={base:30000,max:300000,fails:0,t:null,at:Date.now(),busy:false,q:null,seen:true,gist:null,args:{}};
 function on(){return !document.hidden&&AUTO.seen}
 function plan(){clearTimeout(AUTO.t);AUTO.t=on()?setTimeout(tick,Math.max(0,AUTO.at+Math.min(AUTO.max,AUTO.base*Math.pow(2,AUTO.fails))-Date.now())):null}
 function tick(){AUTO.t=null;if(on())call(AUTO.args,true)}
 function say(t){var l=document.getElementById('live');if(l)l.textContent=t}
-function got(d,args){last=d;lastAt=new Date();failedAt=null;AUTO.args=args;paint();var g=gist();if(g&&AUTO.gist&&g!==AUTO.gist)say('Updated: '+g);AUTO.gist=g}
-function take(r){var d=parse(r);if(d&&d.detail==='compact'){call({});return}if(d){got(d,{});AUTO.at=Date.now();AUTO.fails=0;plan()}else if(!last)paint()}
-function fail(){failedAt=lastAt;paint()}
+function got(d,args){
+var previous=last,previousAt=lastAt;last=d;lastAt=new Date();errorText=null;
+try{paint()}catch(e){last=previous;lastAt=previousAt;throw new Error('The host returned an incomplete work overview. Try Refresh.')}
+AUTO.args=args;var g=gist();if(g&&AUTO.gist&&g!==AUTO.gist)say('Updated: '+g);AUTO.gist=g}
+function take(r){try{var d=parse(r);if(d.detail==='compact'){call({});return}got(d,{});AUTO.at=Date.now();AUTO.fails=0;plan()}catch(e){fail(e);AUTO.at=Date.now();AUTO.fails=Math.min(AUTO.fails+1,6);plan()}}
+function fail(e){errorText=errorMessage(e);paint();say('Could not load work overview. '+errorText)}
 function done(ok){AUTO.busy=false;AUTO.at=Date.now();AUTO.fails=ok===true?0:Math.min(AUTO.fails+1,6);var q=AUTO.q;AUTO.q=null;if(q)call(q);else plan()}
 function call(args,auto){if(AUTO.busy){if(!auto)AUTO.q=args;return}AUTO.busy=true;
-rpc('tools/call',{name:TOOL,arguments:Object.assign({},args,{detail:'full'})}).then(function(r){var d=parse(r);if(d){got(d,args)}else fail();return !!d}).catch(function(){fail();return false}).then(done,done)}
+rpc('tools/call',{name:TOOL,arguments:Object.assign({},args,{detail:'full'})}).then(function(r){var d=parse(r);if(d.detail==='compact')throw new Error('The host returned a partial work overview. Try Refresh.');got(d,args);return true}).catch(function(e){fail(e);return false}).then(done,done)}
 window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
 if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
 if(m.method==='ui/notifications/tool-result')take(m.params);
@@ -91,6 +102,7 @@ var c=s.counts;
 add(root,h('p','big',plural(c.active,'active task')+'. '+plural(c.needs_you,'action needs','actions need')+' you.'));
 add(root,h('p','note',c.awaiting_party+' awaiting a named party · '+c.blocked+' blocked · '+c.reassessment_needed+' reassessment needed · '+c.held_reservations+' held reservations'));
 if(!s.complete)add(root,msg('warn','Coverage incomplete; missing signals remain unknown.'));
+if(s.complete&&s.work.length===0&&!(s.actions||[]).length)add(root,h('p','note','No current work in this overview.'));
 function recipient(r){return r&&r.login?r.login+(r.kind==='lead_agent'?'’s agent':''):r&&r.kind==='none'?'No action assigned':'Recipient unknown'}
 var rows=h('ul','needs');
 s.work.filter(function(w){return w.needs_you}).forEach(function(w){var li=h('li');add(li,ic('alert','warn'),h('span','t',clip(w.title)),h('span','s',recipient(w.recipient)+' · '+clip(w.action)));rows.appendChild(li)});
