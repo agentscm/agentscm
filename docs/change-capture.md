@@ -552,7 +552,8 @@ mismatched reuse.
 
 The Hub resolves the current target for a session whose Work is `active`, `paused` or `blocked`
 at the session's current generation, and accepts event batches and action starts and finishes for
-that Work in the same states. A Claude `SessionEnd` makes the Hub pause the session's Work, and a
+that Work in the same states. A Claude `SessionEnd` can make the Hub pause the session's Work (it
+does once the Work's hold is no longer live), and a
 resumed session (`claude --resume`, same session id) keeps capturing while the Work stays paused,
 so excluding paused Work would defer the session's own `SessionEnd` and everything after a resume.
 `finished` and `handover` Work, and any older generation after a takeover, are refused. Capture

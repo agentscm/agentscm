@@ -3878,7 +3878,8 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
     );
     assert!(started.status.success());
 
-    // The Hub's own Claude hook endpoint pauses the Work for this session.
+    // The Hub's own Claude hook endpoint ends this session. Its Work's hold is live, so the end
+    // may be only the gap between two turns and the Work goes on.
     let ended = reqwest::Client::new()
         .post(format!("{}/v1/hub/hook/claude", hub.base))
         .bearer_auth(secret.expose())
@@ -3891,6 +3892,19 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
         .await
         .unwrap();
     assert_eq!(ended.status(), StatusCode::OK);
+    let ended = hub
+        .store
+        .work_get(&token, &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.state, agentscm::hub::work::WorkState::Active);
+    // The agent's own `done` pauses it, and capture goes on for paused Work.
+    assert!(
+        hub.store
+            .end_session_pausing(&token, Some(&ended.lead_session), "mcp", unix_now())
+            .unwrap()
+            .paused
+    );
     let paused = hub
         .store
         .work_get(&token, &work.id, unix_now())
