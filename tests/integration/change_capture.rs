@@ -4790,6 +4790,91 @@ fn native_recipe_digest_fixture(tool: &str, input: &serde_json::Value) -> String
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[test]
+fn a_shell_call_another_hook_rewrote_or_over_the_snapshot_bound_still_starts_and_finishes() {
+    let repo = git_fixture();
+    let spool_dir = TempDir::new().unwrap();
+    let spool = LocalSpool::open(spool_dir.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: vec![ActionRuleV1 {
+            native_tool: "Bash".into(),
+            kind: ActionKindV1::Execution,
+            coverage: CoverageV1::Partial,
+            result_source: NativeResultSourceV1::ProcessExitCode,
+            recipe_digest: None,
+        }],
+    };
+    // Claude Code reports the original input at Pre and another hook's rewrite of it at Post.
+    let hook = |pre: bool, tool_use_id: &str| {
+        let mut payload = serde_json::json!({
+            "hook_event_name": if pre { "PreToolUse" } else { "PostToolUse" },
+            "session_id": "session_fixture",
+            "tool_name": "Bash",
+            "tool_use_id": tool_use_id,
+            "tool_input": {"command": if pre { "ls dir" } else { "wrapper -- ls dir" }},
+        });
+        if !pre {
+            payload["tool_response"] = serde_json::json!({"exit_code": 0});
+        }
+        serde_json::to_vec(&payload).unwrap()
+    };
+    let tool_events = |kind: CapturedEventKindV1| {
+        captured_events(&spool)
+            .iter()
+            .filter(|(_, event)| event.kind == kind)
+            .count()
+    };
+
+    let started =
+        capture_native_hook(&hook(true, "rewritten"), &request, &actions, &spool).unwrap();
+    assert_eq!(
+        started.action,
+        NativeActionOutcome::Started(AppendOutcome::Stored)
+    );
+    let finished =
+        capture_native_hook(&hook(false, "rewritten"), &request, &actions, &spool).unwrap();
+    assert_eq!(
+        finished.action,
+        NativeActionOutcome::Finished(AppendOutcome::Stored)
+    );
+    assert_eq!(finished.event, HookCaptureOutcome::Stored);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolStarted), 1);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolFinished), 1);
+
+    // An untracked file over the snapshot bound pauses the action but keeps both tool events.
+    fs::File::create(repo.path().join("large.bin"))
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    let paused =
+        capture_native_hook(&hook(true, "large_tree"), &request, &actions, &spool).unwrap();
+    assert_eq!(paused.action, NativeActionOutcome::Interrupted);
+    assert_eq!(paused.event, HookCaptureOutcome::Stored);
+    assert!(captured_events(&spool).iter().any(|(_, event)| {
+        event
+            .gap
+            .as_ref()
+            .is_some_and(|gap| gap.reason == GapReasonV1::CaptureInterrupted)
+    }));
+    let missing =
+        capture_native_hook(&hook(false, "large_tree"), &request, &actions, &spool).unwrap();
+    assert_eq!(missing.action, NativeActionOutcome::MissingStart);
+    assert_eq!(missing.event, HookCaptureOutcome::Stored);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolStarted), 2);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolFinished), 2);
+    assert_eq!(
+        inspect_spool(spool.root())
+            .unwrap()
+            .live_claim_count
+            .present,
+        0
+    );
+}
+
 fn git_fixture() -> TempDir {
     let repo = TempDir::new().unwrap();
     run_git(repo.path(), &["init", "-b", "main"]);

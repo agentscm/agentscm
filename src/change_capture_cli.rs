@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use agentscm::change_capture::claude_code::{self, CaptureRequest};
 use agentscm::change_capture::{
-    ConfiguredRecipeReconcileRequest, ConfiguredRecipeRunRequest, DeferredReasonV1,
+    CaptureError, ConfiguredRecipeReconcileRequest, ConfiguredRecipeRunRequest, DeferredReasonV1,
     GitSourceRequest, LocalSpool, ObservedCommandRequest, ObservedStop, RecipeReconcileOutcome,
     export_spool_archive, inspect_spool, reconcile_retained_configured_recipe,
     run_configured_recipe_with_cancellation, run_observed_command,
@@ -640,7 +640,18 @@ async fn capture_claude(
                 eprintln!("AgentSCM local capture warning: {warning}");
             }
         }
-        Err(_) => eprintln!("AgentSCM local capture warning: native event was not retained"),
+        // The kind only: a message can name local paths.
+        Err(error) => eprintln!(
+            "AgentSCM local capture warning: native event was not retained: {}",
+            match error {
+                CaptureError::Invalid(_) => "the hook input is invalid",
+                CaptureError::Conflict(_) => "it conflicts with a retained capture",
+                CaptureError::Limit(_) => "a capture bound was reached",
+                CaptureError::NotFound(_) => "a retained record is missing",
+                CaptureError::Io(_) => "the local store could not be read or written",
+                CaptureError::Json(_) => "a record is not valid JSON",
+            }
+        ),
     }
     if event == Some("Stop")
         && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
