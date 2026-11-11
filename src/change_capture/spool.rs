@@ -162,8 +162,8 @@ pub(crate) fn limit_gap_reason(message: &str) -> GapReasonV1 {
     }
 }
 
-/// Sanitized deferred hooks kept without a target, and for how long; target-bound ones are kept
-/// until their session can have emitted its gap. See `LocalSpool::prune_deferred`.
+/// Sanitized deferred hooks kept for diagnosis, and for how long; ones bound to an aliased target
+/// are kept until their session can have emitted its gap. See `LocalSpool::prune_deferred`.
 pub const DEFERRED_KEEP: usize = 256;
 pub const DEFERRED_KEEP_SECONDS: i64 = 24 * 60 * 60;
 pub const DEFERRED_GAP_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -2362,7 +2362,7 @@ impl LocalSpool {
 
     /// Lists sanitized unassociated hooks for local diagnosis only. There is deliberately no
     /// acknowledgement or reassociation API in schema v1; `upkeep` expires them after
-    /// `DEFERRED_KEEP_SECONDS` (unbound) or `DEFERRED_GAP_SECONDS` (bound to a target).
+    /// `DEFERRED_KEEP_SECONDS`, or `DEFERRED_GAP_SECONDS` when bound to an aliased target.
     pub fn deferred(&self, limit: usize) -> Result<Vec<DeferredHookV1>> {
         if limit == 0 || limit > MAX_PENDING_PAGE {
             return Err(CaptureError::Invalid(format!(
@@ -2388,9 +2388,9 @@ impl LocalSpool {
     }
 
     /// Deletes sanitized deferred hooks that nothing will read again, so a checkout whose sessions
-    /// often run without Work cannot fill its spool with them. A hook bound to a target is kept
-    /// for `DEFERRED_GAP_SECONDS`, until its session has emitted the gap it stands for; the
-    /// newest `DEFERRED_KEEP` others are kept for `DEFERRED_KEEP_SECONDS` for local diagnosis.
+    /// often run without Work cannot fill its spool with them. A hook bound to an aliased target
+    /// is kept for `DEFERRED_GAP_SECONDS`, until its session has emitted the gap it stands for;
+    /// the newest `DEFERRED_KEEP` others are kept for `DEFERRED_KEEP_SECONDS` for local diagnosis.
     /// Returns how many were deleted.
     pub fn prune_deferred(&self, now: i64) -> Result<usize> {
         let _lock = self.lock()?;
@@ -2400,7 +2400,14 @@ impl LocalSpool {
         let mut removed = 0usize;
         for record in records {
             let age = now.saturating_sub(record.hook.observed_at);
-            let keep = if record.target.is_some() {
+            // Only an aliased target turns the hook into a gap. Without an alias its reserved
+            // sequence is already a hole the next retained event shows (`ensure_deferred_gaps`),
+            // so the hook is only diagnosis, like one without a target.
+            let gap_pending = record
+                .target
+                .as_ref()
+                .is_some_and(|target| target.observed_session_id != target.canonical_session_id);
+            let keep = if gap_pending {
                 age < DEFERRED_GAP_SECONDS
             } else {
                 unbound += 1;
@@ -2421,14 +2428,15 @@ impl LocalSpool {
         Ok(removed)
     }
 
-    /// Deletes tool-call claims older than `CLAIM_KEEP_SECONDS`. A claim only pairs a tool call's
-    /// Pre and Post hooks and is never sent to the Hub; one that waited a day lost its other phase
-    /// (an interrupted tool, a killed hook, an ended session) and nothing will complete it. A
-    /// phase that still arrives later starts a new claim. Legacy claims, and claims a recipe
-    /// attempt names (its reconciliation needs them), stay. Returns how many were deleted.
+    /// Deletes tool-call claims nothing will complete. A claim only pairs a tool call's Pre and
+    /// Post hooks and is never sent to the Hub. An ordinary claim that has seen both phases is
+    /// done, whether or not its Post got to remove it; any claim older than `CLAIM_KEEP_SECONDS`
+    /// lost its other phase (an interrupted tool, a killed hook, an ended session). A phase that
+    /// still arrives later starts a new claim. Legacy claims, and claims a recipe attempt names
+    /// (its reconciliation needs them), stay. Returns how many were deleted.
     pub fn expire_claims(&self, now: i64) -> Result<usize> {
-        // Not the managed-capture lock: a Post hook holds it through a whole Git capture, and a
-        // claim this old has no phase in flight.
+        // Not the managed-capture lock: a Post hook holds it through a whole Git capture. A Post
+        // still running uses its own copy of the claim and treats a removed file as removed.
         let _lock = self.lock()?;
         let attempted = recipe_attempt_markers(&self.root, self.limits.max_records)?;
         let directory = self.root.join("managed-invocations");
@@ -2438,10 +2446,11 @@ impl LocalSpool {
             let marker: ManagedInvocationV1 =
                 serde_json::from_slice(&read_bounded(&path, MAX_DEFERRED_BYTES)?)?;
             validate_managed_invocation(&marker)?;
-            if marker.version != 4
-                || now.saturating_sub(marker.observed_at) < CLAIM_KEEP_SECONDS
-                || attempted.contains(&marker.marker_id)
-            {
+            let done = marker.pre_fingerprint.is_some()
+                && marker.post_fingerprint.is_some()
+                && marker.route != Some(NativeOccurrenceRouteV1::Managed);
+            let old = now.saturating_sub(marker.observed_at) >= CLAIM_KEEP_SECONDS;
+            if marker.version != 4 || !(done || old) || attempted.contains(&marker.marker_id) {
                 continue;
             }
             match fs::remove_file(&path) {
@@ -7833,6 +7842,41 @@ mod tests {
             .collect::<Vec<_>>();
         anchors.sort();
         anchors
+    }
+
+    #[test]
+    fn a_claim_that_saw_both_phases_goes_at_once_and_a_waiting_one_after_a_day() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let now = 1_782_284_400;
+        let ordinary = |tool_use_id: &str, post: bool| ManagedInvocationV1 {
+            observed_at: now - 60,
+            post_fingerprint: post.then(|| "7".repeat(64)),
+            route: Some(NativeOccurrenceRouteV1::OrdinaryEvent),
+            ..completed_occurrence_marker(tool_use_id)
+        };
+        let done = ordinary("both-phases", true);
+        let waiting = ordinary("pre-only", false);
+        // A managed claim is completed by its recipe run, never by upkeep alone.
+        let managed = ManagedInvocationV1 {
+            observed_at: now - 60,
+            ..completed_occurrence_marker("managed")
+        };
+        for marker in [&done, &waiting, &managed] {
+            spool.retain_managed_invocation(marker).unwrap();
+        }
+        let kept = |marker: &ManagedInvocationV1| {
+            spool
+                .root
+                .join("managed-invocations")
+                .join(format!("{}.json", marker.marker_id))
+                .exists()
+        };
+
+        assert_eq!(spool.expire_claims(now).unwrap(), 1);
+        assert!(!kept(&done) && kept(&waiting) && kept(&managed));
+        assert_eq!(spool.expire_claims(now + CLAIM_KEEP_SECONDS).unwrap(), 2);
+        assert!(!kept(&waiting) && !kept(&managed));
     }
 
     fn completed_occurrence_marker(tool_use_id: &str) -> ManagedInvocationV1 {
