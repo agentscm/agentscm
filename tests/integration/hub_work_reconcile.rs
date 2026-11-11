@@ -809,7 +809,7 @@ fn branch_merged(fixture: &StoreFixture) {
     // The head repository round-trips, and a merge's base is a merge base.
     let (rows, bases) = ctx
         .store
-        .catchup_branch_merges(&scope(), &["feature/m".into(), "feature/f".into()])
+        .catchup_branch_merges(&scope(), &["feature/m".into(), "feature/f".into()], 20)
         .unwrap();
     let same: Vec<_> = rows
         .iter()
@@ -822,7 +822,7 @@ fn branch_merged(fixture: &StoreFixture) {
     assert!(!bases.contains("feature/m"));
     let (_, bases) = ctx
         .store
-        .catchup_branch_merges(&scope(), &["main".into()])
+        .catchup_branch_merges(&scope(), &["main".into()], 20)
         .unwrap();
     assert!(bases.contains("main"));
 }

@@ -10976,12 +10976,14 @@ impl Store for PgStore {
         &self,
         scope: &CatchupRepositoryScope,
         branches: &[String],
+        per_branch: usize,
     ) -> Result<BranchMergeRows> {
         scope.validate()?;
         let repository = repository_namespace(&scope.repository, scope.repository_id);
         let key = catchup_repository_key(scope.repository_id);
         self.run(true, |client| {
             let (mut rows, mut bases) = (Vec::new(), BTreeSet::new());
+            let limit = i64::try_from(per_branch).unwrap_or(i64::MAX);
             for branch in branches.iter().collect::<BTreeSet<_>>() {
                 let args: &[&(dyn postgres::types::ToSql + Sync)] =
                     &[&scope.provider, &scope.host, &repository, &key, branch];
@@ -10989,8 +10991,8 @@ impl Store for PgStore {
                     "SELECT pull_number,head_commit,occurred_at,same_repository_head
                      FROM hub_catchup_merges
                      WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND branch=$5
-                     ORDER BY occurred_at DESC NULLS LAST, pull_number DESC LIMIT 20",
-                    args,
+                     ORDER BY occurred_at DESC NULLS LAST, pull_number DESC LIMIT $6",
+                    &[&scope.provider, &scope.host, &repository, &key, branch, &limit],
                 )? {
                     rows.push((
                         branch.clone(),
@@ -11039,7 +11041,12 @@ impl Store for PgStore {
              WHERE m.provider=$1 AND m.host=$2 AND m.repository=$3 AND m.repository_key=$4
                AND m.same_repository_head = $5 AND m.occurred_at >= $6 AND m.occurred_at <= $7
                AND w.provider=$1 AND w.host=$2 AND w.repository=$8 AND w.repository_id IS NOT DISTINCT FROM $9::BIGINT
-               AND (l.number IS NULL OR l.number = m.pull_number)
+               AND (l.number = m.pull_number OR (l.number IS NULL AND NOT EXISTS (
+                 SELECT 1 FROM hub_catchup_merges o
+                 WHERE o.provider=m.provider AND o.host=m.host AND o.repository=m.repository
+                   AND o.repository_key=m.repository_key AND o.branch=m.branch
+                   AND o.same_repository_head IS TRUE AND o.pull_number <> m.pull_number
+                   AND o.occurred_at >= w.created_at)))
                AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
                  WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
                    AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)

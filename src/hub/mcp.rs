@@ -2621,16 +2621,23 @@ async fn call_inner(
                     &OperationalSelect::Holders,
                     now,
                 )?;
-                let (with_stages, stages, merges) = super::work_reconcile::overview_with_stages(
-                    &*store, &principal, &overview, now,
+                // Full detail stages every current Work; compact only the ones it lists.
+                let staged: Vec<&WorkItem> = match detail {
+                    Detail::Full => overview.current.iter().collect(),
+                    Detail::Compact => compact::page_current(&overview, &page)
+                        .into_iter()
+                        .take(page.size)
+                        .collect(),
+                };
+                let read = super::work_reconcile::overview_with_stages(
+                    &*store, &principal, &overview, &staged, now,
                 );
                 Ok(match detail {
                     Detail::Full => structured(&super::work_lifecycle::attach_operational(
-                        with_stages,
-                        &held,
+                        read.value, &held,
                     )),
                     Detail::Compact => {
-                        let value = compact::overview(&overview, &held, &stages, &merges, &page);
+                        let value = compact::overview(&overview, &held, &read, &page);
                         json!({"content": [{"type": "text", "text": compact::overview_text(&value)}],
                             "structuredContent": value, "isError": false})
                     }

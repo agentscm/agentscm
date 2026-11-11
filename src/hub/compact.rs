@@ -94,15 +94,26 @@ pub(super) struct Page {
     pub recent_before: Option<i64>,
 }
 
+/// The current Work a page lists before its size cut: a continuation lists only what its cursor
+/// continues, and a recent-outcomes cursor lists none. The page shows the first `size`.
+pub(super) fn page_current<'a>(overview: &'a WorkOverview, page: &Page) -> Vec<&'a WorkItem> {
+    let first = page.after.is_none() && page.recent_before.is_none();
+    overview
+        .current
+        .iter()
+        .filter(|_| first || page.after.is_some())
+        .collect()
+}
+
 /// One page of the overview. `held` is the operational projection of reservation-holding Work;
 /// each listed item says whether it holds one.
 pub(super) fn overview(
     overview: &WorkOverview,
     held: &OperationalOverviewV1,
-    stages: &std::collections::BTreeMap<String, super::work_reconcile::WorkStageV1>,
-    merges: &super::work_reconcile::RecentMerges,
+    read: &super::work_reconcile::StagedOverview,
     page: &Page,
 ) -> Value {
+    let (stages, merges) = (&read.stages, &read.merges);
     let reservation = |id: &str| {
         held.work
             .iter()
@@ -114,11 +125,7 @@ pub(super) fn overview(
     };
     // The first page lists everything; a continuation lists only what its cursor continues.
     let first = page.after.is_none() && page.recent_before.is_none();
-    let current: Vec<&WorkItem> = overview
-        .current
-        .iter()
-        .filter(|_| first || page.after.is_some())
-        .collect();
+    let current = page_current(overview, page);
     // More follows when the page is cut here or the store's own read was.
     let shown = current.len().min(page.size);
     let next_after = (shown > 0 && (current.len() > page.size || !overview.current_complete))
@@ -132,6 +139,7 @@ pub(super) fn overview(
             if let Some(stage) = stages.get(&item.id) {
                 value["stage"] = json!(stage.stage);
                 value["pull_request"] = json!(stage.pull_request);
+                value["basis"] = json!(stage.basis);
             }
             value
         })
@@ -172,7 +180,8 @@ pub(super) fn overview(
         .take(if first { LIST } else { 0 })
         .map(|merge| {
             json!({"work": merge.work_id, "pull_request": merge.pull_number,
-                "merged_at": merge.merged_at})
+                "merged_at": merge.merged_at, "basis": merge.basis,
+                "provenance": merge.provenance})
         })
         .collect();
     json!({
@@ -191,6 +200,8 @@ pub(super) fn overview(
         "settled_count": overview.settled_count,
         "recent_merges": recent_merges, "recent_merges_listed": merges.list.len(),
         "recent_merges_complete": merges.complete && first && recent_merges.len() == merges.list.len(),
+        "stage_limits": read.limits.iter().take(PAGE).collect::<Vec<_>>(),
+        "stage_limits_listed": read.limits.len(),
         "held_reservations": held.work.len(), "held_reservations_complete": held.complete,
         "planned_issues": first.then(|| planned(&overview.planned_issues)),
         "pages": "The first page lists current Work, recent outcomes and at most five overlap pairs (all of them with detail full). Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
@@ -420,7 +431,6 @@ mod tests {
             &listed(&[3, 2, 1], true),
             &held,
             &Default::default(),
-            &Default::default(),
             &page(None),
         );
         assert_eq!(cut["next_after"], id(2));
@@ -429,7 +439,6 @@ mod tests {
             &listed(&[3, 2], false),
             &held,
             &Default::default(),
-            &Default::default(),
             &page(None),
         );
         assert_eq!(bounded["next_after"], id(2));
@@ -437,7 +446,6 @@ mod tests {
         let rest = super::overview(
             &listed(&[1], true),
             &held,
-            &Default::default(),
             &Default::default(),
             &page(Some(id(2))),
         );

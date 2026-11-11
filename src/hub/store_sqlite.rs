@@ -11038,6 +11038,7 @@ impl Store for SqliteStore {
         &self,
         scope: &CatchupRepositoryScope,
         branches: &[String],
+        per_branch: usize,
     ) -> Result<BranchMergeRows> {
         scope.validate()?;
         let conn = self.conn();
@@ -11046,7 +11047,7 @@ impl Store for SqliteStore {
         let mut merges = conn.prepare(
             "SELECT pull_number,head_commit,occurred_at,same_repository_head FROM hub_catchup_merges
              WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND branch=?5
-             ORDER BY occurred_at IS NULL, occurred_at DESC, pull_number DESC LIMIT 20",
+             ORDER BY occurred_at IS NULL, occurred_at DESC, pull_number DESC LIMIT ?6",
         )?;
         let mut base = conn.prepare(
             "SELECT 1 FROM hub_catchup_branch_merges
@@ -11056,14 +11057,18 @@ impl Store for SqliteStore {
         let (mut rows, mut bases) = (Vec::new(), BTreeSet::new());
         for branch in branches.iter().collect::<BTreeSet<_>>() {
             let args = params![scope.provider, scope.host, repository, key, branch];
-            for row in merges.query_map(args, |row| {
-                Ok(BranchMerge {
-                    pull_number: row.get(0)?,
-                    head_commit: row.get(1)?,
-                    occurred_at: row.get(2)?,
-                    same_repository_head: row.get(3)?,
-                })
-            })? {
+            let limit = i64::try_from(per_branch).unwrap_or(i64::MAX);
+            for row in merges.query_map(
+                params![scope.provider, scope.host, repository, key, branch, limit],
+                |row| {
+                    Ok(BranchMerge {
+                        pull_number: row.get(0)?,
+                        head_commit: row.get(1)?,
+                        occurred_at: row.get(2)?,
+                        same_repository_head: row.get(3)?,
+                    })
+                },
+            )? {
                 rows.push((branch.clone(), row?));
             }
             if base.exists(args)? {
@@ -11093,7 +11098,12 @@ impl Store for SqliteStore {
              WHERE m.provider=?1 AND m.host=?2 AND m.repository=?3 AND m.repository_key=?4
                AND m.same_repository_head = ?5 AND m.occurred_at >= ?6 AND m.occurred_at <= ?7
                AND w.provider=?1 AND w.host=?2 AND w.repository=?8 AND w.repository_id IS ?9
-               AND (l.number IS NULL OR l.number = m.pull_number)
+               AND (l.number = m.pull_number OR (l.number IS NULL AND NOT EXISTS (
+                 SELECT 1 FROM hub_catchup_merges o
+                 WHERE o.provider=m.provider AND o.host=m.host AND o.repository=m.repository
+                   AND o.repository_key=m.repository_key AND o.branch=m.branch
+                   AND o.same_repository_head = 1 AND o.pull_number <> m.pull_number
+                   AND o.occurred_at >= w.created_at)))
                AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
                  WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
                    AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)

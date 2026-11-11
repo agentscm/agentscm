@@ -2001,8 +2001,8 @@ async fn overview_stages_are_opt_in_and_name_the_open_pull_request() {
 
 /// A Work whose same-repository branch merged inside the recent window is listed in
 /// `recent_merges` with provider provenance, while its reported outcome stays as the agent left
-/// it. A fork merge, one outside the window or before the Work, and one for a Work explicitly
-/// linked to another pull request are not listed.
+/// it. A fork merge, one outside the window or before the Work, one for a Work explicitly
+/// linked to another pull request, and a branch reused by two pull requests are not listed.
 async fn recent_merges_list_provider_observed_merges(hub: Hub) {
     use agentscm::hub::work::WorkState;
     use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
@@ -2010,13 +2010,16 @@ async fn recent_merges_list_provider_observed_merges(hub: Hub) {
     let (_, reader) = hub.token(2, "acme/widgets", true).await;
     let now = unix_now();
     // (branch, merged_at, pull number, same repository head, explicit link number)
-    let cases: [(&str, i64, i64, bool, Option<i64>); 6] = [
+    let cases: [(&str, i64, i64, bool, Option<i64>); 8] = [
         ("feat/shipped", now, 30, true, None),
         ("feat/matched", now, 32, true, Some(32)),
         ("feat/fork", now, 33, false, None),
         ("feat/future", now + 1000, 34, true, None),
         ("feat/early", now - 1000, 35, true, None),
         ("feat/other", now, 31, true, Some(99)),
+        // One branch reused for two pull requests: inference picks neither, so none is listed.
+        ("feat/reused", now, 36, true, None),
+        ("feat/reused", now, 37, true, None),
     ];
     let mut ids = Vec::new();
     for (index, (branch, _, _, _, _)) in cases.iter().enumerate() {

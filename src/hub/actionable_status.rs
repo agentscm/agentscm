@@ -15,6 +15,7 @@ use crate::hub::store::{Principal, Store, owner_session, session_ancestors, sess
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
+use crate::hub::work_reconcile::WorkStage;
 use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
@@ -1177,8 +1178,16 @@ pub fn render_text(status: &ActionableStatus) -> String {
             "{} [{}; {}; reservation {:?}]: {}",
             row.title, state, recipient, row.operational.reservation.status, row.action
         ));
+        let stage = row.stage.as_ref().map_or_else(String::new, |s| {
+            let words = match (s.stage, s.pull_request) {
+                (WorkStage::PullRequestMerged, Some(n)) => format!("pull request #{n} merged"),
+                (WorkStage::PullRequestOpen, Some(n)) => format!("pull request #{n} open"),
+                (stage, _) => format!("{stage:?}"),
+            };
+            format!(" Stage: {words}.")
+        });
         lines.push(format!(
-            "  Claim {:?}; outcome {:?} ({:?}). {}",
+            "  Claim {:?}; outcome {:?} ({:?}). {}{}",
             row.freshness,
             row.operational.outcome.value,
             row.operational.outcome.provenance,
@@ -1186,7 +1195,8 @@ pub fn render_text(status: &ActionableStatus) -> String {
                 .report
                 .as_ref()
                 .map(|r| format!("Agent report {:?} at {}.", r.kind, r.at))
-                .unwrap_or_else(|| "No retained agent report.".into())
+                .unwrap_or_else(|| "No retained agent report.".into()),
+            stage
         ));
         if let Some(r) = &row.reconciliation {
             for source in &r.current_source_coverage {

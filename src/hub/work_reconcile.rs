@@ -433,8 +433,9 @@ impl PrRead {
 fn read_pr(
     store: &dyn Store,
     principal: &Principal,
-    scope: &CatchupRepositoryScope,
     work_id: &str,
+    loaded: Option<&WorkItem>,
+    observed: &LazyObservations,
     now: i64,
     merge_gap: bool,
 ) -> Result<Option<PrRead>> {
@@ -461,7 +462,7 @@ fn read_pr(
     let link = match view.link {
         Some(link) => explicit_link(&link),
         None => {
-            let inference = infer_for_work(store, principal, work_id, now);
+            let inference = infer_for_work(store, principal, work_id, loaded, observed, now);
             read.link_limits = inference.limits;
             let Some(link) = inference.link else {
                 return Ok(Some(read));
@@ -470,7 +471,7 @@ fn read_pr(
         }
     };
     let number = link.number;
-    if let Ok(merges) = store.catchup_merges_for_pull(scope, number) {
+    if let Ok(merges) = store.catchup_merges_for_pull(&catchup_scope(principal), number) {
         read.merged = Some(!merges.is_empty());
         read.merges = merges;
     }
@@ -549,19 +550,20 @@ fn infer_branch_link(
 }
 
 /// Same-repository pull-request observations, read once: open pull requests keyed by head
-/// branch, the numbers of all open ones, and the branches some open pull request targets.
+/// branch and the numbers of all open ones.
 #[derive(Default)]
 struct OpenObservations {
     by_branch: BTreeMap<String, Vec<(i64, String)>>,
     open_numbers: BTreeSet<i64>,
-    base_refs: BTreeSet<String>,
     truncated: bool,
 }
 
-fn read_open_observations(
-    store: &dyn Store,
-    principal: &Principal,
-) -> std::result::Result<OpenObservations, &'static str> {
+type ObservationRead = std::result::Result<OpenObservations, &'static str>;
+
+/// Open observations read at most once per reconciliation, and only when some Work needs them.
+type LazyObservations = std::cell::OnceCell<ObservationRead>;
+
+fn read_open_observations(store: &dyn Store, principal: &Principal) -> ObservationRead {
     let Ok(Some(repository)) = super::sync::find_repository(
         store,
         &principal.owner.identity.host,
@@ -574,7 +576,7 @@ fn read_open_observations(
         return Err("observation_unavailable");
     };
     let mut out = OpenObservations {
-        truncated: rows.len() >= 1000,
+        truncated: rows.len() as i64 >= super::store::LIST_LIMIT,
         ..OpenObservations::default()
     };
     for row in &rows {
@@ -583,9 +585,6 @@ fn read_open_observations(
         };
         if value["state"] != "open" {
             continue;
-        }
-        if let Some(base) = value["base_ref"].as_str() {
-            out.base_refs.insert(base.to_owned());
         }
         let (Some(number), Some(repository_id), Some(head_repository_id)) = (
             value["number"].as_i64().filter(|n| *n > 0),
@@ -625,7 +624,7 @@ struct BranchMerges {
 }
 
 /// Rows the Store returns per branch at most; reaching it means older merges may be missing.
-const BRANCH_MERGES_PER_BRANCH: usize = 20;
+pub(super) const BRANCH_MERGES_PER_BRANCH: usize = 20;
 
 fn catchup_scope(principal: &Principal) -> CatchupRepositoryScope {
     CatchupRepositoryScope {
@@ -643,7 +642,11 @@ fn read_branch_merges(
     branches: &[String],
 ) -> Option<BranchMerges> {
     let (rows, bases) = store
-        .catchup_branch_merges(&catchup_scope(principal), branches)
+        .catchup_branch_merges(
+            &catchup_scope(principal),
+            branches,
+            BRANCH_MERGES_PER_BRANCH,
+        )
         .ok()?;
     let mut out = BranchMerges {
         bases,
@@ -658,7 +661,7 @@ fn read_branch_merges(
 /// Infer a Work's link from the observations; no branch or no observation is no link.
 fn infer_from(
     item: &WorkItem,
-    observed: &std::result::Result<OpenObservations, &'static str>,
+    observed: &ObservationRead,
     merged: Option<&BranchMerges>,
 ) -> BranchInference {
     let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
@@ -681,7 +684,7 @@ fn infer_from(
         item.created_at,
         open,
         merges,
-        observed.base_refs.contains(branch) || merged.is_some_and(|m| m.bases.contains(branch)),
+        merged.is_some_and(|m| m.bases.contains(branch)),
     );
     if merged.is_none() {
         inference.limits.push("merge_lookup_unavailable");
@@ -699,20 +702,27 @@ fn infer_for_work(
     store: &dyn Store,
     principal: &Principal,
     work_id: &str,
+    loaded: Option<&WorkItem>,
+    observed: &LazyObservations,
     now: i64,
 ) -> BranchInference {
-    let Ok(Some(item)) = store.work_get(&principal.token_id, work_id, now) else {
+    let fetched;
+    let item = match loaded {
+        Some(item) => item,
+        None => {
+            let Ok(Some(item)) = store.work_get(&principal.token_id, work_id, now) else {
+                return BranchInference::default();
+            };
+            fetched = item;
+            &fetched
+        }
+    };
+    let Some(branch) = item.branch.clone().filter(|b| !b.is_empty()) else {
         return BranchInference::default();
     };
-    if item.branch.as_deref().is_none_or(str::is_empty) {
-        return BranchInference::default();
-    }
-    let merged = read_branch_merges(store, principal, &[item.branch.clone().unwrap_or_default()]);
-    infer_from(
-        &item,
-        &read_open_observations(store, principal),
-        merged.as_ref(),
-    )
+    let merged = read_branch_merges(store, principal, &[branch]);
+    let observed = observed.get_or_init(|| read_open_observations(store, principal));
+    infer_from(item, observed, merged.as_ref())
 }
 
 /// A Work's stage as the status shows it: working, pull request open or merged, complete.
@@ -935,23 +945,28 @@ fn recent_merges(
     RecentMerges { list, complete }
 }
 
-/// The overview as JSON with each current Work's `stages` (keyed by Work id), any
-/// `stage_limits`, and `recent_merges` beside it. They stay out of `WorkOverview`, which older
-/// clients decode strictly.
+/// The overview with stages and recent merges read beside it.
+#[derive(Default)]
+pub(super) struct StagedOverview {
+    pub value: serde_json::Value,
+    pub stages: BTreeMap<String, WorkStageV1>,
+    pub limits: BTreeSet<String>,
+    pub merges: RecentMerges,
+}
+
+/// The overview as JSON with the `stages` (keyed by Work id) of `staged`, any `stage_limits`,
+/// and `recent_merges` beside it. `staged` is the current Work the caller will show. They stay
+/// out of `WorkOverview`, which older clients decode strictly.
 pub(super) fn overview_with_stages(
     store: &dyn Store,
     principal: &Principal,
     overview: &super::work::WorkOverview,
+    staged: &[&WorkItem],
     now: i64,
-) -> (
-    serde_json::Value,
-    BTreeMap<String, WorkStageV1>,
-    RecentMerges,
-) {
-    let items: Vec<_> = overview
-        .current
+) -> StagedOverview {
+    let items: Vec<_> = staged
         .iter()
-        .map(|item| (item, OutcomeValue::None))
+        .map(|item| (*item, OutcomeValue::None))
         .collect();
     let reader = WorkLifecycleReader::Token(&principal.token_id);
     let (stages, limits) = work_stages(store, principal, &reader, &items, now);
@@ -976,7 +991,12 @@ pub(super) fn overview_with_stages(
             serde_json::json!(merges.complete),
         );
     }
-    (value, stages, merges)
+    StagedOverview {
+        value,
+        stages,
+        limits,
+        merges,
+    }
 }
 
 #[derive(Default)]
@@ -1131,15 +1151,19 @@ pub fn read(
     let Some(this) = operational.iter().find(|w| w.work_id == item.id) else {
         return Ok(None);
     };
-    let scope = CatchupRepositoryScope {
-        provider: principal.owner.identity.provider.clone(),
-        host: principal.owner.identity.host.clone(),
-        repository: principal.repository.clone(),
-        repository_id: principal.repository_id,
-    };
     // Coverage first, so a backfill during the preview cannot make the PR reads miss a merge.
     let (coverage, merge_gap) = read_coverage(store, token, now);
-    let Some(pr) = read_pr(store, principal, &scope, &item.id, now, merge_gap)? else {
+    let observed = LazyObservations::new();
+    let Some(pr) = read_pr(
+        store,
+        principal,
+        &item.id,
+        Some(&item),
+        &observed,
+        now,
+        merge_gap,
+    )?
+    else {
         return Ok(None);
     };
     // Only a prerequisite the token can read gets facts; the others stay unknown, unnamed.
@@ -1149,7 +1173,7 @@ pub fn read(
             prerequisite_reads.push((id.as_str(), None, None, UNREAD_DENIED));
             continue;
         };
-        let (read, unread) = match read_pr(store, principal, &scope, id, now, merge_gap) {
+        let (read, unread) = match read_pr(store, principal, id, None, &observed, now, merge_gap) {
             Ok(Some(read)) => (Some(read), UNREAD_DENIED),
             Ok(None) => (None, UNREAD_DENIED),
             Err(_) => (None, UNREAD_FAILED),
@@ -1921,5 +1945,24 @@ mod tests {
         assert!(out.limits.contains(&"pr_link_unavailable".to_owned()));
         assert!(!out.limits.contains(&"no_pr_link".to_owned()));
         assert!(!out.atomic_snapshot);
+    }
+
+    #[test]
+    fn no_connected_repository_reads_an_unlinked_work_unknown() {
+        let mut it = item(WorkState::Active, &[], false);
+        it.branch = Some("feat/x".to_owned());
+        // No connected repository: nothing was observed, which is not "nothing open".
+        let inference = infer_from(&it, &Err("observation_unavailable"), None);
+        assert!(inference.link.is_none());
+        assert_eq!(inference.limits[0], "observation_unavailable");
+        let stage = stage_for(
+            None,
+            StageLink::None {
+                limited: !inference.limits.is_empty(),
+            },
+            |_| None,
+            |_| false,
+        );
+        assert_eq!(stage.stage, WorkStage::Unknown);
     }
 }

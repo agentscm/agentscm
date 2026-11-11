@@ -882,7 +882,13 @@ async fn overview(
             overview.show(Viewer(&principal.owner.id));
             // Stages are opt-in: an older client decodes the overview strictly.
             let value = if stages {
-                super::work_reconcile::overview_with_stages(&*store, &principal, &overview, now).0
+                {
+                    let staged: Vec<_> = overview.current.iter().collect();
+                    super::work_reconcile::overview_with_stages(
+                        &*store, &principal, &overview, &staged, now,
+                    )
+                    .value
+                }
             } else {
                 serde_json::to_value(&overview).unwrap_or(Value::Null)
             };

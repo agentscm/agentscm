@@ -884,13 +884,14 @@ pub trait Store: Send + Sync {
         pull_number: i64,
     ) -> Result<Vec<CatchupMergeObservation>>;
     /// Retained provider merge facts for pull requests whose head branch is one of `branches`,
-    /// ordered by branch, newest merge first, at most 20 per branch (more are dropped), plus the
+    /// ordered by branch, newest merge first, at most `per_branch` for each (more are dropped), plus the
     /// branches that some merged pull request targeted (`is_base`). Rows recorded before the
     /// head repository was kept carry `same_repository_head: None`.
     fn catchup_branch_merges(
         &self,
         scope: &CatchupRepositoryScope,
         branches: &[String],
+        per_branch: usize,
     ) -> Result<super::catchup::BranchMergeRows>;
     /// Same-repository merges in `since..=until` whose head branch is the branch of a Work in
     /// the repository that was created before the merge, newest first, at most `limit`. A merge
