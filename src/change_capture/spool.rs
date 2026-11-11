@@ -2362,7 +2362,7 @@ impl LocalSpool {
 
     /// Lists sanitized unassociated hooks for local diagnosis only. There is deliberately no
     /// acknowledgement or reassociation API in schema v1; `upkeep` expires them after
-    /// `DEFERRED_KEEP_SECONDS` (unbound) or `DEFERRED_GAP_SECONDS` (bound to a target).
+    /// `DEFERRED_KEEP_SECONDS`, or `DEFERRED_GAP_SECONDS` when bound to an aliased target.
     pub fn deferred(&self, limit: usize) -> Result<Vec<DeferredHookV1>> {
         if limit == 0 || limit > MAX_PENDING_PAGE {
             return Err(CaptureError::Invalid(format!(
