@@ -5,7 +5,9 @@
 //! the hook goes on to register the prompt it is showing and to wait for an answer, all while
 //! the dialog stays usable in the session. Codex shows its own prompt only after this hook
 //! returns, so there the hook holds the prompt only while nobody is at the computer
-//! ([`presence`]), gives it back the moment someone is, and ends before Codex's limit for it. Everything the Hub is told about the tool is made on
+//! ([`presence`]), gives it back the moment someone is, and ends before Codex's limit for it.
+//! Where it does not hold the prompt it still offers it, and takes it back at once, so the Hub
+//! lists it as answered at the computer. Everything the Hub is told about the tool is made on
 //! this machine: its name, what to show of it (a command, a path, an address, with secrets
 //! redacted), what the person can pick (the host's own "do not ask again" suggestions, a
 //! question's options) and a salted hash of the tool input.
@@ -100,13 +102,24 @@ fn holds_prompt(agent: &str) -> bool {
 }
 
 /// Whether the prompt's asker can be offered: the lead always; a subagent only with an id the
-/// Hub takes, only where its dialog is on screen while this hook waits, and only in Claude
-/// Code, the one host that was measured for.
+/// Hub takes, and in Claude Code only where its dialog is on screen while this hook waits. A
+/// host that holds its prompt never has a subagent's held ([`may_hold`]), so there it is only
+/// listed.
 fn asker_fits(agent: &str, payload: &Value, entrypoint: Option<&str>) -> bool {
     match payload["agent_id"].as_str() {
         None | Some("") => true,
-        Some(_) => agent == "claude" && agent_id_of(payload).is_some() && asks_its_app(entrypoint),
+        Some(_) => {
+            agent_id_of(payload).is_some() && (holds_prompt(agent) || asks_its_app(entrypoint))
+        }
     }
+}
+
+/// Whether this hook may hold a prompt its host shows only after the hook returns: never for a
+/// subagent, whose request names the session it runs in. A subagent's type with no id would
+/// otherwise read as the lead's prompt.
+fn may_hold(agent: &str, payload: &Value) -> bool {
+    let named = |key: &str| payload[key].as_str().is_some_and(|text| !text.is_empty());
+    holds_prompt(agent) && !named("agent_id") && !named("agent_type")
 }
 
 /// Whether the host asks an app for permission while this hook still waits, so a subagent's
@@ -919,12 +932,11 @@ pub(super) async fn await_answer(
 
 async fn run(agent: &str, payload: &Value, started: Instant) -> Option<Value> {
     let started_under = parent();
-    // Waiting would hide the prompt from a person at the computer: it is theirs at once, and
-    // also where the computer cannot say whether anyone is there.
+    // Waiting would hide the prompt from a person at the computer: it is theirs at once, also
+    // where the computer cannot say whether anyone is there, and always for a subagent. The Hub
+    // still lists it, as answered at the computer.
     let held = holds_prompt(agent);
-    if held && !presence::away().await {
-        return None;
-    }
+    let hold = may_hold(agent, payload) && presence::away().await;
     let routed = super::route_client(agent, payload).ok()?;
     let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
     if token.is_empty() {
@@ -986,6 +998,9 @@ async fn run(agent: &str, payload: &Value, started: Instant) -> Option<Value> {
     let (mut id, mut unconfirmed) = registered(reply, &hash)?;
     if held && unconfirmed {
         return None;
+    }
+    if held && !hold {
+        return released(&hub, &id, &hash, &offer, payload).await;
     }
     let mut offered_again: Option<Instant> = None;
     let until = started + bound(agent);
@@ -1136,13 +1151,18 @@ mod tests {
             );
             // The lead's prompt is offered wherever the host runs.
             assert!(asker_fits("claude", &prompt, entrypoint), "{entrypoint:?}");
-            // Only Claude Code was measured for a subagent's prompt.
-            assert!(
-                !asker_fits("codex", &subagent, entrypoint),
-                "{entrypoint:?}"
-            );
+            // A Codex subagent's prompt is offered, to be listed, wherever Codex runs.
+            assert!(asker_fits("codex", &subagent, entrypoint), "{entrypoint:?}");
             assert!(asker_fits("codex", &prompt, entrypoint), "{entrypoint:?}");
         }
+        // Only the lead's Codex prompt is ever held: a subagent's, by its id or by its type
+        // alone, is listed and left to the session.
+        assert!(may_hold("codex", &prompt));
+        assert!(!may_hold("codex", &subagent));
+        let mut typed_only = prompt.clone();
+        typed_only["agent_type"] = json!("worker");
+        assert!(!may_hold("codex", &typed_only));
+        assert!(!may_hold("claude", &prompt));
         // An empty id is the lead; an id the Hub would not take is nobody's prompt to offer.
         subagent["agent_id"] = json!("");
         assert!(asker_fits("claude", &subagent, Some("cli")));

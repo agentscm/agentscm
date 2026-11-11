@@ -308,3 +308,100 @@ async fn a_connected_app_lists_and_answers_its_persons_prompt_and_nothing_else_d
         (&json!("answered"), &json!("deny"))
     );
 }
+
+/// A Codex approval request: Codex shows its prompt only after the hook returns, so the request
+/// is pending at once, not on screen, and answerable from the app until its hook takes it back.
+/// After that it is still listed, as on the computer, and an answer is refused.
+#[tokio::test]
+async fn a_held_codex_request_is_listed_until_its_hook_takes_it_back_and_then_refused() {
+    let dir = TempDir::new().unwrap();
+    let base = fake_forge().await;
+    let store = store::open(&format!(
+        "sqlite://{}",
+        dir.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let hub = hub(&dir, store.clone(), &base).await;
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: base.trim_start_matches("http://").to_owned(),
+        user_id: 7,
+    };
+    let alice = store.upsert_user(&identity, "alice").unwrap().id;
+    let app = "a".repeat(64);
+    store
+        .insert_device(
+            &alice,
+            "laptop",
+            &device_digest(&app).unwrap(),
+            None,
+            Some("example-app"),
+            unix_now(),
+        )
+        .unwrap();
+    let (_, agent, _) =
+        mint_bound_agent_token(&*store, &alice, "codex", REPO, REPO_ID, 3600, false).unwrap();
+    let agent = agent.expose().to_owned();
+    let session = "11111111-2222-3333-4444-555555555555";
+    let prompt =
+        json!({"hook_event_name": "PermissionRequest", "session_id": session, "tool_name": "Bash"});
+    let hook = "/v1/hub/hook/codex";
+    assert_eq!(
+        call(&hub, Method::POST, hook, &agent, Some(prompt)).await.0,
+        200
+    );
+    let hash = "d".repeat(64);
+    let register = json!({"session": session, "tool": "Bash", "display": "cargo publish",
+        "complete": true, "input_hash": hash, "takes_reason": true, "held": true});
+    let path = "/v1/hub/permission/register";
+    let (status, made) = call(&hub, Method::POST, path, &agent, Some(register)).await;
+    assert_eq!((status, &made["state"]), (200, &json!("pending")), "{made}");
+    let id = made["request_id"].clone();
+    let listed = |hub: String, app: String| async move {
+        let (status, listed) = call(&hub, Method::GET, PERMISSIONS, &app, None).await;
+        assert_eq!(status, 200, "{listed}");
+        listed["requests"][0].clone()
+    };
+    let request = listed(hub.clone(), app.clone()).await;
+    assert_eq!(
+        (
+            &request["state"],
+            &request["on_screen"],
+            &request["display"]
+        ),
+        (&json!("pending"), &json!(false), &json!("cargo publish")),
+        "{request}"
+    );
+    // Someone is back at the computer: the hook takes the prompt back.
+    let release = json!({"request_id": id, "input_hash": hash, "release": true});
+    let path = "/v1/hub/permission/poll";
+    let (status, polled) = call(&hub, Method::POST, path, &agent, Some(release)).await;
+    assert_eq!(
+        (status, &polled["state"]),
+        (200, &json!("ended")),
+        "{polled}"
+    );
+    let request = listed(hub.clone(), app.clone()).await;
+    assert_eq!(
+        (
+            &request["state"],
+            &request["on_screen"],
+            &request["allowable"],
+            &request["display"]
+        ),
+        (
+            &json!("on_computer"),
+            &json!(true),
+            &json!(false),
+            &json!("cargo publish")
+        ),
+        "{request}"
+    );
+    let answer = json!({"repository": REPO, "request_id": id, "decision": "allow"});
+    let (status, refused) = call(&hub, Method::POST, ANSWER, &app, Some(answer)).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("on_computer")),
+        "{refused}"
+    );
+}

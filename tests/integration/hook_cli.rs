@@ -731,14 +731,22 @@ fn a_codex_approval_is_held_for_the_hub_only_while_nobody_is_at_the_computer() {
     });
     let (run, _) = prompt_of("codex", home(), hub, away, |_| {});
     assert_eq!(run.stdout, DENY_SAYING);
-    // Someone is at the computer, or the computer cannot say: the Hub is told of the wait and
-    // nothing more, and Codex shows its own prompt at once.
-    for here in ["1000", "unknown"] {
-        let hub = permission_hub(200, |hash| answered(hash, "allow"));
-        let (run, seen) = prompt_of("codex", home(), hub, &[(IDLE, here)], |_| {});
-        assert_eq!(run.stdout, "{}\n", "{here}");
-        assert!(offered(&seen, "/v1/hub/permission/").is_empty(), "{here}");
-        assert!(run.elapsed < Duration::from_secs(5), "{here}");
+    // Someone is at the computer, the computer cannot say, or a subagent asks: the request is
+    // offered and taken back at once, so the Hub lists it as answered at the computer, and
+    // Codex shows its own prompt.
+    let lead: fn(&mut Value) = |_| {};
+    let subagent: fn(&mut Value) = |payload| payload["agent_id"] = json!("sub-1");
+    for (idle, edit) in [("1000", lead), ("unknown", lead), ("600000", subagent)] {
+        let hub = permission_hub(200, |hash| polled(hash, "ended", None));
+        let (run, seen) = prompt_of("codex", home(), hub, &[(IDLE, idle)], edit);
+        assert_eq!(run.stdout, "{}\n", "{idle}");
+        let registered = offered(&seen, "/v1/hub/permission/register");
+        assert_eq!(registered.len(), 1, "{idle}");
+        assert_eq!(registered[0]["held"], true, "{idle}");
+        let polls = offered(&seen, "/v1/hub/permission/poll");
+        assert_eq!(polls.len(), 1, "{idle}");
+        assert_eq!(polls[0]["release"], true, "{idle}");
+        assert!(run.elapsed < Duration::from_secs(5), "{idle}");
     }
     // Nobody answers: before Codex would stop the hook it takes the prompt back, so the Hub
     // stops offering it, and prints no decision.

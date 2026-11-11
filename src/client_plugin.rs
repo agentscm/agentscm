@@ -1173,6 +1173,11 @@ mod tests {
         assert_eq!(compat["interface"]["displayName"], "AgentSCM");
         let hooks = read("agentscm/hooks/hooks.json");
         assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        // Codex's default limit, half a minute past the hook's own bound for a held approval.
+        assert_eq!(
+            hooks["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            600
+        );
         // The background waiter starts with the chat and again after each turn, only there.
         for event in ["SessionStart", "Stop"] {
             let wait = &hooks["hooks"][event][0]["hooks"][1];
