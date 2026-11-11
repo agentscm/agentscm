@@ -450,7 +450,9 @@ pub trait Store: Send + Sync {
     /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
     /// Work with no session row is still paused. If the pause fails nothing is written, so the
     /// intent stays held and the call can be repeated. `via` (`mcp` or `hook:<agent>`) names the
-    /// pause's operation, which is fixed by the Work's generation and sequence.
+    /// pause's operation, which is fixed by the Work's generation and sequence. A hook's end may
+    /// be only the gap between two turns of one session, so it leaves Work whose hold is live
+    /// active, renews its lease and writes no Work event; `mcp` always pauses.
     fn end_session_pausing(
         &self,
         token: &str,

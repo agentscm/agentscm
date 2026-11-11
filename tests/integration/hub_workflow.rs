@@ -1733,11 +1733,13 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
     assert_eq!(ended, json!({}));
 
     let work_path = format!("/v1/hub/standup/work/{work_id}");
-    let (status, paused) = hub.call(Method::GET, &work_path, &original, None).await;
-    assert_eq!(status, 200, "{paused}");
-    assert_eq!(paused["state"], "paused", "{paused}");
-    assert_eq!(paused["lead_session"], "default", "{paused}");
-    let (status, paused_edit) = hub
+    // The end may be only the gap between two turns: the Work's hold is live, so the Work stays
+    // active and the session that comes back edits on.
+    let (status, ended_work) = hub.call(Method::GET, &work_path, &original, None).await;
+    assert_eq!(status, 200, "{ended_work}");
+    assert_eq!(ended_work["state"], "active", "{ended_work}");
+    assert_eq!(ended_work["lead_session"], "default", "{ended_work}");
+    let (status, next_edit) = hub
         .call(
             Method::POST,
             hook_path,
@@ -1745,12 +1747,12 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
             Some(edit(
                 original_session,
                 "src/native-hook.rs",
-                "rejected-paused-edit",
+                "edit-after-session-end",
             )),
         )
         .await;
-    assert_eq!(status, 200, "{paused_edit}");
-    assert!(denied(&paused_edit), "{paused_edit}");
+    assert_eq!(status, 200, "{next_edit}");
+    assert!(!denied(&next_edit), "{next_edit}");
 
     let handed_over = hub
         .mcp(
@@ -1760,13 +1762,28 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
                 &work_id,
                 "native-hook-handover",
                 "default",
-                paused["updated_seq"].as_i64().unwrap(),
+                ended_work["updated_seq"].as_i64().unwrap(),
                 "handover",
                 "Ready for a successor",
             ),
         )
         .await;
     assert_eq!(handed_over["isError"], false, "{handed_over}");
+    // Handed over, the Work is no longer its old lead's to edit.
+    let (status, handed_over_edit) = hub
+        .call(
+            Method::POST,
+            hook_path,
+            &original,
+            Some(edit(
+                original_session,
+                "src/native-hook.rs",
+                "rejected-handed-over-edit",
+            )),
+        )
+        .await;
+    assert_eq!(status, 200, "{handed_over_edit}");
+    assert!(denied(&handed_over_edit), "{handed_over_edit}");
 
     let taken = hub
         .mcp(
