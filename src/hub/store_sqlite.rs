@@ -3324,61 +3324,6 @@ fn unfinished_for_session(
         .transpose()
 }
 
-/// The paused Work `session` leads that changed last, when its last report is the pause its own
-/// session end wrote and the Work's hold is still live. `None` while the session leads active
-/// or blocked Work: a returning session is not given a second.
-fn paused_by_session_end(
-    tx: &Transaction<'_>,
-    who: &WorkWho,
-    session: &str,
-    now: i64,
-) -> Result<Option<WorkItem>> {
-    if unfinished_for_session(tx, who, session, now)?.is_some() {
-        return Ok(None);
-    }
-    let snapshot: Option<String> = tx
-        .query_row(
-            "SELECT snapshot FROM hub_work_items
-             WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-               AND lead_token = ?5 AND lead_session = ?6 AND state = 'paused'
-             ORDER BY updated_seq DESC LIMIT 1",
-            params![
-                who.owner.identity.provider,
-                who.owner.identity.host,
-                who.repository,
-                who.repository_id,
-                who.token,
-                session
-            ],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(item) = snapshot
-        .map(|snapshot| json_value::<WorkItem>(&snapshot))
-        .transpose()?
-    else {
-        return Ok(None);
-    };
-    // Its last report, not its last change: a pull request the Hub linked since is no report.
-    let pause: Option<String> = tx
-        .query_row(
-            "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = ?1
-             ORDER BY event_seq DESC LIMIT 1",
-            [&item.id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let ended = pause.is_some_and(|operation| WorkCheckpoint::ended_its_session(&operation))
-        && item
-            .current
-            .as_ref()
-            .is_some_and(|report| report.summary == AUTO_PAUSE_SUMMARY);
-    // Only within the hold's own patience: a session that comes back after its hold lapsed may
-    // be back for something else, and its Work must not take its files again unasked.
-    let held = work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
-    Ok((ended && held).then_some(item))
-}
-
 /// The title of the unfinished Work this session leads that was updated last.
 fn lead_title(tx: &Transaction<'_>, token: &str, session: &str) -> Result<Option<String>> {
     Ok(tx
@@ -7698,7 +7643,14 @@ fn work_checkpoint_in(
     )?;
     item.state = checkpoint.state();
     item.claim_status = ClaimStatus::Active;
-    (item.last_checkin_at, item.reported_at) = checkpoint.check_in(&item, now);
+    item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
+        && checkpoint.summary == AUTO_PAUSE_SUMMARY
+    {
+        item.reported_at.or(Some(item.last_checkin_at))
+    } else {
+        None
+    };
+    item.last_checkin_at = now;
     item.next_action = checkpoint.next_action.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
@@ -8870,35 +8822,6 @@ impl Store for SqliteStore {
             work,
             paused,
         })
-    }
-
-    fn resume_ended_session(
-        &self,
-        token: &str,
-        session: Option<&str>,
-        via: &str,
-        now: i64,
-    ) -> Result<Option<WorkItem>> {
-        if let Some(session) = session {
-            check_name(session)?;
-        }
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        active_token(&tx, token, now)?;
-        let name = session_name(&tx, token, session, now)?;
-        let paused = match work_who(&tx, token, now) {
-            Ok(who) if !who.read_only => paused_by_session_end(&tx, &who, &name, now)?,
-            // A token that cannot report on Work resumes none.
-            Ok(_) | Err(HubError::Unauthorized) => None,
-            Err(error) => return Err(error),
-        };
-        let Some(item) = paused else {
-            return Ok(None);
-        };
-        let resumed =
-            work_checkpoint_in(&tx, token, &WorkCheckpoint::auto_resume(&item, via), now)?.item;
-        tx.commit()?;
-        Ok(Some(resumed))
     }
 
     fn ask_handoff_via(
@@ -15606,8 +15529,9 @@ impl Store for SqliteStore {
                     )?;
                 }
             }
-            // An open delivery pages the live tables, so one whose window starts below a raised
-            // floor would skip removed records; end it, and the agent's next read reports the gap.
+            // An open delivery pages the live tables, so one with unread records below a raised
+            // floor would skip them; end it, and the agent's next read reports the gap. One that
+            // already read past the floor keeps paging, even if its window started below it.
             let (event_cut, merge_cut) = delivery_cuts(
                 [
                     current_event_floor,
@@ -15621,7 +15545,8 @@ impl Store for SqliteStore {
             tx.execute(
                 "DELETE FROM hub_work_deliveries
                  WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-                   AND acknowledged = 0 AND from_seq < ?5",
+                   AND acknowledged = 0 AND (next_work_done = 0 OR next_after < through_seq)
+                   AND next_after < ?5",
                 params![
                     scope.provider,
                     scope.host,
@@ -15633,7 +15558,9 @@ impl Store for SqliteStore {
             tx.execute(
                 "DELETE FROM hub_catchup_deliveries
                  WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
-                   AND acknowledged=0 AND (event_from<?5 OR merge_from<?6)",
+                   AND acknowledged=0
+                   AND ((next_event_after<event_through AND next_event_after<?5)
+                     OR (next_merge_after<merge_through AND next_merge_after<?6))",
                 params![
                     scope.provider,
                     scope.host,

@@ -403,21 +403,6 @@ pub fn project_work(
                 )
             }
         }
-    } else if item.state == WorkState::Paused
-        && operational.reservation.status == ReservationStatus::Held
-        && item
-            .current
-            .as_ref()
-            .is_some_and(|report| report.summary == crate::hub::work::AUTO_PAUSE_SUMMARY)
-    {
-        // Paused only because its session ended, which a client that ends its session between
-        // turns does every turn. While its hold is live nothing is stuck: the hold's own
-        // lease, 20 minutes from that session's last call, is the patience it gets.
-        (
-            StatusState::Active,
-            lead(item),
-            "Its session ended without reporting an outcome and may be between turns. Its hold is still live, so the Work is not called quiet until the hold lapses.",
-        )
     } else if quiet {
         if wait == LeadWait::Unknown {
             (
@@ -1797,41 +1782,6 @@ mod tests {
         item.state = WorkState::Blocked;
         let blocked = row(&item, true, LeadWait::Waiting(WaitReason::Idle), "usr_lead");
         assert_eq!(blocked.state, StatusState::Blocked);
-    }
-
-    #[test]
-    fn work_paused_only_by_its_sessions_end_is_not_quiet_while_its_hold_is_live() {
-        let mut item = item(WorkState::Paused);
-        let report = |summary: &str| {
-            serde_json::from_value(json!({
-                "kind":"pause", "summary":summary, "next_action":null, "source_refs":[],
-                "at":100, "token":"tok_lead", "agent":"agent", "session":"session", "generation":1
-            }))
-            .unwrap()
-        };
-        let state = |item: &WorkItem, held| {
-            let wait = LeadWait::NotWaiting;
-            let row = project_work(item, op(item, held, false), None, wait, "usr_lead");
-            assert!(!row.needs_you);
-            (row.state, row.recipient.kind)
-        };
-        item.current = Some(report(crate::hub::work::AUTO_PAUSE_SUMMARY));
-        // It may only be between turns: while its hold is live nothing is stuck.
-        assert_eq!(
-            state(&item, true),
-            (StatusState::Active, RecipientKind::LeadAgent)
-        );
-        // The hold lapsed, so its session did not come back in time.
-        assert_eq!(
-            state(&item, false),
-            (StatusState::ReassessmentNeeded, RecipientKind::None)
-        );
-        // A pause the agent reported on purpose is quiet at once, held or not.
-        item.current = Some(report("Waiting for the review of pull request 12"));
-        assert_eq!(
-            state(&item, true),
-            (StatusState::ReassessmentNeeded, RecipientKind::None)
-        );
     }
 
     #[test]

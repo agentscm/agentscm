@@ -35,9 +35,9 @@ The Hub records three facts per session, in memory, from the session's own calls
 - the hook the session reports through (`hook:claude`, `hook:codex`, `hook:cursor`, `hook:copilot`, `hook:gemini`, `hook:generic`);
 - the agent token's label.
 
-After a Hub restart these facts are lost: a session's tier reads `unknown` until its next hook call.
+After a Hub restart these facts are lost: a session's tier reads `unknown` until its next hook call or AgentSCM tool call. Until a hooked session's next hook call, its next AgentSCM tool call can carry a message instead.
 
-Only the session a person leads is offered a message, never a subagent's. The evidence is a start, prompt or checked tool hook call from that session that carries no subagent marker (Claude Code's `agent_id`, Copilot's `agentId`). An MCP call is no evidence: a subagent makes its AgentSCM calls with its parent's session. So a client with only MCP and no hooks is never offered a message.
+A session is offered a message once it has shown itself in one of two ways. One is a start, prompt or checked tool hook call that carries no subagent marker (Claude Code's `agent_id`, Copilot's `agentId`). The other is an AgentSCM MCP tool call that names the session's `session`. A session whose hook carries context takes its messages only in its hook replies, where a subagent's call is told apart, never in an MCP result. An MCP call cannot say whether a subagent made it, because a subagent makes its AgentSCM calls with its parent's session. So a message delivered in an MCP result tells a subagent to leave it for the session that started it, and one left unanswered is offered again at a later call.
 
 From these facts the Hub derives the tier it can use:
 
@@ -45,8 +45,8 @@ From these facts the Hub derives the tier it can use:
 | --- | --- | --- |
 | `wake` | Claude Code with the AgentSCM plugin, while its background hook waits (seen within the last 90 seconds). | Within seconds, idle or busy: the hook wakes the session with the notice. |
 | `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
-| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). | At the session's next AgentSCM tool call, as an extra text block in the result. |
-| `unknown` | No top-level hook call seen since the Hub started, including every MCP-only client (Antigravity, Devin, Amp, opencode). | Use copy and paste from the Hub page. |
+| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. |
+| `unknown` | Nothing from the session itself since the Hub started, only its subagents' hook calls. | Nothing is offered until the session calls; use copy and paste from the Hub page meanwhile. |
 
 The tier follows the client, not the first call: a Claude Code session takes its messages in its hook replies even before its first prompt, never in an MCP result.
 
@@ -55,15 +55,15 @@ These client hooks use the `mcp` tier:
 - Copilot CLI's `preToolUse` has no context field.
 - Gemini CLI shows the hook's text to the person, not to the model.
 
-In the `mcp` tier the session is known to be a top-level one, but a single MCP call still cannot say whether a subagent made it, so the notice tells a subagent to leave the message for the session that started it.
+In the `mcp` tier a single MCP call cannot say whether a subagent made it, so the notice tells a subagent to leave the message for the session that started it.
 
 A refused edit's reply carries only the refusal, so a queued message waits for the next call. The start context is cut to fit the host's limit, so the Hub does not deliver a message there either. Each reply carries at most three messages.
 
 A message is never delivered:
 
-- to a subagent: hook calls from a subagent are skipped, and a session whose hook carries context takes its messages only there;
-- to a session without top-level evidence (tier `unknown`);
-- by an MCP call that names no `session`;
+- to a subagent's hook call: those are skipped, and a session whose hook carries context takes its messages only in its own hook replies (a subagent of a client without such a hook can receive one in an MCP result; its notice tells it to leave it);
+- to a session the Hub has heard nothing from itself since it started (tier `unknown`);
+- by an MCP call that names no `session`, or names the shared `default`, which is no one conversation;
 - in a hook reply whose outcome is unknown, because that reply's text may be dropped.
 
 A delivered message that is not answered within 60 seconds is offered again at the next call, in case the reply that carried it never reached the model. Only a message never delivered wakes a session, so an agent that does not answer is not woken again and again.
@@ -75,7 +75,7 @@ The Claude Code plugin that `agentscm client setup` installs adds a background h
 - The hook reads the session's id and directory from its input, finds the checkout's saved connection, and holds `POST /v1/hub/agent-messages/wait` open with the agent token, up to 25 seconds per request, then asks again.
 - When a message is sent, the Hub answers the waiting request at once with the same notice a hook reply carries and marks the message delivered via `wake:claude`, exactly as a hook reply would, so it is not delivered twice. The hook prints the notice and exits 2. The woken turn's `Stop` starts the next waiter.
 - The notice still proves nothing alone: the agent answers `accepted` with `agentscm_hub_message` and acts only on that reply.
-- The same wait also wakes a lead for a coordination request to Work it leads that it has neither acknowledged nor answered. The notice opens with `AgentSCM coordination request`, names the request, the Work, the requester and the files (filtered, never the request's title), and points at `agentscm_coordination_inbox`, `agentscm_coordination_ack` and `agentscm_coordination_reply`. The Hub reads the session's coordination inbox once per wait, so a new request wakes it within about 25 seconds, and wakes a session once per request: a lead that does not acknowledge it is not woken again at every turn (a Hub restart forgets this, so such a request wakes it once more). A wake whose answer never reaches the hook, because the wait was replaced or the connection dropped, is not repeated; the request still comes with the session's next hook reply or tool result. If a live lead has still not acknowledged it 10 minutes after it was made, its person is asked in the Hub's Needs you.
+- The same wait also wakes a lead for a coordination request to Work it leads that it has neither acknowledged nor answered. The notice opens with `AgentSCM coordination request`, names the request, the Work, the requester and the files (filtered, never the request's title), and points at `agentscm_coordination_inbox`, `agentscm_coordination_ack` and `agentscm_coordination_reply`, with the Work to pass as `target_work_id` on the acknowledgement and the reply: without it an acknowledgement is taken as the requester's and a lead's is refused. The Hub reads the session's coordination inbox once per wait, so a new request wakes it within about 25 seconds, and wakes a session once per request: a lead that does not acknowledge it is not woken again at every turn (a Hub restart forgets this, so such a request wakes it once more). A wake whose answer never reaches the hook, because the wait was replaced or the connection dropped, is not repeated; the request still comes with the session's next hook reply or tool result. If a live lead has still not acknowledged it 10 minutes after it was made, its person is asked in the Hub's Needs you, unless the request comes from another agent of that same person: such a request is never raised, and its notice does not say it will be.
 - A session can lead Work in another repository that its computer has connected: its calls about that repository go through that repository's own agent token, while its waiter waits with the token of the checkout the session runs in. So once per wait the Hub also reads the person's other live agent tokens on this Hub for Work that the same session leads with them, and wakes the session for a request there in the same way. That notice also names the repository and says to pass `root`, set to the session's checkout of it, on the three calls. The Hub reads with the person's own other token, checked as on that token's own call, and the Work's lead record must name that token and this session; the notice carries the request's id, the Work, the requester, the files and the repository's name, and no title. A session without a waiter gets the same notice where it gets a person's messages, in a prompt or checked tool call's reply or an AgentSCM tool result, read at most once every 25 seconds. A notice for a request in another repository that never reaches the model is not repeated in this one: the session sees the request at its next call in that repository, and its person is asked after 10 minutes.
 - One waiter runs per session. A later start for the same session finds the first one's lock file held and exits; on the Hub a newer wait for the same token and session replaces an older one, which ends empty and never takes a message.
 - A waiter ends silently (exit 0) when its 7 days are up, when the process that started it is gone, when its session ended (the plugin's `SessionEnd` hook runs `agentscm hook-wait claude --end`, which leaves an end marker the waiter sees before its next request, so `/clear` ends the old session's waiter too), when the checkout is not connected, when the person's mode is Ignore, when the token cannot receive messages, when the Hub does not serve the route, or when the Hub has been unreachable for 15 minutes. An error never wakes the session. The next turn's `Stop` starts a new waiter.
@@ -84,7 +84,7 @@ The Claude Code plugin that `agentscm client setup` installs adds a background h
 
 What this does not cover:
 
-- **Other hosts.** Only Claude Code has the background hook. Codex, Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next call, as in the tiers above.
+- **Other hosts.** Only Claude Code has the background hook. Codex, Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above.
 - **Sessions started before this change.** A session reads its plugin's hooks when it starts, so a session that was already running when the client was updated has no waiter until it restarts.
 - **Windows.** The waiter exits at once on Windows, because it cannot tell there when its session has ended. A Windows session gets its messages at its next hook or tool call.
 - **Requests in another repository, the cases not covered.** A session is woken for Work it leads in another repository only when both repositories are on the same Hub and the person's token for the other one is live and can write. The Hub reads the person's eight newest such tokens. A token that was replaced after the Work started is no longer read, so that Work's request waits for the session's next call in its repository. A session the Hub knows only by the shared name `default` is not looked up under other tokens, and two clients of one person that report the same session name can get each other's notice. In each case the lead's person is asked after 10 minutes as above.

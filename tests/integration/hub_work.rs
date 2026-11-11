@@ -705,110 +705,6 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
     assert_eq!(work_event_count(&*store, "work_started"), 3);
 }
 
-fn a_session_end_pause_ends_when_the_session_returns(db: &Db) {
-    let store = db.open();
-    let alice = agent(&*store, 1);
-    let now = unix_now();
-    store.observe_lease_clock(now).unwrap();
-    let begin = |key: &str| {
-        let mut start = native_start(key, "Between turns", key);
-        start.scope = vec![format!("{key}/**")];
-        store.work_start(&alice.token, &start, now).unwrap().item
-    };
-    let end = |session: &str, via: &str| {
-        store
-            .end_session_pausing(&alice.token, Some(session), via, now + 1)
-            .unwrap()
-            .paused
-    };
-    let back = |session: &str, at: i64| {
-        store
-            .resume_ended_session(&alice.token, Some(session), "hook:claude", at)
-            .unwrap()
-    };
-    let state = |id: &str| {
-        let item = store.work_get(&alice.token, id, now + 90).unwrap().unwrap();
-        item.state
-    };
-
-    // A client that ends its session between turns: the end pauses its Work, and the same
-    // session's next start returns it to active with what it meant to do next.
-    let turns = begin("turns");
-    assert!(end("turns", "hook:claude"));
-    assert_eq!(state(&turns.id), WorkState::Paused);
-    let resumed = back("turns", now + 60).unwrap();
-    assert_eq!(resumed.id, turns.id);
-    assert_eq!(resumed.state, WorkState::Active);
-    assert_eq!(resumed.next_action, turns.next_action);
-    // The pause and the return are the Hub's words, not check-ins: the Work reads as it did
-    // before its session ended, so a merge or a long silence since still counts.
-    assert_eq!(
-        (resumed.last_checkin_at, resumed.reported_at),
-        (turns.last_checkin_at, None)
-    );
-    // Nothing is left to resume, and another session's start resumes nothing.
-    assert!(back("turns", now + 61).is_none());
-    assert!(end("turns", "hook:claude"));
-    assert!(back("another", now + 62).is_none());
-    let paused = store.work_get(&alice.token, &turns.id, now + 90).unwrap();
-    let paused = paused.unwrap();
-    assert_eq!(paused.state, WorkState::Paused);
-    assert_eq!(paused.reported_at, Some(turns.last_checkin_at));
-    // The next turn does the same again.
-    let again = back("turns", now + 63).unwrap();
-    assert_eq!(
-        (again.state, again.last_checkin_at),
-        (WorkState::Active, turns.last_checkin_at)
-    );
-    assert!(end("turns", "hook:claude"));
-
-    // The agent's own `done` writes the same pause on purpose: it stays.
-    let done = begin("done");
-    assert!(end("done", "mcp"));
-    assert!(back("done", now + 60).is_none());
-    assert_eq!(state(&done.id), WorkState::Paused);
-
-    // So does a pause the agent reported in its own words.
-    let reported = begin("reported");
-    let mut pause = checkpoint(
-        &reported.id,
-        "reported-pause",
-        reported.generation,
-        "reported",
-        CheckpointKind::Pause,
-        "Waiting for the owner to choose a region",
-    );
-    pause.expected_updated_seq = Some(reported.updated_seq);
-    store
-        .work_checkpoint(&alice.token, &pause, now + 1)
-        .unwrap();
-    assert!(back("reported", now + 60).is_none());
-    assert_eq!(state(&reported.id), WorkState::Paused);
-
-    // A session that leads other active Work by then is not given a second.
-    let old = begin("busy");
-    assert!(end("busy", "hook:claude"));
-    let mut next = native_start("busy-next", "Next task", "busy");
-    next.scope = vec!["busy-next/**".into()];
-    store.work_start(&alice.token, &next, now + 2).unwrap();
-    assert!(back("busy", now + 60).is_none());
-    assert_eq!(state(&old.id), WorkState::Paused);
-
-    // A session that comes back after its hold lapsed may be back for something else: its
-    // Work does not take its files again unasked.
-    let late = begin("late");
-    assert!(end("late", "hook:claude"));
-    let lapsed = now + 2 * LEASE;
-    let mut at = now;
-    while at < lapsed {
-        at = (at + LEASE / 2).min(lapsed);
-        store.observe_lease_clock(at).unwrap();
-    }
-    assert!(back("late", lapsed).is_none());
-    let late = store.work_get(&alice.token, &late.id, lapsed).unwrap();
-    assert_eq!(late.unwrap().state, WorkState::Paused);
-}
-
 fn the_overview_lists_newest_work_first_and_pages(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -1954,6 +1850,78 @@ fn concurrent_deliveries_and_acks_are_monotonic_and_retryable(db: &Db) {
     }
 }
 
+fn a_reader_past_the_floor_is_not_ended_by_later_compactions(db: &Db) {
+    let store = db.open();
+    let lead = agent(&*store, 1);
+    let now = unix_now();
+    let old = now - 200_000;
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let started = store
+        .work_start(
+            &lead.token,
+            &native_start("floor", "Floor work", "floor-session"),
+            old,
+        )
+        .unwrap()
+        .item;
+    let mut seq = started.updated_seq;
+    let mut progress = |id: &str, at: i64| {
+        let mut request = checkpoint(
+            &started.id,
+            id,
+            1,
+            "floor-session",
+            CheckpointKind::Progress,
+            id,
+        );
+        request.expected_updated_seq = Some(seq);
+        seq = store
+            .work_checkpoint(&lead.token, &request, at)
+            .unwrap()
+            .item
+            .updated_seq;
+    };
+    progress("first", old + 10);
+    progress("second", old + 100);
+    progress("third", old + 200);
+    progress("fourth", now - 10);
+    // The first pass raises the floor; then a reader whose cursor is still at 0, below it, reads
+    // its whole delivery and is told of the gap.
+    let first = store.work_compact(&scope, old + 50, true, now).unwrap();
+    assert!(first.applied);
+    let read = store
+        .work_briefing(&lead.token, &BriefingQuery::default(), now)
+        .unwrap();
+    assert!(read.complete);
+    assert!(
+        read.retention_gap,
+        "the reader learns its cursor is below the floor"
+    );
+    // Two later passes raise the floor again. Its window still starts at 0, but it read past each
+    // floor, so it is not ended and can be acknowledged.
+    let mut floor = first.retention_floor;
+    for before in [old + 150, old + 250] {
+        let pass = store.work_compact(&scope, before, true, now).unwrap();
+        assert!(pass.applied);
+        assert!(pass.retention_floor > floor, "each pass raises the floor");
+        floor = pass.retention_floor;
+    }
+    store
+        .work_ack(
+            &lead.token,
+            &BriefingAck {
+                delivery: read.delivery.unwrap(),
+            },
+            now,
+        )
+        .unwrap();
+}
+
 fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     let store = db.open();
     let lead = agent(&*store, 1);
@@ -2057,10 +2025,17 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
         repository_id: Some(REPOSITORY_ID),
     };
     let open = store
-        .work_briefing(&lead.token, &BriefingQuery::default(), now)
+        .work_briefing(
+            &lead.token,
+            &BriefingQuery {
+                limit: 1,
+                ..BriefingQuery::default()
+            },
+            now,
+        )
         .unwrap();
-    assert!(open.complete);
-    // An open delivery no longer blocks compaction; the delivery it cuts is ended below.
+    assert!(!open.complete);
+    // An open delivery no longer blocks compaction; this half-read one is ended below.
     let open_delivery = open.delivery.unwrap();
 
     let preview = store
@@ -2083,7 +2058,7 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     assert_eq!(compacted.deleted_operations, 1);
     assert_eq!(compacted.deleted_versions, 1);
     assert_eq!(compacted.retention_floor, baseline.receipt.event_seq);
-    // Its window started below the raised floor, so acknowledging it now fails.
+    // It has unread records below the raised floor, so acknowledging it now fails.
     assert_invalid(
         store.work_ack(
             &lead.token,
@@ -2637,7 +2612,6 @@ conformance!(
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
-    a_session_end_pause_ends_when_the_session_returns,
     the_overview_lists_newest_work_first_and_pages,
     a_description_is_kept_from_creation_and_read_back,
     authorization_and_claim_projection_keep_old_claims_visible,
@@ -2650,6 +2624,7 @@ conformance!(
     forge_issue_ids_are_canonical_positive_decimals,
     concurrent_deliveries_and_acks_are_monotonic_and_retryable,
     compaction_preserves_baselines_and_expires_old_receipts,
+    a_reader_past_the_floor_is_not_ended_by_later_compactions,
     checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline,
     compaction_delete_exception_is_exact_and_updates_remain_prohibited,
     postgres_read_briefings_share_the_repository_maintenance_lock,

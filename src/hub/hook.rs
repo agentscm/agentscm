@@ -975,18 +975,8 @@ impl Call {
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
                 let requested = self.session.clone();
-                let via = self.via.clone();
                 let briefing = blocking(state, move || {
                     let now = unix_now();
-                    // A session that comes back was between turns, so the Work its own end
-                    // paused goes on. A start that names no session resumes none, as its end
-                    // pauses none. Best effort: the start is answered either way.
-                    if requested.is_some()
-                        && let Err(error) =
-                            store.resume_ended_session(&token, requested.as_deref(), &via, now)
-                    {
-                        crate::hub::error_envelope::log_internal(&error);
-                    }
                     let subscriber = store.session_name_for(&token, requested.as_deref(), now)?;
                     let briefing =
                         store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?;

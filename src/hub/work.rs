@@ -234,7 +234,6 @@ pub struct WorkItem {
     pub last_checkin_at: i64,
     /// Set only on the automatic pause written at session end: the last check-in time before it.
     /// Later auto-pauses keep it, so the pause does not make the session look newly checked in.
-    /// The report of that session's return puts it back as the last check-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<i64>,
     pub generation: i64,
@@ -310,10 +309,11 @@ pub struct WorkCompaction {
     pub merge_retention_floor: i64,
 }
 
-/// Which open deliveries a compaction ends: those whose event window starts below the first
-/// returned seq, or whose merge window starts below the second. Each floor is compared with its
-/// own old value and the highest raised one cuts; a pass that raised none returns 0, so a
-/// delivery that reads nothing removed keeps paging.
+/// The floors below which a compaction ends open deliveries: one that still has unread events
+/// below the first returned seq, or unread merges below the second. A delivery that already read
+/// past a floor keeps paging and is not ended again by later passes; each of its pages reports the
+/// gap while its window starts below the floor. Each floor is compared with its own old value and
+/// the highest raised one cuts; a pass that raised none returns 0.
 pub fn delivery_cuts(
     old_event_floors: [i64; 3],
     new_event_floors: [i64; 3],
@@ -568,9 +568,6 @@ pub const MAX_WORK_SEARCH: usize = 50;
 /// Summary of the pause checkpoint written when a session ends without a reported outcome. Work
 /// holding it is not settled by a merge that predates the session's last check-in.
 pub(super) const AUTO_PAUSE_SUMMARY: &str = "Session ended without a reported final work outcome.";
-
-/// Summary of the report written when the session whose end paused Work starts again.
-pub(super) const AUTO_RESUME_SUMMARY: &str = "Session returned; the Work its end paused goes on.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -844,44 +841,6 @@ impl WorkCheckpoint {
             source_refs: Vec::new(),
             depends_on: item.depends_on.clone(),
             related_work: item.related_work.clone(),
-        }
-    }
-
-    /// Whether `operation_id` is the pause a session's own end wrote through its hook. The pause
-    /// an agent asks for with `done` is written the same way under `mcp`, and is a pause on
-    /// purpose.
-    pub(super) fn ended_its_session(operation_id: &str) -> bool {
-        operation_id.starts_with("hook:") && operation_id.contains("-done-")
-    }
-
-    /// The Work's `last_checkin_at` and `reported_at` once this checkpoint is written at `now`.
-    /// A checkpoint is the lead's check-in, except the two the Hub writes for it. The pause a
-    /// session end writes sets the pause's time aside from the lead's own last check-in, which
-    /// `reported_at` keeps. The report of that session's return puts that check-in back, so the
-    /// Work reads as it did before its session ended: the return is not a check-in either, and
-    /// a merge or a long silence since the lead's own report still counts.
-    pub(super) fn check_in(&self, item: &WorkItem, now: i64) -> (i64, Option<i64>) {
-        match (self.kind, self.summary.as_str()) {
-            (CheckpointKind::Pause, AUTO_PAUSE_SUMMARY) => {
-                (now, item.reported_at.or(Some(item.last_checkin_at)))
-            }
-            (CheckpointKind::Progress, AUTO_RESUME_SUMMARY) => {
-                (item.reported_at.unwrap_or(item.last_checkin_at), None)
-            }
-            _ => (now, None),
-        }
-    }
-
-    /// The report that returns Work to active when the session whose end paused it starts again:
-    /// it was between turns. Like that pause it keeps the next action and relations, and any
-    /// change to the Work since fences it.
-    pub(super) fn auto_resume(item: &WorkItem, via: &str) -> Self {
-        Self {
-            operation_id: format!("{via}-back-{}-{}", item.generation, item.updated_seq),
-            kind: CheckpointKind::Progress,
-            summary: AUTO_RESUME_SUMMARY.into(),
-            next_action: item.next_action.clone(),
-            ..Self::auto_pause(item, via)
         }
     }
 

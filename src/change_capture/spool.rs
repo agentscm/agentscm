@@ -19,7 +19,7 @@ use crate::change_capture::{CaptureError, Result};
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionStartV1, ArtifactMediaV1, ArtifactRefV1, CaptureBatchV1,
     CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1, ContentAvailabilityV1, CoverageV1,
-    RetentionClassV1, SourceBindingV1, ToolKindV1,
+    GapReasonV1, RetentionClassV1, SourceBindingV1, ToolKindV1,
 };
 use crate::checks::sha256;
 
@@ -38,7 +38,12 @@ pub const MIN_ACTION_CAPTURE_BYTES: u64 = 64 * 1024;
 const BASE_METADATA_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
 const BASE_METADATA_RESERVE_RECORDS: usize = 256;
 const MAX_DEFERRED_BYTES: u64 = 64 * 1024;
-const MAX_COMPACTION_PAGE: usize = 100;
+const MAX_COMPACTION_PAGE: usize = 500;
+/// The refusals of a spool with no room left, as opposed to any other bound.
+const STORE_RECORDS_FULL: &str =
+    "local capture spool record limit reached; acknowledge/export or increase the explicit limit";
+const STORE_BYTES_FULL: &str =
+    "local capture spool byte limit reached; no retained data was evicted";
 const MAX_EXPORT_ANCHOR_ATTEMPTS: usize = 8;
 const SPOOL_DIRECTORIES: [&str; 11] = [
     "artifacts",
@@ -146,11 +151,24 @@ impl SpoolUsage {
     }
 }
 
+/// The reason a gap gives for an event the spool refused with `CaptureError::Limit(message)`:
+/// `local_retention_expired` when the spool had no room, so the Hub can say this computer's store
+/// was full, and `capture_interrupted` for any other bound.
+pub(crate) fn limit_gap_reason(message: &str) -> GapReasonV1 {
+    if message == STORE_RECORDS_FULL || message == STORE_BYTES_FULL {
+        GapReasonV1::LocalRetentionExpired
+    } else {
+        GapReasonV1::CaptureInterrupted
+    }
+}
+
 /// Sanitized deferred hooks kept without a target, and for how long; target-bound ones are kept
 /// until their session can have emitted its gap. See `LocalSpool::prune_deferred`.
 pub const DEFERRED_KEEP: usize = 256;
 pub const DEFERRED_KEEP_SECONDS: i64 = 24 * 60 * 60;
 pub const DEFERRED_GAP_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// How long a tool call's claim waits for its other phase. See `LocalSpool::expire_claims`.
+pub const CLAIM_KEEP_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1631,19 +1649,7 @@ impl LocalSpool {
             ));
         }
         let _lock = self.lock()?;
-        for name in regular_file_names(&self.root.join("recipe-attempts"), self.limits.max_records)?
-        {
-            let bytes = read_bounded(
-                &self.root.join("recipe-attempts").join(name),
-                MAX_DEFERRED_BYTES,
-            )?;
-            let attempt: RecipeAttemptV1 = serde_json::from_slice(&bytes)?;
-            validate_recipe_attempt(&attempt)?;
-            if attempt.marker_id == marker_id {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(recipe_attempt_markers(&self.root, self.limits.max_records)?.contains(marker_id))
     }
 
     /// Revalidates the admitted managed Pre and writes the configured ActionStart while holding
@@ -2415,8 +2421,41 @@ impl LocalSpool {
         Ok(removed)
     }
 
-    /// Run at session start and turn end: past 80% of a limit, deletes deferred hooks nothing will
-    /// read (`prune_deferred`) and compacts one page of envelopes the Hub has accepted
+    /// Deletes tool-call claims older than `CLAIM_KEEP_SECONDS`. A claim only pairs a tool call's
+    /// Pre and Post hooks and is never sent to the Hub; one that waited a day lost its other phase
+    /// (an interrupted tool, a killed hook, an ended session) and nothing will complete it. A
+    /// phase that still arrives later starts a new claim. Legacy claims, and claims a recipe
+    /// attempt names (its reconciliation needs them), stay. Returns how many were deleted.
+    pub fn expire_claims(&self, now: i64) -> Result<usize> {
+        // Not the managed-capture lock: a Post hook holds it through a whole Git capture, and a
+        // claim this old has no phase in flight.
+        let _lock = self.lock()?;
+        let attempted = recipe_attempt_markers(&self.root, self.limits.max_records)?;
+        let directory = self.root.join("managed-invocations");
+        let mut removed = 0usize;
+        for name in regular_file_names(&directory, self.limits.max_records)? {
+            let path = directory.join(&name);
+            let marker: ManagedInvocationV1 =
+                serde_json::from_slice(&read_bounded(&path, MAX_DEFERRED_BYTES)?)?;
+            validate_managed_invocation(&marker)?;
+            if marker.version != 4
+                || now.saturating_sub(marker.observed_at) < CLAIM_KEEP_SECONDS
+                || attempted.contains(&marker.marker_id)
+            {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Run by the capture hook before it writes an event: past 80% of a limit, deletes deferred
+    /// hooks nothing will read (`prune_deferred`) and claims that lost their other phase
+    /// (`expire_claims`), and compacts one page of envelopes the Hub has accepted
     /// (`compact_acknowledged`, which never touches anything unaccepted). Answers whether the spool
     /// is still full afterwards. A failed prune does not stop compaction; its error is returned
     /// after compaction has run.
@@ -2425,14 +2464,17 @@ impl LocalSpool {
             return Ok(false);
         }
         let pruned = self.prune_deferred(now);
-        // One page a pass, so a hook stays inside its time; the next hook takes more. Nothing
-        // accepted means nothing to compact, so the full scan is skipped.
+        let expired = self.expire_claims(now);
+        // One page a pass frees up to twice its size in records, enough to take a full spool of
+        // accepted records below 80%. Nothing accepted means nothing to compact, so the full scan
+        // is skipped.
         let accepted = fs::read_dir(self.root.join("acknowledged"))
             .is_ok_and(|mut entries| entries.next().is_some());
         if accepted {
             self.compact_acknowledged(MAX_COMPACTION_PAGE)?;
         }
         pruned?;
+        expired?;
         Ok(self.usage()?.is_full())
     }
 
@@ -3186,8 +3228,8 @@ impl LocalSpool {
         Ok(AppendOutcome::Stored)
     }
 
-    /// Compacts acknowledged envelopes, when asked and from `upkeep` at session start and turn end
-    /// once the spool passes 80% of a limit. Ordinary event batches retain an exact
+    /// Compacts acknowledged envelopes, when asked and from `upkeep` before a captured event once
+    /// the spool passes 80% of a limit. Ordinary event batches retain an exact
     /// idempotency digest; replayable events and completed action pairs retain their full receipts
     /// so following state transitions and action continuity remain checkable. Pending envelopes,
     /// incomplete action starts, artifacts and deferred diagnostics are never removed.
@@ -3916,10 +3958,7 @@ impl LocalSpool {
                 .saturating_add(reserved_records)
                 > self.limits.max_records
             {
-                return Err(CaptureError::Limit(
-                    "local capture spool record limit reached; acknowledge/export or increase the explicit limit"
-                        .into(),
-                ));
+                return Err(CaptureError::Limit(STORE_RECORDS_FULL.into()));
             }
             let reserved_bytes = u64::try_from(outstanding_actions)
                 .unwrap_or(u64::MAX)
@@ -3930,9 +3969,7 @@ impl LocalSpool {
                 .saturating_add(reserved_bytes)
                 > self.limits.max_total_bytes
             {
-                return Err(CaptureError::Limit(
-                    "local capture spool byte limit reached; no retained data was evicted".into(),
-                ));
+                return Err(CaptureError::Limit(STORE_BYTES_FULL.into()));
             }
             Ok(())
         };
@@ -4772,6 +4809,18 @@ fn provider_history_gap_operation(operation_id: &str) -> bool {
 
 fn replayable_event_operation(operation_id: &str) -> bool {
     claimed_event_operation(operation_id) || provider_history_gap_operation(operation_id)
+}
+
+/// The claim ids that retained recipe attempts name. The caller holds the spool lock.
+fn recipe_attempt_markers(root: &Path, max_records: usize) -> Result<BTreeSet<String>> {
+    let mut markers = BTreeSet::new();
+    for name in regular_file_names(&root.join("recipe-attempts"), max_records)? {
+        let bytes = read_bounded(&root.join("recipe-attempts").join(name), MAX_DEFERRED_BYTES)?;
+        let attempt: RecipeAttemptV1 = serde_json::from_slice(&bytes)?;
+        validate_recipe_attempt(&attempt)?;
+        markers.insert(attempt.marker_id);
+    }
+    Ok(markers)
 }
 
 fn retain_compacted_envelope(envelope: &CaptureEnvelopeV1) -> bool {

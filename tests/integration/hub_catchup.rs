@@ -2705,6 +2705,110 @@ fn postgres_why_resolves_after_compaction() {
     why_resolves_after_compaction(&fixture);
 }
 
+/// Catch-up readers that read past each raised merge floor keep their delivery across passes,
+/// including one whose cursor sits exactly at the floor.
+fn catchup_reader_past_the_floor_is_kept(fixture: &Fixture) {
+    let now = unix_now();
+    let old = now - 200_000;
+    let owner = fixture.owner(46);
+    let token = fixture.token(&owner, "floor-reader", 146, false);
+    for (number, at) in [(1, old), (2, old + 100), (3, old + 200), (4, now)] {
+        let (observed, _) = merge(number, at);
+        fixture
+            .store
+            .record_catchup_merge(&scope(146), &observed, at)
+            .unwrap();
+    }
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(146),
+    };
+    let pass = |before: i64| {
+        let compacted = fixture
+            .store
+            .work_compact(&work_scope, before, true, now)
+            .unwrap();
+        assert!(compacted.applied);
+        compacted.merge_retention_floor
+    };
+    let read = |client: &str, limit: usize| {
+        fixture
+            .store
+            .work_catchup(
+                &token,
+                &CatchupQuery {
+                    // Each reader has its own cursor, so both can acknowledge.
+                    subscriber: format!("agent:{client}"),
+                    delivery_client: client.into(),
+                    limit,
+                    ..CatchupQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+    };
+    let first_floor = pass(old + 50);
+    // One reader reads everything; another stops after one merge, which the next pass removes.
+    let whole = read("whole", 50);
+    assert!(whole.complete);
+    assert!(
+        whole.retention.merge_gap,
+        "its cursor starts below the floor"
+    );
+    let partial = read("partial", 1);
+    assert!(!partial.complete);
+    let second_floor = pass(old + 150);
+    assert!(
+        second_floor > first_floor,
+        "the second pass raises the floor"
+    );
+    assert_eq!(
+        partial.next_merge_after, second_floor,
+        "the partial reader sits exactly at the floor"
+    );
+    // At the floor it has read everything removed, so it pages on to the end.
+    let rest = fixture
+        .store
+        .work_catchup(&token, &continuation(&partial, 50), now)
+        .unwrap();
+    assert!(rest.complete);
+    let third_floor = pass(old + 250);
+    assert!(
+        third_floor > second_floor,
+        "the third pass raises the floor"
+    );
+    for page in [&whole, &rest] {
+        let acked = fixture
+            .store
+            .work_catchup_ack(
+                &token,
+                &CatchupAck {
+                    delivery: page.delivery.clone(),
+                    expected_event_from: page.event_from,
+                    expected_merge_from: page.merge_from,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(acked.status, CatchupAckStatus::Advanced);
+    }
+}
+
+#[test]
+fn sqlite_catchup_reader_past_the_floor_is_kept() {
+    catchup_reader_past_the_floor_is_kept(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_catchup_reader_past_the_floor_is_kept() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    catchup_reader_past_the_floor_is_kept(&fixture);
+}
+
 #[test]
 fn sqlite_catchup_delivery_blocks_compaction_until_ack_or_expiry() {
     compaction_delivery_guard(&Fixture::sqlite());

@@ -1419,7 +1419,7 @@ pub async fn capture_status(root: &Path) -> Result<Value> {
             } else {
                 json!(mode)
             },
-            Some(sharing_state(mode, &binding, answer)),
+            Some(session_start_lines(mode, &binding, answer, full).join("\n\n")),
         )
     } else {
         let reason = hub
@@ -1819,6 +1819,25 @@ pub(crate) fn sharing_state(
             "{off}: {repo} does not share agent conversations. A repository admin or a Hub admin turns it on in the Hub's Settings."
         ),
     }
+}
+
+/// What session start says, and what `status` reports a session starting now would say: whether
+/// this session shares, why not when it does not, and a full store. A full store never says
+/// sharing is on: it records only gaps, so nothing of the conversation reaches the Hub.
+pub(crate) fn session_start_lines(
+    mode: CaptureModeV1,
+    binding: &CaptureBinding,
+    hub: SharingAnswer,
+    full: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !(full && mode == CaptureModeV1::SharedConversation) {
+        lines.push(sharing_state(mode, binding, hub));
+    }
+    if full {
+        lines.push(store_full(binding));
+    }
+    lines
 }
 
 /// Said when a capture store is still full after upkeep: capture records only gaps until it has
@@ -3345,6 +3364,84 @@ mod tests {
 
     fn saved_mode() -> CaptureModeV1 {
         load().unwrap()[0].capture_mode
+    }
+
+    #[test]
+    fn status_of_a_store_full_of_unaccepted_records_says_so_and_never_that_sharing_is_on() {
+        use agentscm::change_record::{
+            AgentHarnessV1, CaptureBatchV1, CaptureEnvelopeV1, CapturedEventKindV1,
+            CapturedEventV1, SCHEMA_VERSION_V1, SessionIdentityV1,
+        };
+        client_config::in_isolated_config_home(|config| {
+            let (root, agentscm) = connected_checkout(config);
+            let token = agentscm.join("token");
+            std::fs::write(&token, "agentscm_test_token\n").unwrap();
+            std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
+            let limits = SpoolLimits {
+                max_records: 64,
+                max_total_bytes: 64 * 1024 * 1024,
+                max_artifact_bytes: 1024 * 1024,
+            };
+            let spool = LocalSpool::open_with_limits(config.join("spool"), limits).unwrap();
+            let mut binding = recipe_binding(vec![]);
+            binding.root = root.clone();
+            binding.spool = spool.root().to_owned();
+            binding.spool_identity = Some(spool.identity());
+            binding.repository = "acme/widgets".into();
+            binding.hub = "http://127.0.0.1:9".into();
+            binding.capture_mode = CaptureModeV1::SharedConversation;
+            binding.spool_limits = limits;
+            save(&[binding]).unwrap();
+            // Records the Hub has not accepted, which upkeep never removes, until it refuses more.
+            let mut filled = false;
+            for n in 0..100 {
+                let envelope = CaptureEnvelopeV1::EventBatch(CaptureBatchV1 {
+                    schema_version: SCHEMA_VERSION_V1,
+                    operation_id: format!("op:{n}"),
+                    work_id: "wrk_fixture".into(),
+                    generation: 1,
+                    session: SessionIdentityV1 {
+                        harness: AgentHarnessV1::ClaudeCode,
+                        adapter_version: "1.0.0".into(),
+                        session_id: "session_fixture".into(),
+                        parent_session_id: None,
+                        capture_mode: CaptureModeV1::MetadataOnly,
+                    },
+                    events: vec![CapturedEventV1 {
+                        event_id: format!("event:{n}"),
+                        sequence: 1,
+                        observed_at: 1,
+                        kind: CapturedEventKindV1::SessionEnded,
+                        tool: None,
+                        artifact: None,
+                        setup: None,
+                        gap: None,
+                        boundary: None,
+                        subagent: None,
+                    }],
+                });
+                if spool.append(&envelope).is_err() {
+                    filled = true;
+                    break;
+                }
+            }
+            assert!(filled);
+            let status = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::capture_status(&root))
+                .unwrap();
+            assert_eq!(status["store_full"], true, "{status}");
+            let said = status["session_start"].as_str().unwrap();
+            assert!(said.contains("local capture store is full"), "{said}");
+            assert!(
+                said.contains("agentscm change-capture unconfigure --root"),
+                "{said}"
+            );
+            assert!(!said.contains("sharing is on"), "{said}");
+        });
     }
 
     #[test]

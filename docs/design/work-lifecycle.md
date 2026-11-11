@@ -192,27 +192,6 @@ to pause. If the completion fails, the release still runs and pauses the Work, a
 the completion's error, so the files are never left held; a retry completes the paused Work. After
 a completion, the session's next edit needs a new `agentscm_start`, and the reply says so.
 
-A session that starts again after its own end takes that Work up again. Some clients end the session
-after every turn, so for them the pause only means "between turns". When a hook's session start
-names a session, the Hub looks at the paused Work that session leads which changed last. If its last
-report is the pause that session's own hook end wrote, and its hold is still live, the Hub writes
-the progress report a lead would write, with the summary `Session returned; the Work its end paused
-goes on.`: the Work is active again and keeps its next action. The same start's touch then renews
-its lease, as for any active Work the session leads.
-
-Neither the pause nor the return is the lead's own check-in. The pause keeps the lead's last
-check-in time in `reported_at`; the return puts it back as `last_checkin_at` and clears
-`reported_at`. A resumed Work therefore reads as it did before its session ended: a pull request
-that merged meanwhile still hides or flags it, and a long silence since the lead's own report still
-counts as one.
-
-Nothing is resumed when the pause was reported on purpose (a pause checkpoint, or `agentscm_done`,
-whose pause is written under `mcp`), when the lead reported anything since, when its hold has lapsed
-(one lease after the session's end: 20 minutes, or 2 hours for a retained hold, so a session that
-comes back later takes no files again unasked), or while the session already leads other active or
-blocked Work. A start that names no session resumes nothing, as its end pauses nothing. The resume
-is best effort: a failure is logged and the start is answered.
-
 ## 6. The WorkOperationalV1 projection
 
 `WorkOperationalV1` has `schema_version: 2` and `deny_unknown_fields`; version 2 added the lease to `activity`. Fields: `work_id`, `state`, `generation`, `updated_seq`; `outcome` (`value` of `completed`, `abandoned`, `superseded`, `unstated` or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`); `reservation` (`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and kind of the last agent report); `freshness` (the existing claim status); `activity` (`live` or `lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at`, `lease_expires_at`, `lease_grace_at` (when the Hub last extended the lease after a restart or a clock gap, cleared by the next renewal, admission or decision), a reason that says what to do and who last extended the lease, and `coverage`: what renews the lead session's lease; `unknown` when nothing is held); `merge` (`hidden_by_merged_pr` and a status: `observed` when the legacy merged-branch predicate below matches, `none` only when the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies to the Work, otherwise `unknown`); `actionable` (a recipient of `lead`, `owner`, `admin` or `none`, with a reason); `remedies`; and `completeness` (`complete` and the list of `unknown` field names).
@@ -511,13 +490,6 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   it.
 - **Stopped on its own background work**, which will resume it: the row stays `active` and asks
   nobody.
-- **Paused only by its session's end**, with its hold still live: the row stays `active` and asks
-  nobody, because the session may only be between turns. The patience is the hold's own lease,
-  which the pause starts anew: 20 minutes from the session's end, or 2 hours for a retained hold.
-  Once the hold has lapsed the row is
-  `reassessment_needed` like any quiet Work, and Work that holds nothing gets no patience. The
-  pause `agentscm_done` writes is the same report and reads the same way; a pause reported in the
-  agent's own words is quiet at once.
 - **How long.** A wait for a person is believed until the session's next call or its end, for at
   most 24 hours and no longer than the agent token that reported it stays valid. A stop on
   background work is believed for 60 minutes (`IN_FLIGHT_CAP_SECONDS`), as long as a running shell

@@ -4730,8 +4730,8 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(page0["mode"], "manual", "{page0}");
     assert_eq!(page0["sessions"], json!([]));
 
-    // Gemini CLI: its initialize names it, its first call names its session. MCP alone does not
-    // show that a person leads the session rather than a subagent, so its tier is unknown.
+    // Gemini CLI: its initialize names it, its first call names its session. A call that names
+    // its session is enough to take messages in its tool results (tier mcp).
     mcp_call(
         &env,
         &alice_secret,
@@ -4744,7 +4744,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
     let seen = read().await;
     let session = seen["sessions"][0].clone();
-    assert_eq!(session["tier"], "unknown", "{seen}");
+    assert_eq!(session["tier"], "mcp", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4781,12 +4781,25 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // A call that names no session never takes it, and nor does a session shown only by MCP.
+    // A call that names no session never takes it.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
     let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
     assert!(!unnamed.contains(&id), "{unnamed}");
-    let held = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
-    assert!(!held.contains(&id), "{held}");
+
+    // Delivered once, in the session's next tool result with MCP alone, as a notice that names
+    // no mode and tells a subagent to leave it.
+    let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(text.contains("AgentSCM Hub message"), "{text}");
+    assert!(
+        text.contains(&id) && text.contains("status accepted"),
+        "{text}"
+    );
+    assert!(text.contains("A subagent leaves it"), "{text}");
+    assert!(!text.contains("their yes"), "{text}");
+    let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!again.contains(&id), "{again}");
+    assert_eq!(read().await["messages"][0]["state"], "delivered");
+    assert_eq!(read().await["messages"][0]["via"], "mcp");
 
     // Its hook's start carries no subagent marker, and that hook cannot carry context.
     let response = browser()
@@ -4800,19 +4813,6 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(response.status().as_u16(), 200);
     let seen = read().await;
     assert_eq!(seen["sessions"][0]["tier"], "mcp", "{seen}");
-
-    // Delivered once, in the next tool result, as a notice that names no mode.
-    let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
-    assert!(text.contains("AgentSCM Hub message"), "{text}");
-    assert!(
-        text.contains(&id) && text.contains("status accepted"),
-        "{text}"
-    );
-    assert!(!text.contains("their yes"), "{text}");
-    let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
-    assert!(!again.contains(&id), "{again}");
-    assert_eq!(read().await["messages"][0]["state"], "delivered");
-    assert_eq!(read().await["messages"][0]["via"], "mcp");
 
     // Only the receiving session answers, and only a real id verifies.
     let answer_id = |id: &str, status: &str| {

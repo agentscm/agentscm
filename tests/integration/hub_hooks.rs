@@ -650,21 +650,6 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
         .unwrap();
     assert_eq!(repeated.state, WorkState::Paused);
     assert_eq!(repeated.updated_seq, paused_seq);
-
-    // The same session starts again: it was between turns, so its Work goes on without a call
-    // from the agent, and still says what it meant to do next.
-    hub.hook("claude", &secret, &fixture("claude-SessionStart"));
-    let back = hub
-        .store
-        .work_get(&principal.token_id, &started.item.id, unix_now())
-        .unwrap()
-        .unwrap();
-    assert_eq!(back.state, WorkState::Active);
-    assert_eq!(
-        back.current.as_ref().unwrap().summary,
-        "Session returned; the Work its end paused goes on."
-    );
-    assert_eq!(back.next_action.as_deref(), Some("resume the hook tests"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
