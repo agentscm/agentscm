@@ -690,8 +690,9 @@ pub fn agent_tools() -> Value {
     tools(false, &ViewSettings::default(), false, true)
 }
 
-/// Every tool whose own arguments take `session`: what a Hub released before every tool listed
-/// it accepts `session` on. The local client sends `session` only to these until a Hub lists more.
+/// Every tool a read-write agent may call, listed before `session` is added to each: its schemas
+/// list `session` only where the tool's arguments take it, as a Hub released before #530 accepts
+/// it. The local client sends `session` only to those until a Hub lists more.
 pub fn session_agent_tools() -> Value {
     tool_list(false, &ViewSettings::default(), true, true)
 }
