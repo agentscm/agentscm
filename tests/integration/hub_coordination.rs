@@ -1866,3 +1866,370 @@ parity_case!(
     finished_default_alias,
     finished_default_work_binds_no_hook_session
 );
+
+fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
+    use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let other = token(&*store, 3, "other");
+    let now = unix_now();
+    let target = store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap()
+        .item;
+    let proposal = start("requester", "requester");
+    let request = store
+        .work_start(&requester, &proposal, now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let consent = WorkOverlapConsentRequest {
+        request_id: request.id.clone(),
+        target_work_id: target.id.clone(),
+        operation_id: "consent-1".into(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        target_generation: target.generation,
+        target_updated_seq: target.updated_seq,
+        paths: vec!["src/a.rs".into()],
+    };
+    assert!(matches!(
+        store.work_overlap_consent(&requester, &consent, now + 2),
+        Err(HubError::Unauthorized)
+    ));
+    assert!(matches!(
+        store.work_overlap_consent(&other, &consent, now + 2),
+        Err(HubError::Unauthorized)
+    ));
+    for paths in [
+        vec!["src/**".into()],
+        vec!["outside.rs".into()],
+        vec!["src/a.rs".into(), "src/a.rs".into()],
+    ] {
+        assert!(
+            store
+                .work_overlap_consent(
+                    &incumbent,
+                    &WorkOverlapConsentRequest {
+                        paths,
+                        ..consent.clone()
+                    },
+                    now + 2
+                )
+                .is_err()
+        );
+    }
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let before_charge = db.charged_bytes();
+    let before_recount = store.work_payload_used(&scope).unwrap();
+    let granted = store
+        .work_overlap_consent(&incumbent, &consent, now + 3)
+        .unwrap();
+    assert_eq!(
+        db.charged_bytes() - before_charge,
+        store.work_payload_used(&scope).unwrap() - before_recount
+    );
+    assert!(db.charged_bytes() > before_charge);
+    assert_eq!(granted.state, WorkOverlapConsentState::AwaitingRequester);
+    assert_eq!(granted.consent.paths, ["src/a.rs"]);
+    assert!(granted.consent.accepted.is_none());
+    let replay = store
+        .work_overlap_consent(&incumbent, &consent, now + 4)
+        .unwrap();
+    assert_eq!(granted, replay);
+    assert!(
+        store
+            .work_overlap_consent(
+                &incumbent,
+                &WorkOverlapConsentRequest {
+                    paths: vec!["src/b.rs".into()],
+                    ..consent.clone()
+                },
+                now + 4
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request.id, "requester", now + 4)
+            .unwrap(),
+        vec![granted.clone()]
+    );
+    assert!(matches!(
+        store.work_overlap_consents(&other, &request.id, "other", now + 4),
+        Err(HubError::Unauthorized)
+    ));
+    // Target consent by itself still grants no admission or reservation.
+    assert!(
+        !store
+            .work_start(&requester, &proposal, now + 5)
+            .unwrap()
+            .created
+    );
+    let progress = store
+        .work_checkpoint(
+            &incumbent,
+            &checkpoint(
+                &target.id,
+                "progress",
+                "lead",
+                target.updated_seq,
+                CheckpointKind::Progress,
+                None,
+            ),
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consent(&incumbent, &consent, now + 7)
+            .unwrap()
+            .state,
+        WorkOverlapConsentState::AwaitingRequester
+    );
+    // A scope change away and back must never revive this grant, even with the same lead.
+    let narrowed = store
+        .work_checkpoint(
+            &incumbent,
+            &checkpoint(
+                &target.id,
+                "narrow",
+                "lead",
+                progress.item.updated_seq,
+                CheckpointKind::Progress,
+                Some(&["src/a.rs"]),
+            ),
+            now + 8,
+        )
+        .unwrap();
+    let _restored = store
+        .work_checkpoint(
+            &incumbent,
+            &checkpoint(
+                &target.id,
+                "restore",
+                "lead",
+                narrowed.item.updated_seq,
+                CheckpointKind::Progress,
+                Some(&["src/**"]),
+            ),
+            now + 9,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consent(&incumbent, &consent, now + 10)
+            .unwrap()
+            .state,
+        WorkOverlapConsentState::Invalidated
+    );
+}
+
+fn named_overlap_consent_lapses_and_decline_revokes(db: &Db) {
+    use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
+    let store = db.open();
+    let incumbent = token(&*store, 11, "incumbent");
+    let requester = token(&*store, 12, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(&incumbent, &start("target", "lead"), now)
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(&requester, &start("requester", "requester"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let consent = WorkOverlapConsentRequest {
+        request_id: request.id.clone(),
+        target_work_id: target.id.clone(),
+        operation_id: "grant".into(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        target_generation: target.generation,
+        target_updated_seq: target.updated_seq,
+        paths: vec!["src/a.rs".into()],
+    };
+    let granted = store
+        .work_overlap_consent(&incumbent, &consent, now + 2)
+        .unwrap();
+    store
+        .coordination_reply(
+            &incumbent,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "decline".into(),
+                target_work_id: target.id.clone(),
+                session: "lead".into(),
+                expected_updated_seq: granted.consent.event_seq,
+                kind: CoordinationResponseKind::Decline,
+                note: Some("keep separate".into()),
+                via: agentscm::hub::handoff::Via::Agent,
+            },
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request.id, "requester", now + 4)
+            .unwrap()[0]
+            .state,
+        WorkOverlapConsentState::Invalidated
+    );
+    let request2 = store
+        .work_start(&requester, &start("requester2", "requester2"), now + 5)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let grant2 = WorkOverlapConsentRequest {
+        request_id: request2.id.clone(),
+        operation_id: "grant2".into(),
+        expected_updated_seq: request2.updated_seq,
+        ..consent.clone()
+    };
+    store
+        .work_overlap_consent(&incumbent, &grant2, now + 6)
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request2.id, "requester2", now + 1201)
+            .unwrap()[0]
+            .state,
+        WorkOverlapConsentState::Invalidated
+    );
+    // Simulate a reservation release/re-admission through the actual durable columns. The epoch
+    // must change even if the same principal and scope return before a later reader.
+    db.exec(&format!("UPDATE hub_work_items SET reservation_basis=NULL WHERE id='{}'; UPDATE hub_work_items SET reservation_basis='admitted',reservation_renewed_at={},reservation_expires_at={} WHERE id='{}'",target.id,now+1300,now+2500,target.id));
+    assert_eq!(
+        store
+            .work_overlap_consent(&incumbent, &grant2, now + 1301)
+            .unwrap()
+            .state,
+        WorkOverlapConsentState::Invalidated
+    );
+}
+
+parity_case!(
+    named_overlap_consent,
+    named_overlap_consent_is_fenced_and_not_an_admission
+);
+parity_case!(
+    named_overlap_invalidation,
+    named_overlap_consent_lapses_and_decline_revokes
+);
+
+fn named_overlap_concurrent_retries_keep_one_consent(db: &Db) {
+    use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
+    let store = db.open();
+    let incumbent = token(&*store, 21, "incumbent");
+    let helper = token(&*store, 21, "helper");
+    let requester = token(&*store, 22, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(&incumbent, &start("target", "lead"), now)
+        .unwrap()
+        .item;
+    let joined = store
+        .work_start(
+            &helper,
+            &start_scope(
+                "helper",
+                "helper",
+                WorkRole::Helper,
+                Some(&target.id),
+                &["src/**"],
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert!(joined.joined);
+    let target = joined.item;
+    let request = store
+        .work_start(&requester, &start("requester", "requester"), now + 2)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let consent = WorkOverlapConsentRequest {
+        request_id: request.id.clone(),
+        target_work_id: target.id.clone(),
+        operation_id: "concurrent".into(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        target_generation: target.generation,
+        target_updated_seq: target.updated_seq,
+        paths: vec!["src/a.rs".into()],
+    };
+    assert!(matches!(
+        store.work_overlap_consent(
+            &helper,
+            &WorkOverlapConsentRequest {
+                session: "helper".into(),
+                ..consent.clone()
+            },
+            now + 3
+        ),
+        Err(HubError::Unauthorized)
+    ));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        let tasks = (0..2)
+            .map(|_| {
+                let store = db.open();
+                let barrier = barrier.clone();
+                let consent = consent.clone();
+                let incumbent = incumbent.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .work_overlap_consent(&incumbent, &consent, now + 4)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results[0], results[1]);
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request.id, "requester", now + 5)
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .session_activity(
+            &incumbent,
+            &SessionCall {
+                session: Some("lead".into()),
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: true,
+            },
+            agentscm::hub::work_lifecycle::CallPhase::Start,
+            now + 90,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consent(&incumbent, &consent, now + 91)
+            .unwrap()
+            .state,
+        WorkOverlapConsentState::AwaitingRequester
+    );
+}
+
+parity_case!(
+    named_overlap_concurrency,
+    named_overlap_concurrent_retries_keep_one_consent
+);

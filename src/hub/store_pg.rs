@@ -141,6 +141,7 @@ use crate::local_ci::DeviceAuthorization;
 mod preflight;
 mod repository_rename;
 mod validation_evidence;
+mod work_overlap;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -2748,6 +2749,10 @@ fn work_payload_bytes(
                    JOIN hub_coordination_requests r ON r.id=s.request
                   WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
                     AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(c.payload)::bigint + octet_length(c.snapshot)::bigint + 512
+                   FROM hub_work_overlap_consents c JOIN hub_coordination_requests r ON r.id=c.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3 AND r.repository_id IS NOT DISTINCT FROM $4
                  UNION ALL
                  SELECT octet_length(o.payload)::bigint + 256
                    FROM hub_coordination_operations o
@@ -14738,6 +14743,23 @@ impl Store for PgStore {
         })
     }
 
+    fn work_overlap_consent(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView> {
+        self.overlap_consent(token, request, now)
+    }
+    fn work_overlap_consents(
+        &self,
+        token: &str,
+        request_id: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::work_overlap::WorkOverlapConsentView>> {
+        self.overlap_consents(token, request_id, session, now)
+    }
     fn coordination_reply(
         &self,
         token: &str,

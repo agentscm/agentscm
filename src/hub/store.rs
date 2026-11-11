@@ -1312,6 +1312,21 @@ pub trait Store: Send + Sync {
         ack: &CoordinationAck,
         now: i64,
     ) -> Result<CoordinationRequest>;
+    /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
+    fn work_overlap_consent(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView>;
+    /// Bounded current consent state, visible to the requester and affected current leads.
+    fn work_overlap_consents(
+        &self,
+        token: &str,
+        request_id: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::work_overlap::WorkOverlapConsentView>>;
     fn coordination_reply(
         &self,
         token: &str,
