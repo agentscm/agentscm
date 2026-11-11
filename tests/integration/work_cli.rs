@@ -299,6 +299,59 @@ fn conflict_result(output: &Output, expected: WorkConflictKind) -> WorkStartResu
     result
 }
 
+#[test]
+fn named_overlap_cli_roundtrip_and_dependency_projection() {
+    let hub = Hub::start();
+    let a = hub.bound_client(901, "first", 101);
+    let b = hub.bound_client(902, "second", 101);
+    let first=a.start(r#"{"request_key":"first","title":"First behavior","session":"first","scope":["src/shared.rs"]}"#);
+    assert!(first.status.success(), "{first:?}");
+    let target: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let second = serde_json::json!({"request_key":"second","title":"Second behavior","session":"second","scope":["src/shared.rs"]});
+    let refused = b.start(&second.to_string());
+    assert!(!refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let request = &refused["coordination_request"];
+    let grant=a.request("overlap-consent",&serde_json::json!({"request_id":request["id"],"target_work_id":target["item"]["id"],"operation_id":"grant","session":"first","expected_updated_seq":request["updated_seq"],"target_generation":target["item"]["generation"],"target_updated_seq":target["item"]["updated_seq"],"paths":["src/shared.rs"]}).to_string());
+    assert!(grant.status.success(), "{grant:?}");
+    let grant: serde_json::Value = serde_json::from_slice(&grant.stdout).unwrap();
+    let envelope = serde_json::json!({"start":second,"consent_ids":[grant["consent"]["id"]]});
+    let inspected = b.request("overlap-preflight", &envelope.to_string());
+    assert!(inspected.status.success(), "{inspected:?}");
+    let accepted = b.request("overlap-start", &envelope.to_string());
+    assert!(accepted.status.success(), "{accepted:?}");
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(accepted["created"], true);
+    let dependent=b.start(&serde_json::json!({"request_key":"dependent","title":"Use first behavior","session":"dependent","scope":["docs/dependent.md"],"depends_on":[target["item"]["id"]]}).to_string());
+    assert!(dependent.status.success(), "{dependent:?}");
+    let dependent: serde_json::Value = serde_json::from_slice(&dependent.stdout).unwrap();
+    assert_eq!(
+        dependent["preflight"]["dependencies"]["conditions"][0]["disposition"]["state"],
+        "unknown"
+    );
+    let notices = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args([
+            "work",
+            "dependency-notices",
+            "--session",
+            "first",
+            "--after",
+            "0",
+            "--limit",
+            "20",
+        ])
+        .env_clear()
+        .env("HOME", a.config.path())
+        .env("XDG_CONFIG_HOME", a.config.path())
+        .env("AGENTSCM_HUB_URL", &a.url)
+        .env("AGENTSCM_HUB_TOKEN_FILE", &a.token_file)
+        .output()
+        .unwrap();
+    assert!(notices.status.success(), "{notices:?}");
+    let notices: serde_json::Value = serde_json::from_slice(&notices.stdout).unwrap();
+    assert_eq!(notices["notices"].as_array().unwrap().len(), 1);
+}
+
 fn cli_error(output: &Output) -> serde_json::Value {
     assert!(!output.status.success(), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");

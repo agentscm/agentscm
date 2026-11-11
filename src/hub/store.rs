@@ -1332,6 +1332,14 @@ pub trait Store: Send + Sync {
     ) -> Result<WorkCheckpointResult>;
     /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
     /// Latest durable prerequisite notices for this session's current lead Work items.
+    /// Atomically reserves one bounded advisory summary attempt for this existing native session.
+    /// Does not acknowledge the retained notices; explicit reads remain independent and pure.
+    fn work_dependency_notice_delivery(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<super::work_dependencies::WorkDependencyNoticePage>>;
     fn work_dependency_notices(
         &self,
         token: &str,

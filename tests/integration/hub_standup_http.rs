@@ -102,6 +102,175 @@ fn start(key: &str) -> Value {
         "next_action": "Add boundary tests"})
 }
 
+async fn named_overlap_and_dependencies(hub: Hub) {
+    let (_, a) = hub.token(701, "acme/widgets", false).await;
+    let (_, b) = hub.token(702, "acme/widgets", false).await;
+    let (_, reader) = hub.token(703, "acme/widgets", true).await;
+    let first = json!({"request_key":"first","title":"First behavior","session":"first","scope":["src/shared.rs"]});
+    let (_, target) = hub
+        .call(Method::POST, "/v1/hub/standup/start", &a, Some(first))
+        .await;
+    assert_eq!(target["created"], true, "{target}");
+    let second = json!({"request_key":"second","title":"Second behavior","session":"second","scope":["src/shared.rs"]});
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &b,
+            Some(second.clone()),
+        )
+        .await;
+    assert_eq!(refused["created"], false);
+    let request = &refused["coordination_request"];
+    let consent = json!({"request_id":request["id"],"target_work_id":target["item"]["id"],"operation_id":"grant","session":"first","expected_updated_seq":request["updated_seq"],"target_generation":target["item"]["generation"],"target_updated_seq":target["item"]["updated_seq"],"paths":["src/shared.rs"]});
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/consent",
+            &reader,
+            Some(consent.clone()),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/consent",
+            &b,
+            Some(consent.clone()),
+        )
+        .await;
+    assert_ne!(status, 200);
+    let (status, granted) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/consent",
+            &a,
+            Some(consent),
+        )
+        .await;
+    assert_eq!(status, 200, "{granted}");
+    assert_eq!(granted["state"], "awaiting_requester");
+    let path = format!(
+        "/v1/hub/standup/overlap/consents?request_id={}&session=second",
+        request["id"].as_str().unwrap()
+    );
+    let (status, consents) = hub.call(Method::GET, &path, &b, None).await;
+    assert_eq!(status, 200, "{consents}");
+    assert_ne!(consents[0]["consent"]["target"]["lead"]["session"], "first");
+    assert_eq!(consents[0]["consent"]["requester"]["session"], "second");
+    let acceptance = json!({"start":second,"consent_ids":[granted["consent"]["id"]]});
+    let (status, inspected) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/preflight",
+            &b,
+            Some(acceptance.clone()),
+        )
+        .await;
+    assert_eq!(status, 200, "{inspected}");
+    assert_eq!(
+        inspected["scope_overlaps"][0]["agreed_paths"],
+        json!(["src/shared.rs"])
+    );
+    let (status, admitted) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/start",
+            &b,
+            Some(acceptance.clone()),
+        )
+        .await;
+    assert_eq!(status, 200, "{admitted}");
+    assert_eq!(admitted["created"], true);
+    let (_, retry) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/overlap/start",
+            &b,
+            Some(acceptance),
+        )
+        .await;
+    assert_eq!(retry["item"]["id"], admitted["item"]["id"]);
+    let (_, overview) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &a, None)
+        .await;
+    assert_eq!(
+        overview["overlaps"][0]["agreed_paths"],
+        json!(["src/shared.rs"])
+    );
+    // No shared file is required to declare and inspect a behavior prerequisite.
+    let dependent = json!({"request_key":"dependent","title":"Use first behavior","session":"dependent","scope":["docs/dependent.md"],"depends_on":[target["item"]["id"]]});
+    let (_, created) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &b,
+            Some(dependent.clone()),
+        )
+        .await;
+    assert_eq!(created["created"], true, "{created}");
+    assert!(created["preflight"].get("dependencies").is_none());
+    let (_, compatibility) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight",
+            &b,
+            Some(dependent.clone()),
+        )
+        .await;
+    assert!(compatibility.get("dependencies").is_none());
+    let (_, projection) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight?dependencies=1",
+            &b,
+            Some(dependent),
+        )
+        .await;
+    assert_eq!(
+        projection["dependencies"]["conditions"][0]["disposition"]["state"],
+        "unknown"
+    );
+    for (secret, session) in [(&a, "first"), (&b, "dependent")] {
+        let path = format!("/v1/hub/standup/dependency-notices?session={session}&after=0&limit=20");
+        let (status, page) = hub.call(Method::GET, &path, secret, None).await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["notices"].as_array().unwrap().len(), 1);
+        assert_eq!(page["latest_only"], true);
+        assert_eq!(page["atomic_snapshot"], false);
+        let (_, repeated) = hub.call(Method::GET, &path, secret, None).await;
+        assert_eq!(
+            page["notices"][0]["sequence"],
+            repeated["notices"][0]["sequence"]
+        );
+    }
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/preflight?dependencies=2",
+            &b,
+            Some(json!({"request_key":"flag","title":"Inspect flag","session":"flag","scope":["docs/flag.md"]})),
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_overlap_http_and_dependency_contract() {
+    named_overlap_and_dependencies(Hub::start(None).await).await;
+}
+
+#[test]
+fn postgres_named_overlap_http_and_dependency_contract() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        named_overlap_and_dependencies(Hub::start(Some(pg.url.clone())).await).await;
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn work_roundtrip_and_authorization() {
     roundtrip(Hub::start(None).await).await;

@@ -8,6 +8,9 @@ use super::intent::{overlaps, spec_key, text};
 use super::work::{WorkItem, validate_id};
 use super::{HubError, Result};
 
+/// Shared guidance used by the shipped skill and MCP server.
+pub const AGENT_GUIDANCE: &str = "Declare every file you intend to change. Do not omit shared store files to avoid overlap. For compatible work on the same named files, keep both reservations: obtain the coordination request from the refused start or scope checkpoint, ask its target lead to call agentscm_work_overlap_consent with exact paths and current fences, then read agentscm_work_overlap_consents and explicitly accept the consent IDs with agentscm_work_overlap_start or agentscm_work_overlap_checkpoint. agentscm_work_overlap_preflight checks acceptance without claiming. One lead's grant, acknowledgement or prose reply grants no edit authority. Agreed paths are reported explicitly; other intersections remain contested. Scope change, release, expiry or a new lead ends consent, so obtain fresh consent rather than retrying an old receipt. Declare behavior dependencies with depends_on even without shared files; use existing structured prerequisite declarations for an exact PR/head condition. Read agentscm_work_dependency_notices at startup and when its next-call summary reports changes; page it with the returned cursors. Recorded and current states differ, unbound legacy dependencies remain unknown, and notices are not proof of completion. Splitting scope, joining and handover remain alternatives when sharing is unsuitable.";
+
 pub const MAX_OVERLAP_PATHS: usize = 256;
 pub const MAX_OVERLAP_CONSENTS: usize = 100;
 

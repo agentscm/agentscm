@@ -7329,6 +7329,16 @@ impl PgStore {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut overlaps = work_overlap_pairs(&reserved, query.limit + 1);
+            for pair in &mut overlaps {
+                for consent in work_overlap::agreements(&mut tx, &who, &pair.left.id, now)? {
+                    let other = if consent.target.work_id == pair.left.id {
+                        consent.accepted.as_ref().map(|f| f.work_id.as_str())
+                    } else { Some(consent.target.work_id.as_str()) };
+                    if other == Some(pair.right.id.as_str()) { pair.agreed_paths.extend(consent.paths); }
+                }
+                pair.agreed_paths.sort();
+                pair.agreed_paths.dedup();
+            }
             // A continuation page sees only its own items, so its overlaps are never the whole set.
             let mut overlaps_complete =
                 query.after.is_none() && current_complete && overlaps.len() <= query.limit;
@@ -14854,6 +14864,14 @@ impl Store for PgStore {
         })
     }
 
+    fn work_dependency_notice_delivery(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<super::work_dependencies::WorkDependencyNoticePage>> {
+        self.dependency_notice_delivery(token, session, now)
+    }
     fn work_dependency_notices(
         &self,
         token: &str,

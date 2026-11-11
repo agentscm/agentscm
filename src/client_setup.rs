@@ -50,10 +50,22 @@ static PREVIOUS_WORK_TEXT_SKILL: std::sync::LazyLock<String> = std::sync::LazyLo
 });
 
 /// The coordination skill: the required rules, then how the hooks and tools fit together.
-pub(crate) static SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+static PREVIOUS_OVERLAP_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     PREVIOUS_WORK_TEXT_SKILL.replacen(
         PREVIOUS_DONE_RULE,
         agentscm::hub::agent_rules::REQUIRED_RULES[1],
+        1,
+    )
+});
+
+/// Current generated guidance preserves true scope and requires both leads' explicit consent.
+pub(crate) static SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    PREVIOUS_OVERLAP_SKILL.replacen(
+        "## Details\n\n",
+        &format!(
+            "## Details\n\n{}\n\n",
+            agentscm::hub::work_overlap::AGENT_GUIDANCE
+        ),
         1,
     )
 });
@@ -63,7 +75,7 @@ const PREVIOUS_OUTCOME_RULE: &str = "Call `agentscm_start` with the task and exp
 
 /// The generated skill with that rule, retained so setup can upgrade it.
 static PREVIOUS_OUTCOME_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    SKILL.replacen(
+    PREVIOUS_OVERLAP_SKILL.replacen(
         agentscm::hub::agent_rules::REQUIRED_RULES[1],
         PREVIOUS_OUTCOME_RULE,
         1,
@@ -92,7 +104,7 @@ const PREVIOUS_SUBAGENT_RULE: &str = "A subagent edits under its parent's sessio
 static PREVIOUS_SUBAGENT_SKILLS: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
         [
-            &*SKILL,
+            &*PREVIOUS_OVERLAP_SKILL,
             &*PREVIOUS_OUTCOME_SKILL,
             &*PREVIOUS_WORK_TEXT_SKILL,
             &*PREVIOUS_PLANNED_SKILL,
@@ -627,6 +639,7 @@ fn check_skill(before: Option<&str>) -> Result<()> {
 
 fn generated_skill(text: &str) -> bool {
     text == SKILL.as_str()
+        || text == PREVIOUS_OVERLAP_SKILL.as_str()
         || text == PREVIOUS_OUTCOME_SKILL.as_str()
         || text == PREVIOUS_WORK_TEXT_SKILL.as_str()
         || text == PREVIOUS_PLANNED_SKILL.as_str()
@@ -1487,6 +1500,7 @@ mod tests {
                     PREVIOUS_PLANNED_SKILL.as_str(),
                     PREVIOUS_WORK_TEXT_SKILL.as_str(),
                     PREVIOUS_OUTCOME_SKILL.as_str(),
+                    PREVIOUS_OVERLAP_SKILL.as_str(),
                 ])
                 .chain(PREVIOUS_SIX_RULE_SKILLS.iter().map(String::as_str))
                 .chain(PREVIOUS_SUBAGENT_SKILLS.iter().map(String::as_str))
@@ -1510,6 +1524,8 @@ mod tests {
         assert!(agentscm::hub::agent_rules::carries_all(&SKILL));
         assert!(SKILL.starts_with("---\nname: coordinate-edits\n"));
         assert!(SKILL.contains(PLANNED_ISSUE_GUIDANCE));
+        assert!(SKILL.contains(agentscm::hub::work_overlap::AGENT_GUIDANCE));
+        assert!(!PREVIOUS_OVERLAP_SKILL.contains(agentscm::hub::work_overlap::AGENT_GUIDANCE));
         assert!(!PREVIOUS_RULED_SKILL.contains(PLANNED_ISSUE_GUIDANCE));
         assert!(SKILL.contains(agentscm::hub::agent_rules::WORK_TEXT));
         assert!(!PREVIOUS_PLANNED_SKILL.contains(agentscm::hub::agent_rules::WORK_TEXT));

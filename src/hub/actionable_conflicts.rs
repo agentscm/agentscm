@@ -4,7 +4,7 @@ use crate::hub::intent::{Intent, key_of, overlaps};
 use crate::hub::overlap_detail;
 use crate::hub::session::{HOLD_CAP_SECONDS, same_agent};
 use crate::hub::store::{Principal, Store};
-use crate::hub::work::WorkItem;
+use crate::hub::work::{WorkItem, WorkOverlapPair};
 use crate::hub::work_links::WorkPrLinkTarget;
 use crate::hub::work_transition::WorkLifecycleReader;
 use crate::hub::{HubError, Result};
@@ -153,15 +153,60 @@ fn opened_by(
     Ok(false)
 }
 
+/// Only the exact two current lead sessions share named files. Helpers and third parties
+/// remain contested, and a changed Work read never inherits an earlier agreement projection.
+fn agreed(
+    pairs: &[WorkOverlapPair],
+    items: &BTreeMap<String, WorkItem>,
+    a: (&str, Option<&str>),
+    b: (&str, Option<&str>),
+    path: &str,
+) -> bool {
+    let path = key_of(path);
+    if path.ends_with('/') {
+        return false;
+    }
+    let actor = |item: &WorkItem, who: (&str, Option<&str>)| {
+        item.lead_token == who.0 && who.1 == Some(item.lead_session.as_str())
+    };
+    let current = |item: &WorkItem| {
+        items.get(&item.id).is_some_and(|now| {
+            now.updated_seq == item.updated_seq
+                && now.generation == item.generation
+                && now.lead_token == item.lead_token
+                && now.lead_session == item.lead_session
+                && now.scope == item.scope
+        })
+    };
+    pairs.iter().any(|pair| {
+        pair.agreed_paths.iter().any(|p| p == path)
+            && current(&pair.left)
+            && current(&pair.right)
+            && ((actor(&pair.left, a) && actor(&pair.right, b))
+                || (actor(&pair.left, b) && actor(&pair.right, a)))
+    })
+}
+
 pub(super) fn read(
     store: &dyn Store,
     who: &Principal,
     reader: &WorkLifecycleReader<'_>,
     items: &BTreeMap<String, WorkItem>,
+    agreed_overlaps: &[WorkOverlapPair],
     now: i64,
 ) -> Result<(Vec<StatusAction>, BTreeSet<String>, String)> {
     let mut limits = BTreeSet::new();
     let mut evidence = Sha256::new();
+    for pair in agreed_overlaps {
+        capture(
+            &mut evidence,
+            serde_json::json!({"left":pair.left.id,"right":pair.right.id,
+            "left_version":pair.left.updated_seq,"right_version":pair.right.updated_seq,
+            "agreed_paths":pair.agreed_paths})
+            .to_string()
+            .as_bytes(),
+        );
+    }
     capture(
         &mut evidence,
         format!(
@@ -223,6 +268,15 @@ pub(super) fn read(
                         } else {
                             y
                         };
+                        if agreed(
+                            agreed_overlaps,
+                            items,
+                            (&a.token, a.session.as_deref()),
+                            (&b.token, b.session.as_deref()),
+                            path,
+                        ) {
+                            continue;
+                        }
                         if found.len() >= 200 && !found.contains_key(path) {
                             limits.insert("file_conflicts_truncated".into());
                             continue;
@@ -309,6 +363,15 @@ pub(super) fn read(
                         break 'event_paths;
                     }
                     if overlaps(key_of(spec), key_of(path)) {
+                        if agreed(
+                            agreed_overlaps,
+                            items,
+                            (&event.token, Some(session_id)),
+                            (&i.token, i.session.as_deref()),
+                            path,
+                        ) {
+                            continue;
+                        }
                         current.push(i);
                         break;
                     }

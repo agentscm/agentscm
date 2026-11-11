@@ -2507,3 +2507,76 @@ fn postgres_dependency_fanout_preserves_cleanup() {
         dependency_fanout_does_not_block_cleanup(&f);
     }
 }
+
+fn dependency_summary_attempt_is_serialized(fixture: &StoreFixture) {
+    use agentscm::hub::session::SessionCall;
+    use agentscm::hub::work_dependencies::WorkDependencyNoticeQuery;
+    let ctx = setup(fixture);
+    let prerequisite = ctx.start("delivery-source", "src/source.rs", &[]);
+    ctx.store
+        .touch_session(
+            ctx.token(),
+            &SessionCall {
+                session: Some(prerequisite.lead_session.clone()),
+                via: "mcp".into(),
+                task: None,
+                paths: vec![],
+                deny: false,
+                report: false,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let _dependent = ctx.start("delivery-dependent", "docs/dependent.md", &[&prerequisite]);
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let store = ctx.store.clone();
+            let token = ctx.token().to_owned();
+            let session = prerequisite.lead_session.clone();
+            std::thread::spawn(move || {
+                store
+                    .work_dependency_notice_delivery(&token, &session, unix_now())
+                    .unwrap()
+            })
+        })
+        .collect();
+    let pages: Vec<_> = handles
+        .into_iter()
+        .filter_map(|h| h.join().unwrap())
+        .collect();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].notices.len(), 1);
+    assert!(
+        ctx.store
+            .work_dependency_notice_delivery(ctx.token(), &prerequisite.lead_session, unix_now())
+            .unwrap()
+            .is_none()
+    );
+    // Explicit history reads are independent of attempted advisory delivery.
+    let page = ctx
+        .store
+        .work_dependency_notices(
+            ctx.token(),
+            &WorkDependencyNoticeQuery {
+                session: prerequisite.lead_session,
+                after: 0,
+                through: None,
+                limit: 20,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(page.notices.len(), 1);
+}
+
+#[test]
+fn dependency_summary_delivery_sqlite() {
+    dependency_summary_attempt_is_serialized(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_dependency_summary_delivery() {
+    let Some(fixture) = StoreFixture::postgres() else {
+        return;
+    };
+    dependency_summary_attempt_is_serialized(&fixture);
+}

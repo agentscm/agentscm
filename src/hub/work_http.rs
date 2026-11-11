@@ -39,6 +39,18 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/overview", get(overview))
         .route("/v1/hub/standup/status", get(actionable_status))
         .route("/v1/hub/standup/preflight", post(preflight))
+        .route("/v1/hub/standup/overlap/consent", post(overlap_consent))
+        .route("/v1/hub/standup/overlap/consents", get(overlap_consents))
+        .route("/v1/hub/standup/overlap/preflight", post(overlap_preflight))
+        .route("/v1/hub/standup/overlap/start", post(overlap_start))
+        .route(
+            "/v1/hub/standup/overlap/checkpoint",
+            post(overlap_checkpoint),
+        )
+        .route(
+            "/v1/hub/standup/dependency-notices",
+            get(dependency_notices),
+        )
         .route("/v1/hub/standup/start", post(start))
         .route("/v1/hub/standup/checkpoint", post(checkpoint))
         .route("/v1/hub/standup/work-transition", post(work_transition))
@@ -184,14 +196,22 @@ async fn preflight(
     State(state): State<HubState>,
     Reader(principal): Reader,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
+    dependencies: std::result::Result<Query<DependenciesFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Result<Json<WorkPreflightResult>, ApiError> {
     let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
+    let dependencies = dependencies
+        .map_err(|_| ApiError::invalid())?
+        .0
+        .requested()?;
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
             let now = unix_now();
             let mut result = store.work_preflight(&principal.token_id, &request, now)?;
+            if !dependencies {
+                result.dependencies = None;
+            }
             result.show(Viewer(&principal.owner.id));
             if operational {
                 result.operational = operational_for_overlaps(
@@ -213,6 +233,151 @@ async fn preflight(
 #[derive(serde::Deserialize)]
 struct OperationalFlag {
     operational: Option<u8>,
+}
+
+/// New prerequisite projections are opt-in on the compatibility start/preflight routes.
+#[derive(serde::Deserialize)]
+struct DependenciesFlag {
+    dependencies: Option<u8>,
+}
+impl DependenciesFlag {
+    fn requested(&self) -> Result<bool, ApiError> {
+        match self.dependencies {
+            None | Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(_) => Err(ApiError::invalid()),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverlapConsentsQuery {
+    request_id: String,
+    session: String,
+}
+
+async fn overlap_consent(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_overlap::WorkOverlapConsentRequest>,
+) -> Result<Json<super::work_overlap::WorkOverlapConsentView>, Response> {
+    let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
+    let result = blocking(&state, move || {
+        store
+            .work_overlap_consent(&principal.token_id, &request, unix_now())
+            .map(|v| shown(v, &principal.owner.id))
+    })
+    .await
+    .map_err(|mut e| {
+        e.show(Viewer(&viewer));
+        work_error(e)
+    })?;
+    super::coordination_http::CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+async fn overlap_consents(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<Query<OverlapConsentsQuery>, QueryRejection>,
+) -> Result<Json<Vec<super::work_overlap::WorkOverlapConsentView>>, ApiError> {
+    let query = query.map_err(|_| ApiError::invalid())?.0;
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store
+                .work_overlap_consents(
+                    &principal.token_id,
+                    &query.request_id,
+                    &query.session,
+                    unix_now(),
+                )
+                .map(|v| shown(v, &principal.owner.id))
+        })
+        .await?,
+    ))
+}
+
+async fn overlap_preflight(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    JsonBody(request): JsonBody<super::work_overlap::WorkOverlapStart>,
+) -> Result<Json<WorkPreflightResult>, Response> {
+    let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
+    let result = blocking(&state, move || {
+        store
+            .work_overlap_preflight(&principal.token_id, &request, unix_now())
+            .map(|v| shown(v, &principal.owner.id))
+    })
+    .await
+    .map_err(|mut e| {
+        e.show(Viewer(&viewer));
+        work_error(e)
+    })?;
+    Ok(Json(result))
+}
+
+async fn overlap_start(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_overlap::WorkOverlapStart>,
+) -> Result<Json<super::work::WorkStartResult>, Response> {
+    let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
+    let result = blocking(&state, move || {
+        store
+            .work_overlap_start(&principal.token_id, &request, unix_now())
+            .map(|v| shown(v, &principal.owner.id))
+    })
+    .await
+    .map_err(|mut e| {
+        e.show(Viewer(&viewer));
+        work_error(e)
+    })?;
+    super::coordination_http::CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+async fn overlap_checkpoint(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_overlap::WorkOverlapCheckpoint>,
+) -> Result<Json<WorkCheckpointResult>, Response> {
+    let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
+    let result = blocking(&state, move || {
+        store
+            .work_overlap_checkpoint(&principal.token_id, &request, unix_now())
+            .map(|v| shown(v, &principal.owner.id))
+    })
+    .await
+    .map_err(|mut e| {
+        e.show(Viewer(&viewer));
+        work_error(e)
+    })?;
+    super::coordination_http::CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+async fn dependency_notices(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<
+        Query<super::work_dependencies::WorkDependencyNoticeQuery>,
+        QueryRejection,
+    >,
+) -> Result<Json<super::work_dependencies::WorkDependencyNoticePage>, ApiError> {
+    let query = query.map_err(|_| ApiError::invalid())?.0;
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_dependency_notices(&principal.token_id, &query, unix_now())
+        })
+        .await?,
+    ))
 }
 
 impl OperationalFlag {
@@ -673,8 +838,16 @@ async fn start(
     Authenticated(principal): Authenticated,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
+    dependencies: std::result::Result<Query<DependenciesFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Response {
+    let dependencies = match dependencies
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
     let operational = match flag
         .map_err(|_| ApiError::invalid())
         .and_then(|f| f.0.requested())
@@ -693,6 +866,9 @@ async fn start(
         let context =
             store.work_overview(&principal.token_id, &WorkOverviewQuery::default(), now)?;
         let mut result = store.work_start(&principal.token_id, &request, now)?;
+        if !dependencies && let Some(preflight) = &mut result.preflight {
+            preflight.dependencies = None;
+        }
         super::coordination_http::CHANGED.notify_waiters();
         result.context = Some(context);
         if !reclaimed {
@@ -709,6 +885,9 @@ async fn start(
     {
         Ok(result) => Json(result).into_response(),
         Err(mut error) => {
+            if !dependencies && let HubError::WorkPreflight(preflight) = &mut error {
+                preflight.dependencies = None;
+            }
             error.show(Viewer(&viewer));
             ApiError::from(error).into_response()
         }

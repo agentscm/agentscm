@@ -89,6 +89,11 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     for path in ["start", "checkpoint", "ack", "work-transition"] {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
+    for path in ["consent", "start", "checkpoint"] {
+        row(&post, format!("/v1/hub/standup/overlap/{path}"), "{}".into(), AgentOnly);
+    }
+    row(&get, "/v1/hub/standup/dependency-notices?session=reader&after=0&limit=20".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/overlap/consents?request_id=crq_00000000000000000000000000000001&session=reader".into(), "".into(), Status(400));
     row(&post, "/v1/hub/standup/usage".into(), "{}".into(), AgentOnly);
     row(&post, "/v1/hub/permission/register".into(), "{}".into(), AgentOnly);
     row(&post, "/v1/hub/permission/poll".into(), "{}".into(), AgentOnly);
@@ -136,6 +141,9 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_pr_link_set","arguments":{}}}"#.into(), AgentOnly);
     // Coordination and checkpoint tools mutate state.
     for tool in [
+        "agentscm_work_overlap_consent",
+        "agentscm_work_overlap_start",
+        "agentscm_work_overlap_checkpoint",
         "agentscm_start",
         "agentscm_check",
         "agentscm_status",

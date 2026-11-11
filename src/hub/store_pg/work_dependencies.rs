@@ -262,16 +262,59 @@ impl PgStore {
     ) -> Result<WorkDependencyNoticePage> {
         query.validate()?;
         self.run(true, |client| {
-            let mut tx = client.build_transaction()
-                .isolation_level(IsolationLevel::RepeatableRead).start()?;
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
             let who = work_who(&mut tx, token, now)?;
-            let through = query.through.unwrap_or(tx.query_one(
-                "SELECT COALESCE(MAX(n.event_seq),0) FROM hub_work_dependency_notices n
+            let page = notice_page(&mut tx, &who, query, now)?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+    pub(super) fn dependency_notice_delivery(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<WorkDependencyNoticePage>> {
+        self.run(false,|client| {
+            let mut tx=client.transaction()?;
+            let who=work_who(&mut tx,token,now)?;
+            if who.read_only {return Err(HubError::Unauthorized);}
+            let Some(row)=tx.query_opt("SELECT dependency_notice_cursor FROM hub_sessions WHERE token=$1 AND session=$2 FOR UPDATE",&[&token,&session])? else {return Ok(None);};
+            let after:i64=row.get(0);
+            let query=WorkDependencyNoticeQuery{session:session.into(),after,through:None,limit:3};
+            let page=notice_page(&mut tx,&who,&query,now)?;
+            if page.next_after<=after {return Ok(None);}
+            tx.execute("UPDATE hub_sessions SET dependency_notice_cursor=$3 WHERE token=$1 AND session=$2",&[&token,&session,&page.next_after])?;
+            tx.commit()?;
+            Ok((!page.notices.is_empty() || !page.coverage_complete).then_some(page))
+        })
+    }
+}
+
+fn notice_page(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    query: &WorkDependencyNoticeQuery,
+    now: i64,
+) -> Result<WorkDependencyNoticePage> {
+    let through = query.through.unwrap_or(
+        tx.query_one(
+            "SELECT COALESCE(MAX(n.event_seq),0) FROM hub_work_dependency_notices n
                  JOIN hub_work_items w ON w.id=n.work WHERE w.provider=$1 AND w.host=$2
                  AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4",
-                &[&who.owner.identity.provider, &who.owner.identity.host, &who.repository, &who.repository_id],
-            )?.get(0));
-            let rows = tx.query(
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .get(0),
+    );
+    let rows = tx.query(
                 "SELECT n.event_seq,n.snapshot,w.snapshot FROM hub_work_dependency_notices n
                  JOIN hub_work_items w ON w.id=n.work WHERE n.event_seq>$1 AND n.event_seq<=$2
                  AND w.provider=$3 AND w.host=$4 AND w.repository=$5
@@ -284,33 +327,43 @@ impl PgStore {
                   &who.repository, &who.repository_id, &who.token, &query.session,
                   &((query.limit + 1) as i64)],
             )?;
-            let coverage_complete: bool = !tx.query_one(
+    let coverage_complete: bool = !tx.query_one(
                 "SELECT EXISTS(SELECT 1 FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND n.snapshot::jsonb->>'notification_fanout_complete'='false')",
                 &[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id])?.get::<_,bool>(0);
-            let mut complete = rows.len() <= query.limit;
-            let mut bytes = 0;
-            let mut notices = Vec::new();
-            for row in rows.into_iter().take(query.limit) {
-                let sequence: i64 = row.get(0);
-                let record: String = row.get(1);
-                let snapshot: String = row.get(2);
-                let item: WorkItem = json_value(&snapshot)?;
-                let declared = declaration_view(&mut tx, &item)?;
-                let notice = WorkDependencyNotice {
-                    sequence, recorded: json_value(&record)?,
-                    current: projection(&mut tx, &who, &declared, true, now)?,
-                };
-                let size = json_string(&notice)?.len();
-                if bytes + size > MAX_DEPENDENCY_PAGE_BYTES { complete = false; break; }
-                bytes += size;
-                notices.push(notice);
-            }
-            let next_after = if complete { through }
-                else { notices.last().map_or(query.after, |n| n.sequence) };
-            tx.commit()?;
-            Ok(WorkDependencyNoticePage {
-                through, next_after, complete, notices, latest_only: true, atomic_snapshot: false, coverage_complete,
-            })
-        })
+    let mut complete = rows.len() <= query.limit;
+    let mut bytes = 0;
+    let mut notices = Vec::new();
+    for row in rows.into_iter().take(query.limit) {
+        let sequence: i64 = row.get(0);
+        let record: String = row.get(1);
+        let snapshot: String = row.get(2);
+        let item: WorkItem = json_value(&snapshot)?;
+        let declared = declaration_view(tx, &item)?;
+        let notice = WorkDependencyNotice {
+            sequence,
+            recorded: json_value(&record)?,
+            current: projection(tx, who, &declared, true, now)?,
+        };
+        let size = json_string(&notice)?.len();
+        if bytes + size > MAX_DEPENDENCY_PAGE_BYTES {
+            complete = false;
+            break;
+        }
+        bytes += size;
+        notices.push(notice);
     }
+    let next_after = if complete {
+        through
+    } else {
+        notices.last().map_or(query.after, |n| n.sequence)
+    };
+    Ok(WorkDependencyNoticePage {
+        through,
+        next_after,
+        complete,
+        notices,
+        latest_only: true,
+        atomic_snapshot: false,
+        coverage_complete,
+    })
 }

@@ -154,6 +154,9 @@ pub(super) fn overview(
         .map(|pair| {
             json!({"left": pair.left.id, "right": pair.right.id,
                 "reasons": pair.reasons.iter().take(3).collect::<Vec<_>>(),
+                "agreed_paths": pair.agreed_paths.iter().take(LIST).collect::<Vec<_>>(),
+                "agreed_paths_complete": pair.agreed_paths.len() <= LIST,
+                "unresolved": pair.unresolved(),
                 "reasons_complete": pair.reasons_complete && pair.reasons.len() <= 3})
         })
         .collect();
@@ -203,6 +206,9 @@ fn conflict(conflict: &WorkStartConflict) -> Value {
             "your_scope": overlap.your_scope.iter().take(LIST).collect::<Vec<_>>(),
             "their_scope": overlap.their_scope.iter().take(LIST).collect::<Vec<_>>(),
             "reasons": overlap.reasons.iter().take(LIST).collect::<Vec<_>>(),
+            "agreed_paths": overlap.agreed_paths.iter().take(LIST).collect::<Vec<_>>(),
+            "agreed_paths_complete": overlap.agreed_paths.len() <= LIST,
+            "unresolved": overlap.unresolved(),
         })).collect::<Vec<_>>(),
         "overlaps_listed": conflict.overlaps.len(),
         "operational": conflict.operational.iter().take(LIST).collect::<Vec<_>>()})
@@ -233,7 +239,14 @@ fn preflight(preflight: &WorkPreflightResult) -> Value {
         "reasons": preflight.reasons,
         "issue_advice": issue_advice(&preflight.issue_advice),
         "subject_match": preflight.subject_match.as_ref().map(brief),
-        "scope_overlaps": preflight.scope_overlaps.iter().take(LIST).map(|o| brief(&o.item)).collect::<Vec<_>>(),
+        "scope_overlaps": preflight.scope_overlaps.iter().take(LIST).map(|o| {
+            let mut item=brief(&o.item);
+            item["agreed_paths"]=json!(o.agreed_paths.iter().take(LIST).collect::<Vec<_>>());
+            item["agreed_paths_complete"]=json!(o.agreed_paths.len()<=LIST);
+            item["unresolved"]=json!(o.unresolved());
+            item
+        }).collect::<Vec<_>>(),
+        "dependencies": preflight.dependencies.as_ref().map(|d| json!({"declaration_seq":d.declaration_seq,"conditions":d.conditions.iter().take(LIST).collect::<Vec<_>>(),"conditions_complete":d.conditions.len()<=LIST,"conditions_listed":d.conditions.len(),"evidence_digest":d.evidence_digest,"observed_at":d.observed_at,"read":"agentscm_work_preflight"})),
         "scope_overlaps_listed": preflight.scope_overlaps.len(),
         "merges": preflight.merges.iter().take(2 * LIST).map(merge).collect::<Vec<_>>(),
         "merges_listed": preflight.merges.len(),
