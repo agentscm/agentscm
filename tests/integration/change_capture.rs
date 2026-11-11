@@ -4790,6 +4790,183 @@ fn native_recipe_digest_fixture(tool: &str, input: &serde_json::Value) -> String
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[test]
+fn a_shell_call_another_hook_rewrote_or_over_the_snapshot_bound_still_starts_and_finishes() {
+    let repo = git_fixture();
+    let spool_dir = TempDir::new().unwrap();
+    let spool = LocalSpool::open(spool_dir.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: vec![
+            ActionRuleV1 {
+                native_tool: "Bash".into(),
+                kind: ActionKindV1::Execution,
+                coverage: CoverageV1::Partial,
+                result_source: NativeResultSourceV1::ProcessExitCode,
+                recipe_digest: None,
+            },
+            ActionRuleV1 {
+                native_tool: "Bash".into(),
+                kind: ActionKindV1::Verification,
+                coverage: CoverageV1::Complete,
+                result_source: NativeResultSourceV1::ProcessExitCode,
+                recipe_digest: Some(native_recipe_digest_fixture(
+                    "Bash",
+                    &serde_json::json!({"command": "check"}),
+                )),
+            },
+        ],
+    };
+    // Claude Code reports the original input at Pre and another hook's rewrite of it at Post.
+    let hook = |pre: bool, tool_use_id: &str, command: &str| {
+        let command = if pre {
+            command.to_owned()
+        } else {
+            format!("wrapper -- {command}")
+        };
+        let mut payload = serde_json::json!({
+            "hook_event_name": if pre { "PreToolUse" } else { "PostToolUse" },
+            "session_id": "session_fixture",
+            "tool_name": "Bash",
+            "tool_use_id": tool_use_id,
+            "tool_input": {"command": command},
+        });
+        if !pre {
+            payload["tool_response"] = serde_json::json!({"exit_code": 0});
+        }
+        serde_json::to_vec(&payload).unwrap()
+    };
+    let tool_events = |kind: CapturedEventKindV1| {
+        captured_events(&spool)
+            .iter()
+            .filter(|(_, event)| event.kind == kind)
+            .count()
+    };
+
+    for (count, (tool_use_id, command, kind)) in [
+        ("rewritten", "ls dir", ActionKindV1::Execution),
+        ("rewritten_check", "check", ActionKindV1::Verification),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let started = capture_native_hook(
+            &hook(true, tool_use_id, command),
+            &request,
+            &actions,
+            &spool,
+        )
+        .unwrap();
+        assert_eq!(
+            started.action,
+            NativeActionOutcome::Started(AppendOutcome::Stored)
+        );
+        let finished = capture_native_hook(
+            &hook(false, tool_use_id, command),
+            &request,
+            &actions,
+            &spool,
+        )
+        .unwrap();
+        assert_eq!(
+            finished.action,
+            NativeActionOutcome::Finished(AppendOutcome::Stored)
+        );
+        assert_eq!(finished.event, HookCaptureOutcome::Stored);
+        assert_eq!(tool_events(CapturedEventKindV1::ToolStarted), count + 1);
+        assert_eq!(tool_events(CapturedEventKindV1::ToolFinished), count + 1);
+        let marker_id = format!(
+            "{:x}",
+            Sha256::digest(format!("session_fixture\0{tool_use_id}").as_bytes())
+        );
+        let start = spool
+            .action_start(&format!("native:start:{marker_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(start.kind, kind);
+        assert_eq!(
+            start.recipe_digest,
+            native_recipe_digest_fixture("Bash", &serde_json::json!({"command": command}))
+        );
+        // What ran is not the recipe the start recorded, so the check cannot count as current.
+        let finish = spool
+            .action_finish(&format!("native:finish:{marker_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(finish.drift, DriftV1::RecipeChanged);
+    }
+
+    // An untracked file over the snapshot bound pauses the action but keeps both tool events.
+    fs::File::create(repo.path().join("large.bin"))
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    let paused = capture_native_hook(
+        &hook(true, "large_tree", "ls dir"),
+        &request,
+        &actions,
+        &spool,
+    )
+    .unwrap();
+    assert_eq!(paused.action, NativeActionOutcome::Interrupted);
+    assert_eq!(paused.event, HookCaptureOutcome::Stored);
+    assert!(captured_events(&spool).iter().any(|(_, event)| {
+        event
+            .gap
+            .as_ref()
+            .is_some_and(|gap| gap.reason == GapReasonV1::CaptureInterrupted)
+    }));
+    let missing = capture_native_hook(
+        &hook(false, "large_tree", "ls dir"),
+        &request,
+        &actions,
+        &spool,
+    )
+    .unwrap();
+    assert_eq!(missing.action, NativeActionOutcome::MissingStart);
+    assert_eq!(missing.event, HookCaptureOutcome::Stored);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolStarted), 3);
+    assert_eq!(tool_events(CapturedEventKindV1::ToolFinished), 3);
+
+    // A source refused for another reason (here a non-UTF-8 untracked name) pauses the same way;
+    // some file systems refuse such a name, and then this part has nothing to check.
+    fs::remove_file(repo.path().join("large.bin")).unwrap();
+    let non_utf8 = repo
+        .path()
+        .join(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"bad\xff"));
+    if fs::write(&non_utf8, b"x").is_ok() {
+        let paused = capture_native_hook(
+            &hook(true, "non_utf8_tree", "ls dir"),
+            &request,
+            &actions,
+            &spool,
+        )
+        .unwrap();
+        assert_eq!(paused.action, NativeActionOutcome::Interrupted);
+        assert_eq!(paused.event, HookCaptureOutcome::Stored);
+        let missing = capture_native_hook(
+            &hook(false, "non_utf8_tree", "ls dir"),
+            &request,
+            &actions,
+            &spool,
+        )
+        .unwrap();
+        assert_eq!(missing.action, NativeActionOutcome::MissingStart);
+        assert_eq!(tool_events(CapturedEventKindV1::ToolStarted), 4);
+        assert_eq!(tool_events(CapturedEventKindV1::ToolFinished), 4);
+    }
+    assert_eq!(
+        inspect_spool(spool.root())
+            .unwrap()
+            .live_claim_count
+            .present,
+        0
+    );
+}
+
 fn git_fixture() -> TempDir {
     let repo = TempDir::new().unwrap();
     run_git(repo.path(), &["init", "-b", "main"]);

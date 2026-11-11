@@ -880,6 +880,7 @@ fn capture_native_hook_inner(
         );
     }
     let mut claim = claim.take().expect("new or retained v4 occurrence claim");
+    let mut source_limit = None;
     // Only the Managed and OrdinaryAction routes consume the source; skip the git scan otherwise.
     if phase == "pre"
         && claim.source.is_none()
@@ -903,21 +904,40 @@ fn capture_native_hook_inner(
                 "native occurrence source root changed after claim".into(),
             ));
         }
-        let source = capture_git_source_opened(&original_source, spool, &opened, true)?;
-        let _managed = spool.lock_managed_capture()?;
-        let retained = spool
-            .managed_invocation_for_occurrence(&request.observed_session_id, tool_use_id)?
-            .ok_or_else(|| CaptureError::Conflict("native occurrence claim disappeared".into()))?;
-        if retained.version != 4
-            || retained.marker_id != claim.marker_id
-            || retained.route != claim.route
-            || retained.pre_fingerprint.as_deref() != Some(phase_fingerprint.as_str())
-        {
-            return Err(CaptureError::Conflict(
-                "native occurrence changed during bounded source capture".into(),
-            ));
+        match capture_git_source_opened(&original_source, spool, &opened, true) {
+            Ok(source) => {
+                let _managed = spool.lock_managed_capture()?;
+                let retained = spool
+                    .managed_invocation_for_occurrence(&request.observed_session_id, tool_use_id)?
+                    .ok_or_else(|| {
+                        CaptureError::Conflict("native occurrence claim disappeared".into())
+                    })?;
+                if retained.version != 4
+                    || retained.marker_id != claim.marker_id
+                    || retained.route != claim.route
+                    || retained.pre_fingerprint.as_deref() != Some(phase_fingerprint.as_str())
+                {
+                    return Err(CaptureError::Conflict(
+                        "native occurrence changed during bounded source capture".into(),
+                    ));
+                }
+                claim = spool.enrich_managed_invocation_source(&claim.marker_id, source)?;
+            }
+            // A source that cannot be captured (over the bounds, a non-UTF-8 path, a write during
+            // the scan) still records the tool call and pauses its action.
+            Err(error)
+                if matches!(
+                    claim.route,
+                    Some(NativeOccurrenceRouteV1::OrdinaryAction { .. })
+                ) =>
+            {
+                source_limit = Some(match error {
+                    CaptureError::Limit(message) => message,
+                    other => other.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
         }
-        claim = spool.enrich_managed_invocation_source(&claim.marker_id, source)?;
     }
     let original_request = managed_marker_request(&claim);
     match claim.route.as_ref().expect("validated v4 occurrence route") {
@@ -960,6 +980,7 @@ fn capture_native_hook_inner(
             payload,
             event_name,
             native_tool,
+            claim.recipe_digest.as_deref().unwrap_or(&recipe_digest),
             &recipe_digest,
             &original_request,
             &claim,
@@ -969,6 +990,7 @@ fn capture_native_hook_inner(
             *coverage,
             parse_native_result_source(result_source)?,
             &actions.setup_digest,
+            source_limit.as_deref(),
             spool,
         ),
     }
@@ -1020,8 +1042,11 @@ fn claim_native_occurrence(
                     .into(),
             ));
         }
-        if marker.command_digest != command_digest
-            || marker.recipe_digest.as_deref() != Some(recipe_digest)
+        // Another PreToolUse hook may rewrite the input, so Claude Code reports the original at
+        // Pre and the rewritten one at Post; an ordinary claim keeps its first phase's facts.
+        if marker.route == Some(NativeOccurrenceRouteV1::Managed)
+            && (marker.command_digest != command_digest
+                || marker.recipe_digest.as_deref() != Some(recipe_digest))
         {
             return Err(CaptureError::Conflict(
                 "native occurrence opposite phase changed its canonical tool or input facts".into(),
@@ -1194,6 +1219,7 @@ fn capture_ordinary_claimed_action(
     event_name: &str,
     native_tool: &str,
     recipe_digest: &str,
+    observed_recipe_digest: &str,
     request: &CaptureRequest,
     claim: &ManagedInvocationV1,
     claim_created: bool,
@@ -1202,6 +1228,7 @@ fn capture_ordinary_claimed_action(
     coverage: CoverageV1,
     result_source: NativeResultSourceV1,
     observed_setup_digest: &str,
+    source_limit: Option<&str>,
     spool: &LocalSpool,
 ) -> Result<NativeHookReport> {
     let _managed = spool.lock_managed_capture()?;
@@ -1239,9 +1266,15 @@ fn capture_ordinary_claimed_action(
                 };
                 return spool.append(&CaptureEnvelopeV1::ActionStart(candidate));
             }
-            let source = claim.source.clone().ok_or_else(|| {
-                CaptureError::Conflict("native occurrence source capture is incomplete".into())
-            })?;
+            let source = match (claim.source.clone(), source_limit) {
+                (Some(source), _) => source,
+                (None, Some(error)) => return Err(CaptureError::Limit(error.to_owned())),
+                (None, None) => {
+                    return Err(CaptureError::Conflict(
+                        "native occurrence source capture is incomplete".into(),
+                    ));
+                }
+            };
             spool
                 .append_action_start_ordered(ActionStartV1 {
                     schema_version: SCHEMA_VERSION_V1,
@@ -1374,7 +1407,10 @@ fn capture_ordinary_claimed_action(
             }
         }
     }
-    let drift = if start.setup_digest != observed_setup_digest {
+    // Another hook rewrote the input, so what ran is not the recipe the start recorded.
+    let drift = if observed_recipe_digest != recipe_digest {
+        DriftV1::RecipeChanged
+    } else if start.setup_digest != observed_setup_digest {
         DriftV1::SetupChanged
     } else {
         match capture_git_source(&marker_source_request(claim)?, spool) {
