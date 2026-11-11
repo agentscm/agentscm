@@ -79,9 +79,10 @@ pub(super) fn addresses_person(text: &str) -> bool {
 
 /// Whether the end of an agent's last message may ask its person for something. A wrong yes
 /// only shows a session its person need not answer; a wrong no hides a request. So a question
-/// mark, any word to the person, any offer or choice ("shall I", "which") and any word for
-/// waiting, needing or being stuck counts. "Blocked" counts only as a party's state ("blocked
-/// on", "is blocked"), not as a record's ("blocker checkpoint recorded", "state blocked").
+/// mark, any word to the person, any offer or choice ("shall I", a sentence that opens with
+/// "which") and any word for waiting, needing or being stuck counts. "Blocked" counts as a
+/// party's state or a request ("blocked on", "still blocked:", "unblock", "blocking"), not as a
+/// record's ("blocker checkpoint recorded", "state blocked,").
 fn asks_person(text: &str) -> bool {
     const WAITING: &[&str] = &[
         "wait",
@@ -108,6 +109,14 @@ fn asks_person(text: &str) -> bool {
         "i'm blocked",
         "is blocked",
         "are blocked",
+        "was blocked",
+        "were blocked",
+        "got blocked",
+        "still blocked",
+        "blocked:",
+        "blocker:",
+        "blocking",
+        "unblock",
         "stuck",
         "unable",
         "cannot",
@@ -125,14 +134,20 @@ fn asks_person(text: &str) -> bool {
         "please",
         "should i",
         "shall i",
-        "which",
+        "which one",
+        "which of",
         "want me to",
         "owner",
     ];
     // A typographic apostrophe spells the same word.
     let lower = text.to_lowercase().replace('’', "'");
+    // "Which" asks where it opens a sentence; inside one it is a relative clause.
+    let opens_with_which = lower
+        .split(['.', '!', ':', ';', '\n'])
+        .any(|sentence| sentence.trim_start().starts_with("which"));
     text.contains(['?', '？'])
         || addresses_person(text)
+        || opens_with_which
         || WAITING.iter().any(|phrase| lower.contains(phrase))
 }
 
@@ -150,7 +165,7 @@ fn is_identifier(token: &str) -> bool {
 fn reads_as_english(text: &str) -> bool {
     const COMMON: &[&str] = &[
         "the", "and", "are", "with", "this", "that", "for", "not", "have", "from", "been", "its",
-        "was", "were", "has", "will", "done",
+        "were", "has", "done",
     ];
     let prose = text
         .split_whitespace()
@@ -1280,6 +1295,11 @@ mod tests {
             "Checkpoint recorded. Shall I merge the branch now.",
             "Merged and pushed. Which branch next.",
             "I am blocked on the review of the migration.",
+            "Unblock the deploy and I will continue.",
+            "Still blocked: the release workflow has no access to the signing key.",
+            "This is blocking the release.",
+            "The deploy has stopped and I need the API key for the region.",
+            "Sag mir, was ich als Nächstes tun soll, dann will ich weitermachen.",
         ] {
             assert!(!turn_asked_nothing(asks), "{asks}");
         }
@@ -1304,6 +1324,7 @@ mod tests {
             "wrk_89d7104ec0f8a465b9349113025f86ff — blocker checkpoint recorded (generation 1, \
              state blocked, event_seq 64493).",
             "Done. Next I will run the tests.",
+            "The fix, which adds a test, is merged and the checks passed.",
             "src/hub/hook.rs",
             "64493",
         ] {
