@@ -121,6 +121,13 @@ pub(super) fn evaluate(
             reasons.push(WorkPreflightReason::ActiveScopeOverlap);
         }
         return Ok(WorkPreflightResult {
+            dependencies: super::work_dependencies::for_start(
+                tx,
+                who,
+                start,
+                subject_match.as_ref(),
+                now,
+            )?,
             issue_advice: super::planning_for(tx, who, now)?.candidates(start, who),
             status: status(&reasons),
             source_revision: None,
@@ -352,6 +359,13 @@ pub(super) fn evaluate(
         && !reasons.contains(&WorkPreflightReason::CheckedMergeUnknown)
         && source_relation_checked;
     Ok(WorkPreflightResult {
+        dependencies: super::work_dependencies::for_start(
+            tx,
+            who,
+            start,
+            subject_match.as_ref(),
+            now,
+        )?,
         issue_advice: super::planning_for(tx, who, now)?.candidates(start, who),
         status: status(&reasons),
         source_revision: Some(request.source_revision.clone()),

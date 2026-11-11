@@ -72,6 +72,9 @@ pub enum WorkPreflightReason {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkPreflightResult {
+    /// Fresh declaration/evidence projection; surfaces can omit it for strict older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<super::work_dependencies::WorkDependencyProjection>,
     /// Advice only; it never changes admission status.
     #[serde(default)]
     pub issue_advice: super::planned_issues::IssueCandidateAdvice,

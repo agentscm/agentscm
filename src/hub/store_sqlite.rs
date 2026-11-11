@@ -139,6 +139,7 @@ use crate::local_ci::DeviceAuthorization;
 mod preflight;
 mod repository_rename;
 mod validation_evidence;
+mod work_dependencies;
 mod work_overlap;
 
 fn require_clear_preflight(
@@ -2428,6 +2429,7 @@ fn lapse_reservations(
             .and_then(|bytes| bytes.checked_add(released))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         record_work_payload_delta(tx, who, delta, now)?;
+        work_dependencies::changed(tx, who, &item, now)?;
         reclaimed.push(reclaimed_hold(&item, expires_at));
     }
     Ok(reclaimed)
@@ -2603,17 +2605,9 @@ fn open_requests_by_work(
     Ok(by_work)
 }
 
-/// The unfinished Work that depends on `id`, bounded to one past `MAX_RECOVERY_LISTED`.
+/// The unfinished Work that depends on `id`; recovery applies its own smaller projection bound.
 fn work_dependents(tx: &Transaction<'_>, id: &str) -> Result<Vec<String>> {
-    let limit = i64::try_from(MAX_RECOVERY_LISTED + 1).unwrap_or(i64::MAX);
-    Ok(tx
-        .prepare(
-            "SELECT r.work FROM hub_work_relations r JOIN hub_work_items w ON w.id = r.work
-             WHERE r.related = ?1 AND r.kind = 'depends_on' AND w.state <> 'finished'
-             ORDER BY r.work LIMIT ?2",
-        )?
-        .query_map(params![id, limit], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+    work_dependencies::dependents(tx, id)
 }
 
 fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
@@ -2702,6 +2696,9 @@ fn work_payload_bytes(
               JOIN hub_work_items w ON w.id = v.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
+             UNION ALL
+             SELECT length(CAST(n.snapshot AS BLOB)) + 256 FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work
+              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3 AND w.repository_id IS ?4
              UNION ALL
              SELECT length(CAST(d.snapshot AS BLOB)) + 256 FROM hub_work_declarations d
               JOIN hub_work_items w ON w.id = d.work
@@ -2959,6 +2956,7 @@ fn carry_lead_credential(
         .checked_sub(previous_item_bytes)
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, who, delta, now)?;
+    work_dependencies::changed(tx, who, item, now)?;
     Ok(())
 }
 
@@ -4518,6 +4516,7 @@ fn start_overlap_in(
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             adjust_work_payload_capacity(tx, who, delta, now)?;
+            work_dependencies::changed(tx, who, &item, now)?;
             return Ok(WorkStartResult {
                 reclaimed: Vec::new(),
                 item,
@@ -4846,6 +4845,7 @@ fn start_overlap_in(
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(tx, who, delta, now)?;
+        work_dependencies::changed(tx, who, &item, now)?;
         return Ok(WorkStartResult {
             reclaimed,
             item,
@@ -5061,6 +5061,7 @@ fn start_overlap_in(
             + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
+    work_dependencies::changed(tx, who, &item, now)?;
     let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
     Ok(WorkStartResult {
@@ -7766,12 +7767,26 @@ fn checkpoint_overlap_in(
         item.blocker = None;
     }
     item.current = Some(current);
+    let added_legacy: Vec<String> = checkpoint
+        .depends_on
+        .iter()
+        .filter(|id| !item.depends_on.contains(id))
+        .cloned()
+        .collect();
     item.depends_on = checkpoint.depends_on.clone();
     item.related_work = checkpoint.related_work.clone();
     item.updated_at = now;
     let event = work_event("work_checkpoint", &item)?;
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
+    if matches!(
+        checkpoint.kind,
+        super::work::CheckpointKind::Progress
+            | super::work::CheckpointKind::Decision
+            | super::work::CheckpointKind::Blocker
+    ) {
+        work_dependencies::add_legacy(tx, &who, &item, &added_legacy, seq, now)?;
+    }
     let snapshot = save_work_version(tx, &item, seq)?;
     if checkpoint.kind == super::work::CheckpointKind::Decision {
         record_decision(tx, &item, seq)?;
@@ -7809,6 +7824,7 @@ fn checkpoint_overlap_in(
         .and_then(|bytes| bytes.checked_add(request_bytes))
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, &who, delta, now)?;
+    work_dependencies::changed(tx, &who, &item, now)?;
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
         // records its own size without one, so a finish is never refused for the cleanup.
@@ -11367,6 +11383,7 @@ impl Store for SqliteStore {
         } else {
             adjust_work_payload_capacity(&tx, &who, delta, now)?;
         }
+        work_dependencies::changed(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(WorkTransitionResult {
             reclaimed,
@@ -11729,6 +11746,7 @@ impl Store for SqliteStore {
             })
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = reconciliation_read(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(declarations::ReconciliationResult {
@@ -11826,6 +11844,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_sub(work_payload_row_bytes(old.len()).ok()?))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = declaration_view(&tx, &item)?;
         tx.commit()?;
         Ok(WorkDeclarationsResult {
@@ -11925,6 +11944,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(WorkCheckpointResult {
             item,
@@ -12129,6 +12149,7 @@ impl Store for SqliteStore {
             .and_then(|v| v.checked_sub(old_bytes))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        work_dependencies::changed(&tx, &who, &item, now)?;
         let view = work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
         tx.commit()?;
         Ok(WorkPrLinkResult {
@@ -16105,6 +16126,14 @@ impl Store for SqliteStore {
         Ok(updated)
     }
 
+    fn work_dependency_notices(
+        &self,
+        token: &str,
+        query: &super::work_dependencies::WorkDependencyNoticeQuery,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage> {
+        self.dependency_notices(token, query, now)
+    }
     fn work_overlap_start(
         &self,
         token: &str,

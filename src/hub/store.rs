@@ -1331,6 +1331,13 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
+    /// Latest durable prerequisite notices for this session's current lead Work items.
+    fn work_dependency_notices(
+        &self,
+        token: &str,
+        query: &super::work_dependencies::WorkDependencyNoticeQuery,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
     fn work_overlap_consent(
         &self,
         token: &str,

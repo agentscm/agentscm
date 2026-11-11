@@ -77,6 +77,7 @@ pub mod view_settings;
 pub mod viewer;
 pub mod why;
 pub mod work;
+pub mod work_dependencies;
 pub mod work_http;
 pub mod work_issues;
 pub mod work_lifecycle;
