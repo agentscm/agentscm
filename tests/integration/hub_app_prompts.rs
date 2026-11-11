@@ -1,6 +1,6 @@
 //! A connected app lists and answers its person's permission prompts, as the person's own page
-//! does; a computer credential and an agent token still cannot. Against an in-process fake forge;
-//! no live accounts.
+//! does; a read-only app only lists them; a computer credential and an agent token still cannot.
+//! Against an in-process fake forge; no live accounts.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -80,13 +80,15 @@ fn private_file(dir: &TempDir, name: &str, text: &str) -> String {
     path.display().to_string()
 }
 
-/// A Hub with one registered app, over a store with REPO and SECRET connected.
+/// A Hub with a registered app and a read-only one, over a store with REPO and SECRET connected.
 async fn hub(dir: &TempDir, store: Arc<dyn Store>, base: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let secret = private_file(dir, "app-secret", &format!("{}\n", "s".repeat(40)));
     let apps = json!({"apps": [{"id": "example-app", "name": "Example App",
-        "redirect_uri": "https://app.example.com/callback", "secret_file": secret, "via": "slack"}]});
+        "redirect_uri": "https://app.example.com/callback", "secret_file": secret, "via": "slack"},
+        {"id": "notifier", "name": "Notifier", "redirect_uri": "https://app.example.com/callback",
+        "secret_file": secret, "read_only": true}]});
     let vars: HashMap<String, String> = HashMap::from([
         ("AGENTSCM_GITHUB_CLIENT_ID".into(), "fake-client-id".into()),
         ("AGENTSCM_GITHUB_CLIENT_SECRET".into(), "fake-secret".into()),
@@ -288,7 +290,63 @@ async fn a_connected_app_lists_and_answers_its_persons_prompt_and_nothing_else_d
         assert_eq!(status, 401);
     }
 
-    // The app answers, and the hook hears it.
+    // A read-only app lists her prompt, never another person's, mints read-only tokens only, and
+    // answers nothing: no prompt, coordination or file request, and no message to an agent.
+    let notifier = device(&alice, &"d".repeat(64), Some("notifier"));
+    let bobs_notifier = device(&bob, &"e".repeat(64), Some("notifier"));
+    let (status, listed) = call(&hub, Method::GET, PERMISSIONS, &notifier, None).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(
+        listed["requests"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    assert_eq!(listed["requests"][0]["request_id"], id, "{listed}");
+    let (status, theirs) = call(&hub, Method::GET, PERMISSIONS, &bobs_notifier, None).await;
+    assert_eq!((status, theirs), (200, json!({"requests": []})));
+    let tokens = "/v1/hub/device/tokens";
+    let mint =
+        |read_only: bool| json!({"name": "notifier", "repository": REPO, "read_only": read_only});
+    // It mints no agent token at all: even a read-only one could ack her catch-up.
+    for read_only in [true, false] {
+        let (status, refused) =
+            call(&hub, Method::POST, tokens, &notifier, Some(mint(read_only))).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("app_cannot_answer")),
+            "{refused}"
+        );
+    }
+    let reply = json!({"token": agent, "request_id": "req_1", "operation_id": "op_1",
+        "target_work_id": "work_1", "session": "s1", "expected_updated_seq": 1,
+        "kind": "decline", "note": null});
+    let handoff = json!({"token": agent, "session": null, "path": "src/lib.rs",
+        "accept": true, "reason": null});
+    for (path, body) in [
+        (ANSWER, answer.clone()),
+        ("/v1/hub/session/coordination/reply", reply),
+        ("/v1/hub/session/handoff/answer", handoff),
+    ] {
+        let (status, refused) = call(&hub, Method::POST, path, &notifier, Some(body)).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("app_cannot_answer")),
+            "{path}: {refused}"
+        );
+    }
+    // Sending an agent a message takes the web sign-in alone.
+    let message = json!({"repository": REPO, "token": agent, "body": "hello"});
+    let (status, _) = call(
+        &hub,
+        Method::POST,
+        "/v1/hub/session/agent-messages",
+        &notifier,
+        Some(message),
+    )
+    .await;
+    assert_eq!(status, 401);
+
+    // The full app answers, and the hook hears it.
     let (status, done) = call(&hub, Method::POST, ANSWER, &app, Some(answer)).await;
     assert_eq!(
         (status, done),

@@ -151,18 +151,18 @@ impl FromRequestParts<HubState> for DeviceOrApp {
     }
 }
 
-/// The owner and `via` of a connected app's credential; None for anything that is not a live
-/// app credential, so the caller can try its other sign-ins.
+/// The owner and `via` of a connected app's credential (`via` None for a read-only app); None for
+/// anything that is not a live app credential, so the caller can try its other sign-ins.
 pub(super) async fn app_credential(
     parts: &Parts,
     state: &HubState,
-) -> ApiResult<Option<(User, Via)>> {
+) -> ApiResult<Option<(User, Option<Via>)>> {
     match credential(parts, state).await {
         Ok(device) => Ok(device
             .app_id
             .as_deref()
             .and_then(|app| state.login.app(app))
-            .map(|app| (device.owner, app.via))),
+            .map(|app| (device.owner, app.via.map(|(via, _)| via)))),
         Err(error) if error.code() == "sign_in_required" => Ok(None),
         Err(error) => Err(error),
     }
@@ -454,6 +454,17 @@ async fn mint(
     DeviceOrApp(device): DeviceOrApp,
     JsonBody(body): JsonBody<MintBody>,
 ) -> ApiResult<Response> {
+    // A read-only app reads through its own credential; even a read-only token could ack the
+    // person's catch-up.
+    if let Some(app) = device.app_id.as_deref()
+        && state.login.app(app).is_none_or(|app| app.via.is_none())
+    {
+        return Err(
+            ApiError::new(StatusCode::FORBIDDEN, "app_cannot_answer").with_message(
+                "This connected app only reads; it can't answer for its person or change anything",
+            ),
+        );
+    }
     // A connected app reads as its person; it never holds a token an agent could act with.
     if device.app_id.is_some() && (!body.read_only || body.auto) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "app_read_only")
