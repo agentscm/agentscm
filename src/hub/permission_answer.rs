@@ -24,6 +24,14 @@
 //! `permission_prompt` notification for that session. A host that runs without a person at a
 //! dialog (a headless run) raises the permission request but never shows the prompt, so it never
 //! sends that notification and is never offered for answering.
+//!
+//! Some hosts show their own prompt only after the hook that offers it here returns (Codex). Such
+//! a hook says the prompt is `held`: there is no notice to wait for, so its request is `pending`
+//! at once, and the list says the prompt is not on screen at the computer. That hook holds the
+//! prompt only while nobody is at the computer, and takes it back with a `release` when someone
+//! is, when it cannot tell, or when the host's limit for the hook is near. The request then stays
+//! on the list, marked `on_computer`, for as long as its wait is the session's wait, and an
+//! answer to it is refused: the session's own prompt is the only place to answer.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -164,6 +172,9 @@ pub(super) struct Offer {
     choices: Vec<Choice>,
     /// The questions of a question prompt; empty for a tool.
     questions: Vec<Question>,
+    /// The host shows its own prompt only after the hook that offers this one returns, so the
+    /// prompt is not on screen at the computer while the Hub offers it.
+    held: bool,
 }
 
 impl Offer {
@@ -215,6 +226,7 @@ impl Offer {
             takes_reason: self.takes_reason,
             choices,
             questions,
+            held: self.held,
         })
     }
 }
@@ -287,6 +299,9 @@ pub(super) enum Ended {
     /// asleep, and wakes when the hook polls again.
     HookGone,
     Expired,
+    /// Its hook took the prompt back to the session: someone is at the computer, the computer
+    /// cannot tell, or the host's limit for the hook is near.
+    HandedBack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +445,14 @@ impl Pending {
             && self.attached(waiting, now).is_some()
     }
 
+    /// Its hook took it back to the session, whose wait at it goes on: it stays listed, to be
+    /// answered at the computer.
+    fn on_computer(&self, waiting: &Waiting, now: i64) -> bool {
+        self.state == Phase::Ended(Ended::HandedBack)
+            && now - self.created < TTL_SECONDS
+            && self.attached(waiting, now).is_some()
+    }
+
     /// Its hook is back: a request that was only asleep is offered again. True when the request
     /// is open afterwards.
     fn wake(&mut self, waiting: &Waiting, now: i64) -> bool {
@@ -477,13 +500,23 @@ impl Inner {
             if now - row.created >= TTL_SECONDS {
                 row.end(Ended::Expired, now);
             } else if now - row.last_poll >= HOOK_GONE_SECONDS {
-                row.end(Ended::HookGone, now);
+                // A host that holds its prompt shows it once the hook is gone, killed or not:
+                // the prompt is on the computer, never asleep here.
+                let why = if row.offer.held {
+                    Ended::HandedBack
+                } else {
+                    Ended::HookGone
+                };
+                row.end(why, now);
             } else if row.attached(waiting, now).is_none() {
                 row.end(Ended::SessionMovedOn, now);
             }
         }
         self.rows.retain(|_, row| {
-            row.open() || now - row.settled < RETAIN_SECONDS || row.asleep(waiting, now)
+            row.open()
+                || now - row.settled < RETAIN_SECONDS
+                || row.asleep(waiting, now)
+                || row.on_computer(waiting, now)
         });
     }
 }
@@ -499,6 +532,8 @@ pub(super) enum Refusal {
     NotYours,
     AlreadyAnswered,
     AnsweredInSession,
+    /// Its hook took the prompt back to the session, which is where it is answered now.
+    OnComputer,
     Ended,
     Hub(HubError),
 }
@@ -537,6 +572,10 @@ impl From<Refusal> for ApiError {
             Refusal::AnsweredInSession => conflict(
                 "answered_in_session",
                 "The session moved on; it was answered there or the prompt closed.",
+            ),
+            Refusal::OnComputer => conflict(
+                "on_computer",
+                "The prompt went back to the computer its session runs on; answer it there.",
             ),
             Refusal::Ended => conflict("ended", "This request is over; its prompt is closed."),
             Refusal::Hub(error) => error.into(),
@@ -601,8 +640,9 @@ pub(super) struct Listed {
     summary: Option<String>,
     folder: Option<String>,
     display: String,
-    /// The Hub accepts an allow for every request it lists. The field tells a page this from a
-    /// Hub without it, which refuses an allow unless `complete`.
+    /// The Hub accepts an allow for every `pending` request it lists. The field tells a page this
+    /// from a Hub without it, which refuses an allow unless `complete`. False for a request that
+    /// is `on_computer`, which takes no answer here.
     allowable: bool,
     /// What the display leaves out; a page says it beside Allow.
     missing: Missing,
@@ -611,6 +651,9 @@ pub(super) struct Listed {
     complete: bool,
     content_hidden: bool,
     subagent: bool,
+    /// The session's own prompt shows at its computer. False for a `held` request while the Hub
+    /// offers it: until its hook takes it back, the Hub is the only place to answer it.
+    on_screen: bool,
     /// A reason typed with a deny reaches the agent.
     deny_reason: bool,
     /// What can go with an allow. An answer names one by its `id`.
@@ -619,6 +662,8 @@ pub(super) struct Listed {
     /// empty for a tool.
     questions: Vec<Question>,
     since: i64,
+    /// `pending`, `answered`, or `on_computer`: its hook took the prompt back to the session,
+    /// where it is answered now.
     state: &'static str,
     decision: Option<&'static str>,
 }
@@ -849,9 +894,9 @@ impl Requests {
             }
         }
         // A session shows one prompt at a time: its other requests are over, also one that is
-        // asleep, which must not wake beside this one.
+        // asleep, which must not wake beside this one, and one listed as on the computer.
         for row in inner.rows.values_mut().filter(|row| session_of(row)) {
-            if row.open() || row.asleep(waiting, now) {
+            if row.open() || row.asleep(waiting, now) || row.on_computer(waiting, now) {
                 row.end(Ended::Superseded, now);
             }
         }
@@ -864,8 +909,10 @@ impl Requests {
             return Err(Refusal::Busy);
         }
         // A prompt offered again was confirmed by a notice this process may never have heard:
-        // the wait remembers it, also across a restart.
-        let confirmed = (again.is_some() && waiting.noticed(kept_by, &session, now))
+        // the wait remembers it, also across a restart. A held prompt has no notice to wait for:
+        // its host shows nothing until the hook returns.
+        let confirmed = offer.held
+            || (again.is_some() && waiting.noticed(kept_by, &session, now))
             || inner
                 .prompts
                 .get(&(kept_by.to_owned(), session.clone()))
@@ -986,6 +1033,32 @@ impl Requests {
         }
     }
 
+    /// The hook that made a request takes its prompt back to the session. An open request is
+    /// over and listed as on the computer; one the person already answered keeps its answer,
+    /// which the hook reads from the state returned. `None` as for [`Self::check`].
+    pub(super) fn release(
+        &self,
+        waiting: &Waiting,
+        token: &str,
+        id: &str,
+        hash: &str,
+        now: i64,
+    ) -> Option<Phase> {
+        let mut inner = self.inner.lock().ok()?;
+        inner.settle(waiting, now);
+        let row = inner.rows.get_mut(id)?;
+        if row.token != token || row.input_hash != hash {
+            return None;
+        }
+        if row.open() || row.asleep(waiting, now) {
+            row.end(Ended::HandedBack, now);
+        }
+        let state = row.state;
+        drop(inner);
+        self.changed.notify_waiters();
+        Some(state)
+    }
+
     /// [`Self::check`], held for up to `wait_seconds` until the state changes. A change wakes
     /// the poll at once; a gone wait is noticed within a second.
     pub(super) async fn poll(
@@ -1035,7 +1108,7 @@ impl Requests {
     }
 
     /// The pending and answered requests of `owner` in one repository, or in every repository
-    /// for `None`, oldest first. This is the list a person answers from, so a request is on it
+    /// for `None`, oldest first, with those whose hook took them back to the computer. This is the list a person answers from, so a request is on it
     /// as soon as the host confirms its prompt is on screen; the wait's first minute holds back
     /// only the notice in their status. Unconfirmed requests are never listed.
     pub(super) fn list(
@@ -1057,8 +1130,10 @@ impl Requests {
             let (state, decision) = match row.state {
                 Phase::Pending => ("pending", None),
                 Phase::Answered(decision) => ("answered", Some(decision.code())),
+                Phase::Ended(Ended::HandedBack) => ("on_computer", None),
                 Phase::Unconfirmed | Phase::Ended(_) => continue,
             };
+            let on_computer = row.state == Phase::Ended(Ended::HandedBack);
             let Some(since) = row.attached(waiting, now) else {
                 continue;
             };
@@ -1071,12 +1146,13 @@ impl Requests {
                 summary: row.summary.clone(),
                 folder: row.folder.clone(),
                 display: row.display.clone(),
-                allowable: true,
+                allowable: !on_computer,
                 missing: row.missing.clone(),
                 complete: row.missing == Missing::default()
                     && row.display.encode_utf16().count() <= FIRST_PAGE_DISPLAY_UNITS,
                 content_hidden: row.content_hidden,
                 subagent: row.asker.is_some(),
+                on_screen: !row.offer.held || on_computer,
                 deny_reason: row.offer.takes_reason,
                 choices: row
                     .offer
@@ -1153,6 +1229,7 @@ impl Requests {
             }
             Phase::Answered(_) => Err(Refusal::AlreadyAnswered),
             Phase::Ended(Ended::SessionMovedOn) => Err(Refusal::AnsweredInSession),
+            Phase::Ended(Ended::HandedBack) => Err(Refusal::OnComputer),
             Phase::Ended(_) => Err(Refusal::Ended),
         }
     }
@@ -1225,6 +1302,9 @@ struct RegisterBody {
     choices: Vec<Choice>,
     #[serde(default)]
     questions: Vec<Question>,
+    /// The host shows its own prompt only after this hook returns.
+    #[serde(default)]
+    held: bool,
     /// The request id the hook holds for this prompt, when the Hub answered a poll of it with
     /// 404.
     #[serde(default)]
@@ -1264,6 +1344,7 @@ async fn register(
             takes_reason: body.takes_reason,
             choices: body.choices,
             questions: body.questions,
+            held: body.held,
         },
         body.again.as_deref(),
         unix_now(),
@@ -1282,6 +1363,9 @@ struct PollBody {
     input_hash: String,
     #[serde(default)]
     wait_seconds: u64,
+    /// The hook takes its prompt back to the session; the reply is the request's last state.
+    #[serde(default)]
+    release: bool,
 }
 
 #[derive(Serialize)]
@@ -1307,16 +1391,26 @@ async fn poll(
     }
     let requests = state.onboarding.permissions();
     requests.follow(&principal, &body.request_id, &body.input_hash, unix_now());
-    let polled = requests
-        .poll(
+    let polled = if body.release {
+        requests.release(
             state.onboarding.waiting(),
             &principal.token_id,
             &body.request_id,
             &body.input_hash,
-            body.wait_seconds,
+            unix_now(),
         )
-        .await
-        .ok_or_else(ApiError::not_found)?;
+    } else {
+        requests
+            .poll(
+                state.onboarding.waiting(),
+                &principal.token_id,
+                &body.request_id,
+                &body.input_hash,
+                body.wait_seconds,
+            )
+            .await
+    }
+    .ok_or_else(ApiError::not_found)?;
     let (name, decision) = polled.parts();
     let with = match polled {
         Phase::Answered(_) => state
@@ -2190,6 +2284,116 @@ mod tests {
         );
     }
 
+    /// A host that shows its prompt only after the hook returns: the request is pending at once
+    /// and not on screen; once its hook takes it back it stays listed as on the computer, for as
+    /// long as the wait goes on, and takes no answer.
+    #[test]
+    fn a_held_request_is_pending_at_once_and_once_released_is_listed_but_not_answerable() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
+        let held = Offer {
+            takes_reason: true,
+            held: true,
+            ..Offer::default()
+        };
+        let register = |hash: &str, at| {
+            requests
+                .register_with(
+                    &waiting,
+                    &mine,
+                    registration("s", None, hash),
+                    held.clone(),
+                    None,
+                    at,
+                )
+                .unwrap()
+        };
+        let key = wait_key("tok_a", "s");
+        // No notice of a prompt on screen is needed, or comes.
+        let (id, state) = register(HASH, 1_001);
+        assert_eq!(state, Phase::Pending);
+        assert!(requests.answerable(&waiting, &key, 1_002));
+        let shown = requests.list(&waiting, "usr_me", Some(7), 1_002).unwrap();
+        assert_eq!(
+            (shown[0].state, shown[0].on_screen, shown[0].allowable),
+            ("pending", false, true)
+        );
+        // The hook takes it back: listed as on the computer, and an answer is refused.
+        assert_eq!(
+            requests.release(&waiting, "tok_a", &id, HASH, 1_003),
+            Some(Phase::Ended(Ended::HandedBack))
+        );
+        assert_eq!(requests.release(&waiting, "tok_b", &id, HASH, 1_003), None);
+        assert!(!requests.answerable(&waiting, &key, 1_004));
+        let later = 1_003 + RETAIN_SECONDS + 10;
+        let shown = requests.list(&waiting, "usr_me", Some(7), later).unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            (
+                shown[0].state,
+                shown[0].on_screen,
+                shown[0].allowable,
+                shown[0].display.as_str()
+            ),
+            ("on_computer", true, false, "git push origin main")
+        );
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, later),
+            Err(Refusal::OnComputer)
+        ));
+        let refused = ApiError::from(Refusal::OnComputer);
+        assert_eq!(
+            (refused.status(), refused.code()),
+            (StatusCode::CONFLICT, "request_conflict")
+        );
+        // The session's next prompt replaces it.
+        let (next, _) = register(OTHER_HASH, later);
+        let shown = requests.list(&waiting, "usr_me", Some(7), later).unwrap();
+        assert_eq!(
+            shown
+                .iter()
+                .map(|listed| listed.request_id.as_str())
+                .collect::<Vec<_>>(),
+            [next.as_str()]
+        );
+        // An answer given before the hook takes the prompt back still reaches it.
+        requests
+            .answer(&waiting, "usr_me", Some(7), &next, Decision::Deny, later)
+            .unwrap();
+        assert_eq!(
+            requests.release(&waiting, "tok_a", &next, OTHER_HASH, later),
+            Some(Phase::Answered(Decision::Deny))
+        );
+        // A held hook that goes quiet with no release (its host stopped it) has left the prompt
+        // on the computer: still listed, and an answer is refused rather than lost.
+        let (quiet, _) = register(HASH, later + 1);
+        let gone = later + 1 + HOOK_GONE_SECONDS;
+        let shown = requests.list(&waiting, "usr_me", Some(7), gone).unwrap();
+        let listed = shown
+            .iter()
+            .find(|listed| listed.request_id == quiet)
+            .expect("still listed");
+        assert_eq!(
+            (listed.state, listed.on_screen, listed.allowable),
+            ("on_computer", true, false)
+        );
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &quiet, Decision::Allow, gone),
+            Err(Refusal::OnComputer)
+        ));
+        // Once the session moves on it is no longer listed.
+        let (last, _) = register(OTHER_HASH, gone + 1);
+        requests.release(&waiting, "tok_a", &last, OTHER_HASH, gone + 1);
+        waiting.clear("tok_a", "s", None, true);
+        assert!(
+            requests
+                .list(&waiting, "usr_me", Some(7), gone + 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn without_a_repository_the_list_shows_the_owners_requests_in_every_repository() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
@@ -2352,6 +2556,7 @@ mod tests {
                 saves: "the rule Bash(python3 -c \"print(1)\"), in local settings".into(),
             }],
             questions: Vec::new(),
+            held: false,
         };
         let register = |offer: Offer, hash: &str, at| {
             let made = requests.register_with(
@@ -2556,6 +2761,7 @@ mod tests {
                     multiple: true,
                 },
             ],
+            held: false,
         };
         let register = |at| {
             requests.register_with(
