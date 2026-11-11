@@ -203,7 +203,8 @@ pub struct ActivityEvent {
 /// The event kinds the status page shows, as an SQL list.
 pub(super) const ACTIVITY_KINDS: &str = "'session_started', 'session_connected', 'session_ended',
     'edit_denied', 'edit_repeated', 'hold_expired', 'intent_announced', 'intent_released',
-    'intent_notice', 'pr_notice', 'handoff_request', 'handoff_grant', 'handoff_decline', 'task_overlap'";
+    'intent_notice', 'pr_notice', 'handoff_request', 'handoff_grant', 'handoff_decline', 'task_overlap',
+    'duplicate_start'";
 
 /// The single namespace a promise input page belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

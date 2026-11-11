@@ -75,6 +75,10 @@ pub struct IssueMetrics {
     /// Contested-edit refusals and overlap notices by observed outcome; also counted above.
     #[serde(default)]
     pub contested_edits: super::refusal_outcomes::ContestedMetrics,
+    /// Lead starts that named another person's unfinished Work, by observed outcome; never
+    /// counted above.
+    #[serde(default)]
+    pub duplicate_starts: super::duplicate_starts::DuplicateStartMetrics,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FollowupMetrics {
@@ -271,6 +275,8 @@ pub struct ValueFacts {
     pub context_population: String,
     pub contested: Vec<super::refusal_outcomes::Observed>,
     pub contested_complete: bool,
+    pub duplicate_starts: Vec<super::duplicate_starts::Outcome>,
+    pub duplicate_starts_complete: bool,
     pub overhead: Vec<super::hook_overhead::SessionOverhead>,
     pub overhead_complete: bool,
 }
@@ -395,12 +401,16 @@ pub fn project(
     let mut membership_complete = true;
     let mut contested = super::refusal_outcomes::ContestedMetrics::default();
     let mut contested_complete = true;
+    let mut duplicate_starts = super::duplicate_starts::DuplicateStartMetrics::default();
+    let mut duplicate_starts_complete = true;
     let mut overhead = super::hook_overhead::OverheadMetrics::default();
     let mut overhead_complete = true;
     for fact in facts {
         complete &= fact.complete;
         contested.add(&fact.contested);
         contested_complete &= fact.contested_complete;
+        duplicate_starts.add(&fact.duplicate_starts);
+        duplicate_starts_complete &= fact.duplicate_starts_complete;
         overhead.add(&fact.overhead);
         overhead_complete &= fact.overhead_complete;
         membership_complete &= fact.request_membership_complete;
@@ -994,7 +1004,20 @@ pub fn project(
             availability: "not_scoped_to_work".into(),
             ..Default::default()
         };
+        duplicate_starts = super::duplicate_starts::DuplicateStartMetrics {
+            availability: "not_scoped_to_work".into(),
+            ..Default::default()
+        };
     } else {
+        // Duplicate starts feed no issue total: stood down is inferred, never resolved.
+        duplicate_starts.partial = !duplicate_starts_complete;
+        gaps.insert("Duplicate starts are recorded only when agentscm_start names a forge issue whose unfinished Work another person leads; reads (overview, search, preflight, planned issues) record nothing, so an agent that stopped after a read is not counted".into());
+        if !duplicate_starts_complete {
+            gaps.insert("Duplicate-start records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
+        }
+        if duplicate_starts.stood_down > 0 {
+            gaps.insert("Stood down means no join, lead, linked Work or contested edit by the asking person was seen for that issue within 24 hours of the start; it is inferred from what the Hub did not see and is not counted as resolved".into());
+        }
         issues.unresolved += contested.unresolved();
         issues.resolved += contested.resolved();
         // Only a hook can report an edit, so with no hook session in the window an override
@@ -1020,6 +1043,7 @@ pub fn project(
         }
     }
     issues.contested_edits = contested;
+    issues.duplicate_starts = duplicate_starts;
     issues.availability = if issues.unresolved + issues.resolved > 0 {
         "partial"
     } else {
@@ -1296,9 +1320,72 @@ mod tests {
             context_population: "calling repository token's structured catch-up deliveries".into(),
             contested: vec![],
             contested_complete: true,
+            duplicate_starts: vec![],
+            duplicate_starts_complete: true,
             overhead: vec![],
             overhead_complete: true,
         }
+    }
+    #[test]
+    fn duplicate_starts_are_counted_apart_and_feed_no_issue_total() {
+        use super::super::duplicate_starts::Outcome;
+        let mut f = facts();
+        f.duplicate_starts = vec![
+            Outcome::Proceeded,
+            Outcome::StoodDown,
+            Outcome::Pending,
+            Outcome::Unknown,
+        ];
+        let all = ValueMetricsQuery {
+            since: Some(0),
+            until: Some(100),
+            ..Default::default()
+        };
+        let stood_down =
+            |p: &ValueMetrics| p.coverage.gaps.iter().any(|g| g.starts_with("Stood down"));
+        let reads = |p: &ValueMetrics| {
+            p.coverage
+                .gaps
+                .iter()
+                .any(|g| g.starts_with("Duplicate starts are recorded only"))
+        };
+        let p = project(vec![f.clone()], &all, 100).unwrap();
+        let block = &p.issues.duplicate_starts;
+        assert_eq!(block.availability, "observed");
+        assert_eq!(
+            (
+                block.observed,
+                block.proceeded,
+                block.stood_down,
+                block.pending,
+                block.unknown
+            ),
+            (4, 1, 1, 1, 1)
+        );
+        assert!(!block.partial);
+        assert_eq!((p.issues.resolved, p.issues.unresolved), (0, 0));
+        assert_eq!(p.issues.dismissed, None);
+        assert!(reads(&p) && stood_down(&p));
+        // The read line is always there; the stood-down line only when one stood down.
+        let p = project(vec![facts()], &all, 100).unwrap();
+        assert_eq!(p.issues.duplicate_starts.availability, "none_observed");
+        assert!(reads(&p) && !stood_down(&p));
+        f.duplicate_starts_complete = false;
+        let p = project(vec![f.clone()], &all, 100).unwrap();
+        assert!(p.issues.duplicate_starts.partial);
+        let one = ValueMetricsQuery {
+            work_id: Some("wrk_0123456789abcdef0123456789abcdef".into()),
+            ..all
+        };
+        let p = project(vec![f], &one, 100).unwrap();
+        assert_eq!(
+            p.issues.duplicate_starts,
+            super::super::duplicate_starts::DuplicateStartMetrics {
+                availability: "not_scoped_to_work".into(),
+                ..Default::default()
+            }
+        );
+        assert!(!reads(&p));
     }
     #[test]
     fn contested_edits_feed_issue_totals_and_overhead_is_reported_unless_one_work_is_asked() {
