@@ -883,6 +883,15 @@ pub trait Store: Send + Sync {
         scope: &CatchupRepositoryScope,
         pull_number: i64,
     ) -> Result<Vec<CatchupMergeObservation>>;
+    /// Retained provider merge facts for pull requests whose head branch is one of `branches`,
+    /// ordered by branch, newest merge first, at most 20 per branch (more are dropped), plus the
+    /// branches that some merged pull request targeted (`is_base`). Rows recorded before the
+    /// head repository was kept carry `same_repository_head: None`.
+    fn catchup_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        branches: &[String],
+    ) -> Result<super::catchup::BranchMergeRows>;
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,

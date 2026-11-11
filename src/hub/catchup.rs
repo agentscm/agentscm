@@ -127,6 +127,23 @@ pub struct NewCatchupMerge {
     pub same_repository_head: bool,
 }
 
+/// Merge rows keyed by head branch, and the branches some merged pull request targeted.
+pub type BranchMergeRows = (
+    Vec<(String, BranchMerge)>,
+    std::collections::BTreeSet<String>,
+);
+
+/// A provider-confirmed merge of a pull request whose head branch is a given branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchMerge {
+    pub pull_number: i64,
+    pub head_commit: String,
+    /// Unix seconds.
+    pub occurred_at: Option<i64>,
+    /// `None` for a row recorded before the Hub kept the head repository.
+    pub same_repository_head: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatchupMergeObservation {

@@ -749,6 +749,89 @@ fn branch_inference(fixture: &StoreFixture) {
     assert!(out.link.is_none() && has(&out, "branch_pull_requests_multiple"));
 }
 
+fn branch_merge(ctx: &Ctx, number: i64, branch: &str, at: i64, same: bool) {
+    let merge = NewCatchupMerge {
+        source: CatchupMergeSource::ForgePull,
+        source_id: format!("forge-pr-{number}"),
+        occurred_at: Some(at),
+        title: None,
+        branch: branch.into(),
+        base: "main".into(),
+        head_commit: HEAD_B.into(),
+        merge_commit: format!("{number:040x}"),
+        pull_number: number,
+        paths: vec!["src/a".into()],
+        paths_complete: true,
+        same_repository_head: same,
+    };
+    ctx.store
+        .record_catchup_merge(&scope(), &merge, at + 1)
+        .unwrap();
+}
+
+fn branch_merged(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let after = unix_now() + 5;
+    let setup_observations = agentscm::hub::onboarding::Observations::default();
+
+    let merged = branch_work(&ctx, "m", "src/m", "feature/m");
+    branch_merge(&ctx, 41, "feature/m", after, true);
+    let out = ctx.read(&merged);
+    let link = out.link.as_ref().unwrap();
+    assert_eq!((link.basis, link.number), (LinkBasis::BranchObserved, 41));
+    assert_eq!(out.provider.status, ProviderStatus::Merged);
+    assert!(!has(&out, "no_pr_link"));
+    assert_eq!(out.outcome.value, OutcomeValue::None);
+
+    let fork = branch_work(&ctx, "f", "src/f", "feature/f");
+    branch_merge(&ctx, 42, "feature/f", after, false);
+    let out = ctx.read(&fork);
+    assert!(out.link.is_none() && has(&out, "no_pr_link"));
+
+    let early = branch_work(&ctx, "e", "src/e", "feature/e");
+    branch_merge(&ctx, 43, "feature/e", 1, true);
+    let out = ctx.read(&early);
+    assert!(out.link.is_none() && has(&out, "no_pr_link"));
+
+    let status = agentscm::hub::work_http::actionable_status::read(
+        &*ctx.store,
+        &setup_observations,
+        &ctx.principal,
+        unix_now(),
+    )
+    .unwrap();
+    let row = status.work.iter().find(|w| w.work_id == merged.id).unwrap();
+    assert_eq!(
+        serde_json::to_value(row.stage.as_ref().unwrap()).unwrap(),
+        json!({"stage": "pull_request_merged", "pull_request": 41, "basis": "branch_observed"})
+    );
+
+    // The head repository round-trips, and a merge's base is a merge base.
+    let (rows, bases) = ctx
+        .store
+        .catchup_branch_merges(&scope(), &["feature/m".into(), "feature/f".into()])
+        .unwrap();
+    let same: Vec<_> = rows
+        .iter()
+        .map(|(b, m)| (b.as_str(), m.same_repository_head))
+        .collect();
+    assert_eq!(
+        same,
+        [("feature/f", Some(false)), ("feature/m", Some(true))]
+    );
+    assert!(!bases.contains("feature/m"));
+    let (_, bases) = ctx
+        .store
+        .catchup_branch_merges(&scope(), &["main".into()])
+        .unwrap();
+    assert!(bases.contains("main"));
+}
+
+#[test]
+fn work_reconcile_branch_merged() {
+    run_both(branch_merged);
+}
+
 fn status_stage(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let setup_observations = agentscm::hub::onboarding::Observations::default();

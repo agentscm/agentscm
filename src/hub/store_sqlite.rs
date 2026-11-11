@@ -15,10 +15,11 @@ use crate::change_record::{
 
 use super::capacity::{self, CapacityLimit, CapacityRefusal, CapacityRepository};
 use super::catchup::{
-    CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES, CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES,
-    CATCHUP_DELIVERY_CAPACITY_BYTES, CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult,
-    CatchupAckStatus, CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource,
-    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    BranchMerge, BranchMergeRows, CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES,
+    CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES, CATCHUP_DELIVERY_CAPACITY_BYTES,
+    CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult, CatchupAckStatus,
+    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupPage,
+    CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
     CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
@@ -1228,8 +1229,8 @@ fn sqlite_record_catchup_merge(
         "INSERT INTO hub_catchup_merges
             (provider,host,repository,repository_key,repository_id,seq,id,source,source_id,
              occurred_at,observed_at,title,branch,base,head_commit,merge_commit,pull_number,
-             paths,paths_complete,payload_bytes)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+             paths,paths_complete,payload_bytes,same_repository_head)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             scope.provider,
             scope.host,
@@ -1250,7 +1251,8 @@ fn sqlite_record_catchup_merge(
             merge.pull_number,
             paths,
             merge.paths_complete,
-            payload_bytes
+            payload_bytes,
+            merge.same_repository_head
         ],
     )?;
     tx.execute(
@@ -11030,6 +11032,45 @@ impl Store for SqliteStore {
             sqlite_catchup_merge_row,
         )?;
         rows.map(|row| sqlite_catchup_merge(row?)).collect()
+    }
+
+    fn catchup_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        branches: &[String],
+    ) -> Result<BranchMergeRows> {
+        scope.validate()?;
+        let conn = self.conn();
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        let key = catchup_repository_key(scope.repository_id);
+        let mut merges = conn.prepare(
+            "SELECT pull_number,head_commit,occurred_at,same_repository_head FROM hub_catchup_merges
+             WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND branch=?5
+             ORDER BY occurred_at IS NULL, occurred_at DESC, pull_number DESC LIMIT 20",
+        )?;
+        let mut base = conn.prepare(
+            "SELECT 1 FROM hub_catchup_branch_merges
+             WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
+               AND branch=?5 AND is_base=1",
+        )?;
+        let (mut rows, mut bases) = (Vec::new(), BTreeSet::new());
+        for branch in branches.iter().collect::<BTreeSet<_>>() {
+            let args = params![scope.provider, scope.host, repository, key, branch];
+            for row in merges.query_map(args, |row| {
+                Ok(BranchMerge {
+                    pull_number: row.get(0)?,
+                    head_commit: row.get(1)?,
+                    occurred_at: row.get(2)?,
+                    same_repository_head: row.get(3)?,
+                })
+            })? {
+                rows.push((branch.clone(), row?));
+            }
+            if base.exists(args)? {
+                bases.insert(branch.clone());
+            }
+        }
+        Ok((rows, bases))
     }
 
     fn record_catchup_source_status(

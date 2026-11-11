@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::catchup::{
-    CatchupCoverageState, CatchupMergeObservation, CatchupPreviewQuery, CatchupRepositoryScope,
+    BranchMerge, CatchupCoverageState, CatchupMergeObservation, CatchupPreviewQuery,
+    CatchupRepositoryScope,
 };
 use super::store::{Principal, Store};
 use super::value_metrics::identity;
@@ -485,17 +486,6 @@ fn read_pr(
     Ok(Some(read))
 }
 
-/// A provider-confirmed merge of a pull request, as a later store read will return it for a branch.
-#[allow(dead_code)] // Constructed by the branch merge read of a later phase and by tests.
-pub(super) struct BranchMerge {
-    pub(super) pull_number: i64,
-    pub(super) head_commit: String,
-    /// Unix seconds.
-    pub(super) occurred_at: Option<i64>,
-    /// `None` for a row recorded before the Hub kept the head repository.
-    pub(super) same_repository_head: Option<bool>,
-}
-
 #[derive(Default)]
 struct BranchInference {
     link: Option<PrLinkV1>,
@@ -627,10 +617,49 @@ fn read_open_observations(
     Ok(out)
 }
 
+/// Retained merge rows by head branch, and the branches some merged pull request targeted.
+#[derive(Default)]
+struct BranchMerges {
+    by_branch: BTreeMap<String, Vec<BranchMerge>>,
+    bases: BTreeSet<String>,
+}
+
+/// Rows the Store returns per branch at most; reaching it means older merges may be missing.
+const BRANCH_MERGES_PER_BRANCH: usize = 20;
+
+fn catchup_scope(principal: &Principal) -> CatchupRepositoryScope {
+    CatchupRepositoryScope {
+        provider: principal.owner.identity.provider.clone(),
+        host: principal.owner.identity.host.clone(),
+        repository: principal.repository.clone(),
+        repository_id: principal.repository_id,
+    }
+}
+
+/// `None` when the read failed; inference then uses open observations only.
+fn read_branch_merges(
+    store: &dyn Store,
+    principal: &Principal,
+    branches: &[String],
+) -> Option<BranchMerges> {
+    let (rows, bases) = store
+        .catchup_branch_merges(&catchup_scope(principal), branches)
+        .ok()?;
+    let mut out = BranchMerges {
+        bases,
+        ..BranchMerges::default()
+    };
+    for (branch, merge) in rows {
+        out.by_branch.entry(branch).or_default().push(merge);
+    }
+    Some(out)
+}
+
 /// Infer a Work's link from the observations; no branch or no observation is no link.
 fn infer_from(
     item: &WorkItem,
     observed: &std::result::Result<OpenObservations, &'static str>,
+    merged: Option<&BranchMerges>,
 ) -> BranchInference {
     let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
         return BranchInference::default();
@@ -645,14 +674,20 @@ fn infer_from(
         .by_branch
         .get(branch)
         .map_or(&[][..], Vec::as_slice);
-    // One spot for a later phase to plug in the branch's merge rows.
-    let merges: &[BranchMerge] = &[];
+    let merges = merged
+        .and_then(|m| m.by_branch.get(branch))
+        .map_or(&[][..], Vec::as_slice);
     let mut inference = infer_branch_link(
         item.created_at,
         open,
         merges,
-        observed.base_refs.contains(branch),
+        observed.base_refs.contains(branch) || merged.is_some_and(|m| m.bases.contains(branch)),
     );
+    if merged.is_none() {
+        inference.limits.push("merge_lookup_unavailable");
+    } else if merges.len() >= BRANCH_MERGES_PER_BRANCH {
+        inference.limits.push("branch_merges_truncated");
+    }
     if observed.truncated {
         inference.limits.push("pr_observations_truncated");
     }
@@ -672,7 +707,12 @@ fn infer_for_work(
     if item.branch.as_deref().is_none_or(str::is_empty) {
         return BranchInference::default();
     }
-    infer_from(&item, &read_open_observations(store, principal))
+    let merged = read_branch_merges(store, principal, &[item.branch.clone().unwrap_or_default()]);
+    infer_from(
+        &item,
+        &read_open_observations(store, principal),
+        merged.as_ref(),
+    )
 }
 
 /// A Work's stage as the status shows it: working, pull request open or merged, complete.
@@ -765,11 +805,16 @@ pub(super) fn work_stages(
 ) -> (BTreeMap<String, WorkStageV1>, BTreeSet<String>) {
     let mut limits = BTreeSet::new();
     let mut stages = BTreeMap::new();
-    let scope = CatchupRepositoryScope {
-        provider: principal.owner.identity.provider.clone(),
-        host: principal.owner.identity.host.clone(),
-        repository: principal.repository.clone(),
-        repository_id: principal.repository_id,
+    let scope = catchup_scope(principal);
+    let branches: Vec<String> = items
+        .iter()
+        .filter(|(_, outcome)| *outcome == OutcomeValue::None)
+        .filter_map(|(item, _)| item.branch.clone().filter(|b| !b.is_empty()))
+        .collect();
+    let merged = if branches.is_empty() {
+        Some(BranchMerges::default())
+    } else {
+        read_branch_merges(store, principal, &branches)
     };
     let observed = if items
         .iter()
@@ -794,7 +839,7 @@ pub(super) fn work_stages(
                     head_sha: target.head_sha,
                 }),
                 Ok(None) => {
-                    let inference = infer_from(item, &observed);
+                    let inference = infer_from(item, &observed, merged.as_ref());
                     limits.extend(inference.limits.iter().map(|l| (*l).to_owned()));
                     match inference.link {
                         Some(link) => StageLink::Link(link),
