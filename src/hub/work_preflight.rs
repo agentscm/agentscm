@@ -72,6 +72,9 @@ pub enum WorkPreflightReason {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkPreflightResult {
+    /// Read-time explanatory context; absent on legacy responses and durable records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_intents: Option<super::work_intent::HolderIntents>,
     /// Fresh declaration/evidence projection; surfaces can omit it for strict older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<super::work_dependencies::WorkDependencyProjection>,

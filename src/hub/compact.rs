@@ -231,7 +231,7 @@ fn preflight(preflight: &WorkPreflightResult) -> Value {
             "merge_commit": merge.merge_commit, "head_commit": merge.head_commit,
             "observed_at": merge.observed_at})
     };
-    json!({"status": preflight.status, "complete": preflight.complete,
+    json!({"status": preflight.status, "complete": preflight.complete, "holder_intents": preflight.holder_intents,
         "source_revision": preflight.source_revision,
         "source_relation_checked": preflight.source_relation_checked,
         "merge_after": preflight.merge_after, "merge_through": preflight.merge_through,
@@ -262,7 +262,7 @@ pub(super) fn start_work(work: &super::work::WorkStartResult) -> Value {
         "conflict": work.conflict.as_ref().map(conflict),
         "coordination_request": work.coordination_request.as_ref().map(coordination),
         "preflight": work.preflight.as_ref().map(preflight),
-        "reclaimed": work.reclaimed})
+        "reclaimed": work.reclaimed, "holder_intents": work.holder_intents})
 }
 
 /// Counts of the startup overview; `agentscm_work_overview` pages it.

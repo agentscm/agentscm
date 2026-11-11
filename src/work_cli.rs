@@ -554,7 +554,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/preflight",
+                    "/v1/hub/standup/overlap/preflight?intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -566,7 +566,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/start",
+                    "/v1/hub/standup/overlap/start?intent=1",
                     Some(json!(request)),
                 )
                 .await?;
@@ -579,7 +579,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/overlap/checkpoint",
+                    "/v1/hub/standup/overlap/checkpoint?intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -780,7 +780,8 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 params
                     .append_pair("session", &session)
                     .append_pair("limit", &limit.to_string())
-                    .append_pair("wait_seconds", &wait_seconds.to_string());
+                    .append_pair("wait_seconds", &wait_seconds.to_string())
+                    .append_pair("intent", "1");
                 if let Some(after) = after {
                     params.append_pair("after", &after.to_string());
                 }
@@ -847,7 +848,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/preflight?dependencies=1",
+                    "/v1/hub/standup/preflight?dependencies=1&intent=1",
                     Some(json!(request)),
                 )
                 .await?,
@@ -929,7 +930,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/start?reclaimed=1&dependencies=1",
+                    "/v1/hub/standup/start?reclaimed=1&dependencies=1&intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
@@ -1003,7 +1004,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/work-transitions",
+                    "/v1/hub/standup/work-transitions?intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
@@ -1024,7 +1025,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/checkpoint?reclaimed=1",
+                    "/v1/hub/standup/checkpoint?reclaimed=1&intent=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?,

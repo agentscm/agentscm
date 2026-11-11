@@ -3606,6 +3606,7 @@ mod tests {
         })).unwrap();
         let items = BTreeMap::from([(item.id.clone(), item)]);
         let inbox = |request| CoordinationInbox {
+            holder_intents: None,
             from: 0,
             through: 1,
             next_after: 1,
@@ -3669,6 +3670,7 @@ mod tests {
         })).unwrap();
         let id = item.id.clone();
         let inbox = |request| CoordinationInbox {
+            holder_intents: None,
             from: 0,
             through: 1,
             next_after: 1,

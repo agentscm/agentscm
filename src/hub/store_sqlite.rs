@@ -3782,6 +3782,7 @@ fn coordination_request_at(
     let status = parse_status(&stored_status)?;
     let requester_unavailable = !agent_can_act(tx, &requester_token, now)?;
     Ok(Some(CoordinationRequest {
+        holder_intents: None,
         id: request.to_owned(),
         requester: CoordinationAgent {
             token: requester_token,
@@ -4346,6 +4347,7 @@ fn coordination_page(
         requests.push(request);
     }
     Ok(CoordinationInbox {
+        holder_intents: None,
         from: after,
         through,
         next_after,
@@ -4462,6 +4464,7 @@ fn start_overlap_in(
                 }
                 if existing.role == start.role && participant_generation == Some(item.generation) {
                     return Ok(WorkStartResult {
+                        holder_intents: None,
                         reclaimed: Vec::new(),
                         item,
                         created: false,
@@ -4520,6 +4523,7 @@ fn start_overlap_in(
             adjust_work_payload_capacity(tx, who, delta, now)?;
             work_dependencies::changed(tx, who, &item, now)?;
             return Ok(WorkStartResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 item,
                 created: false,
@@ -4557,6 +4561,7 @@ fn start_overlap_in(
                 || item.related_work != start.related_work
             {
                 return Ok(WorkStartResult {
+                    holder_intents: None,
                     reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::MetadataChanged,
@@ -4623,6 +4628,7 @@ fn start_overlap_in(
                 )?)
             };
             return Ok(WorkStartResult {
+                holder_intents: None,
                 reclaimed,
                 item,
                 created: false,
@@ -4662,6 +4668,7 @@ fn start_overlap_in(
                 WorkConflictKind::ClaimHeld
             };
             return Ok(WorkStartResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind,
@@ -4687,6 +4694,7 @@ fn start_overlap_in(
             || released_by_owner;
         if !resuming_own_paused && !open && item.state != WorkState::Handover {
             return Ok(WorkStartResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::ClaimHeld,
@@ -4723,6 +4731,7 @@ fn start_overlap_in(
             overlaps.retain(WorkScopeOverlap::unresolved);
             if let Some(first) = overlaps.first() {
                 return Ok(WorkStartResult {
+                    holder_intents: None,
                     reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::ScopeOverlap,
@@ -4745,6 +4754,7 @@ fn start_overlap_in(
             && current.id != item.id
         {
             return Ok(WorkStartResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::SessionGoalChanged,
@@ -4849,6 +4859,7 @@ fn start_overlap_in(
         adjust_work_payload_capacity(tx, who, delta, now)?;
         work_dependencies::changed(tx, who, &item, now)?;
         return Ok(WorkStartResult {
+            holder_intents: None,
             reclaimed,
             item,
             created: false,
@@ -4865,6 +4876,7 @@ fn start_overlap_in(
     }
     if let Some(item) = unfinished_for_session(tx, who, &start.session, now)? {
         return Ok(WorkStartResult {
+            holder_intents: None,
             reclaimed: Vec::new(),
             conflict: Some(WorkStartConflict {
                 kind: WorkConflictKind::SessionGoalChanged,
@@ -4906,6 +4918,7 @@ fn start_overlap_in(
             now,
         )?;
         return Ok(WorkStartResult {
+            holder_intents: None,
             reclaimed: Vec::new(),
             item: first.item.clone(),
             created: false,
@@ -5067,6 +5080,7 @@ fn start_overlap_in(
     let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
     Ok(WorkStartResult {
+        holder_intents: None,
         reclaimed,
         item,
         created: true,
@@ -11147,6 +11161,7 @@ impl Store for SqliteStore {
                 operational: Vec::new(),
             });
             let result = WorkStartResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 item,
                 created: false,
@@ -11251,6 +11266,7 @@ impl Store for SqliteStore {
             }
             tx.commit()?;
             return Ok(WorkTransitionResult {
+                holder_intents: None,
                 reclaimed: Vec::new(),
                 item,
                 receipt: Some(CheckpointReceipt {
@@ -11299,6 +11315,7 @@ impl Store for SqliteStore {
                     operational: Vec::new(),
                 };
                 return Ok(WorkTransitionResult {
+                    holder_intents: None,
                     reclaimed: Vec::new(),
                     item,
                     receipt: None,
@@ -11402,6 +11419,7 @@ impl Store for SqliteStore {
         work_dependencies::changed(&tx, &who, &item, now)?;
         tx.commit()?;
         Ok(WorkTransitionResult {
+            holder_intents: None,
             reclaimed,
             receipt: Some(CheckpointReceipt {
                 work_id: item.id.clone(),
@@ -14288,6 +14306,16 @@ impl Store for SqliteStore {
             complete,
             items,
         })
+    }
+
+    fn work_id_for_holder(
+        &self,
+        token: &str,
+        holder_token: &str,
+        holder_session: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        work_intent::holder(self, token, holder_token, holder_session, now)
     }
 
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>> {

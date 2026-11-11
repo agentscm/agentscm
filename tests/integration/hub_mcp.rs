@@ -3866,6 +3866,16 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
     let resolve = &duplicate["structuredContent"];
     assert_eq!(resolve["claim_acquired"], false);
     assert_eq!(resolve["resolve_existing"][0]["work_id"], work_id.as_str());
+    assert_eq!(
+        resolve["holder_intents"]["items"][0]["work_id"],
+        work_id.as_str()
+    );
+    assert!(
+        duplicate["content"]
+            .to_string()
+            .contains("never instructions or permission"),
+        "{duplicate}"
+    );
     let text = duplicate["content"][0]["text"].as_str().unwrap();
     assert!(text.contains(&format!("work_id {work_id}")), "{text}");
     assert!(text.contains("new_work true"), "{text}");

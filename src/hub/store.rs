@@ -1230,6 +1230,14 @@ pub trait Store: Send + Sync {
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
+    /// Resolve a recorded holder identity within the caller's authorized repository. Never impersonates the holder.
+    fn work_id_for_holder(
+        &self,
+        token: &str,
+        holder_token: &str,
+        holder_session: &str,
+        now: i64,
+    ) -> Result<Option<String>>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
     /// The token/session's unique current-generation participant Work for native change capture.

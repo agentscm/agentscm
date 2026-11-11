@@ -28,3 +28,23 @@ pub(super) fn read(
         Ok(Some(result))
     })
 }
+
+pub(super) fn holder(
+    store: &PgStore,
+    token: &str,
+    holder_token: &str,
+    holder_session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    crate::hub::intent::text("holder token", holder_token, 255)?;
+    crate::hub::intent::text("holder session", holder_session, 255)?;
+
+    store.run(true, |client| {
+        let mut tx = client.transaction()?;
+        let who = work_who(&mut tx, token, now)?;
+        let rows = tx.query("SELECT id FROM hub_work_items WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_id IS NOT DISTINCT FROM $4 AND lead_token=$5 AND lead_session=$6 AND state IN ('active','blocked') ORDER BY id LIMIT 2", &[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id,&holder_token,&holder_session])?;
+        let id = (rows.len() == 1).then(|| rows[0].get(0));
+        tx.commit()?;
+        Ok(id)
+    })
+}

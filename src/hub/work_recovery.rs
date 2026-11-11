@@ -435,6 +435,9 @@ pub struct BatchItemV1 {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTransitionBatchV1 {
+    /// One bounded read-time context for the entire batch, never one copy per item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_intents: Option<super::work_intent::HolderIntents>,
     pub schema_version: u16,
     /// Each item ran in its own transaction, in order; earlier items stay applied when a later
     /// one is refused.
@@ -1349,6 +1352,7 @@ pub fn apply_batch(
         .filter(|item| matches!(item.outcome, BatchOutcome::Applied | BatchOutcome::Replayed))
         .count();
     Ok(WorkTransitionBatchV1 {
+        holder_intents: None,
         schema_version: RECOVERY_SCHEMA_VERSION,
         not_applied: items.len() - applied,
         applied,

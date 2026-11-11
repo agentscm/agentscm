@@ -96,6 +96,24 @@ fn contract(f: Fixture) {
         .work_start(&token, &start("prerequisite"), now)
         .unwrap()
         .item;
+    assert_eq!(
+        f.store
+            .work_id_for_holder(&readonly, &token, "prerequisite", now)
+            .unwrap(),
+        Some(prerequisite.id.clone())
+    );
+    assert_eq!(
+        f.store
+            .work_id_for_holder(&foreign, &token, "prerequisite", now)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        f.store
+            .work_id_for_holder(&readonly, &token, "missing", now)
+            .unwrap(),
+        None
+    );
     let mut request = start("dependent");
     request.depends_on.push(prerequisite.id.clone());
     request.issue_choice = Some(WorkIssueChoice::Link {

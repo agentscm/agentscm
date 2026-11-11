@@ -1797,6 +1797,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         })
         .collect::<Vec<_>>();
     let request = CoordinationRequest {
+        holder_intents: None,
         id: format!("crq_{:032x}", 1),
         requester,
         proposal: CoordinationProposal {

@@ -18,6 +18,7 @@ use super::work::{
     WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverviewQuery, WorkScopeOverlap,
     WorkSearchPage, WorkStart, WorkState,
 };
+use super::work_intent::{self, IntentFlag};
 use super::work_lifecycle::overview_with_operational;
 use super::work_preflight::WorkPreflightResult;
 use super::work_transition::{
@@ -198,8 +199,10 @@ async fn preflight(
     Reader(principal): Reader,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     dependencies: std::result::Result<Query<DependenciesFlag>, QueryRejection>,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Result<Json<WorkPreflightResult>, ApiError> {
+    let intent = intent.map_err(|_| ApiError::invalid())?.0.requested()?;
     let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
     let dependencies = dependencies
         .map_err(|_| ApiError::invalid())?
@@ -212,6 +215,14 @@ async fn preflight(
             let mut result = store.work_preflight(&principal.token_id, &request, now)?;
             if !dependencies {
                 result.dependencies = None;
+            }
+            if intent {
+                result.holder_intents = Some(work_intent::for_preflight(
+                    &*store,
+                    &principal.token_id,
+                    &result,
+                    now,
+                ));
             }
             result.show(Viewer(&principal.owner.id));
             if operational {
@@ -304,14 +315,35 @@ async fn overlap_consents(
 async fn overlap_preflight(
     State(state): State<HubState>,
     Reader(principal): Reader,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<super::work_overlap::WorkOverlapStart>,
 ) -> Result<Json<WorkPreflightResult>, Response> {
+    let intent = intent
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+        .map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
     let viewer = principal.owner.id.clone();
     let result = blocking(&state, move || {
         store
             .work_overlap_preflight(&principal.token_id, &request, unix_now())
-            .map(|v| shown(v, &principal.owner.id))
+            .map_err(|mut error| {
+                if intent {
+                    work_intent::enrich_error(&*store, &principal.token_id, &mut error, unix_now());
+                }
+                error
+            })
+            .map(|mut v| {
+                if intent {
+                    v.holder_intents = Some(work_intent::for_preflight(
+                        &*store,
+                        &principal.token_id,
+                        &v,
+                        unix_now(),
+                    ));
+                }
+                shown(v, &principal.owner.id)
+            })
     })
     .await
     .map_err(|mut e| {
@@ -324,14 +356,35 @@ async fn overlap_preflight(
 async fn overlap_start(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<super::work_overlap::WorkOverlapStart>,
 ) -> Result<Json<super::work::WorkStartResult>, Response> {
+    let intent = intent
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+        .map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
     let viewer = principal.owner.id.clone();
     let result = blocking(&state, move || {
         store
             .work_overlap_start(&principal.token_id, &request, unix_now())
-            .map(|v| shown(v, &principal.owner.id))
+            .map_err(|mut error| {
+                if intent {
+                    work_intent::enrich_error(&*store, &principal.token_id, &mut error, unix_now());
+                }
+                error
+            })
+            .map(|mut v| {
+                if intent {
+                    v.holder_intents = Some(work_intent::for_start(
+                        &*store,
+                        &principal.token_id,
+                        &v,
+                        unix_now(),
+                    ));
+                }
+                shown(v, &principal.owner.id)
+            })
     })
     .await
     .map_err(|mut e| {
@@ -345,13 +398,24 @@ async fn overlap_start(
 async fn overlap_checkpoint(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<super::work_overlap::WorkOverlapCheckpoint>,
 ) -> Result<Json<WorkCheckpointResult>, Response> {
+    let intent = intent
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+        .map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
     let viewer = principal.owner.id.clone();
     let result = blocking(&state, move || {
         store
             .work_overlap_checkpoint(&principal.token_id, &request, unix_now())
+            .map_err(|mut error| {
+                if intent {
+                    work_intent::enrich_error(&*store, &principal.token_id, &mut error, unix_now());
+                }
+                error
+            })
             .map(|v| shown(v, &principal.owner.id))
     })
     .await
@@ -491,8 +555,10 @@ async fn work_transition(
     Authenticated(principal): Authenticated,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkTransitionRequest>,
 ) -> Result<Json<WorkTransitionResult>, ApiError> {
+    let intent = intent.map_err(|_| ApiError::invalid())?.0.requested()?;
     let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
     let reclaimed = ReclaimedFlag::requested(reclaimed)?;
     let store = state.store.clone();
@@ -511,6 +577,14 @@ async fn work_transition(
         }
         if !reclaimed {
             result.reclaimed.clear();
+        }
+        if intent {
+            result.holder_intents = Some(work_intent::for_transition(
+                &*store,
+                &principal.token_id,
+                &result,
+                now,
+            ));
         }
         result.show(Viewer(&principal.owner.id));
         Ok(result)
@@ -571,8 +645,10 @@ async fn recovery_preview(
 async fn work_transitions(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(batch): JsonBody<super::work_recovery::WorkTransitionBatch>,
 ) -> Result<Json<super::work_recovery::WorkTransitionBatchV1>, ApiError> {
+    let intent = intent.map_err(|_| ApiError::invalid())?.0.requested()?;
     let store = state.store.clone();
     let result = blocking(&state, move || {
         super::work_recovery::apply_batch(
@@ -583,7 +659,17 @@ async fn work_transitions(
             &batch,
             unix_now(),
         )
-        .map(|result| shown(result, &principal.owner.id))
+        .map(|mut result| {
+            if intent {
+                result.holder_intents = Some(work_intent::for_batch(
+                    &*store,
+                    &principal.token_id,
+                    &result,
+                    unix_now(),
+                ));
+            }
+            shown(result, &principal.owner.id)
+        })
     })
     .await?;
     if result.applied > 0 {
@@ -854,8 +940,16 @@ async fn start(
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
     dependencies: std::result::Result<Query<DependenciesFlag>, QueryRejection>,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Response {
+    let intent = match intent
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+    {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
     let dependencies = match dependencies
         .map_err(|_| ApiError::invalid())
         .and_then(|f| f.0.requested())
@@ -880,7 +974,14 @@ async fn start(
         let now = unix_now();
         let context =
             store.work_overview(&principal.token_id, &WorkOverviewQuery::default(), now)?;
-        let mut result = store.work_start(&principal.token_id, &request, now)?;
+        let mut result = store
+            .work_start(&principal.token_id, &request, now)
+            .map_err(|mut error| {
+                if intent {
+                    work_intent::enrich_error(&*store, &principal.token_id, &mut error, now);
+                }
+                error
+            })?;
         if !dependencies && let Some(preflight) = &mut result.preflight {
             preflight.dependencies = None;
         }
@@ -892,6 +993,14 @@ async fn start(
         if operational && let Some(conflict) = &mut result.conflict {
             conflict.operational =
                 operational_for_overlaps(&*store, &principal.token_id, &conflict.overlaps, now)?;
+        }
+        if intent {
+            result.holder_intents = Some(work_intent::for_start(
+                &*store,
+                &principal.token_id,
+                &result,
+                now,
+            ));
         }
         result.show(Viewer(&principal.owner.id));
         Ok(result)
@@ -914,8 +1023,13 @@ async fn checkpoint(
     Authenticated(principal): Authenticated,
     headers: HeaderMap,
     reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
+    intent: std::result::Result<Query<IntentFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkCheckpoint>,
 ) -> Result<Json<WorkCheckpointResult>, Response> {
+    let intent = intent
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+        .map_err(IntoResponse::into_response)?;
     let reclaimed = ReclaimedFlag::requested(reclaimed).map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
     let viewer = principal.owner.id.clone();
@@ -923,7 +1037,14 @@ async fn checkpoint(
         super::insights::completion_enabled(&headers) && request.kind == CheckpointKind::Finish;
     let result = blocking(&state, move || {
         let now = unix_now();
-        let mut result = store.work_checkpoint(&principal.token_id, &request, now)?;
+        let mut result = store
+            .work_checkpoint(&principal.token_id, &request, now)
+            .map_err(|mut error| {
+                if intent {
+                    work_intent::enrich_error(&*store, &principal.token_id, &mut error, now);
+                }
+                error
+            })?;
         if !reclaimed {
             result.reclaimed.clear();
         }
