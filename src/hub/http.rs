@@ -159,7 +159,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let waiting = restoring.onboarding.waiting();
         waiting.restore(&*restoring.store, unix_now());
-        super::agent_messages::restore(&*restoring.store, unix_now());
+        super::agent_messages::restore_sessions(&*restoring.store, unix_now());
     })
     .await
     .map_err(|_| HubError::Unavailable("startup task failed".into()))?;
@@ -264,7 +264,10 @@ async fn save_waits(state: HubState) {
     let saved = tokio::task::spawn_blocking(move || {
         let now = unix_now();
         let waits = state.onboarding.waiting().save(&*state.store, now);
-        [waits, super::agent_messages::save(&*state.store, now)]
+        [
+            waits,
+            super::agent_messages::save_sessions(&*state.store, now),
+        ]
     })
     .await;
     for error in saved.into_iter().flatten().filter_map(Result::err) {

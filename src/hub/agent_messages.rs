@@ -33,7 +33,8 @@
 //!
 //! What each session's client is and what it can receive is kept in memory from its own calls
 //! (MCP `initialize` `clientInfo`, the hook it reports through, the token's label). A stopping
-//! Hub saves it for the next process, each fact with an expiry ([`save`], [`restore`]); a Hub
+//! Hub saves it for the next process, each fact with an expiry ([`save_sessions`],
+//! [`restore_sessions`]); a Hub
 //! that dies without stopping loses it, and its sessions read unreachable until they call again.
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
@@ -381,8 +382,10 @@ fn pushed(messages: &mut Vec<Message>, message: Message) {
     messages.drain(..excess);
 }
 
-/// What a session's client is and what it can receive, from its own calls.
+/// What a session's client is and what it can receive, from its own calls. A saved fact missing
+/// a field reads it as unknown, so a later field never drops the list.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Client {
     /// MCP `initialize` `clientInfo.name`.
     pub name: Option<String>,
@@ -499,7 +502,7 @@ struct SavedSession {
 /// Leaves the sessions' facts in the store for the next Hub process, each with its expiry, so a
 /// restart does not leave every session unreachable until it calls again. Whether a waiter
 /// waits is not saved: a waiter must wait at the next process to count.
-pub(super) fn save(store: &dyn Store, now: i64) -> Result<()> {
+pub(super) fn save_sessions(store: &dyn Store, now: i64) -> Result<()> {
     let sessions = SESSIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -520,7 +523,7 @@ pub(super) fn save(store: &dyn Store, now: i64) -> Result<()> {
 /// Takes the facts the previous Hub process left when it stopped, once, so a Hub that later dies
 /// without saving does not start from an old list. A fact past its expiry, or from a list dated
 /// after now, is dropped; a session that called this process already keeps what it showed.
-pub(super) fn restore(store: &dyn Store, now: i64) {
+pub(super) fn restore_sessions(store: &dyn Store, now: i64) {
     let Ok(Some(text)) = store.get_setting(SAVED_KEY) else {
         return;
     };
@@ -1168,8 +1171,9 @@ async fn wait(
     if mode == Mode::Ignore {
         return Ok(StatusCode::GONE.into_response());
     }
-    // `default` names no one conversation, so a wait under it could wake any of the token's.
-    if session == super::session::DEFAULT_SESSION {
+    // A waiter that names the shared `default` names no one conversation, so it could wake any of
+    // the token's. A real session the Hub bound to it keeps its waiter.
+    if reported == super::session::DEFAULT_SESSION {
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
     let mut slot = match WaitSlot::open(&principal.owner.id, &principal.token_id, &session) {
@@ -2301,14 +2305,14 @@ mod tests {
         );
         let slot = WaitSlot::open("u_saved", &fresh.0, &fresh.1).unwrap();
         note_wait(&fresh.0, &fresh.1, Waker::Claude, now);
-        save(&*store, now).unwrap();
+        save_sessions(&*store, now).unwrap();
         drop(slot);
         {
             let mut map = SESSIONS.lock().unwrap();
             map.remove(&fresh);
             map.remove(&old);
         }
-        restore(&*store, now + 60);
+        restore_sessions(&*store, now + 60);
         let map = SESSIONS.lock().unwrap();
         let back = map.get(&fresh).expect("a fresh fact comes back");
         assert_eq!(back.hook.as_deref(), Some("hook:claude"));
@@ -2319,7 +2323,7 @@ mod tests {
         drop(map);
         assert_eq!(store.get_setting(SAVED_KEY).unwrap().as_deref(), Some(""));
         SESSIONS.lock().unwrap().remove(&fresh);
-        restore(&*store, now + 120);
+        restore_sessions(&*store, now + 120);
         assert!(!SESSIONS.lock().unwrap().contains_key(&fresh), "taken once");
     }
 
