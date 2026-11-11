@@ -644,12 +644,12 @@ async fn capture_claude(
         Err(error) => eprintln!(
             "AgentSCM local capture warning: native event was not retained: {}",
             match error {
-                CaptureError::Invalid(_) => "the hook input is invalid",
+                CaptureError::Invalid(_) => "an input or setting is invalid",
                 CaptureError::Conflict(_) => "it conflicts with a retained capture",
                 CaptureError::Limit(_) => "a capture bound was reached",
                 CaptureError::NotFound(_) => "a retained record is missing",
-                CaptureError::Io(_) => "the local store could not be read or written",
-                CaptureError::Json(_) => "a record is not valid JSON",
+                CaptureError::Io(_) => "a local file could not be read or written",
+                CaptureError::Json(_) => "JSON could not be parsed",
             }
         ),
     }

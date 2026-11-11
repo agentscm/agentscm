@@ -923,14 +923,18 @@ fn capture_native_hook_inner(
                 }
                 claim = spool.enrich_managed_invocation_source(&claim.marker_id, source)?;
             }
-            // A tree over the snapshot bounds still records the tool call and pauses its action.
-            Err(CaptureError::Limit(error))
+            // A source that cannot be captured (over the bounds, a non-UTF-8 path, a write during
+            // the scan) still records the tool call and pauses its action.
+            Err(error)
                 if matches!(
                     claim.route,
                     Some(NativeOccurrenceRouteV1::OrdinaryAction { .. })
                 ) =>
             {
-                source_limit = Some(error);
+                source_limit = Some(match error {
+                    CaptureError::Limit(message) => message,
+                    other => other.to_string(),
+                });
             }
             Err(error) => return Err(error),
         }
@@ -977,6 +981,7 @@ fn capture_native_hook_inner(
             event_name,
             native_tool,
             claim.recipe_digest.as_deref().unwrap_or(&recipe_digest),
+            &recipe_digest,
             &original_request,
             &claim,
             claim_created,
@@ -1214,6 +1219,7 @@ fn capture_ordinary_claimed_action(
     event_name: &str,
     native_tool: &str,
     recipe_digest: &str,
+    observed_recipe_digest: &str,
     request: &CaptureRequest,
     claim: &ManagedInvocationV1,
     claim_created: bool,
@@ -1401,7 +1407,10 @@ fn capture_ordinary_claimed_action(
             }
         }
     }
-    let drift = if start.setup_digest != observed_setup_digest {
+    // Another hook rewrote the input, so what ran is not the recipe the start recorded.
+    let drift = if observed_recipe_digest != recipe_digest {
+        DriftV1::RecipeChanged
+    } else if start.setup_digest != observed_setup_digest {
         DriftV1::SetupChanged
     } else {
         match capture_git_source(&marker_source_request(claim)?, spool) {
