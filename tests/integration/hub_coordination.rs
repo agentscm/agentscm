@@ -2382,6 +2382,84 @@ fn agreed_overlap_admits_and_checks_only_named_files(db: &Db) {
     );
 }
 
+fn consent_cannot_resolve_inconsistent_checked_scope(db: &Db) {
+    use agentscm::hub::work_overlap::{
+        WorkOverlapConsentRequest, WorkOverlapConsentState, WorkOverlapStart,
+    };
+    let store = db.open();
+    let now = unix_now();
+    let a = token(&*store, 204, "first");
+    let b = token(&*store, 205, "second");
+    let target = store
+        .work_start(
+            &a,
+            &start_scope("first", "first", WorkRole::Lead, None, &["src/a.rs"]),
+            now,
+        )
+        .unwrap()
+        .item;
+    let proposed = start_scope("second", "second", WorkRole::Lead, None, &["src/a.rs"]);
+    let request = store
+        .work_start(&b, &proposed, now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let grant = store
+        .work_overlap_consent(
+            &a,
+            &WorkOverlapConsentRequest {
+                request_id: request.id.clone(),
+                target_work_id: target.id.clone(),
+                operation_id: "grant".into(),
+                session: "first".into(),
+                expected_updated_seq: request.updated_seq,
+                target_generation: target.generation,
+                target_updated_seq: target.updated_seq,
+                paths: vec!["src/a.rs".into()],
+            },
+            now + 2,
+        )
+        .unwrap();
+    let accepted = WorkOverlapStart {
+        start: proposed.clone(),
+        consent_ids: vec![grant.consent.id.clone()],
+    };
+    store.work_overlap_start(&b, &accepted, now + 3).unwrap();
+
+    // Plant inconsistent indexed evidence, retaining the old epoch to isolate this check from
+    // normal scope-change invalidation. A snapshot-based grant cannot resolve different scope.
+    db.exec(&format!(
+        "UPDATE hub_work_items SET scope='[\"src/a.rs\",\"src/other.rs\"]' WHERE id='{}'; UPDATE hub_work_items SET overlap_epoch={} WHERE id='{}'",
+        target.id, grant.consent.target.epoch, target.id,
+    ));
+    assert_eq!(
+        store
+            .work_overlap_consents(&b, &request.id, "second", now + 4)
+            .unwrap()[0]
+            .state,
+        WorkOverlapConsentState::Agreed,
+        "the fixture must reach the checked-scope guard rather than epoch invalidation"
+    );
+    for preflight in [
+        store.work_preflight(&b, &proposed, now + 4).unwrap(),
+        store
+            .work_overlap_preflight(&b, &accepted, now + 4)
+            .unwrap(),
+    ] {
+        let overlap = &preflight.scope_overlaps[0];
+        assert_eq!(overlap.their_scope, ["src/a.rs", "src/other.rs"]);
+        assert_eq!(overlap.item.scope, ["src/a.rs"]);
+        assert!(overlap.agreed_paths.is_empty());
+        assert!(overlap.unresolved());
+    }
+    assert!(store.work_overlap_start(&b, &accepted, now + 5).is_err());
+}
+
+parity_case!(
+    checked_scope_consent,
+    consent_cannot_resolve_inconsistent_checked_scope
+);
+
 fn agreed_overlap_scope_expansion_and_partial_consent(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapCheckpoint, WorkOverlapConsentRequest};
     let store = db.open();

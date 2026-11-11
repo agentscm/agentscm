@@ -238,6 +238,12 @@ pub(super) fn annotate(
     consents: &[WorkOverlapConsent],
 ) {
     for overlap in overlaps {
+        // Consent is fenced to the snapshot scope; it cannot resolve different reservation
+        // evidence that was actually checked by admission.
+        if overlap.their_scope != overlap.item.scope {
+            overlap.agreed_paths.clear();
+            continue;
+        }
         for consent in consents {
             if consent.target.work_id == overlap.item.id {
                 overlap.agreed_paths.extend(consent.paths.clone());

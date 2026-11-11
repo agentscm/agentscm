@@ -257,7 +257,8 @@ pub(super) fn annotate_existing(
             Some(c.target.work_id.as_str())
         };
         for overlap in overlaps.iter_mut() {
-            if other == Some(overlap.item.id.as_str()) {
+            if other == Some(overlap.item.id.as_str()) && overlap.their_scope == overlap.item.scope
+            {
                 overlap.agreed_paths.extend(c.paths.clone());
                 overlap.agreed_paths.sort();
                 overlap.agreed_paths.dedup();

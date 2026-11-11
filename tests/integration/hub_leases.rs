@@ -1146,10 +1146,13 @@ fn a_takeover_of_a_lapsed_hold_is_fenced_like_a_new_start(db: &Db) {
         )
         .unwrap();
     assert!(!refused.took_over, "{refused:?}");
-    assert_eq!(
-        refused.conflict.map(|conflict| conflict.kind),
-        Some(WorkConflictKind::ScopeOverlap)
-    );
+    let conflict = refused.conflict.unwrap();
+    assert_eq!(conflict.kind, WorkConflictKind::ScopeOverlap);
+    let overlap = &conflict.overlaps[0];
+    assert_eq!(overlap.their_scope, ["src/"]);
+    assert_eq!(overlap.item.scope, ["lib/"]);
+    assert!(overlap.unresolved());
+    assert!(overlap.agreed_paths.is_empty());
 }
 
 fn two_takeovers_of_one_lapsed_hold_have_one_winner(db: &Db) {
