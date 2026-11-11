@@ -278,7 +278,7 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
                 operation_id: "handover".into(),
                 generation: held.generation,
                 session: "sa".into(),
-                expected_updated_seq: None,
+                expected_updated_seq: Some(joined.item.updated_seq),
                 kind: CheckpointKind::Handover,
                 summary: "ready for takeover".into(),
                 next_action: Some("next".into()),
