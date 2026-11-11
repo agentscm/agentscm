@@ -79,7 +79,9 @@ pub(super) fn addresses_person(text: &str) -> bool {
 
 /// Whether the end of an agent's last message may ask its person for something. A wrong yes
 /// only shows a session its person need not answer; a wrong no hides a request. So a question
-/// mark, any word to the person, and any word for waiting, needing or being stuck counts.
+/// mark, any word to the person, any offer or choice ("shall I", "which") and any word for
+/// waiting, needing or being stuck counts. "Blocked" counts only as a party's state ("blocked
+/// on", "is blocked"), not as a record's ("blocker checkpoint recorded", "state blocked").
 fn asks_person(text: &str) -> bool {
     const WAITING: &[&str] = &[
         "wait",
@@ -100,7 +102,12 @@ fn asks_person(text: &str) -> bool {
         "login",
         "credential",
         "expired",
-        "block",
+        "blocked on",
+        "blocked by",
+        "am blocked",
+        "i'm blocked",
+        "is blocked",
+        "are blocked",
         "stuck",
         "unable",
         "cannot",
@@ -117,6 +124,8 @@ fn asks_person(text: &str) -> bool {
         "send me",
         "please",
         "should i",
+        "shall i",
+        "which",
         "want me to",
         "owner",
     ];
@@ -127,27 +136,48 @@ fn asks_person(text: &str) -> bool {
         || WAITING.iter().any(|phrase| lower.contains(phrase))
 }
 
-/// Whether `text` is English prose the rule above can read: nearly all of its letters are
-/// unaccented, and it uses at least two of a few words other languages do not share. Anything
-/// else (another language, a bare word or two, code) is not known to ask nothing.
+/// Whether a whitespace-separated token names something instead of saying it: an id, a path or a
+/// number, which holds a digit, `_`, `/` or `\`.
+fn is_identifier(token: &str) -> bool {
+    token.contains(|c: char| c.is_ascii_digit() || matches!(c, '_' | '/' | '\\'))
+}
+
+/// Whether `text` is English prose the rule above can read. Its identifiers are set aside; then
+/// nearly all of its letters are unaccented, and it uses at least two different words that
+/// other languages do not share: a few common ones, or a past tense of six letters or more
+/// ("recorded", "merged"). Anything else (another language, a bare word or two, code) is not
+/// known to ask nothing.
 fn reads_as_english(text: &str) -> bool {
     const COMMON: &[&str] = &[
         "the", "and", "are", "with", "this", "that", "for", "not", "have", "from", "been", "its",
+        "was", "were", "has", "will", "done",
     ];
-    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
-    let plain = text.chars().filter(char::is_ascii_alphabetic).count();
-    let mut common = words(text);
-    common.retain(|word| COMMON.contains(&word.as_str()));
-    common.sort_unstable();
-    common.dedup();
-    letters > 0 && plain * 10 >= letters * 9 && common.len() >= 2
+    let prose = text
+        .split_whitespace()
+        .filter(|token| !is_identifier(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let letters = prose.chars().filter(|c| c.is_alphabetic()).count();
+    let plain = prose.chars().filter(char::is_ascii_alphabetic).count();
+    let mut english = words(&prose);
+    english.retain(|word| {
+        COMMON.contains(&word.as_str()) || (word.len() >= 6 && word.ends_with("ed"))
+    });
+    english.sort_unstable();
+    english.dedup();
+    letters > 0 && plain * 10 >= letters * 9 && english.len() >= 2
 }
 
 /// Whether an agent's whole last message asked its person nothing, so its turn's end is read
-/// and not answered: English prose with no sign of an ask. The hook client judges the message
-/// on the person's machine and sends only this answer; the Hub judges nothing it has not all of.
+/// and not answered. It asked nothing when it is only identifiers (an id, a path, a number) or
+/// English prose, a report of what was done, and shows no sign of an ask: no question mark, no
+/// word to the person, no offer or choice and no word for waiting or needing. Anything the rule
+/// cannot read (an empty message, another language, a word or two) is not known to ask nothing.
+/// The hook client judges the message on the person's machine and sends only this answer; the
+/// Hub judges nothing it has not all of.
 pub fn turn_asked_nothing(message: &str) -> bool {
-    reads_as_english(message) && !asks_person(message)
+    let named = !message.trim().is_empty() && message.split_whitespace().all(is_identifier);
+    (named || reads_as_english(message)) && !asks_person(message)
 }
 
 impl WaitReason {
@@ -1244,6 +1274,12 @@ mod tests {
             "Die Migration ist fertig und die Tests laufen durch.",
             "どちらにしますか？",
             "Done.",
+            "",
+            "I need your API key to continue.",
+            "Checkpoint recorded for wrk_1a2b. Shall I merge it?",
+            "Checkpoint recorded. Shall I merge the branch now.",
+            "Merged and pushed. Which branch next.",
+            "I am blocked on the review of the migration.",
         ] {
             assert!(!turn_asked_nothing(asks), "{asks}");
         }
@@ -1263,6 +1299,13 @@ mod tests {
             "Verified so far against current main: both findings are real. The fix for the \
              first is written and its test run is in the build queue. Still to do in this \
              batch: the second finding, then two more.",
+            // Only an identifier, a path or a number, and a report of a recorded state.
+            "wrk_90c27ff8d0054b06218dbc90b9c083ae",
+            "wrk_89d7104ec0f8a465b9349113025f86ff — blocker checkpoint recorded (generation 1, \
+             state blocked, event_seq 64493).",
+            "Done. Next I will run the tests.",
+            "src/hub/session_waiting.rs",
+            "64493",
         ] {
             assert!(turn_asked_nothing(done), "{done}");
         }
