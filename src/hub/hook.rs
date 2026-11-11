@@ -324,12 +324,13 @@ async fn hook(
         && let Ok(Ok(principal)) =
             timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
     {
-        state.onboarding.waiting().clear(
-            holder(&principal, native),
-            native,
-            call.asker.as_deref(),
-            all,
-        );
+        let (waiting, kept_by) = (state.onboarding.waiting(), holder(&principal, native));
+        // A session's end keeps a turn's end that may ask its person something.
+        if matches!(call.kind, Kind::Done) {
+            waiting.ended(kept_by, native);
+        } else {
+            waiting.clear(kept_by, native, call.asker.as_deref(), all);
+        }
         if all {
             state
                 .onboarding
@@ -660,6 +661,7 @@ impl Call {
 
     /// The wait this call ends, if any: the session's, and whether the call ends every wait
     /// there (the person typed, or the session started or ended) or only one its caller asked.
+    /// An end still keeps a turn's end that may ask its person something (`Waiting::ended`).
     fn ends_wait(&self) -> Option<(&str, bool)> {
         let all = match self.kind {
             Kind::Start | Kind::Prompt | Kind::Done => true,
@@ -2573,7 +2575,8 @@ mod tests {
             .render(&Outcome::clean()),
             json!({})
         );
-        // What ends a wait: a prompt, start or end ends all of it; a tool call only its asker's.
+        // What ends a wait: a prompt, start or end ends all of it, except that an end keeps a
+        // turn's end that may ask (`Waiting::ended`); a tool call ends only its asker's.
         let ends = |agent, v: Value| {
             parse(agent, &v)
                 .ends_wait()
