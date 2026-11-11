@@ -150,7 +150,16 @@ async fn hook(
     let Ok(Ok(Some(body))) = read else {
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
-    let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
+    if agent == "cursor"
+        && client_connection
+        && let Ok(config) = config_dir()
+        && keep_reply(&config, &mut payload)
+    {
+        return json!({});
+    }
+    let payload = std::sync::Arc::new(payload);
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
@@ -1902,6 +1911,11 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         Some(paths) => paths.to_vec(),
         None => edit_paths("codex", payload)?,
     };
+    if payload["hook_event_name"] == "PermissionRequest"
+        && let Some(asks) = prompt_for(tool, &payload["tool_input"], &paths)
+    {
+        out.insert("asks".into(), json!(asks));
+    }
     if tool.eq_ignore_ascii_case("apply_patch") && !paths.is_empty() {
         let mut headers = String::new();
         for path in paths {
@@ -1931,32 +1945,200 @@ fn resumes_itself(payload: &Value) -> bool {
 const ASKS_CHARS: usize = 400;
 
 /// What a wait asks of its person, so the Hub can show that person (and only them) what their
-/// agent needs: the end of the agent's last message when it stops, the questions it asks, or what
-/// a permission prompt is for. One line, secrets redacted, and cut to its last [`ASKS_CHARS`]
-/// characters, where a closing question sits. A stop that background work will resume sends none.
+/// agent needs: the end of the agent's last message when it stops, or the questions it asks
+/// ([`prompt_for`] says what a permission prompt is for). One line, secrets redacted, and cut to
+/// its last [`ASKS_CHARS`] characters, where a closing question sits. A stop that background
+/// work will resume sends none.
 fn wait_asks(payload: &Value) -> Option<String> {
-    let text = match payload["hook_event_name"].as_str()? {
-        "Stop" if !resumes_itself(payload) => {
-            payload["last_assistant_message"].as_str()?.to_owned()
-        }
-        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
-            payload["tool_input"]["questions"]
+    match payload["hook_event_name"].as_str()? {
+        "Stop" if !resumes_itself(payload) => line_end(payload["last_assistant_message"].as_str()?),
+        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => line_end(
+            &payload["tool_input"]["questions"]
                 .as_array()?
                 .iter()
                 .filter_map(|q| q["question"].as_str())
                 .collect::<Vec<_>>()
-                .join(" ")
-        }
-        "PermissionRequest" => payload["tool_input"]["description"].as_str()?.to_owned(),
-        _ => return None,
-    };
-    let text = redacted_line(&text)?.chars().collect::<Vec<_>>();
-    let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// `text` as one redacted line cut to its last [`ASKS_CHARS`] characters, marked where it is cut.
+fn line_end(text: &str) -> Option<String> {
+    redacted_line(text).map(|line| end_of(&line))
+}
+
+fn end_of(line: &str) -> String {
+    let line = line.chars().collect::<Vec<_>>();
+    let tail: String = line[line.len().saturating_sub(ASKS_CHARS)..]
         .iter()
         .collect();
-    match text.len() {
-        n if n > ASKS_CHARS => Some(format!("…{tail}")),
-        _ => Some(tail),
+    match line.len() {
+        n if n > ASKS_CHARS => format!("…{tail}"),
+        _ => tail,
+    }
+}
+
+/// `text` as one redacted line cut to its first [`ASKS_CHARS`] characters, marked where it is cut.
+fn line_start(text: &str) -> Option<String> {
+    let line = redacted_line(text)?;
+    let head: String = line.chars().take(ASKS_CHARS).collect();
+    match line.chars().count() {
+        n if n > ASKS_CHARS => Some(format!("{head}…")),
+        _ => Some(head),
+    }
+}
+
+/// What the end of a turn sends of the agent's last message, for a host whose hook does not name
+/// it `last_assistant_message`: the end of it, and whether the whole of it asked its person
+/// nothing. Judged here, where the whole message is; only the excerpt and the answer leave.
+fn turn_end(message: &str) -> Option<(String, bool)> {
+    let line = redacted_line(message)?;
+    let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&line);
+    Some((end_of(&line), nothing))
+}
+
+/// The payload key under which this hook hands the reply it kept to the report of the turn's
+/// end. No host sends it.
+const KEPT_REPLY: &str = "agentscm_kept_reply";
+
+/// Cursor says what a reply was (`afterAgentResponse`) apart from the end of its turn (`stop`),
+/// and each hook call is its own process. So the end of the reply and whether the whole of it
+/// asked anything wait on this machine, in a file named by a hash of the conversation, and the
+/// `stop` of the same generation takes them. True for every `afterAgentResponse`, kept or not:
+/// nothing of a reply is sent before its turn ends.
+fn keep_reply(config: &Path, payload: &mut Value) -> bool {
+    // Only this hook hands a kept reply over: one that came with the payload is not one.
+    if let Some(sent) = payload.as_object_mut() {
+        sent.remove(KEPT_REPLY);
+    }
+    let event = payload["hook_event_name"].as_str().unwrap_or_default();
+    let replied = event == "afterAgentResponse";
+    if !(replied || matches!(event, "stop" | "sessionEnd")) {
+        return false;
+    }
+    let Some(conversation) = bounded_string(&payload["conversation_id"], 1024) else {
+        return replied;
+    };
+    let kept = marker_path(config, &format!("reply\0cursor\0{conversation}"));
+    let reply = std::fs::read(&kept)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let _ = std::fs::remove_file(&kept);
+    if replied {
+        if let Some((asks, nothing)) = payload["text"].as_str().and_then(turn_end) {
+            let reply = json!({"generation": payload["generation_id"], "asks": asks,
+                "asked_nothing": nothing});
+            write_kept(&kept, &reply);
+        }
+    } else if event == "stop"
+        && let Some(reply) = reply.filter(|reply| reply["generation"] == payload["generation_id"])
+    {
+        payload[KEPT_REPLY] = reply;
+    }
+    replied
+}
+
+/// Writes what a later hook call of the same session takes up, readable by its person only.
+fn write_kept(path: &Path, value: &Value) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    if builder.create(dir).is_err() {
+        return;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    if let Ok(mut file) = options.open(path) {
+        let _ = file.write_all(value.to_string().as_bytes());
+    }
+}
+
+/// What a Gemini CLI permission prompt is for, from the details it gives its hooks: the command
+/// of a shell call, the file of an edit (never what it writes, and no path outside the session's
+/// folder), the tool and server of an MCP call, or what a fetch asks. Else the notification's
+/// own message.
+fn gemini_prompt_for(payload: &Value) -> Option<String> {
+    let details = &payload["details"];
+    let text = |key: &str| details[key].as_str().filter(|text| !text.trim().is_empty());
+    let what = match details["type"].as_str() {
+        Some("exec") => text("command").map(command_head),
+        // Inside the session's folder the path from there, else only the file's name: a path
+        // elsewhere on the machine says where its person keeps things.
+        Some("edit") => text("filePath")
+            .and_then(|file| {
+                let inside = Path::new(file)
+                    .strip_prefix(payload["cwd"].as_str()?)
+                    .ok()?;
+                Some(inside.to_str()?.to_owned()).filter(|inside| !inside.is_empty())
+            })
+            .or_else(|| text("fileName").map(str::to_owned)),
+        Some("mcp") => text("toolName").map(|tool| match text("serverName") {
+            Some(server) => format!("{tool} ({server})"),
+            None => tool.to_owned(),
+        }),
+        Some("info") => text("prompt").map(str::to_owned),
+        _ => None,
+    };
+    line_start(what.as_deref().or_else(|| payload["message"].as_str())?)
+}
+
+/// What a permission prompt is for: the host's own description of the call, where it gives one,
+/// and the files an edit names (never what it writes) or else a shell's command.
+fn prompt_for(tool: &str, input: &Value, edits: &[EditPath]) -> Option<String> {
+    let files: Vec<String> = edits
+        .iter()
+        .map(|edit| {
+            let does = edit
+                .header
+                .map_or("", |header| header.trim_start_matches("*** "));
+            format!("{does}{}", edit.path)
+        })
+        .collect();
+    let what = match &input["command"] {
+        _ if !files.is_empty() => Some(files.join(", ")),
+        // Only a shell's `command` is a command: an edit's is its patch, an MCP tool's an
+        // argument of the call.
+        _ if !agentscm::hub::hook::is_shell_tool(tool) => None,
+        Value::String(command) => Some(command_head(command)),
+        Value::Array(words) => Some(command_head(
+            &words
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )),
+        _ => None,
+    };
+    // An MCP tool's `description` is one of its arguments, not the host's word for the call.
+    let described = input["description"]
+        .as_str()
+        .filter(|text| !tool.starts_with("mcp__") && !text.trim().is_empty());
+    match (described, what) {
+        (Some(described), Some(what)) => line_start(&format!("{described}: {what}")),
+        (Some(text), None) => line_start(text),
+        (None, Some(what)) => line_start(&what),
+        (None, None) => None,
+    }
+}
+
+/// A command up to the text it feeds a program (a here-document, a patch). That text is what a
+/// file would hold, which never leaves the machine.
+fn command_head(command: &str) -> String {
+    let fed = ["<<", "*** Begin Patch"]
+        .iter()
+        .filter_map(|mark| command.find(mark))
+        .min();
+    match fed {
+        Some(at) => format!("{}…", command[..at].trim_end()),
+        None => command.to_owned(),
     }
 }
 
@@ -2009,9 +2191,25 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
             if let Some(id) = bounded_string(&payload["conversation_id"], 1024) {
                 out["conversation_id"] = json!(id);
             }
+            // Cursor's `stop` names no reply: its end is what this hook kept of the turn's last
+            // one (`keep_reply`), already redacted, cut and judged.
+            let kept = &payload[KEPT_REPLY];
+            if payload["hook_event_name"] == "stop"
+                && let Some(asks) = kept["asks"]
+                    .as_str()
+                    .filter(|asks| asks.chars().count() <= ASKS_CHARS + 1)
+                && let Some(nothing) = kept["asked_nothing"].as_bool()
+            {
+                out["asks"] = json!(asks);
+                out["asked_nothing"] = json!(nothing);
+            }
             Ok(out)
         }
-        "copilot" if payload.get("hook_event_name").is_some() => {
+        // Copilot CLI's camelCase notification may also name its event; `sessionId` says
+        // which shape it is.
+        "copilot"
+            if payload.get("hook_event_name").is_some() && payload.get("sessionId").is_none() =>
+        {
             sanitized_codex(payload, Some(paths))
         }
         "copilot" => {
@@ -2045,6 +2243,16 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
             } else if payload.get("source").is_some() || payload.get("initialPrompt").is_some() {
                 out.insert("source".into(), json!("client-session-start"));
             }
+            // What Copilot tells its person a prompt or a question is about. Its turn's end
+            // names only a transcript file, which is not read.
+            let asks = match payload["notification_type"].as_str() {
+                Some("permission_prompt") => payload["message"].as_str().and_then(line_start),
+                Some("elicitation_dialog") => payload["message"].as_str().and_then(line_end),
+                _ => None,
+            };
+            if let Some(asks) = asks {
+                out.insert("asks".into(), json!(asks));
+            }
             Ok(Value::Object(out))
         }
         "gemini" => {
@@ -2062,8 +2270,22 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
                 payload["hook_event_name"].as_str(),
                 payload["notification_type"].as_str(),
             ) {
-                (Some("AfterAgent"), _) => out["reason"] = json!("idle"),
-                (_, Some("ToolPermission")) => out["reason"] = json!("permission"),
+                // The end of the reply, and whether the whole of it asked its person anything.
+                (Some("AfterAgent"), _) => {
+                    out["reason"] = json!("idle");
+                    if let Some((asks, nothing)) =
+                        payload["prompt_response"].as_str().and_then(turn_end)
+                    {
+                        out["asks"] = json!(asks);
+                        out["asked_nothing"] = json!(nothing);
+                    }
+                }
+                (_, Some("ToolPermission")) => {
+                    out["reason"] = json!("permission");
+                    if let Some(asks) = gemini_prompt_for(payload) {
+                        out["asks"] = json!(asks);
+                    }
+                }
                 _ => {}
             }
             if event == "activity"
@@ -2651,18 +2873,144 @@ mod tests {
         let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
             "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});
         assert_eq!(wait_asks(&question).as_deref(), Some("Which cache? Now?"));
-        let prompt = json!({"hook_event_name":"PermissionRequest","tool_name":"Bash",
-            "tool_input":{"command":"git push -f","description":"Force-push the branch"}});
-        assert_eq!(wait_asks(&prompt).as_deref(), Some("Force-push the branch"));
-        // Nothing for a prompt with no description, other events, or a stop background work resumes.
+        // Nothing for other events, or a stop background work resumes.
         for quiet in [
-            json!({"hook_event_name":"PermissionRequest","tool_input":{"command":"x"}}),
             json!({"hook_event_name":"PostToolUse","last_assistant_message":"x"}),
             json!({"hook_event_name":"Stop","last_assistant_message":"x","background_tasks":2}),
             json!({"hook_event_name":"Stop","last_assistant_message":"  "}),
         ] {
             assert_eq!(wait_asks(&quiet), None, "{quiet}");
         }
+    }
+
+    #[test]
+    fn a_permission_prompt_says_its_command_or_its_files() {
+        let prompt = |tool: &str, input: Value| {
+            let payload = json!({"hook_event_name":"PermissionRequest","session_id":"s",
+                "tool_name":tool,"tool_input":input});
+            sanitized_codex(&payload, None).unwrap()["asks"].clone()
+        };
+        assert_eq!(
+            prompt("Bash", json!({"command":"cargo  publish\n--dry-run"})),
+            "cargo publish --dry-run"
+        );
+        assert_eq!(
+            prompt("shell", json!({"command":["bash","-lc","make deploy"]})),
+            "bash -lc make deploy"
+        );
+        // The host's own description of the call comes first, and stands alone without one.
+        assert_eq!(
+            prompt(
+                "Bash",
+                json!({"command":"git push -f","description":"Force-push the branch"})
+            ),
+            "Force-push the branch: git push -f"
+        );
+        assert_eq!(
+            prompt(
+                "Agent",
+                json!({"description":"Find the session keys","prompt":"PRIVATE"})
+            ),
+            "Find the session keys"
+        );
+        // An edit names its files and never what it writes: not when the edit is checked
+        // elsewhere and its files are not passed, and not when a shell is fed the content.
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-PRIVATE OLD\n+PRIVATE NEW\n*** Add File: src/b.rs\n+PRIVATE\n*** End Patch";
+        assert_eq!(
+            prompt("apply_patch", json!({"command":patch})),
+            "Update File: src/a.rs, Add File: src/b.rs"
+        );
+        let unlisted = json!({"hook_event_name":"PermissionRequest","session_id":"s",
+            "tool_name":"apply_patch","tool_input":{"command":patch}});
+        assert!(
+            sanitized_codex(&unlisted, Some(&[]))
+                .unwrap()
+                .get("asks")
+                .is_none()
+        );
+        assert_eq!(
+            prompt(
+                "Bash",
+                json!({"command":"cat > .env <<'EOF'\nPRIVATE=1\nEOF"})
+            ),
+            "cat > .env…"
+        );
+        assert_eq!(
+            prompt("Bash", json!({"command":format!("apply_patch {patch}")})),
+            "apply_patch…"
+        );
+        // An MCP tool's arguments are not the host's words for the call, whatever their names.
+        assert_eq!(
+            prompt(
+                "mcp__tracker__create_issue",
+                json!({"description":"PRIVATE body","command":"PRIVATE"})
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            prompt("Write", json!({"file_path":"src/c.rs","content":"PRIVATE"})),
+            "src/c.rs"
+        );
+        // A long command keeps its start, with its secrets redacted.
+        let long = format!(
+            "deploy GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 {}",
+            "--flag ".repeat(80)
+        );
+        let asks = prompt("Bash", json!({"command":long}));
+        let asks = asks.as_str().unwrap();
+        assert!(asks.starts_with("deploy ") && asks.ends_with('…'), "{asks}");
+        assert!(!asks.contains("ghp_abc"), "{asks}");
+        assert_eq!(asks.chars().count(), ASKS_CHARS + 1);
+        // Nothing for a call that names neither.
+        assert_eq!(prompt("mcp__files__read", json!({"id":7})), Value::Null);
+    }
+
+    #[test]
+    fn cursor_says_how_its_turn_ended_from_the_reply_this_hook_kept() {
+        let config = tempfile::tempdir().unwrap();
+        let call = |event: &str, generation: &str, text: Option<&str>| {
+            let mut payload = json!({"hook_event_name":event,"conversation_id":"c1",
+                "generation_id":generation,"text":text});
+            let kept = keep_reply(config.path(), &mut payload);
+            (kept, sanitized_client("cursor", &payload, &[]).unwrap())
+        };
+        let bare = json!({"hook_event_name":"stop","conversation_id":"c1"});
+        // A reply is kept on the machine and not sent; the stop of its turn says how it ended.
+        let reply = "Done.\n\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 is set. Shall I  merge it?";
+        assert!(call("afterAgentResponse", "g1", Some(reply)).0);
+        let notes = config.path().join("agentscm").join("hook-notes");
+        for kept in std::fs::read_dir(&notes).unwrap() {
+            let kept = std::fs::read_to_string(kept.unwrap().path()).unwrap();
+            assert!(!kept.contains("ghp_abc"), "{kept}");
+        }
+        let (kept, stop) = call("stop", "g1", None);
+        assert!(!kept);
+        assert_eq!(stop["asked_nothing"], false);
+        let asks = stop["asks"].as_str().unwrap();
+        assert!(asks.ends_with("is set. Shall I merge it?"), "{asks}");
+        assert!(!asks.contains("ghp_abc"), "{asks}");
+        // It is taken once, and a turn that only reports says so.
+        assert_eq!(call("stop", "g1", None).1, bare);
+        let report = "The fix is merged and the tests pass for both stores. ".repeat(12);
+        call("afterAgentResponse", "g2", Some(report.as_str()));
+        assert_eq!(call("stop", "g2", None).1["asked_nothing"], true);
+        // Another turn's stop does not take an earlier reply, and the session's end leaves none.
+        call("afterAgentResponse", "g3", Some(reply));
+        assert_eq!(call("stop", "g4", None).1, bare);
+        call("afterAgentResponse", "g5", Some(reply));
+        assert!(!call("sessionEnd", "g5", None).0);
+        assert_eq!(call("stop", "g5", None).1, bare);
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+        // A kept reply comes only from this hook: one the payload itself carries is dropped.
+        let mut forged = json!({"hook_event_name":"stop","conversation_id":"c1",
+            "agentscm_kept_reply":{"asks":"PRIVATE","asked_nothing":true}});
+        assert!(!keep_reply(config.path(), &mut forged));
+        assert_eq!(sanitized_client("cursor", &forged, &[]).unwrap(), bare);
+        // Other events pass untouched, and a reply with no conversation is still not sent.
+        let mut edit = json!({"hook_event_name":"postToolUse","conversation_id":"c1"});
+        assert!(!keep_reply(config.path(), &mut edit));
+        let mut unnamed = json!({"hook_event_name":"afterAgentResponse","text":"x"});
+        assert!(keep_reply(config.path(), &mut unnamed));
     }
 
     #[test]
@@ -2735,23 +3083,92 @@ mod tests {
             sanitized_codex(&stop, Some(&[])).unwrap(),
             json!({"hook_event_name":"Stop","session_id":"s","background_tasks":1})
         );
-        let camel = json!({"sessionId":"s","notification_type":"permission_prompt",
-            "message":"m","agentId":"sub"});
+        // Copilot CLI's notice of a prompt or a question says what it is about; no other notice
+        // sends its message, and the end of its turn names only a transcript, which is not read.
+        let copilot = |v: Value| sanitized_client("copilot", &v, &[]).unwrap();
         assert_eq!(
-            sanitized_client("copilot", &camel, &[]).unwrap(),
-            json!({"sessionId":"s","agentId":"sub","notification_type":"permission_prompt"})
+            copilot(
+                json!({"sessionId":"s","notification_type":"permission_prompt",
+                "title":"Permission needed","message":"Run  `git push`\nin /work?","agentId":"sub"})
+            ),
+            json!({"sessionId":"s","agentId":"sub","notification_type":"permission_prompt",
+                "asks":"Run `git push` in /work?"})
         );
-        let gemini = |v: Value| sanitized_client("gemini", &v, &[]).unwrap();
         assert_eq!(
-            gemini(json!({"hook_event_name":"Notification","session_id":"s",
-                "notification_type":"ToolPermission","message":"m","details":{"tool":"x"}})),
-            json!({"agent":"gemini","event":"waiting","reason":"permission","session":"s"})
+            copilot(
+                json!({"sessionId":"s","notification_type":"elicitation_dialog",
+                "message":"Which branch?"})
+            ),
+            json!({"sessionId":"s","notification_type":"elicitation_dialog","asks":"Which branch?"})
+        );
+        assert_eq!(
+            copilot(json!({"sessionId":"s","hook_event_name":"Notification",
+                "notification_type":"permission_prompt","message":"Run x"})),
+            json!({"sessionId":"s","notification_type":"permission_prompt","asks":"Run x"})
+        );
+        assert_eq!(
+            copilot(json!({"sessionId":"s","notification_type":"shell_completed","message":"m"})),
+            json!({"sessionId":"s","notification_type":"shell_completed"})
+        );
+        assert_eq!(
+            copilot(json!({"sessionId":"s","stopReason":"end_turn","transcriptPath":"/t"})),
+            json!({"sessionId":"s","stopReason":"end_turn"})
+        );
+        // Gemini CLI's prompt says its command, its file (never what is written) or its tool,
+        // else its own message; its turn's end is excerpted and judged like Claude Code's.
+        let gemini = |v: Value| sanitized_client("gemini", &v, &[]).unwrap();
+        let prompt = |details: Value| {
+            gemini(
+                json!({"hook_event_name":"Notification","session_id":"s","cwd":"/r",
+                "notification_type":"ToolPermission","message":"Tool Shell requires execution",
+                "details":details}),
+            )
+        };
+        assert_eq!(
+            prompt(
+                json!({"type":"exec","title":"Shell","command":"rm -rf  build","rootCommand":"rm"})
+            ),
+            json!({"agent":"gemini","event":"waiting","reason":"permission","session":"s",
+                "asks":"rm -rf build"})
+        );
+        assert_eq!(
+            prompt(
+                json!({"type":"edit","fileName":"a.rs","filePath":"/r/src/a.rs",
+                "fileDiff":"PRIVATE","newContent":"PRIVATE"})
+            )["asks"],
+            "src/a.rs"
+        );
+        assert_eq!(
+            prompt(json!({"type":"edit","fileName":"hosts","filePath":"/etc/hosts"}))["asks"],
+            "hosts"
+        );
+        assert_eq!(
+            prompt(json!({"type":"mcp","serverName":"github","toolName":"create_issue"}))["asks"],
+            "create_issue (github)"
+        );
+        assert_eq!(
+            prompt(json!({"type":"ask_user","title":"Ask"}))["asks"],
+            "Tool Shell requires execution"
+        );
+        assert_eq!(
+            prompt(json!({"type":"exec","command":"cat > a <<EOF\nPRIVATE\nEOF"}))["asks"],
+            "cat > a…"
         );
         assert_eq!(
             gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
-                "prompt":"private","prompt_response":"private"})),
-            json!({"agent":"gemini","event":"waiting","reason":"idle","session":"s"})
+                "prompt":"private","prompt_response":"All done.\nWhich branch next?"})),
+            json!({"agent":"gemini","event":"waiting","reason":"idle","session":"s",
+                "asks":"All done. Which branch next?","asked_nothing":false})
         );
+        // The whole reply is judged, not its excerpt: an ask before the cut still counts.
+        let long = format!(
+            "It is your call whether to delete them. {}",
+            "The fix is merged and the tests pass for both stores. ".repeat(12)
+        );
+        let ended = gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
+            "prompt_response":long}));
+        assert!(ended["asks"].as_str().unwrap().starts_with('…'), "{ended}");
+        assert_eq!(ended["asked_nothing"], false);
         // A notification Gemini adds later goes without a reason, which the Hub ignores.
         assert_eq!(
             gemini(json!({"hook_event_name":"Notification","session_id":"s",

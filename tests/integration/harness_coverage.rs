@@ -451,7 +451,11 @@ fn cursor_gets_what_its_row_says() {
         "{noted}"
     );
     cannot_refuse(&noted);
-    // Waiting is reported for the end of a turn only: Cursor reports no permission prompt.
+    // Waiting is reported for the end of a turn only: Cursor reports no permission prompt. A
+    // reply's text is kept on the machine until its turn ends; neither call says anything back.
+    let mut replied = event(&bench, "afterAgentResponse");
+    replied["text"] = json!("Shall I merge it?");
+    says_nothing(&bench.hook("cursor", &replied));
     says_nothing(&bench.hook("cursor", &event(&bench, "stop")));
     bench.hook("cursor", &edited(&bench, "src/own.rs"));
     end_releases(&bench, "cursor", &event(&bench, "sessionEnd"));

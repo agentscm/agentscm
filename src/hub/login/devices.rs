@@ -1056,7 +1056,7 @@ fn attention_revision(
 
 /// The candidates `owner` may read now by [`repository_role`], and how many could not be checked
 /// in time or at all. A role short of read, or a repository no longer connected, is left out.
-async fn readable(
+pub(in crate::hub) async fn readable(
     state: &HubState,
     owner: &User,
     candidates: Vec<ConnectedRepository>,

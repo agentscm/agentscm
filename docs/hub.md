@@ -437,8 +437,13 @@ gives the app a revocable credential bound to that person. With it the app can r
 repositories and work the way their own computer can, mint short read-only tokens for the
 repositories they can read now (the forge role is checked at every mint), and answer coordination
 and file handoff requests for the person's own agents, recorded with the app's `via`. It can
-never mint a writable agent token, enroll a computer, transition or recover Work, create
-hand-off pickups or call an administrator route.
+also list and answer the permission prompts and questions of the person's own agents in the
+repositories they can read now: allow or deny what an agent asks to run, pick one of the
+session's own "don't ask again" choices, and send the reason or answer the person gives, which
+the agent reads. It can never mint a writable agent token, enroll a computer, transition or
+recover Work, create hand-off pickups or call an administrator route. An app connected before a
+Hub version with prompt answering can answer prompts too once that Hub runs; a person who does
+not want that revokes it under Computers.
 
 **Configuration.** `AGENTSCM_HUB_APPS_FILE` is an absolute path to a JSON file under the same
 rules as the Slack config: a regular file, not a symlink, owned by the Hub's user and not
@@ -507,7 +512,12 @@ digest storage, 90-day idle expiry and revocation. It works on:
   `expected_updated_seq` and `operation_id` replay rules all hold, and the person must still be
   on `AGENTSCM_ALLOWED_USERS` when it is set (403 `not_allowed`). A coordination response is
   recorded with `"via": "slack"` (on the response and its `coordination_responded` event), and a
-  handoff answer as `answered_via_slack` with `"via": "slack"` on its event.
+  handoff answer as `answered_via_slack` with `"via": "slack"` on its event;
+- `GET /v1/hub/session/permissions` and `POST /v1/hub/session/permissions/answer`, with the
+  bodies and replies of [answering a permission prompt](agents.md#answer-a-permission-prompt-from-the-hub)
+  and the same allow-list check. The list holds only the person's own requests in repositories
+  the forge says they can read now, and an answer makes the forge's role check for its
+  repository.
 
 Every other computer route refuses it with 403 `app_not_allowed`, and every other person,
 agent or administrator route with 401. `GET /v1/hub/devices` lists it among the person's
@@ -1103,7 +1113,7 @@ existing saved client connection. `agentscm change-capture configure` is a confi
 each hook invocation resolves the session's current authorized Work and generation, appends locally
 before delivery, and replays a bounded ordered page. It does not reuse one fixed Work generation.
 Capture targets a Work that is `active`, `paused` or `blocked` for the session at its current
-generation: session end pauses the Work and a resumed session keeps capturing, while `finished` and
+generation: a session end can pause the Work and a resumed session keeps capturing, while `finished` and
 `handover` Work end capture. Unresolved hooks stay as bounded sanitized local facts and are never
 later attached to a Work item.
 

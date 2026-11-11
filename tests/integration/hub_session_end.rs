@@ -1,5 +1,6 @@
-//! Ending a session releases its intent and pauses the Work it leads in one transaction. Every
-//! case runs on SQLite and, when configured, PostgreSQL.
+//! Ending a session releases its intent and pauses the Work it leads in one transaction. A hook's
+//! end leaves Work whose hold is live as it is. Every case runs on SQLite and, when configured,
+//! PostgreSQL.
 use crate::hub_pg;
 
 use std::sync::Arc;
@@ -272,7 +273,7 @@ fn ending_pauses_the_work_and_releases_the_intent_together(db: &Db) {
     assert_eq!(held.len(), 1);
 
     let end = store
-        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 10)
+        .end_session_pausing(&alice.token, Some("s-a"), "mcp", now + 10)
         .unwrap();
     assert!(end.ended && end.paused);
     let before = end.work.unwrap();
@@ -309,7 +310,7 @@ fn a_failed_end_writes_nothing_and_a_retry_completes_it(db: &Db) {
         ("hub_events", "NEW.kind = 'session_ended'"),
     ] {
         db.fail_inserts(table, condition);
-        let failed = store.end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 10);
+        let failed = store.end_session_pausing(&alice.token, Some("s-a"), "mcp", now + 10);
         db.heal(table);
         assert!(failed.is_err(), "{table}");
         // No half state: the intent is held, the session remains and the Work is untouched.
@@ -325,7 +326,7 @@ fn a_failed_end_writes_nothing_and_a_retry_completes_it(db: &Db) {
 
     // The retry finds the same Work and completes both halves.
     let end = store
-        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 11)
+        .end_session_pausing(&alice.token, Some("s-a"), "mcp", now + 11)
         .unwrap();
     assert!(end.ended && end.paused);
     assert_eq!(
@@ -341,7 +342,7 @@ fn a_failed_end_writes_nothing_and_a_retry_completes_it(db: &Db) {
     // A replay changes nothing.
     let paused = work(&*store, &alice, &item.id, now + 12);
     let replay = store
-        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 12)
+        .end_session_pausing(&alice.token, Some("s-a"), "mcp", now + 12)
         .unwrap();
     assert!(!replay.ended && !replay.paused && replay.work.is_none());
     assert_eq!(work(&*store, &alice, &item.id, now + 12), paused);
@@ -366,7 +367,7 @@ fn an_end_after_the_old_two_step_crash_finishes_the_pause(db: &Db) {
     );
 
     let end = store
-        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + 6)
+        .end_session_pausing(&alice.token, Some("s-a"), "mcp", now + 6)
         .unwrap();
     assert!(!end.ended && end.paused);
     assert_eq!(
@@ -602,6 +603,89 @@ fn a_token_that_can_no_longer_act_on_work_still_ends_its_session(db: &Db) {
     assert!(live(&*store, now + 6).is_empty());
 }
 
+/// A hook's end may be only the gap between two turns of one session. Work whose hold is live
+/// goes on and nothing is written for it; the cases above cover the pause `done` still writes.
+fn a_hooks_end_leaves_work_with_a_live_hold_as_it_is(db: &Db) {
+    const LEASE: i64 = 1_200;
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let item = leading(&*store, &alice, "s-a", "src", now);
+    let gone = leading(&*store, &alice, "s-b", "docs", now);
+    let seen = events(&*store).len();
+    // One session ends and never comes back.
+    let end = store
+        .end_session_pausing(&alice.token, Some("s-b"), "hook:claude", now + 60)
+        .unwrap();
+    assert!(end.ended && !end.paused);
+    let renewed = || {
+        db.text(&format!(
+            "SELECT reservation_renewed_at FROM hub_work_items WHERE id = '{}'",
+            item.id
+        ))
+    };
+
+    // Two turns of a client that ends its session after each one.
+    for turn in [100, 300] {
+        let end = store
+            .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", now + turn)
+            .unwrap();
+        assert!(end.ended && !end.paused);
+        assert_eq!(end.work.unwrap().id, item.id);
+        // The session and its intent are gone; the Work is the same version, still active.
+        assert_eq!(db.sessions(), "0");
+        assert!(live(&*store, now + turn).is_empty());
+        let after = work(&*store, &alice, &item.id, now + turn);
+        assert_eq!(
+            (after.state, after.updated_seq),
+            (WorkState::Active, item.updated_seq)
+        );
+        // Its lease runs from the end.
+        assert_eq!(renewed(), (now + turn).to_string());
+        // The session comes back and edits on under the same Work.
+        let back = touch(&*store, &alice, "s-a", "src/lib.rs", now + turn + 50);
+        assert_eq!(back.intent.unwrap().task, item.title);
+    }
+    assert!(
+        !events(&*store)[seen..]
+            .iter()
+            .any(|kind| kind.starts_with("work_")),
+        "{:?}",
+        &events(&*store)[seen..]
+    );
+
+    // Once the hold has lapsed no lease bounds the wait, so the end pauses as it always did.
+    let lapsed = now + 2 * LEASE;
+    let mut at = now;
+    while at < lapsed {
+        at = (at + LEASE / 2).min(lapsed);
+        store.observe_lease_clock(at).unwrap();
+    }
+    let end = store
+        .end_session_pausing(&alice.token, Some("s-a"), "hook:claude", lapsed)
+        .unwrap();
+    assert!(end.ended && end.paused);
+    let paused = work(&*store, &alice, &item.id, lapsed);
+    assert_eq!(paused.state, WorkState::Paused);
+    assert_eq!(paused.current.as_ref().unwrap().summary, PAUSE_SUMMARY);
+
+    // The Work of the session that never came back is still active, as that of a session that
+    // was killed: the Work admitted over its files pauses it.
+    assert_eq!(
+        work(&*store, &alice, &gone.id, lapsed).state,
+        WorkState::Active
+    );
+    let next = store
+        .work_start(&alice.token, &start("docs-next", "s-c", "docs/**"), lapsed)
+        .unwrap();
+    assert!(next.created && next.conflict.is_none());
+    assert_eq!(
+        work(&*store, &alice, &gone.id, lapsed).state,
+        WorkState::Paused
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -626,4 +710,5 @@ conformance!(
     a_retained_reservation_stays_retained,
     an_unnamed_end_resolves_the_session_like_end_session,
     a_token_that_can_no_longer_act_on_work_still_ends_its_session,
+    a_hooks_end_leaves_work_with_a_live_hold_as_it_is,
 );
