@@ -1361,6 +1361,13 @@ pub trait Store: Send + Sync {
         query: &super::work_dependencies::WorkDependencyNoticeQuery,
         now: i64,
     ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
+    /// Pure bounded read of the shared latest notices addressed to this repository viewer's own Work.
+    /// Person readers must already have the current repository role, as for other scoped reads.
+    fn work_dependency_owner_notices(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage>;
     fn work_overlap_consent(
         &self,
         token: &str,

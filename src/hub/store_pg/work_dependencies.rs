@@ -267,7 +267,41 @@ impl PgStore {
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()?;
             let who = work_who(&mut tx, token, now)?;
-            let page = notice_page(&mut tx, &who, query, now)?;
+            let page = notice_page(&mut tx, &who, query, false, now)?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+    pub(super) fn dependency_owner_notices(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<WorkDependencyNoticePage> {
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            let query = WorkDependencyNoticeQuery {
+                session: String::new(),
+                after: 0,
+                through: None,
+                limit: 100,
+            };
+            let page = notice_page(&mut tx, &who, &query, true, now)?;
             tx.commit()?;
             Ok(page)
         })
@@ -285,7 +319,7 @@ impl PgStore {
             let Some(row)=tx.query_opt("SELECT dependency_notice_cursor FROM hub_sessions WHERE token=$1 AND session=$2 FOR UPDATE",&[&token,&session])? else {return Ok(None);};
             let after:i64=row.get(0);
             let query=WorkDependencyNoticeQuery{session:session.into(),after,through:None,limit:3};
-            let page=notice_page(&mut tx,&who,&query,now)?;
+            let page=notice_page(&mut tx,&who,&query,false,now)?;
             if page.next_after<=after {return Ok(None);}
             tx.execute("UPDATE hub_sessions SET dependency_notice_cursor=$3 WHERE token=$1 AND session=$2",&[&token,&session,&page.next_after])?;
             tx.commit()?;
@@ -298,6 +332,7 @@ fn notice_page(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     query: &WorkDependencyNoticeQuery,
+    owner_queue: bool,
     now: i64,
 ) -> Result<WorkDependencyNoticePage> {
     let through = query.through.unwrap_or(
@@ -319,13 +354,15 @@ fn notice_page(
                  JOIN hub_work_items w ON w.id=n.work WHERE n.event_seq>$1 AND n.event_seq<=$2
                  AND w.provider=$3 AND w.host=$4 AND w.repository=$5
                  AND w.repository_id IS NOT DISTINCT FROM $6
+                 AND (NOT $10 OR w.state<>'finished')
                  AND EXISTS(SELECT 1 FROM jsonb_array_elements_text(n.snapshot::jsonb->'recipients') r
                  JOIN hub_work_items recipient ON recipient.id=r.value
-                 WHERE recipient.lead_token=$7 AND recipient.lead_session=$8)
+                 WHERE (($10 AND recipient.owner=$11 AND recipient.id<>n.work)
+                 OR (NOT $10 AND recipient.lead_token=$7 AND recipient.lead_session=$8)))
                  ORDER BY n.event_seq LIMIT $9",
                 &[&query.after, &through, &who.owner.identity.provider, &who.owner.identity.host,
                   &who.repository, &who.repository_id, &who.token, &query.session,
-                  &((query.limit + 1) as i64)],
+                  &((query.limit + 1) as i64), &owner_queue, &who.owner.id],
             )?;
     let coverage_complete: bool = !tx.query_one(
                 "SELECT EXISTS(SELECT 1 FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND n.snapshot::jsonb->>'notification_fanout_complete'='false')",

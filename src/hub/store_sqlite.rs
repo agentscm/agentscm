@@ -16195,6 +16195,13 @@ impl Store for SqliteStore {
     ) -> Result<super::work_dependencies::WorkDependencyNoticePage> {
         self.dependency_notices(token, query, now)
     }
+    fn work_dependency_owner_notices(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<super::work_dependencies::WorkDependencyNoticePage> {
+        self.dependency_owner_notices(reader, now)
+    }
     fn work_overlap_start(
         &self,
         token: &str,

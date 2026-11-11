@@ -267,7 +267,37 @@ impl SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
-        let page = notice_page(&tx, &who, query, now)?;
+        let page = notice_page(&tx, &who, query, false, now)?;
+        tx.commit()?;
+        Ok(page)
+    }
+    pub(super) fn dependency_owner_notices(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<WorkDependencyNoticePage> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
+        let query = WorkDependencyNoticeQuery {
+            session: String::new(),
+            after: 0,
+            through: None,
+            limit: 100,
+        };
+        let page = notice_page(&tx, &who, &query, true, now)?;
         tx.commit()?;
         Ok(page)
     }
@@ -299,7 +329,7 @@ impl SqliteStore {
             through: None,
             limit: 3,
         };
-        let page = notice_page(&tx, &who, &query, now)?;
+        let page = notice_page(&tx, &who, &query, false, now)?;
         if page.next_after <= after {
             return Ok(None);
         }
@@ -316,6 +346,7 @@ fn notice_page(
     tx: &Transaction<'_>,
     who: &WorkWho,
     query: &WorkDependencyNoticeQuery,
+    owner_queue: bool,
     now: i64,
 ) -> Result<WorkDependencyNoticePage> {
     let through = query.through.unwrap_or(tx.query_row(
@@ -325,7 +356,7 @@ fn notice_page(
         )?);
     // Select only notices addressed to a Work this exact session currently leads. No source
     // relation, helper role or old lead credential grants mailbox access.
-    let rows=tx.prepare("SELECT n.event_seq,n.snapshot,w.snapshot FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work WHERE n.event_seq>?1 AND n.event_seq<=?2 AND w.provider=?3 AND w.host=?4 AND w.repository=?5 AND w.repository_id IS ?6 AND EXISTS(SELECT 1 FROM json_each(n.snapshot,'$.recipients') r JOIN hub_work_items recipient ON recipient.id=r.value WHERE recipient.lead_token=?7 AND recipient.lead_session=?8) ORDER BY n.event_seq LIMIT ?9")?.query_map(params![query.after,through,who.owner.identity.provider,who.owner.identity.host,who.repository,who.repository_id,who.token,query.session,(query.limit+1) as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let rows=tx.prepare("SELECT n.event_seq,n.snapshot,w.snapshot FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work WHERE n.event_seq>?1 AND n.event_seq<=?2 AND w.provider=?3 AND w.host=?4 AND w.repository=?5 AND w.repository_id IS ?6 AND (NOT ?10 OR w.state<>'finished') AND EXISTS(SELECT 1 FROM json_each(n.snapshot,'$.recipients') r JOIN hub_work_items recipient ON recipient.id=r.value WHERE ((?10 AND recipient.owner=?11 AND recipient.id<>n.work) OR (NOT ?10 AND recipient.lead_token=?7 AND recipient.lead_session=?8))) ORDER BY n.event_seq LIMIT ?9")?.query_map(params![query.after,through,who.owner.identity.provider,who.owner.identity.host,who.repository,who.repository_id,who.token,query.session,(query.limit+1) as i64,owner_queue,who.owner.id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let coverage_complete: bool = !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM hub_work_dependency_notices n JOIN hub_work_items w ON w.id=n.work WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3 AND w.repository_id IS ?4 AND json_extract(n.snapshot,'$.notification_fanout_complete')=0)",
             params![who.owner.identity.provider,who.owner.identity.host,who.repository,who.repository_id], |r|r.get::<_,bool>(0))?;
