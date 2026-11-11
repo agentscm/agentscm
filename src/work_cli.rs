@@ -104,6 +104,8 @@ pub enum WorkCommand {
     },
     /// Read the conservative insight projection for one work item.
     Insight { id: String },
+    /// Read bounded recorded intent, freshness and completeness for one Work item.
+    Intent { id: String },
     /// List conservative work insight projections in a bounded time window.
     Insights {
         #[arg(long)]
@@ -390,6 +392,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Reconciliation { .. }
         | WorkCommand::Declarations { .. }
         | WorkCommand::Insight { .. }
+        | WorkCommand::Intent { .. }
         | WorkCommand::Recovery { .. }
         | WorkCommand::RecoveryPreview { .. }
         | WorkCommand::Insights { .. } => false,
@@ -504,6 +507,11 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             LIMIT + Duration::from_secs((*wait_seconds).min(25))
         }
         _ => LIMIT,
+    };
+    let intent_suffix = if matches!(&command, WorkCommand::Intent { .. }) {
+        "intent"
+    } else {
+        "insights"
     };
     let hub = Hub::connect(timeout)?;
     let (reply, claim_conflict) = match command {
@@ -711,13 +719,14 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
-        WorkCommand::Insight { id } => {
+        WorkCommand::Insight { id } | WorkCommand::Intent { id } => {
+            let suffix = intent_suffix;
             let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
                 .map_err(|_| invalid("cannot construct insight URL"))?;
             url.path_segments_mut()
                 .map_err(|_| invalid("cannot construct insight URL"))?
                 .push(&id)
-                .push("insights");
+                .push(suffix);
             let path = url
                 .as_str()
                 .strip_prefix("http://hub")

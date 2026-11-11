@@ -1078,3 +1078,51 @@ fn issue_link_set_preserves_native_identity() {
     assert_eq!(result["item"]["source"], item["source"]);
     assert_eq!(result["item"]["issue_link"]["number"], 7);
 }
+
+#[test]
+fn recorded_intent_read_and_errors() {
+    let hub = Hub::start();
+    let client = hub.bound_client(92, "fixture", 101);
+    let created = client.start(r#"{"request_key":"intent-cli","title":"Synthetic intent task","session":"intent-cli","next_action":"Check the fixture"}"#);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let id = started["item"]["id"].as_str().unwrap();
+    let read = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["work", "intent", id])
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let before = hub.store.latest_event_seq().unwrap();
+    let output = read(id);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["work_id"], id);
+    assert_eq!(report["next_action"], "Check the fixture");
+    assert!(report["completeness"].is_object());
+    assert_eq!(hub.store.latest_event_seq().unwrap(), before);
+    assert!(
+        !read("wrk_00000000000000000000000000000000")
+            .status
+            .success()
+    );
+    // Query/path delimiters stay inside the ID segment and cannot redirect this read.
+    assert!(
+        !read(&format!("{id}/../overview?operational=1"))
+            .status
+            .success()
+    );
+}

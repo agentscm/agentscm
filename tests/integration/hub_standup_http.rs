@@ -42,6 +42,17 @@ impl Hub {
     }
 
     async fn token(&self, id: i64, repository: &str, read_only: bool) -> (String, String) {
+        self.token_in_repository(id, repository, 101, read_only)
+            .await
+    }
+
+    async fn token_in_repository(
+        &self,
+        id: i64,
+        repository: &str,
+        repository_id: i64,
+        read_only: bool,
+    ) -> (String, String) {
         let store = self.store.clone();
         let repository = repository.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -60,7 +71,7 @@ impl Hub {
                 &owner.id,
                 "test-agent",
                 &repository,
-                101,
+                repository_id,
                 3600,
                 read_only,
             )
@@ -1540,4 +1551,105 @@ async fn clients_read_work_replies_a_newer_hub_adds_to() {
     assert_eq!(status, 200, "{batch}");
     let (fields, values) = reads_newer::<WorkTransitionBatchV1>(&batch);
     assert!(fields > 1 && values > 0, "transitions: {fields} {values}");
+}
+
+async fn recorded_intent_surfaces(hub: Hub) {
+    let (_, writer) = hub.token(991, "acme/widgets", false).await;
+    let (_, reader) = hub.token(992, "acme/widgets", true).await;
+    let (_, foreign) = hub
+        .token_in_repository(993, "acme/foreign", 202, true)
+        .await;
+    let (_, started) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &writer,
+            Some(start("intent-http")),
+        )
+        .await;
+    let id = started["item"]["id"].as_str().unwrap();
+    let path = format!("/v1/hub/standup/work/{id}/intent");
+    let store = hub.store.clone();
+    let before = tokio::task::spawn_blocking(move || store.latest_event_seq().unwrap())
+        .await
+        .unwrap();
+    let (status, mut writable) = hub.call(Method::GET, &path, &writer, None).await;
+    assert_eq!(status, 200, "{writable}");
+    let (status, mut readonly) = hub.call(Method::GET, &path, &reader, None).await;
+    assert_eq!(status, 200, "{readonly}");
+    assert_eq!(readonly["work_id"], id);
+    assert_eq!(readonly["next_action"], "Add boundary tests");
+    assert_eq!(readonly["atomic_snapshot"], true);
+    assert!(readonly["completeness"].is_object());
+    assert!(
+        readonly["data_framing"]
+            .as_str()
+            .unwrap()
+            .contains("third-party data")
+    );
+    writable.as_object_mut().unwrap().remove("observed_at");
+    readonly.as_object_mut().unwrap().remove("observed_at");
+    assert_eq!(writable, readonly);
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_intent","arguments":{"work_id":id}}});
+    for secret in [&reader, &writer] {
+        let (status, response) = hub
+            .call(Method::POST, "/mcp", secret, Some(request.clone()))
+            .await;
+        assert_eq!(status, 200, "{response}");
+        let result = &response["result"];
+        assert_eq!(result["isError"], false, "{response}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("third-party data")
+        );
+        let mut projection = result["structuredContent"].clone();
+        projection.as_object_mut().unwrap().remove("observed_at");
+        assert_eq!(projection, readonly);
+    }
+    let store = hub.store.clone();
+    let after = tokio::task::spawn_blocking(move || store.latest_event_seq().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    // A different stable repository identity is inaccessible.
+    let (status, _) = hub.call(Method::GET, &path, &foreign, None).await;
+    assert_eq!(status, 404);
+    let (status, _) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/work/wrk_00000000000000000000000000000000/intent",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/work/invalid/intent",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 400);
+    let (status, response) = hub.call(Method::POST, "/mcp", &reader, Some(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentscm_work_intent","arguments":{"work_id":"invalid"}}}))).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["result"]["isError"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_intent_http_and_mcp() {
+    recorded_intent_surfaces(Hub::start(None).await).await;
+}
+
+#[test]
+fn recorded_intent_http_and_mcp_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        recorded_intent_surfaces(Hub::start(Some(pg.url.clone())).await).await;
+    });
 }

@@ -678,6 +678,7 @@ async fn protocol_basics() {
             "agentscm_work_reconciliation",
             "agentscm_work_reconciliation_apply",
             "agentscm_shared_conversation",
+            "agentscm_work_intent",
             "agentscm_work_insight",
             "agentscm_work_insights",
             "agentscm_value_metrics",
@@ -890,6 +891,7 @@ async fn protocol_basics() {
         "agentscm_change_record",
         "agentscm_work_insight",
         "agentscm_work_insights",
+        "agentscm_work_intent",
         "agentscm_coordination_inbox",
         "agentscm_work_recovery",
         "agentscm_work_recovery_preview",
@@ -2958,7 +2960,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 44] = [
+    const CORE: [&str; 45] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -2988,6 +2990,7 @@ async fn default_tool_list_cost() {
         "agentscm_work_dependency_notices",
         "agentscm_work_insight",
         "agentscm_work_insights",
+        "agentscm_work_intent",
         "agentscm_work_issue_link_set",
         "agentscm_work_overlap_checkpoint",
         "agentscm_work_overlap_consent",

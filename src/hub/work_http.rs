@@ -71,6 +71,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/insights", get(insights))
         .route("/v1/hub/standup/value-metrics", get(value_metrics))
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
+        .route("/v1/hub/standup/work/{id}/intent", get(work_intent))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
         .route("/v1/hub/standup/issue-link", post(set_issue_link))
@@ -720,6 +721,20 @@ async fn value_metrics(
         })
         .await?,
     ))
+}
+
+async fn work_intent(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+) -> Result<Json<super::work_intent::WorkIntentV1>, ApiError> {
+    let store = state.store.clone();
+    let value = blocking(&state, move || {
+        store.work_intent(&principal.token_id, &id, unix_now())
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    Ok(Json(value))
 }
 
 async fn insight(
