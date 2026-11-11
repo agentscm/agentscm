@@ -1744,6 +1744,33 @@ async fn holder_intent_encounters(hub: Hub) {
         assert_eq!(page["requests"][0]["id"], request_id);
         assert_eq!(page["holder_intents"]["items"][0]["work_id"], id);
     }
+    // Numeric pagination must decode directly, with or without optional intent context.
+    let through = enriched["coordination_request"]["updated_seq"]
+        .as_i64()
+        .unwrap();
+    for intent in ["", "&intent=0", "&intent=1"] {
+        let path = format!(
+            "/v1/hub/standup/coordination?after=0&through={through}&limit=100&active_only=true{intent}"
+        );
+        let (status, page) = hub.call(Method::GET, &path, &requester, None).await;
+        assert_eq!(status, 200, "{path}: {page}");
+        assert_eq!(page["requests"][0]["id"], request_id);
+        assert_eq!(page["through"], through);
+        assert_eq!(page.get("holder_intents").is_some(), intent == "&intent=1");
+    }
+    for query in [
+        "after=invalid",
+        "through=invalid",
+        "limit=invalid",
+        "active_only=invalid",
+        "intent=2",
+        "unknown=1",
+        "after=0&after=1",
+    ] {
+        let path = format!("/v1/hub/standup/coordination?{query}");
+        let (status, _) = hub.call(Method::GET, &path, &requester, None).await;
+        assert_eq!(status, 400, "{path}");
+    }
     let (_, plain) = hub
         .call(
             Method::GET,

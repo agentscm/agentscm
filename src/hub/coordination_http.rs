@@ -121,10 +121,15 @@ pub(super) async fn poll_inbox(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListQuery {
+    after: Option<i64>,
+    through: Option<i64>,
+    #[serde(default)]
+    active_only: bool,
+    #[serde(default = "page_limit")]
+    limit: usize,
     intent: Option<u8>,
-    #[serde(flatten)]
-    query: CoordinationListQuery,
 }
 
 async fn list(
@@ -137,7 +142,12 @@ async fn list(
         intent: query.intent,
     }
     .requested()?;
-    let query = query.query;
+    let query = CoordinationListQuery {
+        after: query.after,
+        through: query.through,
+        active_only: query.active_only,
+        limit: query.limit,
+    };
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
