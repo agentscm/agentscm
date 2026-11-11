@@ -517,6 +517,8 @@ Coordination admission is bounded to 8 open requests per token, 25 per owner and
 
 MCP exposes `agentscm_work_overview`, `agentscm_coordination_inbox`, `agentscm_coordination_ack`, `agentscm_coordination_reply`, `agentscm_coordination_resolve`, `agentscm_coordination_withdraw`, `agentscm_work_briefing`, `agentscm_work_checkpoint`, `agentscm_work_transition`, `agentscm_work_transitions`, `agentscm_work_recovery`, `agentscm_work_recovery_preview` and `agentscm_work_ack`. Read-only tokens see and can call the two recovery reads. The existing `agentscm_start` tool accepts an explicit work ID, canonical forge source or stable request key and returns its pre-start briefing with the claim result. Read-only tokens can call `agentscm_work_briefing`; the mutation tools reject them. Implicit MCP pre-start and native session-start briefings are pure previews with no delivery receipt. For deliberate acknowledgement, request a durable `agentscm_work_briefing`, retrieve every page, then acknowledge its delivery identifier.
 
+When a person asks to see the work in an MCP Apps host, call `agentscm_show_overview`. It returns full overview and shared status data and advertises the overview card when the person’s view settings enable it. Agent planning, paging and inbox polling use `agentscm_work_overview` and `agentscm_coordination_inbox`; neither tool mounts a card. The overview card refreshes itself with `agentscm_work_overview` and `detail: "full"`. The inbox has no inline view. `agentscm_value_metrics` retains its existing card. Actual mounting and app-initiated results in live MCP hosts remain unverified.
+
 ## HTTP surface
 
 All scope comes from the bearer token. There is no repository selector in these routes.

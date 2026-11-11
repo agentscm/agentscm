@@ -7,7 +7,7 @@ import { ViewSettingsBox } from '../../src/ViewSettings.tsx'
 vi.mock('../../src/api.ts', () => ({ fetchViewSettings: vi.fn() }))
 vi.mock('../../src/workspace.ts', async (orig) => ({ ...(await orig<typeof ws>()), workspaceRequest: vi.fn(), workspaceMutation: vi.fn() }))
 
-const on = { enabled: true, work_overview: true, coordination_inbox: false }
+const on = { enabled: true, work_overview: true }
 const report = (over: object | null = null, effective: object = on, hub_default: object = on) => ({ effective, hub_default, override: over })
 const session = (manage: boolean) => ({ capabilities: { manage_workspace: manage }, csrf_token: 'c', workspace: { id: 'w' }, actor: { user: { id: 'u' } } })
 const setup = (data: object, manage: boolean | null) => {
@@ -23,6 +23,17 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => vi.restoreAllMocks())
 
 describe('inline agent views settings', () => {
+  it('decodes surviving settings and ignores a retired override from an older hub', async () => {
+    const actual = await vi.importActual<typeof api>('../../src/api.ts')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      effective: { ...on, coordination_inbox: true },
+      hub_default: { ...on, enabled: false, coordination_inbox: false },
+      override: { enabled: false, work_overview: null, coordination_inbox: true },
+    }), { status: 200 }))
+    expect(await actual.fetchViewSettings('synthetic', new AbortController().signal)).toEqual({
+      effective: on, hub_default: { ...on, enabled: false }, override: { enabled: false, work_overview: null },
+    })
+  })
   it('says in plain words when the hub is too old, never the HTTP status', async () => {
     vi.mocked(api.fetchViewSettings).mockRejectedValue(Object.assign(new Error('HTTP 404'), { status: 404 }))
     vi.mocked(ws.workspaceRequest).mockResolvedValue(session(false) as never)
@@ -32,20 +43,21 @@ describe('inline agent views settings', () => {
     expect(document.body.textContent).not.toContain('HTTP')
   })
   it('renders effective values with their source', async () => {
-    setup(report({ coordination_inbox: false, work_overview: null }), true)
+    setup(report({ enabled: true, work_overview: null }), true)
     expect((await sw('Show views in agent apps')).checked).toBe(true)
     expect((await sw('Work overview')).checked).toBe(true)
     expect(described(await sw('Work overview'))).toMatch(/from the hub default/)
-    expect(described(await sw('Coordination inbox'))).toMatch(/from your setting/)
+    expect(described(await sw('Show views in agent apps'))).toMatch(/from your setting/)
     expect(described(await sw('Work overview'))).toMatch(/only to your own agents/)
+    expect(screen.queryByRole('switch', { name: /Coordination inbox/ })).toBeNull()
   })
   it('PUTs only the toggled field to /me', async () => {
     setup(report(), false)
-    vi.mocked(ws.workspaceMutation).mockResolvedValue(report({ coordination_inbox: true }, { ...on, coordination_inbox: true }) as never)
-    const box = await ready('Coordination inbox')
+    vi.mocked(ws.workspaceMutation).mockResolvedValue(report({ work_overview: false }, { ...on, work_overview: false }) as never)
+    const box = await ready('Work overview')
     fireEvent.click(box)
-    await waitFor(() => expect(ws.workspaceMutation).toHaveBeenCalledWith(expect.anything(), '/view-settings/me', { coordination_inbox: true }, { method: 'PUT' }))
-    await waitFor(() => expect(box.checked).toBe(true))
+    await waitFor(() => expect(ws.workspaceMutation).toHaveBeenCalledWith(expect.anything(), '/view-settings/me', { work_overview: false }, { method: 'PUT' }))
+    await waitFor(() => expect(box.checked).toBe(false))
     expect(described(box)).toMatch(/from your setting/)
   })
   it('resets to the hub default only when an override exists', async () => {
@@ -63,11 +75,11 @@ describe('inline agent views settings', () => {
   })
   it('lets an administrator edit the hub default', async () => {
     setup(report(), true)
-    vi.mocked(ws.workspaceMutation).mockResolvedValue({ ...on, coordination_inbox: true } as never)
-    const box = await ready('Hub default: Coordination inbox')
+    vi.mocked(ws.workspaceMutation).mockResolvedValue({ ...on, work_overview: false } as never)
+    const box = await ready('Hub default: Work overview')
     fireEvent.click(box)
-    await waitFor(() => expect(ws.workspaceMutation).toHaveBeenCalledWith(expect.anything(), '/view-settings', { ...on, coordination_inbox: true }, { method: 'PUT' }))
-    await waitFor(() => expect(box.checked).toBe(true))
+    await waitFor(() => expect(ws.workspaceMutation).toHaveBeenCalledWith(expect.anything(), '/view-settings', { ...on, work_overview: false }, { method: 'PUT' }))
+    await waitFor(() => expect(box.checked).toBe(false))
   })
   it('lets a non-admin member edit only their own views', async () => {
     setup(report(), false)
@@ -82,7 +94,7 @@ describe('inline agent views settings', () => {
     expect((await sw('Hub default: Work overview')).disabled).toBe(true)
   })
   it('labels child switches when the master is off', async () => {
-    setup(report({ enabled: false }, { enabled: false, work_overview: true, coordination_inbox: true }), true)
+    setup(report({ enabled: false }, { enabled: false, work_overview: true }), true)
     const child = await sw('Work overview')
     expect(child.disabled).toBe(true)
     expect(child.checked).toBe(false)
