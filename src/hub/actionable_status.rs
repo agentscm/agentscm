@@ -15,6 +15,7 @@ use crate::hub::store::{Principal, Store, owner_session, session_ancestors, sess
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
+use crate::hub::work_reconcile::WorkStage;
 use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
@@ -113,6 +114,9 @@ pub struct StatusWork {
     pub operational: StatusOperational,
     /// Historical retained results are never promoted to current by this projection.
     pub reconciliation: Option<StatusReconciliation>,
+    /// Working, pull request open or merged, or complete, with the pull request number.
+    #[serde(default)]
+    pub stage: Option<crate::hub::work_reconcile::WorkStageV1>,
     pub limits: Vec<String>,
 }
 
@@ -478,6 +482,7 @@ pub fn project_work(
             current_source_coverage: r.current_source_coverage,
             stale_reasons: r.stale_reasons,
         }),
+        stage: None,
         limits: limits.into_iter().collect(),
     }
 }
@@ -618,6 +623,7 @@ fn read_scoped(
         .map(|s| (s.key.as_str(), s.updated_at))
         .collect::<BTreeMap<_, _>>();
     let mut work = Vec::new();
+    let mut staged = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
         let item = match item {
@@ -674,12 +680,20 @@ fn read_scoped(
             row.recipient = StatusRecipient::none();
             row.action = "Refresh changed Work before acting.".into();
         }
+        staged.push((item.clone(), op.outcome.value));
         if !row.limits.iter().any(|limit| {
             limit == "work_changed_during_read" || limit == "reconciliation_work_changed"
         }) {
             items.insert(id, item);
         }
         work.push(row);
+    }
+    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
+    let (mut stages, stage_limits) =
+        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
+    limits.extend(stage_limits);
+    for row in &mut work {
+        row.stage = stages.remove(&row.work_id);
     }
     for request in &requests.requests {
         if !request.responses_complete {
@@ -1164,8 +1178,16 @@ pub fn render_text(status: &ActionableStatus) -> String {
             "{} [{}; {}; reservation {:?}]: {}",
             row.title, state, recipient, row.operational.reservation.status, row.action
         ));
+        let stage = row.stage.as_ref().map_or_else(String::new, |s| {
+            let words = match (s.stage, s.pull_request) {
+                (WorkStage::PullRequestMerged, Some(n)) => format!("pull request #{n} merged"),
+                (WorkStage::PullRequestOpen, Some(n)) => format!("pull request #{n} open"),
+                (stage, _) => format!("{stage:?}"),
+            };
+            format!(" Stage: {words}.")
+        });
         lines.push(format!(
-            "  Claim {:?}; outcome {:?} ({:?}). {}",
+            "  Claim {:?}; outcome {:?} ({:?}). {}{}",
             row.freshness,
             row.operational.outcome.value,
             row.operational.outcome.provenance,
@@ -1173,7 +1195,8 @@ pub fn render_text(status: &ActionableStatus) -> String {
                 .report
                 .as_ref()
                 .map(|r| format!("Agent report {:?} at {}.", r.kind, r.at))
-                .unwrap_or_else(|| "No retained agent report.".into())
+                .unwrap_or_else(|| "No retained agent report.".into()),
+            stage
         ));
         if let Some(r) = &row.reconciliation {
             for source in &r.current_source_coverage {
@@ -4436,6 +4459,14 @@ mod tests {
         assert!(text.contains("3 actions need you"));
         assert!(text.contains("awaiting a named party"));
         assert!(text.contains("Coverage incomplete"));
+        assert!(!text.contains("Stage:"));
+        let mut staged = fixture.clone();
+        staged.work[0].stage = Some(crate::hub::work_reconcile::WorkStageV1 {
+            stage: WorkStage::PullRequestOpen,
+            pull_request: Some(7),
+            basis: None,
+        });
+        assert!(render_text(&staged).contains("Stage: pull request #7 open."));
     }
     #[test]
     fn compact_status_keeps_full_scope_identity_without_serializing_paths() {

@@ -94,13 +94,26 @@ pub(super) struct Page {
     pub recent_before: Option<i64>,
 }
 
+/// The current Work a page lists before its size cut: a continuation lists only what its cursor
+/// continues, and a recent-outcomes cursor lists none. The page shows the first `size`.
+pub(super) fn page_current<'a>(overview: &'a WorkOverview, page: &Page) -> Vec<&'a WorkItem> {
+    let first = page.after.is_none() && page.recent_before.is_none();
+    overview
+        .current
+        .iter()
+        .filter(|_| first || page.after.is_some())
+        .collect()
+}
+
 /// One page of the overview. `held` is the operational projection of reservation-holding Work;
 /// each listed item says whether it holds one.
 pub(super) fn overview(
     overview: &WorkOverview,
     held: &OperationalOverviewV1,
+    read: &super::work_reconcile::StagedOverview,
     page: &Page,
 ) -> Value {
+    let (stages, merges) = (&read.stages, &read.merges);
     let reservation = |id: &str| {
         held.work
             .iter()
@@ -112,11 +125,7 @@ pub(super) fn overview(
     };
     // The first page lists everything; a continuation lists only what its cursor continues.
     let first = page.after.is_none() && page.recent_before.is_none();
-    let current: Vec<&WorkItem> = overview
-        .current
-        .iter()
-        .filter(|_| first || page.after.is_some())
-        .collect();
+    let current = page_current(overview, page);
     // More follows when the page is cut here or the store's own read was.
     let shown = current.len().min(page.size);
     let next_after = (shown > 0 && (current.len() > page.size || !overview.current_complete))
@@ -127,6 +136,11 @@ pub(super) fn overview(
         .map(|item| {
             let mut value = brief(item);
             value["reservation"] = reservation(&item.id);
+            if let Some(stage) = stages.get(&item.id) {
+                value["stage"] = json!(stage.stage);
+                value["pull_request"] = json!(stage.pull_request);
+                value["basis"] = json!(stage.basis);
+            }
             value
         })
         .collect();
@@ -160,6 +174,16 @@ pub(super) fn overview(
                 "reasons_complete": pair.reasons_complete && pair.reasons.len() <= 3})
         })
         .collect();
+    let recent_merges: Vec<Value> = merges
+        .list
+        .iter()
+        .take(if first { LIST } else { 0 })
+        .map(|merge| {
+            json!({"work": merge.work_id, "pull_request": merge.pull_number,
+                "merged_at": merge.merged_at, "basis": merge.basis,
+                "provenance": merge.provenance})
+        })
+        .collect();
     json!({
         "detail": "compact",
         "recent_since": overview.recent_since, "until": overview.until,
@@ -174,6 +198,10 @@ pub(super) fn overview(
         "overlaps": overlaps, "overlaps_listed": overview.overlaps.len(),
         "history_retention_gap": overview.history_retention_gap,
         "settled_count": overview.settled_count,
+        "recent_merges": recent_merges, "recent_merges_listed": merges.list.len(),
+        "recent_merges_complete": merges.complete && first && recent_merges.len() == merges.list.len(),
+        "stage_limits": read.limits.iter().take(PAGE).collect::<Vec<_>>(),
+        "stage_limits_listed": read.limits.len(),
         "held_reservations": held.work.len(), "held_reservations_complete": held.complete,
         "planned_issues": first.then(|| planned(&overview.planned_issues)),
         "pages": "The first page lists current Work, recent outcomes and at most five overlap pairs (all of them with detail full). Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
@@ -399,14 +427,103 @@ mod tests {
             recent_before: None,
         };
         // Cut here: the next page starts after the last item shown.
-        let cut = super::overview(&listed(&[3, 2, 1], true), &held, &page(None));
+        let cut = super::overview(
+            &listed(&[3, 2, 1], true),
+            &held,
+            &Default::default(),
+            &page(None),
+        );
         assert_eq!(cut["next_after"], id(2));
         // Cut by the store's own bound: its last item is where the next read starts.
-        let bounded = super::overview(&listed(&[3, 2], false), &held, &page(None));
+        let bounded = super::overview(
+            &listed(&[3, 2], false),
+            &held,
+            &Default::default(),
+            &page(None),
+        );
         assert_eq!(bounded["next_after"], id(2));
         // A continuation shows what the store read after the cursor; ids are in no order.
-        let rest = super::overview(&listed(&[1], true), &held, &page(Some(id(2))));
+        let rest = super::overview(
+            &listed(&[1], true),
+            &held,
+            &Default::default(),
+            &page(Some(id(2))),
+        );
         assert_eq!(rest["current"][0]["id"], id(1));
         assert!(rest["next_after"].is_null());
+    }
+
+    #[test]
+    fn a_page_labels_stages_and_recent_merges_and_caps_stage_limits() {
+        use crate::hub::work_reconcile::{
+            LinkBasis, Provenance, RecentBranchMerge, RecentMerges, StagedOverview, WorkStage,
+            WorkStageV1,
+        };
+        let id = |n: u8| format!("wrk_{}", n.to_string().repeat(32));
+        let work = |n: u8| {
+            json!({
+                "id": id(n), "repository": "acme/widgets", "owner": "usr_alice",
+                "owner_login": "alice", "title": "Staged", "state": "active",
+                "source": {"kind": "native", "request_key": "synthetic"},
+                "claim_status": "active", "last_checkin_at": 1, "generation": 1,
+                "lead_token": "tok_alice", "lead_agent": "client-a", "lead_session": "s",
+                "participants": [], "scope": [], "branch": null, "worktree": null,
+                "next_action": null, "current": null, "blocker": null,
+                "depends_on": [], "related_work": [], "created_at": 1, "updated_at": 1,
+                "created_seq": 1, "updated_seq": 1
+            })
+        };
+        let overview: super::WorkOverview = serde_json::from_value(json!({
+            "recent_since": 0, "until": 1, "current": [work(1), work(2)], "recent": [],
+            "overlaps": [], "current_complete": true, "recent_complete": true,
+            "overlaps_complete": true, "history_retention_gap": false
+        }))
+        .unwrap();
+        let held = super::OperationalOverviewV1 {
+            schema_version: 1,
+            work: vec![],
+            complete: true,
+        };
+        let read = StagedOverview {
+            stages: [(
+                id(1),
+                WorkStageV1 {
+                    stage: WorkStage::PullRequestOpen,
+                    pull_request: Some(12),
+                    basis: Some(LinkBasis::BranchObserved),
+                },
+            )]
+            .into(),
+            limits: (0..11).map(|n| format!("limit_{n:02}")).collect(),
+            merges: RecentMerges {
+                list: vec![RecentBranchMerge {
+                    work_id: id(1),
+                    pull_number: 30,
+                    merged_at: 5,
+                    basis: LinkBasis::CallerReported,
+                    provenance: Provenance::Provider,
+                }],
+                complete: true,
+            },
+            ..Default::default()
+        };
+        let page = super::Page {
+            size: 5,
+            after: None,
+            recent_before: None,
+        };
+        let value = super::overview(&overview, &held, &read, &page);
+        assert_eq!(value["current"][0]["stage"], "pull_request_open");
+        assert_eq!(value["current"][0]["pull_request"], 12);
+        assert_eq!(value["current"][0]["basis"], "branch_observed");
+        // A Work the read did not stage carries no stage.
+        assert!(value["current"][1].get("stage").is_none(), "{value}");
+        let merge = &value["recent_merges"][0];
+        assert_eq!(merge["pull_request"], 30);
+        assert_eq!(merge["basis"], "caller_reported");
+        assert_eq!(merge["provenance"], "provider");
+        assert_eq!(value["recent_merges_complete"], true);
+        assert_eq!(value["stage_limits"].as_array().unwrap().len(), 10);
+        assert_eq!(value["stage_limits_listed"], 11);
     }
 }

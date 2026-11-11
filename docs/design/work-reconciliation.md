@@ -22,6 +22,21 @@ A prerequisite is satisfied only by one retained merge whose independently provi
 
 Version 1 still has separate reads (`atomic_snapshot: false`) and a final Work recheck. Coverage is a catch-up preview that can run the existing publication backfill. Its digest excludes blocker and open-observation clock fields. Its reassessment flag is derived, and it supports only the independent single-link compatibility slot (`single_pr_link_only`). Legacy checkpoint omission can clear legacy relation hints; the durable declarations below survive it. New clients should use version 2 for persisted results and multiple explicit conditions.
 
+## Inferred pull request link
+
+The version-1 report's `link` has a `basis`. `caller_reported` is the explicit link and always wins. When a Work has no explicit link and has a branch, the Hub reads an observed same-repository pull request on that branch: an open observation, or a provider-observed merge after the Work was created. It reports that link with `basis: "branch_observed"`. Nothing is stored, and the next read infers again.
+
+No link is inferred, with a limit, when:
+
+- `branch_is_merge_base`: the branch is the base of some merged pull request.
+- `branch_pull_requests_multiple`: several candidate pull requests exist.
+- `branch_merge_head_repository_unknown`: the merge was recorded before the Hub kept the head repository.
+- `branch_merges_truncated` and `pr_observations_truncated`: a bounded read hit its limit; `merge_lookup_unavailable`: the merge read failed.
+
+Fork pull requests and merges before the Work existed are never candidates. An inferred link compares no heads: the report carries `branch_link_head_not_compared`, the head relation stays unknown, and the link never satisfies a prerequisite. In stage reads, an explicit link that cannot be read is never inferred over: the stage is `unknown` and `stage_limits` carries `work_link_unavailable`.
+
+The same inference feeds the Work stage in status and overview, and `recent_merges` beside the overview (see [stand-up](../standup.md#work-stage-inferred-links-and-recent-merges)). A provider-observed merge is separate from the reported outcome and never completes Work or releases its reservation.
+
 ## Provider identity and uncertain evidence
 
 Merge lookups use provider, host, stable repository ID and PR number, never just a branch. Fork and branch reuse therefore cannot satisfy a different explicit target. Repository renames preserve the stable evidence namespace; Work still stored under an old repository name needs the existing `work repair-repository` operation before a token for the renamed repository can read it. Legacy unbound or unlinked conditions remain unknown until an evidence target is declared.

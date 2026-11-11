@@ -2611,6 +2611,7 @@ async fn call_inner(
         let store = state.store.clone();
         let token = principal.token_id.clone();
         let viewer = principal.owner.id.clone();
+        let principal = principal.clone();
         return Ok(
             match blocking(state, move || {
                 let now = unix_now();
@@ -2620,12 +2621,23 @@ async fn call_inner(
                     &OperationalSelect::Holders,
                     now,
                 )?;
+                // Full detail stages every current Work; compact only the ones it lists.
+                let staged: Vec<&WorkItem> = match detail {
+                    Detail::Full => overview.current.iter().collect(),
+                    Detail::Compact => compact::page_current(&overview, &page)
+                        .into_iter()
+                        .take(page.size)
+                        .collect(),
+                };
+                let read = super::work_reconcile::overview_with_stages(
+                    &*store, &principal, &overview, &staged, now,
+                );
                 Ok(match detail {
-                    Detail::Full => structured(&super::work_lifecycle::overview_with_operational(
-                        &overview, &held,
+                    Detail::Full => structured(&super::work_lifecycle::attach_operational(
+                        read.value, &held,
                     )),
                     Detail::Compact => {
-                        let value = compact::overview(&overview, &held, &page);
+                        let value = compact::overview(&overview, &held, &read, &page);
                         json!({"content": [{"type": "text", "text": compact::overview_text(&value)}],
                             "structuredContent": value, "isError": false})
                     }

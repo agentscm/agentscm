@@ -1907,3 +1907,298 @@ async fn holder_intent_encounter_aggregate_is_bounded_and_pure() {
         before
     );
 }
+
+/// Each current Work's stage is opt-in with `stages=1`, so a strict older client still decodes
+/// the plain overview. A Work whose branch has a same-repository open pull request is
+/// `pull_request_open` with that number; one without is `working`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_stages_are_opt_in_and_name_the_open_pull_request() {
+    let hub = Hub::start(None).await;
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, reader) = hub.token(2, "acme/widgets", true).await;
+    let mut ids = Vec::new();
+    for (key, path, branch, session) in [
+        ("shipped", "src/shipped.rs", "feat/shipped", "s-a"),
+        ("plain", "src/plain.rs", "feat/plain", "s-b"),
+    ] {
+        let body = json!({"request_key": key, "title": "Stage", "session": session,
+            "scope": [path], "branch": branch, "next_action": "Continue"});
+        let (status, started) = hub
+            .call(Method::POST, "/v1/hub/standup/start", &lead, Some(body))
+            .await;
+        assert_eq!(status, 200, "{started}");
+        ids.push(started["item"]["id"].as_str().unwrap().to_owned());
+    }
+    let store = hub.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let connection = store
+            .insert_connection(
+                &agentscm::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repository = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let data = json!({"number": 12, "state": "open", "repository_id": 101,
+            "head_ref": "feat/shipped", "head_sha": "a".repeat(40), "base_ref": "main",
+            "head_repository_id": 101})
+        .to_string();
+        store
+            .observe(&repository.id, "pull_request", "12", &data, unix_now())
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let (status, plain) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("stages").is_none(), "{plain}");
+    serde_json::from_value::<WorkOverview>(plain).unwrap();
+
+    let (status, staged) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=1",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(
+        staged["stages"][&ids[0]],
+        json!({"stage": "pull_request_open", "pull_request": 12, "basis": "branch_observed"}),
+        "{staged}"
+    );
+    assert_eq!(staged["stages"][&ids[1]]["stage"], "working", "{staged}");
+    let bad = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=2",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(bad.0, 400);
+}
+
+/// A Work whose same-repository branch merged inside the recent window is listed in
+/// `recent_merges` with provider provenance, while its reported outcome stays as the agent left
+/// it. A fork merge, one outside the window or before the Work, one for a Work explicitly
+/// linked to another pull request, and a branch reused by two pull requests are not listed.
+async fn recent_merges_list_provider_observed_merges(hub: Hub) {
+    use agentscm::hub::work::WorkState;
+    use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
+    let (lead_id, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, reader) = hub.token(2, "acme/widgets", true).await;
+    // Merge times are offsets from a clock read after the Work starts, so no merge predates
+    // its Work when a second passes during setup.
+    // (branch, merged_at offset, pull number, same repository head, explicit link number)
+    let cases: [(&str, i64, i64, bool, Option<i64>); 10] = [
+        ("feat/shipped", 0, 30, true, None),
+        ("feat/matched", 0, 32, true, Some(32)),
+        ("feat/fork", 0, 33, false, None),
+        ("feat/future", 1000, 34, true, None),
+        ("feat/early", -1000, 35, true, None),
+        ("feat/other", 0, 31, true, Some(99)),
+        // One branch reused for two pull requests: inference picks neither, so none is listed.
+        ("feat/reused", 0, 36, true, None),
+        ("feat/reused", 0, 37, true, None),
+        // An open same-repository pull request on the branch: inference picks neither.
+        ("feat/reopened", 0, 38, true, None),
+        // A merge base, but explicitly linked: listed, as its stage reads merged.
+        ("feat/stack-base", 0, 40, true, Some(40)),
+    ];
+    let mut ids = Vec::new();
+    for (index, (branch, _, _, _, _)) in cases.iter().enumerate() {
+        let body = json!({"request_key": format!("rm{index}"), "title": "Merged",
+            "session": format!("s-{index}"), "scope": [format!("src/rm{index}.rs")],
+            "branch": branch, "next_action": "Continue"});
+        let (status, started) = hub
+            .call(Method::POST, "/v1/hub/standup/start", &lead, Some(body))
+            .await;
+        assert_eq!(status, 200, "{started}");
+        let started: WorkStartResult = serde_json::from_value(started).unwrap();
+        ids.push(started.item);
+    }
+    let now = unix_now();
+    let store = hub.store.clone();
+    let token = lead_id.clone();
+    let work = ids.clone();
+    tokio::task::spawn_blocking(move || {
+        let connection = store
+            .insert_connection(
+                &agentscm::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repository = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let open = json!({"number": 39, "state": "open", "repository_id": 101,
+            "head_ref": "feat/reopened", "head_sha": "b".repeat(40), "base_ref": "main",
+            "head_repository_id": 101})
+        .to_string();
+        store
+            .observe(&repository.id, "pull_request", "39", &open, now)
+            .unwrap();
+        let scope = CatchupRepositoryScope {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(101),
+        };
+        // A pull request that merged into `feat/stack-base` makes it a merge base.
+        store
+            .record_catchup_merge(
+                &scope,
+                &NewCatchupMerge {
+                    same_repository_head: true,
+                    source: CatchupMergeSource::ForgePull,
+                    source_id: "pull:41".into(),
+                    occurred_at: Some(now),
+                    title: None,
+                    branch: "feat/stack-tip".into(),
+                    base: "feat/stack-base".into(),
+                    head_commit: "8".repeat(40),
+                    merge_commit: format!("{:040x}", 41),
+                    pull_number: 41,
+                    paths: vec!["src/a.rs".into()],
+                    paths_complete: true,
+                },
+                now,
+            )
+            .unwrap();
+        for (item, (branch, at, number, same, link)) in work.iter().zip(cases) {
+            store
+                .record_catchup_merge(
+                    &scope,
+                    &NewCatchupMerge {
+                        same_repository_head: same,
+                        source: CatchupMergeSource::ForgePull,
+                        source_id: format!("pull:{number}"),
+                        occurred_at: Some(now + at),
+                        title: Some("Untrusted title".into()),
+                        branch: branch.into(),
+                        base: "main".into(),
+                        head_commit: "7".repeat(40),
+                        merge_commit: format!("{number:040x}"),
+                        pull_number: number,
+                        paths: vec!["src/a.rs".into()],
+                        paths_complete: true,
+                    },
+                    now,
+                )
+                .unwrap();
+            if let Some(number) = link {
+                store
+                    .work_pr_link_set(
+                        &token,
+                        &WorkPrLinkUpdate {
+                            work_id: item.id.clone(),
+                            operation_id: format!("link-{}", item.id),
+                            generation: item.generation,
+                            session: item.lead_session.clone(),
+                            expected_updated_seq: item.updated_seq,
+                            link: Some(WorkPrLinkTarget {
+                                repository_id: 101,
+                                number,
+                                head_sha: "7".repeat(40),
+                            }),
+                        },
+                        unix_now(),
+                    )
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let (status, plain) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("recent_merges").is_none(), "{plain}");
+    let (status, staged) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?stages=1",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(staged["recent_merges_complete"], true, "{staged}");
+    let listed = staged["recent_merges"].as_array().unwrap();
+    assert_eq!(listed.len(), 3, "{staged}");
+    let by_work = |id: &str| listed.iter().find(|m| m["work_id"] == id).unwrap();
+    assert!(listed.iter().all(|m| m["work_id"] != ids[8].id), "{staged}");
+    assert_eq!(by_work(&ids[9].id)["pull_number"], 40, "{staged}");
+    assert_eq!(by_work(&ids[9].id)["basis"], "caller_reported");
+    assert_eq!(by_work(&ids[0].id)["pull_number"], 30, "{staged}");
+    assert_eq!(by_work(&ids[0].id)["basis"], "branch_observed");
+    assert_eq!(by_work(&ids[1].id)["pull_number"], 32);
+    assert_eq!(by_work(&ids[1].id)["basis"], "caller_reported");
+    for merge in listed {
+        assert_eq!(merge["provenance"], "provider", "{staged}");
+        assert!(!merge.to_string().contains("Untrusted"), "{staged}");
+    }
+    // The agent's outcome is untouched: nothing was reported, so nothing is recent.
+    assert!(staged["recent"].as_array().unwrap().is_empty(), "{staged}");
+    let store = hub.store.clone();
+    let (token, id) = (lead_id.clone(), ids[0].id.clone());
+    let item = tokio::task::spawn_blocking(move || {
+        store.work_get(&token, &id, unix_now()).unwrap().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_ne!(item.state, WorkState::Finished);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_merges_list_provider_observed_merges_sqlite() {
+    recent_merges_list_provider_observed_merges(Hub::start(None).await).await;
+}
+
+#[test]
+fn recent_merges_list_provider_observed_merges_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        recent_merges_list_provider_observed_merges(Hub::start(Some(pg.url.clone())).await).await;
+    });
+}

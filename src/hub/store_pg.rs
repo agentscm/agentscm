@@ -17,15 +17,16 @@ use crate::change_record::{
 
 use super::capacity::{self, CapacityLimit, CapacityRefusal, CapacityRepository};
 use super::catchup::{
-    CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES, CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES,
-    CATCHUP_DELIVERY_CAPACITY_BYTES, CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult,
-    CatchupAckStatus, CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource,
-    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    BranchMerge, BranchMergeRows, CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES,
+    CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES, CATCHUP_DELIVERY_CAPACITY_BYTES,
+    CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult, CatchupAckStatus,
+    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupPage,
+    CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
     CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge, RecentMergeRow,
     TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
     repository_namespace, source_name, tracked_publication_merge,
 };
@@ -1037,8 +1038,8 @@ fn pg_record_catchup_merge(
     tx.execute(
         "INSERT INTO hub_catchup_merges
         (provider,host,repository,repository_key,repository_id,seq,id,source,source_id,occurred_at,
-         observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete,payload_bytes)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+         observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete,payload_bytes,same_repository_head)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
         &[
             &scope.provider,
             &scope.host,
@@ -1060,6 +1061,7 @@ fn pg_record_catchup_merge(
             &paths,
             &merge.paths_complete,
             &payload_bytes,
+            &merge.same_repository_head,
         ],
     )?;
     tx.execute(
@@ -11075,6 +11077,115 @@ impl Store for PgStore {
                 &[&scope.provider, &scope.host, &repository_namespace(&scope.repository, scope.repository_id), &catchup_repository_key(scope.repository_id), &pull_number])?
                 .iter().map(pg_catchup_merge).collect()
         })
+    }
+
+    fn catchup_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        branches: &[String],
+        per_branch: usize,
+    ) -> Result<BranchMergeRows> {
+        scope.validate()?;
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        let key = catchup_repository_key(scope.repository_id);
+        self.run(true, |client| {
+            let (mut rows, mut bases) = (Vec::new(), BTreeSet::new());
+            let limit = i64::try_from(per_branch).unwrap_or(i64::MAX);
+            for branch in branches.iter().collect::<BTreeSet<_>>() {
+                let args: &[&(dyn postgres::types::ToSql + Sync)] =
+                    &[&scope.provider, &scope.host, &repository, &key, branch];
+                for row in client.query(
+                    "SELECT pull_number,head_commit,occurred_at,same_repository_head
+                     FROM hub_catchup_merges
+                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND branch=$5
+                     ORDER BY occurred_at DESC NULLS LAST, pull_number DESC LIMIT $6",
+                    &[&scope.provider, &scope.host, &repository, &key, branch, &limit],
+                )? {
+                    rows.push((
+                        branch.clone(),
+                        BranchMerge {
+                            pull_number: row.get(0),
+                            head_commit: row.get(1),
+                            occurred_at: row.get(2),
+                            same_repository_head: row.get(3),
+                        },
+                    ));
+                }
+                if !client
+                    .query(
+                        "SELECT 1 FROM hub_catchup_branch_merges
+                         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+                           AND branch=$5 AND is_base=1",
+                        args,
+                    )?
+                    .is_empty()
+                {
+                    bases.insert(branch.clone());
+                }
+            }
+            Ok((rows, bases))
+        })
+    }
+
+    fn recent_branch_merges(
+        &self,
+        scope: &CatchupRepositoryScope,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<(Vec<RecentMergeRow>, bool)> {
+        scope.validate()?;
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        let key = catchup_repository_key(scope.repository_id);
+        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = self.run(true, |client| {
+            client
+                .query(
+                    "SELECT w.id, m.pull_number, m.occurred_at, (l.number IS NOT NULL), m.branch
+             FROM hub_catchup_merges m
+             JOIN hub_work_items w ON w.branch = m.branch AND m.occurred_at >= w.created_at
+             LEFT JOIN hub_work_pr_links l ON l.work = w.id
+             WHERE m.provider=$1 AND m.host=$2 AND m.repository=$3 AND m.repository_key=$4
+               AND m.same_repository_head = $5 AND m.occurred_at >= $6 AND m.occurred_at <= $7
+               AND w.provider=$1 AND w.host=$2 AND w.repository=$8 AND w.repository_id IS NOT DISTINCT FROM $9::BIGINT
+               AND (l.number = m.pull_number OR (l.number IS NULL AND NOT EXISTS (
+                 SELECT 1 FROM hub_catchup_merges o
+                 WHERE o.provider=m.provider AND o.host=m.host AND o.repository=m.repository
+                   AND o.repository_key=m.repository_key AND o.branch=m.branch
+                   AND o.same_repository_head IS TRUE AND o.pull_number <> m.pull_number
+                   AND o.occurred_at >= w.created_at)
+                 AND NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges b
+                   WHERE b.provider=m.provider AND b.host=m.host AND b.repository=m.repository
+                     AND b.repository_key=m.repository_key AND b.branch=m.branch AND b.is_base=1)))
+             ORDER BY m.occurred_at DESC, m.pull_number DESC, w.id ASC LIMIT $10",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &repository,
+                        &key,
+                        &true,
+                        &since,
+                        &until,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &fetch,
+                    ],
+                )?
+                .iter()
+                .map(|row| {
+                    Ok(RecentMergeRow {
+                        work_id: row.get(0),
+                        pull_number: row.get(1),
+                        merged_at: row.get(2),
+                        explicit_link: row.get(3),
+                        branch: row.get(4),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let complete = rows.len() <= limit;
+        rows.truncate(limit);
+        Ok((rows, complete))
     }
 
     fn record_catchup_source_status(

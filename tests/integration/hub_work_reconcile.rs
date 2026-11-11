@@ -17,7 +17,9 @@ use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, Wo
 use agentscm::hub::work_lifecycle::{OutcomeValue, ReservationStatus};
 use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
 use agentscm::hub::work_reconcile::WorkReconciliationV1;
-use agentscm::hub::work_reconcile::{self, HeadRelation, PrerequisiteState, ProviderStatus};
+use agentscm::hub::work_reconcile::{
+    self, HeadRelation, LinkBasis, PrerequisiteState, ProviderStatus,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -679,6 +681,191 @@ fn http_route(fixture: &StoreFixture) {
         "another repository must look like unknown Work"
     );
     assert_eq!(get(&work.id, "agt_not-a-token").0, 401);
+}
+
+fn branch_pull(ctx: &mut Ctx, number: i64, branch: &str, head: &str, head_repository: i64) {
+    ctx.clock += 1;
+    let data = json!({"number": number, "state": "open", "repository_id": REPOSITORY_ID,
+        "head_ref": branch, "head_sha": head, "base_ref": "main",
+        "head_repository_id": head_repository})
+    .to_string();
+    ctx.store
+        .observe(
+            &ctx.repo.id,
+            "pull_request",
+            &number.to_string(),
+            &data,
+            ctx.clock,
+        )
+        .unwrap();
+}
+
+fn branch_work(ctx: &Ctx, key: &str, scope: &str, branch: &str) -> WorkItem {
+    let mut request = start(key, scope, &[]);
+    request.branch = Some(branch.into());
+    ctx.store
+        .work_start(ctx.token(), &request, unix_now())
+        .unwrap()
+        .item
+}
+
+fn branch_inference(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    // A same-repository open pull request on the branch links by inference.
+    let work = branch_work(&ctx, "a", "src/a", "feature/a");
+    branch_pull(&mut ctx, 21, "feature/a", HEAD_A, REPOSITORY_ID);
+    let out = ctx.read(&work);
+    let link = out.link.as_ref().unwrap();
+    assert_eq!(link.basis, LinkBasis::BranchObserved);
+    assert_eq!(link.number, 21);
+    assert!(!has(&out, "no_pr_link"));
+    assert_eq!(out.provider.status, ProviderStatus::OpenSameHead);
+    assert_eq!(out.provider.head_relation, HeadRelation::Unknown);
+    assert!(
+        serde_json::to_string(&out)
+            .unwrap()
+            .contains("branch_observed")
+    );
+
+    // A fork pull request never links.
+    let fork = branch_work(&ctx, "b", "src/b", "feature/b");
+    branch_pull(&mut ctx, 22, "feature/b", HEAD_B, 999);
+    let out = ctx.read(&fork);
+    assert!(out.link.is_none() && has(&out, "no_pr_link"));
+
+    // An explicit link wins over a different pull request on the branch.
+    let explicit = branch_work(&ctx, "c", "src/c", "feature/c");
+    ctx.link(&explicit, 5, HEAD_A);
+    branch_pull(&mut ctx, 23, "feature/c", HEAD_B, REPOSITORY_ID);
+    let out = ctx.read(&explicit);
+    let link = out.link.as_ref().unwrap();
+    assert_eq!((link.basis, link.number), (LinkBasis::CallerReported, 5));
+
+    // Two pull requests on one branch are a named limit.
+    let many = branch_work(&ctx, "d", "src/d", "feature/d");
+    branch_pull(&mut ctx, 24, "feature/d", HEAD_A, REPOSITORY_ID);
+    branch_pull(&mut ctx, 25, "feature/d", HEAD_B, REPOSITORY_ID);
+    let out = ctx.read(&many);
+    assert!(out.link.is_none() && has(&out, "branch_pull_requests_multiple"));
+}
+
+fn branch_merge(ctx: &Ctx, number: i64, branch: &str, at: i64, same: bool) {
+    let merge = NewCatchupMerge {
+        source: CatchupMergeSource::ForgePull,
+        source_id: format!("forge-pr-{number}"),
+        occurred_at: Some(at),
+        title: None,
+        branch: branch.into(),
+        base: "main".into(),
+        head_commit: HEAD_B.into(),
+        merge_commit: format!("{number:040x}"),
+        pull_number: number,
+        paths: vec!["src/a".into()],
+        paths_complete: true,
+        same_repository_head: same,
+    };
+    ctx.store
+        .record_catchup_merge(&scope(), &merge, at + 1)
+        .unwrap();
+}
+
+fn branch_merged(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let after = unix_now() + 5;
+    let setup_observations = agentscm::hub::onboarding::Observations::default();
+
+    let merged = branch_work(&ctx, "m", "src/m", "feature/m");
+    branch_merge(&ctx, 41, "feature/m", after, true);
+    let out = ctx.read(&merged);
+    let link = out.link.as_ref().unwrap();
+    assert_eq!((link.basis, link.number), (LinkBasis::BranchObserved, 41));
+    assert_eq!(out.provider.status, ProviderStatus::Merged);
+    assert!(!has(&out, "no_pr_link"));
+    assert_eq!(out.outcome.value, OutcomeValue::None);
+
+    let fork = branch_work(&ctx, "f", "src/f", "feature/f");
+    branch_merge(&ctx, 42, "feature/f", after, false);
+    let out = ctx.read(&fork);
+    assert!(out.link.is_none() && has(&out, "no_pr_link"));
+
+    let early = branch_work(&ctx, "e", "src/e", "feature/e");
+    branch_merge(&ctx, 43, "feature/e", 1, true);
+    let out = ctx.read(&early);
+    assert!(out.link.is_none() && has(&out, "no_pr_link"));
+
+    let status = agentscm::hub::work_http::actionable_status::read(
+        &*ctx.store,
+        &setup_observations,
+        &ctx.principal,
+        unix_now(),
+    )
+    .unwrap();
+    let row = status.work.iter().find(|w| w.work_id == merged.id).unwrap();
+    assert_eq!(
+        serde_json::to_value(row.stage.as_ref().unwrap()).unwrap(),
+        json!({"stage": "pull_request_merged", "pull_request": 41, "basis": "branch_observed"})
+    );
+
+    // The head repository round-trips, and a merge's base is a merge base.
+    let (rows, bases) = ctx
+        .store
+        .catchup_branch_merges(&scope(), &["feature/m".into(), "feature/f".into()], 20)
+        .unwrap();
+    let same: Vec<_> = rows
+        .iter()
+        .map(|(b, m)| (b.as_str(), m.same_repository_head))
+        .collect();
+    assert_eq!(
+        same,
+        [("feature/f", Some(false)), ("feature/m", Some(true))]
+    );
+    assert!(!bases.contains("feature/m"));
+    let (_, bases) = ctx
+        .store
+        .catchup_branch_merges(&scope(), &["main".into()], 20)
+        .unwrap();
+    assert!(bases.contains("main"));
+}
+
+#[test]
+fn work_reconcile_branch_merged() {
+    run_both(branch_merged);
+}
+
+fn status_stage(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    let setup_observations = agentscm::hub::onboarding::Observations::default();
+    let plain = branch_work(&ctx, "p", "src/p", "feature/p");
+    let open = branch_work(&ctx, "o", "src/o", "feature/o");
+    branch_pull(&mut ctx, 31, "feature/o", HEAD_A, REPOSITORY_ID);
+    let many = branch_work(&ctx, "m", "src/m", "feature/m");
+    branch_pull(&mut ctx, 32, "feature/m", HEAD_A, REPOSITORY_ID);
+    branch_pull(&mut ctx, 33, "feature/m", HEAD_B, REPOSITORY_ID);
+    let status = agentscm::hub::work_http::actionable_status::read(
+        &*ctx.store,
+        &setup_observations,
+        &ctx.principal,
+        unix_now(),
+    )
+    .unwrap();
+    let stage = |work: &WorkItem| {
+        let row = status.work.iter().find(|w| w.work_id == work.id).unwrap();
+        serde_json::to_value(row.stage.as_ref().unwrap()).unwrap()
+    };
+    assert_eq!(
+        stage(&plain),
+        json!({"stage": "working", "pull_request": null, "basis": null})
+    );
+    assert_eq!(
+        stage(&open),
+        json!({"stage": "pull_request_open", "pull_request": 31, "basis": "branch_observed"})
+    );
+    assert_eq!(stage(&many)["stage"], "unknown");
+}
+
+#[test]
+fn work_reconcile_status_stage() {
+    run_both(status_stage);
 }
 
 fn run_both(case: fn(&StoreFixture)) {
@@ -2579,4 +2766,9 @@ fn postgres_dependency_summary_delivery() {
         return;
     };
     dependency_summary_attempt_is_serialized(&fixture);
+}
+
+#[test]
+fn work_reconcile_branch_inference() {
+    run_both(branch_inference);
 }
