@@ -397,8 +397,9 @@ async fn authorize(
          <p>{name} will be able to:</p><ul>\
          <li>read your work across the repositories you can read on this Hub;</li>\
          <li>answer coordination requests and file requests for you, shown as \u{201c}via {via}\u{201d};</li>\
-         <li>answer your agents' permission prompts and questions.</li></ul>\
-         <p>It can't edit code, act as your agents, or change Work.</p>\
+         <li>answer your agents' permission prompts and questions in those repositories: allow or deny what an agent asks to run, \
+         pick one of its \u{201c}don't ask again\u{201d} choices, and send it the reason or answer you give.</li></ul>\
+         <p>It can't edit code, start your agents, or change Work.</p>\
          <p>You can revoke it at any time under Computers.</p>\
          <form method=\"post\" action=\"{AUTHORIZE}\">{hidden}\
          <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\

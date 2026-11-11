@@ -97,7 +97,7 @@ the bodies, replies and rules. Requests live in the memory of one Hub process.
 |---|---|---|
 | `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
 | `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
-| `GET /v1/hub/session/permissions?repository=…` | Web sign-in, or a connected app's credential | `{"requests": [...]}`: the person's own requests there (in every repository without `repository`) that a prompt on screen confirmed, each with its `repository` and what of it is not shown |
+| `GET /v1/hub/session/permissions?repository=…` | Web sign-in, or a connected app's credential | `{"requests": [...]}`: the person's own requests there (in every repository without `repository`) that a prompt on screen confirmed, each with its `repository` and what of it is not shown; for a connected app, only in repositories the person can read now |
 | `POST /v1/hub/session/permissions/answer` | Web sign-in with `x-csrf-token`, or a connected app's credential | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
 
 ## Hub: connected apps
@@ -117,7 +117,9 @@ The credential (`Authorization: Bearer <credential>`) works on `GET` and `DELETE
 `app_read_only` otherwise), and `POST /v1/hub/session/coordination/reply` and
 `POST /v1/hub/session/handoff/answer`, where it acts for its person with the app's `via`, and
 `GET /v1/hub/session/permissions` and `POST /v1/hub/session/permissions/answer`, where it lists
-and answers its person's permission prompts and questions. Other
+and answers its person's permission prompts and questions: it can allow what their agent asks
+to run, with one of the session's own choices, or deny it, and send the agent a typed reason or
+answer. Other
 computer routes are 403 `app_not_allowed`; every other route is 401. It is listed in
 `GET /v1/hub/devices` with `"app": {"id", "name"}`.
 

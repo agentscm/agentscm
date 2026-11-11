@@ -594,6 +594,9 @@ pub(super) struct Listed {
     request_id: String,
     /// The `owner/name` of the repository the request's agent token is for.
     repository: String,
+    /// That repository's forge id, for the connected app's role check.
+    #[serde(skip)]
+    repository_id: Option<i64>,
     tool: String,
     summary: Option<String>,
     folder: Option<String>,
@@ -1046,6 +1049,7 @@ impl Requests {
         inner.settle(waiting, now);
         let mut out = Vec::new();
         for (id, row) in &inner.rows {
+            // `register` refuses a token not bound to a repository, so every row has an id.
             if row.owner != owner || (repository_id.is_some() && row.repository_id != repository_id)
             {
                 continue;
@@ -1062,6 +1066,7 @@ impl Requests {
                 item_id: format!("waiting:{}:{}", row.kind.code(), row.item_key),
                 request_id: id.clone(),
                 repository: row.repository.clone(),
+                repository_id: row.repository_id,
                 tool: row.tool.clone(),
                 summary: row.summary.clone(),
                 folder: row.folder.clone(),
@@ -1350,9 +1355,10 @@ async fn list(
     query: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Page>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let user = person.user;
+    let Person { user, via } = person;
     // A page polls this, and it shows only the caller's own requests, so it needs the
-    // repository's id alone. The answer makes the forge's role check.
+    // repository's id alone. The answer makes the forge's role check; a connected app's list
+    // makes it too, below.
     let repository_id = match query.repository {
         None => None,
         Some(repository) => {
@@ -1364,12 +1370,34 @@ async fn list(
             Some(repo.repository_id)
         }
     };
-    let requests = state.onboarding.permissions().list(
+    let mut requests = state.onboarding.permissions().list(
         state.onboarding.waiting(),
         &user.id,
         repository_id,
         unix_now(),
     )?;
+    if !via.hub() && !requests.is_empty() {
+        // An app lists only repositories its person can read now: the forge's role check, kept
+        // for a short while, fails closed.
+        let mut ids: Vec<i64> = requests.iter().filter_map(|r| r.repository_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let (store, host) = (state.store.clone(), user.identity.host.clone());
+        let candidates = blocking(&state, move || {
+            let mut found = Vec::with_capacity(ids.len());
+            for id in ids {
+                found.extend(store.repository_by_id(&host, id)?);
+            }
+            Ok(found)
+        })
+        .await?;
+        let (readable, _) = super::login::devices::readable(&state, &user, candidates, true).await;
+        requests.retain(|r| {
+            readable
+                .iter()
+                .any(|repo| Some(repo.repository_id) == r.repository_id)
+        });
+    }
     Ok(Json(Page { requests }))
 }
 
