@@ -43,7 +43,7 @@ From these facts the Hub derives the tier it can use:
 
 | Tier | Clients | When it arrives |
 | --- | --- | --- |
-| `wake` | Claude Code with the AgentSCM plugin, while its background hook waits (seen within the last 90 seconds). | Within seconds, idle or busy: the hook wakes the session with the notice. |
+| `wake` | Claude Code or Codex with the AgentSCM plugin, while its background waiter waits (seen within the last 90 seconds). | Claude Code: within seconds, idle or busy: the hook wakes the session with the notice. Codex: the waiter queues the notice in the chat, which starts it as a turn (see [Waking a Codex chat](#waking-a-codex-chat)). |
 | `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
 | `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. |
 | `unknown` | Nothing from the session itself since the Hub started, only its subagents' hook calls. | Nothing is offered until the session calls; use copy and paste from the Hub page meanwhile. |
@@ -75,7 +75,7 @@ No message sits unseen. When a message is sent, the Hub gives it a deadline for 
 | `reach` | Deadline |
 | --- | --- |
 | `wake_now`: Claude Code's waiter waits at the Hub now, so it is woken within about a second, idle or busy | 2 minutes |
-| `wake_soon`: Codex's waiter waits now; it queues the notice, which Codex starts as a turn within about ten seconds once the session is idle | 5 minutes |
+| `wake_soon`: Codex's waiter waits now; it queues the notice, which Codex should start as a turn within about ten seconds once the chat is idle (not yet measured) | 5 minutes |
 | `next_step`: at its next prompt or tool call; a session that sits idle makes none | 10 minutes |
 | `unreachable`: nothing from the session itself since the Hub started | 2 minutes, since it will not arrive on its own |
 | `ended`: its `SessionEnd` hook came and nothing from it since | 2 minutes |
@@ -85,6 +85,19 @@ A session reads `wake_now` or `wake_soon` only while a waiter really waits: a wa
 Past its deadline, a message that is still `queued` or `delivered` reads `not_picked_up`. Only the agent's own answer (`accepted`, `declined` or `done`) clears it, a late one included. A delivery never does, and neither does a wait or any other call of the session: none of them shows that the model read the message. A message stored before deadlines existed is due 10 minutes after it was sent.
 
 Each message keeps its own times: `created_at` (sent), `delivered_at` with `via` (its first delivery and the way it came), `offered_at` (its latest offer), `read_at` (its agent's first answer), `done_at` (its agent's `done`), and `answered_at` (its agent's latest answer).
+
+One event for every alert path: a message turns not picked up once, at `deadline_at`, and stays so until its agent answers or its person withdraws it. A path that tells the person (the Hub page's bell, a phone, a chat) rings once per message id at that time, stops when the message moves on, and need not carry the note.
+
+What `reach` each client can have:
+
+| Client | `reach` |
+| --- | --- |
+| Claude Code with the AgentSCM plugin | `wake_now` while its waiter waits, else `next_step`; `ended` after its `SessionEnd` hook |
+| Codex with the AgentSCM plugin | `wake_soon` while its waiter waits, else `next_step`; `ended` after its `SessionEnd` hook |
+| Cursor, Copilot | `next_step`; `ended` after its end hook (`sessionEnd`) |
+| Gemini CLI, a generic hook | `next_step`, in its next AgentSCM tool result; `ended` after a `done` event |
+| MCP only (Codex without hooks, Antigravity, Devin, Amp, opencode) | `next_step` once a call of its own names its session; never `ended`, since MCP has no end signal |
+| Seen only through its subagents' calls, or not since the Hub started | `unreachable` |
 
 ### Waking an idle Claude Code session
 
@@ -102,13 +115,29 @@ The Claude Code plugin that `agentscm client setup` installs adds a background h
 
 What this does not cover:
 
-- **Other hosts.** Only Claude Code has the background hook. Codex, Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above.
+- **Other hosts.** Only Claude Code and Codex have a background waiter. Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above; when one of them sits idle, its message is not picked up by its deadline and the person is told.
 - **Sessions started before this change.** A session reads its plugin's hooks when it starts, so a session that was already running when the client was updated has no waiter until it restarts.
 - **Windows.** The waiter exits at once on Windows, because it cannot tell there when its session has ended. A Windows session gets its messages at its next hook or tool call.
 - **Requests in another repository, the cases not covered.** A session is woken for Work it leads in another repository only when both repositories are on the same Hub and the person's token for the other one is live and can write. The Hub reads the person's eight newest such tokens. A token that was replaced after the Work started is no longer read, so that Work's request waits for the session's next call in its repository. A session the Hub knows only by the shared name `default` is not looked up under other tokens, and two clients of one person that report the same session name can get each other's notice. In each case the lead's person is asked after 10 minutes as above.
 - **Ignore.** A person whose mode is Ignore has no waiter (the wait answers `410`), so their sessions are not woken for coordination requests either. A request to Work that such a session leads with another token still comes with its next call, as for a session without a waiter.
 - **Clients older than this change** read only a Hub message notice as a wake, so they are woken for no coordination request.
 - **Not yet observed.** The wake itself, a real idle Claude Code session woken by this hook, has not been observed with this build; it is to be tried once the client built from main is installed.
+
+### Waking a Codex chat
+
+The Codex plugin that `agentscm client setup` installs runs the same waiter, `agentscm hook-wait codex`, as a background hook (`"async": true`) at `SessionStart` and at every `Stop`, and `agentscm hook-wait codex --end` at `SessionEnd`. Codex documents that a finished background hook starts no turn, so the waiter does not wake the chat by exiting. When a message or a coordination request comes, it runs `codex queue --thread=<session> --message=<notice>`. It tells the Hub it is Codex's with `"agent": "codex"` in the wait body, and while its wait is open the session reads `reach` `wake_soon`, with a 5-minute pick-up deadline. Codex puts the notice in that chat's own queue and starts it as a turn once the chat is idle.
+
+- The Hub marks such a message delivered via `wake:codex` and never offers it again in a hook reply: the chat's queue already holds it, so a re-offer would bring it twice. A message the hook path took first (`hook:codex`) is not queued.
+- The waiter waits only where `codex --version` runs, so a computer without the Codex CLI on the hook's path is not shown as woken.
+- The notice still proves nothing alone: the agent answers `accepted` with `agentscm_hub_message` and acts only on that reply.
+- Codex runs a plugin's hooks only after the person trusts them (Codex Settings > Hooks, or `/hooks`). The waiter hooks are new, so they need that review after the plugin is updated.
+
+What this does not cover:
+
+- **When it arrives is not measured.** Codex's source checks a chat's queue every 10 seconds for messages another process queued, so an idle chat should start the turn within about ten seconds, plus the model's reply. A message that comes while a turn runs starts the next turn when this one ends; it is not added to the running turn. Neither has been observed on a running chat with this build.
+- **A failed `codex queue`.** If the command fails, the message stays delivered and is not offered again. The Hub page shows it waiting for an answer, and the person can send it again.
+- **The Codex desktop app and IDE extension.** Whether their chats read the same queue is not documented.
+- **Windows.** The waiter exits at once, as for Claude Code.
 
 ### Other clients
 

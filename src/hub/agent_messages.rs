@@ -112,8 +112,10 @@ struct WaitSlot {
     owner: String,
     key: (String, String),
     id: u64,
-    /// It answered with a notice, so its waiter wakes the session and does not ask again.
-    delivered: bool,
+    /// It ran to its deadline with nothing for a session still running, so its waiter asks again
+    /// at once. One that delivered (its waiter wakes the session and stops), was dropped or whose
+    /// session ended leaves no grace.
+    asks_again: bool,
 }
 
 impl WaitSlot {
@@ -133,7 +135,7 @@ impl WaitSlot {
             owner: owner.to_owned(),
             key,
             id,
-            delivered: false,
+            asks_again: false,
         })
     }
 
@@ -159,14 +161,11 @@ impl Drop for WaitSlot {
                 waits.latest.remove(&self.key);
             }
         }
-        // Also when the request was dropped mid-wait, so a session never reads as waited for
-        // after its waiter went.
+        // Also when the request was dropped mid-wait.
         let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(client) = map.get_mut(&self.key) {
             client.open_waits = client.open_waits.saturating_sub(1);
-            if !self.delivered {
-                client.wait_left_at = Some(unix_now());
-            }
+            client.wait_left_at = self.asks_again.then(unix_now);
         }
     }
 }
@@ -227,9 +226,9 @@ pub struct Message {
     /// The sender's login.
     pub from: String,
     pub state: MessageState,
-    /// How it first reached the session: `wake:claude`, `hook:<agent>` or `mcp`.
+    /// How it first reached the session: `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`.
     pub via: Option<String>,
-    /// The mode it was delivered under.
+    /// The mode of its latest offer.
     pub mode: Option<Mode>,
     /// When it was sent.
     pub created_at: i64,
@@ -253,10 +252,14 @@ impl Message {
     /// Past its deadline and still unanswered by its agent. A delivery, a wait or another call of
     /// the session never clears it; only the agent's own answer moves the message on.
     pub fn not_picked_up(&self, now: i64) -> bool {
-        let due = self
-            .deadline_at
-            .unwrap_or(self.created_at + Reach::NextStep.pickup_secs());
-        matches!(self.state, MessageState::Queued | MessageState::Delivered) && now >= due
+        matches!(self.state, MessageState::Queued | MessageState::Delivered) && now >= self.due_at()
+    }
+
+    /// When it turns not picked up if its agent has not answered: the one time every alert path
+    /// (the Hub page, a phone, a chat) rings for it, once per message id.
+    pub fn due_at(&self) -> i64 {
+        self.deadline_at
+            .unwrap_or(self.created_at + Reach::NextStep.pickup_secs())
     }
 }
 
@@ -416,8 +419,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// `wake`: its background hook waits now, so a message reaches it within seconds, idle or
-    /// busy. `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
+    /// `wake`: its background hook waited in the last 90 seconds ([`Client::reach`] says whether a
+    /// waiter waits now). `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
     /// its next AgentSCM tool call, as an extra text block in the result. `unknown`: since the
     /// Hub started, nothing from the session itself, only its subagents' hook calls; copy and
     /// paste instead.
@@ -571,14 +574,6 @@ pub fn note_end(token: &str, session: &str) {
     }
 }
 
-fn ended(token: &str, session: &str) -> bool {
-    SESSIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&(token.to_owned(), session.to_owned()))
-        .is_some_and(|client| client.ended)
-}
-
 /// Whether this session takes its messages in AgentSCM tool results (tier `mcp`): it showed
 /// itself in a top-level hook call or an MCP call naming it, and it has no hook that carries
 /// them instead.
@@ -656,9 +651,12 @@ impl Answered {
 
 /// Queued, or delivered and still unanswered a while after its last offer: the reply that carried
 /// it may have been lost.
+/// Never one Codex's waiter put in its chat's own queue: the chat holds it, so a re-offer would
+/// bring it twice; its deadline still tells the person if it is not picked up.
 fn due(message: &Message, now: i64) -> bool {
     match message.state {
         MessageState::Queued => true,
+        MessageState::Delivered if message.via.as_deref() == Some(Waker::Codex.via()) => false,
         MessageState::Delivered => message
             .offered_at
             .or(message.delivered_at)
@@ -705,7 +703,9 @@ fn elsewhere_due(token: &str, session: &str, now: i64) -> bool {
         return false;
     };
     let wait = i64::try_from(WAIT_SECS).unwrap_or(i64::MAX);
-    if client.tier(now) == "wake" || now - client.elsewhere_at < wait {
+    if matches!(client.reach(now), Reach::WakeNow | Reach::WakeSoon)
+        || now - client.elsewhere_at < wait
+    {
         return false;
     }
     client.elsewhere_at = now;
@@ -990,8 +990,11 @@ pub fn answer(
                 }
             };
             message.state = next;
+            // A message answered before read times were kept was read at that answer.
+            message
+                .read_at
+                .get_or_insert(message.answered_at.unwrap_or(now));
             message.answered_at = Some(now);
-            message.read_at.get_or_insert(now);
             if next == MessageState::Done {
                 message.done_at = Some(now);
             }
@@ -1106,7 +1109,7 @@ async fn wait(
     let text = waited(
         deadline,
         // A session that ended meanwhile takes nothing: its waiter is leaving.
-        || slot.replaced() || ended(&principal.token_id, &session),
+        || slot.replaced() || reach_of(&principal.token_id, &session, unix_now()) == Reach::Ended,
         || {
             let asks = std::mem::take(&mut requests);
             let (store, principal, session, reported) = (
@@ -1142,7 +1145,8 @@ async fn wait(
         },
     )
     .await?;
-    slot.delivered = text.is_some();
+    slot.asks_again =
+        text.is_none() && reach_of(&principal.token_id, &session, unix_now()) != Reach::Ended;
     drop(slot);
     Ok(match text {
         Some(text) => Json(serde_json::json!({ "text": text })).into_response(),
@@ -1512,6 +1516,25 @@ mod tests {
         }
     }
 
+    /// Codex's waiter put it in the chat's own queue, so no hook reply brings it a second time;
+    /// one the hook path took first is offered again as any other.
+    #[test]
+    fn a_message_in_a_codex_chats_queue_is_never_offered_again() {
+        let mut m = message("msg_1", 0);
+        m.state = MessageState::Delivered;
+        m.delivered_at = Some(100);
+        m.via = Some(Waker::Codex.via().into());
+        assert!(!due(&m, 100 + 10 * REOFFER_SECS));
+        assert!(
+            m.not_picked_up(m.due_at()),
+            "its deadline still tells the person"
+        );
+        for offered_again in [Waker::Claude.via(), "hook:codex"] {
+            m.via = Some(offered_again.into());
+            assert!(due(&m, 100 + REOFFER_SECS + 1), "{offered_again}");
+        }
+    }
+
     /// Past the deadline an unanswered message is not picked up, delivered or not; only an
     /// answer from its agent clears it, also a late one, and a withdrawn one is never flagged.
     #[test]
@@ -1586,24 +1609,23 @@ mod tests {
         let (token, session) = ("tok_reach", "s_reach");
         let key = (token.to_owned(), session.to_owned());
         let reach = || reach_of(token, session, unix_now());
-        let slot = WaitSlot::open("u_reach", token, session).unwrap();
+        let mut slot = WaitSlot::open("u_reach", token, session).unwrap();
         note_wait(token, session, Waker::Codex, unix_now());
         assert_eq!(reach(), Reach::WakeSoon);
+        slot.asks_again = true;
         drop(slot);
         let left = SESSIONS.lock().unwrap().get(&key).unwrap().wait_left_at;
         assert!(
             left.is_some(),
             "a wait that ended empty: its waiter asks again"
         );
-        let mut slot = WaitSlot::open("u_reach", token, session).unwrap();
+        let slot = WaitSlot::open("u_reach", token, session).unwrap();
         note_wait(token, session, Waker::Claude, unix_now());
         assert_eq!(reach(), Reach::WakeNow);
-        SESSIONS.lock().unwrap().get_mut(&key).unwrap().wait_left_at = None;
-        slot.delivered = true;
+        // Right after the empty wait above: a wait that delivered leaves no grace behind.
         drop(slot);
         assert_eq!(reach(), Reach::NextStep, "it woke the session and stopped");
         note_end(token, session);
-        assert!(ended(token, session));
         assert_eq!(reach(), Reach::Ended);
         note_hook(token, session, "hook:claude", false, true, unix_now());
         assert_eq!(

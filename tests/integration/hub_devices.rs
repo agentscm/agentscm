@@ -5048,10 +5048,41 @@ async fn a_session_reads_as_woken_only_while_its_waiter_waits() {
     };
     hook("UserPromptSubmit").await;
     let claude = Some("hook:claude");
-    assert_eq!(reach(&read().await, claude).unwrap().1, "next_step");
+    let (h1, now) = reach(&read().await, claude).unwrap();
+    assert_eq!(now, "next_step");
+    // Its waiter waits; then the session ends while that wait is still open.
+    let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+    let waiting = tokio::spawn(async move {
+        let response = browser()
+            .post(format!("{hub}/v1/hub/agent-messages/wait"))
+            .bearer_auth(secret)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"session": "h1"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        response.status().as_u16()
+    });
+    for _ in 0..100 {
+        if reach(&read().await, claude).is_some_and(|(_, r)| r == "wake_now") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(reach(&read().await, claude).unwrap().1, "wake_now");
     hook("SessionEnd").await;
     let page = read().await;
     assert_eq!(reach(&page, claude).unwrap().1, "ended", "{page}");
+    // A message sent now is not taken by the ended session's wait: it stays queued, due soon.
+    let note = json!({"repository": REPO, "token": alice_token, "session": h1, "note": "Gone"});
+    let (status, message) = page_post(&env, &alice, true, AGENT_MESSAGES, note).await;
+    assert_eq!(status, 201, "{message}");
+    assert_eq!(
+        message["deadline_at"],
+        message["created_at"].as_i64().unwrap() + 120
+    );
+    assert_eq!(waiting.await.unwrap(), 204);
+    assert_eq!(read().await["messages"][0]["state"], "queued");
     hook("UserPromptSubmit").await;
     assert_eq!(reach(&read().await, claude).unwrap().1, "next_step");
 }
