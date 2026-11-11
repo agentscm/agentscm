@@ -216,14 +216,14 @@ fn automatic_compaction(db: &Db, store: Arc<dyn Store>, now: i64) -> (Vec<WorkCo
 
 fn removes_what_the_operator_command_removes(cli: &Db, auto: &Db) {
     let now = unix_now();
-    let (cli_store, _, _) = fixture(cli, now);
+    let (cli_store, cli_reader, cli_delivery) = fixture(cli, now);
     let (auto_store, reader, delivery) = fixture(auto, now);
     assert_eq!(cli.retained(), auto.retained());
 
     let expected = operator_compaction(&*cli_store, now);
     let actual = automatic_compaction(auto, auto_store.clone(), now);
     assert_eq!(actual, expected);
-    // The busy repository compacts too; its open delivery is ended, not a reason to skip.
+    // The busy repository compacts too; an open delivery is not a reason to skip.
     assert_eq!(
         actual.1, 0,
         "an unacknowledged delivery no longer blocks its repository"
@@ -236,13 +236,19 @@ fn removes_what_the_operator_command_removes(cli: &Db, auto: &Db) {
         .find(|c| c.scope.repository == "acme/other")
         .unwrap();
     assert!(other.deleted_versions > 0, "{other:?}");
-    assert!(
-        auto_store
-            .work_ack(&reader, &BriefingAck { delivery }, now)
-            .unwrap_err()
-            .to_string()
-            .contains("delivery is unknown or incomplete")
-    );
+    // It had read its whole window before the pass, so it is not ended and can be acknowledged.
+    auto_store
+        .work_ack(&reader, &BriefingAck { delivery }, now)
+        .unwrap();
+    cli_store
+        .work_ack(
+            &cli_reader,
+            &BriefingAck {
+                delivery: cli_delivery,
+            },
+            now,
+        )
+        .unwrap();
     let widgets = actual
         .0
         .iter()

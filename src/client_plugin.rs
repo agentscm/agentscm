@@ -67,15 +67,26 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         json!({"type":"command", "command":command,
         "timeout":timeout, "statusMessage":message})
     };
+    // The waiter runs in the background (`async`) from session start and after every turn: it
+    // waits at the Hub for a message to this chat and queues it into the chat with `codex
+    // queue`, which starts a turn once the chat is idle. Only one waits per chat; it leaves on
+    // its own before this timeout.
+    let wait = json!({"type":"command",
+        "command":format!("{} --no-telemetry hook-wait codex", shell_quote(program)),
+        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "async":true});
+    // SessionEnd tells this chat's waiter to leave; Codex allows it at most 3 seconds.
+    let wait_end = json!({"type":"command",
+        "command":format!("{} --no-telemetry hook-wait codex --end", shell_quote(program)),
+        "timeout":3});
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5)]}],
+        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5), wait.clone()]}],
         // Every tool call keeps this chat's hold live; the Hub checks only the edits.
         "PreToolUse":[{"hooks":[hook("AgentSCM: coordinate this tool call", 5)]}],
         "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
         // Tell the Hub this chat waits for its person; the approval itself stays in Codex.
         "PermissionRequest":[{"hooks":[hook("AgentSCM: note this chat waits for you", 3)]}],
-        "Stop":[{"hooks":[hook("AgentSCM: note this chat's turn ended", 3)]}],
-        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3)]}]
+        "Stop":[{"hooks":[hook("AgentSCM: note this chat's turn ended", 3), wait]}],
+        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3), wait_end]}]
     }});
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
         "description":"Coordination hooks for configured AgentSCM checkouts.",
@@ -856,7 +867,13 @@ fn verify_claude_install(plugin: &Value, files: &[(&'static str, Vec<u8>)]) -> R
         .map(Path::new)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| invalid("Claude Code returned an unsupported plugin cache path"))?;
-    let cache_files = claude_cache_files(files)?;
+    let mut cache_files = claude_cache_files(files)?;
+    // Claude Code leaves this marker in a version folder it stopped using and keeps
+    // it when that version is installed again. The walk still refuses it as a link
+    // or a folder.
+    if let Ok(marker) = std::fs::read(install_path.join(".orphaned_at")) {
+        cache_files.push((".orphaned_at", marker));
+    }
     check_tree(install_path, &cache_files).map_err(|_| {
         invalid(
             "Claude Code plugin cache does not match the generated AgentSCM package; retry setup",
@@ -1154,6 +1171,26 @@ mod tests {
         assert_eq!(compat["interface"]["displayName"], "AgentSCM");
         let hooks = read("agentscm/hooks/hooks.json");
         assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        // The background waiter starts with the chat and again after each turn, only there.
+        for event in ["SessionStart", "Stop"] {
+            let wait = &hooks["hooks"][event][0]["hooks"][1];
+            assert_eq!(
+                wait["command"],
+                "'/opt/team'\\''s bin/agentscm' --no-telemetry hook-wait codex"
+            );
+            assert_eq!(wait["async"], true);
+            assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
+        }
+        // SessionEnd ends the waiter, in the foreground and within Codex's 3-second bound.
+        let end = &hooks["hooks"]["SessionEnd"][0]["hooks"][1];
+        assert_eq!(
+            end["command"],
+            "'/opt/team'\\''s bin/agentscm' --no-telemetry hook-wait codex --end"
+        );
+        assert!(end.get("async").is_none());
+        assert_eq!(end["timeout"], 3);
+        let waits = hooks.to_string().matches("hook-wait").count();
+        assert_eq!(waits, 3, "no other event starts or ends a waiter");
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let command = group["hooks"][0]["command"].as_str().unwrap();
@@ -1301,6 +1338,15 @@ mod tests {
         verify_claude_install(&plugin, &files).unwrap();
         assert!(cache.join(".claude-plugin/plugin.json").is_file());
         assert!(!cache.join("agentscm").exists());
+        std::fs::write(cache.join(".orphaned_at"), b"1794359571000").unwrap();
+        verify_claude_install(&plugin, &files).unwrap();
+        std::fs::write(cache.join(".other_marker"), b"").unwrap();
+        assert!(verify_claude_install(&plugin, &files).is_err());
+        std::fs::remove_file(cache.join(".other_marker")).unwrap();
+        std::fs::write(cache.join("hooks/.orphaned_at"), b"").unwrap();
+        assert!(verify_claude_install(&plugin, &files).is_err());
+        std::fs::remove_file(cache.join("hooks/.orphaned_at")).unwrap();
+        verify_claude_install(&plugin, &files).unwrap();
         std::fs::write(cache.join("hooks/hooks.json"), b"{}").unwrap();
         assert!(verify_claude_install(&plugin, &files).is_err());
     }

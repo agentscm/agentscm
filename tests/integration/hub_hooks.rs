@@ -570,7 +570,7 @@ async fn hooks_register_one_session_and_done_releases_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_end_pauses_known_work_without_claiming_completion() {
+async fn session_end_leaves_held_work_active_without_claiming_completion() {
     let mut hub = Hub::start().await;
     let secret = hub.agent();
     let session = "11111111-2222-3333-4444-555555555555";
@@ -628,32 +628,32 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
         hub.hook("claude", &secret, &fixture("claude-SessionEnd")),
         json!({})
     );
-    let paused = hub
+    // The end may be only the gap between two turns: Work whose hold is live goes on as it is,
+    // with nothing written for it, and the end never invents completion.
+    let ended = hub
         .store
         .work_get(&principal.token_id, &started.item.id, unix_now())
         .unwrap()
         .unwrap();
-    assert_eq!(paused.state, WorkState::Paused);
-    assert_eq!(
-        paused.current.as_ref().unwrap().summary,
-        "Session ended without a reported final work outcome."
-    );
-    assert_eq!(paused.next_action.as_deref(), Some("resume the hook tests"));
-    let paused_seq = paused.updated_seq;
+    assert_eq!(ended.state, WorkState::Active);
+    assert_eq!(ended.updated_seq, started.item.updated_seq);
+    assert_eq!(ended.next_action.as_deref(), Some("resume the hook tests"));
 
-    // Repeated SessionEnd is a no-op for the durable pause and never invents completion.
+    // The same session starts again and ends its next turn: still nothing is written.
+    hub.hook("claude", &secret, &fixture("claude-SessionStart"));
     hub.hook("claude", &secret, &fixture("claude-SessionEnd"));
     let repeated = hub
         .store
         .work_get(&principal.token_id, &started.item.id, unix_now())
         .unwrap()
         .unwrap();
-    assert_eq!(repeated.state, WorkState::Paused);
-    assert_eq!(repeated.updated_seq, paused_seq);
+    assert_eq!(repeated.state, WorkState::Active);
+    assert_eq!(repeated.updated_seq, started.item.updated_seq);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_end_naming_no_session_pauses_no_work() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
     let mut hub = Hub::start().await;
     let secret = hub.agent();
     let principal = hub
@@ -661,6 +661,11 @@ async fn a_session_end_naming_no_session_pauses_no_work() {
         .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
         .unwrap()
         .unwrap();
+    // Started two leases ago and never renewed: its hold has lapsed, so no lease bounds a wait
+    // and the end of its own session pauses it. The lease clock is walked there in steps, as a
+    // running Hub observes it, so no reservation is given grace for a gap.
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
     let started = hub
         .store
         .work_start_auto(
@@ -683,9 +688,14 @@ async fn a_session_end_naming_no_session_pauses_no_work() {
                 issue_choice: None,
                 preflight: None,
             },
-            unix_now(),
+            begun,
         )
         .unwrap();
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
     let state = |hub: &Hub| {
         hub.store
             .work_get(&principal.token_id, &started.item.id, unix_now())

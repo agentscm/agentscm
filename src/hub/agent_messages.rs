@@ -26,6 +26,11 @@
 //! not answered is offered again, since the reply that carried it may never have reached the
 //! model.
 //!
+//! No message sits unseen: each gets a pick-up deadline when it is sent, from how its session is
+//! reached then ([`Reach`]). Past it, a message its agent has not answered reads not picked up
+//! on the Hub page. Only the agent's own answer clears that; a delivery, a wait or any other call
+//! of the session never does, since none shows that the model read it.
+//!
 //! What each session's client is and what it can receive is kept in memory from its own calls
 //! (MCP `initialize` `clientInfo`, the hook it reports through, the token's label) and lost on a
 //! restart, after which its tier reads as unknown until it calls again.
@@ -63,10 +68,12 @@ const REOFFER_SECS: i64 = 60;
 pub const FRAME: &str = "AgentSCM Hub message";
 /// Longest a session's background hook waits in one request; under the Hub's 30-second bound.
 pub const WAIT_SECS: u64 = 25;
-/// A session whose hook waited this recently is reached at once.
+/// A session whose hook waited this recently reads tier `wake` (kept for pages older than
+/// [`Reach`], which counts only a waiter that waits now).
 const WAKE_FRESH_SECS: i64 = 90;
-/// How a message the background hook took is recorded.
-const WAKE_VIA: &str = "wake:claude";
+/// How long after a wait ended with nothing a session still reads as waited for: its waiter asks
+/// again at once.
+const WAIT_GAP_SECS: i64 = 5;
 /// Waits held open at once, in all and per person; past either a wait answers 429 and the hook
 /// asks again later. One per running Claude Code session, so forty sessions are well inside.
 /// Counted per Hub process; the total is large so the per-person cap is the one that binds.
@@ -105,6 +112,10 @@ struct WaitSlot {
     owner: String,
     key: (String, String),
     id: u64,
+    /// It ran to its deadline with nothing for a session still running, so its waiter asks again
+    /// at once. One that delivered (its waiter wakes the session and stops), was dropped or whose
+    /// session ended leaves no grace.
+    asks_again: bool,
 }
 
 impl WaitSlot {
@@ -124,6 +135,7 @@ impl WaitSlot {
             owner: owner.to_owned(),
             key,
             id,
+            asks_again: false,
         })
     }
 
@@ -136,16 +148,45 @@ impl WaitSlot {
 
 impl Drop for WaitSlot {
     fn drop(&mut self) {
-        let mut waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
-        waits.total = waits.total.saturating_sub(1);
-        if let Some(held) = waits.per_person.get_mut(&self.owner) {
-            *held = held.saturating_sub(1);
-            if *held == 0 {
-                waits.per_person.remove(&self.owner);
+        {
+            let mut waits = WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+            waits.total = waits.total.saturating_sub(1);
+            if let Some(held) = waits.per_person.get_mut(&self.owner) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    waits.per_person.remove(&self.owner);
+                }
+            }
+            if waits.latest.get(&self.key) == Some(&self.id) {
+                waits.latest.remove(&self.key);
             }
         }
-        if waits.latest.get(&self.key) == Some(&self.id) {
-            waits.latest.remove(&self.key);
+        // Also when the request was dropped mid-wait.
+        let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = map.get_mut(&self.key) {
+            client.open_waits = client.open_waits.saturating_sub(1);
+            client.wait_left_at = self.asks_again.then(unix_now);
+        }
+    }
+}
+
+/// The agent whose waiter holds a wait, which says how fast it wakes its session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waker {
+    /// Claude Code's background hook: the session wakes within about a second.
+    #[default]
+    Claude,
+    /// Codex's: it queues the notice, which Codex starts as a turn within about ten seconds.
+    Codex,
+}
+
+impl Waker {
+    /// How a message its wait took is recorded.
+    fn via(self) -> &'static str {
+        match self {
+            Self::Claude => "wake:claude",
+            Self::Codex => "wake:codex",
         }
     }
 }
@@ -185,13 +226,89 @@ pub struct Message {
     /// The sender's login.
     pub from: String,
     pub state: MessageState,
-    /// How it reached the session: `hook:<agent>` or `mcp`.
+    /// How it first reached the session: `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`.
     pub via: Option<String>,
-    /// The mode it was delivered under.
+    /// The mode of its latest offer.
     pub mode: Option<Mode>,
+    /// When it was sent.
     pub created_at: i64,
+    /// When it first reached the session, the way `via` names.
     pub delivered_at: Option<i64>,
+    /// When it was last offered: the first delivery, or a later one of a message left unanswered.
+    pub offered_at: Option<i64>,
+    /// When its agent first answered it (`accepted`, `declined` or `done`): the only proof that
+    /// the model read it.
+    pub read_at: Option<i64>,
+    /// When its agent answered `done`.
+    pub done_at: Option<i64>,
+    /// When its agent last answered.
     pub answered_at: Option<i64>,
+    /// When its agent's answer is due, from how its session was reached when it was sent; a
+    /// message stored before deadlines existed reads [`Reach::NextStep`]'s from `created_at`.
+    pub deadline_at: Option<i64>,
+}
+
+impl Message {
+    /// Past its deadline and still unanswered by its agent. A delivery, a wait or another call of
+    /// the session never clears it; only the agent's own answer moves the message on.
+    pub fn not_picked_up(&self, now: i64) -> bool {
+        matches!(self.state, MessageState::Queued | MessageState::Delivered) && now >= self.due_at()
+    }
+
+    /// When it turns not picked up if its agent has not answered: the one time every alert path
+    /// (the Hub page, a phone, a chat) rings for it, once per message id.
+    pub fn due_at(&self) -> i64 {
+        self.deadline_at
+            .unwrap_or(self.created_at + Reach::NextStep.pickup_secs())
+    }
+}
+
+/// How a message reaches a session now, from the session's own calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// Claude Code's waiter waits at the Hub now: woken within about a second, idle or busy.
+    WakeNow,
+    /// Codex's waiter waits now: it queues the notice, which starts a turn within about ten
+    /// seconds once the session is idle.
+    WakeSoon,
+    /// At its next prompt or tool call; a session that sits idle makes none.
+    NextStep,
+    /// Nothing from the session itself since the Hub started, only its subagents' hook calls.
+    Unreachable,
+    /// Its `SessionEnd` hook came and nothing from it since.
+    Ended,
+}
+
+impl Reach {
+    /// How long its agent has to answer a message sent while its session is reached this way.
+    /// One that cannot be reached is due soon: it will not arrive on its own, and its person is
+    /// told while it still matters.
+    pub fn pickup_secs(self) -> i64 {
+        match self {
+            Self::WakeNow | Self::Unreachable | Self::Ended => 2 * 60,
+            Self::WakeSoon => 5 * 60,
+            Self::NextStep => 10 * 60,
+        }
+    }
+}
+
+/// A message as the Hub page reads it.
+#[derive(Serialize)]
+struct MessageView {
+    #[serde(flatten)]
+    message: Message,
+    not_picked_up: bool,
+}
+
+impl MessageView {
+    fn at(message: Message, now: i64) -> Self {
+        let not_picked_up = message.not_picked_up(now);
+        Self {
+            message,
+            not_picked_up,
+        }
+    }
 }
 
 fn messages_key(user_id: &str, repository_id: i64) -> String {
@@ -274,32 +391,78 @@ pub struct Client {
     /// only there, where a subagent's call is told apart, and never in an MCP result.
     pub hook_context: bool,
     /// A hook call from it carried no subagent marker: the evidence that it is the session a
-    /// person leads, not a subagent's. Nothing is delivered without it, so a client with only
-    /// MCP, whose calls cannot say who made them, gets nothing.
+    /// person leads, not a subagent's. A hook that carries context delivers only with it.
     pub top_level: bool,
-    /// It made an AgentSCM MCP tool call.
+    /// It made an AgentSCM MCP tool call that named this session (not the shared `default`,
+    /// which names no one conversation). That is enough for a client
+    /// whose hook cannot carry context, or that has no hook, to take messages in its tool
+    /// results: an MCP call cannot say whether a subagent made it, so the notice tells a
+    /// subagent to leave the message for the session that started it, and an unanswered one is
+    /// offered again at a later call.
     pub mcp: bool,
     pub seen_at: i64,
     /// When its background hook last waited for a message.
     pub waited_at: Option<i64>,
+    /// Whose waiter waited last.
+    pub waker: Option<Waker>,
+    /// Its `SessionEnd` hook came and no call of its own since.
+    pub ended: bool,
+    /// Waits open for it now in this Hub process.
+    #[serde(skip)]
+    open_waits: u32,
+    /// When its last wait ended with nothing for it.
+    #[serde(skip)]
+    wait_left_at: Option<i64>,
     /// When a call of its own last read its person's other tokens for requests ([`take`]).
     #[serde(skip)]
     elsewhere_at: i64,
 }
 
 impl Client {
-    /// `wake`: its background hook waits now, so a message reaches it within seconds, idle or
-    /// busy. `hook`: delivered at its next prompt or tool call, no tool call needed. `mcp`: at
-    /// its next AgentSCM call. `unknown`: no top-level hook call seen since the Hub started;
-    /// copy and paste instead.
+    /// `wake`: its background hook waited in the last 90 seconds ([`Client::reach`] says whether
+    /// a waiter waits now). `hook`: delivered at its next prompt or tool call, no tool call
+    /// needed. `mcp`: at its next AgentSCM tool call, as an extra text block in the result.
+    /// `unknown`: since the Hub started, nothing from the session itself, only its subagents'
+    /// hook calls; copy and paste instead.
     pub fn tier(&self, now: i64) -> &'static str {
+        let woken = self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS);
         match (self.top_level, self.hook_context) {
-            (false, _) => "unknown",
-            _ if self.waited_at.is_some_and(|at| now - at <= WAKE_FRESH_SECS) => "wake",
+            (true, _) if woken => "wake",
             (true, true) => "hook",
             (true, false) => "mcp",
+            (false, false) if self.mcp => "mcp",
+            (false, _) => "unknown",
         }
     }
+
+    /// How a message reaches it now. Woken only while a waiter really waits: a wait is open in
+    /// this Hub process, or one ended with nothing a moment ago and its waiter is asking again.
+    /// Waiting lately is not enough: a waiter that woke the session or went away wakes nothing.
+    pub fn reach(&self, now: i64) -> Reach {
+        if self.ended {
+            return Reach::Ended;
+        }
+        let waiting = self.open_waits > 0
+            || self
+                .wait_left_at
+                .is_some_and(|at| now - at <= WAIT_GAP_SECS);
+        match self.tier(now) {
+            "unknown" => Reach::Unreachable,
+            _ if waiting && self.waker == Some(Waker::Codex) => Reach::WakeSoon,
+            _ if waiting => Reach::WakeNow,
+            _ => Reach::NextStep,
+        }
+    }
+}
+
+/// How a message to this session would reach it now; [`Reach::Unreachable`] for a session the
+/// Hub has heard nothing from.
+fn reach_of(token: &str, session: &str, now: i64) -> Reach {
+    SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&(token.to_owned(), session.to_owned()))
+        .map_or(Reach::Unreachable, |client| client.reach(now))
 }
 
 type Clients = BTreeMap<(String, String), Client>;
@@ -356,8 +519,10 @@ pub fn note_mcp(token: &str, install: Option<&str>, session: &str, now: i64) {
     let client = map
         .entry((token.to_owned(), session.to_owned()))
         .or_default();
-    client.mcp = true;
+    // `default` names no one conversation, so a message to it could reach any of the token's.
+    client.mcp |= session != super::session::DEFAULT_SESSION;
     client.seen_at = now;
+    client.ended = false;
     if let Some((name, version, _)) = info {
         client.name = Some(name);
         client.version = Some(version).filter(|v| !v.is_empty());
@@ -376,11 +541,14 @@ pub fn note_hook(token: &str, session: &str, via: &str, top_level: bool, context
     client.hook_context |= context;
     client.top_level |= top_level;
     client.seen_at = now;
+    // A resumed session keeps its id; its subagents' calls do not bring it back.
+    client.ended &= !top_level;
     bounded(&mut map, |client| client.seen_at);
 }
 
-/// At a wait from the session's background hook, which runs only in the session a person leads.
-fn note_wait(token: &str, session: &str, now: i64) {
+/// At a wait from the session's background hook, which runs only in the session a person leads;
+/// the wait's slot ([`WaitSlot`]) counts it off again when it ends.
+fn note_wait(token: &str, session: &str, waker: Waker, now: i64) {
     let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
     let client = map
         .entry((token.to_owned(), session.to_owned()))
@@ -388,17 +556,33 @@ fn note_wait(token: &str, session: &str, now: i64) {
     client.top_level = true;
     client.waited_at = Some(now);
     client.seen_at = now;
+    client.waker = Some(waker);
+    client.ended = false;
+    client.open_waits += 1;
     bounded(&mut map, |client| client.seen_at);
 }
 
-/// Whether this session takes its messages in AgentSCM tool results: it is known to be a
-/// top-level session and its hook cannot carry them.
+/// At the session's own `SessionEnd` hook: nothing reaches it until it runs again. A session
+/// the Hub has no facts for stays unknown.
+pub fn note_end(token: &str, session: &str) {
+    if let Some(client) = SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(&(token.to_owned(), session.to_owned()))
+    {
+        client.ended = true;
+    }
+}
+
+/// Whether this session takes its messages in AgentSCM tool results (tier `mcp`): it showed
+/// itself in a top-level hook call or an MCP call naming it, and it has no hook that carries
+/// them instead.
 pub fn mcp_delivers(token: &str, session: &str) -> bool {
     SESSIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&(token.to_owned(), session.to_owned()))
-        .is_some_and(|client| client.top_level && !client.hook_context)
+        .is_some_and(|client| !client.hook_context && (client.top_level || client.mcp))
 }
 
 fn clients_of(tokens: &[String]) -> Vec<((String, String), Client)> {
@@ -465,13 +649,17 @@ impl Answered {
     }
 }
 
-/// Queued, or delivered and still unanswered after a while: the reply that carried it may have
-/// been lost.
+/// Queued, or delivered and still unanswered a while after its last offer: the reply that carried
+/// it may have been lost.
+/// Never one Codex's waiter put in its chat's own queue: the chat holds it, so a re-offer would
+/// bring it twice; its deadline still tells the person if it is not picked up.
 fn due(message: &Message, now: i64) -> bool {
     match message.state {
         MessageState::Queued => true,
+        MessageState::Delivered if message.via.as_deref() == Some(Waker::Codex.via()) => false,
         MessageState::Delivered => message
-            .delivered_at
+            .offered_at
+            .or(message.delivered_at)
             .is_none_or(|at| now - at >= REOFFER_SECS),
         _ => false,
     }
@@ -515,7 +703,9 @@ fn elsewhere_due(token: &str, session: &str, now: i64) -> bool {
         return false;
     };
     let wait = i64::try_from(WAIT_SECS).unwrap_or(i64::MAX);
-    if client.tier(now) == "wake" || now - client.elsewhere_at < wait {
+    if matches!(client.reach(now), Reach::WakeNow | Reach::WakeSoon)
+        || now - client.elsewhere_at < wait
+    {
         return false;
     }
     client.elsewhere_at = now;
@@ -555,9 +745,14 @@ fn deliver(
             .take(PER_DELIVERY)
             .map(|m| {
                 m.state = MessageState::Delivered;
-                m.via = Some(via.to_owned());
+                // The first delivery is the one the person reads; a later offer only restarts
+                // the wait for an answer.
+                if m.delivered_at.is_none() {
+                    m.delivered_at = Some(now);
+                    m.via = Some(via.to_owned());
+                }
+                m.offered_at = Some(now);
                 m.mode = Some(mode);
-                m.delivered_at = Some(now);
                 render(m)
             })
             .collect::<Vec<_>>()
@@ -795,7 +990,14 @@ pub fn answer(
                 }
             };
             message.state = next;
+            // A message answered before read times were kept was read at that answer.
+            message
+                .read_at
+                .get_or_insert(message.answered_at.unwrap_or(now));
             message.answered_at = Some(now);
+            if next == MessageState::Done {
+                message.done_at = Some(now);
+            }
             Ok((next, message.clone()))
         },
     )??;
@@ -858,6 +1060,9 @@ where
 struct WaitBody {
     /// The session's native id, as its hooks report it.
     session: String,
+    /// Whose waiter this is; Claude Code's, which sends none, by default.
+    #[serde(default)]
+    agent: Waker,
 }
 
 /// The session's background hook waits here for a message, with its agent token: 200 `{text}`
@@ -865,9 +1070,10 @@ struct WaitBody {
 /// waits for its acknowledgement ([`request_wake`], then [`request_wake_elsewhere`] for Work it
 /// leads with another of its person's tokens; read once per wait), 204 when
 /// neither came in [`WAIT_SECS`] or a newer wait for the
-/// session took over, 403 for a token that can never receive one, 410 while the person's mode is
-/// `ignore`, 429 when the Hub or the person holds too many waits. Delivery is [`deliver`], the
-/// hook path's own: the same token and session check, marked delivered once.
+/// session took over or the session ended, 403 for a token that can never receive one, 410 while
+/// the person's mode is `ignore`, 429 when the Hub or the person holds too many waits. Delivery
+/// is [`deliver`], the hook path's own: the same token and session check, marked delivered once,
+/// via `wake:<agent>`.
 async fn wait(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
@@ -882,7 +1088,7 @@ async fn wait(
         principal.token_id.clone(),
         principal.owner.id.clone(),
     );
-    let reported = body.session.clone();
+    let (reported, waker) = (body.session.clone(), body.agent);
     let (session, mode) = blocking(&state, move || {
         Ok((
             store.session_name_for(&token, Some(&body.session), unix_now())?,
@@ -893,16 +1099,17 @@ async fn wait(
     if mode == Mode::Ignore {
         return Ok(StatusCode::GONE.into_response());
     }
-    let Some(slot) = WaitSlot::open(&principal.owner.id, &principal.token_id, &session) else {
+    let Some(mut slot) = WaitSlot::open(&principal.owner.id, &principal.token_id, &session) else {
         return Ok(StatusCode::TOO_MANY_REQUESTS.into_response());
     };
-    note_wait(&principal.token_id, &session, unix_now());
+    note_wait(&principal.token_id, &session, waker, unix_now());
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
     // A request needs no instant wake, so its inbox is read once per wait, not at each recheck.
     let mut requests = true;
     let text = waited(
         deadline,
-        || slot.replaced(),
+        // A session that ended meanwhile takes nothing: its waiter is leaving.
+        || slot.replaced() || reach_of(&principal.token_id, &session, unix_now()) == Reach::Ended,
         || {
             let asks = std::mem::take(&mut requests);
             let (store, principal, session, reported) = (
@@ -915,7 +1122,7 @@ async fn wait(
             async move {
                 blocking(&state, move || {
                     let now = unix_now();
-                    match deliver(&*store, &principal, &session, WAKE_VIA, now, wakes)? {
+                    match deliver(&*store, &principal, &session, waker.via(), now, wakes)? {
                         Some(text) => Ok(Some(text)),
                         None if !asks => Ok(None),
                         // Best effort: a failed read never ends a message wait, and the request
@@ -938,6 +1145,8 @@ async fn wait(
         },
     )
     .await?;
+    slot.asks_again =
+        text.is_none() && reach_of(&principal.token_id, &session, unix_now()) != Reach::Ended;
     drop(slot);
     Ok(match text {
         Some(text) => Json(serde_json::json!({ "text": text })).into_response(),
@@ -957,6 +1166,7 @@ struct SessionView {
     token_name: String,
     session: String,
     tier: &'static str,
+    reach: Reach,
     #[serde(flatten)]
     client: Client,
 }
@@ -970,7 +1180,7 @@ struct Page {
     /// This repository's setting, when set.
     repository_mode: Option<Mode>,
     sessions: Vec<SessionView>,
-    messages: Vec<Message>,
+    messages: Vec<MessageView>,
 }
 
 /// The signed-in person, the repository's forge id, and their live writing tokens for it.
@@ -1021,6 +1231,7 @@ fn page(
             token,
             session,
             tier: client.tier(now),
+            reach: client.reach(now),
             client,
         })
         .collect();
@@ -1033,7 +1244,10 @@ fn page(
         default_mode: load_mode(store, &mode_key(user_id, None))?,
         repository_mode: load_mode(store, &mode_key(user_id, Some(repository_id)))?,
         sessions,
-        messages,
+        messages: messages
+            .into_iter()
+            .map(|m| MessageView::at(m, now))
+            .collect(),
     })
 }
 
@@ -1120,7 +1334,7 @@ async fn send(
     State(state): State<HubState>,
     human: HumanSession,
     JsonBody(body): JsonBody<SendBody>,
-) -> std::result::Result<(StatusCode, Json<Message>), ApiError> {
+) -> std::result::Result<(StatusCode, Json<MessageView>), ApiError> {
     checked_note(&body.note)?;
     checked_name("session", &body.session)?;
     if let Some(id) = &body.work_id {
@@ -1153,6 +1367,7 @@ async fn send(
                 ));
             }
         }
+        let reach = reach_of(&body.token, &body.session, now);
         let message = Message {
             id: new_id("msg")?,
             token: body.token,
@@ -1165,14 +1380,18 @@ async fn send(
             mode: None,
             created_at: now,
             delivered_at: None,
+            offered_at: None,
+            read_at: None,
+            done_at: None,
             answered_at: None,
+            deadline_at: Some(now + reach.pickup_secs()),
         };
         let key = messages_key(&user.id, repository_id);
         let kept = message.clone();
         edit(&*store, &key, &user.id, move |messages| {
             pushed(messages, kept)
         })?;
-        Ok(message)
+        Ok(MessageView::at(message, now))
     })
     .await?;
     SENT.notify_waiters();
@@ -1227,7 +1446,11 @@ mod tests {
             mode: None,
             created_at: at,
             delivered_at: None,
+            offered_at: None,
+            read_at: None,
+            done_at: None,
             answered_at: None,
+            deadline_at: Some(at + Reach::NextStep.pickup_secs()),
         }
     }
 
@@ -1278,6 +1501,10 @@ mod tests {
         m.delivered_at = Some(100);
         assert!(!due(&m, 100 + REOFFER_SECS - 1));
         assert!(due(&m, 100 + REOFFER_SECS));
+        // A later offer restarts the wait; the first delivery's time stays.
+        m.offered_at = Some(150);
+        assert!(!due(&m, 150 + REOFFER_SECS - 1));
+        assert!(due(&m, 150 + REOFFER_SECS));
         for answered in [
             MessageState::Accepted,
             MessageState::Declined,
@@ -1287,6 +1514,170 @@ mod tests {
             m.state = answered;
             assert!(!due(&m, 100 + REOFFER_SECS));
         }
+    }
+
+    /// Codex's waiter put it in the chat's own queue, so no hook reply brings it a second time;
+    /// one the hook path took first is offered again as any other.
+    #[test]
+    fn a_message_in_a_codex_chats_queue_is_never_offered_again() {
+        let mut m = message("msg_1", 0);
+        m.state = MessageState::Delivered;
+        m.delivered_at = Some(100);
+        m.via = Some(Waker::Codex.via().into());
+        assert!(!due(&m, 100 + 10 * REOFFER_SECS));
+        assert!(
+            m.not_picked_up(m.due_at()),
+            "its deadline still tells the person"
+        );
+        for offered_again in [Waker::Claude.via(), "hook:codex"] {
+            m.via = Some(offered_again.into());
+            assert!(due(&m, 100 + REOFFER_SECS + 1), "{offered_again}");
+        }
+    }
+
+    /// Past the deadline an unanswered message is not picked up, delivered or not; only an
+    /// answer from its agent clears it, also a late one, and a withdrawn one is never flagged.
+    #[test]
+    fn a_message_is_not_picked_up_past_its_deadline_until_its_agent_answers() {
+        let mut m = message("msg_1", 0);
+        let due = m.deadline_at.unwrap();
+        assert!(!m.not_picked_up(due - 1));
+        assert!(m.not_picked_up(due));
+        m.state = MessageState::Delivered;
+        m.delivered_at = Some(due + 5);
+        m.offered_at = Some(due + 5);
+        assert!(m.not_picked_up(due + 5), "a delivery never clears it");
+        for answered in [
+            MessageState::Accepted,
+            MessageState::Declined,
+            MessageState::Done,
+        ] {
+            m.state = answered;
+            assert!(!m.not_picked_up(due + 60), "{answered:?}");
+        }
+        m.state = MessageState::Withdrawn;
+        assert!(!m.not_picked_up(due + 60));
+        // A message stored before deadlines existed is due as one reached at its next step.
+        let mut old = message("msg_2", 1_000);
+        old.deadline_at = None;
+        assert!(!old.not_picked_up(1_000 + Reach::NextStep.pickup_secs() - 1));
+        assert!(old.not_picked_up(1_000 + Reach::NextStep.pickup_secs()));
+    }
+
+    #[test]
+    fn a_deadline_fits_how_the_session_is_reached() {
+        let mut client = Client {
+            top_level: true,
+            hook_context: true,
+            ..Client::default()
+        };
+        assert_eq!(client.reach(100), Reach::NextStep);
+        // Having waited lately is not waiting: only an open wait, or the moment after one ended
+        // with nothing while its waiter asks again, wakes the session.
+        client.waited_at = Some(100);
+        assert_eq!(client.reach(100), Reach::NextStep);
+        client.open_waits = 1;
+        assert_eq!(client.reach(100), Reach::WakeNow);
+        client.waker = Some(Waker::Codex);
+        assert_eq!(client.reach(100), Reach::WakeSoon);
+        client.waker = Some(Waker::Claude);
+        client.open_waits = 0;
+        client.wait_left_at = Some(100);
+        assert_eq!(client.reach(100 + WAIT_GAP_SECS), Reach::WakeNow);
+        assert_eq!(client.reach(101 + WAIT_GAP_SECS), Reach::NextStep);
+        client.ended = true;
+        assert_eq!(client.reach(100), Reach::Ended);
+        client.ended = false;
+        client.top_level = false;
+        assert_eq!(client.reach(100), Reach::Unreachable);
+        assert_eq!(
+            reach_of("tok_never_seen", "s", 100),
+            Reach::Unreachable,
+            "a session the Hub has not heard from"
+        );
+        assert!(Reach::WakeNow.pickup_secs() < Reach::WakeSoon.pickup_secs());
+        assert!(Reach::WakeSoon.pickup_secs() < Reach::NextStep.pickup_secs());
+        assert!(Reach::Unreachable.pickup_secs() < Reach::NextStep.pickup_secs());
+        assert_eq!(Reach::Ended.pickup_secs(), Reach::Unreachable.pickup_secs());
+    }
+
+    /// A wait counts its session as waited for while it is open, also when its request is dropped
+    /// mid-wait; one that delivered leaves nothing behind, since its waiter wakes the session and
+    /// stops. The session's end ends its waits' claim, and its next own call brings it back.
+    #[test]
+    fn a_session_reads_as_woken_only_while_its_waiter_waits() {
+        let (token, session) = ("tok_reach", "s_reach");
+        let key = (token.to_owned(), session.to_owned());
+        let reach = || reach_of(token, session, unix_now());
+        let mut slot = WaitSlot::open("u_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Codex, unix_now());
+        assert_eq!(reach(), Reach::WakeSoon);
+        slot.asks_again = true;
+        drop(slot);
+        let left = SESSIONS.lock().unwrap().get(&key).unwrap().wait_left_at;
+        assert!(
+            left.is_some(),
+            "a wait that ended empty: its waiter asks again"
+        );
+        let slot = WaitSlot::open("u_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Claude, unix_now());
+        assert_eq!(reach(), Reach::WakeNow);
+        // Right after the empty wait above: a wait that delivered leaves no grace behind.
+        drop(slot);
+        assert_eq!(reach(), Reach::NextStep, "it woke the session and stopped");
+        note_end(token, session);
+        assert_eq!(reach(), Reach::Ended);
+        note_hook(token, session, "hook:claude", false, true, unix_now());
+        assert_eq!(
+            reach(),
+            Reach::Ended,
+            "a subagent's call does not bring it back"
+        );
+        note_hook(token, session, "hook:claude", true, true, unix_now());
+        assert_eq!(reach(), Reach::NextStep);
+        note_end("tok_reach_unseen", session);
+        assert!(
+            !SESSIONS
+                .lock()
+                .unwrap()
+                .contains_key(&("tok_reach_unseen".to_owned(), session.to_owned()))
+        );
+    }
+
+    /// Each step keeps its own time: the first delivery and its way, the agent's first answer,
+    /// its done. A re-offer by another way changes neither the first delivery nor its way.
+    #[test]
+    fn each_step_of_a_message_keeps_its_own_time() {
+        let (_dir, store) = temp_store();
+        let alice = principal("tok_a", "u_times");
+        sent(&*store, "u_times", message("msg_1", 0));
+        let stored =
+            |store: &dyn Store| load(store, &messages_key("u_times", 7)).unwrap()[0].clone();
+        assert!(
+            take(&*store, &alice, "s", Waker::Claude.via(), 10)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            take(&*store, &alice, "s", "hook:claude", 10 + REOFFER_SECS)
+                .unwrap()
+                .is_some()
+        );
+        let m = stored(&*store);
+        assert_eq!(
+            (m.delivered_at, m.via.as_deref()),
+            (Some(10), Some(Waker::Claude.via()))
+        );
+        assert_eq!(m.offered_at, Some(10 + REOFFER_SECS));
+        assert_eq!((m.read_at, m.done_at), (None, None));
+        answer(&*store, &alice, "s", "msg_1", Answer::Accepted, 200).unwrap();
+        answer(&*store, &alice, "s", "msg_1", Answer::Done, 300).unwrap();
+        let m = stored(&*store);
+        assert_eq!(
+            (m.read_at, m.done_at, m.answered_at),
+            (Some(200), Some(300), Some(300))
+        );
+        assert!(!m.not_picked_up(10_000));
     }
 
     fn principal(token: &str, owner: &str) -> Principal {
@@ -1368,7 +1759,7 @@ mod tests {
                 &*store,
                 &principal,
                 session,
-                WAKE_VIA,
+                Waker::Claude.via(),
                 unix_now(),
                 wakes,
             ))
@@ -1644,7 +2035,12 @@ mod tests {
         assert!(call(now + wait).unwrap().contains(&second));
         // While its hook waits, the wait reads them and a call does not.
         let third = at.asked(705, "third");
-        note_wait(&at.here.token_id, LEAD_SESSION, now + 2 * wait);
+        note_wait(
+            &at.here.token_id,
+            LEAD_SESSION,
+            Waker::Claude,
+            now + 2 * wait,
+        );
         assert_eq!(call(now + 2 * wait), None);
         let woken = request_wake_elsewhere(store, &at.here, LEAD_SESSION, now + 2 * wait)
             .unwrap()
@@ -1678,7 +2074,7 @@ mod tests {
         assert!(!text.contains("auto") && !text.contains("manual"), "{text}");
         let kept = load(&*store, &messages_key("u1", 7)).unwrap();
         assert_eq!(kept[0].state, MessageState::Delivered);
-        assert_eq!(kept[0].via.as_deref(), Some(WAKE_VIA));
+        assert_eq!(kept[0].via.as_deref(), Some(Waker::Claude.via()));
 
         // A second waiter for the same session, and the hook path, get nothing more.
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
@@ -1817,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_session_shown_not_to_be_a_subagent_takes_messages() {
+    fn an_mcp_call_naming_its_session_takes_messages_unless_a_hook_carries_them() {
         let token = "tok_test_top_level";
         let tier = |session: &str| {
             clients_of(&[token.to_owned()])
@@ -1825,22 +2221,36 @@ mod tests {
                 .find(|((_, s), _)| s == session)
                 .map(|(_, client)| client.tier(3))
         };
-        // MCP alone cannot say whether a subagent made the call.
+        // A client with only MCP (Codex without hooks, Antigravity, opencode) is offered messages
+        // in its tool results; the notice tells a subagent to leave them.
         note_mcp(token, None, "mcp-only", 1);
-        assert_eq!(tier("mcp-only"), Some("unknown"));
-        assert!(!mcp_delivers(token, "mcp-only"));
-        // Only a subagent's hook calls seen so far, as after a Hub restart.
+        assert_eq!(tier("mcp-only"), Some("mcp"));
+        assert!(mcp_delivers(token, "mcp-only"));
+        // The shared `default` names no one conversation, so it is offered nothing.
+        note_mcp(token, None, crate::hub::session::DEFAULT_SESSION, 1);
+        assert_eq!(tier(crate::hub::session::DEFAULT_SESSION), Some("unknown"));
+        assert!(!mcp_delivers(token, crate::hub::session::DEFAULT_SESSION));
+        // Only a subagent's hook calls seen so far, as after a Hub restart: nothing from the
+        // session itself, so nothing is offered until it calls.
         note_hook(token, "copilot", "hook:copilot", false, false, 1);
-        note_mcp(token, None, "copilot", 1);
         assert_eq!(tier("copilot"), Some("unknown"));
         assert!(!mcp_delivers(token, "copilot"));
-        note_hook(token, "copilot", "hook:copilot", true, false, 2);
+        note_mcp(token, None, "copilot", 1);
         assert_eq!(tier("copilot"), Some("mcp"), "a hook without added context");
         assert!(mcp_delivers(token, "copilot"));
-        // A hook that carries context takes its messages there, even before its first such call.
+        note_hook(token, "copilot", "hook:copilot", true, false, 2);
+        assert_eq!(tier("copilot"), Some("mcp"));
+        // A hook that carries context takes its messages there, even before its first such call,
+        // and never in an MCP result.
         note_hook(token, "claude", "hook:claude", true, true, 3);
+        note_mcp(token, None, "claude", 3);
         assert_eq!(tier("claude"), Some("hook"));
         assert!(!mcp_delivers(token, "claude"));
+        // Its subagents' calls alone, hook or MCP, never move its messages into MCP results.
+        note_hook(token, "claude-sub", "hook:claude", false, true, 3);
+        note_mcp(token, None, "claude-sub", 3);
+        assert_eq!(tier("claude-sub"), Some("unknown"));
+        assert!(!mcp_delivers(token, "claude-sub"));
     }
 
     #[test]
@@ -1855,10 +2265,6 @@ mod tests {
         let seen = clients_of(&[token.to_owned()]);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1.name.as_deref(), Some("gemini-cli"));
-        assert_eq!(
-            seen[0].1.tier(5),
-            "unknown",
-            "MCP alone is no top-level evidence"
-        );
+        assert_eq!(seen[0].1.tier(5), "mcp", "its MCP calls take its messages");
     }
 }
