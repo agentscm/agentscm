@@ -45,7 +45,9 @@ const PREVIEW_SUBSCRIBER: &str = "work-reconcile";
 /// Provider evidence for one Work's linked pull request.
 #[derive(Default)]
 pub(super) struct PrFacts<'a> {
-    pub(super) link: Option<&'a WorkPrLink>,
+    pub(super) link: Option<&'a PrLinkV1>,
+    /// Limits found while inferring the link, such as `branch_pull_requests_multiple`.
+    pub(super) link_limits: &'a [&'static str],
     /// The link could not be read (for example an unbound repository), which is not the same as
     /// no link.
     pub(super) link_unavailable: bool,
@@ -90,6 +92,8 @@ pub(super) struct ReconcileFacts<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum LinkBasis {
     CallerReported,
+    /// The Hub inferred it from an observed pull request on the Work's branch.
+    BranchObserved,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -182,7 +186,7 @@ pub struct WorkReconciliationV1 {
     pub digest: String,
 }
 
-fn pr_link_v1(link: &WorkPrLink) -> PrLinkV1 {
+fn explicit_link(link: &WorkPrLink) -> PrLinkV1 {
     PrLinkV1 {
         basis: LinkBasis::CallerReported,
         number: link.target.number,
@@ -194,6 +198,7 @@ fn provider_status(
     pr: &PrFacts<'_>,
     limits: &mut BTreeSet<String>,
 ) -> (ProviderStatus, HeadRelation) {
+    limits.extend(pr.link_limits.iter().map(|l| (*l).to_owned()));
     let Some(link) = pr.link else {
         if pr.link_unavailable {
             limits.insert("pr_link_unavailable".to_owned());
@@ -205,6 +210,12 @@ fn provider_status(
     if let Some(limit) = pr.observation_limit {
         limits.insert(limit.to_owned());
     }
+    // An inferred link takes its head from the same evidence it would be compared with, so the
+    // comparison proves nothing: the relation stays unknown and a prerequisite cannot be satisfied.
+    let inferred = link.basis == LinkBasis::BranchObserved;
+    if inferred {
+        limits.insert("branch_link_head_not_compared".to_owned());
+    }
     if pr.merged != Some(true) && pr.merge_gap {
         limits.insert("merge_retention_gap".to_owned());
     }
@@ -215,7 +226,8 @@ fn provider_status(
             limits.insert("merge_and_open_observed".to_owned());
         }
         let relation = match pr.merge_head {
-            Some(head) if head.eq_ignore_ascii_case(&link.target.head_sha) => HeadRelation::Same,
+            _ if inferred => HeadRelation::Unknown,
+            Some(head) if head.eq_ignore_ascii_case(&link.head_sha) => HeadRelation::Same,
             Some(_) => {
                 limits.insert("merge_head_changed".to_owned());
                 HeadRelation::Changed
@@ -246,7 +258,9 @@ fn provider_status(
         limits.insert("merge_lookup_unavailable".to_owned());
     }
     if let Some(head) = pr.open_head {
-        return if head.eq_ignore_ascii_case(&link.target.head_sha) {
+        return if inferred {
+            (ProviderStatus::OpenSameHead, HeadRelation::Unknown)
+        } else if head.eq_ignore_ascii_case(&link.head_sha) {
             (ProviderStatus::OpenSameHead, HeadRelation::Same)
         } else {
             (ProviderStatus::OpenHeadChanged, HeadRelation::Changed)
@@ -296,7 +310,7 @@ fn prerequisite(
         state,
         provider,
         reported_outcome: facts.and_then(|f| f.outcome),
-        link: pr.and_then(|pr| pr.link).map(pr_link_v1),
+        link: pr.and_then(|pr| pr.link).cloned(),
         limits: limits.into_iter().collect(),
     }
 }
@@ -336,7 +350,7 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
         work_id: item.id.clone(),
         generation: item.generation,
         updated_seq: item.updated_seq,
-        link: facts.pr.link.map(pr_link_v1),
+        link: facts.pr.link.cloned(),
         provider: ProviderV1 {
             status,
             head_relation,
@@ -370,7 +384,8 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
 /// Owned provider facts for one Work, read through the Store.
 #[derive(Default)]
 struct PrRead {
-    link: Option<WorkPrLink>,
+    link: Option<PrLinkV1>,
+    link_limits: Vec<&'static str>,
     link_unavailable: bool,
     merged: Option<bool>,
     merges: Vec<CatchupMergeObservation>,
@@ -385,6 +400,7 @@ impl PrRead {
     fn facts(&self) -> PrFacts<'_> {
         PrFacts {
             link: self.link.as_ref(),
+            link_limits: &self.link_limits,
             link_unavailable: self.link_unavailable,
             merged: self.merged,
             merge_head: if self.merges.len() == 1 {
@@ -441,10 +457,18 @@ fn read_pr(
         merge_gap,
         ..PrRead::default()
     };
-    let Some(link) = view.link else {
-        return Ok(Some(read));
+    let link = match view.link {
+        Some(link) => explicit_link(&link),
+        None => {
+            let inference = infer_for_work(store, principal, work_id, now);
+            read.link_limits = inference.limits;
+            let Some(link) = inference.link else {
+                return Ok(Some(read));
+            };
+            link
+        }
     };
-    let number = link.target.number;
+    let number = link.number;
     if let Ok(merges) = store.catchup_merges_for_pull(scope, number) {
         read.merged = Some(!merges.is_empty());
         read.merges = merges;
@@ -459,6 +483,142 @@ fn read_pr(
     }
     read.link = Some(link);
     Ok(Some(read))
+}
+
+/// A provider-confirmed merge of a pull request, as a later store read will return it for a branch.
+#[allow(dead_code)] // Constructed by the branch merge read of a later phase and by tests.
+pub(super) struct BranchMerge {
+    pub(super) pull_number: i64,
+    pub(super) head_commit: String,
+    /// Unix seconds.
+    pub(super) occurred_at: Option<i64>,
+    /// `None` for a row recorded before the Hub kept the head repository.
+    pub(super) same_repository_head: Option<bool>,
+}
+
+#[derive(Default)]
+struct BranchInference {
+    link: Option<PrLinkV1>,
+    limits: Vec<&'static str>,
+}
+
+/// Pick the one pull request a Work's branch names, or none. Open observations are
+/// `(number, head_sha)` of same-repository pull requests whose head ref is the branch. A merge
+/// before the Work existed is an earlier use of the branch name. Several candidate numbers are
+/// a limit, never a choice.
+fn infer_branch_link(
+    work_created_at: i64,
+    open: &[(i64, String)],
+    merges: &[BranchMerge],
+    branch_is_base: bool,
+) -> BranchInference {
+    let mut out = BranchInference::default();
+    if branch_is_base {
+        out.limits.push("branch_is_merge_base");
+        return out;
+    }
+    // Per number: the latest merge (time, head) and the open head.
+    type Candidate<'a> = (Option<(i64, &'a str)>, Option<&'a str>);
+    let mut candidates = std::collections::BTreeMap::<i64, Candidate<'_>>::new();
+    for merge in merges {
+        match merge.same_repository_head {
+            Some(false) => continue,
+            None => {
+                out.limits.push("branch_merge_head_repository_unknown");
+                continue;
+            }
+            Some(true) => {}
+        }
+        let Some(at) = merge.occurred_at.filter(|at| *at >= work_created_at) else {
+            continue;
+        };
+        let entry = candidates.entry(merge.pull_number).or_default();
+        if entry.0.is_none_or(|(latest, _)| at > latest) {
+            entry.0 = Some((at, merge.head_commit.as_str()));
+        }
+    }
+    for (number, head) in open {
+        candidates.entry(*number).or_default().1 = Some(head.as_str());
+    }
+    if candidates.len() > 1 {
+        out.limits.push("branch_pull_requests_multiple");
+        return out;
+    }
+    if let Some((number, (merged, open))) = candidates.into_iter().next() {
+        out.link = Some(PrLinkV1 {
+            basis: LinkBasis::BranchObserved,
+            number,
+            head_sha: merged
+                .map(|(_, head)| head)
+                .or(open)
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    out
+}
+
+/// Infer the link of a Work with no explicit one from observed pull requests on its branch.
+fn infer_for_work(
+    store: &dyn Store,
+    principal: &Principal,
+    work_id: &str,
+    now: i64,
+) -> BranchInference {
+    let Ok(Some(item)) = store.work_get(&principal.token_id, work_id, now) else {
+        return BranchInference::default();
+    };
+    let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
+        return BranchInference::default();
+    };
+    let unavailable = || BranchInference {
+        limits: vec!["observation_unavailable"],
+        ..BranchInference::default()
+    };
+    let Ok(Some(repository)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return unavailable();
+    };
+    let Ok(rows) = store.observations(&repository.id, "pull_request") else {
+        return unavailable();
+    };
+    let mut open = Vec::new();
+    let mut branch_is_base = false;
+    for row in &rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.data) else {
+            continue;
+        };
+        if value["state"] != "open" {
+            continue;
+        }
+        branch_is_base |= value["base_ref"] == branch;
+        let (Some(number), Some(repository_id), Some(head_repository_id)) = (
+            value["number"].as_i64().filter(|n| *n > 0),
+            value["repository_id"].as_i64(),
+            value["head_repository_id"].as_i64(),
+        ) else {
+            continue;
+        };
+        let head = value["head_sha"].as_str().unwrap_or_default();
+        if value["head_ref"] == branch
+            && row.key == number.to_string()
+            && head_repository_id == repository_id
+            && principal.repository_id.is_none_or(|id| id == repository_id)
+            && matches!(head.len(), 40 | 64)
+            && head.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            open.push((number, head.to_owned()));
+        }
+    }
+    let mut inference = infer_branch_link(item.created_at, &open, &[], branch_is_base);
+    if rows.len() >= 1000 {
+        inference.limits.push("pr_observations_truncated");
+    }
+    inference
 }
 
 #[derive(Default)]
@@ -676,10 +836,7 @@ mod tests {
         MergeStatus, OperationalFacts, OutcomeFact, OutcomeProvenance, RenewalCoverage,
         ReservationBasis, TerminalOutcome, work_operational,
     };
-    use super::super::work_links::WorkPrLinkTarget;
     use super::*;
-
-    const TOKEN: &str = "secret-link-token";
 
     fn checkpoint(kind: CheckpointKind) -> Checkpoint {
         Checkpoint {
@@ -732,20 +889,11 @@ mod tests {
         }
     }
 
-    fn link(number: i64, head: &str) -> WorkPrLink {
-        WorkPrLink {
-            target: WorkPrLinkTarget {
-                repository_id: 9,
-                number,
-                head_sha: head.to_owned(),
-            },
-            author: "author-x".to_owned(),
-            token: TOKEN.to_owned(),
-            agent: "agent-x".to_owned(),
-            session: "session-x".to_owned(),
-            generation: 3,
-            linked_at: 5,
-            event_seq: 6,
+    fn link(number: i64, head: &str) -> PrLinkV1 {
+        PrLinkV1 {
+            basis: LinkBasis::CallerReported,
+            number,
+            head_sha: head.to_owned(),
         }
     }
 
@@ -780,7 +928,7 @@ mod tests {
 
     fn run(
         item: &WorkItem,
-        link: Option<&WorkPrLink>,
+        link: Option<&PrLinkV1>,
         merged: Option<bool>,
         open_head: Option<&str>,
         basis: Option<ReservationBasis>,
@@ -802,7 +950,7 @@ mod tests {
     }
 
     type Case<'a> = (
-        Option<&'a WorkPrLink>,
+        Option<&'a PrLinkV1>,
         Option<bool>,
         Option<&'a str>,
         ProviderStatus,
@@ -1085,7 +1233,7 @@ mod tests {
 
     fn prereq<'a>(
         id: &'a str,
-        link: Option<&'a WorkPrLink>,
+        link: Option<&'a PrLinkV1>,
         merged: Option<bool>,
         open: Option<&'a str>,
         outcome: Option<OutcomeValue>,
@@ -1096,7 +1244,7 @@ mod tests {
                 link,
                 merged,
                 merge_head: if merged == Some(true) {
-                    link.map(|l| l.target.head_sha.as_str())
+                    link.map(|l| l.head_sha.as_str())
                 } else {
                     None
                 },
@@ -1239,10 +1387,95 @@ mod tests {
         let it = item(WorkState::Active, &[], false);
         let out = run(&it, Some(&l), Some(true), None, None, &[]);
         let json = serde_json::to_string(&out).unwrap();
-        for secret in [TOKEN, "author-x", "agent-x", "session-x", "secret-lead"] {
+        for secret in ["author-x", "agent-x", "session-x", "secret-lead"] {
             assert!(!json.contains(secret), "{secret}");
         }
         assert!(json.contains("caller_reported"));
+    }
+
+    fn merge(number: i64, head: &str, at: Option<i64>, same: Option<bool>) -> BranchMerge {
+        BranchMerge {
+            pull_number: number,
+            head_commit: head.to_owned(),
+            occurred_at: at,
+            same_repository_head: same,
+        }
+    }
+
+    fn open(number: i64, head: &str) -> Vec<(i64, String)> {
+        vec![(number, head.to_owned())]
+    }
+
+    #[test]
+    fn branch_inference_selects_one_candidate_or_names_the_limit() {
+        let none = |o: &[(i64, String)], m: &[BranchMerge], base| infer_branch_link(10, o, m, base);
+        // One open pull request links, with the open head.
+        let one = none(&open(4, "aaa"), &[], false);
+        let l = one.link.unwrap();
+        assert_eq!(
+            (l.basis, l.number, l.head_sha.as_str()),
+            (LinkBasis::BranchObserved, 4, "aaa")
+        );
+        // One merge links, with the merge head.
+        let m = none(&[], &[merge(6, "mmm", Some(20), Some(true))], false);
+        assert_eq!(
+            m.link.as_ref().map(|l| (l.number, l.head_sha.as_str())),
+            Some((6, "mmm"))
+        );
+        // The same pull request open and merged is one candidate; the merge head wins.
+        let both = none(
+            &open(6, "ooo"),
+            &[merge(6, "mmm", Some(20), Some(true))],
+            false,
+        );
+        assert_eq!(both.link.unwrap().head_sha, "mmm");
+        // The latest merge of one number supplies the head.
+        let two = [
+            merge(6, "old", Some(11), Some(true)),
+            merge(6, "new", Some(30), Some(true)),
+        ];
+        assert_eq!(none(&[], &two, false).link.unwrap().head_sha, "new");
+        // A fork merge and a merge before the Work are ignored without a limit.
+        let ignored = [
+            merge(7, "x", Some(20), Some(false)),
+            merge(8, "y", Some(9), Some(true)),
+            merge(9, "z", None, Some(true)),
+        ];
+        let out = none(&[], &ignored, false);
+        assert!(out.link.is_none() && out.limits.is_empty());
+        // A merge with an unknown head repository is ignored and says so.
+        let unknown = none(&[], &[merge(7, "x", Some(20), None)], false);
+        assert!(unknown.link.is_none());
+        assert_eq!(unknown.limits, ["branch_merge_head_repository_unknown"]);
+        // The branch being a base never links.
+        let base = none(&open(4, "aaa"), &[], true);
+        assert!(base.link.is_none());
+        assert_eq!(base.limits, ["branch_is_merge_base"]);
+        // Two numbers are a limit, not a choice.
+        let many = none(
+            &open(4, "aaa"),
+            &[merge(6, "mmm", Some(20), Some(true))],
+            false,
+        );
+        assert!(many.link.is_none());
+        assert_eq!(many.limits, ["branch_pull_requests_multiple"]);
+    }
+
+    #[test]
+    fn inferred_link_never_compares_its_head_or_satisfies_a_prerequisite() {
+        let inferred = PrLinkV1 {
+            basis: LinkBasis::BranchObserved,
+            ..link(8, "ccc")
+        };
+        let it = item(WorkState::Blocked, &["dep-a"], true);
+        let prereqs = [prereq("dep-a", Some(&inferred), Some(true), None, None)];
+        let out = run(&it, None, None, None, None, &prereqs);
+        assert_eq!(out.prerequisites[0].provider, ProviderStatus::Merged);
+        assert_eq!(out.prerequisites[0].state, PrerequisiteState::Unknown);
+        assert!(!out.reassess.needed);
+        let open = run(&it, Some(&inferred), Some(false), Some("ccc"), None, &[]);
+        assert_eq!(open.provider.status, ProviderStatus::OpenSameHead);
+        assert_eq!(open.provider.head_relation, HeadRelation::Unknown);
     }
 
     #[test]
