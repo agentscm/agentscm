@@ -3586,6 +3586,19 @@ mod shared_bodies {
             assert!(output.status.success());
         }
 
+        /// Compacts what the Hub acknowledged and frees the shared bodies upkeep could then free
+        /// once every grace has passed, as upkeep does.
+        fn free_bodies(&self) -> usize {
+            let later = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + agentscm::change_capture::spool::BODY_GRACE_SECONDS;
+            let spool = agentscm::change_capture::LocalSpool::open(&self.spool).unwrap();
+            spool.compact_acknowledged(100).unwrap();
+            spool.free_uploaded_bodies(later).unwrap()
+        }
+
         fn pending(&self) -> u64 {
             let output = self.cli(&[
                 "change-capture",
@@ -3617,6 +3630,10 @@ mod shared_bodies {
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Available);
         assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+
+        // The Hub answered 204, so the local copy is freed once its grace has passed.
+        assert_eq!(checkout.free_bodies(), 1);
+        assert!(!checkout.spool.join("artifacts").join(&f.sha).exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3678,6 +3695,9 @@ mod shared_bodies {
         assert_eq!(off.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
+        // Acknowledged without an upload: the body stays on this computer.
+        assert_eq!(off.free_bodies(), 0);
+        assert!(off.spool.join("artifacts").join(&f.sha).exists());
 
         // A body that is no longer in the spool is skipped and stays declared on the Hub.
         let missing = Checkout::new(&f);
