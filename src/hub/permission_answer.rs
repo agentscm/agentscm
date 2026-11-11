@@ -2370,9 +2370,13 @@ mod tests {
         let (quiet, _) = register(HASH, later + 1);
         let gone = later + 1 + HOOK_GONE_SECONDS;
         let shown = requests.list(&waiting, "usr_me", Some(7), gone).unwrap();
+        let listed = shown
+            .iter()
+            .find(|listed| listed.request_id == quiet)
+            .expect("still listed");
         assert_eq!(
-            (shown.len(), shown[0].request_id.as_str(), shown[0].state),
-            (1, quiet.as_str(), "on_computer")
+            (listed.state, listed.on_screen, listed.allowable),
+            ("on_computer", true, false)
         );
         assert!(matches!(
             requests.answer(&waiting, "usr_me", Some(7), &quiet, Decision::Allow, gone),
