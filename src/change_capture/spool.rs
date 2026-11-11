@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +39,9 @@ const BASE_METADATA_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
 const BASE_METADATA_RESERVE_RECORDS: usize = 256;
 const MAX_DEFERRED_BYTES: u64 = 64 * 1024;
 const MAX_COMPACTION_PAGE: usize = 500;
+/// Root ledger of shared conversation bodies; see `LocalSpool::free_uploaded_bodies`.
+const BODY_LEDGER: &str = "bodies-v1.log";
+const MAX_BODY_REMOVALS: usize = 500;
 /// The refusals of a spool with no room left, as opposed to any other bound.
 const STORE_RECORDS_FULL: &str =
     "local capture spool record limit reached; acknowledge/export or increase the explicit limit";
@@ -169,6 +172,9 @@ pub const DEFERRED_KEEP_SECONDS: i64 = 24 * 60 * 60;
 pub const DEFERRED_GAP_SECONDS: i64 = 7 * 24 * 60 * 60;
 /// How long a tool call's claim waits for its other phase. See `LocalSpool::expire_claims`.
 pub const CLAIM_KEEP_SECONDS: i64 = 24 * 60 * 60;
+/// How long a shared body nothing retained again stays before upkeep may free it; a capture
+/// retains a body and appends the envelope naming it within seconds.
+pub const BODY_GRACE_SECONDS: i64 = 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2464,10 +2470,11 @@ impl LocalSpool {
 
     /// Run by the capture hook before it writes an event: past 80% of a limit, deletes deferred
     /// hooks nothing will read (`prune_deferred`) and claims that lost their other phase
-    /// (`expire_claims`), and compacts one page of envelopes the Hub has accepted
-    /// (`compact_acknowledged`, which never touches anything unaccepted). Answers whether the spool
-    /// is still full afterwards. A failed prune does not stop compaction; its error is returned
-    /// after compaction has run.
+    /// (`expire_claims`), compacts one page of envelopes the Hub has accepted
+    /// (`compact_acknowledged`, which never touches anything unaccepted), and frees one page of
+    /// shared bodies the Hub holds (`free_uploaded_bodies`). Answers whether the spool is still
+    /// full afterwards. A failed prune does not stop compaction; its error is returned after
+    /// compaction has run.
     pub fn upkeep(&self, now: i64) -> Result<bool> {
         if !self.usage()?.needs_upkeep() {
             return Ok(false);
@@ -2482,6 +2489,7 @@ impl LocalSpool {
         if accepted {
             self.compact_acknowledged(MAX_COMPACTION_PAGE)?;
         }
+        self.free_uploaded_bodies(now)?;
         pruned?;
         expired?;
         Ok(self.usage()?.is_full())
@@ -2667,36 +2675,197 @@ impl LocalSpool {
             }
             Ok(())
         };
-        let mut missing = Vec::new();
+        let mut found = Vec::with_capacity(items.len());
         for (bytes, reference) in items.iter().zip(&references) {
             let path = artifacts.join(&reference.digest);
-            if path.exists() {
+            let exists = path.exists();
+            if exists {
                 verify(&path, bytes)?;
-            } else {
-                missing.push((path, *bytes));
             }
+            found.push(exists);
         }
-        if missing.is_empty() {
+        let shared = retention == RetentionClassV1::SharedApproved;
+        let ledger_path = self.root.join(BODY_LEDGER);
+        // The body ledger exists before the first body it tracks and is never deleted, so without
+        // it no file found here can be freed.
+        if !shared && found.iter().all(|exists| *exists) && !ledger_path.exists() {
             return Ok(references);
         }
         let _lock = self.lock()?;
+        let ledger_bytes = read_body_ledger(&ledger_path, self.limits.max_total_bytes)?;
+        let ledger = BodyLedger::parse(&ledger_bytes)?;
         let mut new = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (path, bytes) in missing {
+        let mut recorded = BTreeSet::<String>::new();
+        let mut records = String::new();
+        let mut touched = Vec::new();
+        for ((bytes, reference), existed) in items.iter().zip(&references).zip(found) {
+            let digest = reference.digest.as_str();
+            let path = artifacts.join(digest);
+            let freeable = ledger.freeable(digest);
             if path.exists() {
-                verify(&path, bytes)?;
+                if !existed {
+                    verify(&path, bytes)?;
+                }
+                if freeable && shared {
+                    // A reused body starts its grace again, so upkeep cannot free it before the
+                    // envelope that names it is appended.
+                    touched.push(path);
+                } else if freeable && recorded.insert(digest.to_owned()) {
+                    records.push_str(&format!("l {digest}\n"));
+                }
             } else if seen.insert(path.clone()) {
-                new.push((path, bytes));
+                if shared && !ledger.shared.contains(digest) && recorded.insert(digest.to_owned()) {
+                    records.push_str(&format!("s {digest}\n"));
+                } else if !shared && freeable && recorded.insert(digest.to_owned()) {
+                    records.push_str(&format!("l {digest}\n"));
+                }
+                new.push((path, *bytes));
             }
         }
-        if !new.is_empty() {
-            let total = new.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-            self.reserve_artifact(total, new.len())?;
-            for (path, bytes) in &new {
-                atomic_write(path, bytes)?;
-            }
+        if !new.is_empty() || !records.is_empty() {
+            let total = new
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+                .saturating_add(records.len() as u64);
+            let ledger_record = !records.is_empty() && !ledger_path.exists();
+            self.reserve_artifact(total, new.len() + usize::from(ledger_record))?;
+        }
+        // Recorded before the files: a non-shared reference to a tracked body guards it before it
+        // is returned, and a body file the ledger does not name is never freed.
+        append_body_records(&self.root, &ledger_path, &ledger_bytes, &records)?;
+        for (path, bytes) in &new {
+            atomic_write(path, bytes)?;
+        }
+        for path in touched {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)?
+                .set_modified(SystemTime::now())?;
         }
         Ok(references)
+    }
+
+    /// Records that the Hub answered 204 to the upload of the shared body `digest` for `work_id`,
+    /// the proof `free_uploaded_bodies` needs. Only bodies the ledger tracks are recorded. It
+    /// uses the headroom ordinary content cannot, so a full store can still record what frees it.
+    pub fn record_body_uploaded(&self, work_id: &str, digest: &str) -> Result<()> {
+        if !valid_digest(digest) {
+            return Err(CaptureError::Invalid("body digest is invalid".into()));
+        }
+        let ledger_path = self.root.join(BODY_LEDGER);
+        if !ledger_path.exists() {
+            return Ok(());
+        }
+        let work = sha256(work_id.as_bytes());
+        let _lock = self.lock()?;
+        let ledger_bytes = read_body_ledger(&ledger_path, self.limits.max_total_bytes)?;
+        let ledger = BodyLedger::parse(&ledger_bytes)?;
+        if !ledger.shared.contains(digest)
+            || ledger.uploaded.contains(&(digest.to_owned(), work.clone()))
+        {
+            return Ok(());
+        }
+        let record = format!("r {digest} {work}\n");
+        self.reserve(record.len() as u64, 0)?;
+        append_body_records(&self.root, &ledger_path, &ledger_bytes, &record)
+    }
+
+    /// Deletes shared conversation bodies this computer no longer needs, at most
+    /// `MAX_BODY_REMOVALS` a pass. A body goes only when all of these hold, checked and removed
+    /// under the spool lock: a shared-conversation retain created its file (the ledger's `s`);
+    /// nothing ever retained the same bytes as local content (no `l`); nothing retained it for
+    /// `BODY_GRACE_SECONDS`; and every envelope that still holds it, in the outbox or kept whole
+    /// by compaction, belongs to a Work for which the Hub answered 204 to its upload (`r`). An
+    /// acknowledgement alone is not that proof: delivery acknowledges without uploading once a
+    /// binding stops sharing. An envelope compacted to a digest holds no reference any more, so
+    /// nothing on this computer can read or upload its body. Bodies retained before the ledger
+    /// existed are never freed: nothing says whether local content shares their file. Returns
+    /// how many were deleted.
+    pub fn free_uploaded_bodies(&self, now: i64) -> Result<usize> {
+        let ledger_path = self.root.join(BODY_LEDGER);
+        if !ledger_path.exists() {
+            return Ok(0);
+        }
+        let _lock = self.lock()?;
+        let ledger = BodyLedger::parse(&read_body_ledger(
+            &ledger_path,
+            self.limits.max_total_bytes,
+        )?)?;
+        let artifacts = self.root.join("artifacts");
+        let mut candidates = BTreeSet::new();
+        for digest in ledger.shared.difference(&ledger.local) {
+            let modified = match fs::symlink_metadata(artifacts.join(digest)) {
+                Ok(metadata) => metadata.modified()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let modified = modified
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
+            if now.saturating_sub(modified) >= BODY_GRACE_SECONDS {
+                candidates.insert(digest.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let state = self.compaction_state()?;
+        let outbox = retained_envelopes(&self.root, self.limits)?;
+        for envelope in outbox.iter().map(|(_, envelope)| envelope).chain(
+            state
+                .entries
+                .values()
+                .filter_map(|compacted| compacted.envelope.as_ref()),
+        ) {
+            let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
+                continue;
+            };
+            let work = sha256(batch.work_id.as_bytes());
+            for artifact in batch
+                .events
+                .iter()
+                .filter_map(|event| event.artifact.as_ref())
+            {
+                if artifact.retention != RetentionClassV1::SharedApproved
+                    || !ledger
+                        .uploaded
+                        .contains(&(artifact.digest.clone(), work.clone()))
+                {
+                    candidates.remove(&artifact.digest);
+                }
+            }
+        }
+        let removed: BTreeSet<String> = candidates.into_iter().take(MAX_BODY_REMOVALS).collect();
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let mut kept = String::new();
+        for digest in ledger.shared.difference(&removed) {
+            kept.push_str(&format!("s {digest}\n"));
+        }
+        for digest in &ledger.local {
+            kept.push_str(&format!("l {digest}\n"));
+        }
+        for (digest, work) in &ledger.uploaded {
+            if ledger.shared.contains(digest) && !removed.contains(digest) {
+                kept.push_str(&format!("r {digest} {work}\n"));
+            }
+        }
+        // The ledger shrinks before the files go, so a crash between leaves untracked files,
+        // which are kept, never a tracked name for a file that is gone. Not reserved: it shrinks.
+        atomic_replace(&ledger_path, kept.as_bytes())?;
+        for digest in &removed {
+            match fs::remove_file(artifacts.join(digest)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(&artifacts)?.sync_all()?;
+        Ok(removed.len())
     }
 
     /// Returns a non-retained reference for a failed local retention attempt. This keeps content
@@ -2936,6 +3105,23 @@ impl LocalSpool {
                         .into(),
                 ))
             };
+        }
+        // Upkeep frees shared bodies under this lock, so a body retained before it may be gone.
+        if let CaptureEnvelopeV1::EventBatch(batch) = envelope {
+            for artifact in batch
+                .events
+                .iter()
+                .filter_map(|event| event.artifact.as_ref())
+            {
+                if artifact.retention == RetentionClassV1::SharedApproved
+                    && artifact.availability == ContentAvailabilityV1::Local
+                    && !self.root.join("artifacts").join(&artifact.digest).exists()
+                {
+                    return Err(CaptureError::Conflict(
+                        "a conversation body this event names is no longer retained".into(),
+                    ));
+                }
+            }
         }
         self.reserve_envelope(envelope, bytes.len() as u64, priority)?;
         atomic_write(&path, &bytes)?;
@@ -7777,9 +7963,101 @@ fn usage_with_outbox(root: &Path) -> Result<(usize, u64, usize)> {
     Ok((records, bytes, outbox))
 }
 
+/// The body ledger's facts, one line each: `s DIGEST` a shared-conversation retain created the
+/// body file; `l DIGEST` the same bytes were retained as local content too, so the file is never
+/// freed; `r DIGEST WORK` the Hub answered 204 to its upload for the Work whose id hashes to WORK.
+#[derive(Default)]
+struct BodyLedger {
+    shared: BTreeSet<String>,
+    local: BTreeSet<String>,
+    uploaded: BTreeSet<(String, String)>,
+}
+
+impl BodyLedger {
+    /// A torn last line, from a writer that stopped mid-append, is not a fact and is ignored.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(&bytes[..0], |end| &bytes[..end]);
+        let mut ledger = Self::default();
+        for line in complete.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let line = std::str::from_utf8(line)
+                .map_err(|_| CaptureError::Invalid("capture body ledger is not UTF-8".into()))?;
+            let parts: Vec<&str> = line.split(' ').collect();
+            match parts.as_slice() {
+                ["s", digest] if valid_digest(digest) => {
+                    ledger.shared.insert((*digest).to_owned());
+                }
+                ["l", digest] if valid_digest(digest) => {
+                    ledger.local.insert((*digest).to_owned());
+                }
+                ["r", digest, work] if valid_digest(digest) && valid_digest(work) => {
+                    ledger
+                        .uploaded
+                        .insert(((*digest).to_owned(), (*work).to_owned()));
+                }
+                _ => {
+                    return Err(CaptureError::Invalid(
+                        "capture body ledger contains an invalid record".into(),
+                    ));
+                }
+            }
+        }
+        Ok(ledger)
+    }
+
+    /// Created by a shared retain and never retained as local content.
+    fn freeable(&self, digest: &str) -> bool {
+        self.shared.contains(digest) && !self.local.contains(digest)
+    }
+}
+
+fn read_body_ledger(path: &Path, max: u64) -> Result<Vec<u8>> {
+    match read_bounded(path, max) {
+        Ok(bytes) => Ok(bytes),
+        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Appends whole ledger lines under the spool lock. `existing` is the ledger as just read; a torn
+/// last line is cut off first so the new lines start on a line of their own.
+fn append_body_records(root: &Path, path: &Path, existing: &[u8], records: &str) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let created = !path.exists();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !existing.ends_with(b"\n") {
+        let complete = existing
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
+        file.set_len(complete as u64)?;
+    }
+    file.write_all(records.as_bytes())?;
+    file.sync_all()?;
+    if created {
+        File::open(root)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Root-level append-only records, counted under the same limits as every other record.
 fn appended_root_record(name: &str) -> bool {
     name == DELIVERY_INDEX
+        || name == BODY_LEDGER
         || name
             .strip_prefix("session-")
             .and_then(|rest| rest.strip_suffix(".events"))

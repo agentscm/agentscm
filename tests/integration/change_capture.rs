@@ -26,10 +26,10 @@ use agentscm::change_capture::{
 };
 use agentscm::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
-    AssuranceBasisV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
-    CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1, DriftV1, GapReasonV1,
-    RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SourceBindingV1,
-    ToolCompletionV1,
+    ArtifactRefV1, AssuranceBasisV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1,
+    CapturedEventKindV1, CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1,
+    DriftV1, GapReasonV1, RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1,
+    SessionIdentityV1, SourceBindingV1, ToolCompletionV1,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -5594,6 +5594,238 @@ fn upkeep_never_removes_what_the_hub_has_not_accepted_and_reports_the_store_full
     );
     assert_eq!(spool.usage().unwrap(), before);
     assert_eq!(spool.pending(100).unwrap(), pending);
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// When upkeep may free a body retained now, once its grace has passed.
+fn after_grace() -> i64 {
+    unix_seconds() + agentscm::change_capture::spool::BODY_GRACE_SECONDS
+}
+
+fn retain_shared(spool: &LocalSpool, body: &str) -> ArtifactRefV1 {
+    spool
+        .retain_artifact(
+            body.as_bytes(),
+            ArtifactMediaV1::Json,
+            RetentionClassV1::SharedApproved,
+        )
+        .unwrap()
+}
+
+/// A shared-conversation prompt of `work_id` whose body is `body`.
+fn shared_body_batch(operation_id: &str, work_id: &str, body: &ArtifactRefV1) -> CaptureEnvelopeV1 {
+    let CaptureEnvelopeV1::EventBatch(mut batch) =
+        sample_batch(operation_id, &format!("{operation_id}:event"))
+    else {
+        unreachable!()
+    };
+    batch.work_id = work_id.into();
+    batch.session.capture_mode = CaptureModeV1::SharedConversation;
+    batch.events[0].kind = CapturedEventKindV1::UserPrompt;
+    batch.events[0].artifact = Some(body.clone());
+    CaptureEnvelopeV1::EventBatch(batch)
+}
+
+#[test]
+fn a_body_the_hub_holds_for_every_work_that_names_it_is_freed_and_never_named_again() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let accepted = retain_shared(&spool, r#"{"prompt":"accepted"}"#);
+    spool
+        .append(&shared_body_batch("accepted:1", "wrk_one", &accepted))
+        .unwrap();
+    // A second Work names the same bytes; the Hub has them only for the first.
+    let shared_twice = retain_shared(&spool, r#"{"prompt":"twice"}"#);
+    spool
+        .append(&shared_body_batch("twice:1", "wrk_one", &shared_twice))
+        .unwrap();
+    spool
+        .append(&shared_body_batch("twice:2", "wrk_two", &shared_twice))
+        .unwrap();
+    spool
+        .record_body_uploaded("wrk_one", &accepted.digest)
+        .unwrap();
+    spool
+        .record_body_uploaded("wrk_one", &shared_twice.digest)
+        .unwrap();
+
+    assert_eq!(
+        spool.free_uploaded_bodies(unix_seconds()).unwrap(),
+        0,
+        "nothing goes inside its grace"
+    );
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 1);
+    assert!(spool.read_artifact(&accepted).is_err());
+    assert_eq!(
+        spool.read_artifact(&shared_twice).unwrap(),
+        br#"{"prompt":"twice"}"#
+    );
+    // A batch can no longer name the freed body; retaining it again first makes it whole.
+    assert!(matches!(
+        spool.append(&shared_body_batch("accepted:2", "wrk_one", &accepted)),
+        Err(agentscm::change_capture::CaptureError::Conflict(_))
+    ));
+    let again = retain_shared(&spool, r#"{"prompt":"accepted"}"#);
+    spool
+        .append(&shared_body_batch("accepted:2", "wrk_one", &again))
+        .unwrap();
+    assert_eq!(
+        spool.read_artifact(&again).unwrap(),
+        br#"{"prompt":"accepted"}"#
+    );
+}
+
+#[test]
+fn an_acknowledged_body_the_hub_never_answered_for_is_kept() {
+    // Delivery acknowledges without uploading once the binding stops sharing.
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let body = retain_shared(&spool, r#"{"prompt":"not shared any more"}"#);
+    let envelope = shared_body_batch("stopped:1", "wrk_fixture", &body);
+    spool.append(&envelope).unwrap();
+    spool.acknowledge(&envelope).unwrap();
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
+    assert!(spool.read_artifact(&body).is_ok());
+}
+
+#[test]
+fn a_body_also_kept_as_local_content_is_never_freed_in_either_order() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let local = |bytes: &str| {
+        spool
+            .retain_artifact(
+                bytes.as_bytes(),
+                ArtifactMediaV1::Json,
+                RetentionClassV1::WorkLocal,
+            )
+            .unwrap()
+    };
+    // Shared first, then the same bytes as local content.
+    let shared_first = retain_shared(&spool, r#"{"same":"shared first"}"#);
+    let twin = local(r#"{"same":"shared first"}"#);
+    // Local first, then shared.
+    let local_first = local(r#"{"same":"local first"}"#);
+    let shared_second = retain_shared(&spool, r#"{"same":"local first"}"#);
+    for (index, body) in [&shared_first, &shared_second].into_iter().enumerate() {
+        spool
+            .append(&shared_body_batch(
+                &format!("twin:{index}"),
+                "wrk_fixture",
+                body,
+            ))
+            .unwrap();
+        spool
+            .record_body_uploaded("wrk_fixture", &body.digest)
+            .unwrap();
+    }
+    assert_eq!(spool.free_uploaded_bodies(after_grace()).unwrap(), 0);
+    assert!(spool.read_artifact(&twin).is_ok());
+    assert!(spool.read_artifact(&local_first).is_ok());
+}
+
+#[test]
+fn a_body_reused_before_upkeep_frees_it_is_kept() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let body = retain_shared(&spool, r#"{"prompt":"reused"}"#);
+    spool
+        .append(&shared_body_batch("reused:1", "wrk_fixture", &body))
+        .unwrap();
+    spool
+        .record_body_uploaded("wrk_fixture", &body.digest)
+        .unwrap();
+    // Untouched for two hours, then retained again by another event.
+    OpenOptions::new()
+        .write(true)
+        .open(spool.root().join("artifacts").join(&body.digest))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
+        .unwrap();
+    let again = retain_shared(&spool, r#"{"prompt":"reused"}"#);
+    assert_eq!(spool.free_uploaded_bodies(unix_seconds()).unwrap(), 0);
+    spool
+        .append(&shared_body_batch("reused:2", "wrk_fixture", &again))
+        .unwrap();
+    assert!(spool.read_artifact(&again).is_ok());
+
+    // Another process reuses the body while upkeep frees bodies as if every grace had passed: an
+    // event either lands with its body or is refused, never written naming a freed body.
+    let root = spool.root().to_owned();
+    let stop = Arc::new(AtomicBool::new(false));
+    let freer = thread::spawn({
+        let root = root.clone();
+        let stop = stop.clone();
+        move || {
+            let spool = LocalSpool::open(&root).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                spool.free_uploaded_bodies(i64::MAX).unwrap();
+            }
+        }
+    });
+    let mut stored = 0;
+    for index in 0..50 {
+        let body = retain_shared(&spool, r#"{"prompt":"raced"}"#);
+        // Another Work the Hub never answered for, so a stored event keeps the body.
+        match spool.append(&shared_body_batch(
+            &format!("raced:{index}"),
+            "wrk_unshared",
+            &body,
+        )) {
+            Ok(_) => stored += 1,
+            Err(agentscm::change_capture::CaptureError::Conflict(_)) => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    freer.join().unwrap();
+    assert!(stored > 0);
+    let raced = retain_shared(&spool, r#"{"prompt":"raced"}"#);
+    spool.free_uploaded_bodies(i64::MAX).unwrap();
+    assert!(spool.read_artifact(&raced).is_ok());
+}
+
+#[test]
+fn a_store_full_of_uploaded_bodies_becomes_writable_after_upkeep() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    let mut filled = false;
+    for index in 0..100 {
+        let Ok(body) = spool.retain_artifact(
+            format!(r#"{{"prompt":{index}}}"#).as_bytes(),
+            ArtifactMediaV1::Json,
+            RetentionClassV1::SharedApproved,
+        ) else {
+            filled = true;
+            break;
+        };
+        let envelope = shared_body_batch(&format!("full:{index}"), "wrk_fixture", &body);
+        if spool.append(&envelope).is_err() {
+            filled = true;
+            break;
+        }
+        spool.acknowledge(&envelope).unwrap();
+        spool
+            .record_body_uploaded("wrk_fixture", &body.digest)
+            .unwrap();
+        // Accepted envelopes go at once, so only bodies fill the store.
+        spool.compact_acknowledged(100).unwrap();
+    }
+    assert!(filled, "the spool reached its limit");
+    assert!(spool.usage().unwrap().is_full());
+
+    assert!(!spool.upkeep(after_grace()).unwrap(), "upkeep made room");
+    assert!(!spool.usage().unwrap().needs_upkeep());
+    let body = retain_shared(&spool, r#"{"prompt":"after upkeep"}"#);
+    spool
+        .append(&shared_body_batch("after-upkeep", "wrk_fixture", &body))
+        .unwrap();
 }
 
 #[test]
