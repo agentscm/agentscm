@@ -6,10 +6,12 @@ CREATE TABLE hub_work_overlap_consents (
     request TEXT NOT NULL REFERENCES hub_coordination_requests(id) ON DELETE CASCADE,
     target_work TEXT NOT NULL REFERENCES hub_work_items(id) ON DELETE CASCADE,
     operation_id TEXT NOT NULL,
+    accepted_work TEXT REFERENCES hub_work_items(id) ON DELETE CASCADE,
     payload TEXT NOT NULL,
     snapshot TEXT NOT NULL,
     UNIQUE(request, target_work, operation_id)
 );
+CREATE INDEX hub_work_overlap_accepted ON hub_work_overlap_consents(accepted_work);
 CREATE INDEX hub_work_overlap_target ON hub_work_overlap_consents(target_work);
 CREATE TRIGGER hub_work_overlap_epoch AFTER UPDATE ON hub_work_items
 WHEN OLD.scope IS DISTINCT FROM NEW.scope

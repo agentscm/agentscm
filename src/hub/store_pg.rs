@@ -2066,12 +2066,16 @@ fn work_scope_overlaps(
             project_claim(tx, &mut item, now)?;
             let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
+                agreed_paths: Vec::new(),
                 item,
                 your_scope: scope.to_vec(),
                 their_scope,
                 reasons,
             });
         }
+    }
+    if let Some(id) = exclude {
+        work_overlap::annotate_existing(tx, who, id, scope, &mut found, now)?;
     }
     Ok(found)
 }
@@ -4267,6 +4271,17 @@ fn start_in(
     named: bool,
     now: i64,
 ) -> Result<WorkStartResult> {
+    start_overlap_in(tx, who, start, named, &[], now)
+}
+
+fn start_overlap_in(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    named: bool,
+    consents: &[super::work_overlap::WorkOverlapConsent],
+    now: i64,
+) -> Result<WorkStartResult> {
     if who.read_only {
         return Err(HubError::Unauthorized);
     }
@@ -4418,11 +4433,18 @@ fn start_in(
                     preflight: None,
                 });
             }
-            let overlaps = if work_holds_reservation(tx, &item.id)? {
+            let mut overlaps = if work_holds_reservation(tx, &item.id)? {
                 work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?
             } else {
                 Vec::new()
             };
+            super::work_overlap::annotate(&mut overlaps, consents);
+            if start.takeover_generation.is_some() {
+                for overlap in &mut overlaps {
+                    overlap.agreed_paths.clear();
+                }
+            }
+            overlaps.retain(WorkScopeOverlap::unresolved);
             // The lead asking again for its own lapsed Work is a fresh admission. A call that named
             // no session is not the lead's own, so it cannot hold the scope again.
             let mut reclaimed = Vec::new();
@@ -4549,9 +4571,16 @@ fn start_in(
             None
         };
         let mut lapsed = Vec::new();
-        if !held || own_lapse.is_some() {
+        if !held || own_lapse.is_some() || start.takeover_generation.is_some() {
             lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
-            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            let mut overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            super::work_overlap::annotate(&mut overlaps, consents);
+            if start.takeover_generation.is_some() {
+                for overlap in &mut overlaps {
+                    overlap.agreed_paths.clear();
+                }
+            }
+            overlaps.retain(WorkScopeOverlap::unresolved);
             if let Some(first) = overlaps.first() {
                 return Ok(WorkStartResult {
                     reclaimed: Vec::new(),
@@ -4712,7 +4741,14 @@ fn start_in(
         });
     }
     let lapsed = lapsed_overlapping(tx, who, &scope, None, now)?;
-    let overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
+    let mut overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
+    super::work_overlap::annotate(&mut overlaps, consents);
+    if start.takeover_generation.is_some() {
+        for overlap in &mut overlaps {
+            overlap.agreed_paths.clear();
+        }
+    }
+    overlaps.retain(WorkScopeOverlap::unresolved);
     if let Some(first) = overlaps.first() {
         let coordination_request = create_coordination_request(
             tx,
@@ -5498,7 +5534,20 @@ fn announce_in(
     }
     ids.insert(intent.id.clone());
     let ids: Vec<String> = ids.into_iter().collect();
-    let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
+    let mut announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
+    if let Some(session) = session {
+        let work = work_who(tx, &who.token, now)?;
+        for overlap in &mut announced.overlaps {
+            let agreed =
+                work_overlap::agreed_intent_paths(tx, &work, session, &overlap.intent, now)?;
+            overlap.agreed_paths = overlap
+                .your_paths
+                .iter()
+                .filter(|path| agreed.contains(path))
+                .cloned()
+                .collect();
+        }
+    }
     if let Plan::Write { previous, .. } = &plan {
         append_all(
             tx,
@@ -6034,7 +6083,8 @@ fn touch_in(
     };
     let step = plan_touch(row.as_ref(), current.as_ref(), call, now)?;
     let own = current.as_ref().map_or("", |held| held.id.as_str());
-    let guarded = guard(
+    let mut agreement_rechecks = Vec::new();
+    let mut guarded = guard(
         token,
         row.as_ref(),
         current.as_ref(),
@@ -6043,9 +6093,24 @@ fn touch_in(
         now,
         |keys| {
             let ids: Vec<String> = probe(tx, who, own, keys, now)?.into_iter().collect();
-            load_intents(tx, &ids)
+            let mut intents = load_intents(tx, &ids)?;
+            let work = work_who(tx, token, now)?;
+            for intent in &mut intents {
+                let agreed = work_overlap::agreed_intent_paths(tx, &work, &name, intent, now)?;
+                agreement_rechecks.extend(keys.iter().filter(|key| agreed.contains(key)).cloned());
+                intent.paths.retain(|path| !agreed.contains(path));
+            }
+            Ok(intents)
         },
     )?;
+    // Agreed edits must revalidate consent on their next call, even while this intent holds the file.
+    if !agreement_rechecks.is_empty() && !guarded.refused() {
+        let mut unchecked: Vec<String> = json_value(&guarded.unchecked_json)?;
+        unchecked.extend(agreement_rechecks);
+        unchecked.sort();
+        unchecked.dedup();
+        guarded.unchecked_json = json_string(&unchecked)?;
+    }
     let step = &guarded.step;
     let cursor = row.as_ref().map_or(0, |row| row.cursor);
     // A refused call reports nothing else, so the notices wait for the next one.
@@ -7299,8 +7364,24 @@ fn work_checkpoint_in(
     checkpoint: &WorkCheckpoint,
     now: i64,
 ) -> Result<WorkCheckpointResult> {
+    checkpoint_overlap_in(tx, token, checkpoint, &[], now)
+}
+
+fn checkpoint_overlap_in(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    checkpoint: &WorkCheckpoint,
+    consents: &[super::work_overlap::WorkOverlapConsent],
+    now: i64,
+) -> Result<WorkCheckpointResult> {
     checkpoint.validate()?;
-    let request = json_string(checkpoint)?;
+    let request = if consents.is_empty() {
+        json_string(checkpoint)?
+    } else {
+        let mut ids: Vec<_> = consents.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        json_string(&json!({"checkpoint":checkpoint,"consent_ids":ids}))?
+    };
     let who = work_who(tx, token, now)?;
     if who.read_only {
         return Err(HubError::Unauthorized);
@@ -7431,12 +7512,14 @@ fn work_checkpoint_in(
     let mut lapsed = Vec::new();
     if let Some(scope) = checkpoint.normalized_scope()? {
         // Work without a reservation claims nothing, so its scope change has nothing to check.
-        let overlaps = if held {
+        let mut overlaps = if held {
             lapsed = lapsed_overlapping(tx, &who, &scope, Some(&item.id), now)?;
             work_scope_overlaps(tx, &who, &scope, Some(&item.id), now)?
         } else {
             Vec::new()
         };
+        super::work_overlap::annotate(&mut overlaps, consents);
+        overlaps.retain(WorkScopeOverlap::unresolved);
         if !overlaps.is_empty() {
             let request = create_coordination_request(
                 tx,
@@ -14026,7 +14109,16 @@ impl Store for PgStore {
                      FROM hub_coordination_requests r
                      WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
                        AND r.repository_id IS NOT DISTINCT FROM $4
-                       AND r.status IN ('resolved','withdrawn') AND r.updated_at < $5
+                       AND NOT EXISTS (SELECT 1 FROM hub_work_overlap_consents c
+                       JOIN hub_work_items t ON t.id=c.target_work
+                       JOIN hub_work_items a ON a.id=c.accepted_work
+                       WHERE c.request=r.id AND r.status='resolved'
+                         AND t.reservation_basis IS NOT NULL AND a.reservation_basis IS NOT NULL
+                         AND t.reservation_expires_at>$6 AND a.reservation_expires_at>$6
+                         AND t.overlap_epoch=(c.snapshot::jsonb->'target'->>'epoch')::bigint AND a.overlap_epoch=(c.snapshot::jsonb->'accepted'->>'epoch')::bigint
+                         AND NOT EXISTS (SELECT 1 FROM hub_coordination_responses q WHERE q.request=r.id
+                             AND q.target_work=c.target_work AND q.kind='decline' AND q.event_seq>(c.snapshot::jsonb->>'event_seq')::bigint))
+                   AND r.status IN ('resolved','withdrawn') AND r.updated_at < $5
                        AND EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                            'coordination_requested','coordination_bound','coordination_retargeted',
                            'coordination_acknowledged','coordination_responded',
@@ -14041,7 +14133,7 @@ impl Store for PgStore {
                         &scope.host,
                         &scope.repository,
                         &scope.repository_id,
-                        &before,
+                        &before, &now,
                     ],
                 )?
                 .into_iter()
@@ -14743,6 +14835,36 @@ impl Store for PgStore {
         })
     }
 
+    fn work_overlap_start(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult> {
+        self.overlap_start(token, request, false, now)
+    }
+    fn work_overlap_preflight(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<super::work_preflight::WorkPreflightResult> {
+        match self.overlap_start(token, request, true, now) {
+            Err(HubError::WorkPreflight(result)) => Ok(*result),
+            Err(e) => Err(e),
+            Ok(_) => Err(HubError::Invalid(
+                "unexpected overlap preflight mutation".into(),
+            )),
+        }
+    }
+    fn work_overlap_checkpoint(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.overlap_checkpoint(token, request, now)
+    }
     fn work_overlap_consent(
         &self,
         token: &str,
@@ -14961,6 +15083,9 @@ impl Store for PgStore {
             )?;
             let mut needs_coordination = Vec::new();
             for overlap in unresolved.drain(..) {
+                if !overlap.unresolved() {
+                    continue;
+                }
                 let participating = tx
                     .query_opt(
                         "SELECT 1 FROM hub_work_participants

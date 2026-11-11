@@ -183,7 +183,10 @@ pub(super) fn coordinates_active_scope_overlap(
     start.preflight.is_some()
         && result.status != WorkPreflightStatus::ClearWithinCheckedWindow
         && result.subject_match.is_none()
-        && !result.scope_overlaps.is_empty()
+        && result
+            .scope_overlaps
+            .iter()
+            .any(WorkScopeOverlap::unresolved)
 }
 
 /// A non-clear preflight may enter `start_in` only to use its existing coordination protocol.

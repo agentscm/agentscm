@@ -395,10 +395,19 @@ pub struct WorkPathOverlap {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeOverlap {
+    /// Exact files covered by a current mutually accepted agreement. Other intersections remain contested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agreed_paths: Vec<String>,
     pub item: WorkItem,
     pub your_scope: Vec<String>,
     pub their_scope: Vec<String>,
     pub reasons: Vec<WorkPathOverlap>,
+}
+
+impl WorkScopeOverlap {
+    pub fn unresolved(&self) -> bool {
+        super::work_overlap::unresolved(&self.your_scope, &self.their_scope, &self.agreed_paths)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

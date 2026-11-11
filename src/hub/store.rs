@@ -1312,6 +1312,24 @@ pub trait Store: Send + Sync {
         ack: &CoordinationAck,
         now: i64,
     ) -> Result<CoordinationRequest>;
+    fn work_overlap_start(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult>;
+    fn work_overlap_preflight(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<super::work_preflight::WorkPreflightResult>;
+    fn work_overlap_checkpoint(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult>;
     /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
     fn work_overlap_consent(
         &self,

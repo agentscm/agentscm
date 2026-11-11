@@ -181,3 +181,336 @@ impl PgStore {
         })
     }
 }
+
+pub(super) fn agreements(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    id: &str,
+    now: i64,
+) -> Result<Vec<WorkOverlapConsent>> {
+    let snapshots = tx.query("SELECT snapshot FROM hub_work_overlap_consents WHERE target_work=$1 OR accepted_work=$1 ORDER BY id LIMIT 101", &[&id])?.iter().map(|row| row.get::<_,String>(0)).collect::<Vec<_>>();
+    if snapshots.len() > contract::MAX_OVERLAP_CONSENTS {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
+    let mut out = Vec::new();
+    for snapshot in snapshots {
+        let v = view(tx, who, json_value(&snapshot)?, now)?;
+        if v.state == WorkOverlapConsentState::Agreed {
+            out.push(v.consent);
+        }
+    }
+    Ok(out)
+}
+pub(super) fn annotate_existing(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    id: &str,
+    scope: &[String],
+    overlaps: &mut [WorkScopeOverlap],
+    now: i64,
+) -> Result<()> {
+    let Some(item) = scoped_work(tx, who, id, now, false)? else {
+        return Ok(());
+    };
+    // A scope mutation ends all prior agreements, including unchanged intersections.
+    if item.scope != scope {
+        return Ok(());
+    }
+    for c in agreements(tx, who, id, now)? {
+        let other = if c.target.work_id == id {
+            c.accepted.as_ref().map(|f| f.work_id.as_str())
+        } else {
+            Some(c.target.work_id.as_str())
+        };
+        for overlap in overlaps.iter_mut() {
+            if other == Some(overlap.item.id.as_str()) {
+                overlap.agreed_paths.extend(c.paths.clone());
+                overlap.agreed_paths.sort();
+                overlap.agreed_paths.dedup();
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn accepting(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    ids: &[String],
+    session: &str,
+    proposal: &CoordinationProposal,
+    now: i64,
+) -> Result<Vec<WorkOverlapConsent>> {
+    contract::consent_ids(ids)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let snapshot: String = tx
+            .query_opt(
+                "SELECT snapshot FROM hub_work_overlap_consents WHERE id=$1",
+                &[&id],
+            )?
+            .ok_or_else(|| contract::invalid("unknown overlap consent"))?
+            .get(0);
+        let v = view(tx, who, json_value(&snapshot)?, now)?;
+        let c = v.consent;
+        if c.requester.token != who.token
+            || c.requester.session != session
+            || c.proposal != *proposal
+        {
+            return Err(HubError::Unauthorized);
+        }
+        if v.state == WorkOverlapConsentState::Invalidated {
+            return Err(contract::invalid(
+                "overlap consent is invalidated; obtain new consent",
+            ));
+        }
+        if let Some(f) = &c.accepted
+            && (f.lead.token != who.token || f.lead.session != session || f.scope != proposal.scope)
+        {
+            return Err(HubError::Unauthorized);
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+pub(super) fn bind(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    consents: &[WorkOverlapConsent],
+    item: &WorkItem,
+    now: i64,
+) -> Result<()> {
+    let (epoch, live) = reservation(tx, &item.id, now)?;
+    if !live {
+        return Err(contract::invalid("requester reservation is not live"));
+    }
+    for old in consents {
+        if let Some(f) = &old.accepted {
+            if !contract::matches(f, item, epoch, live) {
+                return Err(contract::invalid("accepted overlap cannot be rebound"));
+            }
+            continue;
+        }
+        let mut c = old.clone();
+        c.accepted = Some(contract::fence(item, epoch));
+        let snapshot = json_string(&c)?;
+        tx.execute(
+            "UPDATE hub_work_overlap_consents SET snapshot=$2,accepted_work=$3 WHERE id=$1",
+            &[&c.id, &snapshot, &item.id],
+        )?;
+        let request = coordination_request_at(tx, who, &c.request_id, i64::MAX, now)?
+            .ok_or_else(|| contract::invalid("coordination request expired"))?;
+        let event = coordination_event(
+            "coordination_responded",
+            &c.request_id,
+            now,
+            json!({"kind":"overlap_accepted","consent_id":c.id,"work_id":item.id}),
+        )?;
+        let seq = append(tx, &event)?;
+        save_coordination_version(
+            tx,
+            &c.request_id,
+            request.status,
+            request.proposal.work_id.as_deref(),
+            now,
+            seq,
+        )?;
+        adjust_work_payload_capacity(tx, who, coordination_payload_bytes(&[""], &event)?, now)?;
+        let delta = work_payload_row_bytes(snapshot.len())?
+            - work_payload_row_bytes(json_string(old)?.len())?;
+        adjust_work_payload_capacity(tx, who, delta, now)?;
+    }
+    Ok(())
+}
+
+fn mark_preflight(
+    result: &mut crate::hub::work_preflight::WorkPreflightResult,
+    consents: &[WorkOverlapConsent],
+) {
+    contract::annotate(&mut result.scope_overlaps, consents);
+    if !result
+        .scope_overlaps
+        .iter()
+        .any(WorkScopeOverlap::unresolved)
+    {
+        result
+            .reasons
+            .retain(|r| *r != crate::hub::work_preflight::WorkPreflightReason::ActiveScopeOverlap);
+        result.status = crate::hub::work_preflight::status(&result.reasons);
+    }
+}
+
+impl PgStore {
+    pub(super) fn overlap_start(
+        &self,
+        token: &str,
+        input: &crate::hub::work_overlap::WorkOverlapStart,
+        preflight_only: bool,
+        now: i64,
+    ) -> Result<WorkStartResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_capacity(&mut tx, &who)?;
+            lock_repository(&mut tx, &who.repository)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            let scope = input.start.validate(&who)?;
+            if input.start.role != WorkRole::Lead || input.start.takeover_generation.is_some() {
+                return Err(contract::invalid(
+                    "overlap acceptance requires the requesting lead without takeover",
+                ));
+            }
+            let existing = resolve_work(&mut tx, &who, &input.start, now)?;
+            let proposal = if let Some(item) = &existing {
+                if item.lead_token != who.token || item.lead_session != input.start.session {
+                    return Err(HubError::Unauthorized);
+                }
+                CoordinationProposal {
+                    work_id: Some(item.id.clone()),
+                    source: None,
+                    request_key: None,
+                    title: input.start.title.clone(),
+                    scope: scope.clone(),
+                }
+            } else {
+                CoordinationProposal {
+                    work_id: None,
+                    source: input.start.source.clone(),
+                    request_key: input.start.request_key.clone(),
+                    title: input.start.title.clone(),
+                    scope: scope.clone(),
+                }
+            };
+            // A retry of first admission retains the initial proposal identity in its grants.
+            let proposal = if let Some(item) = &existing {
+                let mut original = proposal.clone();
+                original.work_id = None;
+                original.source = input.start.source.clone();
+                original.request_key = input.start.request_key.clone();
+                if input.start.work_id.is_none() {
+                    original
+                } else {
+                    let _ = item;
+                    proposal
+                }
+            } else {
+                proposal
+            };
+            let consents = accepting(
+                &mut tx,
+                &who,
+                &input.consent_ids,
+                &input.start.session,
+                &proposal,
+                now,
+            )?;
+            if existing.is_some() && consents.iter().any(|c|c.accepted.is_none()) {
+                return Err(contract::invalid("existing Work cannot bind a new initial-admission consent; use scope checkpoint acceptance"));
+            }
+            let mut preflight = preflight::evaluate(&mut tx, &who, &input.start, &scope, now)?;
+            mark_preflight(&mut preflight, &consents);
+            require_clear_preflight(&who, &input.start, &preflight)?;
+            if preflight
+                .scope_overlaps
+                .iter()
+                .any(WorkScopeOverlap::unresolved)
+            {
+                return Err(HubError::WorkPreflight(Box::new(preflight)));
+            }
+            if preflight_only {
+                // The dedicated preflight caller reads this projection; it creates no Work.
+                return Err(HubError::WorkPreflight(Box::new(preflight)));
+            }
+            let mut result = start_overlap_in(&mut tx, &who, &input.start, true, &consents, now)?;
+            if result.conflict.is_some() || result.coordination_request.is_some() {
+                return Err(contract::invalid(
+                    "overlap admission did not acquire the requested Work",
+                ));
+            }
+            bind(&mut tx, &who, &consents, &result.item, now)?;
+            pickup_in(&mut tx, &who, &input.start, &result, now)?;
+            result.preflight = Some(preflight);
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+    pub(super) fn overlap_checkpoint(
+        &self,
+        token: &str,
+        input: &crate::hub::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_capacity(&mut tx, &who)?;
+            lock_repository(&mut tx, &who.repository)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            let checkpoint = &input.checkpoint;
+            let item = scoped_work(&mut tx, &who, &checkpoint.work_id, now, true)?
+                .ok_or(HubError::Unauthorized)?;
+            if item.lead_token != who.token
+                || item.lead_session != checkpoint.session
+                || item.generation != checkpoint.generation
+            {
+                return Err(HubError::Unauthorized);
+            }
+            let scope = checkpoint
+                .normalized_scope()?
+                .ok_or_else(|| contract::invalid("overlap acceptance requires explicit scope"))?;
+            let proposal = CoordinationProposal {
+                work_id: Some(item.id.clone()),
+                source: None,
+                request_key: None,
+                title: item.title.clone(),
+                scope,
+            };
+            let consents = accepting(
+                &mut tx,
+                &who,
+                &input.consent_ids,
+                &checkpoint.session,
+                &proposal,
+                now,
+            )?;
+            let result = checkpoint_overlap_in(&mut tx, token, checkpoint, &consents, now)?;
+            bind(&mut tx, &who, &consents, &result.item, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+}
+
+/// Only the two current lead sessions may use their accepted named-file agreement.
+pub(super) fn agreed_intent_paths(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    intent: &Intent,
+    now: i64,
+) -> Result<Vec<String>> {
+    let Some(own) = unfinished_for_session(tx, who, session, now)? else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    for consent in agreements(tx, who, &own.id, now)? {
+        let other = if consent.target.work_id == own.id {
+            consent.accepted.as_ref()
+        } else {
+            Some(&consent.target)
+        };
+        if let Some(other) = other
+            && other.lead.token == intent.token
+            && intent.session.as_deref() == Some(other.lead.session.as_str())
+        {
+            paths.extend(consent.paths);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}

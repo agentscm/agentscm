@@ -182,3 +182,82 @@ pub(super) fn validate_target(
 pub(super) fn invalid(message: &str) -> HubError {
     HubError::Invalid(message.into())
 }
+
+/// Explicit requester consent to the named grants, evaluated with ordinary admission rules.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOverlapStart {
+    pub start: super::work::WorkStart,
+    pub consent_ids: Vec<String>,
+}
+
+/// Scope expansion uses the existing checkpoint fence and receipt.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOverlapCheckpoint {
+    pub checkpoint: super::work::WorkCheckpoint,
+    pub consent_ids: Vec<String>,
+}
+
+pub(super) fn consent_ids(ids: &[String]) -> Result<()> {
+    if ids.is_empty() || ids.len() > MAX_OVERLAP_CONSENTS {
+        return Err(invalid("acceptance requires 1 to 100 consent IDs"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        validate_id("overlap consent", id, "woc")?;
+        if !seen.insert(id) {
+            return Err(invalid("duplicate overlap consent ID"));
+        }
+    }
+    Ok(())
+}
+
+/// Inspect all scope intersections; the bounded display witnesses are not permission evidence.
+pub(super) fn unresolved(ours: &[String], theirs: &[String], agreed: &[String]) -> bool {
+    ours.iter().any(|a| {
+        theirs.iter().any(|b| {
+            overlaps(a, b)
+                && match (a.ends_with('/'), b.ends_with('/')) {
+                    (true, true) => true,
+                    (false, _) => !agreed.contains(a),
+                    (_, false) => !agreed.contains(b),
+                }
+        })
+    })
+}
+
+pub(super) fn annotate(
+    overlaps: &mut [super::work::WorkScopeOverlap],
+    consents: &[WorkOverlapConsent],
+) {
+    for overlap in overlaps {
+        for consent in consents {
+            if consent.target.work_id == overlap.item.id {
+                overlap.agreed_paths.extend(consent.paths.clone());
+            }
+        }
+        overlap.agreed_paths.sort();
+        overlap.agreed_paths.dedup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unresolved;
+    #[test]
+    fn named_file_consent_never_covers_a_directory_or_an_omitted_intersection() {
+        assert!(!unresolved(
+            &["src/".into()],
+            &["src/a.rs".into()],
+            &["src/a.rs".into()]
+        ));
+        assert!(unresolved(
+            &["src/".into()],
+            &["src/".into()],
+            &["src/a.rs".into()]
+        ));
+        let files: Vec<String> = (0..6).map(|i| format!("src/{i}.rs")).collect();
+        assert!(unresolved(&files, &["src/".into()], &files[..5]));
+    }
+}

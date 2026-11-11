@@ -90,13 +90,22 @@ pub(super) fn evaluate(
         .optional()?
         .unwrap_or((0, 0));
     let subject_match = resolve_work(tx, who, start, now)?;
-    let scope_overlaps = work_scope_overlaps(
+    let mut scope_overlaps = work_scope_overlaps(
         tx,
         who,
         scope,
         subject_match.as_ref().map(|item| item.id.as_str()),
         now,
     )?;
+    if start.takeover_generation.is_some()
+        || subject_match
+            .as_ref()
+            .is_some_and(|item| item.lead_token != who.token || item.lead_session != start.session)
+    {
+        for overlap in &mut scope_overlaps {
+            overlap.agreed_paths.clear();
+        }
+    }
     let Some(request) = &start.preflight else {
         let mut reasons = vec![
             WorkPreflightReason::MissingSource,
@@ -105,7 +114,10 @@ pub(super) fn evaluate(
         if scope.is_empty() {
             reasons.insert(0, WorkPreflightReason::MissingScope);
         }
-        if !scope_overlaps.is_empty() {
+        if scope_overlaps
+            .iter()
+            .any(crate::hub::work::WorkScopeOverlap::unresolved)
+        {
             reasons.push(WorkPreflightReason::ActiveScopeOverlap);
         }
         return Ok(WorkPreflightResult {
@@ -183,7 +195,10 @@ pub(super) fn evaluate(
     if request.merge_through != current_merge_through {
         push_reason(&mut reasons, WorkPreflightReason::MergeHighwaterChanged);
     }
-    if !scope_overlaps.is_empty() {
+    if scope_overlaps
+        .iter()
+        .any(crate::hub::work::WorkScopeOverlap::unresolved)
+    {
         push_reason(&mut reasons, WorkPreflightReason::ActiveScopeOverlap);
     }
 
