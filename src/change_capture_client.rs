@@ -2388,8 +2388,13 @@ async fn upload_shared_bodies(
             .await
             .map_err(|_| invalid("capture Hub body upload unavailable"))?;
         match status {
+            // The Hub holds this body for this Work: the proof upkeep needs to free the local
+            // copy. Best effort: without the record the body only stays on this computer.
+            204 => {
+                let _ = spool.record_body_uploaded(&batch.work_id, &artifact.digest);
+            }
             // Gone: its author deleted the body or it expired, so there is nothing to retry.
-            204 | 410 => {}
+            410 => {}
             400 | 401 | 403 | 404 | 409 => return Ok(BodyUpload::Blocked),
             _ => {
                 return Err(invalid(format!(
