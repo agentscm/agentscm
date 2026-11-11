@@ -147,6 +147,7 @@ error_codes! {
     PromiseConflict => ("promise_conflict", 409, false, InspectWork, "The promise changed; read its current version before sending a new request."),
     TooManyPublications => ("too_many_publications", 429, false, ContactOperator, "The publication limit was reached; ask the Hub operator to inspect retained publications."),
     AlreadyConnected => ("already_connected", 409, false, None, "This repository is already connected; use the existing connection."),
+    WaiterPresent => ("waiter_present", 409, true, Wait, "Another waiter already waits for this session; ask again later."),
     NotConfigured => ("not_configured", 404, false, ContactOperator, "The requested integration is not configured; ask the Hub operator to configure it."),
     WorkNotFound => ("work_not_found", 404, false, InspectWork, "Work was not found; refresh the current Work list."),
     GenerationConflict => ("generation_conflict", 409, false, InspectWork, "The generation changed; read current state before sending a new request."),
