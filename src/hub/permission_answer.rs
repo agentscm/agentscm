@@ -3,11 +3,11 @@
 //!
 //! The session's hook registers the prompt it is showing (the tool, what to show of it, what the
 //! person can pick and a salted hash of the tool input, all computed on the machine) and
-//! long-polls for an answer. The person's own page lists the requests and answers one: allow,
-//! allow with one of the session's own choices, deny, or the answers to a question. A choice and
-//! an option travel as positions, and the hook makes its decision from its own copies. The only
-//! text of the Hub's that reaches the model is what the person typed: a reason with a deny, or
-//! an answer to a question.
+//! long-polls for an answer. The person's own page, or a connected app they approved, lists the
+//! requests and answers one: allow, allow with one of the session's own choices, deny, or the
+//! answers to a question. A choice and an option travel as positions, and the hook makes its
+//! decision from its own copies. The only text of the Hub's that reaches the model is what the
+//! person typed: a reason with a deny, or an answer to a question.
 //!
 //! In memory only: bounded, and never written to either store, a log, a notification or a status
 //! read. A Hub restart loses every request. A hook then reads an unknown request and offers its
@@ -42,7 +42,7 @@ use tokio::time::Instant;
 use super::advice::invisible;
 use super::coordination_http::not_your_agent;
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
-use super::login::HumanSession;
+use super::login::apps::Person;
 use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
 use super::store::{AgentToken, Principal, unix_now, validate_repository};
 use super::{HubError, HubState};
@@ -308,6 +308,8 @@ struct Pending {
     holder: String,
     owner: String,
     repository_id: Option<i64>,
+    /// The repository's `owner/name`, as the registering token names it.
+    repository: String,
     item_key: String,
     tool: String,
     summary: Option<String>,
@@ -590,6 +592,8 @@ impl Phase {
 pub(super) struct Listed {
     item_id: String,
     request_id: String,
+    /// The `owner/name` of the repository the request's agent token is for.
+    repository: String,
     tool: String,
     summary: Option<String>,
     folder: Option<String>,
@@ -879,6 +883,7 @@ impl Requests {
                 asker: agent_id,
                 owner: principal.owner.id.clone(),
                 repository_id: principal.repository_id,
+                repository: principal.repository.clone(),
                 tool,
                 summary,
                 folder,
@@ -1026,10 +1031,10 @@ impl Requests {
         Ok(row.token.clone())
     }
 
-    /// The pending and answered requests of `owner` in one repository, oldest first. This is the
-    /// list a person answers from, so a request is on it as soon as the host confirms its prompt
-    /// is on screen; the wait's first minute holds back only the notice in their status.
-    /// Unconfirmed requests are never listed.
+    /// The pending and answered requests of `owner` in one repository, or in every repository
+    /// for `None`, oldest first. This is the list a person answers from, so a request is on it
+    /// as soon as the host confirms its prompt is on screen; the wait's first minute holds back
+    /// only the notice in their status. Unconfirmed requests are never listed.
     pub(super) fn list(
         &self,
         waiting: &Waiting,
@@ -1041,7 +1046,8 @@ impl Requests {
         inner.settle(waiting, now);
         let mut out = Vec::new();
         for (id, row) in &inner.rows {
-            if row.owner != owner || row.repository_id != repository_id {
+            if row.owner != owner || (repository_id.is_some() && row.repository_id != repository_id)
+            {
                 continue;
             }
             let (state, decision) = match row.state {
@@ -1055,6 +1061,7 @@ impl Requests {
             out.push(Listed {
                 item_id: format!("waiting:{}:{}", row.kind.code(), row.item_key),
                 request_id: id.clone(),
+                repository: row.repository.clone(),
                 tool: row.tool.clone(),
                 summary: row.summary.clone(),
                 folder: row.folder.clone(),
@@ -1325,7 +1332,8 @@ async fn poll(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryQuery {
-    repository: String,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1333,26 +1341,33 @@ struct Page {
     requests: Vec<Listed>,
 }
 
+/// The person's own page, or a connected app they approved ([`Person`]), lists their requests:
+/// in one repository, or in all of them without `repository`. The Hub-wide [`MAX_LIVE`] bounds
+/// the list.
 async fn list(
     State(state): State<HubState>,
-    human: HumanSession,
+    person: Person,
     query: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Page>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let user = human.web_user()?.clone();
-    validate_repository(&query.repository)?;
+    let user = person.user;
     // A page polls this, and it shows only the caller's own requests, so it needs the
     // repository's id alone. The answer makes the forge's role check.
-    let (store, host) = (state.store.clone(), user.identity.host.clone());
-    let repo = blocking(&state, move || {
-        store.repository_named(&host, &query.repository)
-    })
-    .await?
-    .ok_or_else(ApiError::not_found)?;
+    let repository_id = match query.repository {
+        None => None,
+        Some(repository) => {
+            validate_repository(&repository)?;
+            let (store, host) = (state.store.clone(), user.identity.host.clone());
+            let repo = blocking(&state, move || store.repository_named(&host, &repository))
+                .await?
+                .ok_or_else(ApiError::not_found)?;
+            Some(repo.repository_id)
+        }
+    };
     let requests = state.onboarding.permissions().list(
         state.onboarding.waiting(),
         &user.id,
-        Some(repo.repository_id),
+        repository_id,
         unix_now(),
     )?;
     Ok(Json(Page { requests }))
@@ -1392,15 +1407,16 @@ fn takes_answer(agent: &AgentToken, token: &str, repository_id: Option<i64>, now
         && (agent.id == token || agent.repository_id == repository_id)
 }
 
-/// A signed-in person allows or denies one prompt of their own agent. The web sign-in and its
-/// CSRF token are checked by [`HumanSession`]; the person must still hold an active agent token
-/// that can take the answer: the request's own, or another for the same repository.
+/// A person allows or denies one prompt of their own agent, from their own page or through a
+/// connected app they approved. [`Person`] checks the web sign-in and its CSRF token, or the
+/// app's credential; the person must still hold an active agent token that can take the answer:
+/// the request's own, or another for the same repository.
 async fn answer(
     State(state): State<HubState>,
-    human: HumanSession,
+    person: Person,
     JsonBody(body): JsonBody<AnswerBody>,
 ) -> std::result::Result<Json<Answered>, ApiError> {
-    let user = human.web_user()?.clone();
+    let user = person.user;
     validate_repository(&body.repository)?;
     let decision = Decision::parse(&body.decision)
         .ok_or_else(|| ApiError::invalid().with_message("decision must be allow or deny"))?;
@@ -2121,6 +2137,54 @@ mod tests {
                 .iter()
                 .all(|listed| listed.request_id != id)
         );
+    }
+
+    #[test]
+    fn without_a_repository_the_list_shows_the_owners_requests_in_every_repository() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let widgets = principal("tok_a", "usr_me", "acme/widgets");
+        let mut site = principal("tok_b", "usr_me", "acme/site");
+        site.repository_id = Some(8);
+        let first = pending(&requests, &waiting, &widgets);
+        // Another person's request, in the same repository.
+        pending(
+            &requests,
+            &waiting,
+            &principal("tok_c", "usr_them", "acme/widgets"),
+        );
+        wait(&waiting, &site, "s", WaitReason::Permission, None, 1_005);
+        requests.confirm("tok_b", "s", 1_006);
+        let second = requests
+            .register(&waiting, &site, registration("s", None, HASH), 1_007)
+            .unwrap()
+            .0;
+        // One of the owner's that no prompt on screen confirmed.
+        wait(&waiting, &widgets, "u", WaitReason::Permission, None, 1_008);
+        requests
+            .register(
+                &waiting,
+                &widgets,
+                registration("u", None, OTHER_HASH),
+                1_008,
+            )
+            .unwrap();
+        let named = |repository| {
+            requests
+                .list(&waiting, "usr_me", repository, 1_010)
+                .unwrap()
+                .iter()
+                .map(|listed| (listed.request_id.clone(), listed.repository.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(None),
+            [
+                (first.clone(), "acme/widgets".to_owned()),
+                (second.clone(), "acme/site".to_owned())
+            ]
+        );
+        assert_eq!(named(Some(8)), [(second, "acme/site".to_owned())]);
+        assert_eq!(named(Some(7)), [(first, "acme/widgets".to_owned())]);
     }
 
     #[test]

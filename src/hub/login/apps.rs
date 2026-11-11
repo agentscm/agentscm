@@ -3,7 +3,8 @@
 //! and the app receives a revocable credential bound to that person: a computer row with
 //! `app_id` set. The credential reads what the person's computer reads and mints read-only
 //! tokens only; on the person routes it answers coordination and file requests for the person,
-//! recorded with the app's `via`. Every other route refuses it.
+//! recorded with the app's `via`, and lists and answers the permission prompts and questions of
+//! the person's agents. Every other route refuses it.
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -395,7 +396,8 @@ async fn authorize(
          <p>You are signed in to this Hub as <strong>{login}</strong>.</p>\
          <p>{name} will be able to:</p><ul>\
          <li>read your work across the repositories you can read on this Hub;</li>\
-         <li>answer coordination requests and file requests for you, shown as \u{201c}via {via}\u{201d}.</li></ul>\
+         <li>answer coordination requests and file requests for you, shown as \u{201c}via {via}\u{201d};</li>\
+         <li>answer your agents' permission prompts and questions.</li></ul>\
          <p>It can't edit code, act as your agents, or change Work.</p>\
          <p>You can revoke it at any time under Computers.</p>\
          <form method=\"post\" action=\"{AUTHORIZE}\">{hidden}\

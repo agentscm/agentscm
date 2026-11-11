@@ -117,6 +117,8 @@ mod hosted_laptop_workflow;
 #[cfg(unix)]
 mod http;
 #[cfg(unix)]
+mod hub_app_prompts;
+#[cfg(unix)]
 mod hub_capacity;
 #[cfg(unix)]
 mod hub_catchup;

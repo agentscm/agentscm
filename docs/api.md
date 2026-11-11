@@ -88,7 +88,8 @@ preflight or a conflict refused does not count.
 ### Permission prompts
 
 A person allows once or denies a Claude Code permission prompt of their own agent's session. The
-session's hook registers the prompt and waits; the person answers with the web sign-in. See
+session's hook registers the prompt and waits; the person answers with the web sign-in, or through
+a connected app they approved, with its credential. See
 [Answer a permission prompt from the Hub](agents.md#answer-a-permission-prompt-from-the-hub) for
 the bodies, replies and rules. Requests live in the memory of one Hub process.
 
@@ -96,8 +97,8 @@ the bodies, replies and rules. Requests live in the memory of one Hub process.
 |---|---|---|
 | `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
 | `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
-| `GET /v1/hub/session/permissions?repository=…` | Web sign-in | `{"requests": [...]}`: the person's own requests there that a prompt on screen confirmed, each with what of it is not shown |
-| `POST /v1/hub/session/permissions/answer` | Web sign-in, `x-csrf-token` | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
+| `GET /v1/hub/session/permissions?repository=…` | Web sign-in, or a connected app's credential | `{"requests": [...]}`: the person's own requests there (in every repository without `repository`) that a prompt on screen confirmed, each with its `repository` and what of it is not shown |
+| `POST /v1/hub/session/permissions/answer` | Web sign-in with `x-csrf-token`, or a connected app's credential | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
 
 ## Hub: connected apps
 
@@ -114,7 +115,9 @@ here is 404 when no app is registered.
 The credential (`Authorization: Bearer <credential>`) works on `GET` and `DELETE /v1/hub/device`,
 `GET /v1/hub/device/repositories`, `POST /v1/hub/device/tokens` with `"read_only": true` (403
 `app_read_only` otherwise), and `POST /v1/hub/session/coordination/reply` and
-`POST /v1/hub/session/handoff/answer`, where it acts for its person with the app's `via`. Other
+`POST /v1/hub/session/handoff/answer`, where it acts for its person with the app's `via`, and
+`GET /v1/hub/session/permissions` and `POST /v1/hub/session/permissions/answer`, where it lists
+and answers its person's permission prompts and questions. Other
 computer routes are 403 `app_not_allowed`; every other route is 401. It is listed in
 `GET /v1/hub/devices` with `"app": {"id", "name"}`.
 
