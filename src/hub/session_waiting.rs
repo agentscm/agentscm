@@ -1304,7 +1304,7 @@ mod tests {
             "wrk_89d7104ec0f8a465b9349113025f86ff — blocker checkpoint recorded (generation 1, \
              state blocked, event_seq 64493).",
             "Done. Next I will run the tests.",
-            "src/hub/session_waiting.rs",
+            "src/hub/hook.rs",
             "64493",
         ] {
             assert!(turn_asked_nothing(done), "{done}");
