@@ -68,7 +68,10 @@ function on(){return !document.hidden&&AUTO.seen}
 function plan(){clearTimeout(AUTO.t);AUTO.t=on()?setTimeout(tick,Math.max(0,AUTO.at+Math.min(AUTO.max,AUTO.base*Math.pow(2,AUTO.fails))-Date.now())):null}
 function tick(){AUTO.t=null;if(on())call(AUTO.args,true)}
 function say(t){var l=document.getElementById('live');if(l)l.textContent=t}
-function got(d,args){last=d;lastAt=new Date();errorText=null;AUTO.args=args;paint();var g=gist();if(g&&AUTO.gist&&g!==AUTO.gist)say('Updated: '+g);AUTO.gist=g}
+function got(d,args){
+var previous=last,previousAt=lastAt;last=d;lastAt=new Date();errorText=null;
+try{paint()}catch(e){last=previous;lastAt=previousAt;throw new Error('The host returned an incomplete work overview. Try Refresh.')}
+AUTO.args=args;var g=gist();if(g&&AUTO.gist&&g!==AUTO.gist)say('Updated: '+g);AUTO.gist=g}
 function take(r){try{var d=parse(r);if(d.detail==='compact'){call({});return}got(d,{});AUTO.at=Date.now();AUTO.fails=0;plan()}catch(e){fail(e);AUTO.at=Date.now();AUTO.fails=Math.min(AUTO.fails+1,6);plan()}}
 function fail(e){errorText=errorMessage(e);paint();say('Could not load work overview. '+errorText)}
 function done(ok){AUTO.busy=false;AUTO.at=Date.now();AUTO.fails=ok===true?0:Math.min(AUTO.fails+1,6);var q=AUTO.q;AUTO.q=null;if(q)call(q);else plan()}

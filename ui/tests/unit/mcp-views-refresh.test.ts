@@ -268,6 +268,23 @@ describe('MCP views auto-refresh', () => {
     expect(host.root.textContent).not.toContain('Could not refresh')
   })
 
+  it('keeps the last rendered data and timestamp when nested refresh data is malformed', async () => {
+    vi.setSystemTime(new Date(2026, 0, 1, 12, 0, 0))
+    const host = mount('work-overview.html', 'agentscm_work_overview')
+    host.push(views[0]!.before)
+    const summary = host.root.querySelector('.big')!.textContent
+    await host.wait(5_000)
+    host.refreshButton().click()
+    await host.answer({ actionable_status: { ...statusFixture, counts: { ...statusFixture.counts, active: 99 }, actions: [null] } })
+    expect(host.root.querySelector('.big')!.textContent).toBe(summary)
+    expect(host.root.textContent).toContain('Showing data from 12:00:00')
+    expect(host.root.textContent).toContain('Task')
+    host.refreshButton().click()
+    await host.answer(views[0]!.after)
+    expect(host.root.textContent).toContain('Stuck')
+    expect(host.root.textContent).not.toContain('Could not refresh')
+  })
+
   it('treats malformed results as errors, never empty work', () => {
     const host = mount('work-overview.html', 'agentscm_work_overview')
     host.result({ content: [{ type: 'text', text: 'not JSON' }] })
