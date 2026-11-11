@@ -1591,7 +1591,8 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
             None => None,
         };
         if let Some(reason) = reason {
-            return call(Kind::Waiting(reason), Shape::Silent);
+            // What the notice says its prompt or question is about, as the client excerpted it.
+            return call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks"));
         }
         if v.get("notification_type").is_some() || v.get("stopReason").is_some() {
             return call(Kind::Ignore, Shape::Silent);
@@ -1637,8 +1638,13 @@ fn cursor(v: &Value, scope: &Scope) -> Call {
             call(Kind::Check, Shape::Snake).paths(edit_paths(tool, input), scope)
         }
         "postToolUse" => call(Kind::Activity(CallPhase::Tick), Shape::Silent),
-        // Cursor reports no permission prompt or question, only the end of a turn.
-        "stop" => call(Kind::Waiting(WaitReason::Idle), Shape::Silent),
+        // Cursor reports no permission prompt or question, only the end of a turn. Its client
+        // says how the turn's last reply ended where Cursor named that reply; a turn that asked
+        // its person nothing is read, not answered, as in `pascal`.
+        "stop" => match WaitReason::turn_end(v["asked_nothing"].as_bool(), str_at(v, "asks")) {
+            WaitReason::Finished => call(Kind::Waiting(WaitReason::Finished), Shape::Silent),
+            reason => call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks")),
+        },
         "sessionEnd" => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
@@ -1658,8 +1664,8 @@ fn notified(kind: Option<&str>) -> Option<WaitReason> {
 }
 
 /// `{agent?, session?, event: start|check|activity|waiting|done, phase?: start|end,
-/// reason?: permission|question|idle, paths?, task?, cwd?}`. A `waiting` event with a reason
-/// this Hub does not know is ignored.
+/// reason?: permission|question|idle, asks?, asked_nothing?, paths?, task?, cwd?}`. A `waiting`
+/// event with a reason this Hub does not know is ignored.
 fn generic(v: &Value, scope: &Scope) -> Call {
     let kind = match str_at(v, "event") {
         Some("start") => Kind::Start,
@@ -1670,6 +1676,11 @@ fn generic(v: &Value, scope: &Scope) -> Call {
             _ => CallPhase::Tick,
         }),
         Some("waiting") => match str_at(v, "reason").and_then(WaitReason::from_code) {
+            // Only a client that judged the turn's whole last message says it asked nothing:
+            // that turn is read, not answered. A client that says nothing is shown as before.
+            Some(WaitReason::Idle) if v["asked_nothing"] == true => {
+                Kind::Waiting(WaitReason::Finished)
+            }
             Some(reason) => Kind::Waiting(reason),
             None => Kind::Ignore,
         },
@@ -1684,9 +1695,11 @@ fn generic(v: &Value, scope: &Scope) -> Call {
                     .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
         })
         .unwrap_or("generic");
+    // What a finished turn ended on is not kept: nobody is shown that wait.
+    let asks = str_at(v, "asks").filter(|_| kind != Kind::Waiting(WaitReason::Finished));
     let mut call = Call::new(Agent::Generic, kind, Shape::Generic)
         .session(str_at(v, "session"))
-        .asks(str_at(v, "asks"))
+        .asks(asks)
         .task(str_at(v, "task"))
         .paths(
             v.get("paths")
@@ -2502,6 +2515,19 @@ mod tests {
                 json!({"hook_event_name":"stop","conversation_id":"s","status":"completed"}),
                 Some(Idle),
             ),
+            // Cursor's client says how the turn's last reply ended, where Cursor named it.
+            (
+                Agent::Cursor,
+                json!({"hook_event_name":"stop","conversation_id":"s","asked_nothing":true,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Finished),
+            ),
+            (
+                Agent::Cursor,
+                json!({"hook_event_name":"stop","conversation_id":"s","asked_nothing":false,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Idle),
+            ),
             (
                 Agent::Copilot,
                 json!({"sessionId":"s","notification_type":"permission_prompt","message":"m"}),
@@ -2542,8 +2568,64 @@ mod tests {
                 json!({"event":"waiting","session":"s"}),
                 None,
             ),
+            // A generic client that judged the turn's whole last message says it asked nothing.
+            // One that sends only an excerpt is shown, and no other wait reads that answer.
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"idle","session":"s","asked_nothing":true,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Finished),
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"idle","session":"s",
+                    "asks":"The fix is merged and the tests pass for both stores."}),
+                Some(Idle),
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"permission","session":"s","asked_nothing":true}),
+                Some(Permission),
+            ),
         ] {
             assert_eq!(wait(agent, v.clone()), want, "{agent:?} {v}");
+        }
+        // What a wait asks is kept from every client that excerpts it; what a finished turn
+        // ended on is not.
+        let asks = |agent, v: Value| parse(agent, &v).asks;
+        for (agent, v, want) in [
+            (
+                Agent::Cursor,
+                json!({"hook_event_name":"stop","conversation_id":"s","asked_nothing":false,
+                    "asks":"Shall I merge it?"}),
+                Some("Shall I merge it?"),
+            ),
+            (
+                Agent::Cursor,
+                json!({"hook_event_name":"stop","conversation_id":"s","asked_nothing":true,
+                    "asks":"All merged."}),
+                None,
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","notification_type":"permission_prompt",
+                    "asks":"Run `git push`"}),
+                Some("Run `git push`"),
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"permission","agent":"gemini","session":"s",
+                    "asks":"rm -rf build"}),
+                Some("rm -rf build"),
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"idle","session":"s","asked_nothing":true,
+                    "asks":"All merged."}),
+                None,
+            ),
+        ] {
+            assert_eq!(asks(agent, v.clone()).as_deref(), want, "{agent:?} {v}");
         }
         // A subagent's wait names it; the lead's does not.
         let sub = parse(
