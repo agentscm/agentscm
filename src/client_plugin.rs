@@ -867,7 +867,13 @@ fn verify_claude_install(plugin: &Value, files: &[(&'static str, Vec<u8>)]) -> R
         .map(Path::new)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| invalid("Claude Code returned an unsupported plugin cache path"))?;
-    let cache_files = claude_cache_files(files)?;
+    let mut cache_files = claude_cache_files(files)?;
+    // Claude Code leaves this marker in a version folder it stopped using and keeps
+    // it when that version is installed again. The walk still refuses it as a link
+    // or a folder.
+    if let Ok(marker) = std::fs::read(install_path.join(".orphaned_at")) {
+        cache_files.push((".orphaned_at", marker));
+    }
     check_tree(install_path, &cache_files).map_err(|_| {
         invalid(
             "Claude Code plugin cache does not match the generated AgentSCM package; retry setup",
@@ -1332,6 +1338,15 @@ mod tests {
         verify_claude_install(&plugin, &files).unwrap();
         assert!(cache.join(".claude-plugin/plugin.json").is_file());
         assert!(!cache.join("agentscm").exists());
+        std::fs::write(cache.join(".orphaned_at"), b"1794359571000").unwrap();
+        verify_claude_install(&plugin, &files).unwrap();
+        std::fs::write(cache.join(".other_marker"), b"").unwrap();
+        assert!(verify_claude_install(&plugin, &files).is_err());
+        std::fs::remove_file(cache.join(".other_marker")).unwrap();
+        std::fs::write(cache.join("hooks/.orphaned_at"), b"").unwrap();
+        assert!(verify_claude_install(&plugin, &files).is_err());
+        std::fs::remove_file(cache.join("hooks/.orphaned_at")).unwrap();
+        verify_claude_install(&plugin, &files).unwrap();
         std::fs::write(cache.join("hooks/hooks.json"), b"{}").unwrap();
         assert!(verify_claude_install(&plugin, &files).is_err());
     }
