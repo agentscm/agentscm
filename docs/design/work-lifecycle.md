@@ -179,11 +179,28 @@ runs. While no reservation is held, progress, decision and blocker checkpoints a
 request to resume first, so a re-reading lead cannot flip the state to active with nothing held.
 
 The `agentscm_done` and hook session end release the intent and pause the Work in one transaction,
-on both stores. The Work is the active Work the session leads, read inside that transaction, and the
+on both stores, except that a hook's end leaves Work whose hold is live as it is (see the next
+paragraph). The Work is the active Work the session leads, read inside that transaction, and the
 pause is the checkpoint a lead would write: the reservation keeps its basis, so a `retained` hold
 stays `retained`. If the pause fails, nothing is written: the intent stays held and the end can be
 repeated. Blocked Work stays blocked, and paused, handed-over and finished Work are not found, so a
 repeat of an end that committed changes nothing. A session with no Work still releases its intent.
+
+A hook's session end does not pause Work whose hold is still live. Some clients end the session
+after every turn and start it again under the same session id, so the end may be only the gap
+between two turns. The Hub then releases the intent and ends the session, renews the Work's lease
+(at most once a minute, as every renewal) and writes no Work event: such a client costs no Work
+event per turn, and nothing automatic reaches other agents' catch-up. The Work stays active. A
+session that returns leads it and renews its lease as a session that never ended does. One that
+does not return leaves a hold that lapses with its lease, about 20 minutes after the end unless the
+hold already ran longer; the Work then reads as any Work whose lead went quiet, and an admission
+that takes its files pauses it. The end also removes the session from the live sessions shared
+status reads (section 10), so between two turns the Work reads quiet once its lead's last report
+is older than `CLAIM_STALE_SECONDS`, until the session calls again. A session that returns later for another task is told to end that
+Work first, as any session that leads active Work is. `agentscm_done` always pauses, because it is
+the agent's own word. So does a hook's end for Work that holds nothing or whose hold has already
+lapsed: no lease bounds that wait.
+
 `agentscm_done` with `outcome: complete` first applies the `complete` transition to the unfinished
 Work the session leads (active, blocked or paused), fenced by the generation and sequence the Hub
 reads just before, with operation id `mcp-done-complete-<work>-<generation>` so a retry replays.

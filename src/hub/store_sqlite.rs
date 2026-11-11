@@ -8810,8 +8810,18 @@ impl Store for SqliteStore {
         // Work before intents.
         let paused = match &work {
             Some(item) if item.state == WorkState::Active => {
-                work_checkpoint_in(&tx, token, &WorkCheckpoint::auto_pause(item, via), now)?;
-                true
+                // A hook's end may be only the gap between two turns of one session. Work whose
+                // hold is live goes on as it is, its lease running from this call, so a client
+                // that ends its session every turn writes no Work event per turn.
+                let between_turns = via.starts_with("hook:")
+                    && work_reservation_basis(&tx, &item.id)?.is_some()
+                    && !lease_lapsed(&tx, &item.id, now)?;
+                if between_turns {
+                    renew_leases(&tx, token, &name, now)?;
+                } else {
+                    work_checkpoint_in(&tx, token, &WorkCheckpoint::auto_pause(item, via), now)?;
+                }
+                !between_turns
             }
             _ => false,
         };

@@ -1103,7 +1103,7 @@ existing saved client connection. `agentscm change-capture configure` is a confi
 each hook invocation resolves the session's current authorized Work and generation, appends locally
 before delivery, and replays a bounded ordered page. It does not reuse one fixed Work generation.
 Capture targets a Work that is `active`, `paused` or `blocked` for the session at its current
-generation: session end pauses the Work and a resumed session keeps capturing, while `finished` and
+generation: a session end can pause the Work and a resumed session keeps capturing, while `finished` and
 `handover` Work end capture. Unresolved hooks stay as bounded sanitized local facts and are never
 later attached to a Work item.
 

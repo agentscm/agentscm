@@ -8695,13 +8695,23 @@ impl Store for PgStore {
             // same session cannot deadlock with the end.
             let paused = match &work {
                 Some(item) if item.state == WorkState::Active => {
-                    work_checkpoint_in(
-                        &mut tx,
-                        token,
-                        &WorkCheckpoint::auto_pause(item, via),
-                        now,
-                    )?;
-                    true
+                    // A hook's end may be only the gap between two turns of one session. Work
+                    // whose hold is live goes on as it is, its lease running from this call, so
+                    // a client that ends its session every turn writes no Work event per turn.
+                    let between_turns = via.starts_with("hook:")
+                        && work_reservation_basis(&mut tx, &item.id)?.is_some()
+                        && !lease_lapsed(&mut tx, &item.id, now)?;
+                    if between_turns {
+                        renew_leases(&mut tx, token, &name, now)?;
+                    } else {
+                        work_checkpoint_in(
+                            &mut tx,
+                            token,
+                            &WorkCheckpoint::auto_pause(item, via),
+                            now,
+                        )?;
+                    }
+                    !between_turns
                 }
                 _ => false,
             };
