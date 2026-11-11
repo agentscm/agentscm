@@ -1175,6 +1175,248 @@ pub fn unmerged_paths(
         .collect())
 }
 
+/// At most this many changed entries in one working-tree snapshot. Past it the snapshot is an
+/// error: a truncated list could hide a change, and a checkout this dirty is not one a shell
+/// call's edits can be attributed in anyway.
+pub const WORKTREE_ENTRIES: usize = 2_000;
+/// At most this many paths in one [`Observed`]; more set `truncated`.
+pub const OBSERVED_PATHS: usize = 200;
+/// Output budget for `git status` and the commit diffs: room for every entry at the path limit.
+const WORKTREE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// One path that `git status` reported: its two-letter porcelain status, and the file's size and
+/// modification time (nanoseconds since the Unix epoch) when it exists on disk, so that a second
+/// write to an already-dirty file still shows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeEntry {
+    pub status: String,
+    pub size: Option<u64>,
+    pub mtime_ns: Option<i64>,
+}
+
+/// A bounded, deterministic picture of a checkout: its `HEAD` and every path that differs from it
+/// (modified, added, deleted or untracked; ignored files and `.git/` are not listed). Two of these
+/// taken around a shell call are compared with [`changed_during`]. Stored between hook
+/// processes, so decode it strictly and call [`WorktreeState::valid`] on what was read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeState {
+    /// The commit `HEAD` names; `None` on an unborn branch.
+    pub head: Option<String>,
+    pub entries: BTreeMap<String, WorktreeEntry>,
+}
+
+fn is_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn in_git_dir(path: &str) -> bool {
+    path == ".git" || path.starts_with(".git/")
+}
+
+impl WorktreeState {
+    pub fn valid(&self) -> bool {
+        self.head.as_deref().is_none_or(is_oid)
+            && self.entries.len() <= WORKTREE_ENTRIES
+            && self.entries.iter().all(|(path, entry)| {
+                advisory_path(path)
+                    && !in_git_dir(path)
+                    && entry.status.len() == 2
+                    && entry.status.bytes().all(|b| b" MADRCUT?".contains(&b))
+            })
+    }
+}
+
+/// The paths that changed between two snapshots, sorted, without duplicates, relative to the
+/// repository root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observed {
+    pub paths: Vec<String>,
+    /// More than [`OBSERVED_PATHS`] changed; `paths` holds the first ones in path order.
+    pub truncated: bool,
+}
+
+fn worktree_git<'a>(git_path: &'a Path, repository: &'a Path, deadline: Instant) -> Git<'a> {
+    Git {
+        exe: git_path,
+        repository,
+        deadline: Some(deadline),
+    }
+}
+
+fn utf8_path(bytes: &[u8]) -> Result<String> {
+    let path = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Invalid("git reported a path that is not UTF-8".into()))?;
+    if !advisory_path(path) {
+        return Err(Error::Invalid(format!("git reported an odd path {path:?}")));
+    }
+    Ok(path.to_owned())
+}
+
+/// Snapshots the checkout at `repository`. Any Git failure, a passed `deadline`, output over the
+/// budget, more than [`WORKTREE_ENTRIES`] entries or a path that is not plain UTF-8 is an error,
+/// never an empty or partial snapshot. Repository-configured clean filters still run, as for
+/// [`collisions`]: point this only at repositories you trust.
+pub fn worktree_state(
+    git_path: &Path,
+    repository: &Path,
+    deadline: Instant,
+) -> Result<WorktreeState> {
+    let git = worktree_git(git_path, repository, deadline);
+    // Exit 1 is an unborn branch (`--quiet` makes it silent); anything else is a real failure.
+    let (code, out) = git.run_code(
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        None,
+        WORKTREE_BYTES,
+        true,
+    )?;
+    let head = if code == 0 {
+        let oid = lossy(&out).trim().to_owned();
+        if !is_oid(&oid) {
+            return Err(Error::Invalid("git returned an invalid HEAD".into()));
+        }
+        Some(oid)
+    } else {
+        None
+    };
+    // Status paths are relative to the top level, which `repository` may be inside.
+    let top = git.run(&["rev-parse", "--show-toplevel"], None, WORKTREE_BYTES)?;
+    let top = top.strip_suffix(b"\n").unwrap_or(&top);
+    let top = PathBuf::from(std::ffi::OsStr::from_bytes(top));
+    let status = git.run(
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+        None,
+        WORKTREE_BYTES,
+    )?;
+    let mut entries = BTreeMap::new();
+    for record in status.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        // "XY path"
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(Error::Invalid("unrecognized git status record".into()));
+        }
+        let path = utf8_path(&record[3..])?;
+        if in_git_dir(&path) {
+            continue;
+        }
+        if entries.len() >= WORKTREE_ENTRIES {
+            return Err(Error::Invalid(format!(
+                "more than {WORKTREE_ENTRIES} changed paths"
+            )));
+        }
+        let (size, mtime_ns) = match std::fs::symlink_metadata(top.join(&path)) {
+            Ok(meta) => {
+                let nanos = match meta.modified()?.duration_since(UNIX_EPOCH) {
+                    Ok(after) => i128::try_from(after.as_nanos()).unwrap_or(i128::MAX),
+                    Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(0),
+                };
+                (
+                    Some(meta.len()),
+                    Some(i64::try_from(nanos).unwrap_or(i64::MAX)),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error.into()),
+        };
+        entries.insert(
+            path,
+            WorktreeEntry {
+                status: lossy(&record[..2]),
+                size,
+                mtime_ns,
+            },
+        );
+    }
+    let state = WorktreeState { head, entries };
+    debug_assert!(state.valid());
+    Ok(state)
+}
+
+/// Paths that differ between two commits, or between a commit and the empty tree.
+fn commit_paths(
+    git: &Git,
+    before: Option<&str>,
+    after: Option<&str>,
+    out: &mut BTreeSet<String>,
+) -> Result<()> {
+    let tree = |head: Option<&str>| -> Result<String> {
+        match head {
+            Some(head) => Ok(head.to_owned()),
+            None => git.text(&["hash-object", "-t", "tree", "/dev/null"]),
+        }
+    };
+    let (a, b) = (tree(before)?, tree(after)?);
+    let listed = git.run(
+        &[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &a,
+            &b,
+        ],
+        None,
+        WORKTREE_BYTES,
+    )?;
+    for field in listed.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+        out.insert(utf8_path(field)?);
+    }
+    Ok(())
+}
+
+/// The paths whose state differed between `before` and `after`: in one but not the other, or with
+/// a different status, size or modification time, plus the paths of commits created in between
+/// (when `HEAD` moved, the difference between the two commits; an unborn side counts as the empty
+/// tree). `.git/` is never reported.
+///
+/// This observes changes during the interval; it does not attribute them to one caller, since
+/// anything else writing the checkout then is included. Size and modification time can miss a
+/// rewrite of an already-dirty file that keeps its size within the filesystem's timestamp
+/// resolution. Any Git failure, a passed `deadline` or output over the budget is an error, never
+/// an empty result.
+pub fn changed_during(
+    git_path: &Path,
+    repository: &Path,
+    before: &WorktreeState,
+    after: &WorktreeState,
+    deadline: Instant,
+) -> Result<Observed> {
+    if !before.valid() || !after.valid() {
+        return Err(Error::Invalid("invalid working-tree snapshot".into()));
+    }
+    let mut changed: BTreeSet<String> = before
+        .entries
+        .keys()
+        .chain(after.entries.keys())
+        .filter(|path| before.entries.get(*path) != after.entries.get(*path))
+        .cloned()
+        .collect();
+    if before.head != after.head {
+        let git = worktree_git(git_path, repository, deadline);
+        commit_paths(
+            &git,
+            before.head.as_deref(),
+            after.head.as_deref(),
+            &mut changed,
+        )?;
+    } else if Instant::now() >= deadline {
+        return Err(Error::Invalid("deadline passed".into()));
+    }
+    changed.retain(|path| !in_git_dir(path));
+    let truncated = changed.len() > OBSERVED_PATHS;
+    Ok(Observed {
+        paths: changed.into_iter().take(OBSERVED_PATHS).collect(),
+        truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

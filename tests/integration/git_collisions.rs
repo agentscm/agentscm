@@ -1236,3 +1236,240 @@ fn history_writes_nothing_to_the_repository() {
     assert_eq!(totals(&history(&repo, "7")), (2, 2, 1, 1));
     assert_eq!(files_under(&repo), before);
 }
+
+mod worktree_observation {
+    use std::time::{Duration, Instant};
+
+    use agentscm::git_collisions::{
+        OBSERVED_PATHS, Observed, WORKTREE_ENTRIES, WorktreeState, changed_during, worktree_state,
+    };
+
+    use super::*;
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    fn state(repo: &Path) -> WorktreeState {
+        worktree_state(&git_path(), repo, soon()).unwrap()
+    }
+
+    fn between(repo: &Path, before: &WorktreeState, after: &WorktreeState) -> Observed {
+        changed_during(&git_path(), repo, before, after, soon()).unwrap()
+    }
+
+    fn paths(observed: &Observed) -> Vec<&str> {
+        observed.paths.iter().map(String::as_str).collect()
+    }
+
+    fn repo_with(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        for (name, text) in files {
+            fs::write(repo.join(name), text).unwrap();
+        }
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "base"]);
+        repo
+    }
+
+    #[test]
+    fn no_change_reports_nothing() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let before = state(&repo);
+        assert!(before.head.is_some() && before.entries.is_empty());
+        let observed = between(&repo, &before, &state(&repo));
+        assert_eq!(observed, Observed::default());
+    }
+
+    #[test]
+    fn untracked_modified_and_deleted_paths_are_reported() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n"), ("b", "2\n"), ("c", "3\n")]);
+        let before = state(&repo);
+        fs::write(repo.join("new"), "n\n").unwrap();
+        fs::write(repo.join("a"), "changed\n").unwrap();
+        fs::remove_file(repo.join("b")).unwrap();
+        let after = state(&repo);
+        assert!(before.valid() && after.valid());
+        assert_eq!(after.entries["new"].status, "??");
+        assert_eq!(after.entries["b"].size, None);
+        let observed = between(&repo, &before, &after);
+        assert_eq!(paths(&observed), ["a", "b", "new"]);
+        assert!(!observed.truncated);
+    }
+
+    #[test]
+    fn a_second_edit_of_an_already_dirty_file_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n"), ("other", "x\n")]);
+        fs::write(repo.join("a"), "first\n").unwrap();
+        fs::write(repo.join("other"), "y\n").unwrap();
+        let before = state(&repo);
+        // A different size, so the result does not depend on timestamp resolution.
+        fs::write(repo.join("a"), "second, longer\n").unwrap();
+        let observed = between(&repo, &before, &state(&repo));
+        assert_eq!(paths(&observed), ["a"]);
+    }
+
+    #[test]
+    fn works_from_a_subdirectory_of_the_checkout() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        fs::create_dir(repo.join("sub")).unwrap();
+        let sub = repo.join("sub");
+        let before = state(&sub);
+        fs::write(repo.join("sub/x"), "x\n").unwrap();
+        fs::write(repo.join("a"), "changed\n").unwrap();
+        let after = state(&sub);
+        assert!(after.entries["a"].size.is_some());
+        assert_eq!(paths(&between(&sub, &before, &after)), ["a", "sub/x"]);
+    }
+
+    #[test]
+    fn a_commit_between_snapshots_is_reported_though_the_tree_is_clean() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n"), ("b", "2\n")]);
+        let before = state(&repo);
+        fs::write(repo.join("a"), "changed\n").unwrap();
+        fs::write(repo.join("new"), "n\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "work"]);
+        let after = state(&repo);
+        assert!(after.entries.is_empty());
+        assert_ne!(before.head, after.head);
+        assert_eq!(paths(&between(&repo, &before, &after)), ["a", "new"]);
+    }
+
+    #[test]
+    fn the_first_commit_on_an_unborn_branch_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let before = state(&repo);
+        assert_eq!(before.head, None);
+        fs::create_dir(repo.join("d")).unwrap();
+        fs::write(repo.join("d/a"), "1\n").unwrap();
+        fs::write(repo.join("b"), "2\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "first"]);
+        let after = state(&repo);
+        assert!(after.head.is_some());
+        assert_eq!(paths(&between(&repo, &before, &after)), ["b", "d/a"]);
+    }
+
+    #[test]
+    fn git_internals_are_never_reported() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let before = state(&repo);
+        fs::write(repo.join(".git/scratch"), "x\n").unwrap();
+        git(&repo, &["branch", "side"]);
+        let after = state(&repo);
+        assert!(after.entries.keys().all(|p| !p.starts_with(".git")));
+        assert_eq!(between(&repo, &before, &after), Observed::default());
+        // Even a snapshot that names one is not trusted.
+        let mut bad = after.clone();
+        bad.entries.insert(
+            ".git/config".into(),
+            after.entries.values().next().cloned().unwrap_or(
+                agentscm::git_collisions::WorktreeEntry {
+                    status: "??".into(),
+                    size: Some(1),
+                    mtime_ns: Some(1),
+                },
+            ),
+        );
+        assert!(!bad.valid());
+        assert!(changed_during(&git_path(), &repo, &after, &bad, soon()).is_err());
+    }
+
+    #[test]
+    fn reported_paths_are_capped_and_marked_truncated() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let before = state(&repo);
+        for i in 0..OBSERVED_PATHS + 5 {
+            fs::write(repo.join(format!("f{i:04}")), "x\n").unwrap();
+        }
+        let observed = between(&repo, &before, &state(&repo));
+        assert!(observed.truncated);
+        assert_eq!(observed.paths.len(), OBSERVED_PATHS);
+        assert_eq!(observed.paths[0], "f0000");
+    }
+
+    #[test]
+    fn too_many_entries_is_an_error_not_a_short_list() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        for i in 0..WORKTREE_ENTRIES + 1 {
+            fs::write(repo.join(format!("f{i:05}")), "").unwrap();
+        }
+        assert!(worktree_state(&git_path(), &repo, soon()).is_err());
+    }
+
+    #[test]
+    fn git_failure_and_a_passed_deadline_are_errors() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(worktree_state(&git_path(), &repo, past).is_err());
+        let snapshot = state(&repo);
+        assert!(changed_during(&git_path(), &repo, &snapshot, &snapshot, past).is_err());
+        // A moved HEAD needs Git, which is not run after the deadline.
+        fs::write(repo.join("a"), "2\n").unwrap();
+        git(&repo, &["commit", "-qam", "next"]);
+        assert!(changed_during(&git_path(), &repo, &snapshot, &state(&repo), past).is_err());
+        // Not a repository.
+        let plain = dir.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        assert!(worktree_state(&git_path(), &plain, soon()).is_err());
+    }
+
+    #[test]
+    fn decoding_is_strict() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        fs::write(repo.join("n"), "x\n").unwrap();
+        let snapshot = state(&repo);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        let back: WorktreeState = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back, snapshot);
+        assert!(back.valid());
+
+        let mut extra = value.clone();
+        extra["extra"] = json!(1);
+        assert!(serde_json::from_value::<WorktreeState>(extra).is_err());
+        let mut extra = value.clone();
+        extra["entries"]["n"]["extra"] = json!(1);
+        assert!(serde_json::from_value::<WorktreeState>(extra).is_err());
+
+        for head in [
+            json!("nothex"),
+            json!("abcd"),
+            json!(format!("{:0>40}", "g")),
+        ] {
+            let mut bad = value.clone();
+            bad["head"] = head;
+            let decoded: WorktreeState = serde_json::from_value(bad).unwrap();
+            assert!(!decoded.valid());
+        }
+        let mut unborn = value.clone();
+        unborn["head"] = Value::Null;
+        assert!(
+            serde_json::from_value::<WorktreeState>(unborn)
+                .unwrap()
+                .valid()
+        );
+        let mut odd = value;
+        odd["entries"]["../x"] = odd["entries"]["n"].clone();
+        assert!(
+            !serde_json::from_value::<WorktreeState>(odd)
+                .unwrap()
+                .valid()
+        );
+    }
+}
