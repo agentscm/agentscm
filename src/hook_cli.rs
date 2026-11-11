@@ -1912,7 +1912,7 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         None => edit_paths("codex", payload)?,
     };
     if payload["hook_event_name"] == "PermissionRequest"
-        && let Some(asks) = prompt_for(&payload["tool_input"], &paths)
+        && let Some(asks) = prompt_for(tool, &payload["tool_input"], &paths)
     {
         out.insert("asks".into(), json!(asks));
     }
@@ -2009,6 +2009,10 @@ const KEPT_REPLY: &str = "agentscm_kept_reply";
 /// `stop` of the same generation takes them. True for a call that only kept a reply: nothing of
 /// a reply is sent before its turn ends.
 fn keep_reply(config: &Path, payload: &mut Value) -> bool {
+    // Only this hook hands a kept reply over: one that came with the payload is not one.
+    if let Some(sent) = payload.as_object_mut() {
+        sent.remove(KEPT_REPLY);
+    }
     let event = payload["hook_event_name"].as_str().unwrap_or_default();
     let replied = event == "afterAgentResponse";
     if !(replied || matches!(event, "stop" | "sessionEnd")) {
@@ -2064,7 +2068,7 @@ fn gemini_prompt_for(payload: &Value) -> Option<String> {
     let details = &payload["details"];
     let text = |key: &str| details[key].as_str().filter(|text| !text.trim().is_empty());
     let what = match details["type"].as_str() {
-        Some("exec") => text("command").map(str::to_owned),
+        Some("exec") => text("command").map(command_head),
         Some("edit") => text("filePath")
             .or_else(|| text("fileName"))
             .map(str::to_owned),
@@ -2079,8 +2083,8 @@ fn gemini_prompt_for(payload: &Value) -> Option<String> {
 }
 
 /// What a permission prompt is for: the host's own description of the call, where it gives one,
-/// and the files an edit names (never what it writes) or else the command.
-fn prompt_for(input: &Value, edits: &[EditPath]) -> Option<String> {
+/// and the files an edit names (never what it writes) or else a shell's command.
+fn prompt_for(tool: &str, input: &Value, edits: &[EditPath]) -> Option<String> {
     let files: Vec<String> = edits
         .iter()
         .map(|edit| {
@@ -2092,24 +2096,41 @@ fn prompt_for(input: &Value, edits: &[EditPath]) -> Option<String> {
         .collect();
     let what = match &input["command"] {
         _ if !files.is_empty() => Some(files.join(", ")),
-        Value::String(command) => Some(command.clone()),
-        Value::Array(words) => Some(
-            words
+        // Only a shell's `command` is a command: an edit's is its patch, an MCP tool's an
+        // argument of the call.
+        _ if !agentscm::hub::hook::is_shell_tool(tool) => None,
+        Value::String(command) => Some(command_head(command)),
+        Value::Array(words) => Some(command_head(
+            &words
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(" "),
-        ),
+        )),
         _ => None,
     };
+    // An MCP tool's `description` is one of its arguments, not the host's word for the call.
     let described = input["description"]
         .as_str()
-        .filter(|text| !text.trim().is_empty());
+        .filter(|text| !tool.starts_with("mcp__") && !text.trim().is_empty());
     match (described, what) {
         (Some(described), Some(what)) => line_start(&format!("{described}: {what}")),
         (Some(text), None) => line_start(text),
         (None, Some(what)) => line_start(&what),
         (None, None) => None,
+    }
+}
+
+/// A command up to the text it feeds a program (a here-document, a patch). That text is what a
+/// file would hold, which never leaves the machine.
+fn command_head(command: &str) -> String {
+    let fed = ["<<", "*** Begin Patch"]
+        .iter()
+        .filter_map(|mark| command.find(mark))
+        .min();
+    match fed {
+        Some(at) => format!("{}…", command[..at].trim_end()),
+        None => command.to_owned(),
     }
 }
 
@@ -2166,7 +2187,9 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
             // one (`keep_reply`), already redacted, cut and judged.
             let kept = &payload[KEPT_REPLY];
             if payload["hook_event_name"] == "stop"
-                && let Some(asks) = bounded_string(&kept["asks"], 4 * (ASKS_CHARS + 1))
+                && let Some(asks) = kept["asks"]
+                    .as_str()
+                    .filter(|asks| asks.chars().count() <= ASKS_CHARS + 1)
                 && let Some(nothing) = kept["asked_nothing"].as_bool()
             {
                 out["asks"] = json!(asks);
@@ -2873,16 +2896,44 @@ mod tests {
         );
         assert_eq!(
             prompt(
-                "mcp__files__read",
-                json!({"id":7,"description":"Read the notes"})
+                "Agent",
+                json!({"description":"Find the session keys","prompt":"PRIVATE"})
             ),
-            "Read the notes"
+            "Find the session keys"
         );
-        // An edit names its files and never what it writes.
+        // An edit names its files and never what it writes: not when the edit is checked
+        // elsewhere and its files are not passed, and not when a shell is fed the content.
         let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-PRIVATE OLD\n+PRIVATE NEW\n*** Add File: src/b.rs\n+PRIVATE\n*** End Patch";
         assert_eq!(
             prompt("apply_patch", json!({"command":patch})),
             "Update File: src/a.rs, Add File: src/b.rs"
+        );
+        let unlisted = json!({"hook_event_name":"PermissionRequest","session_id":"s",
+            "tool_name":"apply_patch","tool_input":{"command":patch}});
+        assert!(
+            sanitized_codex(&unlisted, Some(&[]))
+                .unwrap()
+                .get("asks")
+                .is_none()
+        );
+        assert_eq!(
+            prompt(
+                "Bash",
+                json!({"command":"cat > .env <<'EOF'\nPRIVATE=1\nEOF"})
+            ),
+            "cat > .env…"
+        );
+        assert_eq!(
+            prompt("Bash", json!({"command":format!("apply_patch {patch}")})),
+            "apply_patch…"
+        );
+        // An MCP tool's arguments are not the host's words for the call, whatever their names.
+        assert_eq!(
+            prompt(
+                "mcp__tracker__create_issue",
+                json!({"description":"PRIVATE body","command":"PRIVATE"})
+            ),
+            Value::Null
         );
         assert_eq!(
             prompt("Write", json!({"file_path":"src/c.rs","content":"PRIVATE"})),
@@ -3070,6 +3121,10 @@ mod tests {
         assert_eq!(
             prompt(json!({"type":"ask_user","title":"Ask"}))["asks"],
             "Tool Shell requires execution"
+        );
+        assert_eq!(
+            prompt(json!({"type":"exec","command":"cat > a <<EOF\nPRIVATE\nEOF"}))["asks"],
+            "cat > a…"
         );
         assert_eq!(
             gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
