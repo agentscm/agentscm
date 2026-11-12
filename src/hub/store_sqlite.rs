@@ -18008,6 +18008,14 @@ impl Store for SqliteStore {
             .map(|snapshot| json_value::<WorkItem>(&snapshot?))
             .collect()
     }
+
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM hub_work_merge_prompts WHERE work = ?1 AND audience = ?2)",
+            params![work, audience],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
 }
 
 #[cfg(test)]

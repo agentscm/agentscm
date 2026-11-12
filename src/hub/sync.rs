@@ -1199,45 +1199,50 @@ async fn read_repo(
     if sync.skill_read_due(&repo.id) {
         super::skills::sync_adoption(state, api, repo, token).await;
     }
-    poll_issue_closures(state, conn, repo, token).await;
-    release_settled_holds(state, conn, repo).await;
+    let unchanged = poll_issue_closures(state, conn, repo, token).await;
+    release_settled_holds(state, conn, repo, unchanged).await;
     Ok(report)
 }
 
 /// Most source issues read per poll of one repository.
-// ponytail: a fixed 50 per poll, in Work id order; upgrade: page by a stored cursor so a
-// repository with more merged Work than this cannot starve its later issues.
+// ponytail: a fixed 50 per poll in issue-number order, continuing after the last issue read
+// (a stored cursor, wrapping), so no issue starves the rest; upgrade: a webhook per issue.
 const ISSUE_CLOSURE_POLL_LIMIT: usize = 50;
 
 /// Store how the source issue of each merged unfinished Work stands, so a hold that outlived
 /// its work can be named. A closure already stored as closed by the Work's own pull request is
 /// stable and is not read again. A failed read keeps the previous observation and never fails
 /// the poll; a rate limit or credential failure ends this poll's reads.
+/// Returns the facts it read when it stored no closure, so the release step can reuse them.
 // ponytail: this polls; an `issues` webhook could refresh a closure sooner than the next poll.
 async fn poll_issue_closures(
     state: &HubState,
     conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
-) {
+) -> Option<super::merged_holds::RepositoryFacts> {
     use super::merged_holds::{CloseReason, IssueState, OBSERVATION_KIND, observation_key};
     // GitLab closure facts stay unknown, so a GitLab Work is never settled.
     if conn.provider != "github" {
-        return;
+        return None;
     }
-    let Some(api) = state.sync.api.as_ref() else {
-        return;
-    };
+    let api = state.sync.api.as_ref()?;
     let (store_repo, now) = (repo.clone(), super::store::unix_now());
-    let Ok((found, releasing)) = db(state, move |store| {
+    let cursor_key = format!("merged_poll_cursor:repo:{}", repo.repository_id);
+    let key = cursor_key.clone();
+    let Ok((found, releasing, cursor)) = db(state, move |store| {
         let found = super::merged_holds::repository_facts(store, "github", &store_repo, now)?;
         let releasing =
             super::merged_holds::merged_release_enabled(store, store_repo.repository_id);
-        Ok((found, releasing))
+        let cursor = store
+            .get_setting(&key)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok((found, releasing, cursor))
     })
     .await
     else {
-        return;
+        return None;
     };
     let mut issues = BTreeSet::new();
     for (_, facts) in &found.work {
@@ -1254,12 +1259,26 @@ async fn poll_issue_closures(
             issues.insert(issue);
         }
     }
-    for issue in issues.into_iter().take(ISSUE_CLOSURE_POLL_LIMIT) {
+    // Continue after the last issue read, wrapping, so open issues cannot hold the budget forever.
+    let (later, earlier): (Vec<u64>, Vec<u64>) = issues.into_iter().partition(|n| *n > cursor);
+    let mut stored_any = false;
+    let mut failed = 0;
+    let mut last = None;
+    for issue in later
+        .into_iter()
+        .chain(earlier)
+        .take(ISSUE_CLOSURE_POLL_LIMIT)
+    {
         let closure = match api.issue_closure(token, &repo.full_name, issue).await {
             Ok(closure) => closure,
-            Err(GhError::Limited(_) | GhError::Auth(_)) => return,
-            Err(_) => continue,
+            Err(GhError::Limited(_) | GhError::Auth(_)) => break,
+            Err(_) => {
+                failed += 1;
+                last = Some(issue);
+                continue;
+            }
         };
+        last = Some(issue);
         let (Ok(data), Ok(stamp)) = (
             serde_json::to_string(&closure),
             observation_stamp(state, &repo.id).await,
@@ -1271,21 +1290,40 @@ async fn poll_issue_closures(
             store.observe(&id, OBSERVATION_KIND, &observation_key(issue), &data, stamp)
         })
         .await;
-        if let Err(error) = stored {
-            crate::hub::error_envelope::log_internal(&error);
+        match stored {
+            Ok(_) => stored_any = true,
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
         }
     }
+    if failed > 0 {
+        crate::hub::error_envelope::log_internal(&format!(
+            "hub: {failed} issue closure read(s) failed for repository {}; their earlier observations stay",
+            repo.id
+        ));
+    }
+    if let Some(last) = last {
+        let _ = db(state, move |store| {
+            store.set_setting(&cursor_key, &last.to_string(), "hub")
+        })
+        .await;
+    }
+    (!stored_any).then_some(found)
 }
 
 /// For a repository that opted in, releases the hold of Work whose merged pull request closed
 /// its source issue as completed, from the closures just stored. A failure never fails the poll.
-async fn release_settled_holds(state: &HubState, conn: &Connection, repo: &ConnectedRepository) {
+async fn release_settled_holds(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    known: Option<super::merged_holds::RepositoryFacts>,
+) {
     if conn.provider != "github" {
         return;
     }
     let (repo, now) = (repo.clone(), super::store::unix_now());
     let done = db(state, move |store| {
-        super::merged_holds::release_settled(store, "github", &repo, now)
+        super::merged_holds::release_settled(store, "github", &repo, known, now)
     })
     .await;
     if let Err(error) = done {

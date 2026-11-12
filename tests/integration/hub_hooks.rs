@@ -2036,7 +2036,7 @@ mod merged_prompts {
         let id = w.merged_work();
         w.close_issue(completed());
         let notice = format!(
-            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed as completed by it. Finish it (agentscm_done with outcome complete) or release it if work remains."
+            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed as completed by it. Complete it (agentscm_done with outcome complete), or if work remains, release the hold and continue later."
         );
         // The lead's next hook says it once.
         let first = w.prompt(LEAD);
@@ -2048,6 +2048,18 @@ mod merged_prompts {
         );
         let start = w.start(OTHER);
         assert_eq!(lines(&start, &owner), 1, "{start}");
+        // It sits ahead of the listing and status, which a host's context limit cuts first.
+        let at = start.find(&owner).unwrap();
+        assert!(
+            at < start
+                .find("Current actionable status")
+                .unwrap_or(usize::MAX),
+            "{start}"
+        );
+        assert!(
+            at < start.find("shared work").unwrap_or(usize::MAX),
+            "{start}"
+        );
         assert_eq!(lines(&w.start("third-session"), "merged and #7"), 0);
     }
 

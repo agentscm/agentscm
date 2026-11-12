@@ -1578,6 +1578,9 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<WorkItem>>;
     /// The unfinished Work that `session` of `token` leads, by id, at most five.
     fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>>;
+    /// Whether `audience` already holds a merged-prompt marker for `work` (an indexed read of the
+    /// marker's primary key), so a hook can skip Work it has nothing left to say about.
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.

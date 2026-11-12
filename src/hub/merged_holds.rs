@@ -241,6 +241,29 @@ pub fn facts(
     }
 }
 
+/// Whether the stored closure of `item`'s source issue says it is closed as completed by a pull
+/// request. A cheap, necessary condition for `Settled` that reads one observation and no stages.
+pub fn closed_by_pull(
+    store: &dyn Store,
+    repo: &ConnectedRepository,
+    item: &WorkItem,
+    provider: &str,
+) -> bool {
+    source_issue(item, provider, &repo.full_name, repo.repository_id)
+        .and_then(|issue| {
+            store
+                .observation(&repo.id, OBSERVATION_KIND, &observation_key(issue))
+                .ok()
+                .flatten()
+        })
+        .and_then(|row| IssueClosure::decode(&row.data))
+        .is_some_and(|c| {
+            c.state == IssueState::Closed
+                && c.reason == CloseReason::Completed
+                && c.closer_pull.is_some()
+        })
+}
+
 /// The merged facts of the unfinished Work of one connected repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryFacts {
@@ -283,6 +306,18 @@ pub fn repository_facts(
     repo: &ConnectedRepository,
     now: i64,
 ) -> super::Result<RepositoryFacts> {
+    repository_facts_where(store, provider, repo, now, |_| true)
+}
+
+/// `repository_facts` for the listed Work `keep` accepts; the stage read, the costly part, runs
+/// only for those.
+pub fn repository_facts_where(
+    store: &dyn Store,
+    provider: &str,
+    repo: &ConnectedRepository,
+    now: i64,
+    keep: impl Fn(&WorkItem) -> bool,
+) -> super::Result<RepositoryFacts> {
     let principal = repository_principal(provider, repo);
     let overview = store.repository_work_overview(
         &principal.owner,
@@ -296,6 +331,8 @@ pub fn repository_facts(
         now,
     )?;
     // The overview hides unreserved Work whose branch merged; the merged facts are about it.
+    // ponytail: at most 100 such Work are read, oldest id first, so a repository with more
+    // unreserved merged Work than that leaves the rest unconsidered; upgrade: a cursor.
     let hidden = store.repository_unreserved_merged_work(
         &principal.owner,
         &repo.full_name,
@@ -303,7 +340,12 @@ pub fn repository_facts(
         MAX_WORK_PAGE,
         now,
     )?;
-    let listed: Vec<&WorkItem> = overview.current.iter().chain(&hidden).collect();
+    let listed: Vec<&WorkItem> = overview
+        .current
+        .iter()
+        .chain(&hidden)
+        .filter(|item| keep(item))
+        .collect();
     let items: Vec<_> = listed
         .iter()
         .map(|item| (*item, OutcomeValue::None))
@@ -426,6 +468,7 @@ pub fn release_settled(
     store: &dyn Store,
     provider: &str,
     repo: &ConnectedRepository,
+    known: Option<RepositoryFacts>,
     now: i64,
 ) -> super::Result<Vec<String>> {
     use super::work_transition::{
@@ -435,7 +478,11 @@ pub fn release_settled(
     if !merged_release_enabled(store, repo.repository_id) {
         return Ok(released);
     }
-    let found = repository_facts(store, provider, repo, now)?;
+    // `known` is facts the caller read after the last change to any closure; otherwise read them.
+    let found = match known {
+        Some(found) => found,
+        None => repository_facts(store, provider, repo, now)?,
+    };
     for (item, facts) in &found.work {
         let MergedHold::Settled { pull, issue } = facts.hold else {
             continue;
@@ -555,7 +602,24 @@ pub fn lead_notices(
     let Ok(led) = store.session_led_work(&principal.token_id, session) else {
         return Vec::new();
     };
+    // Cheapest first: Work already told, then Work whose stored issue closure cannot settle it.
+    let led: Vec<_> = led
+        .into_iter()
+        .filter(|item| !store.merge_prompt_claimed(&item.id, "lead").unwrap_or(true))
+        .collect();
+    if led.is_empty() {
+        return Vec::new();
+    }
+    let Ok(Some(repo)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return Vec::new();
+    };
     led.into_iter()
+        .filter(|item| closed_by_pull(store, &repo, item, &principal.owner.identity.provider))
         .filter_map(|item| {
             let hold = work_facts(store, principal, &item, now)?.hold;
             let MergedHold::Settled { pull, issue } = hold else {
@@ -569,7 +633,7 @@ pub fn lead_notices(
                     &item,
                     pull,
                     issue,
-                    " as completed by it. Finish it (agentscm_done with outcome complete) or release it if work remains.",
+                    " as completed by it. Complete it (agentscm_done with outcome complete), or if work remains, release the hold and continue later.",
                 ),
             })
         })
@@ -593,13 +657,21 @@ pub fn owner_start_notices(
     ) else {
         return Vec::new();
     };
-    let Ok(facts) = repository_facts(store, &principal.owner.identity.provider, &repo, now) else {
+    let provider = &principal.owner.identity.provider;
+    // Work this owner owns that is not yet told and whose stored closure could settle it; only
+    // those have their stages read.
+    let Ok(facts) = repository_facts_where(store, provider, &repo, now, |item| {
+        item.owner == principal.owner.id
+            && !store
+                .merge_prompt_claimed(&item.id, "owner")
+                .unwrap_or(true)
+            && closed_by_pull(store, &repo, item, provider)
+    }) else {
         return Vec::new();
     };
     facts
         .work
         .into_iter()
-        .filter(|(item, _)| item.owner == principal.owner.id)
         .filter_map(|(item, facts)| {
             let MergedHold::Settled { pull, issue } = facts.hold else {
                 return None;

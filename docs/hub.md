@@ -1301,6 +1301,11 @@ forge's repository id so a rename keeps them; a token minted without a forge rep
 never sent a digest. `agentscm digest enable`, `disable`, `opt-out`, `opt-in` and `settings` call
 these routes. Reading the digest needs neither switch.
 
+A separate per-repository setting, `GET` or `PUT /v1/hub/standup/merged-release/settings`, lets the
+sync poll release the hold of Work whose merged pull request closed its source issue as completed
+([automatic release](standup.md#automatic-release-of-a-merged-works-hold)). It is off by default,
+and only a Hub admin or a repository admin can switch it on with `PUT`.
+
 **Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
 digest once a week as a private direct message to each person who has a Slack binding for the
 repository, has not switched theirs off and has something in it. Each stale Work row has buttons

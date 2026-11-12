@@ -245,7 +245,7 @@ fn held(db: &Db, w: &World) -> (bool, WorkItem) {
 }
 
 fn release(db: &Db, w: &World) -> Vec<String> {
-    release_settled(&*db.store, "github", &w.repo, unix_now() + 10).unwrap()
+    release_settled(&*db.store, "github", &w.repo, None, unix_now() + 10).unwrap()
 }
 
 fn off_by_default_keeps_the_hold(db: &Db) {

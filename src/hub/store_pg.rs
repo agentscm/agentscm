@@ -16688,6 +16688,17 @@ impl Store for PgStore {
                 .collect()
         })
     }
+
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool> {
+        self.run(true, |client| {
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM hub_work_merge_prompts WHERE work = $1 AND audience = $2)",
+                    &[&work, &audience],
+                )?
+                .get::<_, bool>(0))
+        })
+    }
 }
 
 // The accepted URLs include a Unix socket path.
