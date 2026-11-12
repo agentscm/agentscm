@@ -3,6 +3,7 @@
 //! AGENTSCM_TEST_DATABASE_URL is set; the setting route runs against SQLite.
 use crate::hub_pg::PgSchema;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
@@ -245,7 +246,36 @@ fn held(db: &Db, w: &World) -> (bool, WorkItem) {
 }
 
 fn release(db: &Db, w: &World) -> Vec<String> {
-    release_settled(&*db.store, "github", &w.repo, None, unix_now() + 10).unwrap()
+    release_settled(
+        &*db.store,
+        "github",
+        &w.repo,
+        &BTreeSet::from([7]),
+        unix_now() + 10,
+    )
+    .unwrap()
+}
+
+fn an_issue_not_read_this_poll_is_not_released(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    let none = BTreeSet::new();
+    let other = BTreeSet::from([8]);
+    for read in [&none, &other] {
+        let now = unix_now() + 10;
+        assert!(
+            release_settled(&*db.store, "github", &w.repo, read, now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(held(db, &w).0, "the hold stays");
+    assert!(
+        !db.store
+            .merge_prompt_claimed(&w.work, "policy_release")
+            .unwrap()
+    );
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
 }
 
 fn off_by_default_keeps_the_hold(db: &Db) {
@@ -551,6 +581,19 @@ fn postgres_off_by_default_keeps_the_hold() {
         return;
     };
     off_by_default_keeps_the_hold(&db);
+}
+
+#[test]
+fn sqlite_an_issue_not_read_this_poll_is_not_released() {
+    an_issue_not_read_this_poll_is_not_released(&Db::sqlite());
+}
+
+#[test]
+fn postgres_an_issue_not_read_this_poll_is_not_released() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    an_issue_not_read_this_poll_is_not_released(&db);
 }
 
 #[test]

@@ -524,15 +524,11 @@ async fn hook(
                 );
                 // An unknown reply loses its text after the session's first, so it takes nothing.
                 // A take that finishes past the deadline is offered again later (REOFFER_SECS).
+                let merged_scope = (principal.clone(), session.clone());
                 if context && outcome.status != "unknown" {
-                    let (store, via, taker, name) = (
-                        state.store.clone(),
-                        call.via.clone(),
-                        principal.clone(),
-                        session.clone(),
-                    );
+                    let (store, via) = (state.store.clone(), call.via.clone());
                     let taken = blocking(&state, move || {
-                        super::agent_messages::take(&*store, &taker, &name, &via, unix_now())
+                        super::agent_messages::take(&*store, &principal, &session, &via, unix_now())
                     });
                     if let Ok(Ok(Some(text))) = timeout_at(deadline, taken).await {
                         outcome.text.push('\n');
@@ -545,10 +541,10 @@ async fn hook(
                 // The lead of Work whose merged pull request closed its issue hears it once. The
                 // claim is the delivery, so it runs only where the text is kept. It runs after the
                 // person's messages and under its own short bound, so it cannot starve them.
-                if context && outcome.status != "unknown" && !principal.read_only {
+                let (scope, name) = merged_scope;
+                if context && outcome.status != "unknown" && !scope.read_only {
                     let sub_deadline = Instant::now() + MERGED_NOTICE_BUDGET;
-                    let (store, scope, name) =
-                        (state.store.clone(), principal.clone(), session.clone());
+                    let store = state.store.clone();
                     let found = blocking(&state, move || {
                         Ok(super::merged_holds::lead_notices(
                             &*store,
@@ -1281,16 +1277,17 @@ impl Call {
                     .unwrap_or_else(|_| unknown("other agents could not be listed"));
                 let status = Outcome::advice(advice.text.clone(), advice.stop).status;
                 // Work of this owner whose merged pull request closed its issue: once each, ever.
-                // The claim is the delivery, so a line is claimed only when it is kept here, and it is
-                // placed right after the advice, ahead of everything `START_CONTEXT` may cut.
-                let owner_lines = if !principal.read_only && !self.child {
+                // The claim is the delivery, so it runs last, just before this reply returns, and a
+                // line another session won is dropped. The lines sit right after the advice, ahead
+                // of everything `START_CONTEXT` may cut.
+                let owner_notices = if !principal.read_only && !self.child {
                     let (store, scope, name) = (
                         state.store.clone(),
                         principal.clone(),
                         advice.touched.session.clone(),
                     );
                     let found = tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
+                        MERGED_NOTICE_BUDGET,
                         blocking(state, move || {
                             Ok(super::merged_holds::owner_start_notices(
                                 &*store,
@@ -1301,30 +1298,19 @@ impl Call {
                         }),
                     )
                     .await;
-                    let store = state.store.clone();
-                    let lines = match found {
-                        Ok(Ok(notices)) if !notices.is_empty() => {
-                            blocking(state, move || {
-                                Ok(super::merged_holds::claim_notices(
-                                    &*store,
-                                    notices,
-                                    unix_now(),
-                                ))
-                            })
-                            .await
-                        }
-                        _ => Ok(Vec::new()),
-                    };
-                    lines.unwrap_or_default()
+                    match found {
+                        Ok(Ok(notices)) => notices,
+                        _ => Vec::new(),
+                    }
                 } else {
                     Vec::new()
                 };
                 let mut head = advice.text.clone();
-                for line in owner_lines {
+                for notice in &owner_notices {
                     if !head.is_empty() {
                         head.push('\n');
                     }
-                    head.push_str(&line);
+                    head.push_str(notice.line());
                 }
                 let mut text = if head.is_empty() {
                     listing
@@ -1391,6 +1377,23 @@ impl Call {
                 {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
+                }
+                if !owner_notices.is_empty() {
+                    let all: Vec<String> =
+                        owner_notices.iter().map(|n| n.line().to_string()).collect();
+                    let store = state.store.clone();
+                    let won = blocking(state, move || {
+                        Ok(super::merged_holds::claim_notices(
+                            &*store,
+                            owner_notices,
+                            unix_now(),
+                        ))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    for line in all.iter().filter(|line| !won.contains(line)) {
+                        text = text.replacen(&format!("{line}\n"), "", 1);
+                    }
                 }
                 Ok(Outcome {
                     text,

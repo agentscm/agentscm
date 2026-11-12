@@ -4,6 +4,8 @@
 //! The closure is a provider fact the sync stores as an observation. Missing, unreadable or
 //! undecodable facts classify as `Unknown` or `MergedOnly`, never as `Settled`. A merge alone
 //! never settles a Work: a "Part of" pull request merges while its issue stays open.
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -393,6 +395,16 @@ pub fn work_facts(
         principal.repository_id,
     )
     .ok()??;
+    work_facts_in(store, principal, &repo, item, now)
+}
+
+fn work_facts_in(
+    store: &dyn Store,
+    principal: &Principal,
+    repo: &ConnectedRepository,
+    item: &WorkItem,
+    now: i64,
+) -> Option<MergedFacts> {
     let reader = WorkLifecycleReader::Token(&principal.token_id);
     let (stages, _, unsettled) = work_stages_detailed(
         store,
@@ -443,8 +455,8 @@ pub fn set_merged_release(
 const POLICY_RELEASE: &str = "policy_release";
 
 /// For a repository that opted in, releases the hold of each unfinished Work whose every linked
-/// pull request merged and whose source issue one of them closed as completed
-/// (`MergedHold::Settled`). It releases the hold only: the Work stays unfinished with no
+/// pull request merged and whose source issue the Work's linked pull request closed as completed
+/// (`MergedHold::Settled`), when that issue's closure was read and stored in this poll (`read`). It releases the hold only: the Work stays unfinished with no
 /// outcome. Returns the ids released.
 ///
 /// The policy releases a Work at most once. It claims the `policy_release` marker (the same
@@ -468,21 +480,22 @@ pub fn release_settled(
     store: &dyn Store,
     provider: &str,
     repo: &ConnectedRepository,
-    known: Option<RepositoryFacts>,
+    read: &BTreeSet<u64>,
     now: i64,
 ) -> super::Result<Vec<String>> {
     use super::work_transition::{
         OperationalSelect, WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
     };
     let mut released = Vec::new();
-    if !merged_release_enabled(store, repo.repository_id) {
+    if read.is_empty() || !merged_release_enabled(store, repo.repository_id) {
         return Ok(released);
     }
-    // `known` is facts the caller read after the last change to any closure; otherwise read them.
-    let found = match known {
-        Some(found) => found,
-        None => repository_facts(store, provider, repo, now)?,
-    };
+    // A closure this poll did not read again may be stale (the issue reopened), so only Work whose
+    // issue was read now is released.
+    let found = repository_facts_where(store, provider, repo, now, |item| {
+        source_issue(item, provider, &repo.full_name, repo.repository_id)
+            .is_some_and(|issue| read.contains(&issue))
+    })?;
     for (item, facts) in &found.work {
         let MergedHold::Settled { pull, issue } = facts.hold else {
             continue;
@@ -531,7 +544,19 @@ pub fn release_settled(
             match store.work_transition(&actor, &request, now) {
                 Ok(_) => Ok(true),
                 // The Work moved or no longer holds: someone else decided, so the claim stays.
-                Err(error @ super::HubError::Invalid(_)) => Err(error),
+                Err(error @ super::HubError::Invalid(_)) => {
+                    // Keep the claim only when the hold is gone; an unrelated fence change or an
+                    // unknown Work leaves the hold, so the release stays possible.
+                    let gone = store
+                        .work_operational(&reader, &OperationalSelect::One(&item.id), now)
+                        .ok()
+                        .and_then(|o| o.work.first().map(|w| w.reservation.basis.is_none()))
+                        .unwrap_or(false);
+                    if !gone {
+                        let _ = store.unclaim_merge_prompt(&item.id, POLICY_RELEASE);
+                    }
+                    Err(error)
+                }
                 Err(error) => {
                     let _ = store.unclaim_merge_prompt(&item.id, POLICY_RELEASE);
                     Err(error)
@@ -570,6 +595,13 @@ pub struct MergedNotice {
     /// Audiences claimed with it, so the same session is not told twice.
     also: Option<&'static str>,
     line: String,
+}
+
+impl MergedNotice {
+    /// The text this notice shows once claimed.
+    pub fn line(&self) -> &str {
+        &self.line
+    }
 }
 
 /// Claims each notice once ever and returns the lines of those this call won. Run it only when
@@ -703,21 +735,42 @@ pub fn merged_sentence(hold: &MergedHold) -> Option<String> {
     }
 }
 
+/// The most conflicts `annotate_conflicts` reads facts for.
+// ponytail: five conflicts, lowest Work id first; upgrade: a count line when more are held.
+const MAX_ANNOTATED_CONFLICTS: usize = 5;
+
 /// Adds the merged facts to the `next` text of each conflict whose holding Work has a merged
-/// linked pull request. When the caller owns that Work (`mine`), it also names the direct
-/// release remedy: preview, then apply, with no join request. Other conflicts are unchanged, and
-/// a Work that cannot be read or has no connected repository adds nothing.
+/// linked pull request, for at most the first few conflicts by Work id. When a caller that can
+/// write owns that Work (`mine`), it also names the direct release remedy: preview, then apply,
+/// with no join request. Other conflicts are unchanged, and a Work that cannot be read or has no
+/// connected repository adds nothing.
 pub fn annotate_conflicts(
     store: &dyn Store,
     principal: &Principal,
     recovery: &mut super::work_recovery::WorkRecoveryV1,
     now: i64,
 ) {
-    for conflict in &mut recovery.conflicts {
+    let Ok(Some(repo)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return;
+    };
+    let mut order: Vec<usize> = (0..recovery.conflicts.len()).collect();
+    order.sort_by(|a, b| {
+        recovery.conflicts[*a]
+            .work_id
+            .cmp(&recovery.conflicts[*b].work_id)
+    });
+    for index in order.into_iter().take(MAX_ANNOTATED_CONFLICTS) {
+        let conflict = &mut recovery.conflicts[index];
         let Ok(Some(item)) = store.work_get(&principal.token_id, &conflict.work_id, now) else {
             continue;
         };
-        let Some(hold) = work_facts(store, principal, &item, now).map(|facts| facts.hold) else {
+        let Some(hold) = work_facts_in(store, principal, &repo, &item, now).map(|facts| facts.hold)
+        else {
             continue;
         };
         let Some(sentence) = merged_sentence(&hold) else {
@@ -725,7 +778,7 @@ pub fn annotate_conflicts(
         };
         conflict.next.push(' ');
         conflict.next.push_str(&sentence);
-        if conflict.mine {
+        if conflict.mine && !principal.read_only {
             let obsolete = if matches!(hold, MergedHold::MergedIssueOpen { .. }) {
                 "Only if it is obsolete, release"
             } else {
