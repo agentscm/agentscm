@@ -5,14 +5,16 @@ use crate::hub_pg;
 use std::sync::Arc;
 
 use agentscm::hub::store::{self, ForgeIdentity, Store, User, mint_bound_agent_token, unix_now};
-use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkRole, WorkStart, WorkState};
+use agentscm::hub::work::{
+    CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, WorkStart, WorkState,
+};
 use agentscm::hub::work_lifecycle::{
     ActivityStatus, LEASE_SECONDS, Recipient, ReservationStatus, WorkTransitionKind,
 };
 use agentscm::hub::work_recovery::{
-    BatchOutcome, BatchTransitionItem, RecoveryBucket, RecoveryCaller, RecoveryQuery, RefusalCode,
-    RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1, WorkTransitionBatch, apply_batch,
-    inspect, preview,
+    BatchItemV1, BatchOutcome, BatchTransitionItem, RecoveryBucket, RecoveryCaller, RecoveryQuery,
+    RefusalCode, RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1, WorkTransitionBatch,
+    apply_batch, inspect, preview,
 };
 use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader, WorkTransitionActor};
 use hub_pg::PgSchema;
@@ -945,6 +947,154 @@ fn people_use_the_same_service(db: &Db) {
     assert_eq!(applied.items[0].outcome, BatchOutcome::Applied);
 }
 
+fn join(store: &dyn Store, who: &Agent, work_id: &str, session: &str, role: WorkRole, now: i64) {
+    let mut join = start("join", session, "src/none/**");
+    join.work_id = Some(work_id.into());
+    join.request_key = None;
+    join.role = role;
+    join.scope = vec![];
+    join.branch = None;
+    join.next_action = None;
+    store.work_start(&who.token, &join, now).unwrap();
+}
+
+fn abandon_with(
+    store: &dyn Store,
+    owner: &Agent,
+    work: &WorkItem,
+    operation: &str,
+    seq: i64,
+    now: i64,
+) -> BatchItemV1 {
+    let batch = WorkTransitionBatch {
+        session: Some("s-a".into()),
+        items: vec![item(
+            &work.id,
+            operation,
+            work.generation,
+            seq,
+            WorkTransitionKind::Abandon,
+        )],
+    };
+    let actor = WorkTransitionActor::Agent {
+        token: &owner.token,
+    };
+    apply_batch(store, &actor, &batch, now)
+        .unwrap()
+        .items
+        .remove(0)
+}
+
+/// A helper from another owner that joins and re-joins moves `updated_seq` but cannot starve the
+/// owner's cleanup: joins alone do not expire the receipt.
+fn a_helper_moving_updated_seq_cannot_starve_owner_cleanup(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 2);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 3);
+    let moved = one(&*store, &caller(&alice, "s-a"), &work.id, now + 4);
+    assert!(moved.work[0].operational.updated_seq > work.updated_seq);
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 5,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Applied);
+}
+
+/// A real change after the observed seq still refuses, even with joins around it.
+fn a_non_join_change_after_the_observed_seq_still_refuses(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let current = one(&*store, &caller(&alice, "s-a"), &work.id, now + 2);
+    store
+        .work_checkpoint(
+            &alice.token,
+            &WorkCheckpoint {
+                work_id: work.id.clone(),
+                operation_id: "progress".into(),
+                generation: work.generation,
+                session: "s-a".into(),
+                expected_updated_seq: Some(current.work[0].operational.updated_seq),
+                kind: CheckpointKind::Progress,
+                summary: "moved on".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: vec![],
+                related_work: vec![],
+            },
+            now + 3,
+        )
+        .unwrap();
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 4);
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 5,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Refused);
+    assert_eq!(result.code.as_deref(), Some("work_changed"));
+}
+
+/// An `expected_updated_seq` that is not a recorded seq of this Work cannot skip over changes.
+fn an_unrecorded_expected_seq_is_not_accepted_over_joins(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let other = store
+        .work_start(&alice.token, &start("b", "s-b", "src/b/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-c", WorkRole::Helper, now + 1);
+    for (n, seq) in [(1, 1), (2, other.updated_seq), (3, work.updated_seq + 1000)] {
+        let op = format!("abandon-{n}");
+        let result = abandon_with(&*store, &alice, &work, &op, seq, now + 2);
+        assert_eq!(result.outcome, BatchOutcome::Refused, "seq {seq}");
+        assert_eq!(result.code.as_deref(), Some("work_changed"), "seq {seq}");
+    }
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-ok",
+        work.updated_seq,
+        now + 3,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Applied);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -970,4 +1120,7 @@ conformance!(
     a_scoped_handover_frees_only_what_it_drops,
     ending_work_names_the_requests_and_dependents_it_reaches,
     people_use_the_same_service,
+    a_helper_moving_updated_seq_cannot_starve_owner_cleanup,
+    a_non_join_change_after_the_observed_seq_still_refuses,
+    an_unrecorded_expected_seq_is_not_accepted_over_joins,
 );

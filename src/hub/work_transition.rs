@@ -289,11 +289,15 @@ pub(super) fn classify(
 }
 
 /// Applies the matrix and the generation and sequence fences, in that order.
+///
+/// `only_joins_since` is true when `expected_updated_seq` is a recorded event of this Work and
+/// every later event of it is a `work_joined`, so the sequence fence is met.
 pub(super) fn check(
     item: &WorkItem,
     held: bool,
     acting: &Acting,
     request: &WorkTransitionRequest,
+    only_joins_since: bool,
 ) -> Result<()> {
     decide_transition(
         request.transition,
@@ -315,7 +319,7 @@ pub(super) fn check(
             item.generation
         )));
     }
-    if item.updated_seq != request.expected_updated_seq {
+    if item.updated_seq != request.expected_updated_seq && !only_joins_since {
         return Err(HubError::Invalid(format!(
             "transition receipt expired or work changed; current updated_seq is {}",
             item.updated_seq

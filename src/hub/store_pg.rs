@@ -11727,7 +11727,16 @@ impl Store for PgStore {
             let outcome_column: Option<String> = columns_row.get(0);
             let basis_column: Option<String> = columns_row.get(1);
             let held = basis_column.is_some();
-            work_transition::check(&item, held, &acting, request)?;
+            let only_joins_since = item.updated_seq != request.expected_updated_seq
+                && tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)
+                            AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1
+                                AND seq > $2 AND seq <= $3 AND kind <> 'work_joined')",
+                        &[&item.id, &request.expected_updated_seq, &item.updated_seq],
+                    )?
+                    .get::<_, bool>(0);
+            work_transition::check(&item, held, &acting, request, only_joins_since)?;
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {

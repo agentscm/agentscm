@@ -58,7 +58,7 @@ resolves before this check.
 
 A new store operation `work_transition` runs in one transaction. It is idempotent by `operation_id`
 and fenced by both `expected_updated_seq` and `generation`. An exact retry returns the stored
-receipt and the current item and acquires nothing. A different request with the same `operation_id`
+receipt and the current item and acquires nothing. The sequence fence also passes when `expected_updated_seq` is a recorded event of the Work and every later event of it is `work_joined`, so a participant joining or changing role cannot expire an owner's cleanup. A different request with the same `operation_id`
 is refused. A bounded, sanitized reason is required.
 
 Actors:

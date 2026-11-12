@@ -101,7 +101,7 @@ A pause or handover checkpoint, including the automatic session-end pause, keeps
 
 ### Work transitions
 
-A transition changes the outcome or the reservation without a checkpoint written in the agent's name. The kinds are `release`, `retain`, `complete`, `abandon`, `supersede` and `reopen`. The request carries `operation_id`, `generation`, `expected_updated_seq` and a required reason (at most 500 bytes); `supersede` also names another Work in the repository. A different request with a used `operation_id` is refused and an exact retry returns the stored receipt and acquires nothing.
+A transition changes the outcome or the reservation without a checkpoint written in the agent's name. The kinds are `release`, `retain`, `complete`, `abandon`, `supersede` and `reopen`. The request carries `operation_id`, `generation`, `expected_updated_seq` and a required reason (at most 500 bytes); `supersede` also names another Work in the repository. A different request with a used `operation_id` is refused and an exact retry returns the stored receipt and acquires nothing. A transition still applies when `expected_updated_seq` is a recorded event of that Work and every later event is a participant join (`work_joined`); any other change refuses it.
 
 | Transition | Allowed from | Who may request it | Effect |
 | --- | --- | --- | --- |
