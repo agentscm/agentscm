@@ -437,9 +437,13 @@ so an update between pages cannot repeat or skip an item; treat it as opaque). I
 work id, scope paths, the source issue number and the lead agent label, except another owner's generated `client-…` label, which is masked as described in [other owners' agents](standup.md#other-owners-agents). The reply is `{"items": [{id, title, state,
 lead_agent, owner, branch, source_issue, updated_at, created_at}], "next_cursor": cursor|null, "complete": bool}`.
 Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` also carry the manifest `title`. It also includes `POST /v1/hub/standup/usage`,
-`GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
-The first stores one idempotent partial usage report; the GET routes return bounded
-work projections. See [work insights](work-insights.md) for pagination and evidence limits.
+`GET /v1/hub/standup/insights`, `GET /v1/hub/standup/work/{work_id}/insights` and
+`GET /v1/hub/standup/work/{work_id}/usage`.
+The first stores one idempotent partial usage report; the insight routes return bounded
+work projections, whose usage totals count cache-read and cache-creation input beside input and
+output. The last returns one work item's stored usage reports, at most 100 per page, without the
+session, author or reporter-supplied identifiers. See [work insights](work-insights.md) for
+pagination and evidence limits.
 
 `POST /v1/hub/standup/checkpoint` returns HTTP 409 with
 `{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the

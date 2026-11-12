@@ -28,7 +28,10 @@ use super::coordination::{
 use super::device::{Device, DevicePrincipal, Refusal, RepositoryUsage};
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked, HandoffView, Via};
-use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
+use super::insights::{
+    InsightPage, InsightQuery, UsageReceipt, UsageRecord, UsageReportPage, UsageReportQuery,
+    WorkInsight,
+};
 use super::intent::{Announced, Intent, NewIntent};
 use super::pickup::Pickup;
 use super::promise::{
@@ -1251,6 +1254,15 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<()>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
+    /// One page of a work item's stored usage reports, oldest first, for any reader of its
+    /// repository; `None` when the work item is not in the token's repository.
+    fn work_usage_reports(
+        &self,
+        token: &str,
+        id: &str,
+        query: &UsageReportQuery,
+        now: i64,
+    ) -> Result<Option<UsageReportPage>>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// Resolve a recorded holder identity within the caller's authorized repository. Never impersonates the holder.

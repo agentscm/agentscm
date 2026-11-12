@@ -29,7 +29,7 @@ use super::coordination::{
 };
 use super::error_envelope::{self, ErrorCode, FieldProblem, InputProblem};
 use super::http::{ApiError, Reader, blocking};
-use super::insights::{InsightQuery, UsageRecord};
+use super::insights::{InsightQuery, MAX_USAGE_PAGE, UsageRecord, UsageReportQuery};
 use super::promise::{
     DEFAULT_PROMISE_PAGE, MAX_PROMISE_PAGE, PromiseConstraintV1, PromiseCriterionV1,
     PromiseInputV1, PromiseViewV1, current_admission,
@@ -89,7 +89,8 @@ const SKILL_TOOLS: [&str; 3] = [
 ];
 /// Tools no shipped skill, instruction, hook or view asks an agent to call; they are listed only
 /// with the full set (`/mcp?tools=all`) and stay callable either way.
-const OPT_IN_TOOLS: [&str; 19] = [
+const OPT_IN_TOOLS: [&str; 20] = [
+    "agentscm_work_usage_reports",
     "agentscm_change_record",
     "agentscm_workflow_status",
     "agentscm_shared_conversation",
@@ -255,6 +256,14 @@ struct WorkflowStatusArgs {
 #[serde(deny_unknown_fields)]
 struct WorkInsightArgs {
     work_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkUsageReportsArgs {
+    work_id: String,
+    after: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -573,6 +582,7 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_work_intent"
                     | "agentscm_work_insight"
                     | "agentscm_work_insights"
+                    | "agentscm_work_usage_reports"
                     | "agentscm_value_metrics"
                     | "agentscm_contribution_receipt"
                     | "agentscm_change_record"
@@ -872,6 +882,14 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             "after":{"type":"string","maxLength":512}, "through":{"type":"integer","minimum":0},
             "limit":{"type":"integer","minimum":1,"maximum":20,"default":20}
         }), &[])});
+    let usage_reports = json!({"name": "agentscm_work_usage_reports",
+        "description": "Reads one page of a work item's stored usage reports, oldest first: the counts, cost and labels each report gave, without its session, author or caller-supplied identifiers. Reports are caller-supplied and prove no exhaustive usage or billing. Continue with next_after as after until it is null.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({
+            "work_id": {"type":"string"},
+            "after":{"type":"integer","minimum":0,"maximum":super::insights::MAX_OBSERVATIONS},
+            "limit":{"type":"integer","minimum":1,"maximum":MAX_USAGE_PAGE,"default":MAX_USAGE_PAGE}
+        }), &["work_id"])});
     let mut value_metrics = json!({"name":"agentscm_value_metrics",
         "description":"Reads the same deterministic observed-contribution projection as the Hub for this repository only. Unknown coverage and costs remain unknown. Bounded evidence; no provider polling or model generation. Continue using next_after when present.",
         "annotations":{"readOnlyHint":true},
@@ -1067,6 +1085,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             work_intent,
             insight,
             insights,
+            usage_reports,
             value_metrics,
             contribution_receipt,
             work_search,
@@ -1269,6 +1288,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
         work_intent,
         insight,
         insights,
+        usage_reports,
         value_metrics,
         contribution_receipt,
         receipt_settings,
@@ -2298,6 +2318,7 @@ async fn call_inner(
             | "agentscm_work_intent"
             | "agentscm_work_insight"
             | "agentscm_work_insights"
+            | "agentscm_work_usage_reports"
             | "agentscm_value_metrics"
             | "agentscm_contribution_receipt"
             | "agentscm_receipt_settings"
@@ -2914,6 +2935,33 @@ async fn call_inner(
             .await
             {
                 Ok(value) => structured(&value),
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_work_usage_reports" {
+        let WorkUsageReportsArgs {
+            work_id,
+            after,
+            limit,
+        } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let page = UsageReportQuery {
+            after: after.unwrap_or(0),
+            limit: limit.unwrap_or(MAX_USAGE_PAGE),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.work_usage_reports(&token, &work_id, &page, unix_now())
+            })
+            .await
+            {
+                Ok(Some(value)) => structured(&value),
+                Ok(None) => refused("not_found"),
                 Err(error) => work_failure(&error),
             },
         );
@@ -4781,6 +4829,7 @@ mod tests {
         accepts::<ViewSettingsArgs>(json!({}));
         accepts::<WorkflowStatusArgs>(json!({"run_id": "r"}));
         accepts::<WorkInsightArgs>(json!({"work_id": "w"}));
+        accepts::<WorkUsageReportsArgs>(json!({"work_id": "w", "after": 100}));
         accepts::<ChangeRecordArgs>(json!({"work_id": "w"}));
         accepts::<SharedConversationArgs>(json!({"work_id": "w"}));
         accepts::<PickerArgs>(json!({}));
