@@ -1893,17 +1893,37 @@ async fn scope_refusals_follow_the_declared_scope_not_the_tool_or_file() {
         None,
         unix_now(),
     );
-    for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
-        let answer = hub.hook_raw("claude", &lead, &edit_of(tool, session, file));
-        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
-        assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
-        assert!(
-            reason.contains("outside the declared scope"),
-            "{tool} {file}: {answer}"
-        );
-    }
-    for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
-        hub.hook("claude", &lead, &edit_of(tool, session, file));
+    for child in [false, true] {
+        for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
+            let mut payload = edit_of(tool, session, file);
+            if child {
+                payload["agent_id"] = json!("scope-child");
+                payload["agent_type"] = json!("general-purpose");
+            }
+            let answer = hub.hook_raw("claude", &lead, &payload);
+            assert_eq!(
+                answer["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{answer}"
+            );
+            let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+            assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
+            assert!(
+                reason.contains("outside the declared scope"),
+                "{tool} {file}: {answer}"
+            );
+            if child {
+                assert!(reason.contains("You are a subagent"), "{answer}");
+                assert!(reason.contains(session), "{answer}");
+            }
+        }
+        for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
+            let mut payload = edit_of(tool, session, file);
+            if child {
+                payload["agent_id"] = json!("scope-child");
+                payload["agent_type"] = json!("general-purpose");
+            }
+            hub.hook("claude", &lead, &payload);
+        }
     }
 }
 
@@ -1938,15 +1958,35 @@ async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
         unix_now(),
     );
     assert!(resumed.generation > lapsed.generation);
-    let answer = hub.hook_raw("claude", &lead, &edit_of("Edit", session, "src/lib.rs"));
-    let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
-    assert!(
-        reason.contains(&format!(
-            "generation {}, expected_updated_seq {}",
-            resumed.generation, resumed.updated_seq
-        )),
-        "{answer}"
-    );
+    for child in [false, true] {
+        let mut payload = edit_of("Edit", session, "src/lib.rs");
+        if child {
+            payload["agent_id"] = json!("resumed-child");
+            payload["agent_type"] = json!("general-purpose");
+        }
+        let answer = hub.hook_raw("claude", &lead, &payload);
+        assert_eq!(
+            answer["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{answer}"
+        );
+        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+        if child {
+            // Children hand recovery to the parent; they receive no mutation fences.
+            assert!(reason.contains("You are a subagent"), "{answer}");
+            assert!(reason.contains(session), "{answer}");
+            assert!(reason.contains(&resumed.id), "{answer}");
+            assert!(reason.contains("the parent should checkpoint"), "{answer}");
+            assert!(!reason.contains("expected_updated_seq"), "{answer}");
+        } else {
+            assert!(
+                reason.contains(&format!(
+                    "generation {}, expected_updated_seq {}",
+                    resumed.generation, resumed.updated_seq
+                )),
+                "{answer}"
+            );
+        }
+    }
 }
 
 /// #542 item 9: the lead's next tool call after its hold lapsed says so once, before any edit
