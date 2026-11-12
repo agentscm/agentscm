@@ -511,7 +511,20 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
     match error {
         HubError::Rejected(rejection) => envelope.message = server_message(&rejection.message),
         HubError::Input(fields) => {
-            envelope.message = "Provide exactly one Work identity: work_id, source or request_key; do not use a title as identity.".into();
+            let identity = ["work_id", "source", "request_key"];
+            envelope.message = if fields
+                .iter()
+                .all(|field| identity.contains(&field.name.as_str()))
+            {
+                "Provide exactly one Work identity: work_id, source or request_key; do not use a title as identity.".into()
+            } else {
+                // Hints are fixed text, so the message still echoes no caller value.
+                let named: Vec<String> = fields
+                    .iter()
+                    .map(|field| format!("{}: {}", field.name, field.hint))
+                    .collect();
+                format!("Correct request field {}", named.join(" "))
+            };
             envelope.fields = Some(fields.clone());
         }
         HubError::WorkCheckpointSequenceConflict { current_seq } => {
@@ -862,6 +875,25 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn input_errors_name_their_fields_or_the_work_identity() {
+        let problem =
+            |name| vec![InputProblem::new(name, FieldProblem::Missing, "Provide it.").unwrap()];
+        let identity = from_hub_error(&HubError::Input(problem("source")));
+        assert!(
+            identity
+                .message
+                .starts_with("Provide exactly one Work identity")
+        );
+        let other = from_hub_error(&HubError::Input(problem("expected_updated_seq")));
+        assert!(
+            other
+                .message
+                .contains("Correct request field expected_updated_seq: Provide it.")
+        );
+        assert_eq!(other.fields.unwrap()[0].name, "expected_updated_seq");
+    }
 
     #[test]
     fn entropy_failure_omits_the_reference_without_panicking() {

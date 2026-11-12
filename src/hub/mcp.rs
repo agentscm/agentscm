@@ -2,6 +2,7 @@
 //! session code with the hooks; durable work tools share the authenticated store. Hand-rolled
 //! JSON-RPC 2.0: one message per request, no
 //! `Mcp-Session-Id`, no SSE, no batches.
+use std::collections::BTreeMap;
 #[cfg(not(unix))]
 use std::sync::Arc;
 
@@ -4136,6 +4137,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let title = task.clone();
+    let caller = principal.clone();
     let work = blocking(state, move || {
         let start = WorkStart {
             issue_choice,
@@ -4201,12 +4203,37 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
                     .is_some_and(|view| {
                         view.reservation.status != super::work_lifecycle::ReservationStatus::Held
                     });
-            Ok((work, unreserved))
+            // Whether each target's lead session is live, read before the reply is redacted: a
+            // Work that reports nothing may still be answered by a session that is calling.
+            let lead_live = match &work.coordination_request {
+                Some(request) => {
+                    // The read only feeds advice: a failed read leaves every lead unknown.
+                    let sessions = store
+                        .live_sessions(&caller, now, LEAD_SESSION_LIMIT + 1)
+                        .ok();
+                    let complete = sessions
+                        .as_ref()
+                        .is_some_and(|sessions| sessions.len() <= LEAD_SESSION_LIMIT);
+                    let sessions = sessions.unwrap_or_default();
+                    request
+                        .targets
+                        .iter()
+                        .map(|target| {
+                            let key =
+                                super::store::session_key(&target.lead.token, &target.lead.session);
+                            let live = sessions.iter().any(|s| s.key == key);
+                            (target.work_id.clone(), (live || complete).then_some(live))
+                        })
+                        .collect()
+                }
+                None => BTreeMap::new(),
+            };
+            Ok((work, unreserved, lead_live))
         })
-        .map(|(work, unreserved)| (work, unreserved, resolved, paths))
+        .map(|(work, unreserved, lead_live)| (work, unreserved, lead_live, resolved, paths))
     })
     .await?;
-    let (mut work, unreserved, resolved, paths) = work;
+    let (mut work, unreserved, lead_live, resolved, paths) = work;
     work.context = Some(context);
     // The reply's text reads ids and counts only, so it can be built from the redacted copy.
     let viewer = Viewer(&principal.owner.id);
@@ -4241,7 +4268,15 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             )
         })
         .await;
-        let mut result = start_result(String::new(), briefing, work, catchup, unreserved, detail);
+        let mut result = start_result(
+            String::new(),
+            briefing,
+            work,
+            catchup,
+            unreserved,
+            &lead_live,
+            detail,
+        );
         attach_recovery(&mut result, recovery, detail);
         return Ok(result);
     }
@@ -4308,7 +4343,15 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    let mut result = start_result(parts.join("\n"), briefing, work, catchup, false, detail);
+    let mut result = start_result(
+        parts.join("\n"),
+        briefing,
+        work,
+        catchup,
+        false,
+        &lead_live,
+        detail,
+    );
     if let Some(warning) = unlinked
         && let Some(object) = result["structuredContent"].as_object_mut()
     {
@@ -4441,12 +4484,16 @@ fn unlinked_start(item: &WorkItem, unknown: bool) -> String {
     )
 }
 
+/// Live sessions read to tell whether a quiet lead can still answer; more than this is unknown.
+const LEAD_SESSION_LIMIT: usize = super::work_http::actionable_status::MAX_STATUS_WORK;
+
 fn start_result(
     coordination: String,
     briefing: Briefing,
     work: WorkStartResult,
     catchup: Option<CatchupPreview>,
     unreserved: bool,
+    lead_live: &BTreeMap<String, Option<bool>>,
     detail: Detail,
 ) -> Value {
     let paused = unreserved
@@ -4549,7 +4596,9 @@ fn start_result(
     if let Some(request) = &work.coordination_request {
         text.push_str(&format!("\nCoordination request {} is queued for the affected leads. Queued is not received; inspect agentscm_coordination_inbox for receipts and replies.", request.id));
         // A live lead that does not even acknowledge it in time is stuck, and its person is asked
-        // in the Hub's Needs you. A paused or quiet lead asks nobody: its hold lapses by itself.
+        // in the Hub's Needs you. A paused or quiet lead asks nobody, but its Work reporting
+        // nothing does not mean its session is gone: only a session that is not live cannot answer.
+        // No reply promises a lapse: a hold can be retained.
         for target in &request.targets {
             let idle = work
                 .context
@@ -4561,14 +4610,22 @@ fn start_result(
                         .find(|item| item.id == target.work_id)
                 })
                 .is_some_and(WorkItem::lead_idle);
-            if idle {
-                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. It is not raised in the AgentSCM Hub's Needs you: its hold lapses by itself if it does not return, and a later agentscm_start then takes the files. Where Slack is set up, its person is told there and can answer for it from the Hub's Inbox.", target.work_id));
+            let live = lead_live.get(&target.work_id).copied().flatten();
+            if idle && live == Some(false) {
+                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. It is not raised in the AgentSCM Hub's Needs you: agentscm_work_status says whether its hold lapses or is retained. Where Slack is set up, its person is told there and can answer for it from the Hub's Inbox.", target.work_id));
+            } else if idle && live.is_none() {
+                text.push_str(&format!("\nWhether the agent leading {} can answer is unknown: its Work is quiet and its session could not be checked.", target.work_id));
+            } else if idle {
+                text.push_str(&format!("\nThe Work of the agent leading {id} is quiet but its session is live, so it can still reply; agentscm_work_status says where the request stands.", id = target.work_id));
             } else if request.requester.owner == target.lead.owner {
                 text.push_str(&format!("\nThe agent leading {} is your person's too, so the request is not raised in the AgentSCM Hub's Needs you: if it stays unanswered, ask your person in this session.", target.work_id));
             } else {
                 text.push_str(&format!("\nIf the agent leading {} has not acknowledged it by Unix {}, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, request.created_at + super::coordination::ACK_BOUND_SECS, super::advice::sanitize(&target.lead.login, 64)));
             }
         }
+        text.push_str(
+            "\nRead agentscm_coordination_inbox for a reply before planning to wait out a lease.",
+        );
     }
     if let Some(holders) = &work.holder_intents
         && (holders.holders_listed > 0 || !holders.complete)

@@ -549,6 +549,41 @@ fn repair_merge_previews_and_applies_only_the_guarded_retained_failure() {
 }
 
 #[test]
+fn start_accepts_task_alias_and_omitted_optional_fields() {
+    let hub = Hub::start();
+    let client = hub.client(1, "alice");
+    let output = client.start(
+        r#"{"request_key":"alias-goal","task":"implement via task alias","session":"alice-session","scope":["src/alias.rs"]}"#,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: WorkStartResult = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result.item.title, "implement via task alias");
+}
+
+#[test]
+fn request_decode_errors_name_the_field() {
+    let hub = Hub::start();
+    let client = hub.client(1, "alice");
+    let unknown =
+        client.start(r#"{"title":"t","session":"s","scope":[],"surprise":"secret-value"}"#);
+    let missing = client.start(r#"{"title":"t","scope":[]}"#);
+    let broken = client.start(r#"{"title":"#);
+    for (output, expected) in [
+        (&unknown, "work request field `surprise` is unknown"),
+        (&missing, "work request field `session` is missing"),
+        (
+            &broken,
+            "work request is not valid strict JSON at line 1 column",
+        ),
+    ] {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("secret-value"), "{stderr}");
+    }
+}
+
+#[test]
 fn start_claim_conflicts_keep_json_and_exit_nonzero() {
     let hub = Hub::start();
     let first_client = hub.client(1, "alice");

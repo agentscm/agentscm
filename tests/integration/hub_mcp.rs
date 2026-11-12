@@ -424,6 +424,55 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observed_shell_change_does_not_verify_the_native_edit_hook() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "member-agent");
+    let binding = "a".repeat(64);
+    let session = "setup-shell-observed";
+    let post = |body: Value| {
+        hub.onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            "/v1/hub/hook/claude",
+            body,
+        )
+    };
+    post(json!({"hook_event_name":"SessionStart","session_id":session})).await;
+    let status = || async {
+        let (_, reply) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"agentscm_setup_status",
+                    "arguments":{"agent":"claude","session":session}}}),
+            )
+            .await;
+        serde_json::from_str::<Value>(reply["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(status().await["native_verified"], false);
+    post(json!({
+        "hook_event_name":"PostToolUse","session_id":session,"tool_name":"Bash",
+        "tool_use_id":"toolu_shell","tool_input":{"command":"true"},
+        "observed":{"outcome":"changed","paths":["src/a.rs"],"truncated":false}
+    }))
+    .await;
+    let after_shell = status().await;
+    assert_eq!(after_shell["mcp_verified"], true, "{after_shell}");
+    assert_eq!(after_shell["native_verified"], false, "{after_shell}");
+    post(json!({
+        "hook_event_name":"PreToolUse","session_id":session,"tool_name":"Write",
+        "tool_input":{"file_path":"src/b.rs"}
+    }))
+    .await;
+    assert_eq!(status().await["native_verified"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_is_authenticated_revalidates_revocation_and_rejects_fabricated_fields() {
     let hub = Hub::start().await;
     let secret = hub.secret(1, "agent");
@@ -2143,7 +2192,8 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
+async fn a_refused_start_says_a_quiet_leading_agent_cannot_answer_only_when_its_session_is_not_live()
+ {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");
     let bob = hub.secret(2, "bob-agent");
@@ -2178,6 +2228,7 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
         .await;
     let said = refused(&running);
     assert!(!said.contains("is not running"), "{said}");
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
     // It says when the request is raised to that lead's person if it is not acknowledged.
     assert!(
         said.contains(&format!(
@@ -2197,6 +2248,28 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
         .await;
     assert_eq!(paused["isError"], false, "{paused}");
 
+    // Paused Work, but its session called a moment ago: it can still reply, and nothing says
+    // it is not running.
+    let quiet = hub
+        .tool_result(
+            &carol,
+            "agentscm_start",
+            overlap("add a digest filter", "carol"),
+        )
+        .await;
+    let said = refused(&quiet);
+    assert!(
+        said.contains("is quiet but its session is live") && !said.contains("is not running"),
+        "{said}"
+    );
+    assert!(!said.contains("lapses by itself"), "{said}");
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
+
+    // Once its session has not called for longer than a session lives, it cannot answer. The
+    // reply still promises no lapse: a hold can be retained.
+    let db = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+    db.execute("UPDATE hub_sessions SET updated_at = 0", [])
+        .unwrap();
     let idle = hub
         .tool_result(
             &carol,
@@ -2208,10 +2281,17 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
     assert!(
         said.contains(&format!("The agent leading {work_id} is not running"))
             && said.contains("It is not raised in the AgentSCM Hub's Needs you")
-            && !said.contains("raised to its person"),
+            && !said.contains("raised to its person")
+            && !said.contains("lapses by itself")
+            && !said.contains("is quiet but its session is live"),
         "{said}"
     );
+    assert!(said.contains("agentscm_work_status says whether its hold lapses or is retained"));
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
 }
+
+const INBOX_SENTENCE: &str =
+    "Read agentscm_coordination_inbox for a reply before planning to wait out a lease.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_are_tool_results_with_fixed_text() {

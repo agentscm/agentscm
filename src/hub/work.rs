@@ -51,6 +51,7 @@ pub struct WorkStart {
     pub work_id: Option<String>,
     pub source: Option<ForgeWorkRef>,
     pub request_key: Option<String>,
+    #[serde(alias = "task")]
     pub title: String,
     /// What the new Work changes and why, for a teammate; set only when Work is created.
     #[serde(default, skip_serializing_if = "Option::is_none")]

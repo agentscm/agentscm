@@ -192,6 +192,90 @@ struct Call {
     cleared: bool,
     /// The subagent this call started, as the hook client reported it.
     launched: Option<Launched>,
+    /// What the hook client observed a shell call do to the working tree, on the call that ends
+    /// it. Never more than the client's word: another process may have changed the same files.
+    observed: Option<Observed>,
+}
+
+/// At most this many paths in one observation; more set `truncated`. Defined here, not in the
+/// Unix-only `git_collisions`, because the Hub compiles everywhere; the client shares it.
+pub const OBSERVED_PATHS: usize = 200;
+const MAX_OBSERVED_PATHS: usize = OBSERVED_PATHS;
+/// How many observed paths a reply names.
+const SHOWN_OBSERVED: usize = 20;
+/// Why a shell call could not be observed: the reasons the hook client sends and the Hub accepts.
+pub const OBSERVED_UNKNOWN: [&str; 7] = [
+    "missing_snapshot",
+    "pre_snapshot_failed",
+    "invalid_snapshot",
+    "git_failed",
+    "no_tool_use_id",
+    "background",
+    "local_error",
+];
+
+/// The `observed` field of a shell call's end, decoded strictly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Observed {
+    /// These files changed while the call ran. They are already changed, so a check of them
+    /// refuses nothing.
+    Changed { paths: Vec<String>, truncated: bool },
+    /// The client could not tell, or the field was malformed (`invalid`).
+    Unknown(&'static str),
+}
+
+impl Observed {
+    /// Anything outside the bounds and shape the client sends is `Unknown("invalid")`.
+    fn decode(value: &Value) -> Self {
+        let invalid = Self::Unknown("invalid");
+        let Some(map) = value.as_object() else {
+            return invalid;
+        };
+        let only = |keys: &[&str]| map.keys().all(|key| keys.contains(&key.as_str()));
+        match map.get("outcome").and_then(Value::as_str) {
+            Some("unknown") if only(&["outcome", "reason"]) => map
+                .get("reason")
+                .and_then(Value::as_str)
+                .and_then(|reason| OBSERVED_UNKNOWN.iter().find(|known| **known == reason))
+                .map_or(invalid, |reason| Self::Unknown(reason)),
+            Some("changed") if only(&["outcome", "paths", "truncated"]) => {
+                let Some(Value::Bool(truncated)) = map.get("truncated") else {
+                    return invalid;
+                };
+                let mut truncated = *truncated;
+                let Some(listed) = map.get("paths").and_then(Value::as_array) else {
+                    return invalid;
+                };
+                if listed.is_empty() || listed.len() > MAX_OBSERVED_PATHS {
+                    return invalid;
+                }
+                let mut paths = BTreeSet::new();
+                for path in listed {
+                    let Some(path) = path.as_str() else {
+                        return invalid;
+                    };
+                    // The client accepts a few names the Hub cannot hold (`*`, a drive-like
+                    // `c:x`): drop those and say the list is incomplete, rather than lose it all.
+                    if relative(path, &[]).as_deref() == Some(path)
+                        && !path.contains('*')
+                        && spec_key(path).is_ok()
+                    {
+                        paths.insert(path.to_owned());
+                    } else {
+                        truncated = true;
+                    }
+                }
+                if paths.is_empty() {
+                    return invalid;
+                }
+                Self::Changed {
+                    paths: paths.into_iter().collect(),
+                    truncated,
+                }
+            }
+            _ => invalid,
+        }
+    }
 }
 
 /// A subagent a session started, from the hook client's `subagent` object on the call that
@@ -580,7 +664,73 @@ impl Call {
             stopped: false,
             cleared: false,
             launched: None,
+            observed: None,
         }
+    }
+
+    /// The shell call this call ends changed these files (observed by the hook client): already
+    /// applied, so the check of them runs after the fact like Cursor's, with the host's context
+    /// channel for `event`. A call that observed nothing is unchanged.
+    fn observed_shell(mut self, event: &'static str, field: Option<&Value>) -> Self {
+        let Some(field) = field.filter(|field| !field.is_null()) else {
+            return self;
+        };
+        let observed = Observed::decode(field);
+        if let Observed::Changed { paths, .. } = &observed {
+            self.kind = Kind::Check;
+            self.paths = paths
+                .iter()
+                .take(super::session::MAX_SESSION_PATHS)
+                .cloned()
+                .collect();
+        }
+        self.shape = Shape::Hook(event);
+        self.observed = Some(observed);
+        self
+    }
+
+    /// Files a shell call has already changed.
+    fn applied(&self) -> bool {
+        matches!(self.observed, Some(Observed::Changed { .. }))
+    }
+
+    /// The reply's account of an observation, or empty when there was none.
+    fn observed_line(&self) -> String {
+        match &self.observed {
+            None => String::new(),
+            Some(Observed::Unknown("background")) => "AgentSCM cannot observe this shell call's changes: it continues in the background, so what it changes later is not observed. If it changed files, call `agentscm_check` with those paths.".to_owned(),
+            Some(Observed::Unknown(reason)) => format!(
+                "AgentSCM could not observe which files this shell call changed ({reason}). If it changed files, call `agentscm_check` with those paths."
+            ),
+            Some(Observed::Changed { paths, truncated }) => {
+                let shown = serde_json::to_string(&paths[..paths.len().min(SHOWN_OBSERVED)])
+                    .unwrap_or_default();
+                let more = if *truncated || paths.len() > SHOWN_OBSERVED {
+                    ", and more"
+                } else {
+                    ""
+                };
+                format!(
+                    "AgentSCM observed these files change during this shell call (already applied; another process may also have changed them): {shown}{more}."
+                )
+            }
+        }
+    }
+
+    /// What a session with no Work does about files already changed.
+    fn applied_undeclared(&self, paths: &[String]) -> String {
+        if self.child {
+            return "Tell the session that started you to call `agentscm_start` with these paths; do not start Work yourself.".to_owned();
+        }
+        let named = self
+            .session
+            .as_deref()
+            .and_then(|id| serde_json::to_string(id).ok())
+            .map_or_else(String::new, |id| format!(" (pass session {id})"));
+        let paths = serde_json::to_string(paths).unwrap_or_default();
+        format!(
+            "This session has no Work: call `agentscm_start` with these paths now: {paths}{named}."
+        )
     }
 
     fn failed(agent: Agent, reason: &'static str) -> Self {
@@ -799,7 +949,8 @@ impl Call {
                         return Err(reason(error));
                     }
                 }
-                Ok(Outcome::clean())
+                // Only a shell call's end that could not observe its changes says anything.
+                Ok(Outcome::advice(self.observed_line(), false))
             }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
@@ -854,6 +1005,23 @@ impl Call {
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
                 self.note_subagents(state, &principal);
+                let applied = self.applied();
+                let observed = self.observed_line();
+                // Files changed by a shell call: the call has ended, whatever the check finds.
+                if applied && self.session.is_some() {
+                    let store = state.store.clone();
+                    let id = principal.token_id.clone();
+                    let ended = SessionCall {
+                        task: None,
+                        deny: false,
+                        report: false,
+                        ..call(Vec::new())
+                    };
+                    let _ = blocking(state, move || {
+                        store.session_activity(&id, &ended, CallPhase::End, unix_now())
+                    })
+                    .await;
+                }
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
                 let requested = self.session.clone();
@@ -875,7 +1043,7 @@ impl Call {
                     return Ok(Outcome {
                         deny: self.deny.then(|| text.clone()),
                         text,
-                        status: "stop",
+                        status: if applied { "fyi" } else { "stop" },
                     });
                 }
                 let touched = announce_reading(
@@ -902,16 +1070,34 @@ impl Call {
                             } else {
                                 ""
                             };
-                            format!(
-                                "AgentSCM: {detail}{child} {NO_BYPASS} No new file intent was announced."
-                            )
+                            if applied {
+                                // The change is made; the advice to hold the scope first is for
+                                // the next one.
+                                let detail = detail
+                                    .replace(
+                                        "Hold it again before editing",
+                                        "Hold it again before the next change",
+                                    )
+                                    .replace(
+                                        "request fresh admission before editing",
+                                        "request fresh admission before the next change",
+                                    )
+                                    .replace("when this was refused", "when this change was made");
+                                format!(
+                                    "{observed}\nAgentSCM: {detail}{child} No new file intent was announced."
+                                )
+                            } else {
+                                format!(
+                                    "AgentSCM: {detail}{child} {NO_BYPASS} No new file intent was announced."
+                                )
+                            }
                         } else {
                             self.unlinked_refusal(None)
                         };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
                             text,
-                            status: "stop",
+                            status: if applied { "fyi" } else { "stop" },
                         });
                     }
                     Err(error) => return Err(reason(error)),
@@ -928,7 +1114,26 @@ impl Call {
                     .filter(|path| !super::session::never_hold(path))
                     .cloned()
                     .collect();
-                if coverage.item.is_none()
+                if applied {
+                    // The line that asks for Work comes right after the account of the change, so
+                    // that cutting a long reply to fit never drops it.
+                    let mut lead = observed.clone();
+                    if coverage.item.is_none() && !holdable.is_empty() {
+                        lead = format!("{lead}\n{}", self.applied_undeclared(&holdable));
+                    }
+                    outcome.text = if outcome.text.is_empty() {
+                        lead
+                    } else {
+                        format!("{lead}\n{}", outcome.text)
+                    };
+                    if outcome.status == "clean" {
+                        outcome.status = "fyi";
+                    }
+                }
+                // For files a shell call already changed nothing can be refused, so the session is
+                // told every time, not once, ahead of the other advice (above).
+                if !applied
+                    && coverage.item.is_none()
                     && !self.child
                     && !holdable.is_empty()
                     && let Some(native) = self.session.as_deref()
@@ -967,7 +1172,8 @@ impl Call {
                         Outcome { text, ..outcome }
                     };
                 }
-                if self.agent != Agent::Generic || self.via == "hook:gemini" {
+                // Native edit tools only: a shell call's observed change must not verify them.
+                if !applied && (self.agent != Agent::Generic || self.via == "hook:gemini") {
                     state.onboarding.native(
                         &principal,
                         client,
@@ -1158,7 +1364,48 @@ impl Call {
             .as_deref()
             .unwrap_or("set to your native session ID");
         let paths = serde_json::to_string(&self.paths).unwrap_or_default();
+        let applied = self.applied();
+        // Files a shell call already changed are not made again.
+        let again = if applied {
+            ""
+        } else {
+            ", then make the edit again"
+        };
+        // Live Work exists but the path is outside its declared scope.
+        let scope_id = work
+            .filter(|(item, _)| matches!(item.state, WorkState::Active | WorkState::Blocked))
+            .map(|(item, _)| item.id.as_str());
         let recovery = match work {
+            Some((item, lead)) if self.child && scope_id.is_some() => {
+                let sid = session
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default();
+                let tail = match (applied, lead) {
+                    (true, true) => "Tell your parent, which holds the claim, so it can record them",
+                    (true, false) => "Tell your parent, so it can have them recorded",
+                    (false, true) => {
+                        "Finish without this edit and tell your parent it was refused, so it can record them"
+                    }
+                    (false, false) => {
+                        "Finish without this edit and tell your parent it was refused, so it can have them recorded"
+                    }
+                };
+                let (leader, ask) = if lead {
+                    ("that session", "the parent should checkpoint")
+                } else {
+                    ("another session", "the parent should ask that lead to checkpoint")
+                };
+                format!(
+                    "You are a subagent: AgentSCM checks your edits under your parent's session{sid}. These files are outside the scope of {id}, which {leader} leads. Do not start, join or take over Work from here. {tail}: {ask} {paths} into its scope{itself}.",
+                    id = item.id,
+                    itself = if applied || !lead { "" } else { " or make the edit itself" },
+                )
+            }
+            _ if self.child && applied => {
+                "You are a subagent: do not start, join or take over Work from here. Tell your parent, which holds the claim, that these files are outside its Work so it can record them."
+                    .to_owned()
+            }
             _ if self.child => format!(
                 "You are a subagent: AgentSCM checks your edits under your parent's session{}. Do not start, join or take over Work from here. Finish without this edit and tell your parent it was refused, so the session holding the claim can start or update its Work, or make the edit itself.",
                 session
@@ -1168,14 +1415,22 @@ impl Call {
             ),
             Some((item, true)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
                 format!(
-                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}, then make the edit again.",
+                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are unavailable or bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{json_session},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":{widened}}} on standard input.",
                     id = item.id,
                     generation = item.generation,
                     seq = item.updated_seq,
+                    widened = {
+                        let mut scope = item.scope.clone();
+                        scope.extend(self.paths.iter().cloned());
+                        scope.sort();
+                        scope.dedup();
+                        serde_json::to_string(&scope).unwrap_or_default()
+                    },
+                    json_session = session.as_deref().unwrap_or("\"<your native session ID>\""),
                 )
             }
             Some((item, _)) if item.state == WorkState::Finished => format!(
-                "{id} is finished. Start new Work: call agentscm_start with session {named}, your task and paths {paths}, then make the edit again.",
+                "{id} is finished. Start new Work: call agentscm_start with session {named}, your task and paths {paths}{again}.",
                 id = item.id,
             ),
             // Live Work led elsewhere: its lead widens the scope; a takeover would conflict.
@@ -1191,11 +1446,22 @@ impl Call {
                 generation = item.generation,
             ),
             None => format!(
-                "Link it: call agentscm_start with session {named}, your task and paths {paths}, then make the edit again."
+                "Link it: call agentscm_start with session {named}, your task and paths {paths}{again}."
             ),
         };
+        let cause = if scope_id.is_some() {
+            "outside the declared scope of its Work"
+        } else {
+            "not linked to a current assignment of this session"
+        };
+        if applied {
+            return format!(
+                "{}\nAgentSCM: {EDIT_UNLINKED}: these files are {cause}. {recovery} No new file intent was announced.",
+                self.observed_line()
+            );
+        }
         format!(
-            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is not linked to a current assignment of this session. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
+            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is {cause}. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
         )
     }
 
@@ -1571,6 +1837,18 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             call(Kind::Check, Shape::Hook("PreToolUse"))
                 .deny()
                 .paths(edit_paths(tool, input), scope)
+        }
+        // A shell call's end also reports the files the hook client saw it change, or that it
+        // could not tell. A failed call ends too, and may have changed files before it failed.
+        Some(event @ ("PostToolUse" | "PostToolUseFailure")) if is_shell_tool(tool) => {
+            let event = if event == "PostToolUse" {
+                "PostToolUse"
+            } else {
+                "PostToolUseFailure"
+            };
+            call(Kind::Activity(CallPhase::End), Shape::Silent)
+                .launched(&v["subagent"])
+                .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
         // call's input or result is read.
@@ -1952,6 +2230,155 @@ mod tests {
         }
     }
 
+    fn shell_end(extra: Value, observed: Value) -> Call {
+        let mut v = json!({"hook_event_name":"PostToolUse","session_id":"native-id",
+            "cwd":"/r","tool_name":"Bash","observed":observed});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Call::parse(Agent::Claude, &serde_json::to_vec(&v).unwrap(), None)
+    }
+
+    #[test]
+    fn an_observation_is_decoded_strictly_and_never_trusted_further() {
+        let decode = |value: Value| Observed::decode(&value);
+        let invalid = Observed::Unknown("invalid");
+        assert_eq!(
+            decode(json!({"outcome":"changed","paths":["b","a/c"],"truncated":true})),
+            Observed::Changed {
+                paths: vec!["a/c".into(), "b".into()],
+                truncated: true
+            }
+        );
+        assert_eq!(
+            decode(json!({"outcome":"unknown","reason":"missing_snapshot"})),
+            Observed::Unknown("missing_snapshot")
+        );
+        let too_many: Vec<String> = (0..=MAX_OBSERVED_PATHS).map(|n| format!("f{n}")).collect();
+        for bad in [
+            json!("changed"),
+            json!({}),
+            json!({"outcome":"deleted","paths":["a"]}),
+            json!({"outcome":"changed"}),
+            json!({"outcome":"changed","paths":[]}),
+            json!({"outcome":"changed","paths":"a"}),
+            json!({"outcome":"changed","paths":[1]}),
+            json!({"outcome":"changed","paths":["a"],"truncated":"yes"}),
+            json!({"outcome":"changed","paths":["a"],"truncated":false,"extra":1}),
+            // The client always says whether the list is complete.
+            json!({"outcome":"changed","paths":["a"]}),
+            json!({"outcome":"changed","paths":too_many,"truncated":false}),
+            // No path survives.
+            json!({"outcome":"changed","paths":["/etc/passwd"],"truncated":false}),
+            json!({"outcome":"changed","paths":["../x"],"truncated":false}),
+            json!({"outcome":"changed","paths":["a/../b"],"truncated":false}),
+            json!({"outcome":"changed","paths":["src/**"],"truncated":false}),
+            json!({"outcome":"changed","paths":["a\nb"],"truncated":false}),
+            json!({"outcome":"changed","paths":["", "*"],"truncated":false}),
+            json!({"outcome":"unknown"}),
+            json!({"outcome":"unknown","reason":"made up"}),
+            json!({"outcome":"unknown","reason":"git_failed","paths":["a"]}),
+        ] {
+            assert_eq!(decode(bad.clone()), invalid, "{bad}");
+        }
+        // One path the Hub cannot hold is dropped and the list marked incomplete.
+        assert_eq!(
+            decode(
+                json!({"outcome":"changed","paths":["ok","*","c:x","a\u{200b}b"],"truncated":false})
+            ),
+            Observed::Changed {
+                paths: vec!["ok".into()],
+                truncated: true
+            }
+        );
+        assert!(decode(json!({"outcome":"unknown","reason":"background"})) != invalid);
+        assert!(decode(json!({"outcome":"unknown","reason":"local_error"})) != invalid);
+        // A malformed field still ends the call and says it could not tell.
+        let call = shell_end(
+            json!({}),
+            json!({"outcome":"changed","paths":["/x"],"truncated":false}),
+        );
+        assert_eq!(call.kind, Kind::Activity(CallPhase::End));
+        assert!(
+            call.observed_line().contains("(invalid)"),
+            "{}",
+            call.observed_line()
+        );
+        // An explicit null is as good as none.
+        let none = shell_end(json!({}), Value::Null);
+        assert_eq!((none.observed, none.shape), (None, Shape::Silent));
+    }
+
+    #[test]
+    fn observed_changes_are_worded_as_applied_and_unknown_asks_for_a_check() {
+        let call = shell_end(
+            json!({}),
+            json!({"outcome":"changed","paths":["src/a.rs"],"truncated":false}),
+        );
+        let line = call.observed_line();
+        assert!(
+            line.contains("AgentSCM observed these files change during this shell call (already applied; another process may also have changed them): [\"src/a.rs\"]."),
+            "{line}"
+        );
+        assert!(!line.contains("and more"), "{line}");
+        // The reply names a bounded list and says there is more.
+        let many: Vec<String> = (0..30).map(|n| format!("f{n:02}")).collect();
+        let long = shell_end(
+            json!({}),
+            json!({"outcome":"changed","paths":many,"truncated":false}),
+        );
+        let line = long.observed_line();
+        assert!(line.contains("f19") && !line.contains("f20"), "{line}");
+        assert!(line.contains(", and more."), "{line}");
+        assert_eq!(long.paths.len(), 30);
+        let unknown = shell_end(
+            json!({}),
+            json!({"outcome":"unknown","reason":"git_failed"}),
+        );
+        assert_eq!(
+            unknown.observed_line(),
+            "AgentSCM could not observe which files this shell call changed (git_failed). If it changed files, call `agentscm_check` with those paths."
+        );
+        // The context reaches the agent on the event's own channel.
+        let reply = unknown.render(&Outcome::advice(unknown.observed_line(), false));
+        assert_eq!(
+            reply["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+            "{reply}"
+        );
+        // No Work: said by name, for a subagent as a request to its parent.
+        let own = call.applied_undeclared(&call.paths);
+        assert!(
+            own.starts_with("This session has no Work: call `agentscm_start` with these paths now"),
+            "{own}"
+        );
+        assert!(own.contains("\"native-id\""), "{own}");
+        let child = shell_end(
+            json!({"agent_id":"sub"}),
+            json!({"outcome":"changed","paths":["src/a.rs"],"truncated":false}),
+        );
+        let background = shell_end(
+            json!({}),
+            json!({"outcome":"unknown","reason":"background"}),
+        );
+        let line = background.observed_line();
+        assert!(
+            line.contains("continues in the background") && line.contains("`agentscm_check`"),
+            "{line}"
+        );
+        assert_eq!(
+            child.applied_undeclared(&child.paths),
+            "Tell the session that started you to call `agentscm_start` with these paths; do not start Work yourself."
+        );
+        // No recovery asks for an edit to be made again or says it was not applied.
+        for (call, work) in [(&call, None), (&child, None)] {
+            let text = call.unlinked_refusal(work);
+            assert!(!text.contains("not applied"), "{text}");
+            assert!(!text.contains("make the edit again"), "{text}");
+            assert!(!text.contains("Repeating the edit"), "{text}");
+            assert!(text.starts_with("AgentSCM observed these files"), "{text}");
+        }
+    }
+
     #[test]
     fn an_unlinked_edit_names_its_session_and_the_start_that_links_it() {
         let edit = |extra: Value| {
@@ -1979,6 +2406,50 @@ mod tests {
             "{child}"
         );
         assert!(!child.contains("call agentscm_start with"), "{child}");
+        // Out-of-scope edits name the scope; a lead also gets the CLI checkpoint route.
+        let active = overlap_side("a", WorkState::Active, ClaimStatus::Active);
+        let lead = edit(json!({})).unlinked_refusal(Some((&active, true)));
+        assert!(
+            lead.contains("this edit was not applied because it is outside the declared scope"),
+            "{lead}"
+        );
+        assert!(
+            lead.contains("agentscm work checkpoint --request -"),
+            "{lead}"
+        );
+        assert!(
+            lead.contains("\"scope\":[\"src/a.rs\",\"src/shared.rs\"]"),
+            "{lead}"
+        );
+        // The CLI example decodes as a strict checkpoint, with or without a session ID.
+        for call in [edit(json!({})), edit(json!({"session_id": null}))] {
+            let text = call.unlinked_refusal(Some((&active, true)));
+            let body = text
+                .split_once("inside this file's checkout instead, with ")
+                .and_then(|(_, rest)| rest.split_once(" on standard input"))
+                .map(|(body, _)| body)
+                .unwrap_or_default();
+            serde_json::from_str::<crate::hub::work::WorkCheckpoint>(body)
+                .unwrap_or_else(|error| panic!("{error}: {body}"));
+        }
+        let scoped = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, true)));
+        assert!(
+            scoped.starts_with("AgentSCM: EDIT_UNLINKED: this edit was not applied"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("outside the scope of wrk_a, which that session leads")
+                && scoped.contains("the parent should checkpoint [\"src/a.rs\"] into its scope")
+                && scoped.contains("Do not start, join or take over Work"),
+            "{scoped}"
+        );
+        // A parent that only helps cannot widen the scope; it asks the lead.
+        let helper = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, false)));
+        assert!(
+            helper.contains("which another session leads")
+                && helper.contains("ask that lead to checkpoint [\"src/a.rs\"]"),
+            "{helper}"
+        );
         // Without a usable session ID none is shown or guessed.
         let unnamed = Call::parse(
             Agent::Claude,
@@ -2255,7 +2726,74 @@ mod tests {
             Agent::Claude,
             &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"}),
         );
-        assert_eq!(bash_done.kind, Kind::Activity(CallPhase::End));
+        // Without an observation a shell call's end stays silent activity; with one it is
+        // either an after-the-fact check or an end that says it could not tell.
+        assert_eq!(
+            (bash_done.kind, bash_done.shape, bash_done.observed),
+            (Kind::Activity(CallPhase::End), Shape::Silent, None)
+        );
+        let shell_end = |agent, event: &str, tool: &str, observed: Value| {
+            parse(
+                agent,
+                &json!({"hook_event_name": event, "session_id": "s", "cwd": "/r",
+                    "tool_name": tool, "observed": observed}),
+            )
+        };
+        let changed = shell_end(
+            Agent::Claude,
+            "PostToolUse",
+            "Bash",
+            json!({"outcome": "changed", "paths": ["src/b.rs", "a.rs"], "truncated": false}),
+        );
+        assert_eq!(
+            (changed.kind, changed.shape, changed.paths, changed.deny),
+            (
+                Kind::Check,
+                Shape::Hook("PostToolUse"),
+                vec!["a.rs".to_owned(), "src/b.rs".to_owned()],
+                false
+            )
+        );
+        let failed = shell_end(
+            Agent::Codex,
+            "PostToolUseFailure",
+            "Bash",
+            json!({"outcome": "unknown", "reason": "git_failed"}),
+        );
+        assert_eq!(
+            (failed.kind, failed.shape, failed.observed),
+            (
+                Kind::Activity(CallPhase::End),
+                Shape::Hook("PostToolUseFailure"),
+                Some(Observed::Unknown("git_failed"))
+            )
+        );
+        // A failed shell call ends even when nothing was observed; other tools' failures are not
+        // read at all.
+        let quiet = parse(
+            Agent::Claude,
+            &json!({"hook_event_name": "PostToolUseFailure", "session_id": "s", "tool_name": "Bash"}),
+        );
+        assert_eq!(
+            (quiet.kind, quiet.shape),
+            (Kind::Activity(CallPhase::End), Shape::Silent)
+        );
+        let other = parse(
+            Agent::Claude,
+            &json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Read"}),
+        );
+        assert_eq!(other.kind, Kind::Ignore);
+        // A non-shell tool never reads the field.
+        let read = shell_end(
+            Agent::Claude,
+            "PostToolUse",
+            "Read",
+            json!({"outcome": "changed", "paths": ["a.rs"]}),
+        );
+        assert_eq!(
+            (read.kind, read.observed),
+            (Kind::Activity(CallPhase::Tick), None)
+        );
         let cursor_pre = parse(
             Agent::Cursor,
             &json!({"hook_event_name": "preToolUse", "tool_name": "Write"}),

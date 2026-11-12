@@ -84,7 +84,7 @@ src/telemetry.rs let config: Config = serde_json::from_slice(&bytes).map_err(|_|
 
 # src/work_cli.rs: a command-line argument, the caller's request file, strict because it becomes a request
 src/work_cli.rs let remedy: RemedyKind = serde_json::from_value(json!(remedy)).map_err(|_| {
-src/work_cli.rs serde_json::from_str(&text).map_err(|_| invalid("work request is not valid strict JSON"))
+src/work_cli.rs serde_json::from_str(&text).map_err(|error| {
 
 # src/workflow_library.rs: rows of the local workflow library database, an action declaration
 src/workflow_library.rs .map(|value| serde_json::from_str(&value))
