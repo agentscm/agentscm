@@ -156,7 +156,8 @@ uploads it to the Hub's object store.
 ### The repository setting
 
 Whether a repository shares agent conversations is a Hub setting, **Share agent conversations**,
-not a per-checkout switch. It starts off. A repository admin (GitHub `admin`, GitLab maintainer
+not a per-checkout switch. It is on by default on a new Hub, and stays off on a Hub that already
+had people when the default became on. A repository admin (GitHub `admin`, GitLab maintainer
 or owner) or a Hub admin changes it for one repository; a Hub admin can also set a Hub-wide
 default that applies to every repository without its own setting. The routes are in
 [conversation sharing](hub.md#conversation-sharing).
@@ -177,8 +178,10 @@ default that applies to every repository without its own setting. The routes are
   already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
   that person's own sessions in the repository, on every computer, from uploading;
   `change-capture opt-in` undoes it. The choice is per person and repository, stored on the Hub.
-  Opting out works forward: bodies already uploaded stay readable to the repository's readers
-  until they expire or their author deletes them with `change-capture conversation --delete`.
+  Opting out also hides what the person shared before: their entries leave other readers'
+  listings and their bodies are no longer served to them, while the person and Hub admins still
+  read them. The bodies stay stored until they expire or their author deletes them with
+  `change-capture conversation --delete`, and opting in again shows them again.
 - **Every session says whether it shares, and why not.** The session-start context says
   "conversation sharing is on for this session", or that it is off with the reason and the one
   command that changes it:
@@ -285,7 +288,8 @@ confirmation turns sharing on. Turning sharing off needs no confirmation.
   hex, recorded in the binding); worktree id `checkout_<32 random hex characters>`; setup digest 32
   random bytes in hex; base ref the checkout's default branch from `origin/HEAD` as `origin/<name>`
   when that resolves to a commit, else `origin/main`; one action rule,
-  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root; default spool
+  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root of its own, so
+  usage is read from Claude Code's projects directory (see below); default spool
   limits; hooks in `ROOT/.claude/settings.local.json`. The ids are random, not derived from the
   path, so they cannot be recomputed offline from Hub records by guessing paths and two computers
   with the same path never share one; the saved binding is what keeps them stable across
@@ -403,6 +407,8 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
 number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
+A program that embeds the Hub may set it per repository instead, from 0 to 3650; at 0 the Hub keeps no
+bodies for that repository, asks for no uploads and the page says nothing is uploaded.
 `client status --check` carries it in the connection's `hub_check` (when the check is valid), and the
 local page's `GET /v1/local/capture` lists it per
 checkout (looked up with the checkout's own agent token and reused for a minute). The page
@@ -495,10 +501,14 @@ agentscm change-capture configure \
   --recipe-file /absolute/private/test-recipe.json
 ```
 
-`--claude-history-root` is optional. When configured, the Claude hook may read only the regular
-JSONL file whose basename exactly matches the observed native session id and whose canonical path
-remains beneath that non-symlink directory. A caller-supplied transcript path alone grants no read
-authority. The reader follows a bounded per-session offset and file identity; replacement,
+A captured Claude Code session reports its token counts and model names by default, in every
+capture mode. The hook reads them from the session's own history file: the regular JSONL file whose
+basename exactly matches the observed native session id and whose canonical path remains beneath
+the history root. The history root is Claude Code's projects directory (`projects` under
+`$CLAUDE_CONFIG_DIR`, else under `~/.claude`), unless `--claude-history-root` names another
+non-symlink directory. A caller-supplied transcript path alone grants no read authority: a file
+outside the root, or named for another session, is not read, and usage stays unknown. A subagent's
+history is a separate file and is not read. The reader follows a bounded per-session offset and file identity; replacement,
 truncation, malformed complete records, foreign session records, or a changed Work association
 produce an explicit capture gap. Replacement and truncation stop that cursor. A Work or generation
 change rebinds at the opened snapshot's end of file: boundary records remain unattributed and later

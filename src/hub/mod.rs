@@ -1,4 +1,5 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
+pub mod access;
 pub mod advice;
 pub mod agent_messages;
 pub mod agent_rules;
@@ -37,6 +38,7 @@ mod lead_credential;
 pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;
+pub mod merged_holds;
 pub mod narrative;
 pub mod onboarding;
 mod overlap_detail;
@@ -233,10 +235,10 @@ const WORK_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_
 const WORK_COMPACTION_BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
 
-/// Applies the operator `work compact` to every repository scope with history older than
-/// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
-/// results and how many scopes were skipped: refused by a guard or the store stayed busy. An open
-/// delivery the pass would cut is ended, not a reason to skip, so a busy repository still
+/// Applies the operator `work compact` to every repository scope with history older than what
+/// it keeps ([`HubState::work_history_seconds`]), with that command's own guards. Returns the
+/// applied results and how many scopes were skipped: refused by a guard or the store stayed busy.
+/// An open delivery the pass would cut is ended, not a reason to skip, so a busy repository still
 /// compacts. Each scope is a separate bounded store call.
 pub async fn compact_work_history(
     state: &HubState,
@@ -244,13 +246,20 @@ pub async fn compact_work_history(
 ) -> Result<(Vec<work::WorkCompaction>, usize)> {
     let store = state.store.clone();
     let scopes = blocking_when_free(state, move || store.work_compaction_scopes()).await?;
-    let before = now - WORK_AUTO_COMPACTION_AGE_SECONDS;
     let mut applied = Vec::new();
     let mut skipped = 0;
     for scope in scopes {
-        let store = state.store.clone();
-        match blocking_when_free(state, move || store.work_compact(&scope, before, true, now)).await
-        {
+        let (store, hub) = (state.store.clone(), state.clone());
+        let compact = move || {
+            // An embedder that cannot say how long one repository keeps its history skips only
+            // that repository this pass.
+            let kept = hub.work_history_seconds(&scope).map_err(|error| {
+                error_envelope::log_internal(&error);
+                HubError::Invalid("history length unknown".into())
+            })?;
+            store.work_compact(&scope, now - kept, true, now)
+        };
+        match blocking_when_free(state, compact).await {
             Ok(result) => applied.push(result),
             Err(HubError::Invalid(_) | HubError::Busy) => skipped += 1,
             Err(error) => return Err(error),
@@ -300,6 +309,10 @@ pub async fn work_compaction_loop(state: HubState) {
     }
 }
 
+/// A per-repository number an embedding program supplies; see [`HubState::with_work_history`]
+/// and [`HubState::with_shared_conversation_retention`].
+type PerRepository = Arc<dyn Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync>;
+
 pub const DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 30;
 pub const MAX_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 3650;
 
@@ -318,9 +331,15 @@ pub struct HubState {
     demo: bool,
     /// Days an uploaded shared-conversation body stays readable.
     shared_conversation_retention_days: i64,
+    /// Set by an embedding program: days each repository keeps shared-conversation bodies.
+    body_retention: Option<PerRepository>,
     slack: Option<Arc<slack::Slack>>,
     /// The operator-registered context source; `None` unless `hub serve` loaded one.
     pub context_source: Option<Arc<context_source::ContextSource>>,
+    /// Set by an embedding program to decide who may use the Hub; `None` keeps the Hub's rules.
+    access: Option<Arc<dyn access::Access>>,
+    /// Set by an embedding program: seconds of stand-up history each repository keeps.
+    work_history: Option<PerRepository>,
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
     workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
@@ -341,8 +360,11 @@ impl HubState {
             onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
             shared_conversation_retention_days: DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS,
+            body_retention: None,
             slack: None,
             context_source: None,
+            access: None,
+            work_history: None,
             workspace: None,
             #[cfg(unix)]
             workspace_execution: None,
@@ -354,6 +376,60 @@ impl HubState {
     pub fn with_login(mut self, login: login::Login) -> Self {
         self.login = Arc::new(login);
         self
+    }
+
+    /// Lets `access` decide who may use the Hub and what each person may do (see
+    /// [`access::Access`]).
+    pub fn with_access(mut self, access: Arc<dyn access::Access>) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    /// Lets `keep` decide how many seconds of stand-up history each repository keeps, at least a
+    /// day; without it every repository keeps [`WORK_AUTO_COMPACTION_AGE_SECONDS`]. It runs on a
+    /// blocking thread, once per repository per compaction pass and per retention read; an error
+    /// skips the pass rather than guessing.
+    pub fn with_work_history(
+        mut self,
+        keep: impl Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync + 'static,
+    ) -> Self {
+        self.work_history = Some(Arc::new(keep));
+        self
+    }
+
+    /// Seconds of stand-up history `scope` keeps. Call it from a blocking thread.
+    pub(crate) fn work_history_seconds(&self, scope: &work::WorkRepositoryScope) -> Result<i64> {
+        match &self.work_history {
+            None => Ok(WORK_AUTO_COMPACTION_AGE_SECONDS),
+            Some(keep) => keep(scope).map(|seconds| seconds.max(86_400)),
+        }
+    }
+
+    /// Lets `keep` decide how many days each repository keeps an uploaded shared-conversation
+    /// body, 0 to [`MAX_SHARED_CONVERSATION_RETENTION_DAYS`]; 0 keeps none, so the Hub asks for no
+    /// uploads and refuses them. Without it every repository keeps the Hub-wide
+    /// [`Self::with_shared_conversation_retention_days`]. It runs on a blocking thread, per upload,
+    /// upload check and retention read; an error fails that request rather than guessing. A body
+    /// keeps the expiry set when it was uploaded.
+    pub fn with_shared_conversation_retention(
+        mut self,
+        keep: impl Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync + 'static,
+    ) -> Self {
+        self.body_retention = Some(Arc::new(keep));
+        self
+    }
+
+    /// Days `scope` keeps an uploaded shared-conversation body. Call it from a blocking thread.
+    pub(crate) fn shared_conversation_retention_days(
+        &self,
+        scope: &work::WorkRepositoryScope,
+    ) -> Result<i64> {
+        match &self.body_retention {
+            None => Ok(self.shared_conversation_retention_days),
+            Some(keep) => {
+                keep(scope).map(|days| days.clamp(0, MAX_SHARED_CONVERSATION_RETENTION_DAYS))
+            }
+        }
     }
 
     /// Revokes every connected-app credential whose app the apps file no longer registers, with
@@ -503,6 +579,12 @@ fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config
 }
 
 pub fn router(state: HubState) -> Router {
+    router_with(state, Router::new())
+}
+
+/// [`router`] with `extra` routes from a program that embeds the Hub, served under the same body
+/// and time bounds and error envelope as the Hub's own. A path both define panics at startup.
+pub fn router_with(state: HubState, extra: Router<HubState>) -> Router {
     #[cfg(unix)]
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
@@ -534,6 +616,7 @@ pub fn router(state: HubState) -> Router {
         .merge(sync::routes())
         .merge(ui::routes())
         .merge(workspace_routes)
+        .merge(extra)
         .fallback(http::not_found);
     #[cfg(unix)]
     let publication = workspace_publication::routes();

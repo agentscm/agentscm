@@ -3714,6 +3714,33 @@ fn hand_off_pickups(db: &Db) {
     );
 }
 
+/// Agent conversations are shared by default on a Hub with no one in it. A Hub that has people
+/// when it gets that default keeps off, and a default somebody set is left alone.
+fn conversation_sharing_default_stays_off_for_a_hub_that_has_people(db: &Db) {
+    const KEY: &str = "conversation_sharing:default";
+    let store = db.open();
+    let migrate = || {
+        db.exec(if db.pg.is_some() {
+            include_str!("../../src/hub/migrations/named/conversation_sharing_default.pg.sql")
+        } else {
+            include_str!("../../src/hub/migrations/named/conversation_sharing_default.sqlite.sql")
+        })
+        .unwrap()
+    };
+    // Opening an empty Hub ran the migration and recorded nothing, as does running it again.
+    assert_eq!(store.get_setting(KEY).unwrap(), None);
+    migrate();
+    assert_eq!(store.get_setting(KEY).unwrap(), None);
+
+    store.upsert_user(&identity(7), "alice").unwrap();
+    migrate();
+    assert_eq!(store.get_setting(KEY).unwrap().as_deref(), Some("off"));
+
+    store.set_setting(KEY, "on", "admin").unwrap();
+    migrate();
+    assert_eq!(store.get_setting(KEY).unwrap().as_deref(), Some("on"));
+}
+
 fn settings_read_write_and_create_once(db: &Db) {
     let store = db.open();
     assert_eq!(store.get_setting("k").unwrap(), None);
@@ -3811,6 +3838,7 @@ conformance!(
     local_ci_corrupt_records_are_refused,
     hand_off_pickups,
     work_payload_used_reads_the_charged_bytes,
+    conversation_sharing_default_stays_off_for_a_hub_that_has_people,
     settings_read_write_and_create_once,
 );
 

@@ -13,12 +13,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use super::access;
 use super::error_envelope::{self, ErrorCode, ErrorEnvelope, InputProblem};
 use super::login::{Login, LoginConfig};
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
-use super::{HubError, HubState, Result, open_objects, router};
+use super::{HubError, HubState, Result, open_objects, router_with};
 
 pub struct HubConfig {
     pub database_url: String,
@@ -89,6 +90,16 @@ async fn lease_clock_loop(state: HubState) {
 }
 
 pub async fn serve(config: HubConfig) -> Result<()> {
+    serve_with(config, |state| Ok((state, Router::new()))).await
+}
+
+/// [`serve`] for a program that embeds the Hub. `customize` gets the configured state before any
+/// background work starts and returns it, with routes to serve beside the Hub's own (see
+/// [`super::router_with`]).
+pub async fn serve_with(
+    config: HubConfig,
+    customize: impl FnOnce(HubState) -> Result<(HubState, Router<HubState>)>,
+) -> Result<()> {
     if !config.bind.ip().is_loopback() && !config.public {
         return Err(HubError::Invalid(
             "binding a non-loopback address requires --public".into(),
@@ -220,6 +231,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .map_err(|_| HubError::Unavailable("Slack startup task failed".into()))??;
         state = state.with_slack(slack);
     }
+    let (state, extra) = customize(state)?;
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
         crate::hub::error_envelope::log_internal(&error);
@@ -246,7 +258,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         crate::http_listener::shutdown_signal().await;
         save_waits(stopping).await;
     };
-    crate::http_listener::serve(listener, router(state), stop).await;
+    crate::http_listener::serve(listener, router_with(state, extra), stop).await;
     if let Some(worker) = slack_worker {
         worker.abort();
     }
@@ -489,7 +501,7 @@ impl FromRequestParts<HubState> for Reader {
         let digest = agent_token_digest(raw)?;
         let web_digest = web_read_token_digest(raw)?;
         let store = state.store.clone();
-        blocking(state, move || {
+        let principal = blocking(state, move || {
             let now = unix_now();
             match store.authenticate(&digest, now)? {
                 Some(principal) => Ok(Some(principal)),
@@ -497,8 +509,12 @@ impl FromRequestParts<HubState> for Reader {
             }
         })
         .await?
-        .map(Self)
-        .ok_or_else(ApiError::unauthorized)
+        .ok_or_else(ApiError::unauthorized)?;
+        // A token keeps the repository it was minted for; the embedder must still grant it now.
+        access::token(state, principal)
+            .await?
+            .map(Self)
+            .ok_or_else(access::not_granted)
     }
 }
 
@@ -556,9 +572,20 @@ async fn whoami(
     State(state): State<HubState>,
     Reader(principal): Reader,
 ) -> Json<serde_json::Value> {
+    let (hub, repository) = (
+        state.clone(),
+        super::work::WorkRepositoryScope::of(&principal),
+    );
+    // Unknown (null) rather than a failed identity check when the number cannot be read.
+    let retention_days = blocking(&state, move || {
+        hub.shared_conversation_retention_days(&repository)
+    })
+    .await
+    .inspect_err(super::error_envelope::log_internal)
+    .ok();
     let owner = principal.owner;
     Json(json!({
-        "shared_conversation_retention_days": state.shared_conversation_retention_days,
+        "shared_conversation_retention_days": retention_days,
         "token": {
             "id": principal.token_id,
             "name": principal.name,

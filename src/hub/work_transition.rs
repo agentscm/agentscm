@@ -38,6 +38,13 @@ pub enum WorkTransitionActor<'a> {
         repository_id: i64,
         is_admin: bool,
     },
+    /// The Hub applying a repository's opted-in policy for the Work's owner, who is not asked.
+    /// It has the owner's standing, may only release, and the event records no login.
+    Policy {
+        owner: &'a User,
+        repository: &'a str,
+        repository_id: i64,
+    },
 }
 
 /// Whose view a lifecycle read is.
@@ -244,6 +251,21 @@ pub(super) fn classify(
                 agent: Some((who.token.clone(), who.agent.clone(), session.to_owned())),
             }))
         }
+        WorkTransitionActor::Policy { owner, .. } => {
+            if session.is_some() {
+                return Err(invalid("a policy does not act through a session"));
+            }
+            if owner.id != item.owner {
+                return Ok(None);
+            }
+            Ok(Some(Acting {
+                kind: WorkActorKind::Owner,
+                via: ActorVia::Policy,
+                user_id: owner.id.clone(),
+                login: String::new(),
+                agent: None,
+            }))
+        }
         WorkTransitionActor::Person { user, is_admin, .. } => {
             if session.is_some() {
                 return Err(invalid("a person does not act through a session"));
@@ -439,7 +461,8 @@ pub(super) fn event(
         json!({
             "transition": request.transition,
             "actor": {"kind": acting.kind, "id": acting.user_id,
-                      "login": acting.login, "via": acting.via},
+                      "login": (acting.via != ActorVia::Policy).then_some(&acting.login),
+                      "via": acting.via},
             "reason": request.reason,
             "operation_id": request.operation_id,
             "prior_state": prior.state,

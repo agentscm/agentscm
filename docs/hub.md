@@ -561,7 +561,8 @@ start; until then they stop working (401 `sign_in_required`).
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
   token's id, name, repository and expiry, and its owner, plus
   `shared_conversation_retention_days`, the days this Hub keeps an uploaded shared conversation
-  (`hub serve --shared-conversation-retention-days`, 1 to 3650). The field is additive: a Hub
+  for the token's repository (`hub serve --shared-conversation-retention-days`, 1 to 3650, unless
+  a program that embeds the Hub sets it per repository, where 0 means it keeps none). The field is additive: a Hub
   that predates it omits it, and clients then say the retention is not known instead of naming a
   number. Every authentication failure returns the same 401 body.
 - `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes
@@ -1181,16 +1182,18 @@ explicitly untrusted structured data and are not interpolated into that narratio
 ### Shared conversation reads
 
 Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares
-agent conversations (see [conversation sharing](#conversation-sharing)), by anyone who can read the
-repository: any of their tokens, read-only ones included, so the Hub's web pages read them with
-their read token. Otherwise only the human who declared them (any of that person's tokens for the
+agent conversations (see [conversation sharing](#conversation-sharing)) and their author has not
+opted out, by anyone who can read the repository: any of their tokens, read-only ones included, so
+the Hub's web pages read them with their read token. Opting out takes effect on what the person
+shared before as well: their entries leave other readers' listings and their bodies answer as a
+digest nobody declared, until they opt in again. Otherwise only the human who declared them (any of that person's tokens for the
 repository) and Hub admins (`AGENTSCM_ADMINS`) read them, which also holds for bodies uploaded
 before the setting was turned off. Only the author and Hub admins delete; read-only tokens never
 do. Admins can read every body, so list them as
 `provider:#<numeric user id>` (for example `github:#42`), which survives a rename or re-registered
 login, rather than by login name. The Work owner has no special access unless they are the
 author. Each human's declaration of a digest is its own row, so two authors of identical content
-each have their own entry, upload and expiry. The listing returns every author's entries to
+each have their own entry, upload and expiry. The listing returns the entries of every author who has not opted out to
 a reader while the repository shares, else only the caller's own (an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that
 digest gets 403 `forbidden` whether or not the digest exists (a Hub admin learns unknown as 404). There
 is no per-body grant.
@@ -1230,10 +1233,26 @@ the person who shared it (older clients, which refuse unknown fields, need upgra
 
 ### Conversation sharing
 
-**Share agent conversations** is a per-repository Hub setting with a Hub-wide default; both start
-off and live in the Hub's settings table, keyed by the forge's repository id so a rename keeps
-them. Connected checkouts follow it as described in
+**Share agent conversations** is a per-repository Hub setting with a Hub-wide default. Both live
+in the Hub's settings table, keyed by the forge's repository id so a rename keeps them. Connected
+checkouts follow it as described in
 [the repository setting](change-capture.md#the-repository-setting).
+
+The Hub-wide default is on until a Hub admin sets it, so on a new Hub a connected repository shares
+its agents' conversations with the people who can read it there. Four switches turn that off, and
+each still wins over the default:
+
+- a Hub admin sets the Hub-wide default off (`PUT .../conversation-sharing/default` below);
+- a repository admin sets the repository off;
+- a person opts their own sessions out for a repository;
+- a checkout's own capture mode is lower than `shared-conversation`, or its capture is off
+  ([capture modes](change-capture.md)).
+
+A Hub that already had people when it first ran a build with this default keeps sharing off: the
+`conversation_sharing_default` migration records the default as off there, unless a Hub admin had
+already set it. Nothing a person had not agreed to share starts uploading because of an upgrade. A
+Hub admin turns the default on for such a Hub with the same `PUT`. Each person's agent is told once
+at session start that sharing is on.
 
 - `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
   `{repository, enabled, source, hub_default, opted_out, notified, sharing}` for the token's
@@ -1302,6 +1321,11 @@ person can switch their own off. Both values live in the Hub's settings table, k
 forge's repository id so a rename keeps them; a token minted without a forge repository id is
 never sent a digest. `agentscm digest enable`, `disable`, `opt-out`, `opt-in` and `settings` call
 these routes. Reading the digest needs neither switch.
+
+A separate per-repository setting, `GET` or `PUT /v1/hub/standup/merged-release/settings`, lets the
+sync poll release the hold of Work whose merged pull request closed its source issue as completed
+([automatic release](standup.md#automatic-release-of-a-merged-works-hold)). It is off by default,
+and only a Hub admin or a repository admin can switch it on with `PUT`.
 
 **Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
 digest once a week as a private direct message to each person who has a Slack binding for the
@@ -1406,6 +1430,32 @@ Repositories are added one at a time with
 them (409 when another connection already holds the repository). A PAT acts as one
 person: its comments appear as theirs.
 `AGENTSCM_GITHUB_URL` and `AGENTSCM_GITHUB_API_URL` are the ones sign-in uses.
+
+Embedded connections. A program that embeds the hub as a library can supply a
+connection's credential itself. It implements `sync::ConnectionCredentials`
+(`token`, `active` and, optionally, `namespace`) and passes it to
+`Sync::with_connection_credentials`, then records connections of kind `embedded`
+(GitHub or GitLab; no app id or slug; `acts_as` is required, so the hub recognises
+its own comments and statuses). For an embedded connection the hub asks `token`
+for a current credential on every use and caches nothing. An unauthorized answer
+marks the connection `auth_failed` and starts the usual backoff; any other error
+skips that repository for the round. Without an embedder, an embedded connection
+fails as a credential problem and nothing is called. Embedded connections are
+polled only: their webhook route answers 401. Repositories are added as for a
+PAT (`POST /v1/hub/connections/{id}/repositories`). `active` applies to every
+connection kind, apps included: a repository it answers false for is skipped by
+polling, the catch-up status pass and webhook jobs, though discovery still
+attaches it. With only `AGENTSCM_GITLAB_URL` set (no token), the GitLab client
+serves embedded connections alone.
+
+Following a GitLab namespace. When `namespace` names a group or a user for a
+GitLab connection that is not an app, each poll lists its projects
+(`/groups/:id/projects?include_subgroups=true&archived=false`, or
+`/users/:id/projects?archived=false`), 100 a page and at most 10 pages, and
+connects new ones as discovery does. Nothing is detached; a project another
+connection holds stays with it. A listing cut short at the page cap adds a poll
+report with an empty `repository` and `truncated: {"namespace_projects": <pages
+unread>}`. At most 1,000 connected repositories per connection are polled.
 
 _Experimental: tested only against in-process fake servers, not live GitHub or GitLab._
 

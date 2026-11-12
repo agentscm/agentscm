@@ -1119,6 +1119,34 @@ impl Api {
         }
     }
 
+    /// How one issue stands: its state, close reason and the pull request of its latest closing
+    /// event. One GraphQL call; any reply that does not decode is an error, never a fact.
+    pub async fn issue_closure(
+        &self,
+        token: &str,
+        full_name: &str,
+        number: u64,
+    ) -> Gh<super::merged_holds::IssueClosure> {
+        const QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){state stateReason timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{closer{__typename ... on PullRequest{number repository{databaseId}}}}}}}}}";
+        let (owner, name) = full_name
+            .split_once('/')
+            .ok_or_else(|| GhError::Failed("bad repository name".into()))?;
+        let body = json!({"query": QUERY,
+            "variables": {"owner": owner, "name": name, "number": number}});
+        let reply = self
+            .call(token, Method::POST, &self.graphql, Some(body), None)
+            .await?;
+        let body = reply.ok("graphql")?;
+        let errors = body["errors"].as_array().into_iter().flatten();
+        if errors.clone().any(|e| e["type"] == "RATE_LIMITED") {
+            return Err(GhError::Limited(unix_now() + MIN_BACKOFF_SECONDS));
+        }
+        if !body["errors"].is_null() {
+            return Err(GhError::Failed("graphql issue unavailable".into()));
+        }
+        super::merged_holds::IssueClosure::from_graphql(&body)
+    }
+
     /// `(comment id, author login, body)` of the first three pages of comments.
     pub async fn comments(
         &self,

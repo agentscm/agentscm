@@ -50,6 +50,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 
+use super::access::Level;
 use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
@@ -1266,16 +1267,18 @@ struct Page {
     messages: Vec<MessageView>,
 }
 
-/// The signed-in person, the repository's forge id, and their live writing tokens for it.
+/// The signed-in person, the repository's forge id, and their live writing tokens for it, when
+/// they may act on it at `need`.
 async fn scoped(
     state: &HubState,
     human: &HumanSession,
     repository: &str,
+    need: Level,
 ) -> std::result::Result<(super::store::User, i64, Vec<(String, String)>), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
     let repo =
-        super::login::devices::mint_check(state, &user, repository, "agent_messages").await?;
+        super::login::devices::mint_check(state, &user, repository, "agent_messages", need).await?;
     let (store, owner, repository_id) = (state.store.clone(), user.id.clone(), repo.repository_id);
     let tokens = blocking(state, move || {
         let now = unix_now();
@@ -1340,7 +1343,8 @@ async fn list(
     query: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let (user, repository_id, tokens) = scoped(&state, &human, &query.repository).await?;
+    let (user, repository_id, tokens) =
+        scoped(&state, &human, &query.repository, Level::Read).await?;
     let store = state.store.clone();
     let page = blocking(&state, move || {
         page(&*store, &user.id, repository_id, &tokens)
@@ -1365,7 +1369,8 @@ async fn set_mode(
     human: HumanSession,
     JsonBody(body): JsonBody<ModeBody>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (user, repository_id, tokens) = scoped(&state, &human, &body.repository).await?;
+    let (user, repository_id, tokens) =
+        scoped(&state, &human, &body.repository, Level::Contribute).await?;
     let store = state.store.clone();
     let page = blocking(&state, move || {
         let key = mode_key(&user.id, body.this_repository.then_some(repository_id));
@@ -1423,7 +1428,8 @@ async fn send(
     if let Some(id) = &body.work_id {
         checked_name("work_id", id)?;
     }
-    let (user, repository_id, tokens) = scoped(&state, &human, &body.repository).await?;
+    let (user, repository_id, tokens) =
+        scoped(&state, &human, &body.repository, Level::Contribute).await?;
     if !tokens.iter().any(|(id, _)| *id == body.token) {
         return Err(
             ApiError::new(StatusCode::FORBIDDEN, "not_your_agent").with_message(
@@ -1495,7 +1501,8 @@ async fn withdraw(
     query: std::result::Result<Query<WithdrawQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let (user, repository_id, tokens) = scoped(&state, &human, &query.repository).await?;
+    let (user, repository_id, tokens) =
+        scoped(&state, &human, &query.repository, Level::Contribute).await?;
     let store = state.store.clone();
     let page = blocking(&state, move || {
         let key = messages_key(&user.id, repository_id);

@@ -1684,6 +1684,15 @@ mod shared_bodies {
         }
 
         async fn start_undeclared_for(retention_days: i64) -> Self {
+            Self::start_undeclared_with(move |state| {
+                state
+                    .with_shared_conversation_retention_days(retention_days)
+                    .unwrap()
+            })
+            .await
+        }
+
+        async fn start_undeclared_with(customize: impl FnOnce(HubState) -> HubState) -> Self {
             let directory = TempDir::new().unwrap();
             let database = format!("sqlite://{}", directory.path().join("hub.sqlite").display());
             let store = store::open(&database).unwrap();
@@ -1699,10 +1708,10 @@ mod shared_bodies {
                 (name == "AGENTSCM_ADMINS").then(|| "github:#900".to_owned())
             })
             .unwrap();
-            let state = HubState::new(store.clone(), backend.clone())
-                .with_login(Login::new(login).unwrap())
-                .with_shared_conversation_retention_days(retention_days)
-                .unwrap();
+            let state = customize(
+                HubState::new(store.clone(), backend.clone())
+                    .with_login(Login::new(login).unwrap()),
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1830,7 +1839,17 @@ mod shared_bodies {
         }
 
         async fn start_for(retention_days: i64) -> Self {
-            let fixture = Self::start_undeclared_for(retention_days).await;
+            Self::start_with(move |state| {
+                state
+                    .with_shared_conversation_retention_days(retention_days)
+                    .unwrap()
+            })
+            .await
+        }
+
+        /// A declared body on a Hub an embedding program changed with `customize`.
+        async fn start_with(customize: impl FnOnce(HubState) -> HubState) -> Self {
+            let fixture = Self::start_undeclared_with(customize).await;
             let token = fixture.owner_token();
             fixture
                 .store
@@ -2060,6 +2079,69 @@ mod shared_bodies {
                     .contains("shared_conversation_retention_days")
             );
         }
+    }
+
+    /// whoami and the repository's retention read, both with the owner's token.
+    async fn reported_days(f: &Fixture) -> (Value, Value) {
+        let get = |path: String| async move {
+            let reply = f
+                .client
+                .get(format!("{}{path}", f.base))
+                .bearer_auth(&f.owner_secret)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::OK);
+            json_of(reply).await
+        };
+        let whoami = get("/v1/hub/whoami".into()).await;
+        let retention = get(format!("/v1/hub/repos/{REPOSITORY_PATH}/retention")).await;
+        (
+            whoami["shared_conversation_retention_days"].clone(),
+            retention["shared_conversations"]["retention_days"].clone(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_embedding_program_sets_how_long_each_repository_keeps_bodies() {
+        // Without the hook the Hub-wide number applies.
+        let f = Fixture::start_for(7).await;
+        assert_eq!(reported_days(&f).await, (json!(7), json!(7)));
+
+        // The hook's number replaces it for reads and for the expiry an upload sets.
+        let f = Fixture::start_with(|state| {
+            state.with_shared_conversation_retention(|scope| {
+                assert_eq!(scope.repository_id, Some(77));
+                Ok(365)
+            })
+        })
+        .await;
+        assert_eq!(reported_days(&f).await, (json!(365), json!(365)));
+        let before = unix_now();
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        let expires = f.row().expires_at.unwrap();
+        assert!(expires >= before + 365 * DAY && expires <= unix_now() + 365 * DAY);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_that_keeps_no_bodies_asks_for_none_and_refuses_uploads() {
+        let f =
+            Fixture::start_with(|state| state.with_shared_conversation_retention(|_| Ok(0))).await;
+        assert_eq!(reported_days(&f).await, (json!(0), json!(0)));
+        let (status, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["missing"], json!([]));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2450,6 +2532,59 @@ mod shared_bodies {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opting_out_also_hides_what_the_person_shared_before() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        let entries = |page: Value| page["entries"].as_array().unwrap().len();
+        let (_, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(entries(page), 1);
+        let opt = |opted_out: bool| {
+            f.client
+                .put(format!(
+                    "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing/me",
+                    f.base
+                ))
+                .bearer_auth(&f.owner_secret)
+                .header("content-type", "application/json")
+                .body(json!({"opted_out": opted_out}).to_string())
+                .send()
+        };
+        assert_eq!(opt(true).await.unwrap().status(), StatusCode::OK);
+
+        // Another member no longer lists or reads it, and is told what they are told for a digest
+        // nobody declared, so the answer does not say the body exists.
+        let (status, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(entries(page), 0);
+        let hidden = f.read(&f.member_secret, &f.sha).await;
+        let unknown = f.read(&f.member_secret, &"1".repeat(64)).await;
+        assert_eq!(hidden.status(), unknown.status());
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        assert!(!hidden.text().await.unwrap().contains("synthetic"));
+        let none = f.mcp(&f.member_secret, json!({"work_id": f.work_id})).await;
+        assert!(!none.to_string().contains(&f.sha), "{none}");
+
+        // The author, on every token of theirs, and a Hub admin still list and read it.
+        for secret in [&f.owner_secret, &f.sibling_secret, &f.admin_secret] {
+            let (_, page) = f.list(secret, "").await;
+            assert_eq!(entries(page), 1);
+            assert_eq!(f.read(secret, &f.sha).await.status(), StatusCode::OK);
+        }
+
+        // Opting in again shares it again.
+        assert_eq!(opt(false).await.unwrap().status(), StatusCode::OK);
+        let (_, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(entries(page), 1);
+        assert_eq!(
+            f.read(&f.member_secret, &f.sha).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn listing_maps_availability_through_upload_expiry_and_deletion() {
         // One day of retention, so a three-day token is still valid at the deadline.
         let f = Fixture::start_for(1).await;
@@ -2489,13 +2624,25 @@ mod shared_bodies {
         };
         let at_deadline = f
             .store
-            .shared_conversation_page(&long_lived, &f.work_id, None, false, expires)
+            .shared_conversation_page(
+                &long_lived,
+                &f.work_id,
+                None,
+                agentscm::hub::change_record::ConversationAudience::Own,
+                expires,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(at_deadline[0].availability, ContentAvailabilityV1::Expired);
         let before_deadline = f
             .store
-            .shared_conversation_page(&long_lived, &f.work_id, None, false, expires - 1)
+            .shared_conversation_page(
+                &long_lived,
+                &f.work_id,
+                None,
+                agentscm::hub::change_record::ConversationAudience::Own,
+                expires - 1,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
