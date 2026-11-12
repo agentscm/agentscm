@@ -19,4 +19,4 @@ export const CHECKPOINT_NOT_PROOF = 'A checkpoint is the agent’s own report, n
 export const OVERLAP_IS_SIGNAL = 'An overlap is a reason to talk, not proof the code conflicts.'
 export const STILL_ASSIGNED = 'A quiet task is still assigned; coordinate with its lead before taking it over.'
 export const SEARCH_THIS_PAGE_ONLY = 'Search covers only what is loaded on this page.'
-export const OPEN_FROM_THIS_COMPUTER = 'Open it from the AgentSCM menu bar app (Open Hub), or run agentscm open in your repository.'
+export const OPEN_FROM_THIS_COMPUTER = 'Run agentscm open in your repository.'

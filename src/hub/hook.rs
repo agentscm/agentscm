@@ -24,7 +24,10 @@ use super::advice::{agent_name, unknown};
 use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
-use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
+use super::coordination::{
+    CoordinationInboxQuery, CoordinationRequest, CoordinationStatus, RequestedPathsHold,
+    response_kind_name,
+};
 use super::error_envelope::{self, ErrorCode, ErrorEnvelope};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
@@ -197,6 +200,9 @@ struct Call {
     /// What the hook client observed a shell call do to the working tree, on the call that ends
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
+    /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
+    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    notice: Option<Shape>,
 }
 
 /// At most this many paths in one observation; more set `truncated`. Defined here, not in the
@@ -360,7 +366,7 @@ async fn hook(
     let measured = (token.clone(), repo.clone());
     let started = Instant::now();
     let deadline = started + BUDGET;
-    let call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
+    let mut call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
         Ok(Ok(bytes)) => Call::parse(agent, &bytes, root_header(&parts.headers)),
         Ok(Err(_)) => Call::failed(agent, "hook payload too large"),
         Err(_) => Call::failed(agent, "hub timed out"),
@@ -493,12 +499,49 @@ async fn hook(
                                         && reply.responder.session == session
                                 })
                         });
-                        // A prompt repeats every turn, so it carries only what this session must answer.
-                        if call.kind == Kind::Prompt && !reply_needed {
+                        let own = !reply_needed
+                            && request.requester.token == principal.token_id
+                            && request.requester.session == session;
+                        let released =
+                            request.requested_paths == Some(RequestedPathsHold::Released);
+                        // A prompt repeats every turn, so it carries only what this session must
+                        // answer, and a requester's own request only while it has news the
+                        // requester has not acknowledged.
+                        let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
+                            receipt.target_work_id.is_none()
+                                && receipt.agent.token == principal.token_id
+                                && receipt.agent.session == session
+                                && receipt.through_seq >= request.updated_seq
+                        });
+                        if call.kind == Kind::Prompt
+                            && !reply_needed
+                            // A release need not bump the request's seq (a narrowed scope or an
+                            // ended intent), so it shows whether or not the requester acked.
+                            && !(own
+                                && (released
+                                    || (unacknowledged && !request.responses.is_empty())))
+                        {
                             continue;
                         }
                         shown += 1;
-                        outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        if own {
+                            let reply =
+                                request.responses.first().map_or_else(String::new, |reply| {
+                                    let note =
+                                        reply.note.as_deref().map_or_else(String::new, |note| {
+                                            format!(": {}", bounded_hook_text(note, 200))
+                                        });
+                                    format!(" Reply {}{note}.", response_kind_name(reply.kind))
+                                });
+                            let paths = if released {
+                                " The requested paths are released: retry agentscm_start."
+                            } else {
+                                ""
+                            };
+                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        } else {
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
                                 "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline. {NO_BYPASS}",
@@ -616,6 +659,13 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+    // A lapse notice is the only text an otherwise silent tool call carries.
+    if matches!(call.kind, Kind::Activity(_))
+        && outcome.status == "fyi"
+        && let Some(shape) = call.notice
+    {
+        call.shape = shape;
+    }
     settle_owner_lines(&state, &call, &mut outcome).await;
     let rendered = call.render(&outcome);
     let sample = super::hook_overhead::sample(
@@ -771,7 +821,21 @@ impl Call {
             cleared: false,
             launched: None,
             observed: None,
+            notice: None,
         }
+    }
+
+    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
+    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+        let event = match event {
+            "PreToolUse" => "PreToolUse",
+            "PostToolUse" => "PostToolUse",
+            _ => return self,
+        };
+        if agent == Agent::Claude {
+            self.notice = Some(Shape::Hook(event));
+        }
+        self
     }
 
     /// The shell call this call ends changed these files (observed by the hook client): already
@@ -1036,6 +1100,7 @@ impl Call {
             Kind::Activity(phase) => {
                 // Best effort and silent: the touch renews the session's own leases, and a
                 // failure must not disturb the agent. An unnamed session renews nothing.
+                let mut lapsed = None;
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
                     self.note_subagents(state, &principal);
@@ -1047,16 +1112,35 @@ impl Call {
                         report: false,
                         ..heartbeat
                     };
-                    if let Err(error) = blocking(state, move || {
-                        store.session_activity(&principal.token_id, &heartbeat, phase, unix_now())
+                    let id = principal.token_id.clone();
+                    let found = blocking(state, move || {
+                        store.session_activity(&id, &heartbeat, phase, unix_now())
                     })
                     .await
-                    {
-                        return Err(reason(error));
-                    }
+                    .map_err(reason)?;
+                    // Once per lapse, to the lead itself: a subagent's context ends with it.
+                    lapsed = found.filter(|text| {
+                        !self.child
+                            && self.notice.is_some()
+                            && first_note(format!("lapse\0{}\0{text}", principal.token_id))
+                    });
                 }
-                // Only a shell call's end that could not observe its changes says anything.
-                Ok(Outcome::advice(self.observed_line(), false))
+                // Only a shell call's end that could not observe its changes, or a lapse the
+                // lead has not been told of, says anything.
+                let mut outcome = Outcome::advice(self.observed_line(), false);
+                if let Some(text) = lapsed {
+                    let text = text.replace("when this was refused", "at this tool call");
+                    outcome.text = format!(
+                        "{}AgentSCM: this session's hold lapsed, so its next edit is refused until it holds the Work again. {text}",
+                        if outcome.text.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}\n", outcome.text)
+                        }
+                    );
+                    outcome.status = "fyi";
+                }
+                Ok(outcome)
             }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
@@ -1994,6 +2078,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
+                .noticed(agent, event)
                 .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
@@ -2002,7 +2087,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Kind::Activity(phase(tool, event == "PreToolUse")),
             Shape::Silent,
         )
-        .launched(&v["subagent"]),
+        .launched(&v["subagent"])
+        .noticed(agent, event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";

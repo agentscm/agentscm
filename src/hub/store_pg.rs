@@ -48,8 +48,8 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
-    response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, RequestedPathsHold, helper_join_editable, join_uncovered,
+    parse_response_kind, parse_status, response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -66,7 +66,8 @@ use super::handoff::{
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
     MAX_OBSERVATIONS, MAX_PUBLICATIONS, PublicationEvidence, RecordedCheck, TokenGroup,
-    UsageReceipt, UsageRecord, UsageSummary, WorkInsight,
+    UsageReceipt, UsageRecord, UsageReport, UsageReportPage, UsageReportQuery, UsageSummary,
+    WorkInsight,
 };
 use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Overlap, Plan, Who, announced,
@@ -1685,11 +1686,13 @@ fn pg_usage_summary(
     work: &str,
     group_limit: usize,
 ) -> Result<UsageSummary> {
-    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative'",&[&work])?;
+    // The cache counts have no column of their own: they are read from the stored report, where
+    // an absent count and a null are both unknown, so neither is summed or counted as known.
+    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint,SUM((request::jsonb->>'cache_read_input_tokens')::bigint)::bigint,SUM((request::jsonb->>'cache_creation_input_tokens')::bigint)::bigint,COUNT(request::jsonb->>'cache_read_input_tokens')::bigint,COUNT(request::jsonb->>'cache_creation_input_tokens')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative'",&[&work])?;
     let observations: i64 = r.get(0);
     let mut token_groups = Vec::new();
-    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
-        let basis:String=r.get(3); token_groups.push(TokenGroup { agent:r.get(0),provider:r.get(1),model:r.get(2),usage_basis:serde_json::from_str(&format!("\"{basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,observations:r.get::<_,i64>(4) as usize,input_tokens:r.get(5),output_tokens:r.get(6),input_known_observations:r.get::<_,i64>(7) as usize,output_known_observations:r.get::<_,i64>(8) as usize });
+    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,SUM((request::jsonb->>'cache_read_input_tokens')::bigint)::bigint,SUM((request::jsonb->>'cache_creation_input_tokens')::bigint)::bigint,COUNT(request::jsonb->>'cache_read_input_tokens')::bigint,COUNT(request::jsonb->>'cache_creation_input_tokens')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
+        let basis:String=r.get(3); token_groups.push(TokenGroup { agent:r.get(0),provider:r.get(1),model:r.get(2),usage_basis:serde_json::from_str(&format!("\"{basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,observations:r.get::<_,i64>(4) as usize,input_tokens:r.get(5),output_tokens:r.get(6),cache_read_input_tokens:r.get(9),cache_creation_input_tokens:r.get(10),input_known_observations:r.get::<_,i64>(7) as usize,output_known_observations:r.get::<_,i64>(8) as usize,cache_read_input_known_observations:r.get::<_,i64>(11) as usize,cache_creation_input_known_observations:r.get::<_,i64>(12) as usize });
     }
     let mut cost_groups = Vec::new();
     for r in tx.query("SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros)::bigint,COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND cost_amount_micros IS NOT NULL AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\",cost_kind COLLATE \"C\",cost_currency COLLATE \"C\",cost_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
@@ -1698,7 +1701,7 @@ fn pg_usage_summary(
     let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
     token_groups.truncate(group_limit);
     cost_groups.truncate(group_limit);
-    Ok(UsageSummary {
+    let mut summary = UsageSummary {
         observations: observations as usize,
         coverage: if observations == 0 {
             "unknown"
@@ -1708,14 +1711,20 @@ fn pg_usage_summary(
         .into(),
         input_tokens: r.get(1),
         output_tokens: r.get(2),
+        cache_read_input_tokens: r.get(7),
+        cache_creation_input_tokens: r.get(8),
         input_known_observations: r.get::<_, i64>(3) as usize,
         output_known_observations: r.get::<_, i64>(4) as usize,
+        cache_read_input_known_observations: r.get::<_, i64>(9) as usize,
+        cache_creation_input_known_observations: r.get::<_, i64>(10) as usize,
         missing_cost_observations: r.get::<_, i64>(5) as usize,
         reported_failed_attempts: r.get::<_, i64>(6) as usize,
         groups_complete,
         cost_groups,
         token_groups,
-    })
+    };
+    summary.mask_agents();
+    Ok(summary)
 }
 
 fn pg_insight_input(
@@ -2289,6 +2298,36 @@ fn lapsed_hold_refusal(
         &holder,
         agent.as_deref(),
     )))
+}
+
+/// The `LEASE_LAPSED` text the next edit of this lead session would meet: its scope taken
+/// after the lapse, or its active or blocked Work's lease lapsed with the scope still free.
+fn lapse_notice(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let who = match work_who(tx, token, now) {
+        Ok(who) => who,
+        Err(HubError::Unauthorized) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Current Work first: a lapse whose scope was taken leaves active Work paused (blocked Work
+    // stays blocked), and a lead that has since moved on is told only of the Work it leads now.
+    if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
+        if let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)? {
+            return Ok(Some(lapsed_unheld_text(
+                &item.id,
+                item.generation,
+                renewed,
+                expired,
+                Unheld::Edit,
+            )));
+        }
+        return lapsed_hold_refusal(tx, &who, session, Some(&item.id));
+    }
+    lapsed_hold_refusal(tx, &who, session, None)
 }
 
 /// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
@@ -3667,6 +3706,7 @@ fn coordination_request_at(
         created_seq: row.get(16),
         updated_seq: row.get(17),
         requester_unavailable,
+        requested_paths: None,
     }))
 }
 
@@ -4192,8 +4232,13 @@ fn coordination_page(
     for row in rows {
         let id: String = row.get(0);
         let seq: i64 = row.get(1);
-        let request = coordination_request_at(tx, who, &id, through, now)?
+        let mut request = coordination_request_at(tx, who, &id, through, now)?
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
+        if request.requester.token == who.token
+            && Some(request.requester.session.as_str()) == session
+        {
+            request.requested_paths = requested_paths_hold(tx, who, &request, now);
+        }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
             complete = false;
@@ -4216,6 +4261,72 @@ fn coordination_page(
         requests,
         complete,
         retention_gap: after < retention_floor,
+    })
+}
+
+/// Whether the paths an open request asks for are still held by another lead's reservation or
+/// another token's live intent. Only the requester's own inbox asks, and a failed read (rolled
+/// back to its savepoint, so the transaction survives) says unknown rather than failing the page.
+fn requested_paths_hold(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    request: &CoordinationRequest,
+    now: i64,
+) -> Option<RequestedPathsHold> {
+    if !matches!(
+        request.status,
+        CoordinationStatus::Pending | CoordinationStatus::Responded
+    ) {
+        return None;
+    }
+    let mut read = || -> Result<bool> {
+        tx.batch_execute("SAVEPOINT requested_paths")?;
+        let scope = &request.proposal.scope;
+        let held_work = work_scope_overlaps(tx, who, scope, None, now)?
+            .iter()
+            .any(|overlap| {
+                request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
+                    && overlap.item.lead_token != who.token
+            });
+        let mut held = held_work;
+        if !held {
+            let keys = scope
+                .iter()
+                .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+                .collect::<Vec<_>>();
+            let (points, ranges) = probe_set(&keys);
+            let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id=p.intent
+                 WHERE p.repository=$1 AND i.token<>$2 AND p.expires_at>$3";
+            if !points.is_empty() {
+                held = tx
+                    .query_opt(
+                        &format!("{live} AND p.key = ANY($4) LIMIT 1"),
+                        &[&who.repository, &who.token, &now, &points],
+                    )?
+                    .is_some();
+            }
+            for (start, end) in &ranges {
+                if held {
+                    break;
+                }
+                held = tx
+                    .query_opt(
+                        &format!("{live} AND p.key >= $4 AND p.key < $5 LIMIT 1"),
+                        &[&who.repository, &who.token, &now, start, end],
+                    )?
+                    .is_some();
+            }
+        }
+        tx.batch_execute("RELEASE requested_paths")?;
+        Ok(held)
+    };
+    Some(match read() {
+        Ok(true) => RequestedPathsHold::Held,
+        Ok(false) => RequestedPathsHold::Released,
+        Err(_) => {
+            let _ = tx.batch_execute("ROLLBACK TO requested_paths; RELEASE requested_paths");
+            RequestedPathsHold::Unknown
+        }
     })
 }
 
@@ -4343,6 +4454,24 @@ fn start_overlap_in(
                 return Err(HubError::Invalid(
                     "work has the maximum of 100 participants".into(),
                 ));
+            }
+            if !scope.is_empty() {
+                let elsewhere = tx
+                    .query_opt(
+                        "SELECT w.id FROM hub_work_items w
+                         JOIN hub_work_items t ON t.id = $1
+                         JOIN hub_work_participants p ON p.work = w.id
+                         WHERE w.id <> t.id AND w.provider = t.provider AND w.host = t.host
+                           AND w.repository = t.repository
+                           AND w.repository_id IS NOT DISTINCT FROM t.repository_id
+                           AND w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                           AND p.token = $2 AND p.session = $3 AND p.generation = w.generation
+                         ORDER BY w.id LIMIT 1",
+                        &[&item.id, &who.token, &start.session],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                let holds = work_holds_reservation(tx, &item.id)?;
+                helper_join_editable(&item, holds, elsewhere.as_deref(), &scope)?;
             }
             item.participants.push(WorkParticipant {
                 owner: who.owner.id.clone(),
@@ -5657,6 +5786,63 @@ fn release_session_intent(
         .map(Option::unwrap_or_default)
 }
 
+/// After a checkpoint narrowed `item`'s scope from `previous`, frees from each participant
+/// session's intent the paths the Work no longer covers, unless another Work the token is
+/// eligible on does. An intent left with no path is released.
+fn trim_session_intents(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    previous: &[String],
+    now: i64,
+) -> Result<()> {
+    for (token, session) in work_transition::claim_sessions(item) {
+        let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
+            continue;
+        };
+        let expires_at: i64 = tx
+            .query_one(
+                "SELECT expires_at FROM hub_intents WHERE id = $1",
+                &[&intent],
+            )?
+            .get(0);
+        // An expired intent holds nothing, so there is nothing to trim or announce.
+        if expires_at <= now {
+            continue;
+        }
+        let keys = tx
+            .query(
+                "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
+                &[&intent],
+            )?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        let elsewhere = other_eligible_scopes(tx, &item.id, &token)?;
+        let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
+        if kept.len() == keys.len() {
+            continue;
+        }
+        if kept.is_empty() {
+            release_in(tx, &token, &intent, now)?;
+            continue;
+        }
+        let paths = display_all(&kept);
+        tx.execute(
+            "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
+            &[&intent, &serde_json::json!(paths).to_string(), &now],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
+            &[&intent, &kept],
+        )?;
+        append(
+            tx,
+            &Event::intent_paths_changed(&intent, &paths, expires_at)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Releases the token's live intents that no session holds and that cover part of `scope`.
 /// A plain intent announce has no session, so only the path overlap ties it to the Work.
 fn release_sessionless_intents(
@@ -6658,19 +6844,26 @@ fn unheld(
     now: i64,
 ) -> Result<Asked> {
     let work = work_who(tx, token, now)?;
-    let overlaps = work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)?;
-    Ok(overlaps
-        .into_iter()
-        .find(|o| {
-            !o.item
-                .participants
-                .iter()
-                .any(|p| p.token == token && p.session == name)
-        })
-        .map_or(Asked::NotHeld, |o| Asked::Reserved {
-            lead: coordination_lead(&o.item),
-            work_id: o.item.id,
-        }))
+    for o in work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)? {
+        // A session eligible on the Work may edit under it, so it is not reserved against it.
+        let eligible: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+                 JOIN hub_work_participants p ON p.work = w.id
+                 WHERE w.id = $1 AND w.state IN ('active','blocked')
+                   AND w.reservation_basis IS NOT NULL
+                   AND p.token = $2 AND p.session = $3 AND p.generation = w.generation)",
+                &[&o.item.id, &token, &name],
+            )?
+            .get(0);
+        if !eligible {
+            return Ok(Asked::Reserved {
+                lead: coordination_lead(&o.item),
+                work_id: o.item.id,
+            });
+        }
+    }
+    Ok(Asked::NotHeld)
 }
 
 /// A refused call asks the holder of each contested file to hand it over, as `agentscm_ask`
@@ -7718,6 +7911,7 @@ fn checkpoint_overlap_in(
     };
     item.last_checkin_at = now;
     item.next_action = checkpoint.next_action.clone();
+    let previous_scope = item.scope.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
     }
@@ -7802,6 +7996,12 @@ fn checkpoint_overlap_in(
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, &who, delta, now)?;
     work_dependencies::changed(tx, &who, &item, now)?;
+    if held
+        && checkpoint.kind != super::work::CheckpointKind::Finish
+        && item.scope != previous_scope
+    {
+        trim_session_intents(tx, &item, &previous_scope, now)?;
+    }
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
         // records its own size without one, so a finish is never refused for the cleanup.
@@ -8880,17 +9080,32 @@ impl Store for PgStore {
         call: &SessionCall,
         phase: CallPhase,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
             let touched = touch_in(&mut tx, &who, &call, call.session.is_some(), now)?;
+            let mut lapsed = None;
             if call.session.is_some() {
                 session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+                // Advice only: the touch's renewal must not depend on it. A failed statement
+                // aborts a PostgreSQL transaction, so the read runs in a savepoint that is
+                // rolled back on its own.
+                let mut savepoint = tx.transaction()?;
+                lapsed = match lapse_notice(&mut savepoint, token, &touched.session, now) {
+                    Ok(found) => {
+                        savepoint.commit()?;
+                        found
+                    }
+                    Err(error) => {
+                        eprintln!("hub: lapse notice not read: {error}");
+                        None
+                    }
+                };
             }
             tx.commit()?;
-            Ok(())
+            Ok(lapsed)
         })
     }
 
@@ -13623,6 +13838,38 @@ impl Store for PgStore {
             adjust_work_payload_capacity(&mut tx,&who,work_payload_row_bytes(request.len())?,now)?;tx.commit()?;Ok(UsageReceipt{work_id:usage.work_id.clone(),observation_id:usage.observation_id.clone(),received_at:now,replayed:false})})
     }
 
+    fn work_usage_reports(
+        &self,
+        token: &str,
+        id: &str,
+        query: &UsageReportQuery,
+        now: i64,
+    ) -> Result<Option<UsageReportPage>> {
+        query.validate()?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let rows = tx.query(
+                "SELECT request,received_at FROM hub_work_model_usage WHERE work=$1
+                  ORDER BY received_at,observation_id COLLATE \"C\" LIMIT $2 OFFSET $3",
+                &[&item.id, &((query.limit + 1) as i64), &(query.after as i64)],
+            )?;
+            tx.commit()?;
+            let items = rows
+                .iter()
+                .map(|r| {
+                    let request: String = r.get(0);
+                    Ok(UsageReport::stored(json_value(&request)?, r.get(1)))
+                })
+                .collect::<Result<_>>()?;
+            Ok(Some(UsageReportPage::of(item.id, query, items, now)))
+        })
+    }
+
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>> {
         self.run(true, |client| {
             let mut tx = client
@@ -15415,7 +15662,9 @@ impl Store for PgStore {
                     target.lead.token == who.token && target.lead.session == resolve.session
                 });
             if !authorized {
-                return Err(HubError::Unauthorized);
+                return Err(HubError::invalid_or_changed(
+                    super::coordination::RESOLVE_NOT_PARTY.into(),
+                ));
             }
             if coordination_operation_replay(
                 &mut tx,

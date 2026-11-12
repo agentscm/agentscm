@@ -481,7 +481,6 @@ fn own_session(client: &str) -> String {
 struct Sent<'a> {
     connection: &'a Connection,
     token: &'a str,
-    activity_binding: &'a str,
 }
 
 /// What the server knows about the agent it serves, apart from its default connection.
@@ -497,6 +496,9 @@ struct Client {
     own_session: Option<String>,
     /// The tools that take `session`, from the last `tools/list`.
     session_tools: HashSet<String>,
+    /// The server answered `initialize` or `tools/list` itself because the Hub did not; the
+    /// next Hub reply announces the tools changed so the host lists the Hub's own.
+    answered_locally: bool,
 }
 
 impl Client {
@@ -509,6 +511,7 @@ impl Client {
             own_session: None,
             // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
             session_tools: session_tools(&agentscm::hub::mcp::session_agent_tools()),
+            answered_locally: false,
         })
     }
 
@@ -637,13 +640,32 @@ impl Client {
                     Ok(token) => token,
                     Err(reason) => return refuse(id.as_ref(), &reason, writer),
                 };
-                let activity_binding = crate::client_activity::activity_binding(connection, &token);
                 let sent = Sent {
                     connection,
                     token: &token,
-                    activity_binding: &activity_binding,
                 };
                 exchange(&self.http, &sent, body, id.clone(), writer).await?
+            }
+            // A host drops a server whose `initialize` fails and never retries it, so while the
+            // Hub cannot answer, the server answers `initialize` and `tools/list` itself and each
+            // tool call reports the outage. Every request is sent again, so it recovers by itself.
+            (None, Some(default)) if local_result(&message, HUB_UNAVAILABLE).is_some() => {
+                let mut failed = Vec::new();
+                match exchange(&self.http, default, body, id.clone(), &mut failed).await? {
+                    Some(reply) => Some(reply),
+                    None => {
+                        self.answered_locally = true;
+                        let (Some(id), Some(result)) =
+                            (&id, local_result(&message, HUB_UNAVAILABLE))
+                        else {
+                            return Ok(());
+                        };
+                        return write_json(
+                            writer,
+                            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                        );
+                    }
+                }
             }
             (None, Some(default)) => {
                 exchange(&self.http, default, body, id.clone(), writer).await?
@@ -653,6 +675,8 @@ impl Client {
         let Some(mut reply) = reply else {
             return Ok(());
         };
+        // A reply from another repository's Hub says nothing about this one's.
+        let announce = elsewhere.is_none() && std::mem::take(&mut self.answered_locally);
         if method == "tools/list"
             && let Some(tools) = reply.pointer_mut("/result/tools")
         {
@@ -673,7 +697,11 @@ impl Client {
                 checkout.display()
             )}));
         }
-        write_json(writer, &reply)
+        write_json(writer, &reply)?;
+        if announce {
+            write_json(writer, &TOOLS_CHANGED)?;
+        }
+        Ok(())
     }
 }
 
@@ -692,7 +720,6 @@ fn unconnected<T>(
     poll: Duration,
     mut look: impl FnMut(&Value) -> std::result::Result<bool, String>,
 ) -> Result<Option<Waited<T>>> {
-    let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
     std::thread::scope(|scope| {
         // The reader thread reads one line per request, so none is pending once a connection is found
         // from a request, and the reader is free for `serve` when the scope ends.
@@ -718,7 +745,7 @@ fn unconnected<T>(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Ok(found) = find() {
-                        write_json(writer, &changed)?;
+                        write_json(writer, &TOOLS_CHANGED)?;
                         // The read already under way is the first request to forward.
                         return match lines.recv() {
                             Ok(Ok(Some(line))) => Ok(Some(Waited::Connected(found, line))),
@@ -731,7 +758,7 @@ fn unconnected<T>(
             };
             let reason = match find() {
                 Ok(found) => {
-                    write_json(writer, &changed)?;
+                    write_json(writer, &TOOLS_CHANGED)?;
                     return Ok(Some(Waited::Connected(found, line)));
                 }
                 Err(why) => why,
@@ -751,22 +778,10 @@ fn unconnected<T>(
                 continue;
             };
             let result = match message["method"].as_str() {
-                Some("initialize") => json!({
-                    "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                    "capabilities": {"tools": {"listChanged": true}},
-                    "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
-                    // Initialize happens once, so a session that connects later keeps these.
-                    "instructions": format!(
-                        "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run. {}",
-                        agentscm::hub::agent_rules::prose()
-                    ),
-                }),
-                Some("ping") => json!({}),
-                Some("tools/list") => {
-                    let mut tools = agentscm::hub::mcp::agent_tools();
-                    with_root(&mut tools);
-                    json!({"tools": tools})
+                Some("initialize" | "tools/list") => {
+                    local_result(&message, NOT_CONNECTED).unwrap_or_default()
                 }
+                Some("ping") => json!({}),
                 Some("tools/call") => refused(looked.as_ref().err().unwrap_or(&reason)),
                 _ => {
                     write_json(
@@ -782,6 +797,33 @@ fn unconnected<T>(
             )?;
         }
     })
+}
+
+static TOOLS_CHANGED: std::sync::LazyLock<Value> = std::sync::LazyLock::new(
+    || json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+);
+
+const NOT_CONNECTED: &str = "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run.";
+const HUB_UNAVAILABLE: &str = "The AgentSCM Hub gave no usable answer when this session started. The tools are listed, and each call tries the Hub again; until it answers, a call says why it cannot run.";
+
+/// The server's own answer to `initialize` or `tools/list`, for when no Hub can give one; `None`
+/// for any other request. `why` opens the instructions, which a host reads only at `initialize`.
+fn local_result(message: &Value, why: &str) -> Option<Value> {
+    match message["method"].as_str()? {
+        "initialize" => Some(json!({
+            "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+            "capabilities": {"tools": {"listChanged": true}},
+            "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
+            // Initialize happens once, so a session that connects later keeps these.
+            "instructions": format!("{why} {}", agentscm::hub::agent_rules::prose()),
+        })),
+        "tools/list" => {
+            let mut tools = agentscm::hub::mcp::agent_tools();
+            with_root(&mut tools);
+            Some(json!({"tools": tools}))
+        }
+        _ => None,
+    }
 }
 
 /// How the wait for the start checkout's connection ended.
@@ -802,11 +844,7 @@ async fn exchange(
     id: Option<Value>,
     writer: &mut impl Write,
 ) -> Result<Option<Value>> {
-    let &Sent {
-        connection,
-        token,
-        activity_binding,
-    } = sent;
+    let &Sent { connection, token } = sent;
     let client_id = crate::client_config::onboarding_client(&connection.root, token);
     let forwarded = forward(
         http,
@@ -818,36 +856,9 @@ async fn exchange(
     )
     .await;
     match (id, forwarded) {
-        (None, Ok((202 | 204, _, _))) => report_activity(
-            activity_binding,
-            crate::client_activity::ActivityOutcome::Acknowledged,
-        ),
-        (None, Ok((401 | 403, _, _))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::TokenRejected,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
-        (None, Ok(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::InvalidResponse,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
-        (None, Err(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Unavailable,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
+        (None, Ok((202 | 204, _, _))) => {}
+        (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
         (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Acknowledged,
-            );
             let mut reply = reply;
             // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
             // start's conflict, coordination and recovery payload, reach the agent unchanged.
@@ -866,19 +877,11 @@ async fn exchange(
             return Ok(Some(reply));
         }
         (Some(id), Ok((status @ (401 | 403), _, reply))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::TokenRejected,
-            );
             let error = agentscm::hub::error_envelope::decode(status, &reply);
             eprintln!("AgentSCM MCP: {}", error.render());
             write_json(writer, &rpc_hub_error(&id, &error))?;
         }
         (Some(id), Ok((status, _, reply))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::InvalidResponse,
-            );
             let error = if status >= 400 {
                 agentscm::hub::error_envelope::decode(status, &reply)
             } else {
@@ -890,10 +893,6 @@ async fn exchange(
             write_json(writer, &rpc_hub_error(&id, &error))?;
         }
         (Some(id), Err(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Unavailable,
-            );
             let error = agentscm::hub::error_envelope::ErrorEnvelope::local(
                 agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
             );
@@ -918,7 +917,6 @@ async fn serve(
         .and_then(|dir| agentscm::hook_relay::Address::new(&dir, &connection.hub).ok())
         .map(agentscm::hook_relay::Relay::spawn);
     let mut token = token.to_owned();
-    let mut activity_binding = crate::client_activity::activity_binding(connection, &token);
     loop {
         let line = match first
             .take()
@@ -950,13 +948,8 @@ async fn serve(
             && *current != token
         {
             token.clone_from(current);
-            activity_binding = crate::client_activity::activity_binding(connection, &token);
         }
         if checked.is_err() {
-            report_activity(
-                &activity_binding,
-                crate::client_activity::ActivityOutcome::BindingChanged,
-            );
             if let Some(id) = response_id(&message) {
                 write_json(
                     writer,
@@ -970,19 +963,9 @@ async fn serve(
         let default = Sent {
             connection,
             token: &token,
-            activity_binding: &activity_binding,
         };
         client.send(message, line, Some(&default), writer).await?;
     }
-}
-
-fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutcome) {
-    crate::client_activity::observe(
-        binding,
-        None,
-        crate::client_activity::ActivityPath::Mcp,
-        outcome,
-    );
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
@@ -1048,45 +1031,54 @@ mod tests {
     }
 
     fn server(status: u16, content_type: &str, body: &str) -> (String, mpsc::Receiver<String>) {
+        servers(&[(status, content_type, body)])
+    }
+
+    /// Answers one connection per reply, in order.
+    fn servers(replies: &[(u16, &str, &str)]) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
-        let content_type = content_type.to_owned();
-        let body = body.to_owned();
+        let replies: Vec<(u16, String, String)> = replies
+            .iter()
+            .map(|&(status, content_type, body)| (status, content_type.to_owned(), body.to_owned()))
+            .collect();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut chunk).unwrap();
-                request.extend_from_slice(&chunk[..read]);
-                let Some(head) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..head]);
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if request.len() >= head + 4 + length {
-                    break;
+            for (status, content_type, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(head) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..head]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head + 4 + length {
+                        break;
+                    }
                 }
-            }
-            sender.send(String::from_utf8(request).unwrap()).unwrap();
-            write!(
+                sender.send(String::from_utf8(request).unwrap()).unwrap();
+                write!(
                 stream,
                 "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .unwrap();
+            }
         });
         (format!("http://{address}"), receiver)
     }
@@ -1791,6 +1783,71 @@ mod tests {
         assert_eq!(reply["error"]["data"]["error"], "hub_unreachable");
         assert_eq!(reply["error"]["data"]["recovery"]["action"], "reconnect");
         assert!(reply["error"]["data"].get("correlation_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_hub_at_initialize_keeps_the_server_and_each_call_reports_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"agentscm_status\",\"arguments\":{}}}\n",
+        );
+        let output = proxied(
+            input,
+            &saved(hub, "/checkout", "owner/repo"),
+            "synthetic-token",
+        )
+        .await;
+        let replies: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3, "{output}");
+        assert_eq!(replies[0]["id"], 1);
+        assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
+        assert!(
+            replies[0]["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with(HUB_UNAVAILABLE)
+        );
+        assert_eq!(replies[1]["id"], 2);
+        assert!(!replies[1]["result"]["tools"].as_array().unwrap().is_empty());
+        assert_eq!(replies[2]["id"], 3);
+        assert_eq!(replies[2]["error"]["data"]["error"], "hub_unreachable");
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_answers_again_is_announced_after_its_first_reply() {
+        let listed = json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}}).to_string();
+        let (hub, requests) = servers(&[
+            (503, "application/json", "{\"error\":\"unavailable\"}"),
+            (200, "application/json", &listed),
+        ]);
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        );
+        let output = proxied(
+            input,
+            &saved(hub, "/checkout", "owner/repo"),
+            "synthetic-token",
+        )
+        .await;
+        let replies: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3, "{output}");
+        assert!(replies[0]["result"]["instructions"].is_string());
+        assert_eq!(replies[1]["id"], 2);
+        assert_eq!(replies[1]["result"]["tools"], json!([]));
+        assert_eq!(replies[2], *TOOLS_CHANGED);
+        assert_eq!(requests.iter().take(2).count(), 2);
     }
 
     #[tokio::test]

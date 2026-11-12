@@ -28,7 +28,10 @@ use super::coordination::{
 use super::device::{Device, DevicePrincipal, Refusal, RepositoryUsage};
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked, HandoffView, Via};
-use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
+use super::insights::{
+    InsightPage, InsightQuery, UsageReceipt, UsageRecord, UsageReportPage, UsageReportQuery,
+    WorkInsight,
+};
 use super::intent::{Announced, Intent, NewIntent};
 use super::pickup::Pickup;
 use super::promise::{
@@ -1259,6 +1262,15 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<()>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
+    /// One page of a work item's stored usage reports, oldest first, for any reader of its
+    /// repository; `None` when the work item is not in the token's repository.
+    fn work_usage_reports(
+        &self,
+        token: &str,
+        id: &str,
+        query: &UsageReportQuery,
+        now: i64,
+    ) -> Result<Option<UsageReportPage>>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// Resolve a recorded holder identity within the caller's authorized repository. Never impersonates the holder.
@@ -1287,14 +1299,15 @@ pub trait Store: Send + Sync {
     fn default_session_bound(&self, token: &str) -> Result<bool>;
     /// A tool call a hook reported that is not an edit check: a touch of the session, which
     /// renews its leases, and for a shell call the start or end that keeps them live while it
-    /// runs, up to the in-flight cap.
+    /// runs, up to the in-flight cap. Returns the `LEASE_LAPSED` text the session's next edit
+    /// would meet when the hold of Work it leads has lapsed, so the hook can say so first.
     fn session_activity(
         &self,
         token: &str,
         call: &SessionCall,
         phase: super::work_lifecycle::CallPhase,
         now: i64,
-    ) -> Result<()>;
+    ) -> Result<Option<String>>;
     /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
     /// observation, every reservation that was live then gets one lease of grace.
     fn observe_lease_clock(&self, now: i64) -> Result<()>;

@@ -121,6 +121,13 @@ fn start(source: Option<&str>, work_id: Option<&str>, session: &str, role: WorkR
     }
 }
 
+/// A helper join with no paths: a join with paths the Work does not cover is refused.
+fn helper_join(work_id: &str, session: &str) -> WorkStart {
+    let mut join = start(None, Some(work_id), session, WorkRole::Helper);
+    join.scope.clear();
+    join
+}
+
 fn lead(issue: &str, session: &str) -> WorkStart {
     start(Some(issue), None, session, WorkRole::Lead)
 }
@@ -263,11 +270,7 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
     let (alice, bob, carol) = (agent(&*store, 1), agent(&*store, 2), agent(&*store, 3));
     let held = hold(&*store, &alice, "7", "sa");
     let joined = store
-        .work_start(
-            &bob.token,
-            &start(None, Some(&held.id), "sb-help", WorkRole::Helper),
-            T0 + 1,
-        )
+        .work_start(&bob.token, &helper_join(&held.id, "sb-help"), T0 + 1)
         .unwrap();
     assert!(joined.joined);
     // A lead start by work_id names the Work, not the issue.
@@ -349,11 +352,7 @@ fn outcomes_follow_what_the_asking_person_did_next(db: &Db) {
     }
     // Bob joins the Work on #7 as a helper: proceeded. Nothing is seen for #8.
     store
-        .work_start(
-            &bob.token,
-            &start(None, Some(&seven.id), "sb-help", WorkRole::Helper),
-            asked + 10,
-        )
+        .work_start(&bob.token, &helper_join(&seven.id, "sb-help"), asked + 10)
         .unwrap();
 
     let early = metrics(&*store, &bob.token, asked + 3600);

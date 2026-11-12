@@ -1,9 +1,10 @@
-//! Claude Code capture adapter.
+//! Claude Code capture adapter, and the hook path it shares with Codex.
 //!
-//! The hook path consumes actual native hook JSON one event at a time. The import path reads the
-//! user's own Claude Code JSONL and deliberately selects only visible user/assistant text and
-//! tool events. Thinking blocks, attachments, request caches and unrelated record types are not
-//! retained.
+//! The hook path consumes actual native hook JSON one event at a time. Codex hooks use the same
+//! event names and fields, so [`CaptureRequest::harness`] is all that tells the two apart here;
+//! what only Codex has is in [`super::codex`]. The import path reads the user's own Claude Code
+//! JSONL and deliberately selects only visible user/assistant text and tool events. Thinking
+//! blocks, attachments, request caches and unrelated record types are not retained.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -59,6 +60,8 @@ pub struct CaptureRequest {
     pub capture_mode: CaptureModeV1,
     /// The binding's current mode. It alone decides whether bodies are retained.
     pub live_capture_mode: CaptureModeV1,
+    /// The agent tool whose hooks or history this capture reads.
+    pub harness: AgentHarnessV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -142,7 +145,7 @@ struct TranscriptMessage {
     usage: Option<Value>,
 }
 
-struct SelectedEvent {
+pub(super) struct SelectedEvent {
     event_id: String,
     observed_at: i64,
     kind: CapturedEventKindV1,
@@ -151,6 +154,32 @@ struct SelectedEvent {
     setup: Option<SetupObservationV1>,
     boundary: Option<String>,
     subagent: Option<SubagentFactV1>,
+}
+
+impl SelectedEvent {
+    /// A message or tool event read from session history. An id too long for the record is hashed.
+    pub(super) fn history(
+        event_id: String,
+        observed_at: i64,
+        kind: CapturedEventKindV1,
+        tool: Option<ToolFactV1>,
+        local_body: Value,
+    ) -> Self {
+        Self {
+            event_id: if event_id.len() > 255 {
+                format!("evt:{}", sha256(event_id.as_bytes()))
+            } else {
+                event_id
+            },
+            observed_at,
+            kind,
+            tool,
+            local_body: Some(local_body),
+            setup: None,
+            boundary: None,
+            subagent: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -242,7 +271,7 @@ fn capture_hook_with_identity_mode(
             request.parent_session_id.as_deref(),
             request.capture_mode,
         )?;
-        ensure_deferred_gaps(&request.observed_session_id, spool)?;
+        ensure_deferred_gaps(request, spool)?;
     }
     let provider_timestamp = payload.get("timestamp").and_then(Value::as_str);
     let tool_name = payload.get("tool_name").and_then(Value::as_str);
@@ -379,7 +408,7 @@ fn capture_hook_with_identity_mode(
         kind,
         tool,
         local_body,
-        setup: native_setup_observation(payload, spool)?,
+        setup: native_setup_observation(payload, request.harness, spool)?,
         boundary,
         subagent,
     };
@@ -631,8 +660,8 @@ pub fn deferred_native_hook(
     })
 }
 
-fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result<()> {
-    for deferred in spool.deferred_gaps(observed_session_id)? {
+fn ensure_deferred_gaps(live: &CaptureRequest, spool: &LocalSpool) -> Result<()> {
+    for deferred in spool.deferred_gaps(&live.observed_session_id)? {
         // Without an alias, the reserved observed-session sequence is already in the canonical
         // stream. The next retained event exposes that exact hole; adding another explicit gap
         // would double-count the same missed occurrence.
@@ -662,6 +691,7 @@ fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result
             parent_session_id: deferred.target.parent_session_id,
             capture_mode: deferred.target.capture_mode,
             live_capture_mode: deferred.target.capture_mode,
+            harness: live.harness,
         };
         let event = CapturedEventV1 {
             event_id: event_id.clone(),
@@ -939,7 +969,7 @@ fn capture_native_hook_inner(
             Err(error) => return Err(error),
         }
     }
-    let original_request = managed_marker_request(&claim);
+    let original_request = managed_marker_request(&claim, request.harness);
     match claim.route.as_ref().expect("validated v4 occurrence route") {
         NativeOccurrenceRouteV1::Managed => capture_managed_invocation(
             input,
@@ -1508,7 +1538,7 @@ fn capture_managed_invocation(
             ));
         }
     };
-    let original_request = managed_marker_request(&marker);
+    let original_request = managed_marker_request(&marker, request.harness);
 
     spool.bind_observation(&managed_event_operation_id, &phase_fingerprint)?;
     let event = capture_hook_with_identity_mode(
@@ -1693,7 +1723,7 @@ fn capture_managed_invocation(
     }
 }
 
-fn managed_marker_request(marker: &ManagedInvocationV1) -> CaptureRequest {
+fn managed_marker_request(marker: &ManagedInvocationV1, harness: AgentHarnessV1) -> CaptureRequest {
     CaptureRequest {
         operation_prefix: marker
             .operation_prefix
@@ -1706,6 +1736,7 @@ fn managed_marker_request(marker: &ManagedInvocationV1) -> CaptureRequest {
         parent_session_id: marker.parent_session_id.clone(),
         capture_mode: marker.capture_mode.unwrap_or(CaptureModeV1::MetadataOnly),
         live_capture_mode: marker.capture_mode.unwrap_or(CaptureModeV1::MetadataOnly),
+        harness,
     }
 }
 
@@ -2285,7 +2316,7 @@ fn record_provider_history_gap(
         if retained.operation_id == operation_id
             && retained.work_id == request.work_id
             && retained.generation == request.generation
-            && retained.session.harness == AgentHarnessV1::ClaudeCode
+            && retained.session.harness == request.harness
             && retained.session.session_id == request.canonical_session_id
             && exact_gap
         {
@@ -2328,9 +2359,35 @@ fn native_recipe_digest(native_tool: &str, tool_input: Option<&Value>) -> Result
 /// Imports a bounded visible-history stream. The initial gap states that this is retrospective
 /// history, not proof that live capture observed the session from its beginning.
 pub fn import_jsonl(
+    input: impl BufRead,
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+) -> Result<CaptureReport> {
+    import_history(input, request, spool, |line, ordinal| {
+        let Ok(parsed) = serde_json::from_slice::<TranscriptLine>(line) else {
+            return Ok(None);
+        };
+        if parsed
+            .session_id
+            .as_deref()
+            .is_some_and(|session| session != request.observed_session_id)
+        {
+            return Err(CaptureError::Invalid(
+                "Claude Code history contains another session".into(),
+            ));
+        }
+        select_line(parsed, request, ordinal).map(Some)
+    })
+}
+
+/// The import both harnesses share: bounds, the retrospective-history gap, retention and batches.
+/// `select` turns one history line (with its 1-based number) into events and a count of private
+/// blocks it left out, or `None` for a record it cannot read, which becomes part of a gap.
+pub(super) fn import_history(
     mut input: impl BufRead,
     request: &CaptureRequest,
     spool: &LocalSpool,
+    mut select: impl FnMut(&[u8], usize) -> Result<Option<(Vec<SelectedEvent>, usize)>>,
 ) -> Result<CaptureReport> {
     spool.remember_session_association(
         &request.observed_session_id,
@@ -2376,7 +2433,7 @@ pub fn import_jsonl(
             ReadLine::End => break,
             ReadLine::Limit => {
                 return Err(CaptureError::Limit(
-                    "Claude Code history import exceeds its line or byte bound".into(),
+                    "session history import exceeds its line or byte bound".into(),
                 ));
             }
             ReadLine::Oversized(bytes) => (bytes, true),
@@ -2386,30 +2443,17 @@ pub fn import_jsonl(
         lines = lines.saturating_add(1);
         if total > MAX_IMPORT_BYTES || lines > MAX_IMPORT_LINES {
             return Err(CaptureError::Limit(
-                "Claude Code history import exceeds its line or byte bound".into(),
+                "session history import exceeds its line or byte bound".into(),
             ));
         }
         if oversized {
             missing = missing.saturating_add(1);
             continue;
         }
-        let parsed: TranscriptLine = match serde_json::from_slice(&line) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                missing = missing.saturating_add(1);
-                continue;
-            }
+        let Some((events, ignored)) = select(&line, lines)? else {
+            missing = missing.saturating_add(1);
+            continue;
         };
-        if parsed
-            .session_id
-            .as_deref()
-            .is_some_and(|session| session != request.observed_session_id)
-        {
-            return Err(CaptureError::Invalid(
-                "Claude Code history contains another session".into(),
-            ));
-        }
-        let (events, ignored) = select_line(parsed, request, lines)?;
         report.private_blocks_ignored = report.private_blocks_ignored.saturating_add(ignored);
         for event in events {
             let retained = retain_selected(event, request, spool)?;
@@ -2524,50 +2568,41 @@ fn select_line(
             });
         let event_id = format!("evt:{base_id}:{index}");
         match (kind, block_kind) {
-            ("user", "text") => selected.push(SelectedEvent {
+            ("user", "text") => selected.push(SelectedEvent::history(
                 event_id,
                 observed_at,
-                kind: CapturedEventKindV1::UserPrompt,
-                tool: None,
-                local_body: Some(json!({"content": block.get("text")})),
-                setup: None,
-                boundary: None,
-                subagent: None,
-            }),
-            ("assistant", "text") => selected.push(SelectedEvent {
+                CapturedEventKindV1::UserPrompt,
+                None,
+                json!({"content": block.get("text")}),
+            )),
+            ("assistant", "text") => selected.push(SelectedEvent::history(
                 event_id,
                 observed_at,
-                kind: CapturedEventKindV1::AssistantMessage,
-                tool: None,
-                local_body: Some(json!({"content": block.get("text")})),
-                setup: None,
-                boundary: None,
-                subagent: None,
-            }),
+                CapturedEventKindV1::AssistantMessage,
+                None,
+                json!({"content": block.get("text")}),
+            )),
             ("assistant", "tool_use") => {
                 let tool_name = block.get("name").and_then(Value::as_str);
                 let request_id = block.get("id").and_then(Value::as_str);
-                selected.push(SelectedEvent {
+                selected.push(SelectedEvent::history(
                     event_id,
                     observed_at,
-                    kind: check_kind(CapturedEventKindV1::ToolStarted, tool_name),
-                    tool: Some(tool_fact(tool_name, request_id, None)),
-                    local_body: Some(json!({
+                    check_kind(CapturedEventKindV1::ToolStarted, tool_name),
+                    Some(tool_fact(tool_name, request_id, None)),
+                    json!({
                         "tool_name": tool_name,
                         "tool_input": block.get("input"),
-                    })),
-                    setup: None,
-                    boundary: None,
-                    subagent: None,
-                });
+                    }),
+                ));
             }
             ("user", "tool_result") => {
                 let request_id = block.get("tool_use_id").and_then(Value::as_str);
-                selected.push(SelectedEvent {
+                selected.push(SelectedEvent::history(
                     event_id,
                     observed_at,
-                    kind: CapturedEventKindV1::ToolFinished,
-                    tool: Some(tool_fact(
+                    CapturedEventKindV1::ToolFinished,
+                    Some(tool_fact(
                         None,
                         request_id,
                         Some(
@@ -2578,24 +2613,14 @@ fn select_line(
                             },
                         ),
                     )),
-                    local_body: Some(json!({
+                    json!({
                         "tool_result": block.get("content"),
                         "is_error": block.get("is_error"),
-                    })),
-                    setup: None,
-                    boundary: None,
-                    subagent: None,
-                });
+                    }),
+                ));
             }
             (_, "thinking" | "redacted_thinking") => private = private.saturating_add(1),
             _ => {}
-        }
-    }
-    if selected.iter().any(|event| event.event_id.len() > 255) {
-        for event in &mut selected {
-            if event.event_id.len() > 255 {
-                event.event_id = format!("evt:{}", sha256(event.event_id.as_bytes()));
-            }
         }
     }
     Ok((selected, private))
@@ -2705,6 +2730,7 @@ fn retain_selected(
 
 fn native_setup_observation(
     payload: &serde_json::Map<String, Value>,
+    harness: AgentHarnessV1,
     spool: &LocalSpool,
 ) -> Result<Option<SetupObservationV1>> {
     let model = payload
@@ -2731,7 +2757,7 @@ fn native_setup_observation(
     }
     let bytes = serde_json::to_vec(&json!({
         "schema_version": SCHEMA_VERSION_V1,
-        "harness": "claude_code",
+        "harness": harness,
         "adapter_version": ADAPTER_VERSION,
         "provider": Value::Null,
         "model": model,
@@ -2780,7 +2806,7 @@ fn batch(
         work_id: request.work_id.clone(),
         generation: request.generation,
         session: SessionIdentityV1 {
-            harness: AgentHarnessV1::ClaudeCode,
+            harness: request.harness,
             adapter_version: ADAPTER_VERSION.into(),
             session_id: request.canonical_session_id.clone(),
             parent_session_id: request.parent_session_id.clone(),
@@ -2864,14 +2890,14 @@ fn tool_kind(name: Option<&str>) -> ToolKindV1 {
         "edit" | "apply_patch" | "multiedit" => ToolKindV1::Edit,
         "write" => ToolKindV1::Write,
         "search" | "grep" | "glob" => ToolKindV1::Search,
-        "bash" | "shell" | "terminal" => ToolKindV1::Shell,
+        "bash" | "shell" | "terminal" | "exec_command" => ToolKindV1::Shell,
         "test" | "tests" => ToolKindV1::Test,
         "task" | "agent" => ToolKindV1::Model,
         _ => ToolKindV1::Other,
     }
 }
 
-fn identifier(value: &str, max: usize) -> bool {
+pub(super) fn identifier(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value.bytes().all(|byte| {

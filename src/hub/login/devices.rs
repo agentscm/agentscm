@@ -72,11 +72,13 @@ fn refused_about(kind: &'static str, repository: &str, forge: &str) -> ApiError 
     let (status, message) = match kind {
         "sign_in_required" => (
             StatusCode::UNAUTHORIZED,
-            "This computer isn't signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app or run agentscm hub login".to_owned(),
+            "This computer isn't signed in to this Hub any more; run agentscm hub login".to_owned(),
         ),
         "permission_unavailable" => (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("{forge} didn't answer the Hub's access check; nothing changed, so try again in a minute"),
+            format!(
+                "{forge} didn't answer the Hub's access check; nothing changed, so try again in a minute"
+            ),
         ),
         "not_connected" => (
             StatusCode::FORBIDDEN,
@@ -84,7 +86,9 @@ fn refused_about(kind: &'static str, repository: &str, forge: &str) -> ApiError 
         ),
         "access_check_unavailable" => (
             StatusCode::FORBIDDEN,
-            format!("The Hub can't check your access to {repository}; ask a Hub admin to check that repository's connection"),
+            format!(
+                "The Hub can't check your access to {repository}; ask a Hub admin to check that repository's connection"
+            ),
         ),
         "not_allowed" => (StatusCode::FORBIDDEN, super::NOT_ALLOWED.to_owned()),
         _ => (StatusCode::FORBIDDEN, super::DISABLED.to_owned()),

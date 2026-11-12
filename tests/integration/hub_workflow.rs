@@ -952,6 +952,27 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
         "requester was acknowledged merely by reading: {reported}"
     );
 
+    // The requester's next tool reply delivers the reply and the hold without polling.
+    let delivered = hub
+        .mcp(
+            &requester,
+            "agentscm_status",
+            json!({"session": "requester-session"}),
+        )
+        .await;
+    let notice = delivered["_meta"]["agentscm"]["coordination_notifications"]["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["request_id"] == request_id)
+        .unwrap()
+        .clone();
+    assert_eq!(notice["yours"], true, "{delivered}");
+    assert_eq!(notice["replies"][0]["kind"], "join", "{delivered}");
+    assert_eq!(notice["requested_paths"], "held", "{delivered}");
+    let text = delivered["content"].to_string();
+    assert!(text.contains("For your own requests"), "{text}");
+
     // A response is a report, not permission to close an overlap that still exists.
     let unresolved = hub
         .mcp(

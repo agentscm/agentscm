@@ -10,7 +10,10 @@ use serde_json::json;
 
 use super::catchup::{CatchupAck, CatchupAckResult, CatchupPage, CatchupQuery};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
-use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
+use super::insights::{
+    InsightPage, InsightQuery, UsageReceipt, UsageRecord, UsageReportPage, UsageReportQuery,
+    WorkInsight,
+};
 use super::store::{search_text, unix_now};
 use super::viewer::{Shown, Viewer, shown};
 use super::work::{
@@ -71,6 +74,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/insights", get(insights))
         .route("/v1/hub/standup/value-metrics", get(value_metrics))
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
+        .route("/v1/hub/standup/work/{id}/usage", get(usage_reports))
         .route("/v1/hub/standup/work/{id}/intent", get(work_intent))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
@@ -787,6 +791,22 @@ async fn usage(
         })
         .await?,
     ))
+}
+
+async fn usage_reports(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<UsageReportQuery>, QueryRejection>,
+) -> Result<Json<UsageReportPage>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let store = state.store.clone();
+    blocking(&state, move || {
+        store.work_usage_reports(&principal.token_id, &id, &query, unix_now())
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(ApiError::not_found)
 }
 
 async fn value_metrics(
