@@ -1115,15 +1115,14 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<Vec<SharedBodyRow>>>;
     /// Up to `MAX_CONVERSATION_PAGE_ENTRIES + 1` shared-conversation entries of the Work after
     /// `cursor`, ordered by (session_id bytewise, sequence, digest), when `token`'s repository
-    /// scope contains it: the caller's own declarations, or every author's when `all_authors`
-    /// (a Hub admin; see `conversation_readable`). `None` for an unknown Work; a malformed cursor
-    /// is `Invalid`.
+    /// scope contains it: the caller's own declarations and those `audience` adds. `None` for an
+    /// unknown Work; a malformed cursor is `Invalid`.
     fn shared_conversation_page(
         &self,
         token: &str,
         work_id: &str,
         cursor: Option<&str>,
-        all_authors: bool,
+        audience: super::change_record::ConversationAudience,
         now: i64,
     ) -> Result<Option<Vec<ConversationEntryV1>>>;
     /// Moves `author`'s `declared` body to `available` with `expires_at = now + retention_seconds`.

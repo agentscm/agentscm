@@ -156,7 +156,8 @@ uploads it to the Hub's object store.
 ### The repository setting
 
 Whether a repository shares agent conversations is a Hub setting, **Share agent conversations**,
-not a per-checkout switch. It starts off. A repository admin (GitHub `admin`, GitLab maintainer
+not a per-checkout switch. It is on by default on a new Hub, and stays off on a Hub that already
+had people when the default became on. A repository admin (GitHub `admin`, GitLab maintainer
 or owner) or a Hub admin changes it for one repository; a Hub admin can also set a Hub-wide
 default that applies to every repository without its own setting. The routes are in
 [conversation sharing](hub.md#conversation-sharing).
@@ -177,8 +178,10 @@ default that applies to every repository without its own setting. The routes are
   already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
   that person's own sessions in the repository, on every computer, from uploading;
   `change-capture opt-in` undoes it. The choice is per person and repository, stored on the Hub.
-  Opting out works forward: bodies already uploaded stay readable to the repository's readers
-  until they expire or their author deletes them with `change-capture conversation --delete`.
+  Opting out also hides what the person shared before: their entries leave other readers'
+  listings and their bodies are no longer served to them, while the person and Hub admins still
+  read them. The bodies stay stored until they expire or their author deletes them with
+  `change-capture conversation --delete`, and opting in again shows them again.
 - **Every session says whether it shares, and why not.** The session-start context says
   "conversation sharing is on for this session", or that it is off with the reason and the one
   command that changes it:
