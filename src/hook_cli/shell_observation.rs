@@ -240,7 +240,7 @@ pub(super) fn pre(
         return;
     }
     // Resolution trouble only means ignored-by-the-user files may show; it is not an error.
-    let excludes = git_collisions::global_excludes_file(git, deadline);
+    let excludes = git_collisions::global_excludes_file(git, root, deadline);
     let state = git_collisions::worktree_state(git, root, deadline, excludes.as_deref()).ok();
     let stored = Stored {
         root: root.to_string_lossy().into_owned(),

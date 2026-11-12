@@ -1296,21 +1296,21 @@ fn entry_metadata(path: &Path) -> (Option<u64>, Option<i64>) {
     )
 }
 
-/// The user's global Git excludes file, for [`worktree_state`]: `core.excludesFile` from the
-/// user's own Git configuration (read with their environment, inside `deadline`), else the
-/// default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore`. `None` when there is none
-/// or it cannot be read in time; the caller then proceeds without it.
-pub fn global_excludes_file(git_path: &Path, deadline: Instant) -> Option<PathBuf> {
+/// The excludes file Git would use in `repository`, for [`worktree_state`]: the effective
+/// `core.excludesFile` read in `repository` with the user's own environment, inside `deadline`,
+/// so a repository's own setting wins over the user's global one, as it does for Git. Without a
+/// setting, the default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore`. `None` when
+/// there is none or it cannot be read in time; the caller then proceeds without it.
+pub fn global_excludes_file(
+    git_path: &Path,
+    repository: &Path,
+    deadline: Instant,
+) -> Option<PathBuf> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(git_path)
-        .args([
-            "config",
-            "--global",
-            "--type=path",
-            "--get",
-            "core.excludesFile",
-        ])
+        .args(["config", "--type=path", "--get", "core.excludesFile"])
+        .current_dir(repository)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
