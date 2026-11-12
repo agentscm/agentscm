@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::error_envelope::{FieldProblem, InputProblem};
 use super::handoff::Via;
 use super::intent::text;
 use super::work::{ForgeWorkRef, WorkPathOverlap, validate_id};
@@ -305,13 +306,32 @@ impl CoordinationAck {
     }
 }
 
+/// Like `text`, but names the field in the typed error so the caller can correct it.
+fn validate_note(note: &str) -> Result<()> {
+    let (problem, hint) = if note.len() > MAX_NOTE_BYTES {
+        (FieldProblem::TooLong, "Shorten note to at most 500 bytes.")
+    } else if text("note", note, MAX_NOTE_BYTES).is_err() {
+        (
+            FieldProblem::Invalid,
+            "Send a non-empty note of 1-500 bytes without control or invisible characters.",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(HubError::Input(
+        InputProblem::new("note", problem, hint)
+            .into_iter()
+            .collect(),
+    ))
+}
+
 impl CoordinationReply {
     pub(super) fn validate(&self) -> Result<()> {
         validate_mutation(&self.request_id, &self.session, self.expected_updated_seq)?;
         validate_id("target work", &self.target_work_id, "wrk")?;
         text("operation_id", &self.operation_id, 255)?;
         if let Some(note) = &self.note {
-            text("note", note, MAX_NOTE_BYTES)?;
+            validate_note(note)?;
         }
         Ok(())
     }

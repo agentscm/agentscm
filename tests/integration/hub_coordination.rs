@@ -304,6 +304,21 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
         note: Some("Join the incumbent work as a helper".into()),
         via: agentscm::hub::handoff::Via::Agent,
     };
+    let long_note = CoordinationReply {
+        note: Some("n".repeat(501)),
+        ..reply.clone()
+    };
+    match store.coordination_reply(&incumbent, &long_note, now + 6) {
+        Err(HubError::Input(problems)) => {
+            assert_eq!(problems.len(), 1);
+            assert_eq!(problems[0].name, "note");
+            assert_eq!(
+                problems[0].problem,
+                agentscm::hub::error_envelope::FieldProblem::TooLong
+            );
+        }
+        other => panic!("expected an Input error naming note, got {other:?}"),
+    }
     let responded = store
         .coordination_reply(&incumbent, &reply, now + 6)
         .unwrap();

@@ -7754,7 +7754,15 @@ fn checkpoint_overlap_in(
         work_transition::needs_resume(checkpoint.kind)?;
     }
     let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
-        HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
+        HubError::Input(
+            super::error_envelope::InputProblem::new(
+                "expected_updated_seq",
+                super::error_envelope::FieldProblem::Missing,
+                "Send the Work's current updated_seq as expected_updated_seq for a new checkpoint.",
+            )
+            .into_iter()
+            .collect(),
+        )
     })?;
     if expected != item.updated_seq {
         // A missing receipt alone is not proof of noncommit: compaction can

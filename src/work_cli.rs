@@ -8,6 +8,7 @@ use agentscm::hub::catchup::{CatchupAck, CatchupPublicationRepair, CatchupQuery}
 use agentscm::hub::coordination::{
     CoordinationAck, CoordinationReply, CoordinationResolve, CoordinationWithdraw,
 };
+use agentscm::hub::error_envelope::{FieldProblem, InputProblem};
 use agentscm::hub::insights::UsageRecord;
 use agentscm::hub::reply::{self, Seen};
 use agentscm::hub::store::{self, unix_now};
@@ -1103,7 +1104,26 @@ fn read_request<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
     if text.len() as u64 > REQUEST_BYTES {
         return Err(invalid("work request exceeds 1 MiB"));
     }
-    serde_json::from_str(&text).map_err(|_| invalid("work request is not valid strict JSON"))
+    serde_json::from_str(&text).map_err(|error| {
+        match InputProblem::from_json_error(&error.to_string()) {
+            Some(problem) => invalid(&format!(
+                "work request field `{}` is {}: {}",
+                problem.name,
+                match problem.problem {
+                    FieldProblem::Missing => "missing",
+                    FieldProblem::Unknown => "unknown",
+                    FieldProblem::WrongType => "the wrong type",
+                    _ => "invalid",
+                },
+                problem.hint
+            )),
+            None => invalid(&format!(
+                "work request is not valid strict JSON at line {} column {}",
+                error.line(),
+                error.column()
+            )),
+        }
+    })
 }
 
 fn query_path(path: &str, query: serde_json::Value) -> Result<String> {
