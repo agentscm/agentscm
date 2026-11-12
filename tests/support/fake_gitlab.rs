@@ -209,6 +209,10 @@ pub struct Project {
     pub default_branch: Option<String>,
     /// A bare Git repository behind the branch reads and MR creation, if any.
     pub git: Option<std::path::PathBuf>,
+    /// Namespace ids from the project's own outward: its group then each parent group, or its
+    /// owner's user id.
+    pub namespaces: Vec<i64>,
+    pub archived: bool,
 }
 
 impl Project {
@@ -224,6 +228,8 @@ impl Project {
             commits: BTreeMap::new(),
             default_branch: Some("main".into()),
             git: None,
+            namespaces: Vec::new(),
+            archived: false,
         }
     }
 }
@@ -572,6 +578,36 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             200,
             json!({"id": token.user_id, "username": token.username}),
         );
+    }
+    // A group's projects (its subgroups' too when asked) or a user's, honouring `archived`.
+    if let (&Method::GET, [owner @ ("groups" | "users"), id, "projects"]) = (method, &segs[..]) {
+        let q = |name: &str| {
+            query
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let (id, deep) = (
+            id.parse::<i64>().unwrap_or(0),
+            q("include_subgroups") == Some("true"),
+        );
+        let listed: Vec<Value> = state
+            .projects
+            .values()
+            .filter(|p| can_read(p, &token))
+            .filter(|p| match *owner {
+                "groups" if deep => p.namespaces.contains(&id),
+                _ => p.namespaces.first() == Some(&id),
+            })
+            .filter(|p| q("archived") != Some("false") || !p.archived)
+            .map(|p| {
+                let mut json = project_json(ctx, p, &token);
+                json["archived"] = json!(p.archived);
+                json
+            })
+            .collect();
+        let (page, link) = paginate(ctx, uri, &query, listed);
+        return reply(200, &link, Some(Value::Array(page)));
     }
     let ["projects", key, tail @ ..] = &segs[..] else {
         return not_found();

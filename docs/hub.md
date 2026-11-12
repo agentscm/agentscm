@@ -1430,6 +1430,32 @@ them (409 when another connection already holds the repository). A PAT acts as o
 person: its comments appear as theirs.
 `AGENTSCM_GITHUB_URL` and `AGENTSCM_GITHUB_API_URL` are the ones sign-in uses.
 
+Embedded connections. A program that embeds the hub as a library can supply a
+connection's credential itself. It implements `sync::ConnectionCredentials`
+(`token`, `active` and, optionally, `namespace`) and passes it to
+`Sync::with_connection_credentials`, then records connections of kind `embedded`
+(GitHub or GitLab; no app id or slug; `acts_as` is required, so the hub recognises
+its own comments and statuses). For an embedded connection the hub asks `token`
+for a current credential on every use and caches nothing. An unauthorized answer
+marks the connection `auth_failed` and starts the usual backoff; any other error
+skips that repository for the round. Without an embedder, an embedded connection
+fails as a credential problem and nothing is called. Embedded connections are
+polled only: their webhook route answers 401. Repositories are added as for a
+PAT (`POST /v1/hub/connections/{id}/repositories`). `active` applies to every
+connection kind, apps included: a repository it answers false for is skipped by
+polling, the catch-up status pass and webhook jobs, though discovery still
+attaches it. With only `AGENTSCM_GITLAB_URL` set (no token), the GitLab client
+serves embedded connections alone.
+
+Following a GitLab namespace. When `namespace` names a group or a user for a
+GitLab connection that is not an app, each poll lists its projects
+(`/groups/:id/projects?include_subgroups=true&archived=false`, or
+`/users/:id/projects?archived=false`), 100 a page and at most 10 pages, and
+connects new ones as discovery does. Nothing is detached; a project another
+connection holds stays with it. A listing cut short at the page cap adds a poll
+report with an empty `repository` and `truncated: {"namespace_projects": <pages
+unread>}`. At most 1,000 connected repositories per connection are polled.
+
 _Experimental: tested only against in-process fake servers, not live GitHub or GitLab._
 
 GitLab. The same engine reads GitLab (REST v4, `Authorization: Bearer`) through

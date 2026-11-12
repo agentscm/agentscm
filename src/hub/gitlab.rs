@@ -27,6 +27,17 @@ const MAX_BRANCH_PAGES: u32 = 10;
 pub const MAX_TREE_PAGES: u32 = 5;
 /// Pages of one commit's statuses of a single name.
 pub const MAX_STATUS_PAGES: u32 = 2;
+/// Pages of a followed namespace's project listing (1,000 projects); more is reported.
+pub const MAX_NAMESPACE_PAGES: u32 = 10;
+
+/// A GitLab namespace whose projects a connection follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Namespace {
+    /// A group by id; its subgroups' projects are followed too.
+    Group(i64),
+    /// A user by id: the projects in their personal namespace.
+    User(i64),
+}
 
 /// The newest status of one name on a commit, as GitLab reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +165,29 @@ impl Api {
     pub async fn project_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
         let path = format!("/projects/{}", encode(full_name));
         answer(self.get(token, &path).await?, "projects")
+    }
+
+    /// The namespace's projects, archived ones left out, at most [`MAX_NAMESPACE_PAGES`]
+    /// pages, and the number of pages left unread past that cap.
+    pub async fn namespace_projects(
+        &self,
+        token: &str,
+        namespace: Namespace,
+    ) -> Gh<(Vec<RepoInfo>, u32)> {
+        let path = match namespace {
+            Namespace::Group(id) => {
+                format!("/groups/{id}/projects?include_subgroups=true&archived=false")
+            }
+            Namespace::User(id) => format!("/users/{id}/projects?archived=false"),
+        };
+        let paged = self.paged(token, &path, MAX_NAMESPACE_PAGES).await?;
+        let projects = paged
+            .items
+            .iter()
+            .filter(|item| item["archived"].as_bool() != Some(true))
+            .filter_map(project_info)
+            .collect();
+        Ok((projects, paged.unread))
     }
 
     /// The user id and username the token acts as.
