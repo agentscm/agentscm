@@ -333,6 +333,24 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
         session: "requester-session".into(),
         expected_updated_seq: responded.updated_seq,
     };
+    // A session that is neither the requester nor a target's lead is told who resolves, not
+    // to sign in again.
+    match store.coordination_resolve(
+        &requester,
+        &CoordinationResolve {
+            session: "bystander-session".into(),
+            ..premature.clone()
+        },
+        now + 8,
+    ) {
+        Err(HubError::Rejected(rejection)) => {
+            assert_eq!(
+                rejection.message(),
+                agentscm::hub::coordination::RESOLVE_NOT_PARTY
+            );
+        }
+        other => panic!("expected the resolve-party refusal, got {other:?}"),
+    }
     assert!(matches!(
         store.coordination_resolve(&requester, &premature, now + 8),
         Err(HubError::WorkCoordinationRequired { .. })

@@ -2300,6 +2300,36 @@ fn lapsed_hold_refusal(
     )))
 }
 
+/// The `LEASE_LAPSED` text the next edit of this lead session would meet: its scope taken
+/// after the lapse, or its active or blocked Work's lease lapsed with the scope still free.
+fn lapse_notice(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let who = match work_who(tx, token, now) {
+        Ok(who) => who,
+        Err(HubError::Unauthorized) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Current Work first: a lapse whose scope was taken leaves active Work paused (blocked Work
+    // stays blocked), and a lead that has since moved on is told only of the Work it leads now.
+    if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
+        if let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)? {
+            return Ok(Some(lapsed_unheld_text(
+                &item.id,
+                item.generation,
+                renewed,
+                expired,
+                Unheld::Edit,
+            )));
+        }
+        return lapsed_hold_refusal(tx, &who, session, Some(&item.id));
+    }
+    lapsed_hold_refusal(tx, &who, session, None)
+}
+
 /// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
 fn lapsed_at(tx: &mut postgres::Transaction<'_>, id: &str, now: i64) -> Result<Option<(i64, i64)>> {
     if !lease_lapsed(tx, id, now)? {
@@ -8889,17 +8919,32 @@ impl Store for PgStore {
         call: &SessionCall,
         phase: CallPhase,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
             let touched = touch_in(&mut tx, &who, &call, call.session.is_some(), now)?;
+            let mut lapsed = None;
             if call.session.is_some() {
                 session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+                // Advice only: the touch's renewal must not depend on it. A failed statement
+                // aborts a PostgreSQL transaction, so the read runs in a savepoint that is
+                // rolled back on its own.
+                let mut savepoint = tx.transaction()?;
+                lapsed = match lapse_notice(&mut savepoint, token, &touched.session, now) {
+                    Ok(found) => {
+                        savepoint.commit()?;
+                        found
+                    }
+                    Err(error) => {
+                        eprintln!("hub: lapse notice not read: {error}");
+                        None
+                    }
+                };
             }
             tx.commit()?;
-            Ok(())
+            Ok(lapsed)
         })
     }
 
@@ -15411,7 +15456,9 @@ impl Store for PgStore {
                     target.lead.token == who.token && target.lead.session == resolve.session
                 });
             if !authorized {
-                return Err(HubError::Unauthorized);
+                return Err(HubError::invalid_or_changed(
+                    super::coordination::RESOLVE_NOT_PARTY.into(),
+                ));
             }
             if coordination_operation_replay(
                 &mut tx,

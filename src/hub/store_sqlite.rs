@@ -2280,6 +2280,36 @@ fn lapsed_hold_refusal(
     )))
 }
 
+/// The `LEASE_LAPSED` text the next edit of this lead session would meet: its scope taken
+/// after the lapse, or its active or blocked Work's lease lapsed with the scope still free.
+fn lapse_notice(
+    tx: &Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let who = match work_who(tx, token, now) {
+        Ok(who) => who,
+        Err(HubError::Unauthorized) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Current Work first: a lapse whose scope was taken leaves active Work paused (blocked Work
+    // stays blocked), and a lead that has since moved on is told only of the Work it leads now.
+    if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
+        if let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)? {
+            return Ok(Some(lapsed_unheld_text(
+                &item.id,
+                item.generation,
+                renewed,
+                expired,
+                Unheld::Edit,
+            )));
+        }
+        return lapsed_hold_refusal(tx, &who, session, Some(&item.id));
+    }
+    lapsed_hold_refusal(tx, &who, session, None)
+}
+
 /// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
 fn lapsed_at(tx: &Transaction<'_>, id: &str, now: i64) -> Result<Option<(i64, i64)>> {
     if !lease_lapsed(tx, id, now)? {
@@ -9007,17 +9037,23 @@ impl Store for SqliteStore {
         call: &SessionCall,
         phase: CallPhase,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let call = check(call)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
         let touched = touch_in(&tx, &who, &call, call.session.is_some(), now)?;
+        let mut lapsed = None;
         if call.session.is_some() {
             session_tool_call(&tx, token, &touched.session, phase, now)?;
+            lapsed = lapse_notice(&tx, token, &touched.session, now).unwrap_or_else(|error| {
+                // Advice only: the touch's renewal must not depend on it.
+                eprintln!("hub: lapse notice not read: {error}");
+                None
+            });
         }
         tx.commit()?;
-        Ok(())
+        Ok(lapsed)
     }
 
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool> {
@@ -16664,7 +16700,9 @@ impl Store for SqliteStore {
                 target.lead.token == who.token && target.lead.session == resolve.session
             });
         if !authorized {
-            return Err(HubError::Unauthorized);
+            return Err(HubError::invalid_or_changed(
+                super::coordination::RESOLVE_NOT_PARTY.into(),
+            ));
         }
         if coordination_operation_replay(
             &tx,

@@ -337,6 +337,9 @@ impl CoordinationReply {
     }
 }
 
+/// Why a session that neither made a request nor leads one of its targets cannot resolve it.
+pub const RESOLVE_NOT_PARTY: &str = "only the session that made this coordination request, or the session that leads one of its target Work items, can resolve it, and the session in this call is neither. If you lead the target Work, pass the session that leads it. Otherwise answer with agentscm_coordination_reply (`agentscm work coordination-reply`) and leave resolving to the requester";
+
 impl CoordinationResolve {
     pub(super) fn validate(&self) -> Result<()> {
         validate_mutation(&self.request_id, &self.session, self.expected_updated_seq)?;
