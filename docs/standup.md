@@ -485,7 +485,7 @@ Old-name tokens cannot perform Work operations after the connected identity chan
 
 ## Agent surfaces
 
-The CLI prints the Hub's JSON response. A rejected `start` claim prints the structured conflict and exits with a nonzero status. `start` and `checkpoint` accept a strict JSON request from a file or standard input, bounded to 1 MiB:
+The CLI prints the Hub's JSON response. A rejected `start` claim prints the structured conflict and exits with a nonzero status. `start` and `checkpoint` accept a strict JSON request from a file or standard input, bounded to 1 MiB. `start` accepts `task` as an alias for `title`, and optional fields may be omitted. A request that does not decode fails with an error naming the offending field, never its value, or the line and column when no field can be named:
 
 ```sh
 agentscm work overview
