@@ -1,6 +1,7 @@
 //! Computer credentials: issued at sign-in, they mint and renew their owner's agent tokens with
 //! the repository role re-checked through the Hub's own connection credential, never a stored
 //! user forge token. They are refused on every human-session and agent route.
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::Router;
@@ -12,6 +13,7 @@ use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::super::access::{self, Decision, Level};
 use super::super::connection::ConnectedRepository;
 use super::super::device::{
     DEVICE_AGENT_TOKEN_TTL_SECONDS, DEVICE_READ_TOKEN_TTL_SECONDS, Device, DevicePrincipal,
@@ -473,7 +475,12 @@ async fn mint(
     validate_agent_name(&body.name)?;
     validate_repository(&body.repository)?;
     let owner = device.owner.clone();
-    let repo = mint_check(&state, &owner, &body.repository, "device_mint").await?;
+    let need = if body.read_only {
+        Level::Read
+    } else {
+        Level::Contribute
+    };
+    let repo = mint_check(&state, &owner, &body.repository, "device_mint", need).await?;
     let secret = generate_secret().map_err(|_| HubError::Unavailable("random source".into()))?;
     let ttl = if body.read_only {
         DEVICE_READ_TOKEN_TTL_SECONDS
@@ -508,26 +515,47 @@ async fn mint(
     Ok((StatusCode::CREATED, Json(reply)).into_response())
 }
 
-/// The connected repository `repository` when `owner` may have a token for it now: the allow
-/// list and their current role, checked for every mint. A refusal is recorded under `via`.
+/// The connected repository `repository` when `owner` may act on it at `need` now: the allow
+/// list and their current role, checked for every mint and every change a web page makes. A
+/// refusal is recorded under `via`.
 pub(in crate::hub) async fn mint_check(
     state: &HubState,
     owner: &User,
     repository: &str,
     via: &'static str,
+    need: Level,
 ) -> ApiResult<ConnectedRepository> {
-    mint_access(state, owner, repository, via)
-        .await
-        .map(|(repo, _)| repo)
+    let (repo, level) = mint_level(state, owner, repository, via).await?;
+    if level < need {
+        record_refusal(state, owner, "read_only", via).await;
+        return Err(ApiError::read_only().with_message(format!(
+            "You can read {} but not change anything in it",
+            repo.full_name
+        )));
+    }
+    Ok(repo)
 }
 
-/// [`mint_check`], and whether `owner` administers the repository (see [`repository_access`]).
+/// [`mint_check`] for reading, and whether `owner` administers the repository.
 pub(in crate::hub) async fn mint_access(
     state: &HubState,
     owner: &User,
     repository: &str,
     via: &'static str,
 ) -> ApiResult<(ConnectedRepository, bool)> {
+    mint_level(state, owner, repository, via)
+        .await
+        .map(|(repo, level)| (repo, level == Level::Administer))
+}
+
+/// The connected repository `repository` and what `owner` may do on it now (see
+/// [`repository_access`]).
+async fn mint_level(
+    state: &HubState,
+    owner: &User,
+    repository: &str,
+    via: &'static str,
+) -> ApiResult<(ConnectedRepository, Level)> {
     allow_listed(state, owner, via).await?;
     let identity = &owner.identity;
     let (store, host, named) = (
@@ -546,8 +574,8 @@ pub(in crate::hub) async fn mint_access(
             None => refused_about("not_connected", repository, forge),
         });
     };
-    let admin = match repository_access(state, owner, &repo).await {
-        Ok(admin) => admin,
+    let level = match repository_access(state, owner, &repo).await {
+        Ok(level) => level,
         Err(Denial::Role(role)) => {
             record_refusal(state, owner, "insufficient_role", via).await;
             return Err(super::insufficient_role(
@@ -563,20 +591,29 @@ pub(in crate::hub) async fn mint_access(
             return Err(refused_about(kind, &repo.full_name, forge));
         }
     };
-    Ok((repo, admin))
+    Ok((repo, level))
 }
 
-/// Refuses someone the allow list leaves out, recording it under `via`.
+/// Refuses someone the allow list, or the embedder's [`access::Access`], leaves out, recording
+/// it under `via`. Hub admins are never refused here.
 pub(super) async fn allow_listed(
     state: &HubState,
     owner: &User,
     via: &'static str,
 ) -> ApiResult<()> {
     let (identity, login) = (&owner.identity, &state.login);
-    if login.has_allow_list()
-        && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
-        && !login.is_allowed(&identity.provider, identity.user_id, &owner.login)
-    {
+    if login.is_admin(&identity.provider, identity.user_id, &owner.login) {
+        return Ok(());
+    }
+    let allowed = match access::decide(state, owner).await? {
+        Decision::HubRules => {
+            !login.has_allow_list()
+                || login.is_allowed(&identity.provider, identity.user_id, &owner.login)
+        }
+        Decision::Refused => false,
+        Decision::Granted(_) => true,
+    };
+    if !allowed {
         record_refusal(state, owner, "not_allowed", via).await;
         return Err(refused("not_allowed"));
     }
@@ -603,7 +640,14 @@ async fn web_read_token(
         ));
     }
     validate_repository(&body.repository)?;
-    let repo = mint_check(&state, &human.user, &body.repository, "web_read_token").await?;
+    let repo = mint_check(
+        &state,
+        &human.user,
+        &body.repository,
+        "web_read_token",
+        Level::Read,
+    )
+    .await?;
     let store = state.store.clone();
     let owner = human.user.id.clone();
     let (secret, expires_at) = blocking(&state, move || {
@@ -628,6 +672,41 @@ const LIST_DEADLINE: Duration = Duration::from_secs(10);
 /// Live intents and sessions read per repository for its counts.
 const LIST_LIVE_LIMIT: usize = 500;
 
+/// The connected repositories one of `owner`'s lists checks, at most
+/// [`super::MAX_SIGN_IN_PROBES`]; whether that is all of them; and the Hub ids of those they may
+/// only read. Without an embedder that is every one on their Git host, none read-only; with one,
+/// the ones it grants there.
+async fn list_candidates(
+    state: &HubState,
+    owner: &User,
+) -> ApiResult<(Vec<ConnectedRepository>, bool, HashSet<String>)> {
+    let host = owner.identity.host.clone();
+    let mut read_only = HashSet::new();
+    let mut candidates = match access::decide(state, owner).await? {
+        Decision::HubRules => {
+            let store = state.store.clone();
+            blocking(state, move || {
+                store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
+            })
+            .await?
+        }
+        Decision::Refused => Vec::new(),
+        Decision::Granted(grants) => grants
+            .into_iter()
+            .filter(|grant| grant.repository.host == host)
+            .map(|grant| {
+                if grant.level == Level::Read {
+                    read_only.insert(grant.repository.id.clone());
+                }
+                grant.repository
+            })
+            .collect(),
+    };
+    let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
+    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    Ok((candidates, complete, read_only))
+}
+
 /// The connected repositories on the person's forge host that they can read now, with a few
 /// counts each, for the web pages' All repositories list. Each passes the role check a mint makes,
 /// with no token stored. A refused one is left out without a refusal row; one the forge could not
@@ -646,13 +725,7 @@ async fn session_value_metrics(
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     query.window(unix_now()).map_err(ApiError::from)?;
     let owner = human.user;
-    let (store, host) = (state.store.clone(), owner.identity.host.clone());
-    let mut candidates = blocking(&state, move || {
-        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
-    })
-    .await?;
-    let repositories_complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
-    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    let (candidates, repositories_complete, _) = list_candidates(&state, &owner).await?;
     // A fresh role check applies to every aggregate and every detail page.
     let (mut readable, unchecked) = readable(&state, &owner, candidates, false).await;
     if let Some(name) = &query.repository {
@@ -721,13 +794,7 @@ async fn repositories_for_owner(
         },
     )
     .await?;
-    let (store, host) = (state.store.clone(), owner.identity.host.clone());
-    let mut candidates = blocking(&state, move || {
-        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
-    })
-    .await?;
-    let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
-    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    let (candidates, complete, read_only) = list_candidates(&state, &owner).await?;
     let (readable, unchecked) = readable(&state, &owner, candidates, !include_work).await;
     let store = state.store.clone();
     let setup = state.onboarding.clone();
@@ -875,6 +942,7 @@ async fn repositories_for_owner(
             } else {
                 Vec::new()
             };
+            let only_reads = read_only.contains(&repo.id);
             let summary = summarize(
                 repo.full_name,
                 repo.repository_id,
@@ -888,13 +956,21 @@ async fn repositories_for_owner(
             } else {
                 None
             };
-            rows.push((summary, work, live, work_complete, live_complete, revision));
+            rows.push((
+                summary,
+                work,
+                live,
+                work_complete,
+                live_complete,
+                revision,
+                only_reads,
+            ));
         }
         Ok(rows)
     })
     .await?;
     // What needs a person first, then stuck work, then the newest activity.
-    rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| {
+    rows.sort_by(|(a, ..), (b, ..)| {
         (b.needs_you > 0)
             .cmp(&(a.needs_you > 0))
             .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
@@ -904,9 +980,11 @@ async fn repositories_for_owner(
     let rows = rows
         .into_iter()
         .map(
-            |(summary, work, live, work_complete, live_complete, revision)| {
+            |(summary, work, live, work_complete, live_complete, revision, only_reads)| {
                 let mut value =
                     serde_json::to_value(summary).expect("repository summary serializes");
+                // Pages hide the changes a person who may only read cannot make.
+                value["read_only"] = json!(only_reads);
                 if include_work {
                     value["work"] = json!(work);
                     value["work_complete"] = json!(work_complete);
@@ -966,13 +1044,7 @@ pub(in crate::hub) async fn agent_repositories(
     }
     let owner = principal.owner.clone();
     allow_listed(state, &owner, "agent_repositories").await?;
-    let (store, host) = (state.store.clone(), owner.identity.host.clone());
-    let mut candidates = blocking(state, move || {
-        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
-    })
-    .await?;
-    let all_candidates = candidates.len() <= super::MAX_SIGN_IN_PROBES;
-    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    let (candidates, all_candidates, _) = list_candidates(state, &owner).await?;
     let (mut readable, unchecked) = readable(state, &owner, candidates, false).await;
     readable.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     let store = state.store.clone();
@@ -1073,6 +1145,18 @@ pub(in crate::hub) async fn readable(
     candidates: Vec<ConnectedRepository>,
     use_role_cache: bool,
 ) -> (Vec<ConnectedRepository>, usize) {
+    // An embedder answers for every repository at once, and its answer is never cached.
+    match access::decide(state, owner).await {
+        Ok(Decision::HubRules) => {}
+        Ok(decision) => {
+            let granted = candidates
+                .into_iter()
+                .filter(|repo| decision.level(&repo.id).is_some())
+                .collect();
+            return (granted, 0);
+        }
+        Err(_) => return (Vec::new(), candidates.len()),
+    }
     let deadline = tokio::time::Instant::now() + LIST_DEADLINE;
     let mut pending = candidates.into_iter();
     let mut checks = tokio::task::JoinSet::new();
@@ -1237,27 +1321,38 @@ async fn fork_parent(state: &HubState, owner: &User, repository: &str) -> Option
     None
 }
 
-/// The person's current role on a connected repository, asked with the connection's own
-/// credential and judged by [`super::missing_role`], the rule sign-in and session minting use.
-///
-/// The only source today is the forge; an administrator-issued grant for other Git hosts would
-/// be a second source here.
+/// Whether the person may contribute to a connected repository now: their role asked with the
+/// connection's own credential and judged by [`super::missing_role`], the rule sign-in and
+/// session minting use, or the embedder's grant when an [`access::Access`] is set.
 pub(in crate::hub) async fn repository_role(
     state: &HubState,
     owner: &User,
     repo: &ConnectedRepository,
 ) -> std::result::Result<(), Denial> {
-    repository_access(state, owner, repo).await.map(|_| ())
+    match repository_access(state, owner, repo).await? {
+        Level::Read => Err(Denial::Role(("private", "read", "developer"))),
+        Level::Contribute | Level::Administer => Ok(()),
+    }
 }
 
-/// [`repository_role`], and whether the person administers the repository: GitHub `admin`, or a
-/// GitLab maintainer or owner.
+/// What the person may do on the repository by [`repository_role`]: through the forge, to
+/// contribute, or to administer as a GitHub `admin` or a GitLab maintainer or owner.
 pub(in crate::hub) async fn repository_access(
     state: &HubState,
     owner: &User,
     repo: &ConnectedRepository,
-) -> std::result::Result<bool, Denial> {
+) -> std::result::Result<Level, Denial> {
     let kind = Denial::Kind;
+    match access::decide(state, owner).await {
+        Ok(Decision::HubRules) => {}
+        // Not granted reads as no role at all on the repository.
+        Ok(decision) => {
+            return decision
+                .level(&repo.id)
+                .ok_or(Denial::Role(("private", "none", "read")));
+        }
+        Err(_) => return Err(kind("permission_unavailable")),
+    }
     let store = state.store.clone();
     let id = repo.connection.clone();
     let conn = match blocking(state, move || store.connection(&id)).await {
@@ -1314,7 +1409,10 @@ pub(in crate::hub) async fn repository_access(
         return Err(kind("sign_in_required"));
     }
     match role_refusal(gitlab, &project, role.as_ref()) {
-        None => Ok(role.as_ref().is_some_and(|role| administers(gitlab, role))),
+        None if role.as_ref().is_some_and(|role| administers(gitlab, role)) => {
+            Ok(Level::Administer)
+        }
+        None => Ok(Level::Contribute),
         Some(role) => Err(Denial::Role(role)),
     }
 }
