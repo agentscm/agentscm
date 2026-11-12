@@ -840,6 +840,8 @@ async fn repositories_for_owner(
         complete,
         read_only,
     } = listed(&state, &owner, &decision, !include_work).await?;
+    // Every listed repository is on the person's own forge host; the summary already names the provider.
+    let host = owner.identity.host.clone();
     let store = state.store.clone();
     let setup = state.onboarding.clone();
     let mut rows = blocking(&state, move || {
@@ -1029,6 +1031,7 @@ async fn repositories_for_owner(
                     serde_json::to_value(summary).expect("repository summary serializes");
                 // Pages hide the changes a person who may only read cannot make.
                 value["read_only"] = json!(only_reads);
+                value["host"] = json!(host);
                 if include_work {
                     value["work"] = json!(work);
                     value["work_complete"] = json!(work_complete);
