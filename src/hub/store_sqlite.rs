@@ -2285,6 +2285,30 @@ fn lapsed_hold_refusal(
     )))
 }
 
+/// The `LEASE_LAPSED` text the next edit of this lead session would meet: its scope taken
+/// after the lapse, or its active or blocked Work's lease lapsed with the scope still free.
+fn lapse_notice(
+    tx: &Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let who = match work_who(tx, token, now) {
+        Ok(who) => who,
+        Err(HubError::Unauthorized) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if let Some(refusal) = lapsed_hold_refusal(tx, &who, session, None)? {
+        return Ok(Some(refusal));
+    }
+    let Some(item) = unfinished_for_session(tx, &who, session, now)? else {
+        return Ok(None);
+    };
+    Ok(lapsed_at(tx, &item.id, now)?.map(|(renewed, expired)| {
+        lapsed_unheld_text(&item.id, item.generation, renewed, expired, Unheld::Edit)
+    }))
+}
+
 /// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
 fn lapsed_at(tx: &Transaction<'_>, id: &str, now: i64) -> Result<Option<(i64, i64)>> {
     if !lease_lapsed(tx, id, now)? {
@@ -9012,17 +9036,19 @@ impl Store for SqliteStore {
         call: &SessionCall,
         phase: CallPhase,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let call = check(call)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
         let touched = touch_in(&tx, &who, &call, call.session.is_some(), now)?;
+        let mut lapsed = None;
         if call.session.is_some() {
             session_tool_call(&tx, token, &touched.session, phase, now)?;
+            lapsed = lapse_notice(&tx, token, &touched.session, now)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(lapsed)
     }
 
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool> {

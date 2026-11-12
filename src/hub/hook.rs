@@ -195,6 +195,9 @@ struct Call {
     /// What the hook client observed a shell call do to the working tree, on the call that ends
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
+    /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
+    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    notice: Option<Shape>,
 }
 
 /// At most this many paths in one observation; more set `truncated`. Defined here, not in the
@@ -352,7 +355,7 @@ async fn hook(
     let measured = (token.clone(), repo.clone());
     let started = Instant::now();
     let deadline = started + BUDGET;
-    let call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
+    let mut call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
         Ok(Ok(bytes)) => Call::parse(agent, &bytes, root_header(&parts.headers)),
         Ok(Err(_)) => Call::failed(agent, "hook payload too large"),
         Err(_) => Call::failed(agent, "hub timed out"),
@@ -565,6 +568,13 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+    // A lapse notice is the only text an otherwise silent tool call carries.
+    if matches!(call.kind, Kind::Activity(_))
+        && outcome.status == "fyi"
+        && let Some(shape) = call.notice
+    {
+        call.shape = shape;
+    }
     let rendered = call.render(&outcome);
     let sample = super::hook_overhead::sample(
         call.session.as_deref(),
@@ -665,12 +675,26 @@ impl Call {
             cleared: false,
             launched: None,
             observed: None,
+            notice: None,
         }
     }
 
     /// The shell call this call ends changed these files (observed by the hook client): already
     /// applied, so the check of them runs after the fact like Cursor's, with the host's context
     /// channel for `event`. A call that observed nothing is unchanged.
+    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
+    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+        let event = match event {
+            "PreToolUse" => "PreToolUse",
+            "PostToolUse" => "PostToolUse",
+            _ => return self,
+        };
+        if agent == Agent::Claude {
+            self.notice = Some(Shape::Hook(event));
+        }
+        self
+    }
+
     fn observed_shell(mut self, event: &'static str, field: Option<&Value>) -> Self {
         let Some(field) = field.filter(|field| !field.is_null()) else {
             return self;
@@ -930,6 +954,7 @@ impl Call {
             Kind::Activity(phase) => {
                 // Best effort and silent: the touch renews the session's own leases, and a
                 // failure must not disturb the agent. An unnamed session renews nothing.
+                let mut lapsed = None;
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
                     self.note_subagents(state, &principal);
@@ -941,16 +966,35 @@ impl Call {
                         report: false,
                         ..heartbeat
                     };
-                    if let Err(error) = blocking(state, move || {
-                        store.session_activity(&principal.token_id, &heartbeat, phase, unix_now())
+                    let id = principal.token_id.clone();
+                    let found = blocking(state, move || {
+                        store.session_activity(&id, &heartbeat, phase, unix_now())
                     })
                     .await
-                    {
-                        return Err(reason(error));
-                    }
+                    .map_err(reason)?;
+                    // Once per lapse, to the lead itself: a subagent's context ends with it.
+                    lapsed = found.filter(|text| {
+                        !self.child
+                            && self.notice.is_some()
+                            && first_note(format!("lapse\0{}\0{text}", principal.token_id))
+                    });
                 }
-                // Only a shell call's end that could not observe its changes says anything.
-                Ok(Outcome::advice(self.observed_line(), false))
+                // Only a shell call's end that could not observe its changes, or a lapse the
+                // lead has not been told of, says anything.
+                let mut outcome = Outcome::advice(self.observed_line(), false);
+                if let Some(text) = lapsed {
+                    let text = text.replace("when this was refused", "at this tool call");
+                    outcome.text = format!(
+                        "{}AgentSCM: nothing was refused yet, but this session's next edit is: {text}",
+                        if outcome.text.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}\n", outcome.text)
+                        }
+                    );
+                    outcome.status = "fyi";
+                }
+                Ok(outcome)
             }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
@@ -1848,6 +1892,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
+                .noticed(agent, event)
                 .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
@@ -1856,7 +1901,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Kind::Activity(phase(tool, event == "PreToolUse")),
             Shape::Silent,
         )
-        .launched(&v["subagent"]),
+        .launched(&v["subagent"])
+        .noticed(agent, event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";

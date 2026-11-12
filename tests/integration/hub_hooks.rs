@@ -1830,6 +1830,57 @@ async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
     );
 }
 
+/// #542 item 9: the lead's next tool call after its hold lapsed says so once, before any edit
+/// is refused. A subagent's call says nothing, since its context ends with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let item = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let read = |agent_id: Option<&str>| {
+        let mut call = json!({"hook_event_name":"PostToolUse", "session_id":session,
+            "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+            "cwd":"/work/acme-widgets"});
+        if let Some(id) = agent_id {
+            call["agent_id"] = json!(id);
+        }
+        call
+    };
+    assert_eq!(
+        hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
+        json!({})
+    );
+    let answer = hub.hook_raw("claude", &lead, &read(None));
+    assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(text.contains("nothing was refused yet"), "{answer}");
+    assert!(text.contains("LEASE_LAPSED"), "{answer}");
+    assert!(
+        text.contains(&format!(
+            "work_id {}, takeover_generation {}",
+            item.id, item.generation
+        )),
+        "{answer}"
+    );
+    assert!(!text.contains("when this was refused"), "{answer}");
+    assert_eq!(hub.hook_raw("claude", &lead, &read(None)), json!({}));
+}
+
 /// The hook's side of answering a permission prompt from the Hub. A request needs its session's
 /// permission wait, is offered only once the host's own notification confirms a prompt is on
 /// screen, and ends when the session moves on.
