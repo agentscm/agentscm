@@ -139,10 +139,10 @@ identity, permission, generation and `updated_seq` in its own transaction. See
 
 | Route | Caller | Effect |
 |---|---|---|
-| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work and typed remedies |
+| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work, typed remedies (including `prune_participants`) and per-Work `findings` (`kind`, `evidence`, `complete`, optional `proposed`). `all_owners` is refused here |
 | `POST /v1/hub/standup/recovery/preview` | Agent or read-only bearer token | Body `work_id`, `remedy`, optional `session`, `scope` (handover) and `superseded_by` (supersede): effects, fences and the apply call |
 | `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item. An item may carry `participants` (`token`, `session`) for `prune_participants` |
-| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's as a Hub administrator |
+| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's by `work_id` as a Hub administrator. Optional `all_owners: true`, for a Hub administrator only and not with `work_id`, pages every owner's unfinished Work; others get 400 "only a Hub administrator can inspect every owner's Work" |
 | `POST /v1/hub/session/work/recovery/preview` | Web sign-in with CSRF | The person's preview; `repository`, `work_id`, `remedy`, optional `scope` and `superseded_by` |
 | `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items`; an item may carry `participants` for `prune_participants` |
 

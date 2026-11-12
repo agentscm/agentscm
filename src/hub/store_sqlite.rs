@@ -130,7 +130,7 @@ use super::work_reconciliation::{
     WorkDeclarationsView,
 };
 use super::work_recovery::{
-    MAX_RECOVERY_LISTED, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
+    MAX_RECOVERY_LISTED, ParticipantMark, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
 };
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
@@ -2633,6 +2633,24 @@ fn open_requests_by_work(
         }
     }
     Ok(by_work)
+}
+
+/// When each participant of `id` joined and last changed.
+fn participant_marks(tx: &Transaction<'_>, id: &str) -> Result<Vec<ParticipantMark>> {
+    let mut statement = tx.prepare(
+        "SELECT token, session, generation, updated_at FROM hub_work_participants WHERE work = ?1",
+    )?;
+    let marks = statement
+        .query_map(params![id], |row| {
+            Ok(ParticipantMark {
+                token: row.get(0)?,
+                session: row.get(1)?,
+                generation: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(marks)
 }
 
 /// The unfinished Work that depends on `id`; recovery applies its own smaller projection bound.
@@ -11957,7 +11975,7 @@ impl Store for SqliteStore {
                 let mut statement = tx.prepare(
                     "SELECT id FROM hub_work_items
                      WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-                       AND owner = ?5 AND state <> 'finished' AND id > ?6
+                       AND (?8 OR owner = ?5) AND state <> 'finished' AND id > ?6
                      ORDER BY id LIMIT ?7",
                 )?;
                 let mut ids = statement
@@ -11969,7 +11987,8 @@ impl Store for SqliteStore {
                             who.repository_id,
                             who.owner.id,
                             read.after.as_deref().unwrap_or(""),
-                            i64::try_from(read.limit + 1).unwrap_or(i64::MAX)
+                            i64::try_from(read.limit + 1).unwrap_or(i64::MAX),
+                            read.all_owners
                         ],
                         |row| row.get::<_, String>(0),
                     )?
@@ -12039,10 +12058,12 @@ impl Store for SqliteStore {
                 .into_iter()
                 .take(MAX_RECOVERY_LISTED + 1)
                 .collect();
+            let marks = participant_marks(&tx, &row.item.id)?;
             recovery.push(RecoveryRow {
                 row,
                 requests,
                 dependents,
+                marks,
             });
         }
         let forge_window_from = forge_window_from(&tx, &who)?;

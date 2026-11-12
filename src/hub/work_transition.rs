@@ -21,7 +21,7 @@ use super::{HubError, Result};
 
 const MAX_REASON_BYTES: usize = 500;
 const MAX_LABEL_BYTES: usize = 255;
-const MAX_PARTICIPANTS: usize = 100;
+pub(super) const MAX_PARTICIPANTS: usize = 100;
 const MAX_RELATIONS: usize = 100;
 
 /// Who asks for a transition. The caller establishes a person's identity and administrator flag;
@@ -116,7 +116,8 @@ pub struct WorkTransitionRequest {
     pub participants: Vec<ParticipantRef>,
 }
 
-/// One participant of a Work, named the way the Work lists it.
+/// One participant of a Work, named the way the Work lists it. A session may be its native id or
+/// the digest a Work shows for another owner's session; both name the same participant.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipantRef {
@@ -426,16 +427,18 @@ pub(super) fn apply(
             removed: Vec::new(),
         },
         PruneParticipants => {
+            let names = |participant: &WorkParticipant, wanted: &ParticipantRef| {
+                participant.token == wanted.token
+                    && (participant.session == wanted.session
+                        || super::store::session_key(&participant.token, &participant.session)
+                            == wanted.session)
+            };
             let listed = |participant: &WorkParticipant| {
-                request
-                    .participants
-                    .iter()
-                    .any(|p| p.token == participant.token && p.session == participant.session)
+                request.participants.iter().any(|p| names(participant, p))
             };
             let removable = request.participants.iter().all(|wanted| {
                 item.participants.iter().any(|participant| {
-                    participant.token == wanted.token
-                        && participant.session == wanted.session
+                    names(participant, wanted)
                         && participant.role != WorkRole::Lead
                         && !(participant.token == item.lead_token
                             && participant.session == item.lead_session)

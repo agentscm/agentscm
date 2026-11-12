@@ -255,7 +255,7 @@ pub enum WorkCommand {
     RecoveryPreview {
         #[arg(long)]
         work_id: String,
-        /// release, retain, complete, abandon, supersede, reopen, resume or handover.
+        /// release, retain, complete, abandon, supersede, reopen, prune_participants, resume or handover.
         #[arg(long)]
         remedy: String,
         /// Your agent session.
@@ -958,6 +958,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 after,
                 limit,
                 session,
+                all_owners: false,
             };
             let reply = hub
                 .call(

@@ -13,9 +13,9 @@ use agentscm::hub::work_lifecycle::{
     ActivityStatus, LEASE_SECONDS, Recipient, ReservationStatus, WorkTransitionKind,
 };
 use agentscm::hub::work_recovery::{
-    BatchItemV1, BatchOutcome, BatchTransitionItem, RecoveryBucket, RecoveryCaller, RecoveryQuery,
-    RefusalCode, RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1, WorkTransitionBatch,
-    apply_batch, inspect, preview,
+    BatchItemV1, BatchOutcome, BatchTransitionItem, FindingKind, RecoveryBucket, RecoveryCaller,
+    RecoveryQuery, RefusalCode, RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1,
+    WorkTransitionBatch, apply_batch, inspect, preview,
 };
 use agentscm::hub::work_transition::{
     OperationalSelect, ParticipantRef, WorkLifecycleReader, WorkTransitionActor,
@@ -1580,6 +1580,390 @@ macro_rules! conformance {
     };
 }
 
+fn person<'a>(user: &'a User, is_admin: bool) -> RecoveryCaller<'a> {
+    RecoveryCaller::Person {
+        user,
+        repository: REPO,
+        repository_id: REPOSITORY_ID,
+        is_admin,
+    }
+}
+
+fn all_owners() -> RecoveryQuery {
+    RecoveryQuery {
+        all_owners: true,
+        ..RecoveryQuery::default()
+    }
+}
+
+fn finding_kinds(recovery: &WorkRecoveryV1, id: &str) -> Vec<FindingKind> {
+    recovery
+        .work
+        .iter()
+        .find(|work| work.work_id == id)
+        .unwrap()
+        .findings
+        .iter()
+        .map(|finding| finding.kind)
+        .collect()
+}
+
+/// A Hub administrator pages every owner's Work through the person route's service; nobody else
+/// may, and an owner or an agent still reads only their own.
+fn an_admin_inventories_every_owner_and_owners_see_their_own(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let (stranger, admin) = (user(&*store, 7), user(&*store, 8));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let a = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let b = store
+        .work_start(&bob.token, &start("b", "s-b", "src/b/**"), now)
+        .unwrap()
+        .item;
+
+    let seen = inspect(&*store, &person(&admin, true), &all_owners(), now + 1).unwrap();
+    let ids: Vec<_> = seen.work.iter().map(|work| work.work_id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&a.id.as_str()) && ids.contains(&b.id.as_str()));
+    assert!(
+        seen.work
+            .iter()
+            .all(|work| work.standing == Standing::Admin)
+    );
+    // Admin standing keeps the transitions an administrator already had.
+    assert_eq!(
+        permitted(&seen, &a.id),
+        [
+            RemedyKind::Abandon,
+            RemedyKind::Release,
+            RemedyKind::Supersede
+        ]
+    );
+    // Without all_owners an administrator reads their own Work, which is none.
+    let own = read(
+        &*store,
+        &person(&admin, true),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert!(own.work.is_empty());
+
+    for refused in [
+        inspect(&*store, &person(&stranger, false), &all_owners(), now + 1),
+        inspect(&*store, &person(&alice.user, false), &all_owners(), now + 1),
+        inspect(&*store, &caller(&alice, "s-a"), &all_owners(), now + 1),
+        inspect(
+            &*store,
+            &person(&admin, true),
+            &RecoveryQuery {
+                work_id: Some(a.id.clone()),
+                all_owners: true,
+                ..RecoveryQuery::default()
+            },
+            now + 1,
+        ),
+    ] {
+        match refused {
+            Err(HubError::Invalid(message)) => assert!(
+                message.contains("Hub administrator") || message.contains("work_id"),
+                "{message}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-a"),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert_eq!(mine.work.len(), 1);
+    assert_eq!(mine.work[0].work_id, a.id);
+    assert_eq!(mine.work[0].standing, Standing::Lead);
+    let theirs = read(
+        &*store,
+        &person(&alice.user, false),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert_eq!(theirs.work.len(), 1);
+}
+
+/// A Work left alone for a long time gets findings, but none proposes `complete`, and the
+/// remedies it lists are the ones it had without them.
+fn inventory_never_proposes_complete_from_age(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let admin = user(&*store, 8);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + 2 * 86_400;
+    tick(&*store, now, now + LEASE_SECONDS + 1);
+    store.observe_lease_clock(later).unwrap();
+
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-new"),
+        RecoveryQuery::default(),
+        later,
+    );
+    let kinds = finding_kinds(&mine, &work.id);
+    assert!(kinds.contains(&FindingKind::LapsedHold), "{kinds:?}");
+    assert!(kinds.contains(&FindingKind::AbandonedSession), "{kinds:?}");
+    let entry = &mine.work[0];
+    let lapsed = entry
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::LapsedHold)
+        .unwrap();
+    assert_eq!(lapsed.proposed, Some(RemedyKind::Release));
+    assert!(
+        lapsed.evidence.contains("lapsed at Unix"),
+        "{}",
+        lapsed.evidence
+    );
+    let abandoned = entry
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::AbandonedSession)
+        .unwrap();
+    assert_eq!(abandoned.proposed, Some(RemedyKind::Resume));
+    // Other standing is told, never proposed, a takeover of a stale claim.
+    let theirs = read(
+        &*store,
+        &caller(&bob, "s-b"),
+        RecoveryQuery {
+            work_id: Some(work.id.clone()),
+            ..RecoveryQuery::default()
+        },
+        later,
+    );
+    assert!(
+        theirs.work[0]
+            .findings
+            .iter()
+            .all(|finding| finding.proposed.is_none())
+    );
+    let everyone = inspect(&*store, &person(&admin, true), &all_owners(), later).unwrap();
+    for recovery in [&mine, &theirs, &everyone] {
+        for work in &recovery.work {
+            assert!(
+                work.findings
+                    .iter()
+                    .all(|finding| finding.proposed != Some(RemedyKind::Complete)),
+                "{:?}",
+                work.findings
+            );
+        }
+    }
+    // The remedies are the same with or without the inventory's findings: complete stays refused
+    // to the admin and is never added.
+    assert_eq!(
+        permitted(&everyone, &work.id),
+        [
+            RemedyKind::Abandon,
+            RemedyKind::Release,
+            RemedyKind::Supersede
+        ]
+    );
+}
+
+/// Reading an inventory with findings writes nothing.
+fn read_only_inventory_changes_nothing(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let admin = user(&*store, 8);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let state = || {
+        (
+            db.scalar("SELECT COUNT(*) FROM hub_events"),
+            db.scalar(&format!(
+                "SELECT updated_seq FROM hub_work_items WHERE id = '{}'",
+                work.id
+            )),
+            db.scalar("SELECT COUNT(*) FROM hub_work_participants"),
+        )
+    };
+    let before = state();
+    let page = inspect(&*store, &person(&admin, true), &all_owners(), later).unwrap();
+    assert!(!page.work[0].findings.is_empty());
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-new"),
+        RecoveryQuery::default(),
+        later,
+    );
+    assert!(!mine.work[0].findings.is_empty());
+    assert_eq!(state(), before);
+    assert_eq!(
+        current(&*store, &alice, &work.id, later).updated_seq,
+        work.updated_seq
+    );
+}
+
+/// A full participant list is reported, the prune the inventory proposes previews and applies
+/// as returned, and a new session can then take the Work over.
+fn the_inventory_proposes_a_prune_that_frees_a_full_list(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let me = caller(&alice, "s-new");
+    let page = one(&*store, &me, &work.id, later);
+    let cap = page.work[0]
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::ParticipantCap)
+        .expect("a full list is reported");
+    assert_eq!(cap.proposed, Some(RemedyKind::PruneParticipants));
+    assert!(cap.complete);
+    assert!(
+        cap.evidence.contains("100 participants"),
+        "{}",
+        cap.evidence
+    );
+    assert!(permitted(&page, &work.id).contains(&RemedyKind::PruneParticipants));
+
+    let previewed = preview(
+        &*store,
+        &me,
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-new".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(previewed.permitted, "{:?}", previewed.refusal);
+    assert_eq!(previewed.effects.fenced.len(), 1);
+    assert_eq!(
+        previewed.effects.reservation,
+        previewed.operational.reservation.status
+    );
+    let json = serde_json::to_string(&previewed.effects).unwrap();
+    assert!(
+        !json.contains(&alice.token) && !json.contains("h-0"),
+        "{json}"
+    );
+    let apply = previewed.apply.clone().unwrap();
+    assert_eq!(apply.tool.as_deref(), Some("agentscm_work_transition"));
+    assert_eq!(apply.arguments["transition"], "prune_participants");
+    assert_eq!(apply.arguments["participants"].as_array().unwrap().len(), 1);
+    // The call carries a digest, never a native session id.
+    assert!(
+        !apply.arguments.to_string().contains("h-"),
+        "{}",
+        apply.arguments
+    );
+
+    let mut request: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+        "work_id": apply.arguments["work_id"],
+        "operation_id": "prune-from-preview",
+        "generation": apply.arguments["generation"],
+        "expected_updated_seq": apply.arguments["expected_updated_seq"],
+        "session": apply.arguments["session"],
+        "transition": apply.arguments["transition"],
+        "reason": "synthetic participant repair",
+        "participants": apply.arguments["participants"],
+    }))
+    .unwrap();
+    let pruned = store
+        .work_transition(&as_agent(&alice), &request, later + 2)
+        .unwrap();
+    assert_eq!(pruned.item.participants.len(), 99);
+    // The same call again replays.
+    request.operation_id = "prune-from-preview".into();
+    assert!(
+        store
+            .work_transition(&as_agent(&alice), &request, later + 3)
+            .unwrap()
+            .receipt
+            .unwrap()
+            .replayed
+    );
+    // With room left, the finding and the prune are gone.
+    let after = one(&*store, &me, &work.id, later + 4);
+    assert!(!finding_kinds(&after, &work.id).contains(&FindingKind::ParticipantCap));
+    assert!(!permitted(&after, &work.id).contains(&RemedyKind::PruneParticipants));
+    let resumed = takeover(&*store, &alice, &pruned.item, "s-new", later + 5).unwrap();
+    assert!(resumed.took_over);
+}
+
+/// Another owner's agent can read a Work but is offered no transition and no prune on it.
+fn other_owners_items_are_refused_not_taken(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let theirs = read(
+        &*store,
+        &caller(&bob, "s-b"),
+        RecoveryQuery {
+            work_id: Some(work.id.clone()),
+            ..RecoveryQuery::default()
+        },
+        later,
+    );
+    let entry = &theirs.work[0];
+    assert_eq!(entry.standing, Standing::Other);
+    assert!(
+        entry
+            .remedies
+            .iter()
+            .all(|remedy| !remedy.permitted || remedy.remedy == RemedyKind::Resume)
+    );
+    let prune = entry
+        .remedies
+        .iter()
+        .find(|remedy| remedy.remedy == RemedyKind::PruneParticipants)
+        .unwrap();
+    assert!(!prune.permitted);
+    assert_eq!(
+        prune.refusal.as_ref().unwrap().code,
+        RefusalCode::NotAuthorized
+    );
+    assert!(prune.apply.is_none());
+    assert!(
+        entry
+            .findings
+            .iter()
+            .all(|finding| finding.proposed.is_none())
+    );
+}
+
 conformance!(
     an_owner_retires_an_obsolete_hold_and_keeps_its_follow_up,
     the_owner_resumes_expired_work_after_a_session_restart,
@@ -1598,4 +1982,9 @@ conformance!(
     a_full_participant_list_is_repairable_and_resumable,
     legacy_over_share_work_repairs,
     only_the_owner_or_an_admin_prunes_and_nothing_is_partly_pruned,
+    an_admin_inventories_every_owner_and_owners_see_their_own,
+    inventory_never_proposes_complete_from_age,
+    read_only_inventory_changes_nothing,
+    the_inventory_proposes_a_prune_that_frees_a_full_list,
+    other_owners_items_are_refused_not_taken,
 );

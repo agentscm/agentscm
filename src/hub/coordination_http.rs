@@ -516,6 +516,9 @@ struct PersonRecovery {
     after: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Page every owner's Work; only a Hub administrator may.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 /// What a signed-in person can recover in one repository: their own Work, and anyone's as a
@@ -534,6 +537,7 @@ async fn person_recovery(
         after: body.after,
         limit: body.limit,
         session: None,
+        all_owners: body.all_owners,
     };
     let store = state.store.clone();
     Ok(Json(

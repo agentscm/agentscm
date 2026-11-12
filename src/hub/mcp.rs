@@ -1056,7 +1056,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
          "annotations": {"readOnlyHint": true},
          "inputSchema": schema(json!({
              "work_id": {"type": "string"},
-             "remedy": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "resume", "handover"]},
+             "remedy": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "prune_participants", "resume", "handover"]},
              "session": {"type": "string", "description": "Your native session ID."},
              "scope": {"type": "array", "items": {"type": "string"}, "description": "For handover only: the paths the next lead takes; the rest is freed."},
              "superseded_by": {"type": "string", "description": "For supersede only: the Work that replaces this one."}

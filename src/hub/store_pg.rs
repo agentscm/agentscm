@@ -132,7 +132,7 @@ use super::work_reconciliation::{
     WorkDeclarationsView,
 };
 use super::work_recovery::{
-    MAX_RECOVERY_LISTED, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
+    MAX_RECOVERY_LISTED, ParticipantMark, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
 };
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
@@ -2632,6 +2632,24 @@ fn open_requests_by_work(
         }
     }
     Ok(by_work)
+}
+
+/// When each participant of `id` joined and last changed.
+fn participant_marks(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Vec<ParticipantMark>> {
+    Ok(tx
+        .query(
+            "SELECT token, session, generation, updated_at FROM hub_work_participants
+             WHERE work = $1",
+            &[&id],
+        )?
+        .iter()
+        .map(|row| ParticipantMark {
+            token: row.get(0),
+            session: row.get(1),
+            generation: row.get(2),
+            updated_at: row.get(3),
+        })
+        .collect())
 }
 
 /// The unfinished Work that depends on `id`; recovery applies its own smaller projection bound.
@@ -11966,7 +11984,7 @@ impl Store for PgStore {
                             "SELECT id FROM hub_work_items
                              WHERE provider = $1 AND host = $2 AND repository = $3
                                AND repository_id IS NOT DISTINCT FROM $4
-                               AND owner = $5 AND state <> 'finished' AND id > $6
+                               AND ($8 OR owner = $5) AND state <> 'finished' AND id > $6
                              ORDER BY id LIMIT $7",
                             &[
                                 &who.owner.identity.provider,
@@ -11976,6 +11994,7 @@ impl Store for PgStore {
                                 &who.owner.id,
                                 &read.after.as_deref().unwrap_or(""),
                                 &limit,
+                                &read.all_owners,
                             ],
                         )?
                         .iter()
@@ -12042,10 +12061,12 @@ impl Store for PgStore {
                     .into_iter()
                     .take(MAX_RECOVERY_LISTED + 1)
                     .collect();
+                let marks = participant_marks(&mut tx, &row.item.id)?;
                 recovery.push(RecoveryRow {
                     row,
                     requests,
                     dependents,
+                    marks,
                 });
             }
             let forge_window_from = forge_window_from(&mut tx, &who)?;

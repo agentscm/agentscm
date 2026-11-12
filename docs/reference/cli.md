@@ -108,8 +108,9 @@ with the exact call that applies it. `--path` (repeat it, at most 32) also lists
 those paths with the exact overlapping paths, and your owner's resumable Work there. `--work-id`
 reads one Work item of the repository, whoever owns it. `--session` tells your lead session from
 your owner's other sessions; without it you act as your owner's agent. Page with `--after` set to
-the previous `next_after` and `--limit` (1 to 50, default 20). `--json` prints the versioned
-response.
+the previous `next_after` and `--limit` (1 to 50, default 20). Each Work item may list `findings`
+(for example a lapsed hold or a full participant list) with the remedy proposed for you, if any.
+`--json` prints the versioned response.
 
 ```sh
 agentscm work recovery --session "$SESSION" --path src/billing.rs

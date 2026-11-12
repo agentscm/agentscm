@@ -288,7 +288,8 @@ pub enum WorkTransitionKind {
     Supersede,
     Reopen,
     /// Removes named non-lead participants from the Work. A participant repair: it changes no
-    /// state, outcome or reservation, so it is never offered as a remedy.
+    /// state, outcome or reservation, so a state never lists it among its operational remedies;
+    /// recovery offers it when the participant list needs repair.
     PruneParticipants,
 }
 
