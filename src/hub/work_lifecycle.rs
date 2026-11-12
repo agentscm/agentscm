@@ -325,6 +325,8 @@ pub enum WorkActorKind {
 pub enum ActorVia {
     Agent,
     Person,
+    /// The Hub applying a repository's opted-in policy. It has no login and may only release.
+    Policy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,6 +352,7 @@ pub(super) fn decide_transition(
     use WorkActorKind::{Admin, Lead, Owner};
     use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
     let authorized = match kind {
+        _ if via == ActorVia::Policy => kind == Release,
         Release | Abandon | Supersede => true,
         Retain | Complete => actor != Admin,
         Reopen => actor != Admin && via == ActorVia::Agent,
@@ -963,6 +966,34 @@ mod tests {
                 ),
                 Err(Refusal::NotAuthorized)
             );
+        }
+    }
+
+    #[test]
+    fn policy_may_only_release() {
+        for kind in WorkTransitionKind::ALL {
+            let want = if kind == WorkTransitionKind::Release {
+                Ok(())
+            } else {
+                Err(Refusal::NotAuthorized)
+            };
+            assert_eq!(
+                decide_transition(
+                    kind,
+                    WorkActorKind::Owner,
+                    ActorVia::Policy,
+                    WorkState::Paused,
+                    true
+                ),
+                want,
+                "{kind:?}"
+            );
+            for actor in [WorkActorKind::Lead, WorkActorKind::Admin] {
+                assert_eq!(
+                    decide_transition(kind, actor, ActorVia::Policy, WorkState::Paused, true),
+                    Err(Refusal::NotAuthorized)
+                );
+            }
         }
     }
 

@@ -11650,6 +11650,11 @@ impl Store for PgStore {
                     repository,
                     repository_id,
                     ..
+                }
+                | WorkTransitionActor::Policy {
+                    owner: user,
+                    repository,
+                    repository_id,
                 } => {
                     if user.disabled {
                         return Err(HubError::Unauthorized);
@@ -11663,6 +11668,7 @@ impl Store for PgStore {
             let via = match actor {
                 WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
                 WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+                WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
             };
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
@@ -12494,6 +12500,45 @@ impl Store for PgStore {
                 .map(|link| link.target);
             tx.commit()?;
             Ok(target)
+        })
+    }
+
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<work_links::WorkPrLinkTarget>>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            if scoped_work(&mut tx, &who, id, now, false)?.is_none() {
+                return Ok(None);
+            }
+            let links = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_declarations WHERE work=$1",
+                    &[&id],
+                )?
+                .map(|row| json_value::<WorkDeclarations>(&row.get::<_, String>(0)))
+                .transpose()?
+                .map_or_else(Vec::new, |d| {
+                    d.links.into_iter().map(|l| l.target).collect()
+                });
+            tx.commit()?;
+            Ok(Some(links))
         })
     }
 
@@ -16820,6 +16865,97 @@ impl Store for PgStore {
                     data: row.get(5),
                 })
                 .collect())
+        })
+    }
+
+    fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool> {
+        self.run(false, |client| {
+            let inserted = client.execute(
+                "INSERT INTO hub_work_merge_prompts (work, audience, delivered_at)
+                 VALUES ($1, $2, $3) ON CONFLICT (work, audience) DO NOTHING",
+                &[&work, &audience, &now],
+            )?;
+            Ok(inserted == 1)
+        })
+    }
+
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "DELETE FROM hub_work_merge_prompts WHERE work = $1 AND audience = $2",
+                &[&work, &audience],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn repository_unreserved_merged_work(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<WorkItem>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let catchup_repository = repository_namespace(repository, Some(repository_id));
+            let catchup_key = catchup_repository_key(Some(repository_id));
+            let settled =
+                settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut items = tx
+                .query(
+                    &format!(
+                        "SELECT w.snapshot FROM hub_work_items w
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id = $4 AND w.state <> 'finished'
+                           AND w.reservation_basis IS NULL AND {settled}
+                         ORDER BY w.id COLLATE \"C\" LIMIT $8"
+                    ),
+                    &[
+                        &owner.identity.provider,
+                        &owner.identity.host,
+                        &repository,
+                        &repository_id,
+                        &catchup_repository,
+                        &catchup_key,
+                        &AUTO_PAUSE_SUMMARY,
+                        &limit,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .collect::<Result<Vec<_>>>()?;
+            project_claims(&mut tx, &mut items, now)?;
+            tx.commit()?;
+            Ok(items)
+        })
+    }
+
+    fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>> {
+        self.run(true, |client| {
+            client
+                .query(
+                    "SELECT snapshot FROM hub_work_items
+                     WHERE lead_token = $1 AND lead_session = $2 AND state <> 'finished'
+                     ORDER BY id COLLATE \"C\" LIMIT 5",
+                    &[&token, &session],
+                )?
+                .into_iter()
+                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .collect()
+        })
+    }
+
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool> {
+        self.run(true, |client| {
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM hub_work_merge_prompts WHERE work = $1 AND audience = $2)",
+                    &[&work, &audience],
+                )?
+                .get::<_, bool>(0))
         })
     }
 }

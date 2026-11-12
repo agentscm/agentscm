@@ -274,6 +274,7 @@ pub(super) fn observation_kinds(kind: &str) -> Result<(&'static str, &'static st
         "branch" => Ok(("branch_observed", "branch_deleted")),
         "provider_context" => Ok(("provider_context_observed", "provider_context_removed")),
         "planned_issues" => Ok(("planned_issues_observed", "planned_issues_removed")),
+        "issue_closure" => Ok(("issue_closure_observed", "issue_closure_removed")),
         _ => Err(invalid("unsupported observation kind")),
     }
 }
@@ -287,6 +288,7 @@ pub(super) fn gone_event(kind: &str, event: &str) -> Result<&'static str> {
         ("branch", "branch_unobserved") => Ok("branch_unobserved"),
         ("provider_context", "provider_context_removed") => Ok("provider_context_removed"),
         ("planned_issues", "planned_issues_removed") => Ok("planned_issues_removed"),
+        ("issue_closure", "issue_closure_removed") => Ok("issue_closure_removed"),
         _ => Err(invalid("event does not fit the observation kind")),
     }
 }
@@ -300,6 +302,15 @@ pub(super) fn validate_observation(kind: &str, key: &str, data: &str) -> Result<
         return Err(invalid(
             "planned issue snapshot exceeds its identity or size bounds",
         ));
+    }
+    if kind == "issue_closure"
+        && (key
+            .strip_prefix("issue:")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_none_or(|n| n == 0)
+            || super::merged_holds::IssueClosure::decode(data).is_none())
+    {
+        return Err(invalid("issue closure does not fit its model"));
     }
     if kind == "provider_context"
         && (data.len() > super::provider_context::MAX_SNAPSHOT_BYTES
@@ -552,6 +563,33 @@ mod tests {
             node_id: None,
             installation_id: None,
             pulls_etag: None,
+        }
+    }
+
+    #[test]
+    fn issue_closure_observations_fit_their_model() {
+        let ok = r#"{"state":"closed","reason":"completed","closer_pull":7}"#;
+        validate_observation("issue_closure", "issue:3", ok).unwrap();
+        assert_eq!(
+            observation_kinds("issue_closure").unwrap(),
+            ("issue_closure_observed", "issue_closure_removed")
+        );
+        assert_eq!(
+            gone_event("issue_closure", "issue_closure_removed").unwrap(),
+            "issue_closure_removed"
+        );
+        assert!(gone_event("issue_closure", "branch_deleted").is_err());
+        for (key, data) in [
+            ("issue:0", ok),
+            ("3", ok),
+            ("issue:x", ok),
+            (
+                "issue:3",
+                r#"{"state":"closed","reason":"completed","extra":1}"#,
+            ),
+            ("issue:3", "{}"),
+        ] {
+            assert!(validate_observation("issue_closure", key, data).is_err());
         }
     }
 

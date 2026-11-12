@@ -3195,17 +3195,21 @@ async fn call_inner(
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
+        let caller = principal.clone();
         return Ok(
             match blocking(state, move || {
-                super::work_recovery::inspect(
+                let now = unix_now();
+                let mut recovery = super::work_recovery::inspect(
                     &*store,
                     &super::work_recovery::RecoveryCaller::Agent {
                         token: &token,
                         session: query.session.as_deref(),
                     },
                     &query,
-                    unix_now(),
-                )
+                    now,
+                )?;
+                super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+                Ok(recovery)
             })
             .await
             {
@@ -4288,16 +4292,20 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             session: Some(resolved),
             ..Default::default()
         };
+        let caller = principal.clone();
         let recovery = blocking(state, move || {
-            super::work_recovery::inspect(
+            let now = unix_now();
+            let mut recovery = super::work_recovery::inspect(
                 &*store,
                 &super::work_recovery::RecoveryCaller::Agent {
                     token: &token,
                     session: query.session.as_deref(),
                 },
                 &query,
-                unix_now(),
-            )
+                now,
+            )?;
+            super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+            Ok(recovery)
         })
         .await;
         let mut result = start_result(

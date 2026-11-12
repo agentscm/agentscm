@@ -977,6 +977,14 @@ pub trait Store: Send + Sync {
         id: &str,
         now: i64,
     ) -> Result<Option<super::work_links::WorkPrLinkTarget>>;
+    /// Scoped read of the pull request targets the Work declares (`WorkDeclarations.links`).
+    /// Empty when it declares none; `None` when the Work is not in the reader's scope.
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<super::work_links::WorkPrLinkTarget>>>;
     /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
     fn work_pr_link_set(
         &self,
@@ -1564,6 +1572,27 @@ pub trait Store: Send + Sync {
         limit: usize,
         current: &super::promise::PromiseCurrentAdmissionsV1,
     ) -> Result<PromisePageV1>;
+    /// Records that `audience` (`lead` or `owner`) was told `work`'s merged pull request closed
+    /// its issue. True only for the first claim, so a notice is delivered once however many
+    /// hooks race.
+    fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool>;
+    /// Gives back a claim whose action did not happen, so a later attempt can claim it again.
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()>;
+    /// Unfinished Work of one repository that holds no reservation and that the repository
+    /// overview hides because its branch merged, oldest first by id, at most `limit`.
+    fn repository_unreserved_merged_work(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<WorkItem>>;
+    /// The unfinished Work that `session` of `token` leads, by id, at most five.
+    fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>>;
+    /// Whether `audience` already holds a merged-prompt marker for `work` (an indexed read of the
+    /// marker's primary key), so a hook can skip Work it has nothing left to say about.
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.
