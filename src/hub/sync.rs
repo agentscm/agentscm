@@ -1065,8 +1065,12 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
         let start = state.sync.round.fetch_add(1, Ordering::Relaxed) % repos.len();
         repos.rotate_left(start);
     }
-    for repo in repos {
-        match sync_repo(state, conn, &repo).await {
+    for mut repo in repos {
+        let synced = match follow_rename(state, conn, &mut repo).await {
+            Ok(()) => sync_repo(state, conn, &repo).await,
+            Err(error) => Err(error),
+        };
+        match synced {
             Ok(report) => {
                 if !marked {
                     mark_enabled(state, conn).await?;
@@ -1082,6 +1086,40 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
         }
     }
     Ok(reports)
+}
+
+/// GitLab keeps a project's id across a rename or a transfer to another group, so each poll reads the project
+/// by id and records a new path (`repository_renamed`). GitHub apps re-list their repositories in discovery.
+/// A project the credential no longer reaches is left as it is.
+async fn follow_rename(
+    state: &HubState,
+    conn: &Connection,
+    repo: &mut ConnectedRepository,
+) -> Gh<()> {
+    if conn.provider != "gitlab" {
+        return Ok(());
+    }
+    let token = state.sync.token(conn, None).await?;
+    let api = state.sync.forge(conn)?;
+    let Some(info) = api.repo(&token, &repo.repository_id.to_string()).await? else {
+        return Ok(());
+    };
+    if info.repository_id != repo.repository_id || info.full_name == repo.full_name {
+        return Ok(());
+    }
+    let (id, host) = (conn.id.clone(), conn.host.clone());
+    *repo = db(state, move |store| {
+        store.upsert_repository(
+            &id,
+            &host,
+            info.repository_id,
+            &info.full_name,
+            info.node_id.as_deref(),
+            None,
+        )
+    })
+    .await?;
+    Ok(())
 }
 
 /// Connects every repository the app's installations can see.
