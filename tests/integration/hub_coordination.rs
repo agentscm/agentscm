@@ -2246,6 +2246,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         created_seq: 1,
         updated_seq: 2,
         requester_unavailable: true,
+        requested_paths: None,
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();
@@ -2293,6 +2294,127 @@ parity_case!(
     finished_default_alias,
     finished_default_work_binds_no_hook_session
 );
+
+fn requester_sees_reply_and_release(db: &Db) {
+    use agentscm::hub::coordination::RequestedPathsHold;
+    let store = db.open();
+    let holder = token(&*store, 61, "holder");
+    let requester = token(&*store, 62, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(&holder, &start("holder", "holder-session"), now)
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let inbox = |at: i64| {
+        let page = store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("requester-session".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap();
+        page.requests
+            .into_iter()
+            .find(|candidate| candidate.id == request.id)
+            .unwrap()
+    };
+    assert_eq!(
+        inbox(now + 2).requested_paths,
+        Some(RequestedPathsHold::Held)
+    );
+    assert!(inbox(now + 2).responses.is_empty());
+
+    let ack = CoordinationAck {
+        request_id: request.id.clone(),
+        target_work_id: Some(request.targets[0].work_id.clone()),
+        session: "holder-session".into(),
+        expected_updated_seq: request.updated_seq,
+    };
+    let acknowledged = store.coordination_ack(&holder, &ack, now + 3).unwrap();
+    store
+        .coordination_reply(
+            &holder,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "decline-operation".into(),
+                target_work_id: request.targets[0].work_id.clone(),
+                session: "holder-session".into(),
+                expected_updated_seq: acknowledged.updated_seq,
+                kind: CoordinationResponseKind::Decline,
+                note: Some("Not before the release".into()),
+                via: agentscm::hub::handoff::Via::Agent,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let answered = inbox(now + 5);
+    assert_eq!(answered.responses.len(), 1);
+    assert_eq!(
+        answered.responses[0].kind,
+        CoordinationResponseKind::Decline
+    );
+    assert_eq!(answered.requested_paths, Some(RequestedPathsHold::Held));
+
+    store
+        .work_checkpoint(
+            &holder,
+            &checkpoint(
+                &target.id,
+                "finish-holder",
+                "holder-session",
+                target.updated_seq,
+                CheckpointKind::Finish,
+                None,
+            ),
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(
+        inbox(now + 7).requested_paths,
+        Some(RequestedPathsHold::Released)
+    );
+    // A request settled by its requester carries no hold.
+    let current = inbox(now + 7);
+    store
+        .coordination_withdraw(
+            &requester,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "withdraw-operation".into(),
+                session: "requester-session".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 8,
+        )
+        .unwrap();
+    let page = store
+        .coordination_list(
+            &requester,
+            &CoordinationListQuery {
+                active_only: false,
+                ..CoordinationListQuery::default()
+            },
+            now + 9,
+        )
+        .unwrap();
+    assert!(page.requests.iter().all(|r| r.requested_paths.is_none()));
+}
+
+parity_case!(requester_hold_state, requester_sees_reply_and_release);
 
 fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};

@@ -48,8 +48,8 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, helper_join_editable, join_uncovered, parse_response_kind,
-    parse_status, response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, RequestedPathsHold, helper_join_editable, join_uncovered,
+    parse_response_kind, parse_status, response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -3667,6 +3667,7 @@ fn coordination_request_at(
         created_seq: row.get(16),
         updated_seq: row.get(17),
         requester_unavailable,
+        requested_paths: None,
     }))
 }
 
@@ -4192,8 +4193,13 @@ fn coordination_page(
     for row in rows {
         let id: String = row.get(0);
         let seq: i64 = row.get(1);
-        let request = coordination_request_at(tx, who, &id, through, now)?
+        let mut request = coordination_request_at(tx, who, &id, through, now)?
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
+        if request.requester.token == who.token
+            && Some(request.requester.session.as_str()) == session
+        {
+            request.requested_paths = requested_paths_hold(tx, who, &request, now);
+        }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
             complete = false;
@@ -4216,6 +4222,72 @@ fn coordination_page(
         requests,
         complete,
         retention_gap: after < retention_floor,
+    })
+}
+
+/// Whether the paths an open request asks for are still held by another lead's reservation or
+/// another token's live intent. Only the requester's own inbox asks, and a failed read (rolled
+/// back to its savepoint, so the transaction survives) says unknown rather than failing the page.
+fn requested_paths_hold(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    request: &CoordinationRequest,
+    now: i64,
+) -> Option<RequestedPathsHold> {
+    if !matches!(
+        request.status,
+        CoordinationStatus::Pending | CoordinationStatus::Responded
+    ) {
+        return None;
+    }
+    let mut read = || -> Result<bool> {
+        tx.batch_execute("SAVEPOINT requested_paths")?;
+        let scope = &request.proposal.scope;
+        let held_work = work_scope_overlaps(tx, who, scope, None, now)?
+            .iter()
+            .any(|overlap| {
+                request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
+                    && overlap.item.lead_token != who.token
+            });
+        let mut held = held_work;
+        if !held {
+            let keys = scope
+                .iter()
+                .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+                .collect::<Vec<_>>();
+            let (points, ranges) = probe_set(&keys);
+            let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id=p.intent
+                 WHERE p.repository=$1 AND i.token<>$2 AND p.expires_at>$3";
+            if !points.is_empty() {
+                held = tx
+                    .query_opt(
+                        &format!("{live} AND p.key = ANY($4) LIMIT 1"),
+                        &[&who.repository, &who.token, &now, &points],
+                    )?
+                    .is_some();
+            }
+            for (start, end) in &ranges {
+                if held {
+                    break;
+                }
+                held = tx
+                    .query_opt(
+                        &format!("{live} AND p.key >= $4 AND p.key < $5 LIMIT 1"),
+                        &[&who.repository, &who.token, &now, start, end],
+                    )?
+                    .is_some();
+            }
+        }
+        tx.batch_execute("RELEASE requested_paths")?;
+        Ok(held)
+    };
+    Some(match read() {
+        Ok(true) => RequestedPathsHold::Held,
+        Ok(false) => RequestedPathsHold::Released,
+        Err(_) => {
+            let _ = tx.batch_execute("ROLLBACK TO requested_paths; RELEASE requested_paths");
+            RequestedPathsHold::Unknown
+        }
     })
 }
 

@@ -1344,6 +1344,63 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
     let context = text_at(&answer, CLAUDE_CONTEXT);
     assert!(context.contains("wait for your lead session"), "{answer}");
     assert!(!context.contains(&request), "{answer}");
+
+    // Once the holder answers, the requester's next prompt carries the reply and is never held.
+    {
+        use agentscm::hub::coordination::{
+            CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+        };
+        let lead_token = token_id(&lead);
+        let now = unix_now();
+        let page = hub
+            .store
+            .coordination_inbox(
+                &lead_token,
+                &CoordinationInboxQuery {
+                    session: Some(session.into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap();
+        let open = &page.requests[0];
+        let target = open.targets[0].work_id.clone();
+        let acknowledged = hub
+            .store
+            .coordination_ack(
+                &lead_token,
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: Some(target.clone()),
+                    session: session.into(),
+                    expected_updated_seq: open.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        hub.store
+            .coordination_reply(
+                &lead_token,
+                &CoordinationReply {
+                    request_id: request.clone(),
+                    operation_id: "decline-widget".into(),
+                    target_work_id: target,
+                    session: session.into(),
+                    expected_updated_seq: acknowledged.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: Some("Still editing the widget".into()),
+                    via: agentscm::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        let context = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(context.contains(&request), "{answer}");
+        assert!(context.contains("Reply decline"), "{answer}");
+        assert!(context.contains("Still editing the widget"), "{answer}");
+        assert!(!context.contains("report a split/join"), "{answer}");
+    }
 }
 
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy

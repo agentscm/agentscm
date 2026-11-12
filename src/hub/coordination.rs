@@ -134,6 +134,20 @@ pub struct CoordinationRequest {
     /// person who owns it, may then withdraw the request. Left out of the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requester_unavailable: bool,
+    /// Whether the paths an open request asks for are still held by another Work or live
+    /// intent. Derived when the requester reads its own inbox, not stored; absent for a
+    /// settled request and for any other reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_paths: Option<RequestedPathsHold>,
+}
+
+/// Whether the paths a request asks for are still held.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPathsHold {
+    Held,
+    Released,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

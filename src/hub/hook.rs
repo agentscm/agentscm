@@ -24,7 +24,10 @@ use super::advice::{agent_name, unknown};
 use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
-use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
+use super::coordination::{
+    CoordinationInboxQuery, CoordinationRequest, CoordinationStatus, RequestedPathsHold,
+    response_kind_name,
+};
 use super::error_envelope::{self, ErrorCode, ErrorEnvelope};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
@@ -483,12 +486,38 @@ async fn hook(
                                         && reply.responder.session == session
                                 })
                         });
-                        // A prompt repeats every turn, so it carries only what this session must answer.
-                        if call.kind == Kind::Prompt && !reply_needed {
+                        let own = !reply_needed
+                            && request.requester.token == principal.token_id
+                            && request.requester.session == session;
+                        let released =
+                            request.requested_paths == Some(RequestedPathsHold::Released);
+                        // A prompt repeats every turn, so it carries only what this session must
+                        // answer, and a requester's own request only once it has news.
+                        if call.kind == Kind::Prompt
+                            && !reply_needed
+                            && !(own && (released || !request.responses.is_empty()))
+                        {
                             continue;
                         }
                         shown += 1;
-                        outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        if own {
+                            let reply =
+                                request.responses.first().map_or_else(String::new, |reply| {
+                                    let note =
+                                        reply.note.as_deref().map_or_else(String::new, |note| {
+                                            format!(": {}", bounded_hook_text(note, 200))
+                                        });
+                                    format!(" Reply {}{note}.", response_kind_name(reply.kind))
+                                });
+                            let paths = if released {
+                                " The requested paths are released: retry agentscm_start."
+                            } else {
+                                ""
+                            };
+                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        } else {
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
                                 "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline. {NO_BYPASS}",
