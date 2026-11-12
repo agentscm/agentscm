@@ -950,6 +950,188 @@ fn work_reconcile_merged_issue_facts() {
     run_both(merged_issue_facts);
 }
 
+/// A start refused by a held Work whose pull request merged says so, and the owner releases it
+/// directly. `closure` is the stored closure of source issue 7, if any.
+fn merged_hold_refusal(
+    fixture: &StoreFixture,
+    closure: Option<agentscm::hub::merged_holds::IssueClosure>,
+) -> (String, String, String) {
+    use agentscm::hub::merged_holds::{OBSERVATION_KIND, annotate_conflicts, observation_key};
+    use agentscm::hub::planned_issues::IssueIdentity;
+    use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    use agentscm::hub::work_recovery::{
+        RecoveryCaller, RecoveryQuery, RemedyKind, RemedyPreviewRequest, inspect, preview,
+    };
+    let mut ctx = setup(fixture);
+    ctx.store.observe_lease_clock(unix_now()).unwrap();
+    let held = branch_work(&ctx, "m", "src/m", "feature/m");
+    ctx.store
+        .work_issue_link_set(
+            ctx.token(),
+            &WorkIssueLinkUpdate {
+                work_id: held.id.clone(),
+                operation_id: "link-7".into(),
+                generation: held.generation,
+                session: "session-m".into(),
+                expected_updated_seq: held.updated_seq,
+                link: Some(IssueIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository_id: REPOSITORY_ID,
+                    number: 7,
+                }),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    branch_merge(&ctx, 41, "feature/m", unix_now() + 5, true);
+    if let Some(closure) = closure {
+        ctx.clock += 1;
+        ctx.store
+            .observe(
+                &ctx.repo.id,
+                OBSERVATION_KIND,
+                &observation_key(7),
+                &serde_json::to_string(&closure).unwrap(),
+                ctx.clock,
+            )
+            .unwrap();
+    }
+    let refusal = |ctx: &Ctx, principal: &Principal, session: &str| {
+        let now = unix_now();
+        let mut recovery = inspect(
+            &*ctx.store,
+            &RecoveryCaller::Agent {
+                token: &principal.token_id,
+                session: Some(session),
+            },
+            &RecoveryQuery {
+                paths: vec!["src/m".into()],
+                session: Some(session.into()),
+                ..RecoveryQuery::default()
+            },
+            now,
+        )
+        .unwrap();
+        annotate_conflicts(&*ctx.store, principal, &mut recovery, now);
+        assert_eq!(recovery.conflicts.len(), 1);
+        assert_eq!(recovery.conflicts[0].work_id, held.id);
+        recovery.conflicts[0].next.clone()
+    };
+    let owner_text = refusal(&ctx, &ctx.principal, "session-other");
+
+    let other = user(&*ctx.store, 62, "stranger");
+    let (_, secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &other,
+        "writer",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let stranger = principal(&*ctx.store, secret.expose());
+    let stranger_text = refusal(&ctx, &stranger, "session-stranger");
+
+    // The same owner previews and applies a release from another session, with no join request.
+    let now = unix_now();
+    let release = preview(
+        &*ctx.store,
+        &RecoveryCaller::Agent {
+            token: ctx.token(),
+            session: Some("session-other"),
+        },
+        &RemedyPreviewRequest {
+            work_id: held.id.clone(),
+            remedy: RemedyKind::Release,
+            session: Some("session-other".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        now,
+    )
+    .unwrap();
+    assert!(release.permitted);
+    let apply = release.apply.unwrap();
+    assert_eq!(apply.tool.as_deref(), Some("agentscm_work_transition"));
+    let mut arguments = apply.arguments;
+    arguments["operation_id"] = json!("release-merged");
+    arguments["reason"] = json!("the merged Work is obsolete");
+    let request: agentscm::hub::work_transition::WorkTransitionRequest =
+        serde_json::from_value(arguments).unwrap();
+    ctx.store
+        .work_transition(
+            &agentscm::hub::work_transition::WorkTransitionActor::Agent { token: ctx.token() },
+            &request,
+            now,
+        )
+        .unwrap();
+    // The retried start now claims the paths.
+    let mut retry = start("retry", "src/m", &[]);
+    retry.session = "session-other".into();
+    let result = ctx
+        .store
+        .work_start(ctx.token(), &retry, unix_now())
+        .unwrap();
+    assert!(result.conflict.is_none(), "{:?}", result.conflict);
+    (owner_text, stranger_text, held.id)
+}
+
+#[test]
+fn work_reconcile_merged_hold_refusal() {
+    use agentscm::hub::merged_holds::{CloseReason, IssueClosure, IssueState};
+    let completed = || IssueClosure {
+        state: IssueState::Closed,
+        reason: CloseReason::Completed,
+        closer_pull: Some(41),
+    };
+    let open = || IssueClosure {
+        state: IssueState::Open,
+        reason: CloseReason::Other,
+        closer_pull: None,
+    };
+    let fixtures = std::iter::once(StoreFixture::sqlite()).chain(StoreFixture::postgres());
+    for fixture in fixtures {
+        let (owner, stranger, id) = merged_hold_refusal(&fixture, Some(completed()));
+        assert!(
+            owner.contains("Its pull request #41 merged and #7 is closed as completed by it."),
+            "{owner}"
+        );
+        assert!(
+            owner.contains(&format!(
+                "release it without a join request: agentscm_work_recovery_preview with work_id {id}, remedy release"
+            )),
+            "{owner}"
+        );
+        assert!(owner.contains("agentscm_work_transition"), "{owner}");
+        // A caller of another owner sees the facts and the existing guidance, not the remedy.
+        assert!(stranger.contains("Its pull request #41 merged and #7 is closed"));
+        assert!(
+            !stranger.contains("release") && !stranger.contains("join request"),
+            "{stranger}"
+        );
+        assert!(stranger.contains("Do not take it over"), "{stranger}");
+    }
+    let fixtures = std::iter::once(StoreFixture::sqlite()).chain(StoreFixture::postgres());
+    for fixture in fixtures {
+        // "Part of": merged, issue still open. No finish prompt; release only if obsolete.
+        let (owner, _, _) = merged_hold_refusal(&fixture, Some(open()));
+        assert!(
+            owner.contains("Its pull request #41 merged; #7 is still open, so work may remain."),
+            "{owner}"
+        );
+        assert!(
+            owner.contains("Only if it is obsolete, release it"),
+            "{owner}"
+        );
+        assert!(
+            !owner.contains("finish") && !owner.contains("complete"),
+            "{owner}"
+        );
+    }
+}
+
 fn status_stage(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let setup_observations = agentscm::hub::onboarding::Observations::default();

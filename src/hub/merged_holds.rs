@@ -338,6 +338,57 @@ pub fn work_facts(
     ))
 }
 
+/// The sentence a refusal adds when the holding Work's linked pull request merged. Numbers only:
+/// nothing user-controlled enters the text. `None` when no linked pull request merged.
+pub fn merged_sentence(hold: &MergedHold) -> Option<String> {
+    match *hold {
+        MergedHold::Settled { pull, issue } => Some(format!(
+            "Its pull request #{pull} merged and #{issue} is closed as completed by it."
+        )),
+        MergedHold::MergedIssueOpen { pull, issue } => Some(format!(
+            "Its pull request #{pull} merged; #{issue} is still open, so work may remain."
+        )),
+        MergedHold::MergedOnly { pull } => Some(format!("Its pull request #{pull} merged.")),
+        MergedHold::NotMerged | MergedHold::Unknown => None,
+    }
+}
+
+/// Adds the merged facts to the `next` text of each conflict whose holding Work has a merged
+/// linked pull request. When the caller owns that Work (`mine`), it also names the direct
+/// release remedy: preview, then apply, with no join request. Other conflicts are unchanged, and
+/// a Work that cannot be read or has no connected repository adds nothing.
+pub fn annotate_conflicts(
+    store: &dyn Store,
+    principal: &Principal,
+    recovery: &mut super::work_recovery::WorkRecoveryV1,
+    now: i64,
+) {
+    for conflict in &mut recovery.conflicts {
+        let Ok(Some(item)) = store.work_get(&principal.token_id, &conflict.work_id, now) else {
+            continue;
+        };
+        let Some(hold) = work_facts(store, principal, &item, now).map(|facts| facts.hold) else {
+            continue;
+        };
+        let Some(sentence) = merged_sentence(&hold) else {
+            continue;
+        };
+        conflict.next.push(' ');
+        conflict.next.push_str(&sentence);
+        if conflict.mine {
+            let obsolete = if matches!(hold, MergedHold::MergedIssueOpen { .. }) {
+                "Only if it is obsolete, release"
+            } else {
+                "To free these paths, release"
+            };
+            conflict.next.push_str(&format!(
+                " {obsolete} it without a join request: agentscm_work_recovery_preview with work_id {id}, remedy release and your session, then send the apply call it returns (agentscm_work_transition).",
+                id = conflict.work_id
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
