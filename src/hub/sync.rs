@@ -1200,6 +1200,7 @@ async fn read_repo(
         super::skills::sync_adoption(state, api, repo, token).await;
     }
     poll_issue_closures(state, conn, repo, token).await;
+    release_settled_holds(state, conn, repo).await;
     Ok(report)
 }
 
@@ -1266,6 +1267,22 @@ async fn poll_issue_closures(
         if let Err(error) = stored {
             crate::hub::error_envelope::log_internal(&error);
         }
+    }
+}
+
+/// For a repository that opted in, releases the hold of Work whose merged pull request closed
+/// its source issue as completed, from the closures just stored. A failure never fails the poll.
+async fn release_settled_holds(state: &HubState, conn: &Connection, repo: &ConnectedRepository) {
+    if conn.provider != "github" {
+        return;
+    }
+    let (repo, now) = (repo.clone(), super::store::unix_now());
+    let done = db(state, move |store| {
+        super::merged_holds::release_settled(store, "github", &repo, now)
+    })
+    .await;
+    if let Err(error) = done {
+        crate::hub::error_envelope::log_internal(&error);
     }
 }
 

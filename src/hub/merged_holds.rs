@@ -345,6 +345,122 @@ pub fn work_facts(
     ))
 }
 
+fn release_key(repository_id: i64) -> String {
+    format!("merged_release:repo:{repository_id}")
+}
+
+/// Whether the repository opted in to releasing the hold of Work its merged pull request
+/// finished. Off unless the stored value is exactly `on`; a missing or unreadable value is off.
+pub fn merged_release_enabled(store: &dyn Store, repository_id: i64) -> bool {
+    store
+        .get_setting(&release_key(repository_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("on")
+}
+
+/// Switches the repository's automatic release on or off; the caller has checked that `actor`
+/// may.
+pub fn set_merged_release(
+    store: &dyn Store,
+    repository_id: i64,
+    enabled: bool,
+    actor: &str,
+) -> super::Result<()> {
+    let value = if enabled { "on" } else { "off" };
+    store.set_setting(&release_key(repository_id), value, actor)
+}
+
+/// For a repository that opted in, releases the hold of each unfinished Work whose merged pull
+/// request closed its source issue as completed (`MergedHold::Settled`). It releases the hold
+/// only: the Work stays unfinished with no outcome. Returns the ids released.
+///
+/// It acts only when the read is complete. A truncated read can miss a second pull request
+/// linked to the same branch, and "every linked pull request merged" must not rest on a guess.
+/// A Work with several candidate pull requests, a missing or unreadable closure, an open issue,
+/// or an issue closed another way is never `Settled`, so it keeps its hold.
+///
+/// The release is a transition fenced by the Work's generation and sequence, with an operation
+/// id derived from them, so a lead acting at the same moment or a second poll changes nothing
+/// twice: a Work no longer holding is skipped and a stale fence is refused and skipped. A
+/// failure on one Work is logged and does not stop the others.
+pub fn release_settled(
+    store: &dyn Store,
+    provider: &str,
+    repo: &ConnectedRepository,
+    now: i64,
+) -> super::Result<Vec<String>> {
+    use super::work_transition::{
+        OperationalSelect, WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let mut released = Vec::new();
+    if !merged_release_enabled(store, repo.repository_id) {
+        return Ok(released);
+    }
+    let found = repository_facts(store, provider, repo, now)?;
+    if !found.complete {
+        return Ok(released);
+    }
+    for (item, facts) in &found.work {
+        let MergedHold::Settled { pull, issue } = facts.hold else {
+            continue;
+        };
+        let attempt = || -> super::Result<bool> {
+            let Some(owner) = store.user_by_id(&item.owner)?.filter(|u| !u.disabled) else {
+                return Ok(false);
+            };
+            let reader = WorkLifecycleReader::Person {
+                owner: &owner,
+                repository: &repo.full_name,
+                repository_id: repo.repository_id,
+            };
+            let overview =
+                store.work_operational(&reader, &OperationalSelect::One(&item.id), now)?;
+            let Some(current) = overview
+                .work
+                .first()
+                .filter(|w| w.reservation.basis.is_some())
+            else {
+                return Ok(false);
+            };
+            let request = WorkTransitionRequest {
+                work_id: item.id.clone(),
+                operation_id: format!(
+                    "repository-policy:{}:{}:{}",
+                    item.id, current.generation, current.updated_seq
+                ),
+                generation: current.generation,
+                expected_updated_seq: current.updated_seq,
+                session: None,
+                transition: WorkTransitionKind::Release,
+                reason: format!(
+                    "Released by repository policy: pull request #{pull} merged and closed #{issue} as completed."
+                ),
+                superseded_by: None,
+            };
+            // Acts as the Work's owner, as the Slack digest's release button does; the
+            // `repository-policy:` operation id and the reason name the policy.
+            let actor = WorkTransitionActor::Person {
+                user: &owner,
+                repository: &repo.full_name,
+                repository_id: repo.repository_id,
+                is_admin: false,
+            };
+            store.work_transition(&actor, &request, now)?;
+            Ok(true)
+        };
+        match attempt() {
+            Ok(true) => released.push(item.id.clone()),
+            Ok(false) => {}
+            // A fence the Work moved past, or a hold already gone: nothing to release.
+            Err(super::HubError::Invalid(_)) => {}
+            Err(error) => super::error_envelope::log_internal(&error),
+        }
+    }
+    Ok(released)
+}
+
 /// The most owner start lines one session start carries.
 // ponytail: ten lines, oldest Work id first; upgrade: a count line and a page when more wait.
 const MAX_START_LINES: usize = 10;
