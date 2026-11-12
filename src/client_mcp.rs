@@ -481,7 +481,6 @@ fn own_session(client: &str) -> String {
 struct Sent<'a> {
     connection: &'a Connection,
     token: &'a str,
-    activity_binding: &'a str,
 }
 
 /// What the server knows about the agent it serves, apart from its default connection.
@@ -637,11 +636,9 @@ impl Client {
                     Ok(token) => token,
                     Err(reason) => return refuse(id.as_ref(), &reason, writer),
                 };
-                let activity_binding = crate::client_activity::activity_binding(connection, &token);
                 let sent = Sent {
                     connection,
                     token: &token,
-                    activity_binding: &activity_binding,
                 };
                 exchange(&self.http, &sent, body, id.clone(), writer).await?
             }
@@ -802,11 +799,7 @@ async fn exchange(
     id: Option<Value>,
     writer: &mut impl Write,
 ) -> Result<Option<Value>> {
-    let &Sent {
-        connection,
-        token,
-        activity_binding,
-    } = sent;
+    let &Sent { connection, token } = sent;
     let client_id = crate::client_config::onboarding_client(&connection.root, token);
     let forwarded = forward(
         http,
@@ -818,36 +811,9 @@ async fn exchange(
     )
     .await;
     match (id, forwarded) {
-        (None, Ok((202 | 204, _, _))) => report_activity(
-            activity_binding,
-            crate::client_activity::ActivityOutcome::Acknowledged,
-        ),
-        (None, Ok((401 | 403, _, _))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::TokenRejected,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
-        (None, Ok(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::InvalidResponse,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
-        (None, Err(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Unavailable,
-            );
-            eprintln!("AgentSCM MCP: Hub notification failed");
-        }
+        (None, Ok((202 | 204, _, _))) => {}
+        (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
         (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Acknowledged,
-            );
             let mut reply = reply;
             // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
             // start's conflict, coordination and recovery payload, reach the agent unchanged.
@@ -866,19 +832,11 @@ async fn exchange(
             return Ok(Some(reply));
         }
         (Some(id), Ok((status @ (401 | 403), _, reply))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::TokenRejected,
-            );
             let error = agentscm::hub::error_envelope::decode(status, &reply);
             eprintln!("AgentSCM MCP: {}", error.render());
             write_json(writer, &rpc_hub_error(&id, &error))?;
         }
         (Some(id), Ok((status, _, reply))) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::InvalidResponse,
-            );
             let error = if status >= 400 {
                 agentscm::hub::error_envelope::decode(status, &reply)
             } else {
@@ -890,10 +848,6 @@ async fn exchange(
             write_json(writer, &rpc_hub_error(&id, &error))?;
         }
         (Some(id), Err(_)) => {
-            report_activity(
-                activity_binding,
-                crate::client_activity::ActivityOutcome::Unavailable,
-            );
             let error = agentscm::hub::error_envelope::ErrorEnvelope::local(
                 agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
             );
@@ -918,7 +872,6 @@ async fn serve(
         .and_then(|dir| agentscm::hook_relay::Address::new(&dir, &connection.hub).ok())
         .map(agentscm::hook_relay::Relay::spawn);
     let mut token = token.to_owned();
-    let mut activity_binding = crate::client_activity::activity_binding(connection, &token);
     loop {
         let line = match first
             .take()
@@ -950,13 +903,8 @@ async fn serve(
             && *current != token
         {
             token.clone_from(current);
-            activity_binding = crate::client_activity::activity_binding(connection, &token);
         }
         if checked.is_err() {
-            report_activity(
-                &activity_binding,
-                crate::client_activity::ActivityOutcome::BindingChanged,
-            );
             if let Some(id) = response_id(&message) {
                 write_json(
                     writer,
@@ -970,19 +918,9 @@ async fn serve(
         let default = Sent {
             connection,
             token: &token,
-            activity_binding: &activity_binding,
         };
         client.send(message, line, Some(&default), writer).await?;
     }
-}
-
-fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutcome) {
-    crate::client_activity::observe(
-        binding,
-        None,
-        crate::client_activity::ActivityPath::Mcp,
-        outcome,
-    );
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
