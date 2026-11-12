@@ -59,6 +59,15 @@ steps:
 
 Its inputs are `environment`, `hub-url` and `hub-token` (all required), `status` (default `success`), `url`, `commit` (default the checked-out `HEAD`) and `version`, the npm version of `agentscm` it runs when the command is not already on `PATH` (default `latest`). The workflow's own `GITHUB_TOKEN` is not used. Pin the action to a release tag or commit instead of `main` in production workflows.
 
+## Count a deploy workflow instead
+
+When a GitHub Actions workflow deploys on every push to the default branch but uses no `environment:`, there is nothing to add to it: name it as the repository's deploy workflow, and a successful run of it on a merge commit counts as that commit's deployment.
+
+- `PUT /v1/hub/repos/{repo}/deploy-workflow` with `{"workflow": ".github/workflows/deploy.yml"}` (an agent token for the repository whose owner is a repository admin, or a Hub admin) names it; `{"workflow": null}` clears it. The value is the workflow's file under `.github/workflows/`, ending in `.yml` or `.yaml`.
+- `GET /v1/hub/repos/{repo}/deploy-workflow` (agent or read-only token) answers `{"repository", "workflow"}`; `workflow` is null when none is named or the repository is not connected.
+
+Naming a deploy workflow also makes the Hub read the repository's runs and deployments after each merge, as listing it in `AGENTSCM_GITHUB_EXTERNAL_RUNS` does. A push run of that workflow on the base branch, for the merge commit, becomes a deployment of source `workflow`, named after the workflow (its `name`, or its file when it has none), with the run's outcome: `succeeded` once it completes successfully, `running` while it runs, `failed` when it fails. GitHub only: the Hub reads no GitLab pipelines.
+
 ## What the Hub shows
 
-A merged publication's `external` object lists each deployment of its merge commit with its `source`: `recorded` for one written this way, `forge` for one the Hub read from the forge that it did not write (see [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes) and the [HTTP API](api.md#hub-publication-external-outcomes)). A recorded deployment is shown for any repository, on GitHub or GitLab, whether or not the Hub watches it. Only the commit you record is marked: when one deploy ships several merges, record the newest merge commit, and the earlier merges in it stay unmarked.
+A merged publication's `external` object lists each deployment of its merge commit with its `source`: `forge` for one the Hub read from the forge that it did not write, `workflow` for a run of the deploy workflow, `recorded` for one written with `agentscm deployed` (see [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes) and the [HTTP API](api.md#hub-publication-external-outcomes)). A recorded deployment is shown for any repository, on GitHub or GitLab, whether or not the Hub watches it. Only the commit you record is marked: when one deploy ships several merges, record the newest merge commit, and the earlier merges in it stay unmarked.
