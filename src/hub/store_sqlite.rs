@@ -16631,7 +16631,9 @@ impl Store for SqliteStore {
                 target.lead.token == who.token && target.lead.session == resolve.session
             });
         if !authorized {
-            return Err(HubError::Unauthorized);
+            return Err(HubError::invalid_or_changed(
+                super::coordination::RESOLVE_NOT_PARTY.into(),
+            ));
         }
         if coordination_operation_replay(
             &tx,
