@@ -390,3 +390,78 @@ pub(super) fn with_via(mut data: serde_json::Value, via: Option<&str>) -> serde_
     }
     data
 }
+
+const JOIN_UNCOVERED_SHOWN: usize = 3;
+
+/// Refuses a `join` reply whose overlapping paths fall outside the target Work's declared scope.
+/// The requester's later helper start is admitted only for declared paths, so such a join could
+/// not be used.
+pub(super) fn join_uncovered(
+    kind: CoordinationResponseKind,
+    target_scope: &[String],
+    requested: &[String],
+) -> Result<()> {
+    if kind != CoordinationResponseKind::Join {
+        return Ok(());
+    }
+    let uncovered = super::work::uncovered_scope(target_scope, requested);
+    if uncovered.is_empty() {
+        return Ok(());
+    }
+    let shown = uncovered
+        .iter()
+        .take(JOIN_UNCOVERED_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = uncovered.len().saturating_sub(JOIN_UNCOVERED_SHOWN);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Err(HubError::invalid_or_changed(format!(
+        "Your Work's declared scope does not cover the overlapping paths ({shown}{more}), so a join could not be used. Grant agentscm_work_overlap_consent for those paths instead, or checkpoint your scope to include them and reply join."
+    )))
+}
+
+#[cfg(test)]
+mod join_uncovered_tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn covered_paths_pass() {
+        let kind = CoordinationResponseKind::Join;
+        assert!(join_uncovered(kind, &s(&["src/a.rs"]), &s(&["src/a.rs"])).is_ok());
+        assert!(join_uncovered(kind, &s(&["src/"]), &s(&["src/a/b.rs"])).is_ok());
+    }
+
+    #[test]
+    fn uncovered_paths_are_named_and_bounded() {
+        let kind = CoordinationResponseKind::Join;
+        let error = join_uncovered(kind, &s(&["src/a.rs"]), &s(&["docs/x.md"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("docs/x.md"), "{error}");
+        assert!(error.contains("agentscm_work_overlap_consent"), "{error}");
+        let many = s(&["a", "b", "c", "d", "e"]);
+        let error = join_uncovered(kind, &[], &many).unwrap_err().to_string();
+        assert!(error.contains("and 2 more"), "{error}");
+        assert!(!error.contains(", d"), "{error}");
+    }
+
+    #[test]
+    fn other_kinds_pass() {
+        for kind in [
+            CoordinationResponseKind::ProposeSplit,
+            CoordinationResponseKind::Handover,
+            CoordinationResponseKind::Decline,
+        ] {
+            assert!(join_uncovered(kind, &[], &s(&["docs/x.md"])).is_ok());
+        }
+    }
+}

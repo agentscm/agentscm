@@ -1693,6 +1693,66 @@ fn a_lead_closes_a_request_whose_requester_is_gone(db: &Db) {
     assert!(!events[1].contains("\"via\""), "{events:?}");
 }
 
+fn join_reply_outside_the_holders_scope_is_refused(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    store
+        .work_start(
+            &incumbent,
+            &start_scope(
+                "incumbent",
+                "incumbent-session",
+                WorkRole::Lead,
+                None,
+                &["src/a.rs"],
+            ),
+            now,
+        )
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let reply = |kind, operation_id: &str| CoordinationReply {
+        request_id: request.id.clone(),
+        operation_id: operation_id.into(),
+        target_work_id: request.targets[0].work_id.clone(),
+        session: "incumbent-session".into(),
+        expected_updated_seq: request.updated_seq,
+        kind,
+        note: None,
+        via: agentscm::hub::handoff::Via::Agent,
+    };
+    let refusal = store
+        .coordination_reply(
+            &incumbent,
+            &reply(CoordinationResponseKind::Join, "join-operation"),
+            now + 2,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("src/"), "{refusal}");
+    assert!(
+        refusal.contains("agentscm_work_overlap_consent"),
+        "{refusal}"
+    );
+    let declined = store
+        .coordination_reply(
+            &incumbent,
+            &reply(CoordinationResponseKind::Decline, "decline-operation"),
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(declined.responses.len(), 1);
+}
+
 macro_rules! parity_case {
     ($name:ident, $case:ident) => {
         mod $name {
@@ -1711,6 +1771,10 @@ macro_rules! parity_case {
     };
 }
 
+parity_case!(
+    join_reply_outside_scope,
+    join_reply_outside_the_holders_scope_is_refused
+);
 parity_case!(
     person_reply_through_the_hub,
     a_person_reply_through_the_hub_is_marked_and_delivered
