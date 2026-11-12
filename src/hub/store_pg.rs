@@ -11732,7 +11732,11 @@ impl Store for PgStore {
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)
                             AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1
-                                AND seq > $2 AND seq <= $3 AND kind <> 'work_joined')",
+                                AND seq > $2 AND seq <= $3 AND kind <> 'work_joined')
+                    AND $2 >= COALESCE((SELECT MAX(r.event_floor_seq) FROM hub_work_retention r
+                        JOIN hub_work_items w ON w.id = $1 AND r.provider = w.provider
+                        AND r.host = w.host AND r.repository = w.repository
+                        AND r.repository_id IS NOT DISTINCT FROM w.repository_id), 0)",
                         &[&item.id, &request.expected_updated_seq, &item.updated_seq],
                     )?
                     .get::<_, bool>(0);
