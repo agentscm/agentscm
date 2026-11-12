@@ -741,9 +741,20 @@ async fn capture_native(
             }
         }
     }
-    if let (true, Some(history_root), Some(transcript_path)) = (
-        claude,
-        binding.claude_history_root.as_deref(),
+    // A captured Claude Code session reports its token counts and model names by default: a
+    // binding with no history root of its own uses Claude Code's projects folder. Either way the
+    // reader takes only this session's own file under that root.
+    let history_root = claude
+        .then(|| {
+            binding.claude_history_root.clone().or_else(|| {
+                crate::client_plugin::claude_config_dir(&binding.root)
+                    .ok()
+                    .map(|config| config.join("projects"))
+            })
+        })
+        .flatten();
+    if let (Some(history_root), Some(transcript_path)) = (
+        history_root.as_deref(),
         payload
             .get("transcript_path")
             .and_then(Value::as_str)
@@ -2054,6 +2065,80 @@ mod tests {
             codex_hook(&bound, &spool, &hub, codex_model_request());
             assert!(spool.pending(100).unwrap().is_empty());
             assert!(spool.deferred(100).unwrap().is_empty());
+        });
+    }
+
+    /// The fixture session's Claude Code history file in a project folder under `root`, holding
+    /// one request's usage.
+    fn history_under(root: &Path) -> std::path::PathBuf {
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("session_fixture.jsonl");
+        let line = json!({
+            "type": "assistant", "sessionId": "session_fixture", "uuid": "a1",
+            "timestamp": "2026-11-01T10:00:00Z", "requestId": "req_1",
+            "message": {"model": "model-fixture", "usage": {
+                "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100,
+            }},
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    }
+
+    /// Starts the fixture Claude Code session with `transcript` as its history file, in a new
+    /// store, and counts the usage reports capture wrote.
+    fn usage_at_start(binding: &CaptureBinding, hub: &CaptureHub, transcript: &Path) -> usize {
+        let name = format!(
+            "spool-{}",
+            std::fs::read_dir(&binding.root).unwrap().count()
+        );
+        let spool = LocalSpool::open_with_limits(binding.root.join(name), SMALL).unwrap();
+        let payload = json!({
+            "session_id": "session_fixture", "hook_event_name": "SessionStart",
+            "source": "startup", "cwd": binding.root, "transcript_path": transcript,
+        });
+        let input = payload.to_string();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::capture_native(
+                AgentHarnessV1::ClaudeCode,
+                input.as_bytes(),
+                &payload,
+                binding,
+                &spool,
+                Some(hub),
+                None,
+            ));
+        let pending = spool.pending(100).unwrap();
+        pending
+            .iter()
+            .filter(|envelope| matches!(envelope, CaptureEnvelopeV1::Usage(_)))
+            .count()
+    }
+
+    #[test]
+    fn claude_usage_is_read_by_default_and_only_from_the_sessions_own_history() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let (hub, url) = loopback(config, true);
+            let bound = |history_root: Option<&str>| CaptureBinding {
+                hub: url.clone(),
+                claude_history_root: history_root.map(|root| config.join(root)),
+                ..binding(config)
+            };
+            // No history root is set: Claude Code's own projects folder is read.
+            let default = history_under(&config.join("claude/projects"));
+            assert_eq!(usage_at_start(&bound(None), &hub, &default), 1);
+            // A history file anywhere else is not.
+            let elsewhere = history_under(&config.join("elsewhere"));
+            assert_eq!(usage_at_start(&bound(None), &hub, &elsewhere), 0);
+            // A binding's own history root replaces the default.
+            assert_eq!(
+                usage_at_start(&bound(Some("elsewhere")), &hub, &elsewhere),
+                1
+            );
+            assert_eq!(usage_at_start(&bound(Some("elsewhere")), &hub, &default), 0);
         });
     }
 }
