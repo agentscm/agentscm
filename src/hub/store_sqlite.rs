@@ -54,7 +54,8 @@ use super::device::{
     REFUSAL_SECONDS, Refusal, RepositoryUsage, validate_device_name,
 };
 use super::external_runs::{
-    EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
+    EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun,
+    ExternalSource, supersedes,
 };
 use super::handoff::{
     Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request,
@@ -5541,9 +5542,12 @@ fn merge_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeGroup> {
 fn external_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ExternalRun>> {
     let kind: String = row.get(1)?;
     let outcome: String = row.get(8)?;
-    let (Some(kind), Some(outcome)) =
-        (ExternalKind::parse(&kind), ExternalOutcome::parse(&outcome))
-    else {
+    let source: String = row.get(11)?;
+    let (Some(kind), Some(outcome), Some(source)) = (
+        ExternalKind::parse(&kind),
+        ExternalOutcome::parse(&outcome),
+        ExternalSource::parse(&source),
+    ) else {
         return Ok(Err(HubError::Unavailable(
             "stored external run is invalid".into(),
         )));
@@ -5551,6 +5555,7 @@ fn external_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<External
     Ok(Ok(ExternalRun {
         provider: row.get(0)?,
         kind,
+        source,
         run_id: row.get(2)?,
         attempt: row.get(3)?,
         commit_sha: row.get(4)?,
@@ -10720,14 +10725,15 @@ impl Store for SqliteStore {
                 &format!(
                     "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
                      WHERE repository = ?1 AND provider = ?2 AND kind = ?3 AND run_id = ?4
-                         AND attempt = ?5"
+                         AND attempt = ?5 AND source = ?6"
                 ),
                 params![
                     repo,
                     run.provider,
                     run.kind.as_str(),
                     run.run_id,
-                    run.attempt
+                    run.attempt,
+                    run.source.as_str()
                 ],
                 external_run_row,
             )
@@ -10740,9 +10746,10 @@ impl Store for SqliteStore {
         }
         tx.execute(
             "INSERT INTO hub_external_runs (repository, provider, kind, run_id, attempt,
-                 commit_sha, branch, environment, name, outcome, provider_updated_at, html_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT (repository, provider, kind, run_id, attempt) DO UPDATE SET
+                 commit_sha, branch, environment, name, outcome, provider_updated_at, html_url,
+                 source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT (repository, provider, kind, source, run_id, attempt) DO UPDATE SET
                  commit_sha = excluded.commit_sha, branch = excluded.branch,
                  environment = excluded.environment, name = excluded.name,
                  outcome = excluded.outcome,
@@ -10760,7 +10767,8 @@ impl Store for SqliteStore {
                 run.name,
                 run.outcome.as_str(),
                 run.provider_updated_at,
-                run.html_url
+                run.html_url,
+                run.source.as_str()
             ],
         )?;
         append(&tx, &Event::external_run_observed(repo, run)?)?;

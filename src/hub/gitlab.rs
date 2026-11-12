@@ -14,7 +14,7 @@ use super::forge_http::{self, Full, send_capped};
 use super::github::{
     API_BODY_BYTES, Branch, ClosedPage, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES,
     MAX_FILE_PAGES, MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply,
-    RepoInfo, StatusState, answer, endpoint_kind, parse_rfc3339, valid_ref_name,
+    RepoInfo, StatusState, answer, endpoint_kind, parse_rfc3339, refusal, valid_ref_name,
 };
 use super::store::{unix_now, validate_repository};
 
@@ -561,6 +561,76 @@ impl Api {
             head_tree,
             head_parents,
         }))
+    }
+
+    /// The newest deployment of exactly `sha` among the 100 newest to `environment`, with its
+    /// status (`running`, `success`, `failed`, ...); `None` when there is none.
+    pub async fn find_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        sha: &str,
+        environment: &str,
+    ) -> Gh<Option<(i64, String)>> {
+        let path = format!(
+            "/projects/{project}/deployments?environment={}&order_by=id&sort=desc&per_page=100",
+            encode(environment)
+        );
+        let list = self.get(token, &path).await?.ok("deployments")?;
+        let Some(list) = list.as_array() else {
+            return Err(GhError::Failed("unreadable reply from deployments".into()));
+        };
+        Ok(list
+            .iter()
+            .find(|item| item["sha"] == sha)
+            .and_then(|item| Some((item["id"].as_i64()?, item["status"].as_str()?.to_owned()))))
+    }
+
+    /// Records a deployment of `sha` from `ref_name` to `environment` in `status`, creating the
+    /// environment when it is new, and returns its id.
+    pub async fn create_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        sha: &str,
+        ref_name: &str,
+        environment: &str,
+        status: &str,
+    ) -> Gh<i64> {
+        let url = format!("{}/projects/{project}/deployments", self.base);
+        let body = json!({"environment": environment, "sha": sha, "ref": ref_name,
+            "tag": false, "status": status});
+        let reply = self.call(token, Method::POST, &url, Some(body)).await?;
+        match reply.body["id"].as_i64() {
+            Some(id) if reply.status == 201 && reply.body["sha"] == sha => Ok(id),
+            _ => Err(GhError::Failed(format!(
+                "{} from deployments: {}",
+                reply.status,
+                refusal(&reply.body)
+            ))),
+        }
+    }
+
+    /// Moves deployment `id` to `status`.
+    pub async fn update_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        id: i64,
+        status: &str,
+    ) -> Gh<()> {
+        let url = format!("{}/projects/{project}/deployments/{id}", self.base);
+        let reply = self
+            .call(token, Method::PUT, &url, Some(json!({"status": status})))
+            .await?;
+        if reply.status != 200 || reply.body["status"] != status {
+            return Err(GhError::Failed(format!(
+                "{} from deployments: {}",
+                reply.status,
+                refusal(&reply.body)
+            )));
+        }
+        Ok(())
     }
 
     /// Posts a commit status on the commit with `ref_name` (the merge request's source branch).

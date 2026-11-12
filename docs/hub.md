@@ -1976,6 +1976,12 @@ paged, so old merges never occupy a page:
   Deployments carry no repository id, so they are matched by the repository name in the
   request and the exact sha, the same exposure as the `pulls/{n}` merge read.
 
+A deploy run from a script records no deployment by itself; `agentscm deployed` asks the Hub
+to record one with the connection's own credential, which on GitHub needs the App permission
+Deployments: Read and write (see [record a deployment from a script](record-deployments.md)).
+A deployment the Hub wrote carries `payload` `{"agentscm": "recorded"}` and is read back as
+source `recorded`; every other deployment read is source `forge`.
+
 Outcomes are `pending`, `running`, `succeeded`, `failed`, `cancelled`, `superseded` (a
 deployment that went `inactive`) or `unknown`; anything the Hub does not recognise is
 `unknown`, never success. A run is keyed by provider, kind, run id and attempt, so a rerun

@@ -1716,6 +1716,73 @@ async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
     assert_eq!(forge.state, CatchupCoverageState::ObservedOnly);
 }
 
+#[tokio::test]
+async fn a_recorded_deployment_is_written_with_the_connections_token() {
+    let env = Env::start().await;
+    let agent = env.agent(41, "dana", "agent-d");
+    let sha = "1".repeat(40);
+    let path = "/v1/hub/repos/acme%2Fwidgets/deployments";
+    let body = |status: &str| json!({"commit": sha, "environment": "production", "status": status});
+
+    let (status, first) = env.post(path, Some(&agent), body("in_progress")).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(
+        (&first["recorded"], &first["provider"], &first["outcome"]),
+        (&json!(true), &json!("gitlab"), &json!("running"))
+    );
+    assert_eq!(
+        env.post(path, Some(&agent), body("in_progress")).await.1["recorded"],
+        false
+    );
+    assert_eq!(
+        env.post(path, Some(&agent), body("success")).await.1["recorded"],
+        true
+    );
+    let made = env.fake.with(|s| s.projects[&REPO_ID].deployments.clone());
+    assert_eq!(made.len(), 1, "one deployment, moved to success: {made:?}");
+    assert_eq!(
+        (&made[0]["sha"], &made[0]["ref"], &made[0]["status"]),
+        (&json!(sha), &json!("main"), &json!("success"))
+    );
+    let stored = env
+        .store
+        .external_runs(
+            &env.store
+                .repository_named(&env.host, REPO)
+                .unwrap()
+                .unwrap()
+                .id,
+            &sha,
+            agentscm::hub::external_runs::ExternalKind::Deployment,
+            10,
+        )
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].provider, "gitlab");
+
+    // A token below Developer may not write deployments: nothing is recorded, and it says why.
+    env.fake.with(|s| {
+        s.tokens.get_mut(TOKEN).unwrap().access.insert(REPO_ID, 20);
+    });
+    let (status, refused) = env
+        .post(
+            path,
+            Some(&agent),
+            json!({"commit": "2".repeat(40),
+            "environment": "staging", "status": "success"}),
+        )
+        .await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["error"], "forge_permission_missing");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("Developer role")
+    );
+    assert_eq!(env.fake.with(|s| s.projects[&REPO_ID].deployments.len()), 1);
+}
+
 // ---- connections whose credential an embedder supplies ----
 
 /// An embedder: a token per connection, repositories it does not bind, and followed namespaces.
