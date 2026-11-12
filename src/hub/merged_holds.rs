@@ -167,6 +167,10 @@ pub struct MergedFacts {
     pub hold: MergedHold,
     /// The Work is listed only because it is unreserved and its branch merged: it holds nothing.
     pub unreserved: bool,
+    /// Its linked pull request merged and its read established that every pull request of the
+    /// Work merged: no limit on the read, no declared pull request not known merged, and no other
+    /// open pull request on its branch.
+    pub all_merged: bool,
 }
 
 /// The Work's source issue number in `repository_id`/`full_name`, from its forge source or its
@@ -240,6 +244,7 @@ pub fn facts(
         closure,
         hold,
         unreserved: false,
+        all_merged: merged_pull.is_some() && !unsettled,
     }
 }
 
@@ -454,6 +459,9 @@ pub fn set_merged_release(
 /// The audience under which a policy release is claimed, once per Work ever.
 const POLICY_RELEASE: &str = "policy_release";
 
+/// The audience under which the Hub's completion of merged Work is claimed, once per Work ever.
+const HUB_COMPLETE: &str = "hub_complete";
+
 /// After a refused policy release: keeps the `policy_release` claim when a re-read shows the
 /// Work's hold is gone (someone else released it), else gives the claim back so a later run can
 /// release. An unreadable Work counts as still holding. Returns whether the claim was kept.
@@ -583,6 +591,128 @@ pub fn release_settled(
         }
     }
     Ok(released)
+}
+
+/// Whether the Hub completes `facts`' Work on its observed merge: every pull request of the Work
+/// merged, and its source issue, when it has one, was closed as completed by that pull request.
+/// A "Part of" pull request merges while its issue stays open, so a Work with an issue that is
+/// open, unread or closed another way is never completed.
+fn completes_on_merge(facts: &MergedFacts) -> Option<u64> {
+    if !facts.all_merged {
+        return None;
+    }
+    match facts.hold {
+        MergedHold::Settled { pull, .. } => Some(pull),
+        MergedHold::MergedOnly { pull } if facts.issue.is_none() => Some(pull),
+        _ => None,
+    }
+}
+
+/// Completes each unfinished Work of `repo` whose pull request the Hub observed merge, so Work
+/// whose agent ended its turn before the merge queue merged does not stay open holding files.
+/// Returns the ids completed.
+///
+/// A Work is completed when `completes_on_merge` accepts its facts, it is active or paused (a
+/// blocked Work waits on someone and a handed-over Work on its next lead), and no live session
+/// holds it: its reservation lapsed or it holds none. While its lead's lease is live the Hub
+/// leaves it to the lead, whom the merged prompt tells to complete it, and completes it after
+/// the lease lapses. The Hub completes a Work at most once ever (the `hub_complete` marker), so a
+/// lead who reopens it keeps it open, and it leaves alone a Work its lead resumed after the
+/// opted-in policy released it.
+///
+/// The completion is a `complete` transition by the policy actor for the Work's owner, fenced
+/// by the Work's generation and sequence, with an operation id naming both, so a lead finishing
+/// at the same moment changes nothing twice and a retry replays. The outcome reads
+/// `hub_observed_merge`. A failure on one Work is logged and does not stop the others.
+pub fn complete_merged(
+    store: &dyn Store,
+    provider: &str,
+    repo: &ConnectedRepository,
+    now: i64,
+) -> super::Result<Vec<String>> {
+    use super::work::WorkState;
+    use super::work_lifecycle::ActivityStatus;
+    use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
+    let found = repository_facts_where(store, provider, repo, now, |item| {
+        matches!(item.state, WorkState::Active | WorkState::Paused)
+    })?;
+    let mut completed = Vec::new();
+    for (item, facts) in &found.work {
+        let Some(pull) = completes_on_merge(facts) else {
+            continue;
+        };
+        let attempt = || -> super::Result<bool> {
+            let Some(owner) = store.user_by_id(&item.owner)?.filter(|u| !u.disabled) else {
+                return Ok(false);
+            };
+            let reader = WorkLifecycleReader::Person {
+                owner: &owner,
+                repository: &repo.full_name,
+                repository_id: repo.repository_id,
+            };
+            let overview =
+                store.work_operational(&reader, &OperationalSelect::One(&item.id), now)?;
+            let open = |w: &super::work_lifecycle::WorkOperationalV1| {
+                matches!(w.state, WorkState::Active | WorkState::Paused)
+            };
+            let Some(current) = overview
+                .work
+                .first()
+                .filter(|w| open(w) && w.activity.status != ActivityStatus::Live)
+            else {
+                return Ok(false);
+            };
+            // A Work its lead resumed after the policy released it holds again on purpose.
+            if current.reservation.basis.is_some()
+                && store.merge_prompt_claimed(&item.id, POLICY_RELEASE)?
+            {
+                return Ok(false);
+            }
+            // Once ever, claimed before the transition so two pollers cannot both complete, and so
+            // Work reopened after the Hub completed it is left to its lead.
+            if !store.claim_merge_prompt(&item.id, HUB_COMPLETE, now)? {
+                return Ok(false);
+            }
+            let request = WorkTransitionRequest {
+                work_id: item.id.clone(),
+                operation_id: format!(
+                    "hub-observed-merge:{}:{}:{}",
+                    item.id, current.generation, current.updated_seq
+                ),
+                generation: current.generation,
+                expected_updated_seq: current.updated_seq,
+                session: None,
+                transition: WorkTransitionKind::Complete,
+                reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
+                superseded_by: None,
+            };
+            let actor = WorkTransitionActor::Policy {
+                owner: &owner,
+                repository: &repo.full_name,
+                repository_id: repo.repository_id,
+            };
+            let done = store.work_transition(&actor, &request, now);
+            if done.is_err() {
+                // The claim stays only when a re-read shows the Work is no longer open (someone
+                // finished it); otherwise it is given back so a later poll can complete it.
+                let still_open = store
+                    .work_operational(&reader, &OperationalSelect::One(&item.id), now)
+                    .map_or(true, |o| o.work.first().is_some_and(open));
+                if still_open {
+                    let _ = store.unclaim_merge_prompt(&item.id, HUB_COMPLETE);
+                }
+            }
+            done.map(|_| true)
+        };
+        match attempt() {
+            Ok(true) => completed.push(item.id.clone()),
+            Ok(false) => {}
+            // The fence moved or the Work finished meanwhile: a later poll reads it again.
+            Err(super::HubError::Invalid(_)) => {}
+            Err(error) => super::error_envelope::log_internal(&error),
+        }
+    }
+    Ok(completed)
 }
 
 /// The most owner start lines one session start carries.
@@ -912,6 +1042,33 @@ mod tests {
         json!({"data": {"repository": {"issue": {
             "state": state, "stateReason": reason,
             "timelineItems": {"nodes": nodes}}}}})
+    }
+
+    fn merged(hold: MergedHold, issue: Option<u64>, all_merged: bool) -> MergedFacts {
+        MergedFacts {
+            merged_pull: Some(7),
+            issue,
+            closure: None,
+            hold,
+            unreserved: false,
+            all_merged,
+        }
+    }
+
+    #[test]
+    fn completes_only_a_fully_merged_work_whose_issue_it_closed_or_that_has_none() {
+        let settled = MergedHold::Settled { pull: 7, issue: 3 };
+        let only = MergedHold::MergedOnly { pull: 7 };
+        assert_eq!(completes_on_merge(&merged(settled, Some(3), true)), Some(7));
+        assert_eq!(completes_on_merge(&merged(only, None, true)), Some(7));
+        // Another pull request open or unread, an issue left open, unread or closed otherwise.
+        assert_eq!(completes_on_merge(&merged(only, None, false)), None);
+        assert_eq!(completes_on_merge(&merged(only, Some(3), true)), None);
+        let open = MergedHold::MergedIssueOpen { pull: 7, issue: 3 };
+        assert_eq!(completes_on_merge(&merged(open, Some(3), true)), None);
+        for hold in [MergedHold::NotMerged, MergedHold::Unknown] {
+            assert_eq!(completes_on_merge(&merged(hold, None, true)), None);
+        }
     }
 
     #[test]
