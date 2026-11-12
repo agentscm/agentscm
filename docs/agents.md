@@ -399,17 +399,18 @@ start-up check does not auto-connect a checkout. What each documents, as of Octo
 
 None of these sends `agentscm hook generic` input directly. To wire one by hand:
 
-1. Add the user-level MCP server with command `agentscm` and arguments
-   `--no-telemetry client mcp`. It uses the saved connection of the checkout it starts in, which
-   `agentscm client connect --hub HUB` makes, and of any other connected checkout that a call
-   names ([routing](#calls-reach-the-repository-whose-files-they-name)). In a checkout without a
+1. Add the user-level MCP server with command `agentscm` and arguments `--no-telemetry client
+   mcp`. It uses the saved connection of the checkout it starts in, which `agentscm client
+   connect --hub HUB` makes, and of any other connected checkout that a call names
+   ([routing](#calls-reach-the-repository-whose-files-they-name)). In a checkout without a
    connection it lists the tools, and a call for that checkout says why it cannot run. When the
-   Hub gives no usable answer to `initialize` or `tools/list` (unreachable, an error or a rejected
-   token), the server answers them itself, so the host keeps it; each tool call is still sent to the Hub and says the Hub is unreachable until it
-   answers, and the first Hub reply after that sends `notifications/tools/list_changed` so the
-   host lists the Hub's own tools. A host reads the instructions only at `initialize`, so that
-   session keeps the server's own shorter instructions until it restarts. A client with no AgentSCM hook gets one session name per
-   server process.
+   Hub gives no usable answer to `initialize` or `tools/list` (unreachable, an error or a
+   rejected token), the server answers them itself, so the host keeps it; each tool call is still
+   sent to the Hub and says why it cannot run until the Hub answers, and the first Hub reply
+   after that sends `notifications/tools/list_changed` so the host lists the Hub's own tools. A
+   host reads the instructions only at `initialize`, so that session keeps the server's own
+   shorter instructions until it restarts. A client with no AgentSCM hook gets one session name
+   per server process.
 2. Add a hook, or plugin, that maps the agent's event to
    `{"event": "start"|"check"|"waiting"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}` (a `waiting` event also carries `"reason"`),
    pipes it to `agentscm hook generic` with `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN` set, and

@@ -2304,12 +2304,19 @@ fn lapse_notice(
         Err(HubError::Unauthorized) => return Ok(None),
         Err(error) => return Err(error),
     };
-    // Current Work first: a lapse whose scope was taken leaves that Work paused, and a lead
-    // that has since moved on is told only of the Work it leads now.
+    // Current Work first: a lapse whose scope was taken leaves active Work paused (blocked Work
+    // stays blocked), and a lead that has since moved on is told only of the Work it leads now.
     if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
-        return Ok(lapsed_at(tx, &item.id, now)?.map(|(renewed, expired)| {
-            lapsed_unheld_text(&item.id, item.generation, renewed, expired, Unheld::Edit)
-        }));
+        if let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)? {
+            return Ok(Some(lapsed_unheld_text(
+                &item.id,
+                item.generation,
+                renewed,
+                expired,
+                Unheld::Edit,
+            )));
+        }
+        return lapsed_hold_refusal(tx, &who, session, Some(&item.id));
     }
     lapsed_hold_refusal(tx, &who, session, None)
 }
@@ -8912,12 +8919,20 @@ impl Store for PgStore {
             let mut lapsed = None;
             if call.session.is_some() {
                 session_tool_call(&mut tx, token, &touched.session, phase, now)?;
-                lapsed =
-                    lapse_notice(&mut tx, token, &touched.session, now).unwrap_or_else(|error| {
-                        // Advice only: the touch's renewal must not depend on it.
+                // Advice only: the touch's renewal must not depend on it. A failed statement
+                // aborts a PostgreSQL transaction, so the read runs in a savepoint that is
+                // rolled back on its own.
+                let mut savepoint = tx.transaction()?;
+                lapsed = match lapse_notice(&mut savepoint, token, &touched.session, now) {
+                    Ok(found) => {
+                        savepoint.commit()?;
+                        found
+                    }
+                    Err(error) => {
                         eprintln!("hub: lapse notice not read: {error}");
                         None
-                    });
+                    }
+                };
             }
             tx.commit()?;
             Ok(lapsed)

@@ -2298,12 +2298,19 @@ fn lapse_notice(
         Err(HubError::Unauthorized) => return Ok(None),
         Err(error) => return Err(error),
     };
-    // Current Work first: a lapse whose scope was taken leaves that Work paused, and a lead
-    // that has since moved on is told only of the Work it leads now.
+    // Current Work first: a lapse whose scope was taken leaves active Work paused (blocked Work
+    // stays blocked), and a lead that has since moved on is told only of the Work it leads now.
     if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
-        return Ok(lapsed_at(tx, &item.id, now)?.map(|(renewed, expired)| {
-            lapsed_unheld_text(&item.id, item.generation, renewed, expired, Unheld::Edit)
-        }));
+        if let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)? {
+            return Ok(Some(lapsed_unheld_text(
+                &item.id,
+                item.generation,
+                renewed,
+                expired,
+                Unheld::Edit,
+            )));
+        }
+        return lapsed_hold_refusal(tx, &who, session, Some(&item.id));
     }
     lapsed_hold_refusal(tx, &who, session, None)
 }
