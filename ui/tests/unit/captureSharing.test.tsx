@@ -214,7 +214,7 @@ describe('Conversation sharing in Settings', () => {
   it('only points at the computer when this page is not served by it', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => reply(200, { version: 1, checkouts: [row()] })))
     render(<CaptureSharingElsewhere />)
-    expect(screen.getByText(/menu bar app/)).toBeTruthy()
+    expect(screen.getByText(/that computer’s own Hub page/)).toBeTruthy()
     expect(screen.queryByRole('switch')).toBeNull()
   })
 })

@@ -63,6 +63,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/briefing".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/insights".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
+    row(&get, "/v1/hub/standup/work/missing/usage".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
     // A preflight reads: the exact-subject check names overlaps, changes no Work and records no event.
@@ -101,6 +102,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/pr-link".into(), "".into(), Status(404));
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_insights","arguments":{}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_usage_reports","arguments":{"work_id":"wrk_00000000000000000000000000000001"}}}"#.into(), Allowed);
     // Agent-token routes.
     row(&post, format!("{REPO}/intents"), announce.to_string(), AgentOnly);
     row(&post, format!("{REPO}/intents/{intent}/renew"), r#"{"ttl_s":60}"#.into(), AgentOnly);

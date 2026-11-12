@@ -249,7 +249,7 @@ export function Avatar({ name, size = 32 }: { name: string; size?: number }) {
 export function OnThisComputer({ what }: { what: string }) {
   return (
     <Empty icon="laptop" title={`${what} runs on this computer`}>
-      Open it from the AgentSCM menu bar app (Open Hub), or run <code>agentscm open</code> in your repository. It opens there already connected.
+      Run <code>agentscm open</code> in your repository. It opens there already connected.
     </Empty>
   )
 }

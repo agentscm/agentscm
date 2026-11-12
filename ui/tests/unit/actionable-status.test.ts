@@ -13,7 +13,7 @@ import type { HubData } from '../../src/useHub.ts'
 
 // Load shared evidence only at test runtime; the UI Docker build copies only ui/.
 const fixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
-// A real store's projection of #290's cases; the menu-bar companion counts the same file.
+// A real store's projection of #290's cases, written by the Hub's own tests.
 const surfaces = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/needs-you-surfaces.json'), 'utf8')) as ActionableStatus
 
 describe('shared actionable status', () => {
@@ -28,7 +28,7 @@ describe('shared actionable status', () => {
     expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
   })
-  it('badges the same needs the menu-bar companion counts', () => {
+  it('badges the needs the Hub counts in the shared fixture', () => {
     const status = decodeStatus(surfaces)
     const rail = dashboardStatus(null, null, null, null, new Set(), undefined, status).needs
     // Only the blocked task asks its person. The quiet task, the request to it, the shared file and the

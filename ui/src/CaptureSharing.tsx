@@ -3,7 +3,7 @@ import { fetchSharing, isSharing, setSharing, SharingError, sharingState, type S
 import { Box, Icon, Pill, Skeleton } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 
-/** What turning sharing on does, in the words the menu bar app uses. */
+/** What turning sharing on does. */
 export function SharingConsequences({ hub, retentionDays }: { hub: string; retentionDays: number | null }) {
   return (
     <ul className="small">
@@ -127,7 +127,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
 export function CaptureSharingElsewhere() {
   return (
     <Box tour="settings-sharing" icon="chat-square-text" title="Conversation sharing" explain="Off by default.">
-      <p className="small m-0">Sharing agent conversations is set per checkout on your computer: in the AgentSCM menu bar app (Share agent conversations with Hub), or in Settings on that computer’s own Hub page.</p>
+      <p className="small m-0">Sharing agent conversations is set per checkout on your computer, in Settings on that computer’s own Hub page.</p>
     </Box>
   )
 }

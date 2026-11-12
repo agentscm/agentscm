@@ -1,4 +1,4 @@
-// This computer's Hub page. `agentscm open` (or Open Hub in the menu bar app) serves this same page
+// This computer's Hub page. `agentscm open` serves this same page
 // from the local service at http://127.0.0.1:…/ui/ and opens it with `#pair=<code>&repo=<owner/name>`.
 // The page removes the fragment from history, redeems the single-use code with its own service, and
 // keeps `local:<grant>:<repo>` where the Hub sign-in normally lives. Every request then carries it:

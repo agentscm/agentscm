@@ -1,44 +1,12 @@
-//! `~/Applications/AgentSCM.app`: a minimal bundle that opens the menu bar app from the
-//! installed link, so Spotlight, Launchpad and the Dock can reopen it after a restart. It is
-//! written locally (so it carries no quarantine attribute). The bundle id in its Info.plist marks
-//! it as ours, so any later version can update or remove it; an app without it is left alone.
+//! `~/Applications/AgentSCM.app`: the bundle earlier versions wrote to open the removed menu bar
+//! app. Nothing writes it any more; setup and uninstall remove it. The bundle id in its
+//! Info.plist marks it as ours; an app without it is left alone.
 use std::path::{Path, PathBuf};
 
 const BUNDLE_ID: &str = "<string>com.counterbranch.agentscm.launcher</string>";
 
-const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key>
-	<string>AgentSCM</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.counterbranch.agentscm.launcher</string>
-	<key>CFBundleName</key>
-	<string>AgentSCM</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>LSUIElement</key>
-	<true/>
-</dict>
-</plist>
-"#;
-
 pub(crate) fn app(home: &Path) -> PathBuf {
     home.join("Applications").join("AgentSCM.app")
-}
-
-fn files(app: &Path, program: &Path) -> [(PathBuf, String); 2] {
-    [
-        (app.join("Contents/Info.plist"), PLIST.to_owned()),
-        (
-            app.join("Contents/MacOS/AgentSCM"),
-            format!(
-                "#!/bin/sh\nexec {} --no-telemetry tray\n",
-                super::binary::quote(program)
-            ),
-        ),
-    ]
 }
 
 fn ours(app: &Path) -> bool {
@@ -46,38 +14,6 @@ fn ours(app: &Path) -> bool {
         .is_ok_and(|meta| meta.file_type().is_symlink())
         && std::fs::read_to_string(app.join("Contents/Info.plist"))
             .is_ok_and(|plist| plist.contains(BUNDLE_ID))
-}
-
-/// Writes the bundle, or brings ours up to date; `Ok(false)` when it already matched. An app of
-/// that name without our bundle id is left alone and reported.
-pub(crate) fn ensure(app: &Path, program: &Path) -> std::io::Result<bool> {
-    let files = files(app, program);
-    if files
-        .iter()
-        .all(|(path, text)| std::fs::read_to_string(path).is_ok_and(|found| found == *text))
-        && ours(app)
-    {
-        return Ok(false);
-    }
-    if app.symlink_metadata().is_ok() && !ours(app) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} exists and was not made by AgentSCM", app.display()),
-        ));
-    }
-    for (path, text) in files {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, text)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let script = app.join("Contents/MacOS/AgentSCM");
-        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(true)
 }
 
 /// Removes our bundle, whatever version wrote it; `Ok(false)` when there was none.
@@ -102,49 +38,39 @@ pub(crate) fn remove(app: &Path) -> std::io::Result<bool> {
 mod tests {
     use super::*;
 
+    /// A bundle as an earlier version wrote it.
+    fn write(app: &Path, info: &str) {
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), info).unwrap();
+        std::fs::write(
+            app.join("Contents/MacOS/AgentSCM"),
+            "#!/bin/sh\nexec /old/agentscm tray\n",
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn the_launcher_is_written_once_updated_by_marker_and_never_takes_another_app() {
+    fn our_launcher_is_removed_and_another_app_is_left_alone() {
         let home = tempfile::tempdir().unwrap();
         let app = app(home.path());
-        let program = home.path().join(".agentscm/bin/agentscm");
-        assert!(ensure(&app, &program).unwrap());
-        assert!(!ensure(&app, &program).unwrap());
-        let script = app.join("Contents/MacOS/AgentSCM");
-        assert!(
-            std::fs::read_to_string(&script)
-                .unwrap()
-                .contains("--no-telemetry tray")
-        );
+        let ours = format!("<plist>{BUNDLE_ID}</plist>");
+        assert!(!remove(&app).unwrap());
 
-        // A launcher an older version wrote (different script) is still ours: updated, then removed.
-        std::fs::write(&script, "#!/bin/sh\nexec /old/agentscm tray\n").unwrap();
-        assert!(ensure(&app, &program).unwrap());
-        assert!(
-            std::fs::read_to_string(&script)
-                .unwrap()
-                .contains(".agentscm/bin/agentscm")
-        );
-        std::fs::write(&script, "#!/bin/sh\nexec /old/agentscm tray\n").unwrap();
+        write(&app, &ours);
         assert!(remove(&app).unwrap());
         assert!(!app.exists());
         assert!(home.path().join("Applications").exists());
 
         // Something the person put inside ours stays, with the folders that hold it.
-        ensure(&app, &program).unwrap();
+        write(&app, &ours);
         std::fs::write(app.join("Contents/notes.txt"), "mine").unwrap();
         assert!(remove(&app).unwrap());
         assert!(app.join("Contents/notes.txt").exists());
         std::fs::remove_dir_all(&app).unwrap();
 
-        // Another app of that name is neither replaced nor removed.
-        std::fs::create_dir_all(app.join("Contents")).unwrap();
-        std::fs::write(
-            app.join("Contents/Info.plist"),
-            "<plist>someone else</plist>",
-        )
-        .unwrap();
-        assert!(ensure(&app, &program).is_err());
+        // Another app of that name is not removed.
+        write(&app, "<plist>someone else</plist>");
         assert!(!remove(&app).unwrap());
-        assert!(app.join("Contents/Info.plist").exists());
+        assert!(app.join("Contents/MacOS/AgentSCM").exists());
     }
 }

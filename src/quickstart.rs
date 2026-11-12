@@ -23,6 +23,8 @@ mod hub_native;
 mod hub_setup;
 #[cfg(any(target_os = "macos", test))]
 mod launcher;
+#[cfg(target_os = "macos")]
+mod login_item;
 mod manifest;
 pub(crate) mod process;
 
@@ -117,7 +119,7 @@ pub struct QuickstartArgs {
     /// writes nothing to the repository.
     #[arg(hide = true, long)]
     init: bool,
-    /// Open the optional native status-bar companion after setup succeeds (macOS only).
+    /// Accepted for older scripts: the menu bar app was removed, so this opens nothing.
     #[arg(hide = true, long)]
     tray: bool,
     /// Print every file and setting this would write, then stop without writing.
@@ -603,6 +605,20 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     }
     agents_stage(&mut cx).await;
     init_stage(&mut cx);
+    // The menu bar app was removed: take away the launcher an earlier setup wrote.
+    #[cfg(target_os = "macos")]
+    let launcher_removed = match launcher::remove(&launcher::app(&cx.home)) {
+        Ok(removed) => removed,
+        Err(error) => {
+            println!("Couldn't remove the old AgentSCM app launcher: {error}.");
+            false
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let launcher_removed = false;
+    if launcher_removed {
+        println!("Removed the AgentSCM app launcher: the menu bar app it opened no longer exists.");
+    }
     let command = cli_command(&cx);
     // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
     #[cfg(unix)]
@@ -614,15 +630,6 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         || args.hub_url.is_some())
         && (!cx.live.hub_up
             || (cx.live.repo.is_none() && cx.live.wanted_agents && nothing_installed));
-    let ready = cx.failure.is_none()
-        && cx.live.pending_local.is_none()
-        && cx.live.agent_error.is_none()
-        && !requested_hub_incomplete;
-    let tray_result = if ready && args.tray {
-        launch_tray(&cx)
-    } else {
-        Ok(())
-    };
     if !cx.manifest.is_empty() {
         cx.manifest.save()?;
     }
@@ -630,12 +637,9 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         || hub_files.each_ref().map(|path| file_hash(path)) != original_hub_files
         || program_fingerprint(&cx.home) != original_program
         || sessions_file.as_deref().map(file_hash) != original_sessions
-        || !cx.init_written.is_empty();
+        || !cx.init_written.is_empty()
+        || launcher_removed;
     summary(&cx, changed, &command);
-    #[cfg(target_os = "macos")]
-    if !(ready && args.tray) {
-        println!("Menu bar app: {command} tray");
-    }
     println!("{}", cx.live.line(&command));
     #[cfg(unix)]
     if let Some(mut out) = json_out {
@@ -658,7 +662,6 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
             "the requested hub setup is incomplete; see the status and recovery instructions above",
         ));
     }
-    tray_result?;
     Ok(0)
 }
 
@@ -1248,12 +1251,6 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     if cx.live.installed.is_empty() && !cx.live.failed.is_empty() {
         cx.live.agent_error = Some("no agent could be set up".into());
     }
-    #[cfg(target_os = "macos")]
-    if let Some(dir) = &cx.manifest.bin_dir
-        && let Err(error) = launcher::ensure(&launcher::app(&cx.home), &dir.join(binary::LINK))
-    {
-        println!("Didn't add the AgentSCM app launcher: {error}.");
-    }
 }
 
 /// Connects the checkout quickstart runs in and sets its agents up there. A checkout the Hub
@@ -1355,22 +1352,28 @@ fn cli_command(cx: &Cx<'_>) -> String {
     }
 }
 
-fn launch_tray(cx: &Cx<'_>) -> Result<()> {
-    let program = match &cx.manifest.bin_dir {
-        Some(dir) => dir.join(binary::LINK),
-        None => std::env::current_exe()?,
-    };
-    let status = std::process::Command::new(&program)
-        .args(["--no-telemetry", "tray"])
-        .status()?;
-    if status.success() {
-        println!("Opened the AgentSCM status-bar companion.");
-        Ok(())
-    } else {
-        Err(invalid(&format!(
-            "could not open the AgentSCM status-bar companion (exit status {status})"
-        )))
+/// `agentscm tray`, kept hidden. The menu bar app was removed; a Start at Login entry or app
+/// launcher from an earlier version still runs this command, and removes itself here.
+#[derive(Debug, Args)]
+pub struct RetiredTrayArgs {
+    /// What the old Start at Login entry passes.
+    #[arg(hide = true, long)]
+    foreground: bool,
+    #[arg(hide = true, long)]
+    panel: bool,
+}
+
+pub fn retired_tray() -> Result<()> {
+    println!("The AgentSCM menu bar app has been removed.");
+    #[cfg(unix)]
+    println!("Open the Hub page with `agentscm open`.");
+    #[cfg(target_os = "macos")]
+    {
+        let _lifecycle = crate::client_cli::lifecycle_lock()?;
+        login_item::remove()?;
+        launcher::remove(&launcher::app(&home_dir()?))?;
     }
+    Ok(())
 }
 
 /// The closing lines: what is set up, what the person does next, and how to undo it.
@@ -1509,7 +1512,6 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     // What could not be undone stays in the record, with the command to finish by hand.
     let mut left = Manifest {
         created_at: m.created_at,
-        tray_declined: m.tray_declined,
         ..Manifest::default()
     };
     let mut manual: Vec<String> = Vec::new();
@@ -1619,24 +1621,29 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     {
         println!("Couldn't remove the AgentSCM app launcher: {error}.");
     }
-    let tray_cleanup_failed = if programs.is_some() && !retain_program {
-        match crate::tray::remove_login_setting_locked() {
+    // An earlier version's menu bar app may have left a Start at Login entry.
+    #[cfg(target_os = "macos")]
+    let login_cleanup_failed = programs.is_some()
+        && !retain_program
+        && match login_item::remove() {
             Ok(()) => false,
             Err(error) => {
-                println!("Couldn't remove the tray login setting: {}.", short(&error));
+                println!(
+                    "Couldn't remove the old Start at Login entry: {}.",
+                    short(&error)
+                );
                 manual.push(
-                    "review the AgentSCM tray login setting, then run `agentscm uninstall` again"
+                    "review the AgentSCM entry in ~/Library/LaunchAgents, then run `agentscm uninstall` again"
                         .into(),
                 );
                 true
             }
-        }
-    } else {
-        false
-    };
+        };
+    #[cfg(not(target_os = "macos"))]
+    let login_cleanup_failed = false;
     if let Some((dir, _)) = programs.as_ref().filter(|_| {
         // Connections quickstart didn't make may run this program too.
-        retain_program || tray_cleanup_failed
+        retain_program || login_cleanup_failed
     }) {
         println!(
             "Left the program files in {}: client connections or a managed hub still need them, or the native executable changed.",

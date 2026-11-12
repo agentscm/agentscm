@@ -610,9 +610,6 @@ pub(crate) async fn sign_in_for_setup(hub: &str, provider: Option<Provider>) -> 
 pub(crate) enum SignIn {
     /// This computer's browser when it has one, else a code for another device.
     Auto,
-    /// This computer's browser: the menu bar app has no terminal to show a code in.
-    #[cfg(target_os = "macos")]
-    Browser,
     /// A code typed on another device.
     Device,
 }
@@ -659,8 +656,6 @@ pub(crate) async fn sign_in_with(
         device["replaces"] = json!(replaces);
     }
     let browser = match how {
-        #[cfg(target_os = "macos")]
-        SignIn::Browser => true,
         SignIn::Device => false,
         SignIn::Auto => browser_available() || browser_only(&client, hub, provider).await,
     };
@@ -773,8 +768,7 @@ fn signed_in_line(hub: &str, who: &str) -> String {
 }
 
 /// Asks once per Hub, at a terminal, for every saved Hub that was never asked: sign-ins from
-/// the menu bar app or from before the question existed are asked at the next interactive
-/// command.
+/// before the question existed are asked at the next interactive command.
 pub(crate) fn ask_auto_connect_unasked() {
     for hub in auto_connect_unasked().unwrap_or_default() {
         ask_auto_connect(&hub);
@@ -782,7 +776,7 @@ pub(crate) fn ask_auto_connect_unasked() {
 }
 
 /// Asks once, at a terminal, whether agents connect themselves to `hub`; Yes by default.
-/// Without a terminal the question waits for the menu bar app or the next interactive command.
+/// Without a terminal the question waits for the next interactive command.
 fn ask_auto_connect(hub: &str) {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal()
@@ -972,7 +966,7 @@ async fn logout(hub: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// One saved Hub as `hub whoami` and the menu bar app show it, from local files only.
+/// One saved Hub as `hub whoami` shows it, from local files only.
 pub(crate) struct SignInSummary {
     pub(crate) hub: String,
     pub(crate) computer: Option<String>,
@@ -2028,12 +2022,6 @@ pub(crate) fn is_signed_in(hub: Option<&str>) -> Result<bool> {
         check_base_url(hub).map_err(map_hub_error)?;
     }
     Ok(load_auth(hub).is_ok())
-}
-
-/// The saved Hub for `hub` (or the default Hub), signed in or not: where a sign-in goes.
-#[cfg(target_os = "macos")]
-pub(crate) fn saved_hub(hub: Option<&str>) -> Option<String> {
-    load_saved_session(hub).ok().map(|(hub, _)| hub)
 }
 
 /// The computer credential saved for exactly `hub`, if any.

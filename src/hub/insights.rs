@@ -239,6 +239,121 @@ pub struct UsageReceipt {
     pub replayed: bool,
 }
 
+pub const MAX_USAGE_PAGE: usize = 100;
+
+/// A field left out takes its value from `Default`: the first and largest page.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageReportQuery {
+    /// How many of the work item's reports to skip: `next_after` of the previous page.
+    pub after: usize,
+    pub limit: usize,
+}
+
+impl Default for UsageReportQuery {
+    fn default() -> Self {
+        Self {
+            after: 0,
+            limit: MAX_USAGE_PAGE,
+        }
+    }
+}
+
+impl UsageReportQuery {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_USAGE_PAGE).contains(&self.limit) || self.after > MAX_OBSERVATIONS {
+            return Err(invalid("usage report page is out of bounds"));
+        }
+        Ok(())
+    }
+}
+
+/// One stored usage report as every reader of the repository may see it: what was measured and
+/// under which labels. The session, the author token and the identifiers the reporter supplied
+/// (observation, action, attempt, provider request and event) stay in the store.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UsageReport {
+    /// A digest of the work item and the stored observation ID, the same one value-metrics
+    /// evidence uses, so a reader can tell reports apart without learning that ID.
+    pub id: String,
+    pub received_at: i64,
+    pub generation: i64,
+    pub phase: AttemptPhase,
+    pub outcome: AttemptOutcome,
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub usage_basis: UsageBasis,
+    pub source_commit: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    /// `session_cumulative` reports are listed here but are not in any insight total.
+    pub measurement_scope: Option<UsageMeasurementScope>,
+    pub cost: Option<ReportedCost>,
+}
+
+impl UsageReport {
+    pub(super) fn stored(record: UsageRecord, received_at: i64) -> Self {
+        Self {
+            id: format!(
+                "usage-{}",
+                super::value_metrics::identity(&[&record.work_id, &record.observation_id])
+            ),
+            received_at,
+            generation: record.generation,
+            phase: record.phase,
+            outcome: record.outcome,
+            // Completion reports record the token label, and the readers are the whole repository.
+            agent: super::viewer::masked_label(&record.agent),
+            provider: record.provider,
+            model: record.model,
+            usage_basis: record.usage_basis,
+            source_commit: record.source_commit,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            measurement_scope: record.measurement_scope,
+            cost: record.cost,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UsageReportPage {
+    pub version: u32,
+    pub as_of: i64,
+    pub work_id: String,
+    /// Oldest first. Reports are immutable, and a work item keeps at most `MAX_OBSERVATIONS`.
+    pub items: Vec<UsageReport>,
+    /// Pass as `after` to read the next page; null on the last page.
+    pub next_after: Option<usize>,
+}
+
+impl UsageReportPage {
+    /// Builds a page from up to `limit + 1` stored rows read at offset `query.after`.
+    pub(super) fn of(
+        work_id: String,
+        query: &UsageReportQuery,
+        mut items: Vec<UsageReport>,
+        as_of: i64,
+    ) -> Self {
+        let more = items.len() > query.limit;
+        items.truncate(query.limit);
+        Self {
+            version: 1,
+            as_of,
+            work_id,
+            next_after: more.then_some(query.after + items.len()),
+            items,
+        }
+    }
+}
+
 /// Storage-only input. Tokens and native session identifiers never enter an insight response.
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -389,14 +504,100 @@ pub struct UsageSummary {
     pub coverage: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// Cached input is reported beside `input_tokens` and never added to it.
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
     pub input_known_observations: usize,
     pub output_known_observations: usize,
+    pub cache_read_input_known_observations: usize,
+    pub cache_creation_input_known_observations: usize,
     pub missing_cost_observations: usize,
     pub reported_failed_attempts: usize,
     pub cost_groups: Vec<CostGroup>,
     pub token_groups: Vec<TokenGroup>,
     /// False when a cohort page omits groups; the detail endpoint returns all bounded groups.
     pub groups_complete: bool,
+}
+
+impl UsageSummary {
+    /// Shows each group's agent as every reader of the repository may see it. A completion report
+    /// records the token label, which an older client built from its host name, and the stores
+    /// group by the label as stored. Groups that the masked label makes equal are added together.
+    pub(super) fn mask_agents(&mut self) {
+        fn add(total: &mut Option<i64>, value: Option<i64>) {
+            if let Some(value) = value {
+                *total = Some(total.unwrap_or(0) + value);
+            }
+        }
+        // A masked label can equal one that came before it or one that comes after, so every
+        // group is checked against the ones already kept. A summary holds at most 500 groups.
+        let mut tokens: Vec<TokenGroup> = Vec::with_capacity(self.token_groups.len());
+        for mut group in std::mem::take(&mut self.token_groups) {
+            group.agent = super::viewer::masked_label(&group.agent);
+            let Some(same) = tokens.iter_mut().find(|other| {
+                (
+                    &other.agent,
+                    &other.provider,
+                    &other.model,
+                    other.usage_basis,
+                ) == (
+                    &group.agent,
+                    &group.provider,
+                    &group.model,
+                    group.usage_basis,
+                )
+            }) else {
+                tokens.push(group);
+                continue;
+            };
+            same.observations += group.observations;
+            add(&mut same.input_tokens, group.input_tokens);
+            add(&mut same.output_tokens, group.output_tokens);
+            add(
+                &mut same.cache_read_input_tokens,
+                group.cache_read_input_tokens,
+            );
+            add(
+                &mut same.cache_creation_input_tokens,
+                group.cache_creation_input_tokens,
+            );
+            same.input_known_observations += group.input_known_observations;
+            same.output_known_observations += group.output_known_observations;
+            same.cache_read_input_known_observations += group.cache_read_input_known_observations;
+            same.cache_creation_input_known_observations +=
+                group.cache_creation_input_known_observations;
+        }
+        self.token_groups = tokens;
+        let mut costs: Vec<CostGroup> = Vec::with_capacity(self.cost_groups.len());
+        for mut group in std::mem::take(&mut self.cost_groups) {
+            group.agent = super::viewer::masked_label(&group.agent);
+            let Some(same) = costs.iter_mut().find(|other| {
+                (
+                    &other.agent,
+                    &other.provider,
+                    &other.model,
+                    other.usage_basis,
+                    other.kind,
+                    &other.currency,
+                    &other.basis,
+                ) == (
+                    &group.agent,
+                    &group.provider,
+                    &group.model,
+                    group.usage_basis,
+                    group.kind,
+                    &group.currency,
+                    &group.basis,
+                )
+            }) else {
+                costs.push(group);
+                continue;
+            };
+            same.amount_micros += group.amount_micros;
+            same.observations += group.observations;
+        }
+        self.cost_groups = costs;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -452,8 +653,12 @@ pub struct TokenGroup {
     pub observations: usize,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
     pub input_known_observations: usize,
     pub output_known_observations: usize,
+    pub cache_read_input_known_observations: usize,
+    pub cache_creation_input_known_observations: usize,
 }
 
 /// A bounded, self-contained continuation. Scope is always supplied by authentication.
@@ -500,10 +705,9 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
     type CostKey = (String, String, String, UsageBasis, CostKind, String, String);
     let mut tokens: BTreeMap<(String, String, String, UsageBasis), TokenGroup> = BTreeMap::new();
     let mut costs: BTreeMap<CostKey, CostGroup> = BTreeMap::new();
-    let mut input = None;
-    let mut output = None;
-    let mut input_known = 0;
-    let mut output_known = 0;
+    // Input, output, cache read and cache creation, in that order.
+    let mut totals = [None; 4];
+    let mut known = [0; 4];
     let mut missing_cost = 0;
     let mut failed = 0;
     let mut summarized_observations = 0;
@@ -529,21 +733,47 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
             observations: 0,
             input_tokens: None,
             output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
             input_known_observations: 0,
             output_known_observations: 0,
+            cache_read_input_known_observations: 0,
+            cache_creation_input_known_observations: 0,
         });
         group.observations += 1;
-        if let Some(value) = r.input_tokens {
-            input = Some(input.unwrap_or(0) + value);
-            group.input_tokens = Some(group.input_tokens.unwrap_or(0) + value);
-            input_known += 1;
-            group.input_known_observations += 1;
-        }
-        if let Some(value) = r.output_tokens {
-            output = Some(output.unwrap_or(0) + value);
-            group.output_tokens = Some(group.output_tokens.unwrap_or(0) + value);
-            output_known += 1;
-            group.output_known_observations += 1;
+        for (slot, value, group_total, group_known) in [
+            (
+                0,
+                r.input_tokens,
+                &mut group.input_tokens,
+                &mut group.input_known_observations,
+            ),
+            (
+                1,
+                r.output_tokens,
+                &mut group.output_tokens,
+                &mut group.output_known_observations,
+            ),
+            (
+                2,
+                r.cache_read_input_tokens,
+                &mut group.cache_read_input_tokens,
+                &mut group.cache_read_input_known_observations,
+            ),
+            (
+                3,
+                r.cache_creation_input_tokens,
+                &mut group.cache_creation_input_tokens,
+                &mut group.cache_creation_input_known_observations,
+            ),
+        ] {
+            // An absent count stays unknown: it adds nothing and is not counted as known.
+            if let Some(value) = value {
+                totals[slot] = Some(totals[slot].unwrap_or(0) + value);
+                *group_total = Some(group_total.unwrap_or(0) + value);
+                known[slot] += 1;
+                *group_known += 1;
+            }
         }
         failed += usize::from(r.outcome == AttemptOutcome::Failed);
         if let Some(cost) = &r.cost {
@@ -581,10 +811,14 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
             "partial"
         }
         .into(),
-        input_tokens: input,
-        output_tokens: output,
-        input_known_observations: input_known,
-        output_known_observations: output_known,
+        input_tokens: totals[0],
+        output_tokens: totals[1],
+        cache_read_input_tokens: totals[2],
+        cache_creation_input_tokens: totals[3],
+        input_known_observations: known[0],
+        output_known_observations: known[1],
+        cache_read_input_known_observations: known[2],
+        cache_creation_input_known_observations: known[3],
         missing_cost_observations: missing_cost,
         reported_failed_attempts: failed,
         cost_groups: costs.into_values().collect(),
@@ -883,6 +1117,151 @@ mod tests {
         assert_eq!(summary.output_known_observations, 1);
     }
     #[test]
+    fn cached_input_is_summed_beside_input_and_stays_unknown_when_unreported() {
+        let mut none = observation("generic");
+        none.request.input_tokens = Some(7);
+        let summary = summarize_usage(&[none.clone()]).unwrap();
+        assert_eq!(summary.cache_read_input_tokens, None);
+        assert_eq!(summary.cache_creation_input_tokens, None);
+        assert_eq!(summary.cache_read_input_known_observations, 0);
+        assert_eq!(summary.cache_creation_input_known_observations, 0);
+
+        let mut zero = none.clone();
+        zero.request.cache_read_input_tokens = Some(0);
+        let mut read = none.clone();
+        read.request.cache_read_input_tokens = Some(40);
+        read.request.cache_creation_input_tokens = Some(3);
+        let mut other_model = read.clone();
+        other_model.request.model = "other".into();
+        let mut cumulative = read.clone();
+        cumulative.request.cache_read_input_tokens = Some(4_000);
+        cumulative.request.measurement_scope = Some(UsageMeasurementScope::SessionCumulative);
+
+        let summary = summarize_usage(&[none, zero, read, other_model, cumulative]).unwrap();
+        assert_eq!(summary.observations, 4);
+        // Cached input is never folded into the input total.
+        assert_eq!(summary.input_tokens, Some(28));
+        assert_eq!(summary.cache_read_input_tokens, Some(80));
+        assert_eq!(summary.cache_creation_input_tokens, Some(6));
+        assert_eq!(summary.cache_read_input_known_observations, 3);
+        assert_eq!(summary.cache_creation_input_known_observations, 2);
+        let groups = &summary.token_groups;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].model, "other");
+        assert_eq!(groups[0].cache_read_input_tokens, Some(40));
+        assert_eq!(groups[0].cache_read_input_known_observations, 1);
+        assert_eq!(groups[1].cache_read_input_tokens, Some(40));
+        assert_eq!(groups[1].cache_creation_input_tokens, Some(3));
+        assert_eq!(groups[1].cache_read_input_known_observations, 2);
+        assert_eq!(groups[1].cache_creation_input_known_observations, 1);
+    }
+    #[test]
+    fn usage_groups_show_masked_agents_and_merge_the_ones_that_become_equal() {
+        // What a store returns: one group per stored label.
+        let mut named = observation("client-buildhost-0a1b2c3d");
+        named.request.input_tokens = Some(7);
+        named.request.cache_read_input_tokens = Some(40);
+        named.request.cost = Some(ReportedCost {
+            kind: CostKind::ListPriceEstimate,
+            currency: "USD".into(),
+            amount_micros: 5,
+            basis: "rates-v1".into(),
+        });
+        let mut plain = named.clone();
+        plain.request.agent = "client-host-0a1b2c3d".into();
+        plain.request.input_tokens = None;
+        plain.request.output_tokens = Some(11);
+        let mut other = observation("generic");
+        other.request.input_tokens = Some(1);
+        let mut stored = summarize_usage(&[]).unwrap();
+        for report in [&plain, &named, &other] {
+            let one = summarize_usage(std::slice::from_ref(report)).unwrap();
+            stored.token_groups.extend(one.token_groups);
+            stored.cost_groups.extend(one.cost_groups);
+        }
+        // `summarize_usage` masks as it groups; put the stored label back on the host-named group.
+        stored.token_groups[1].agent = "client-buildhost-0a1b2c3d".into();
+        stored.cost_groups[1].agent = "client-buildhost-0a1b2c3d".into();
+        // A store sorts by the stored label, so the host-named group can also come first.
+        let mut host_first = stored.clone();
+        host_first.token_groups.swap(0, 1);
+        host_first.cost_groups.swap(0, 1);
+        host_first.mask_agents();
+
+        stored.mask_agents();
+        assert_eq!(host_first, stored);
+        assert!(
+            !serde_json::to_string(&stored)
+                .unwrap()
+                .contains("buildhost")
+        );
+        // The same groups the reference summary makes from the three reports.
+        let reference = summarize_usage(&[plain, named, other]).unwrap();
+        let by_agent = |mut groups: Vec<TokenGroup>| {
+            groups.sort_by(|a, b| a.agent.cmp(&b.agent));
+            groups
+        };
+        assert_eq!(
+            by_agent(stored.token_groups.clone()),
+            by_agent(reference.token_groups)
+        );
+        assert_eq!(stored.cost_groups, reference.cost_groups);
+        let merged = &stored.token_groups[0];
+        assert_eq!(merged.agent, "client-host-0a1b2c3d");
+        assert_eq!((merged.observations, merged.input_tokens), (2, Some(7)));
+        assert_eq!(merged.output_tokens, Some(11));
+        assert_eq!(merged.cache_read_input_tokens, Some(80));
+        assert_eq!(merged.input_known_observations, 1);
+        assert_eq!(merged.cache_read_input_known_observations, 2);
+        assert_eq!(stored.cost_groups[0].amount_micros, 10);
+    }
+    #[test]
+    fn a_stored_report_is_shown_without_its_identifiers() {
+        let mut stored = observation("client-buildhost-0a1b2c3d");
+        stored.request.observation_id = "private-observation".into();
+        stored.request.session = "private-session".into();
+        stored.request.action_id = Some("private-action".into());
+        stored.request.attempt_id = Some("private-attempt".into());
+        stored.request.provider_request_id = Some("private-request".into());
+        stored.request.provider_event_id = Some("private-event".into());
+        stored.request.cache_read_input_tokens = Some(40);
+        let report = UsageReport::stored(stored.request.clone(), stored.received_at);
+        assert_eq!(report.agent, "client-host-0a1b2c3d");
+        assert_eq!(report.received_at, 101);
+        assert_eq!(report.cache_read_input_tokens, Some(40));
+        assert_eq!(report.input_tokens, None);
+        let json = serde_json::to_value(&report).unwrap();
+        // Unknown counts are present as null, never left out or zero.
+        assert!(json["input_tokens"].is_null() && json["cost"].is_null());
+        let text = json.to_string();
+        assert!(!text.contains("private-") && !text.contains("buildhost"));
+        // The same report keeps one id, and another observation gets another.
+        assert_eq!(report.id, UsageReport::stored(stored.request.clone(), 5).id);
+        stored.request.observation_id = "other".into();
+        assert_ne!(report.id, UsageReport::stored(stored.request, 5).id);
+    }
+    #[test]
+    fn usage_report_pages_are_bounded_and_say_where_the_next_starts() {
+        for (after, limit, valid) in [
+            (0, 1, true),
+            (MAX_OBSERVATIONS, MAX_USAGE_PAGE, true),
+            (0, 0, false),
+            (0, MAX_USAGE_PAGE + 1, false),
+            (MAX_OBSERVATIONS + 1, 1, false),
+        ] {
+            let query = UsageReportQuery { after, limit };
+            assert_eq!(query.validate().is_ok(), valid, "{query:?}");
+        }
+        let query = UsageReportQuery { after: 4, limit: 2 };
+        let report = || UsageReport::stored(observation("generic").request, 1);
+        let work = || "wrk_0123456789abcdef0123456789abcdef".to_owned();
+        // The store reads one row past the page to learn whether more follow.
+        let more = UsageReportPage::of(work(), &query, vec![report(), report(), report()], 9);
+        assert_eq!((more.items.len(), more.next_after), (2, Some(6)));
+        let last = UsageReportPage::of(work(), &query, vec![report(), report()], 9);
+        assert_eq!((last.items.len(), last.next_after), (2, None));
+    }
+    #[test]
     fn absent_usage_metadata_keeps_the_legacy_canonical_shape() {
         let encoded = serde_json::to_value(observation("generic").request).unwrap();
         for field in [
@@ -902,9 +1281,16 @@ mod tests {
         let mut a = observation("generic");
         a.request.input_tokens = Some(MAX_MEASUREMENT);
         a.request.output_tokens = Some(MAX_MEASUREMENT);
+        a.request.cache_read_input_tokens = Some(MAX_MEASUREMENT);
+        a.request.cache_creation_input_tokens = Some(MAX_MEASUREMENT);
         let summary = summarize_usage(&vec![a.clone(); MAX_OBSERVATIONS]).unwrap();
         assert_eq!(summary.input_tokens, Some(500_000_000_000_000));
         assert!(summary.input_tokens.unwrap() < (1i64 << 53));
+        assert_eq!(summary.cache_read_input_tokens, summary.input_tokens);
+        assert_eq!(summary.cache_creation_input_tokens, summary.input_tokens);
+        let mut over = a.clone();
+        over.request.cache_read_input_tokens = Some(MAX_MEASUREMENT + 1);
+        assert!(summarize_usage(&[over]).is_err());
         a.request.input_tokens = Some(MAX_MEASUREMENT + 1);
         assert!(summarize_usage(&[a]).is_err());
     }

@@ -13,7 +13,7 @@ operator. It does not fetch, check out a branch, run an agent or execute a check
 
 ## Open it
 
-Run `agentscm open` in a connected checkout, or choose **Open Hub** in the AgentSCM menu bar app.
+Run `agentscm open` in a connected checkout.
 The browser opens this computer's Hub page on Repository explorer, already connected to every
 checkout connected on this computer, with capture included where change capture is set up for that
 checkout. See [Open the Hub from this computer](connect-this-computer.md).

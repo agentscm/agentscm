@@ -2296,6 +2296,7 @@ mod tests {
             parent_session_id: None,
             capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
             live_capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
+            harness: crate::change_record::AgentHarnessV1::ClaudeCode,
         };
         let actions = claude_code::ActionCaptureConfig {
             source: GitSourceRequest {
@@ -2358,6 +2359,7 @@ mod tests {
                 parent_session_id: None,
                 capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
                 live_capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
+                harness: crate::change_record::AgentHarnessV1::ClaudeCode,
             };
             let actions = claude_code::ActionCaptureConfig {
                 source: source.clone(),

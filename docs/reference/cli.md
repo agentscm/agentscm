@@ -6,7 +6,7 @@ title: "Native CLI reference"
 
 > **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [connected local page](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
 
-`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `client setup`, `client remove`, `client doctor`, `open` and `tray`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
+`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
 
 ## Commands
 
@@ -273,9 +273,9 @@ sessions reported setup it also carries up to 16 `session_setups` (model, effort
 mode per session) and `session_setups_omitted`.
 
 `pending` shows shareable queued envelopes. `deferred` shows sanitized hooks that could not resolve
-current authorized Work and will never be rewritten into an associated action. `observe` and
-`import-claude` are explicit local operations; run their `--help` before supplying source, session
-and operation identities. See [local change capture](../change-capture.md) for privacy, source and
+current authorized Work and will never be rewritten into an associated action. `observe`,
+`import-claude` and `import-codex` are explicit local operations; run their `--help` before
+supplying source, session and operation identities. See [local change capture](../change-capture.md) for privacy, source and
 qualification limits. Real-host and complete integrated qualification remain pending.
 
 ### `attached-worktree` (experimental, Unix)
@@ -391,58 +391,16 @@ agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--tray` (macOS only; open the companion after successful setup), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--no-collisions`.
 
-### Status-bar companion and client status
-
-`agentscm tray` opens the optional macOS status-bar app and returns after its background
-process is ready. A primary click on its icon opens the AgentSCM work overview; right click opens
-the setup and troubleshooting menu. The default **Work** view groups every listed repository's
-local agent connections and recent sightings with current Hub Work and live agent tasks. A
-signed-in computer can also list other repositories it can read on the same Hub, after a fresh
-role check for each. Repositories needing attention come first, and **Needs you** narrows the
-roster to actionable rows. Opening the panel refreshes stale local and Hub reads while keeping
-the last known view visible. Local agents are labelled as connected unless AgentSCM recently
-observed a hook or MCP call; a local sighting does not reveal the agent's task. Hub Work state
-and next actions are reported by agents, not verified execution. Partial and unavailable Hub
-reads stay labelled.
-
-The panel's quick prompt sends one prompt to installed Claude Code or Codex CLI in an explicitly
-selected, still-current connected checkout. The prompt goes to the
-client on standard input; the panel does not save the prompt or read client credentials. Native
-defaults remain the default; the additional modes are Claude Code Plan and Codex read only. A
-client exit is a process fact, not proof that its task completed. The panel separates that local
-process from recent hook/MCP sightings, whose live task state is unknown. Existing checkout
-attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
-tray checks connected checkouts about once a minute with short-lived read-only tokens and
-counts what needs you from the same shared status projection as the Hub's **Needs you** badge:
-your own agents waiting for you; blockers and reassessments on Work your agent leads; handovers
-of Work you own; required checks failing on your open pull requests; `pr-gate` runs blocked at a
-gate after their agent stopped; and agent setup problems. What agents settle between themselves
-is listed but not counted: paused, quiet or merged Work, live tasks whose declared scopes
-overlap, files two agents hold, open pull requests touching held files and requests from one
-agent to another. Another person's blocker is listed but not counted. The Hub badge also leaves out needs hidden in that
-browser, which the tray cannot see. It refreshes the cross-repository list about every two
-minutes. A newly observed need opens a small attention notice, or marks **New attention** when
-the Now card is fully visible; a partial read may reveal an older one later. The summary marks
-incomplete reads; open Hub for full context. The cross-repository list requires a Hub with
-`GET /v1/hub/device/repositories`; older Hubs leave that portion unavailable. **Pin** keeps the same panel on top until
-dismissed or unpinned. **Start at Login** is off by default and can be changed from the menu. This
-alpha has no separate app install or updater; the binary is unsigned and unnotarized.
-
-On Linux, `agentscm tray` provides a terminal companion. It lists connected checkouts and
-reported participation, then optionally asks for a checkout, installed agent, supported mode and
-one-line prompt. A Linux status icon and pinned native window are not yet qualified. Windows
-retains the CLI status fallback:
+### Client status
 
 ```sh
 agentscm client status [--root PATH] [--check] [--json]
 ```
 
 Without `--check`, status reads local configuration only. `--check` performs bounded authenticated
-Hub reads and reports recent participation recorded by the existing native integrations. The tray
-also shows local hook and MCP transport outcomes observed while it is running; these observations
-stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
+Hub reads and reports recent participation recorded by the existing native integrations. Missing or idle activity stays unknown. `--json` emits a versioned
 status contract, including separate onboarding and local-activity binding identifiers.
 
 A saved token is configuration, not proof of coordination. Each connection reports one
@@ -463,27 +421,6 @@ A saved token is configuration, not proof of coordination. Each connection repor
 for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
 Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
 same state and build, and stops with the reason when the Hub does not accept the token.
-
-Each connected checkout has **Agent Integrations** actions for Claude Code, Codex, Cursor,
-Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved
-connection and stable installed binary. **Reapply** repeats setup; it does not certify runtime
-health or accept the native client's trust prompts. A tray started by macOS can have a minimal
-`PATH`, so Claude Code or Codex may be installed but unavailable to the tray. Each agent action has
-a **Copy Terminal Setup** fallback. The copied command is executed only when you paste and
-run it in Terminal; it runs normal `client setup`, which may contact the Hub, request forge sign-in,
-and create or replace a managed coordination token. The native client's own trust prompts still
-apply.
-
-A Git checkout where a client-connection hook ran without a connection is listed under **Not
-connected** while the tray runs (local only, at most eight, forgotten after an hour). **Connect
-with** an agent runs `client setup` for its main checkout against the Hub of the most recent saved
-sign-in, without starting a new sign-in; **Copy Terminal Setup** copies `quickstart` instead.
-
-Setup actions show a progress and result window with the client's next steps; they do not install
-the coding client itself. **Open Hub** uses the exact Hub's saved human sign-in to mint a 30-minute
-read-only token for the selected repository. The token goes to the browser in a URL fragment,
-which the UI removes. An existing browser sign-in is preserved. Missing or expired sign-in,
-changed checkout bindings and failed Hub requests produce a visible error.
 
 ## Shared actionable status
 

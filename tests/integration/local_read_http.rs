@@ -260,6 +260,7 @@ fn explorer_conversation_reads_only_retained_visible_capture_after_authorization
         parent_session_id: None,
         capture_mode: CaptureModeV1::LocalConversation,
         live_capture_mode: CaptureModeV1::LocalConversation,
+        harness: agentscm::change_record::AgentHarnessV1::ClaudeCode,
     };
     let transcript = concat!(
         "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"session_example\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"Review the fixture source\"}}\n",
