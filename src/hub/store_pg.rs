@@ -5675,6 +5675,59 @@ fn release_session_intent(
         .map(Option::unwrap_or_default)
 }
 
+/// After a checkpoint narrowed `item`'s scope from `previous`, frees from each participant
+/// session's intent the paths the Work no longer covers, unless another Work the token is
+/// eligible on does. An intent left with no path is released.
+fn trim_session_intents(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    previous: &[String],
+    now: i64,
+) -> Result<()> {
+    for (token, session) in work_transition::claim_sessions(item) {
+        let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
+            continue;
+        };
+        let keys = tx
+            .query(
+                "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
+                &[&intent],
+            )?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        let elsewhere = other_eligible_scopes(tx, &item.id, &token)?;
+        let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
+        if kept.len() == keys.len() {
+            continue;
+        }
+        if kept.is_empty() {
+            release_in(tx, &token, &intent, now)?;
+            continue;
+        }
+        let paths = display_all(&kept);
+        let expires_at: i64 = tx
+            .query_one(
+                "SELECT expires_at FROM hub_intents WHERE id = $1",
+                &[&intent],
+            )?
+            .get(0);
+        tx.execute(
+            "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
+            &[&intent, &serde_json::json!(paths).to_string(), &now],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
+            &[&intent, &kept],
+        )?;
+        append(
+            tx,
+            &Event::intent_paths_changed(&intent, &paths, expires_at)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Releases the token's live intents that no session holds and that cover part of `scope`.
 /// A plain intent announce has no session, so only the path overlap ties it to the Work.
 fn release_sessionless_intents(
@@ -7731,6 +7784,7 @@ fn checkpoint_overlap_in(
     };
     item.last_checkin_at = now;
     item.next_action = checkpoint.next_action.clone();
+    let previous_scope = item.scope.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
     }
@@ -7815,6 +7869,12 @@ fn checkpoint_overlap_in(
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, &who, delta, now)?;
     work_dependencies::changed(tx, &who, &item, now)?;
+    if held
+        && checkpoint.kind != super::work::CheckpointKind::Finish
+        && item.scope != previous_scope
+    {
+        trim_session_intents(tx, &item, &previous_scope, now)?;
+    }
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
         // records its own size without one, so a finish is never refused for the cleanup.

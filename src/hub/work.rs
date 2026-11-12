@@ -1153,6 +1153,28 @@ pub(super) fn uncovered_scope(declared: &[String], requested: &[String]) -> Vec<
         .collect()
 }
 
+/// The intent keys that survive a scope change: a key stays unless the previous scope covered it
+/// and neither the new scope nor another scope the session is eligible on does. Keys the Work
+/// never covered (advisory holds from before it) are not the checkpoint's to free.
+pub(super) fn keys_kept_after_narrowing(
+    keys: &[String],
+    previous: &[String],
+    current: &[String],
+    elsewhere: &[Vec<String>],
+) -> Vec<String> {
+    let covered = |scope: &[String], key: &String| {
+        uncovered_scope(scope, std::slice::from_ref(key)).is_empty()
+    };
+    keys.iter()
+        .filter(|key| {
+            !covered(previous, key)
+                || covered(current, key)
+                || elsewhere.iter().any(|other| covered(other, key))
+        })
+        .cloned()
+        .collect()
+}
+
 fn label(name: &str, value: &str) -> Result<()> {
     text(name, value, MAX_LABEL_BYTES)
 }

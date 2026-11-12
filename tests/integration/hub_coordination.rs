@@ -1832,6 +1832,10 @@ parity_case!(
     responded_request_does_not_block_checkpoint_once_unheld
 );
 parity_case!(ask_helped_work, ask_reports_reservation_of_helped_work);
+parity_case!(
+    session_hold_outside_declared_scope,
+    narrowing_a_scope_releases_the_session_hold_on_dropped_paths
+);
 
 fn release_work(store: &dyn Store, who: &str, item: &agentscm::hub::work::WorkItem, session: &str) {
     use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
@@ -2087,6 +2091,83 @@ fn ask_reports_reservation_of_helped_work(db: &Db) {
             .unwrap(),
         Asked::NotHeld
     ));
+}
+
+fn narrowing_a_scope_releases_the_session_hold_on_dropped_paths(db: &Db) {
+    use agentscm::hub::handoff::Asked;
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/store.rs", "src/mod.rs", "docs/a.md"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let touch = |who: &str, session: &str, paths: &[&str], at: i64| {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+            deny: false,
+            report: true,
+        };
+        store.touch_session(who, &call, at).unwrap()
+    };
+    touch(&b, "b-session", &["src/store.rs", "src/mod.rs"], now + 1);
+    touch(&a, "a-session", &[], now + 1);
+    let kept = ["docs/a.md", "src/mod.rs"];
+    store
+        .work_checkpoint(
+            &b,
+            &checkpoint(
+                &target.id,
+                "narrow",
+                "b-session",
+                target.updated_seq,
+                CheckpointKind::Progress,
+                Some(&kept),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    // The dropped file is free; the kept one is still held by B's session.
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/store.rs", None, now + 3)
+            .unwrap(),
+        Asked::NotHeld
+    ));
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/mod.rs", None, now + 3)
+            .unwrap(),
+        Asked::Requested { .. } | Asked::Reserved { .. }
+    ));
+    let started = store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Lead,
+                None,
+                &["src/store.rs"],
+            ),
+            now + 4,
+        )
+        .unwrap();
+    assert!(started.item.scope.contains(&"src/store.rs".to_owned()));
 }
 
 fn agent(seed: &str) -> CoordinationAgent {
@@ -2721,10 +2802,12 @@ fn agreed_overlap_admits_and_checks_only_named_files(db: &Db) {
         )
         .unwrap();
     assert!(store.work_overlap_start(&b, &accepted, now + 11).is_err());
+    // Narrowing also freed the first lead's and the helper's holds on the dropped file, so
+    // nothing remains to collide with and the second lead's held edit is no longer contested.
     let invalidated = touch(&b, "second", &["src/a.rs"], true, now + 11).unwrap();
     assert!(
-        !invalidated.denied.is_empty(),
-        "an already held edit must recheck ended consent"
+        invalidated.denied.is_empty(),
+        "a narrowed scope frees the dropped file for the other lead"
     );
 }
 
