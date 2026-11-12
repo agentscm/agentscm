@@ -325,7 +325,9 @@ pub enum WorkActorKind {
 pub enum ActorVia {
     Agent,
     Person,
-    /// The Hub applying a repository's opted-in policy. It has no login and may only release.
+    /// The Hub acting on provider facts for the Work's owner: a repository's opted-in release, or
+    /// the completion of Work whose pull request it observed merge. It has no login and may only
+    /// release or complete.
     Policy,
 }
 
@@ -352,7 +354,7 @@ pub(super) fn decide_transition(
     use WorkActorKind::{Admin, Lead, Owner};
     use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
     let authorized = match kind {
-        _ if via == ActorVia::Policy => kind == Release,
+        _ if via == ActorVia::Policy => matches!(kind, Release | Complete),
         Release | Abandon | Supersede => true,
         Retain | Complete => actor != Admin,
         Reopen => actor != Admin && via == ActorVia::Agent,
@@ -416,6 +418,8 @@ pub enum OutcomeProvenance {
     AgentReport,
     Person,
     Admin,
+    /// The Hub completed the Work after it observed the Work's pull request merge.
+    HubObservedMerge,
     Unknown,
 }
 
@@ -970,9 +974,12 @@ mod tests {
     }
 
     #[test]
-    fn policy_may_only_release() {
+    fn policy_may_only_release_or_complete() {
         for kind in WorkTransitionKind::ALL {
-            let want = if kind == WorkTransitionKind::Release {
+            let want = if matches!(
+                kind,
+                WorkTransitionKind::Release | WorkTransitionKind::Complete
+            ) {
                 Ok(())
             } else {
                 Err(Refusal::NotAuthorized)
@@ -1075,6 +1082,10 @@ mod tests {
         assert_eq!(json(&WorkTransitionKind::Supersede), "\"supersede\"");
         assert_eq!(json(&WorkActorKind::Admin), "\"admin\"");
         assert_eq!(json(&OutcomeProvenance::AgentReport), "\"agent_report\"");
+        assert_eq!(
+            json(&OutcomeProvenance::HubObservedMerge),
+            "\"hub_observed_merge\""
+        );
         assert_eq!(json(&OutcomeValue::Unstated), "\"unstated\"");
         assert!(serde_json::from_str::<ReservationBasis>("\"legacy_implicit\"").is_err());
         assert!(serde_json::from_str::<TerminalOutcome>("\"finished\"").is_err());
