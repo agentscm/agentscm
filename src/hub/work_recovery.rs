@@ -395,6 +395,8 @@ pub struct BatchTransitionItem {
     pub reason: String,
     #[serde(default)]
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub participants: Vec<super::work_transition::ParticipantRef>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1308,6 +1310,7 @@ pub fn apply_batch(
             transition: entry.transition,
             reason: entry.reason.clone(),
             superseded_by: entry.superseded_by.clone(),
+            participants: entry.participants.clone(),
         };
         let item = match store.work_transition(actor, &request, now) {
             Ok(result) => {

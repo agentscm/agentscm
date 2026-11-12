@@ -1729,6 +1729,7 @@ mod tests {
                         transition,
                         reason: "Synthetic disposition".into(),
                         superseded_by: None,
+                        participants: Vec::new(),
                     },
                     now,
                 )

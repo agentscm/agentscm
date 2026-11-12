@@ -554,6 +554,7 @@ pub fn release_settled(
                     "Released by repository policy: pull request #{pull} merged and closed #{issue} as completed."
                 ),
                 superseded_by: None,
+                participants: Vec::new(),
             };
             let actor = WorkTransitionActor::Policy {
                 owner: &owner,

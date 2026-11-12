@@ -362,6 +362,7 @@ impl Slack {
             transition,
             reason: reason.to_owned(),
             superseded_by: None,
+            participants: Vec::new(),
         };
         let actor = WorkTransitionActor::Person {
             user: &who.owner,

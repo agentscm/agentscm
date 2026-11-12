@@ -11785,18 +11785,21 @@ impl Store for PgStore {
                 lead_session: item.lead_session.clone(),
             };
             let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
-            let columns = work_transition::apply(&mut item, request, &acting, now)?;
+            let columns = work_transition::apply(&mut item, request, &acting, &prior, now)?;
             let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
             let seq = append(&mut tx, &event)?;
             item.updated_seq = seq;
             let snapshot = save_work_version(&mut tx, &item, seq)?;
-            set_work_reservation(
-                &mut tx,
-                &item.id,
-                columns.outcome.map(work_transition::TerminalOutcome::column),
-                columns.basis.map(work_transition::ReservationBasis::column),
-                now,
-            )?;
+            // A prune changes neither the outcome nor the reservation, so its lease is not reset.
+            if request.transition != work_transition::WorkTransitionKind::PruneParticipants {
+                set_work_reservation(
+                    &mut tx,
+                    &item.id,
+                    columns.outcome.map(work_transition::TerminalOutcome::column),
+                    columns.basis.map(work_transition::ReservationBasis::column),
+                    now,
+                )?;
+            }
             let reclaimed = lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
             if request.superseded_by.is_some() {
                 replace_relations(
@@ -11806,6 +11809,17 @@ impl Store for PgStore {
                     &item.depends_on,
                     &item.related_work,
                 )?;
+            }
+            for removed in &columns.removed {
+                tx.execute(
+                    "DELETE FROM hub_work_participants WHERE work = $1 AND token = $2 AND session = $3",
+                    &[&item.id, &removed.token, &removed.session],
+                )?;
+                // The intent a pruned session holds for this Work goes with it, unless the
+                // session is still eligible on other Work.
+                if !session_eligible_elsewhere(&mut tx, &item.id, &removed.token, &removed.session)? {
+                    release_session_intent(&mut tx, &removed.token, &removed.session, now)?;
+                }
             }
             if request.transition == work_transition::WorkTransitionKind::Reopen {
                 tx.execute(

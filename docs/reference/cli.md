@@ -125,7 +125,9 @@ paths for the next lead and frees the rest). `agentscm work transitions` applies
 `{"session": …, "items": [...]}` batch of up to 25 transitions in order, each in its own transaction,
 and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (with a `code` and a
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
-items stay applied, and sending the same batch again is safe.
+items stay applied, and sending the same batch again is safe. A batch item may also be a
+`prune_participants` transition with `participants` (`token` and `session`), for the Work's owner or
+a Hub administrator; it removes those non-lead participants so a full Work can be resumed or reopened.
 
 ### `why`
 

@@ -110,6 +110,18 @@ pub struct WorkTransitionRequest {
     /// The Work that replaces this one; required for `supersede` and refused otherwise.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// The non-lead participants to remove; required for `prune_participants` and refused
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ParticipantRef>,
+}
+
+/// One participant of a Work, named the way the Work lists it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipantRef {
+    pub token: String,
+    pub session: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -153,6 +165,34 @@ impl WorkTransitionRequest {
             }
             (_, Some(_)) => {
                 return Err(invalid("superseded_by is only valid for supersede"));
+            }
+            _ => {}
+        }
+        match (self.transition, self.participants.is_empty()) {
+            (WorkTransitionKind::PruneParticipants, true) => {
+                return Err(invalid("prune_participants requires participants"));
+            }
+            (WorkTransitionKind::PruneParticipants, false) => {
+                if self.participants.len() > MAX_PARTICIPANTS {
+                    return Err(invalid("more than 100 participants"));
+                }
+                for participant in &self.participants {
+                    text("token", &participant.token, MAX_LABEL_BYTES)?;
+                    text("session", &participant.session, MAX_LABEL_BYTES)?;
+                }
+                let mut seen: Vec<_> = self
+                    .participants
+                    .iter()
+                    .map(|p| (&p.token, &p.session))
+                    .collect();
+                seen.sort();
+                seen.dedup();
+                if seen.len() != self.participants.len() {
+                    return Err(invalid("participants must not repeat"));
+                }
+            }
+            (_, false) => {
+                return Err(invalid("participants is only valid for prune_participants"));
             }
             _ => {}
         }
@@ -350,6 +390,8 @@ impl Prior {
 pub(super) struct Columns {
     pub outcome: Option<TerminalOutcome>,
     pub basis: Option<ReservationBasis>,
+    /// The participants a prune removed; empty for every other transition.
+    pub removed: Vec<WorkParticipant>,
 }
 
 /// Changes the item in memory. `current` and `blocker` are never touched. Reopen makes the
@@ -358,9 +400,12 @@ pub(super) fn apply(
     item: &mut WorkItem,
     request: &WorkTransitionRequest,
     acting: &Acting,
+    prior: &Prior,
     now: i64,
 ) -> Result<Columns> {
-    use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
+    use WorkTransitionKind::{
+        Abandon, Complete, PruneParticipants, Release, Reopen, Retain, Supersede,
+    };
     let lead = acting.kind == WorkActorKind::Lead;
     item.updated_at = now;
     Ok(match request.transition {
@@ -372,12 +417,46 @@ pub(super) fn apply(
             Columns {
                 outcome: None,
                 basis: None,
+                removed: Vec::new(),
             }
         }
         Retain => Columns {
             outcome: None,
             basis: Some(ReservationBasis::Retained),
+            removed: Vec::new(),
         },
+        PruneParticipants => {
+            let listed = |participant: &WorkParticipant| {
+                request
+                    .participants
+                    .iter()
+                    .any(|p| p.token == participant.token && p.session == participant.session)
+            };
+            let removable = request.participants.iter().all(|wanted| {
+                item.participants.iter().any(|participant| {
+                    participant.token == wanted.token
+                        && participant.session == wanted.session
+                        && participant.role != WorkRole::Lead
+                        && !(participant.token == item.lead_token
+                            && participant.session == item.lead_session)
+                })
+            });
+            if !removable {
+                return Err(invalid(
+                    "every listed participant must be a current non-lead participant",
+                ));
+            }
+            let (removed, kept) = std::mem::take(&mut item.participants)
+                .into_iter()
+                .partition(listed);
+            item.participants = kept;
+            // The reservation and outcome stay as stored.
+            Columns {
+                outcome: prior.outcome,
+                basis: prior.basis,
+                removed,
+            }
+        }
         Complete | Abandon | Supersede => {
             if let Some(by) = &request.superseded_by
                 && !item.depends_on.contains(by)
@@ -399,6 +478,7 @@ pub(super) fn apply(
                     _ => TerminalOutcome::Superseded,
                 }),
                 basis: None,
+                removed: Vec::new(),
             }
         }
         Reopen => {
@@ -443,6 +523,7 @@ pub(super) fn apply(
             Columns {
                 outcome: None,
                 basis: Some(ReservationBasis::Admitted),
+                removed: Vec::new(),
             }
         }
     })
@@ -459,6 +540,12 @@ pub(super) fn event(
 ) -> Result<Event> {
     let lead_acted_on = (acting.kind != WorkActorKind::Lead)
         .then(|| json!({"agent": prior.lead_agent, "session": prior.lead_session}));
+    // Removed participants are named by owner, agent and session, never by token.
+    let removed: Vec<serde_json::Value> = columns
+        .removed
+        .iter()
+        .map(|p| json!({"owner": p.owner, "agent": p.agent, "session": p.session}))
+        .collect();
     let mut event = Event::new(
         "work_transition",
         &item.id,
@@ -476,6 +563,7 @@ pub(super) fn event(
             "outcome": columns.outcome,
             "basis": columns.basis,
             "superseded_by": request.superseded_by,
+            "removed_participants": (!removed.is_empty()).then_some(removed),
             "lead": lead_acted_on,
             "generation": item.generation, "owner": item.owner,
             "repository": item.repository, "state": item.state,

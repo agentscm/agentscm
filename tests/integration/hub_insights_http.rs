@@ -377,6 +377,7 @@ async fn stale_finished_checkpoint_replays_do_not_report_completion() {
                 transition: WorkTransitionKind::Reopen,
                 reason: "continue after review".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             unix_now(),
         )
