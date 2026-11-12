@@ -1414,6 +1414,71 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
     assert!(expiry(&hub) >= before + LEASE_SECONDS);
 }
 
+/// A subagent's tool calls carry its parent's session and renew the parent's lease as the
+/// parent's own calls do, whatever the tool (#542 item 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subagents_tool_calls_renew_its_parent_sessions_lease() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let started = unix_now() - 600;
+    let item = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("delegating".into()),
+                title: "delegating".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            started,
+        )
+        .unwrap()
+        .item;
+    let expiry = |hub: &Hub| {
+        hub.store
+            .work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::One(&item.id),
+                unix_now(),
+            )
+            .unwrap()
+            .work[0]
+            .activity
+            .lease_expires_at
+            .unwrap()
+    };
+    assert_eq!(expiry(&hub), started + LEASE_SECONDS);
+    let before = unix_now();
+    let read = json!({"hook_event_name":"PostToolUse", "session_id":session,
+        "agent_id":"sub-1", "agent_type":"general-purpose",
+        "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+        "cwd":"/work/acme-widgets"});
+    assert_eq!(hub.hook("claude", &lead, &read), json!({}));
+    assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}
+
 /// A shell call's end reports what the hook client observed. Files it changed are applied, so
 /// a session with no Work is told to declare it every time, never that anything was refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1639,6 +1704,128 @@ async fn observed_shell_changes_on_lapsed_work_are_reported_as_applied() {
     }
     assert!(
         !answer.to_string().contains("permissionDecision"),
+        "{answer}"
+    );
+}
+
+/// Starts or resumes Work for `session` at `at`, as `agentscm_start` does.
+fn start_work(
+    hub: &Hub,
+    token: &str,
+    session: &str,
+    scope: &[&str],
+    resume: Option<(&str, i64)>,
+    at: i64,
+) -> agentscm::hub::work::WorkItem {
+    hub.store
+        .work_start(
+            token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: resume.map(|(id, _)| id.to_owned()),
+                source: None,
+                request_key: resume.is_none().then(|| "scoped".into()),
+                title: "scoped".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: scope.iter().map(|path| (*path).to_owned()).collect(),
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: resume.map(|(_, generation)| generation),
+                preflight: None,
+            },
+            at,
+        )
+        .unwrap()
+        .item
+}
+
+fn edit_of(tool: &str, session: &str, file: &str) -> Value {
+    let mut payload = fixture("claude-PreToolUse-Edit");
+    payload["tool_name"] = json!(tool);
+    payload["session_id"] = json!(session);
+    payload["tool_input"]["file_path"] = json!(format!("/work/acme-widgets/{file}"));
+    payload
+}
+
+/// #542 items 5 and 13: during a live hold an edit outside the declared scope is refused
+/// whether it is a `Write` or an `Edit` and whether the file exists, since the Hub sees only
+/// the path. A directory entry (`docs/**`) covers every file under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_refusals_follow_the_declared_scope_not_the_tool_or_file() {
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs", "docs/**"],
+        None,
+        unix_now(),
+    );
+    for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
+        let answer = hub.hook_raw("claude", &lead, &edit_of(tool, session, file));
+        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+        assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
+        assert!(
+            reason.contains("outside the declared scope"),
+            "{tool} {file}: {answer}"
+        );
+    }
+    for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
+        hub.hook("claude", &lead, &edit_of(tool, session, file));
+    }
+}
+
+/// #542 item 10: after a lapsed hold is resumed, an out-of-scope refusal quotes the resumed
+/// generation and its current fence, not the lapsed ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let lapsed = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let resumed = start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs"],
+        Some((&lapsed.id, lapsed.generation)),
+        unix_now(),
+    );
+    assert!(resumed.generation > lapsed.generation);
+    let answer = hub.hook_raw("claude", &lead, &edit_of("Edit", session, "src/lib.rs"));
+    let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+    assert!(
+        reason.contains(&format!(
+            "generation {}, expected_updated_seq {}",
+            resumed.generation, resumed.updated_seq
+        )),
         "{answer}"
     );
 }
