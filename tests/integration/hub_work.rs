@@ -583,6 +583,18 @@ fn work_event_count(store: &dyn Store, kind: &str) -> usize {
         .count()
 }
 
+fn assert_input_field<T>(result: Result<T, HubError>, field: &str) {
+    match result {
+        Err(HubError::Input(problems)) => {
+            assert_eq!(
+                problems.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                [field]
+            );
+        }
+        _ => panic!("expected input problem naming {field:?}"),
+    }
+}
+
 fn assert_invalid<T>(result: Result<T, HubError>, message: &str) {
     match result {
         Err(HubError::Invalid(actual)) => assert_eq!(actual, message),
@@ -1643,7 +1655,7 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
         .work_start(&lead.token, &retry_start, now + 40)
         .unwrap()
         .item;
-    assert_invalid(
+    assert_input_field(
         store.work_checkpoint(
             &lead.token,
             &checkpoint(
@@ -1656,7 +1668,7 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
             ),
             now + 40,
         ),
-        "expected_updated_seq is required for a new checkpoint",
+        "expected_updated_seq",
     );
     let mut pause = checkpoint(
         &started.id,
