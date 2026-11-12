@@ -1943,7 +1943,16 @@ mod tests {
             if command == "lookup" {
                 arguments.push("not-retained");
             }
-            let cli = Cli::try_parse_from(arguments).unwrap();
+            // Debug builds of the derived parser need more than a test thread's stack, as in
+            // `parse_cli_on_bounded_stack`.
+            let cli = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(4 * 1024 * 1024)
+                    .spawn_scoped(scope, || Cli::try_parse_from(arguments).unwrap())
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
             assert!(run(cli).await.is_err());
             assert!(
                 !data.exists(),
