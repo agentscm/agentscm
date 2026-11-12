@@ -1823,6 +1823,272 @@ parity_case!(
     default_work_session_is_durably_aliased_to_the_first_hook
 );
 
+parity_case!(
+    refused_helper_start,
+    refused_helper_start_leaves_no_participant
+);
+parity_case!(
+    responded_request_unheld,
+    responded_request_does_not_block_checkpoint_once_unheld
+);
+parity_case!(ask_helped_work, ask_reports_reservation_of_helped_work);
+
+fn release_work(store: &dyn Store, who: &str, item: &agentscm::hub::work::WorkItem, session: &str) {
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    let release: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+        "work_id": item.id, "operation_id": "release-op", "generation": item.generation,
+        "expected_updated_seq": item.updated_seq, "session": session,
+        "transition": "release", "reason": "synthetic release"
+    }))
+    .unwrap();
+    store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: who },
+            &release,
+            unix_now() + 50,
+        )
+        .unwrap();
+}
+
+fn scope_item(
+    store: &dyn Store,
+    who: &str,
+    session: &str,
+) -> Option<agentscm::hub::work::WorkItem> {
+    store
+        .work_scope_check(who, session, &["src/a.rs".into()], unix_now() + 60)
+        .unwrap()
+        .item
+}
+
+fn refused_helper_start_leaves_no_participant(db: &Db) {
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let c = token(&*store, 3, "charlie");
+    let d = token(&*store, 4, "delta");
+    let now = unix_now();
+    let lead = |name: &str| start_scope(name, name, WorkRole::Lead, None, &["src/a.rs"]);
+    let target = store.work_start(&b, &lead("b-session"), now).unwrap().item;
+    let helper = |session: &str, scope: &[&str]| {
+        start_scope("helper", session, WorkRole::Helper, Some(&target.id), scope)
+    };
+
+    // A path outside the Work's scope is refused and nothing is written.
+    let refusal = store
+        .work_start(&a, &helper("a-session", &["src/a.rs", "src/b.rs"]), now + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("Nothing was joined"), "{refusal}");
+    assert!(refusal.contains("src/b.rs"), "{refusal}");
+    assert!(
+        refusal.contains("agentscm_work_overlap_consent"),
+        "{refusal}"
+    );
+    assert!(scope_item(&*store, &a, "a-session").is_none());
+    let unchanged = scope_item(&*store, &b, "b-session").unwrap();
+    assert_eq!(unchanged.participants.len(), 1);
+    assert_eq!(unchanged.updated_seq, target.updated_seq);
+
+    // A session already eligible on another Work is refused, naming that Work.
+    let own = store
+        .work_start(
+            &a,
+            &start_scope("own", "a-session", WorkRole::Lead, None, &["docs/own.md"]),
+            now + 2,
+        )
+        .unwrap()
+        .item;
+    let refusal = store
+        .work_start(&a, &helper("a-session", &["src/a.rs"]), now + 3)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains(&own.id), "{refusal}");
+    assert!(refusal.contains("one Work at a time"), "{refusal}");
+    assert_eq!(
+        scope_item(&*store, &b, "b-session")
+            .unwrap()
+            .participants
+            .len(),
+        1
+    );
+
+    // An empty-path join and a covered join from a fresh session still work.
+    let empty = store
+        .work_start(&a, &helper("a-session", &[]), now + 4)
+        .unwrap();
+    assert!(empty.joined);
+    let covered = store
+        .work_start(&c, &helper("c-session", &["src/a.rs"]), now + 5)
+        .unwrap();
+    assert!(covered.joined);
+
+    // A Work that is no longer active refuses a join with paths.
+    let item = scope_item(&*store, &b, "b-session").unwrap();
+    release_work(&*store, &b, &item, "b-session");
+    let refusal = store
+        .work_start(&d, &helper("d-session", &["src/a.rs"]), now + 6)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("Nothing was joined"), "{refusal}");
+    assert!(refusal.contains("Resume or take over"), "{refusal}");
+}
+
+fn responded_request_does_not_block_checkpoint_once_unheld(db: &Db) {
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/a.rs"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let own = store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Lead,
+                None,
+                &["docs/own.md"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let desired = ["docs/own.md", "src/a.rs"];
+    let request = match store
+        .work_checkpoint(
+            &a,
+            &checkpoint(
+                &own.id,
+                "propose",
+                "a-session",
+                own.updated_seq,
+                CheckpointKind::Progress,
+                Some(&desired),
+            ),
+            now + 1,
+        )
+        .unwrap_err()
+    {
+        HubError::WorkCoordinationRequired { request, .. } => *request,
+        e => panic!("{e:?}"),
+    };
+    let responded = store
+        .coordination_reply(
+            &b,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "decline".into(),
+                target_work_id: target.id.clone(),
+                session: "b-session".into(),
+                expected_updated_seq: request.updated_seq,
+                kind: CoordinationResponseKind::Decline,
+                note: None,
+                via: agentscm::hub::handoff::Via::Agent,
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(responded.responses.len(), 1);
+    let target_now = scope_item(&*store, &b, "b-session").unwrap();
+    release_work(&*store, &b, &target_now, "b-session");
+    let own_now = store
+        .work_scope_check(&a, "a-session", &["docs/own.md".into()], now + 60)
+        .unwrap()
+        .item
+        .unwrap();
+    let moved = store
+        .work_checkpoint(
+            &a,
+            &checkpoint(
+                &own.id,
+                "expand",
+                "a-session",
+                own_now.updated_seq,
+                CheckpointKind::Progress,
+                Some(&desired),
+            ),
+            now + 61,
+        )
+        .unwrap();
+    assert!(moved.item.scope.contains(&"src/a.rs".to_owned()));
+}
+
+fn ask_reports_reservation_of_helped_work(db: &Db) {
+    use agentscm::hub::handoff::Asked;
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/a.rs"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Helper,
+                Some(&target.id),
+                &["src/a.rs"],
+            ),
+            now + 1,
+        )
+        .unwrap();
+    for (who, session) in [(&a, "a-session"), (&b, "b-session")] {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: Vec::new(),
+            deny: false,
+            report: true,
+        };
+        store.touch_session(who, &call, now + 2).unwrap();
+    }
+    match store
+        .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 3)
+        .unwrap()
+    {
+        Asked::Reserved { work_id, lead } => {
+            assert_eq!(work_id, target.id);
+            assert_eq!(lead.session, "b-session");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        store
+            .ask_handoff(&b, Some("b-session"), "src/a.rs", None, now + 4)
+            .unwrap(),
+        Asked::NotHeld
+    ));
+}
+
 fn agent(seed: &str) -> CoordinationAgent {
     CoordinationAgent {
         token: format!("tok_{seed:0<32}"),

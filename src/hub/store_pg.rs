@@ -48,8 +48,8 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
-    response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, helper_join_editable, join_uncovered, parse_response_kind,
+    parse_status, response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -4344,6 +4344,24 @@ fn start_overlap_in(
                     "work has the maximum of 100 participants".into(),
                 ));
             }
+            if !scope.is_empty() {
+                let elsewhere = tx
+                    .query_opt(
+                        "SELECT w.id FROM hub_work_items w
+                         JOIN hub_work_items t ON t.id = $1
+                         JOIN hub_work_participants p ON p.work = w.id
+                         WHERE w.id <> t.id AND w.provider = t.provider AND w.host = t.host
+                           AND w.repository = t.repository
+                           AND w.repository_id IS NOT DISTINCT FROM t.repository_id
+                           AND w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                           AND p.token = $2 AND p.session = $3 AND p.generation = w.generation
+                         ORDER BY w.id LIMIT 1",
+                        &[&item.id, &who.token, &start.session],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                let holds = work_holds_reservation(tx, &item.id)?;
+                helper_join_editable(&item, holds, elsewhere.as_deref(), &scope)?;
+            }
             item.participants.push(WorkParticipant {
                 owner: who.owner.id.clone(),
                 login: who.owner.login.clone(),
@@ -6661,12 +6679,7 @@ fn unheld(
     let overlaps = work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)?;
     Ok(overlaps
         .into_iter()
-        .find(|o| {
-            !o.item
-                .participants
-                .iter()
-                .any(|p| p.token == token && p.session == name)
-        })
+        .find(|o| !(o.item.lead_token == token && o.item.lead_session == name))
         .map_or(Asked::NotHeld, |o| Asked::Reserved {
             lead: coordination_lead(&o.item),
             work_id: o.item.id,
