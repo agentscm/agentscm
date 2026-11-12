@@ -636,6 +636,11 @@ async fn authenticate(
     let principal = blocking(state, move || store.authenticate(&digest, unix_now()))
         .await
         .map_err(reason)?
+        .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
+    // The embedder's grant applies here as on every other token route.
+    let principal = super::access::token(state, principal)
+        .await
+        .map_err(reason)?
         .filter(|principal| !principal.read_only) // a read-only token is as good as an unknown one
         .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
     if repo.is_some_and(|repo| repo != principal.repository) {

@@ -250,8 +250,13 @@ pub async fn compact_work_history(
     for scope in scopes {
         let (store, hub) = (state.store.clone(), state.clone());
         let compact = move || {
-            let before = now - hub.work_history_seconds(&scope)?;
-            store.work_compact(&scope, before, true, now)
+            // An embedder that cannot say how long one repository keeps its history skips only
+            // that repository this pass.
+            let kept = hub.work_history_seconds(&scope).map_err(|error| {
+                error_envelope::log_internal(&error);
+                HubError::Invalid("history length unknown".into())
+            })?;
+            store.work_compact(&scope, now - kept, true, now)
         };
         match blocking_when_free(state, compact).await {
             Ok(result) => applied.push(result),

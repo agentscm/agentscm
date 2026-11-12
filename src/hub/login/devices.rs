@@ -556,7 +556,8 @@ async fn mint_level(
     repository: &str,
     via: &'static str,
 ) -> ApiResult<(ConnectedRepository, Level)> {
-    allow_listed(state, owner, via).await?;
+    let decision = access::decide(state, owner).await?;
+    admitted(state, owner, &decision, via).await?;
     let identity = &owner.identity;
     let (store, host, named) = (
         state.store.clone(),
@@ -574,7 +575,7 @@ async fn mint_level(
             None => refused_about("not_connected", repository, forge),
         });
     };
-    let level = match repository_access(state, owner, &repo).await {
+    let level = match repository_level(state, owner, &repo, &decision).await {
         Ok(level) => level,
         Err(Denial::Role(role)) => {
             record_refusal(state, owner, "insufficient_role", via).await;
@@ -601,11 +602,22 @@ pub(super) async fn allow_listed(
     owner: &User,
     via: &'static str,
 ) -> ApiResult<()> {
+    let decision = access::decide(state, owner).await?;
+    admitted(state, owner, &decision, via).await
+}
+
+/// [`allow_listed`] with the embedder's answer already read.
+async fn admitted(
+    state: &HubState,
+    owner: &User,
+    decision: &Decision,
+    via: &'static str,
+) -> ApiResult<()> {
     let (identity, login) = (&owner.identity, &state.login);
     if login.is_admin(&identity.provider, identity.user_id, &owner.login) {
         return Ok(());
     }
-    let allowed = match access::decide(state, owner).await? {
+    let allowed = match decision {
         Decision::HubRules => {
             !login.has_allow_list()
                 || login.is_allowed(&identity.provider, identity.user_id, &owner.login)
@@ -672,17 +684,30 @@ const LIST_DEADLINE: Duration = Duration::from_secs(10);
 /// Live intents and sessions read per repository for its counts.
 const LIST_LIVE_LIMIT: usize = 500;
 
-/// The connected repositories one of `owner`'s lists checks, at most
-/// [`super::MAX_SIGN_IN_PROBES`]; whether that is all of them; and the Hub ids of those they may
-/// only read. Without an embedder that is every one on their Git host, none read-only; with one,
-/// the ones it grants there.
-async fn list_candidates(
+/// What one of a person's repository lists shows.
+struct Listed {
+    /// The connected repositories on their Git host they can read now, at most
+    /// [`super::MAX_SIGN_IN_PROBES`].
+    repositories: Vec<ConnectedRepository>,
+    /// How many the forge could not answer for in time.
+    unchecked: usize,
+    /// False when there were more than could be checked.
+    complete: bool,
+    /// Hub ids of those they may only read.
+    read_only: HashSet<String>,
+}
+
+/// [`Listed`] for `owner`: every repository on their Git host that passes [`readable`], or,
+/// with an embedder, the ones it grants there.
+async fn listed(
     state: &HubState,
     owner: &User,
-) -> ApiResult<(Vec<ConnectedRepository>, bool, HashSet<String>)> {
+    decision: &Decision,
+    use_role_cache: bool,
+) -> ApiResult<Listed> {
     let host = owner.identity.host.clone();
     let mut read_only = HashSet::new();
-    let mut candidates = match access::decide(state, owner).await? {
+    let mut candidates = match decision {
         Decision::HubRules => {
             let store = state.store.clone();
             blocking(state, move || {
@@ -692,19 +717,28 @@ async fn list_candidates(
         }
         Decision::Refused => Vec::new(),
         Decision::Granted(grants) => grants
-            .into_iter()
+            .iter()
             .filter(|grant| grant.repository.host == host)
             .map(|grant| {
                 if grant.level == Level::Read {
                     read_only.insert(grant.repository.id.clone());
                 }
-                grant.repository
+                grant.repository.clone()
             })
             .collect(),
     };
     let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
-    Ok((candidates, complete, read_only))
+    let (repositories, unchecked) = match decision {
+        Decision::HubRules => readable(state, owner, candidates, use_role_cache).await,
+        Decision::Refused | Decision::Granted(_) => (candidates, 0),
+    };
+    Ok(Listed {
+        repositories,
+        unchecked,
+        complete,
+        read_only,
+    })
 }
 
 /// The connected repositories on the person's forge host that they can read now, with a few
@@ -725,9 +759,14 @@ async fn session_value_metrics(
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     query.window(unix_now()).map_err(ApiError::from)?;
     let owner = human.user;
-    let (candidates, repositories_complete, _) = list_candidates(&state, &owner).await?;
+    let decision = access::decide(&state, &owner).await?;
     // A fresh role check applies to every aggregate and every detail page.
-    let (mut readable, unchecked) = readable(&state, &owner, candidates, false).await;
+    let Listed {
+        repositories: mut readable,
+        unchecked,
+        complete: repositories_complete,
+        ..
+    } = listed(&state, &owner, &decision, false).await?;
     if let Some(name) = &query.repository {
         readable.retain(|r| &r.full_name == name);
         if readable.is_empty() {
@@ -784,18 +823,19 @@ async fn repositories_for_owner(
     owner: User,
     include_work: bool,
 ) -> ApiResult<Json<Value>> {
-    allow_listed(
-        &state,
-        &owner,
-        if include_work {
-            "device_repositories"
-        } else {
-            "session_repositories"
-        },
-    )
-    .await?;
-    let (candidates, complete, read_only) = list_candidates(&state, &owner).await?;
-    let (readable, unchecked) = readable(&state, &owner, candidates, !include_work).await;
+    let decision = access::decide(&state, &owner).await?;
+    let via = if include_work {
+        "device_repositories"
+    } else {
+        "session_repositories"
+    };
+    admitted(&state, &owner, &decision, via).await?;
+    let Listed {
+        repositories: readable,
+        unchecked,
+        complete,
+        read_only,
+    } = listed(&state, &owner, &decision, !include_work).await?;
     let store = state.store.clone();
     let setup = state.onboarding.clone();
     let mut rows = blocking(&state, move || {
@@ -1043,9 +1083,14 @@ pub(in crate::hub) async fn agent_repositories(
         return Ok(value.clone());
     }
     let owner = principal.owner.clone();
-    allow_listed(state, &owner, "agent_repositories").await?;
-    let (candidates, all_candidates, _) = list_candidates(state, &owner).await?;
-    let (mut readable, unchecked) = readable(state, &owner, candidates, false).await;
+    let decision = access::decide(state, &owner).await?;
+    admitted(state, &owner, &decision, "agent_repositories").await?;
+    let Listed {
+        repositories: mut readable,
+        unchecked,
+        complete: all_candidates,
+        ..
+    } = listed(state, &owner, &decision, false).await?;
     readable.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     let store = state.store.clone();
     let (rows, work_complete) = blocking(state, move || {
@@ -1342,16 +1387,25 @@ pub(in crate::hub) async fn repository_access(
     owner: &User,
     repo: &ConnectedRepository,
 ) -> std::result::Result<Level, Denial> {
-    let kind = Denial::Kind;
     match access::decide(state, owner).await {
-        Ok(Decision::HubRules) => {}
+        Ok(decision) => repository_level(state, owner, repo, &decision).await,
+        Err(_) => Err(Denial::Kind("permission_unavailable")),
+    }
+}
+
+/// [`repository_access`] with the embedder's answer already read.
+async fn repository_level(
+    state: &HubState,
+    owner: &User,
+    repo: &ConnectedRepository,
+    decision: &Decision,
+) -> std::result::Result<Level, Denial> {
+    let kind = Denial::Kind;
+    if !matches!(decision, Decision::HubRules) {
         // Not granted reads as no role at all on the repository.
-        Ok(decision) => {
-            return decision
-                .level(&repo.id)
-                .ok_or(Denial::Role(("private", "none", "read")));
-        }
-        Err(_) => return Err(kind("permission_unavailable")),
+        return decision
+            .level(&repo.id)
+            .ok_or(Denial::Role(("private", "none", "read")));
     }
     let store = state.store.clone();
     let id = repo.connection.clone();

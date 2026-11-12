@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use super::access::{self, Decision, Level};
+use super::access;
 use super::error_envelope::{self, ErrorCode, ErrorEnvelope, InputProblem};
 use super::login::{Login, LoginConfig};
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
@@ -501,7 +501,7 @@ impl FromRequestParts<HubState> for Reader {
         let digest = agent_token_digest(raw)?;
         let web_digest = web_read_token_digest(raw)?;
         let store = state.store.clone();
-        let mut principal = blocking(state, move || {
+        let principal = blocking(state, move || {
             let now = unix_now();
             match store.authenticate(&digest, now)? {
                 Some(principal) => Ok(Some(principal)),
@@ -511,17 +511,10 @@ impl FromRequestParts<HubState> for Reader {
         .await?
         .ok_or_else(ApiError::unauthorized)?;
         // A token keeps the repository it was minted for; the embedder must still grant it now.
-        match access::decide(state, &principal.owner).await? {
-            Decision::HubRules => {}
-            Decision::Refused => return Err(access::not_granted()),
-            Decision::Granted(grants) => {
-                let level =
-                    access::token_level(&grants, &principal.repository, principal.repository_id)
-                        .ok_or_else(access::not_granted)?;
-                principal.read_only |= level == Level::Read;
-            }
-        }
-        Ok(Self(principal))
+        access::token(state, principal)
+            .await?
+            .map(Self)
+            .ok_or_else(access::not_granted)
     }
 }
 

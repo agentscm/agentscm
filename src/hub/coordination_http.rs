@@ -310,7 +310,7 @@ pub(super) fn owns_agent(
         return Ok(true);
     };
     Ok(access.grants(owner)?.is_some_and(|grants| {
-        super::access::token_level(&grants, &t.repository, t.repository_id)
+        super::access::token_level(&grants, &owner.identity.host, t.repository_id)
             >= Some(super::access::Level::Contribute)
     }))
 }
