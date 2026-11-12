@@ -38,7 +38,7 @@ AgentSCM exists to coordinate coding agents, so agent-written pull requests are 
 - A named person is the author of record. They have read the whole diff, can explain it, and have run the checks. Unread bulk or autonomous sweeps are closed without review.
 - Disclose assistance in the pull request template: none, assisted, or agent-authored, which tool, and what you verified yourself.
 - You may add an `Assisted-by: <tool or model>` trailer to commits. Do not use `Co-authored-by` for tools; it is for people.
-- Agents merge only under the interim rule in [AGENTS.md](AGENTS.md#rules): their own owner's non-draft PR, when GitHub reports it clean, with no `--admin` or other bypass, and never while another owner's open PR touches the same files.
+- Agents merge only under the interim rule in [AGENTS.md](AGENTS.md#rules): their own owner's non-draft PR, when GitHub reports it clean, with no `--admin` or other bypass, and never while another owner's open PR touches the same files, unless that PR has been idle for 4 hours with no live AgentSCM hold on them.
 - A 500 or a timeout on an agent's push or merge means the outcome is unknown: re-read the remote ref or the PR before retrying, and never force-push to recover.
 - Agents never edit CI, release, signing or agent-instruction files (`AGENTS.md`, `CLAUDE.md`) without a maintainer's sign-off.
 - Agent instructions for this repository are in [AGENTS.md](AGENTS.md).
