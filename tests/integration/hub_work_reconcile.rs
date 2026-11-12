@@ -862,7 +862,6 @@ fn merged_issue_facts(fixture: &StoreFixture) {
     branch_merge(&ctx, 41, "feature/m", after, true);
     let hold = |ctx: &Ctx, id: &str| {
         let found = repository_facts(&*ctx.store, "github", &ctx.repo, unix_now()).unwrap();
-        assert!(found.complete);
         let ids: Vec<_> = found.work.iter().map(|(w, _)| w.id.clone()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -899,6 +898,7 @@ fn merged_issue_facts(fixture: &StoreFixture) {
             state: IssueState::Open,
             reason: CloseReason::Other,
             closer_pull: None,
+            closer_repository_id: None,
         },
     );
     assert_eq!(
@@ -912,6 +912,7 @@ fn merged_issue_facts(fixture: &StoreFixture) {
             state: IssueState::Closed,
             reason: CloseReason::Completed,
             closer_pull: Some(99),
+            closer_repository_id: Some(REPOSITORY_ID),
         },
     );
     assert_eq!(
@@ -925,6 +926,7 @@ fn merged_issue_facts(fixture: &StoreFixture) {
             state: IssueState::Closed,
             reason: CloseReason::Completed,
             closer_pull: Some(41),
+            closer_repository_id: Some(REPOSITORY_ID),
         },
     );
     assert_eq!(
@@ -1085,11 +1087,13 @@ fn work_reconcile_merged_hold_refusal() {
         state: IssueState::Closed,
         reason: CloseReason::Completed,
         closer_pull: Some(41),
+        closer_repository_id: Some(REPOSITORY_ID),
     };
     let open = || IssueClosure {
         state: IssueState::Open,
         reason: CloseReason::Other,
         closer_pull: None,
+        closer_repository_id: None,
     };
     let fixtures = std::iter::once(StoreFixture::sqlite()).chain(StoreFixture::postgres());
     for fixture in fixtures {

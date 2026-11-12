@@ -1229,8 +1229,11 @@ async fn poll_issue_closures(
         return;
     };
     let (store_repo, now) = (repo.clone(), super::store::unix_now());
-    let Ok(found) = db(state, move |store| {
-        super::merged_holds::repository_facts(store, "github", &store_repo, now)
+    let Ok((found, releasing)) = db(state, move |store| {
+        let found = super::merged_holds::repository_facts(store, "github", &store_repo, now)?;
+        let releasing =
+            super::merged_holds::merged_release_enabled(store, store_repo.repository_id);
+        Ok((found, releasing))
     })
     .await
     else {
@@ -1238,11 +1241,15 @@ async fn poll_issue_closures(
     };
     let mut issues = BTreeSet::new();
     for (_, facts) in &found.work {
-        let stable = facts.closure.is_some_and(|c| {
-            c.state == IssueState::Closed
-                && c.reason == CloseReason::Completed
-                && c.closer_pull.is_some()
-        });
+        // With automatic release on, a Work that may still hold is read again each poll, so an
+        // issue reopened after it closed is seen before the hold is released.
+        let stable = (!releasing || facts.unreserved)
+            && facts.closure.is_some_and(|c| {
+                c.state == IssueState::Closed
+                    && c.reason == CloseReason::Completed
+                    && c.closer_pull.is_some()
+                    && c.closer_repository_id.is_some()
+            });
         if let (Some(_), Some(issue), false) = (facts.merged_pull, facts.issue, stable) {
             issues.insert(issue);
         }

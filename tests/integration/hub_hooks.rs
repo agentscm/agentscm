@@ -2022,6 +2022,7 @@ mod merged_prompts {
             state: IssueState::Closed,
             reason: CloseReason::Completed,
             closer_pull: Some(41),
+            closer_repository_id: Some(ID),
         }
     }
 
@@ -2087,6 +2088,7 @@ mod merged_prompts {
             state: IssueState::Open,
             reason: CloseReason::Other,
             closer_pull: None,
+            closer_repository_id: None,
         });
         assert_eq!(lines(&w.prompt(LEAD), "merged and"), 0);
         assert_eq!(lines(&w.start(OTHER), "merged and"), 0);

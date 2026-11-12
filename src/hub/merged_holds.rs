@@ -12,7 +12,7 @@ use super::github::{Gh, GhError};
 use super::store::{ForgeIdentity, Principal, Store, User};
 use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource};
 use super::work_lifecycle::OutcomeValue;
-use super::work_reconcile::{WorkStage, WorkStageV1, work_stages};
+use super::work_reconcile::{WorkStage, WorkStageV1, work_stages_detailed};
 use super::work_transition::WorkLifecycleReader;
 
 /// Observation kind and key prefix of one issue's closure fact.
@@ -48,6 +48,10 @@ pub struct IssueClosure {
     /// The pull request that closed the issue, when its latest closing event names one.
     #[serde(default)]
     pub closer_pull: Option<u64>,
+    /// The provider id of the repository that pull request belongs to. An observation stored
+    /// before it was read has none, and never settles a Work: it is read again instead.
+    #[serde(default)]
+    pub closer_repository_id: Option<i64>,
 }
 
 impl IssueClosure {
@@ -71,6 +75,7 @@ impl IssueClosure {
                 state,
                 reason: CloseReason::Other,
                 closer_pull: None,
+                closer_repository_id: None,
             });
         }
         let reason = match issue["stateReason"].as_str() {
@@ -81,19 +86,28 @@ impl IssueClosure {
         let nodes = issue["timelineItems"]["nodes"].as_array().ok_or_else(bad)?;
         // Only the latest closing event counts; a Commit or other closer names no pull request.
         let closer = nodes.last().map(|node| &node["closer"]);
-        let closer_pull = match closer {
-            Some(closer) if closer["__typename"].as_str() == Some("PullRequest") => Some(
-                closer["number"]
-                    .as_u64()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(bad)?,
+        let (closer_pull, closer_repository_id) = match closer {
+            Some(closer) if closer["__typename"].as_str() == Some("PullRequest") => (
+                Some(
+                    closer["number"]
+                        .as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(bad)?,
+                ),
+                Some(
+                    closer["repository"]["databaseId"]
+                        .as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(bad)?,
+                ),
             ),
-            _ => None,
+            _ => (None, None),
         };
         Ok(Self {
             state,
             reason,
             closer_pull,
+            closer_repository_id,
         })
     }
 }
@@ -114,11 +128,14 @@ pub enum MergedHold {
 }
 
 /// Classify. `merged_pull` is the Work's linked pull request when it merged; `closure` is the
-/// stored fact for `issue`, if any.
+/// stored fact for `issue`, if any; `repository_id` is the Work's repository, which the closing
+/// pull request must belong to (a pull request of another repository with the same number is
+/// not it).
 pub fn classify(
     merged_pull: Option<u64>,
     issue: Option<u64>,
     closure: Option<&IssueClosure>,
+    repository_id: i64,
 ) -> MergedHold {
     let Some(pull) = merged_pull else {
         return MergedHold::Unknown;
@@ -129,7 +146,9 @@ pub fn classify(
     match closure.state {
         IssueState::Open => MergedHold::MergedIssueOpen { pull, issue },
         IssueState::Closed
-            if closure.reason == CloseReason::Completed && closure.closer_pull == Some(pull) =>
+            if closure.reason == CloseReason::Completed
+                && closure.closer_pull == Some(pull)
+                && closure.closer_repository_id == Some(repository_id) =>
         {
             MergedHold::Settled { pull, issue }
         }
@@ -144,6 +163,8 @@ pub struct MergedFacts {
     pub issue: Option<u64>,
     pub closure: Option<IssueClosure>,
     pub hold: MergedHold,
+    /// The Work is listed only because it is unreserved and its branch merged: it holds nothing.
+    pub unreserved: bool,
 }
 
 /// The Work's source issue number in `repository_id`/`full_name`, from its forge source or its
@@ -175,17 +196,19 @@ pub fn source_issue(
         .flatten()
 }
 
-/// Merged facts for `item`. `stage` is its entry from `work_reconcile::work_stages`;
-/// `observation_repo` is the connected repository's observation scope (`rep_…`). An unreadable
+/// Merged facts for `item`. `stage` is its entry from `work_reconcile::work_stages_detailed`
+/// and `unsettled` whether that read could not establish that every pull request of the Work
+/// merged (a limit on its own read, a declared pull request not known merged, or another open
+/// candidate on its branch); such a Work is never `Settled`. `observation_repo` is the connected repository's observation scope (`rep_…`). An unreadable
 /// or undecodable closure is treated as unknown.
 pub fn facts(
     store: &dyn Store,
     observation_repo: &str,
     item: &WorkItem,
     stage: Option<&WorkStageV1>,
+    unsettled: bool,
     provider: &str,
-    full_name: &str,
-    repository_id: i64,
+    (full_name, repository_id): (&str, i64),
 ) -> MergedFacts {
     let merged_pull = stage
         .filter(|s| s.stage == WorkStage::PullRequestMerged)
@@ -203,23 +226,27 @@ pub fn facts(
         (Some(s), None) if matches!(s.stage, WorkStage::Working | WorkStage::PullRequestOpen) => {
             MergedHold::NotMerged
         }
-        _ => classify(merged_pull, issue, closure.as_ref()),
+        _ => classify(merged_pull, issue, closure.as_ref(), repository_id),
+    };
+    let hold = match hold {
+        MergedHold::Settled { pull, .. } if unsettled => MergedHold::MergedOnly { pull },
+        other => other,
     };
     MergedFacts {
         merged_pull,
         issue,
         closure,
         hold,
+        unreserved: false,
     }
 }
 
 /// The merged facts of the unfinished Work of one connected repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryFacts {
-    /// Ordered by Work id.
+    /// Ordered by Work id. Work the overview did not list is absent, which is safe: an unlisted
+    /// Work is never considered. A limit on one Work's read keeps only that Work from `Settled`.
     pub work: Vec<(WorkItem, MergedFacts)>,
-    /// False when the read listed fewer Work than the repository has, or a stage limit was hit.
-    pub complete: bool,
 }
 
 /// The repository's own scope as a `Principal`, for the stage logic that reads by repository
@@ -286,27 +313,25 @@ pub fn repository_facts(
         repository: &repo.full_name,
         repository_id: repo.repository_id,
     };
-    let (stages, limits) = work_stages(store, &principal, &reader, &items, now);
+    let (stages, _, unsettled) = work_stages_detailed(store, &principal, &reader, &items, now);
     let mut work: Vec<_> = listed
         .iter()
         .map(|item| {
-            let facts = facts(
+            let mut facts = facts(
                 store,
                 &repo.id,
                 item,
                 stages.get(&item.id),
+                unsettled.contains(&item.id),
                 provider,
-                &repo.full_name,
-                repo.repository_id,
+                (&repo.full_name, repo.repository_id),
             );
+            facts.unreserved = hidden.iter().any(|h| h.id == item.id);
             ((*item).clone(), facts)
         })
         .collect();
     work.sort_by(|a, b| a.0.id.cmp(&b.0.id));
-    Ok(RepositoryFacts {
-        work,
-        complete: overview.current_complete && limits.is_empty(),
-    })
+    Ok(RepositoryFacts { work })
 }
 
 /// Merged facts of one Work for a caller holding a `Principal` (an MCP or hook request). The
@@ -327,7 +352,7 @@ pub fn work_facts(
     )
     .ok()??;
     let reader = WorkLifecycleReader::Token(&principal.token_id);
-    let (stages, _) = work_stages(
+    let (stages, _, unsettled) = work_stages_detailed(
         store,
         principal,
         &reader,
@@ -339,9 +364,9 @@ pub fn work_facts(
         &repo.id,
         item,
         stages.get(&item.id),
+        unsettled.contains(&item.id),
         &principal.owner.identity.provider,
-        &repo.full_name,
-        repo.repository_id,
+        (&repo.full_name, repo.repository_id),
     ))
 }
 
@@ -372,19 +397,31 @@ pub fn set_merged_release(
     store.set_setting(&release_key(repository_id), value, actor)
 }
 
-/// For a repository that opted in, releases the hold of each unfinished Work whose merged pull
-/// request closed its source issue as completed (`MergedHold::Settled`). It releases the hold
-/// only: the Work stays unfinished with no outcome. Returns the ids released.
+/// The audience under which a policy release is claimed, once per Work ever.
+const POLICY_RELEASE: &str = "policy_release";
+
+/// For a repository that opted in, releases the hold of each unfinished Work whose every linked
+/// pull request merged and whose source issue one of them closed as completed
+/// (`MergedHold::Settled`). It releases the hold only: the Work stays unfinished with no
+/// outcome. Returns the ids released.
 ///
-/// It acts only when the read is complete. A truncated read can miss a second pull request
-/// linked to the same branch, and "every linked pull request merged" must not rest on a guess.
-/// A Work with several candidate pull requests, a missing or unreadable closure, an open issue,
-/// or an issue closed another way is never `Settled`, so it keeps its hold.
+/// The policy releases a Work at most once. It claims the `policy_release` marker (the same
+/// once-ever claim the finish prompts use) before it releases, so a lead or owner who then
+/// resumes the Work keeps the hold: later polls find the marker taken. The claim comes before the
+/// transition so two pollers cannot both release; it is given back when the transition fails
+/// for a reason other than the Work having moved (a store error), so a transient failure does
+/// not spend the one release. A crash between the claim and the transition spends it, which only
+/// leaves the hold to lapse by itself, as it would without the policy.
 ///
-/// The release is a transition fenced by the Work's generation and sequence, with an operation
-/// id derived from them, so a lead acting at the same moment or a second poll changes nothing
-/// twice: a Work no longer holding is skipped and a stale fence is refused and skipped. A
-/// failure on one Work is logged and does not stop the others.
+/// A Work whose own read hit a limit, that declares a pull request not known merged, or that has
+/// another open pull request on its branch is never `Settled`, whatever the rest of the
+/// repository looks like. A missing or unreadable closure, an open issue, or an issue closed
+/// another way is never `Settled` either, so the Work keeps its hold.
+///
+/// The release is a transition by the policy actor, fenced by the Work's generation and
+/// sequence, so a lead acting at the same moment changes nothing twice: a Work no longer holding
+/// is skipped and a stale fence is refused and skipped. A failure on one Work is logged and does
+/// not stop the others.
 pub fn release_settled(
     store: &dyn Store,
     provider: &str,
@@ -399,9 +436,6 @@ pub fn release_settled(
         return Ok(released);
     }
     let found = repository_facts(store, provider, repo, now)?;
-    if !found.complete {
-        return Ok(released);
-    }
     for (item, facts) in &found.work {
         let MergedHold::Settled { pull, issue } = facts.hold else {
             continue;
@@ -424,6 +458,9 @@ pub fn release_settled(
             else {
                 return Ok(false);
             };
+            if !store.claim_merge_prompt(&item.id, POLICY_RELEASE, now)? {
+                return Ok(false);
+            }
             let request = WorkTransitionRequest {
                 work_id: item.id.clone(),
                 operation_id: format!(
@@ -439,16 +476,20 @@ pub fn release_settled(
                 ),
                 superseded_by: None,
             };
-            // Acts as the Work's owner, as the Slack digest's release button does; the
-            // `repository-policy:` operation id and the reason name the policy.
-            let actor = WorkTransitionActor::Person {
-                user: &owner,
+            let actor = WorkTransitionActor::Policy {
+                owner: &owner,
                 repository: &repo.full_name,
                 repository_id: repo.repository_id,
-                is_admin: false,
             };
-            store.work_transition(&actor, &request, now)?;
-            Ok(true)
+            match store.work_transition(&actor, &request, now) {
+                Ok(_) => Ok(true),
+                // The Work moved or no longer holds: someone else decided, so the claim stays.
+                Err(error @ super::HubError::Invalid(_)) => Err(error),
+                Err(error) => {
+                    let _ = store.unclaim_merge_prompt(&item.id, POLICY_RELEASE);
+                    Err(error)
+                }
+            }
         };
         match attempt() {
             Ok(true) => released.push(item.id.clone()),
@@ -632,11 +673,17 @@ mod tests {
 
     use super::*;
 
+    const REPO: i64 = 42;
+
     const fn closed(reason: CloseReason, closer: Option<u64>) -> IssueClosure {
         IssueClosure {
             state: IssueState::Closed,
             reason,
             closer_pull: closer,
+            closer_repository_id: match closer {
+                Some(_) => Some(REPO),
+                None => None,
+            },
         }
     }
 
@@ -644,8 +691,27 @@ mod tests {
     fn settled_only_when_the_merged_pull_closed_the_issue_as_completed() {
         let c = closed(CloseReason::Completed, Some(7));
         assert_eq!(
-            classify(Some(7), Some(3), Some(&c)),
+            classify(Some(7), Some(3), Some(&c), REPO),
             MergedHold::Settled { pull: 7, issue: 3 }
+        );
+    }
+
+    #[test]
+    fn a_closer_of_another_repository_or_unread_repository_never_settles() {
+        let mut c = closed(CloseReason::Completed, Some(7));
+        c.closer_repository_id = Some(REPO + 1);
+        assert_eq!(
+            classify(Some(7), Some(3), Some(&c), REPO),
+            MergedHold::MergedOnly { pull: 7 }
+        );
+        // An observation stored before the repository was read decodes without it.
+        let old =
+            IssueClosure::decode(r#"{"state":"closed","reason":"completed","closer_pull":7}"#)
+                .unwrap();
+        assert_eq!(old.closer_repository_id, None);
+        assert_eq!(
+            classify(Some(7), Some(3), Some(&old), REPO),
+            MergedHold::MergedOnly { pull: 7 }
         );
     }
 
@@ -655,9 +721,10 @@ mod tests {
             state: IssueState::Open,
             reason: CloseReason::Other,
             closer_pull: None,
+            closer_repository_id: None,
         };
         assert_eq!(
-            classify(Some(7), Some(3), Some(&open)),
+            classify(Some(7), Some(3), Some(&open), REPO),
             MergedHold::MergedIssueOpen { pull: 7, issue: 3 }
         );
     }
@@ -671,7 +738,7 @@ mod tests {
             closed(CloseReason::Completed, None),
         ] {
             assert_eq!(
-                classify(Some(7), Some(3), Some(&c)),
+                classify(Some(7), Some(3), Some(&c), REPO),
                 MergedHold::MergedOnly { pull: 7 },
                 "{c:?}"
             );
@@ -681,14 +748,15 @@ mod tests {
     #[test]
     fn missing_facts_never_settle() {
         assert_eq!(
-            classify(Some(7), Some(3), None),
+            classify(Some(7), Some(3), None, REPO),
             MergedHold::MergedOnly { pull: 7 }
         );
         assert_eq!(
             classify(
                 Some(7),
                 None,
-                Some(&closed(CloseReason::Completed, Some(7)))
+                Some(&closed(CloseReason::Completed, Some(7))),
+                REPO
             ),
             MergedHold::MergedOnly { pull: 7 }
         );
@@ -696,11 +764,12 @@ mod tests {
             classify(
                 None,
                 Some(3),
-                Some(&closed(CloseReason::Completed, Some(7)))
+                Some(&closed(CloseReason::Completed, Some(7))),
+                REPO
             ),
             MergedHold::Unknown
         );
-        assert_eq!(classify(None, None, None), MergedHold::Unknown);
+        assert_eq!(classify(None, None, None, REPO), MergedHold::Unknown);
     }
 
     fn reply(state: &str, reason: Value, nodes: Value) -> Value {
@@ -714,7 +783,8 @@ mod tests {
         let body = reply(
             "CLOSED",
             json!("COMPLETED"),
-            json!([{"closer": {"__typename": "PullRequest", "number": 12}}]),
+            json!([{"closer": {"__typename": "PullRequest", "number": 12,
+                "repository": {"databaseId": 42}}}]),
         );
         assert_eq!(
             IssueClosure::from_graphql(&body).unwrap(),
@@ -758,6 +828,11 @@ mod tests {
                 "CLOSED",
                 json!("COMPLETED"),
                 json!([{"closer": {"__typename": "PullRequest"}}]),
+            ),
+            reply(
+                "CLOSED",
+                json!("COMPLETED"),
+                json!([{"closer": {"__typename": "PullRequest", "number": 12}}]),
             ),
         ] {
             assert!(IssueClosure::from_graphql(&bad).is_err(), "{bad}");

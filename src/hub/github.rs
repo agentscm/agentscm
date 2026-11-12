@@ -1127,7 +1127,7 @@ impl Api {
         full_name: &str,
         number: u64,
     ) -> Gh<super::merged_holds::IssueClosure> {
-        const QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){state stateReason timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{closer{__typename ... on PullRequest{number}}}}}}}}";
+        const QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){state stateReason timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{closer{__typename ... on PullRequest{number repository{databaseId}}}}}}}}}";
         let (owner, name) = full_name
             .split_once('/')
             .ok_or_else(|| GhError::Failed("bad repository name".into()))?;

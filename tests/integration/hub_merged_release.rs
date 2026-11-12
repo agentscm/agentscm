@@ -24,6 +24,10 @@ use agentscm::hub::store::{
 use agentscm::hub::work::{WorkItem, WorkStart};
 use agentscm::hub::work_issues::WorkIssueLinkUpdate;
 use agentscm::hub::work_lifecycle::{OutcomeValue, ReservationStatus};
+use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
+use agentscm::hub::work_reconciliation::{
+    DeclaredPrLink, WorkDeclarations, WorkDeclarationsUpdate,
+};
 use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use agentscm::hub::{HubState, router};
 use serde_json::{Value, json};
@@ -83,6 +87,7 @@ fn closure(state: IssueState, reason: CloseReason, closer: Option<u64>) -> Issue
         state,
         reason,
         closer_pull: closer,
+        closer_repository_id: closer.map(|_| REPO_ID),
     }
 }
 
@@ -272,6 +277,10 @@ fn on_releases_a_settled_hold_once_and_never_completes(db: &Db) {
     let last = events.last().unwrap();
     assert_eq!(last["transition"], "release");
     assert_eq!(last["outcome"], Value::Null);
+    // The policy is the actor: not the owner as a person, so no login is attributed.
+    assert_eq!(last["actor"]["via"], "policy", "{last}");
+    assert_eq!(last["actor"]["kind"], "owner");
+    assert_eq!(last["actor"]["login"], Value::Null);
     assert!(
         last["reason"]
             .as_str()
@@ -318,6 +327,219 @@ fn other_facts_keep_the_hold(db_with: impl Fn() -> Db) {
     }
 }
 
+/// The Work's lead takes it over again, so it holds once more.
+fn resume(db: &Db, w: &World) {
+    let now = unix_now() + 20;
+    let item = db.store.work_get(&w.token, &w.work, now).unwrap().unwrap();
+    db.store
+        .work_start(
+            &w.token,
+            &serde_json::from_value::<WorkStart>(json!({
+                "work_id": w.work, "title": "resume", "session": SESSION,
+                "scope": ["src/merged.rs"], "takeover_generation": item.generation
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+    assert!(held(db, w).0, "the Work holds again");
+}
+
+fn merge_row(number: u64, branch: &str, same_repository: bool) -> NewCatchupMerge {
+    let at = unix_now() + 5;
+    NewCatchupMerge {
+        source: CatchupMergeSource::ForgePull,
+        source_id: format!("forge-pr-{number}"),
+        occurred_at: Some(at),
+        title: None,
+        branch: branch.into(),
+        base: "main".into(),
+        head_commit: "b".repeat(40),
+        merge_commit: format!("{number:040x}"),
+        pull_number: i64::try_from(number).unwrap(),
+        paths: vec!["src/x.rs".into()],
+        paths_complete: true,
+        same_repository_head: same_repository,
+    }
+}
+
+fn a_resumed_work_is_not_released_again(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
+    assert!(!held(db, &w).0);
+    resume(db, &w);
+    // The decision to resume stands: later polls leave the hold alone.
+    assert!(release(db, &w).is_empty());
+    assert!(release(db, &w).is_empty());
+    assert!(held(db, &w).0, "the resumed hold is kept");
+}
+
+fn every_pull_request_must_be_merged(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    // A second pull request the Work declares (v2) that is not merged.
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    db.store
+        .work_declarations_set(
+            &w.token,
+            &WorkDeclarationsUpdate {
+                work_id: w.work.clone(),
+                operation_id: "declare-77".into(),
+                generation: item.generation,
+                session: SESSION.into(),
+                expected_updated_seq: item.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![DeclaredPrLink {
+                        id: "second".into(),
+                        target: WorkPrLinkTarget {
+                            repository_id: REPO_ID,
+                            number: 77,
+                            head_sha: "c".repeat(40),
+                        },
+                    }],
+                    prerequisites: vec![],
+                },
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(release(db, &w).is_empty());
+    assert!(held(db, &w).0, "a declared pull request is not merged");
+    // Once it merges too, the Work is settled.
+    db.store
+        .record_catchup_merge(
+            &scope(),
+            &merge_row(77, "feature/second", true),
+            unix_now() + 6,
+        )
+        .unwrap();
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
+}
+
+fn another_open_pull_request_on_the_branch_blocks_an_explicit_link(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    db.store
+        .work_pr_link_set(
+            &w.token,
+            &WorkPrLinkUpdate {
+                work_id: w.work.clone(),
+                operation_id: "link-41".into(),
+                generation: item.generation,
+                session: SESSION.into(),
+                expected_updated_seq: item.updated_seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: REPO_ID,
+                    number: i64::try_from(PULL).unwrap(),
+                    head_sha: "b".repeat(40),
+                }),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let observe = |state: &str, stamp: i64| {
+        let data = json!({"number": 55, "state": state, "repository_id": REPO_ID,
+            "head_repository_id": REPO_ID, "head_sha": "d".repeat(40),
+            "head_ref": "feature/m"})
+        .to_string();
+        db.store
+            .observe(&w.repo.id, "pull_request", "55", &data, stamp)
+            .unwrap();
+    };
+    observe("open", 2_000);
+    assert!(release(db, &w).is_empty());
+    assert!(held(db, &w).0, "a second open pull request on the branch");
+    observe("closed", 3_000);
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
+}
+
+fn a_limited_neighbour_does_not_block_a_clean_work(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    // A second Work, on a branch whose merge history may be truncated: inference finds its one
+    // merged pull request (60) but cannot rule out older ones.
+    let other = db
+        .store
+        .work_start(
+            &w.token,
+            &serde_json::from_value::<WorkStart>(json!({
+                "request_key": "limited", "title": "Limited Work", "session": "other-session",
+                "scope": ["src/limited.rs"], "branch": "feature/n"
+            }))
+            .unwrap(),
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    db.store
+        .work_issue_link_set(
+            &w.token,
+            &WorkIssueLinkUpdate {
+                work_id: other.id.clone(),
+                operation_id: "link-8".into(),
+                generation: other.generation,
+                session: "other-session".into(),
+                expected_updated_seq: other.updated_seq,
+                link: Some(IssueIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository_id: REPO_ID,
+                    number: 8,
+                }),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    db.store
+        .observe(
+            &w.repo.id,
+            OBSERVATION_KIND,
+            &observation_key(8),
+            &serde_json::to_string(&completed_by(60)).unwrap(),
+            1_000,
+        )
+        .unwrap();
+    for number in 100..119 {
+        db.store
+            .record_catchup_merge(
+                &scope(),
+                &merge_row(number, "feature/n", false),
+                unix_now() + 6,
+            )
+            .unwrap();
+    }
+    db.store
+        .record_catchup_merge(&scope(), &merge_row(60, "feature/n", true), unix_now() + 6)
+        .unwrap();
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
+    assert!(!held(db, &w).0, "the clean Work is released");
+    let now = unix_now() + 10;
+    let owner = db.store.user_by_id(&w.owner).unwrap().unwrap();
+    let reader = WorkLifecycleReader::Person {
+        owner: &owner,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let limited = db
+        .store
+        .work_operational(&reader, &OperationalSelect::One(&other.id), now)
+        .unwrap();
+    assert!(
+        limited.work[0].reservation.basis.is_some(),
+        "the limited Work keeps its hold"
+    );
+}
+
 #[test]
 fn sqlite_off_by_default_keeps_the_hold() {
     off_by_default_keeps_the_hold(&Db::sqlite());
@@ -342,6 +564,58 @@ fn postgres_on_releases_a_settled_hold_once_and_never_completes() {
         return;
     };
     on_releases_a_settled_hold_once_and_never_completes(&db);
+}
+
+#[test]
+fn sqlite_a_resumed_work_is_not_released_again() {
+    a_resumed_work_is_not_released_again(&Db::sqlite());
+}
+
+#[test]
+fn postgres_a_resumed_work_is_not_released_again() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    a_resumed_work_is_not_released_again(&db);
+}
+
+#[test]
+fn sqlite_every_pull_request_must_be_merged() {
+    every_pull_request_must_be_merged(&Db::sqlite());
+}
+
+#[test]
+fn postgres_every_pull_request_must_be_merged() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    every_pull_request_must_be_merged(&db);
+}
+
+#[test]
+fn sqlite_another_open_pull_request_on_the_branch_blocks_an_explicit_link() {
+    another_open_pull_request_on_the_branch_blocks_an_explicit_link(&Db::sqlite());
+}
+
+#[test]
+fn postgres_another_open_pull_request_on_the_branch_blocks_an_explicit_link() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    another_open_pull_request_on_the_branch_blocks_an_explicit_link(&db);
+}
+
+#[test]
+fn sqlite_a_limited_neighbour_does_not_block_a_clean_work() {
+    a_limited_neighbour_does_not_block_a_clean_work(&Db::sqlite());
+}
+
+#[test]
+fn postgres_a_limited_neighbour_does_not_block_a_clean_work() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    a_limited_neighbour_does_not_block_a_clean_work(&db);
 }
 
 #[test]

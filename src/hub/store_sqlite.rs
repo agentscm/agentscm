@@ -11462,6 +11462,11 @@ impl Store for SqliteStore {
                 repository,
                 repository_id,
                 ..
+            }
+            | WorkTransitionActor::Policy {
+                owner: user,
+                repository,
+                repository_id,
             } => {
                 if user.disabled {
                     return Err(HubError::Unauthorized);
@@ -11477,6 +11482,7 @@ impl Store for SqliteStore {
         let via = match actor {
             WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
             WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+            WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
         };
         let mut item = scoped_work(&tx, &who, &request.work_id, now)?
             .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
@@ -12311,6 +12317,48 @@ impl Store for SqliteStore {
             .map(|link| link.target);
         tx.commit()?;
         Ok(target)
+    }
+
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<work_links::WorkPrLinkTarget>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
+        if scoped_work(&tx, &who, id, now)?.is_none() {
+            return Ok(None);
+        }
+        let snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_declarations WHERE work=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let links = snapshot
+            .as_deref()
+            .map(json_value::<WorkDeclarations>)
+            .transpose()?
+            .map_or_else(Vec::new, |d| {
+                d.links.into_iter().map(|l| l.target).collect()
+            });
+        tx.commit()?;
+        Ok(Some(links))
     }
 
     fn work_pr_link_set(
@@ -17896,6 +17944,14 @@ impl Store for SqliteStore {
             params![work, audience, now],
         )?;
         Ok(inserted == 1)
+    }
+
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM hub_work_merge_prompts WHERE work = ?1 AND audience = ?2",
+            params![work, audience],
+        )?;
+        Ok(())
     }
 
     fn repository_unreserved_merged_work(

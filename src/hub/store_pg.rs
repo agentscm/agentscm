@@ -11435,6 +11435,11 @@ impl Store for PgStore {
                     repository,
                     repository_id,
                     ..
+                }
+                | WorkTransitionActor::Policy {
+                    owner: user,
+                    repository,
+                    repository_id,
                 } => {
                     if user.disabled {
                         return Err(HubError::Unauthorized);
@@ -11448,6 +11453,7 @@ impl Store for PgStore {
             let via = match actor {
                 WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
                 WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+                WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
             };
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
@@ -12279,6 +12285,45 @@ impl Store for PgStore {
                 .map(|link| link.target);
             tx.commit()?;
             Ok(target)
+        })
+    }
+
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<work_links::WorkPrLinkTarget>>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            if scoped_work(&mut tx, &who, id, now, false)?.is_none() {
+                return Ok(None);
+            }
+            let links = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_declarations WHERE work=$1",
+                    &[&id],
+                )?
+                .map(|row| json_value::<WorkDeclarations>(&row.get::<_, String>(0)))
+                .transpose()?
+                .map_or_else(Vec::new, |d| {
+                    d.links.into_iter().map(|l| l.target).collect()
+                });
+            tx.commit()?;
+            Ok(Some(links))
         })
     }
 
@@ -16572,6 +16617,16 @@ impl Store for PgStore {
                 &[&work, &audience, &now],
             )?;
             Ok(inserted == 1)
+        })
+    }
+
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "DELETE FROM hub_work_merge_prompts WHERE work = $1 AND audience = $2",
+                &[&work, &audience],
+            )?;
+            Ok(())
         })
     }
 

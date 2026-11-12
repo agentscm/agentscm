@@ -974,6 +974,14 @@ pub trait Store: Send + Sync {
         id: &str,
         now: i64,
     ) -> Result<Option<super::work_links::WorkPrLinkTarget>>;
+    /// Scoped read of the pull request targets the Work declares (`WorkDeclarations.links`).
+    /// Empty when it declares none; `None` when the Work is not in the reader's scope.
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<super::work_links::WorkPrLinkTarget>>>;
     /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
     fn work_pr_link_set(
         &self,
@@ -1556,6 +1564,8 @@ pub trait Store: Send + Sync {
     /// its issue. True only for the first claim, so a notice is delivered once however many
     /// hooks race.
     fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool>;
+    /// Gives back a claim whose action did not happen, so a later attempt can claim it again.
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()>;
     /// Unfinished Work of one repository that holds no reservation and that the repository
     /// overview hides because its branch merged, oldest first by id, at most `limit`.
     fn repository_unreserved_merged_work(
