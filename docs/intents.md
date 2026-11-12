@@ -147,8 +147,11 @@ should resume). The edit proceeds either way.
   The hook drops a refused path from its state, announces the other paths once and shows the
   reason; the edit proceeds because the hook exits 0. After the agent resumes the Work, a
   dropped path stays unannounced until it is edited again.
-- Only files the agent edits through Edit, Write or MultiEdit are announced, not files
-  written by shell commands.
+- Only files the agent edits through Edit, Write or MultiEdit are announced before the
+  edit, not files written by shell commands. For Claude Code and Codex the hook client
+  observes a shell call's file changes and the Hub records the first 50 changed paths as
+  intents after the call, as an already-applied edit that refuses nothing (see
+  [shell-call observation](agents.md#shell-call-observation) and its limits).
 - An intent expires two hours after its last announce. SessionEnd may not run after a
   crash, so that expiry is the backstop. A session that announces more than 256 files
   keeps the most recent 256.

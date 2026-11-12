@@ -107,7 +107,9 @@ Silicon macOS; Docker is an explicit fallback. Server deployment is
 
 Coordination is **not locking**. Supported hooks refuse the first contested edit once per
 session and file; a repeat passes, and hook failures let edits through. Cursor receives a
-note after the edit; MCP-only clients receive advice. Only announced work is visible, and
+note after the edit; MCP-only clients receive advice. Shell writes are not checked
+beforehand; Claude Code and Codex hooks report which files a shell call changed only after it
+ran. Only announced work is visible, and
 same-file overlap is not proof of conflict. See [support boundaries](docs/agents.md).
 
 `pr-gate` evidence is **self-reported**. A recorded test, independent review or approval is
