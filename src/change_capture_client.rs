@@ -1660,7 +1660,7 @@ pub async fn resolve_target_with(
 /// What the Hub says about agent conversation sharing for this checkout's repository and person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct HubSharing {
-    /// The repository shares and this person has not opted out.
+    /// The repository is enabled and this person affirmatively consented.
     pub sharing: bool,
     /// This person's agent has already shown the one-time notice.
     pub notified: bool,
@@ -1670,6 +1670,9 @@ pub struct HubSharing {
     /// This person keeps their own sessions out.
     #[serde(default)]
     pub opted_out: bool,
+    /// This person affirmatively opted in. Missing on an older Hub is not consent.
+    #[serde(default)]
+    pub consented: bool,
 }
 
 /// What asking the Hub about conversation sharing gave. Only `Answered` with `sharing` starts it.
@@ -1706,7 +1709,11 @@ pub async fn hub_sharing(hub: &CaptureHub) -> SharingAnswer {
         .timeout(Duration::from_secs(2));
     match send(request, REPLY_BYTES).await {
         Ok((200, body)) => {
-            reply::decode(&body).map_or(SharingAnswer::NoAnswer, SharingAnswer::Answered)
+            reply::decode::<HubSharing>(&body).map_or(SharingAnswer::NoAnswer, |mut answer| {
+                // Older or malformed answers cannot turn sharing on without affirmative consent.
+                answer.sharing &= answer.consented;
+                SharingAnswer::Answered(answer)
+            })
         }
         Ok((404, _)) => SharingAnswer::NoSetting,
         _ => SharingAnswer::NoAnswer,
@@ -1808,6 +1815,16 @@ pub(crate) fn sharing_state(
             };
             format!(
                 "{off}: you keep your own sessions out of sharing in {repo}. To share them again, run `agentscm change-capture opt-in` in this checkout.{then}"
+            )
+        }
+        SharingAnswer::Answered(answer) if answer.enabled && !answer.consented => {
+            let then = if capped {
+                format!(" This checkout's local setting is to {set}, so also {fix}.")
+            } else {
+                String::new()
+            };
+            format!(
+                "{off}: {repo} permits conversation sharing, but you have not opted in. To consent and share your sessions, run `agentscm change-capture opt-in` in this checkout.{then}"
             )
         }
         SharingAnswer::Answered(answer) if answer.sharing && capped => format!(
@@ -1972,6 +1989,20 @@ pub(crate) fn unknown_sharing(checkout: &Path) -> Option<String> {
     (!load().ok()?.iter().any(|binding| binding.root == root)).then(|| {
         "AgentSCM: whether conversation sharing is on for this session is unknown, because the Hub did not answer in time, so nothing is recorded in this session. The next session asks again.".into()
     })
+}
+
+/// Said when the plugin hook has no capture binding and the Hub answered that sharing is off.
+/// Repository enablement and the person's consent are deliberately reported as separate gates.
+pub(crate) fn unconfigured_sharing(repository: &str, answer: SharingAnswer) -> Option<String> {
+    match answer {
+        SharingAnswer::Answered(answer) if answer.enabled && !answer.consented => Some(format!(
+            "AgentSCM: conversation sharing is off for this session; only sanitized activity facts are recorded: {repository} permits conversation sharing, but you have not opted in. To consent and share your sessions, run `agentscm change-capture opt-in` in this checkout; the next session shares."
+        )),
+        SharingAnswer::Answered(_) => Some(format!(
+            "AgentSCM: conversation sharing is off for this session; only sanitized activity facts are recorded: {repository} does not share agent conversations. A repository admin or a Hub admin turns it on in the Hub's Settings."
+        )),
+        SharingAnswer::NoSetting | SharingAnswer::NoAnswer => None,
+    }
 }
 
 pub async fn fetch_change_record(root: &Path, work_id: &str) -> Result<ChangeRecordResponseV1> {
@@ -2519,8 +2550,8 @@ mod tests {
         install_hooks, is_digest, is_identifier, load, load_recipe_file, load_recipe_from_file,
         lock_checkout, managed_recipe_invocations, mode_under_hub, parse_rule, plan_enable,
         release_excludes, remove_owned_hooks, save, session_start_context, set_capture_mode,
-        setting_in, sharing_state, store_full, unconfigure, unknown_sharing, validate_binding,
-        validate_binding_update,
+        setting_in, sharing_state, store_full, unconfigure, unconfigured_sharing, unknown_sharing,
+        validate_binding, validate_binding_update,
     };
     use crate::client_config;
     use crate::client_status::CaptureMismatch;
@@ -3051,12 +3082,14 @@ mod tests {
             notified: false,
             enabled: false,
             opted_out: false,
+            consented: false,
         });
         let on = Some(HubSharing {
             sharing: true,
             notified: true,
             enabled: true,
             opted_out: false,
+            consented: true,
         });
         let mut binding = recipe_binding(vec![]);
         binding.capture_mode = CaptureModeV1::SharedConversation;
@@ -3090,6 +3123,7 @@ mod tests {
                 notified: true,
                 enabled,
                 opted_out,
+                consented: enabled && !opted_out,
             })
         };
         let mut binding = recipe_binding(vec![]);
@@ -3136,6 +3170,16 @@ mod tests {
         assert!(opted_out.contains("change-capture opt-in"), "{opted_out}");
         assert!(!opted_out.contains("set-mode"), "{opted_out}");
         assert!(say(&binding, answer(false, false)).contains("does not share agent conversations"));
+        let missing = SharingAnswer::Answered(HubSharing {
+            sharing: false,
+            notified: true,
+            enabled: true,
+            opted_out: false,
+            consented: false,
+        });
+        let missing = say(&binding, missing);
+        assert!(missing.contains("you have not opted in"), "{missing}");
+        assert!(missing.contains("change-capture opt-in"), "{missing}");
         // A shared binding whose session kept a lower mode names no local setting.
         for hub in [answer(true, false), SharingAnswer::NoAnswer] {
             let kept = sharing_state(CaptureModeV1::MetadataOnly, &binding, hub);
@@ -3191,6 +3235,28 @@ mod tests {
                 "a disabled binding needs only forget: {other}"
             );
         });
+    }
+
+    #[test]
+    fn an_unconfigured_checkout_distinguishes_missing_consent_from_repository_disablement() {
+        let answer = |enabled, consented| {
+            SharingAnswer::Answered(HubSharing {
+                sharing: enabled && consented,
+                notified: false,
+                enabled,
+                opted_out: false,
+                consented,
+            })
+        };
+        let missing = unconfigured_sharing("acme/widgets", answer(true, false)).unwrap();
+        assert!(missing.contains("you have not opted in"), "{missing}");
+        assert!(missing.contains("change-capture opt-in"), "{missing}");
+        let disabled = unconfigured_sharing("acme/widgets", answer(false, false)).unwrap();
+        assert!(
+            disabled.contains("does not share agent conversations"),
+            "{disabled}"
+        );
+        assert!(!disabled.contains("opt-in"), "{disabled}");
     }
 
     #[test]

@@ -1563,9 +1563,9 @@ fn audience(admin: bool) -> ConversationAudience {
     }
 }
 
-/// While a repository shares, a reader lists every author's entries except those of an author
-/// who opted out, whose earlier entries leave the listing too.
-fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
+/// While a repository permits sharing, another reader lists an author's entries only after the
+/// author affirmatively opts in. Notice-only, absent and invalid choices grant no access.
+fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
     use ConversationAudience::{Everyone, Own, Sharing};
     const REPOSITORY_ID: i64 = 77;
     let store = db.open();
@@ -1619,12 +1619,26 @@ fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
             .unwrap()
             .len()
     };
-    assert_eq!(listed(&reader_token, Own), 0);
-    assert_eq!(listed(&reader_token, Sharing), 1);
-
     let opt_out = |user: &str, repository_id: i64| {
         format!("conversation_sharing:opt_out:{user}:{repository_id}")
     };
+    let notified = |user: &str, repository_id: i64| {
+        format!("conversation_sharing:notified:{user}:{repository_id}")
+    };
+    assert_eq!(listed(&reader_token, Own), 0);
+    assert_eq!(listed(&reader_token, Sharing), 0, "absent consent");
+    store
+        .set_setting(&notified(&author.id, REPOSITORY_ID), "1", &author.id)
+        .unwrap();
+    assert_eq!(listed(&reader_token, Sharing), 0, "notice is not consent");
+    store
+        .set_setting(&opt_out(&author.id, REPOSITORY_ID), "invalid", &author.id)
+        .unwrap();
+    assert_eq!(listed(&reader_token, Sharing), 0, "invalid choice");
+    store
+        .set_setting(&opt_out(&author.id, REPOSITORY_ID), "0", &author.id)
+        .unwrap();
+    assert_eq!(listed(&reader_token, Sharing), 1, "explicit opt-in");
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "1", &author.id)
         .unwrap();
@@ -1648,14 +1662,14 @@ fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
 }
 
 #[test]
-fn sqlite_opting_out_leaves_the_listing_other_readers_get() {
-    opting_out_leaves_the_listing_other_readers_get(&Db::sqlite());
+fn sqlite_affirmative_consent_controls_the_listing_other_readers_get() {
+    affirmative_consent_controls_the_listing_other_readers_get(&Db::sqlite());
 }
 
 #[test]
-fn postgres_opting_out_leaves_the_listing_other_readers_get() {
+fn postgres_affirmative_consent_controls_the_listing_other_readers_get() {
     if let Some(db) = Db::postgres() {
-        opting_out_leaves_the_listing_other_readers_get(&db);
+        affirmative_consent_controls_the_listing_other_readers_get(&db);
     }
 }
 

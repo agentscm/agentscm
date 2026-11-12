@@ -13301,9 +13301,9 @@ impl Store for SqliteStore {
             "WITH page AS (
                  SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
                  WHERE work=?1 AND (?2 IS NULL OR (session_id,sequence,digest) > (?2,?3,?4))
-                   AND (?6 OR author=?7 OR (?8 IS NOT NULL AND NOT EXISTS (
+                   AND (?6 OR author=?7 OR (?8 IS NOT NULL AND EXISTS (
                         SELECT 1 FROM hub_settings o
-                         WHERE o.key = ?8 || author || ':' || ?9 AND o.value <> '0')))
+                         WHERE o.key = ?8 || author || ':' || ?9 AND o.value = '0')))
                  ORDER BY session_id,sequence,digest LIMIT ?5)
              SELECT page.*, e.event, e.observed_at FROM page
              JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -13320,8 +13320,8 @@ impl Store for SqliteStore {
                     MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1,
                     audience == ConversationAudience::Everyone,
                     who.owner.id,
-                    // Set only for readers of a sharing repository: an author who opted out is
-                    // left out, with what they shared before.
+                    // Set only for readers of a sharing repository: an author is included only
+                    // after their affirmative opt-in, including for bodies shared before it.
                     opt_out_prefix,
                     who.repository_id
                 ],

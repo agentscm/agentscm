@@ -1745,6 +1745,17 @@ mod shared_bodies {
             let helper = user(&*store, 12, "helper");
             let (helper_token, helper_secret) = token(&*store, &helper, "helper", false);
             let (_, helper_read_only_secret) = token(&*store, &helper, "helper-reader", true);
+            // Positive-path fixtures opt each author in explicitly. Repository enablement alone
+            // is intentionally insufficient.
+            for author in [&owner, &helper] {
+                store
+                    .set_setting(
+                        &format!("conversation_sharing:opt_out:{author}:77"),
+                        "0",
+                        author,
+                    )
+                    .unwrap();
+            }
             let work = store
                 .work_start(
                     &owner_token,
@@ -2196,9 +2207,10 @@ mod shared_bodies {
                 .await,
             StatusCode::FORBIDDEN
         );
+        // Hub administration does not substitute for the uploader's own consent.
         assert_eq!(
             f.put(&f.admin_secret, &undeclared_sha, undeclared).await,
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
         for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
             assert_eq!(
@@ -2483,6 +2495,7 @@ mod shared_bodies {
             .parse::<Value>()
             .unwrap();
         assert_eq!(answer["sharing"], true);
+        assert_eq!(answer["consented"], true);
         assert_eq!(answer["source"], "repository");
         f.share(false);
         // Nothing is missing, so a client sends nothing, and a direct upload is refused.
@@ -2497,6 +2510,52 @@ mod shared_bodies {
         );
         assert_eq!(f.row().state, SharedBodyState::Declared);
         f.share(true);
+        // Notice-only and invalid legacy choices do not become consent after re-enablement.
+        f.store
+            .set_setting(
+                &format!("conversation_sharing:opt_out:{}:77", f.owner),
+                "invalid",
+                &f.owner,
+            )
+            .unwrap();
+        f.store
+            .set_setting(
+                &format!("conversation_sharing:notified:{}:77", f.owner),
+                "1",
+                &f.owner,
+            )
+            .unwrap();
+        let denied: Value = sharing(&f.owner_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(denied["notified"], true);
+        assert_eq!(denied["consented"], false);
+        assert_eq!(denied["sharing"], false);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        // The existing explicit opt-in operation writes the positive choice.
+        let opt_in = f
+            .client
+            .put(format!(
+                "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing/me",
+                f.base
+            ))
+            .bearer_auth(&f.owner_secret)
+            .header("content-type", "application/json")
+            .body(json!({"opted_out": false}).to_string())
+            .send()
+            .await
+            .unwrap();
+        let opted_in: Value = serde_json::from_str(&opt_in.text().await.unwrap()).unwrap();
+        assert_eq!(opted_in["consented"], true);
+        assert_eq!(opted_in["sharing"], true);
         // Opting out is per person and stops that person's uploads on every token.
         let opt_out = f
             .client
@@ -2528,7 +2587,7 @@ mod shared_bodies {
             .unwrap()
             .parse::<Value>()
             .unwrap();
-        assert_eq!(other["sharing"], true, "another person still shares");
+        assert_eq!(other["sharing"], false, "another person has not opted in");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
