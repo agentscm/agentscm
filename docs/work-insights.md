@@ -336,6 +336,11 @@ The list projection returns at most 20 token groups and 20 cost groups per work 
 detail returns at most 500 of each. Totals and known-report counts still cover all retained reports.
 `groups_complete: false` means only the grouped breakdown was truncated.
 
+A group's `agent` is the label the report gave, with one exception: a generated label that names a
+host is shown without the host name, as in [other owners' agents](standup.md#other-owners-agents),
+because every reader of the repository sees these groups. Groups that differ only by that host name
+are added together.
+
 The usage summary and each token group carry four sums: `input_tokens`, `output_tokens`,
 `cache_read_input_tokens` and `cache_creation_input_tokens`. Each has a count of the reports that
 gave it: `input_known_observations`, `output_known_observations`,

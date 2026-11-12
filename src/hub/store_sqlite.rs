@@ -1688,6 +1688,7 @@ fn sqlite_usage_summary(
     cost_groups.truncate(group_limit);
     summary.token_groups = token_groups;
     summary.cost_groups = cost_groups;
+    summary.mask_agents();
     Ok(summary)
 }
 

@@ -848,6 +848,71 @@ fn cached_input_is_totalled_and_stored_reports_read_back(db: &Db) {
     ));
 }
 
+fn usage_groups_show_a_host_named_agent_without_the_host(db: &Db) {
+    let store = db.open();
+    let lead = ordinary_agent(&*store, 16);
+    let now = unix_now();
+    let item = store
+        .work_start(&lead.token, &start("masked", "Masked labels", "lead"), now)
+        .unwrap()
+        .item;
+    let cost = Some(ReportedCost {
+        kind: CostKind::ListPriceEstimate,
+        currency: "USD".into(),
+        amount_micros: 5,
+        basis: "rates-v1".into(),
+    });
+    // An older client named its token after the host; a client with no host name used `host`.
+    for (observation_id, agent, cache_read) in [
+        ("named", "client-buildhost-0a1b2c3d", Some(40)),
+        ("plain", "client-host-0a1b2c3d", None),
+        ("other", "custom-mcp", None),
+    ] {
+        let mut report = usage(&item.id, observation_id, 1, "lead");
+        report.agent = agent.into();
+        report.cache_read_input_tokens = cache_read;
+        report.cost = cost.clone();
+        store.work_usage(&lead.token, &report, now + 1).unwrap();
+    }
+    let usage = store
+        .work_insight(&lead.token, &item.id, now + 2)
+        .unwrap()
+        .unwrap()
+        .usage;
+    assert!(!serde_json::to_string(&usage).unwrap().contains("buildhost"));
+    assert_eq!(usage.observations, 3);
+    // The two labels that are one agent once the host is gone are one group, with both reports.
+    let agents: Vec<_> = usage
+        .token_groups
+        .iter()
+        .map(|group| (group.agent.as_str(), group.observations))
+        .collect();
+    assert_eq!(agents, [("client-host-0a1b2c3d", 2), ("custom-mcp", 1)]);
+    let merged = &usage.token_groups[0];
+    assert_eq!(merged.input_tokens, Some(14));
+    assert_eq!(merged.cache_read_input_tokens, Some(40));
+    assert_eq!(merged.cache_read_input_known_observations, 1);
+    let costs: Vec<_> = usage
+        .cost_groups
+        .iter()
+        .map(|group| {
+            (
+                group.agent.as_str(),
+                group.amount_micros,
+                group.observations,
+            )
+        })
+        .collect();
+    assert_eq!(
+        costs,
+        [("client-host-0a1b2c3d", 10, 2), ("custom-mcp", 5, 1)]
+    );
+    let listed = store
+        .work_insights(&lead.token, &InsightQuery::default(), now + 2)
+        .unwrap();
+    assert_eq!(listed.items[0].usage, usage);
+}
+
 fn keyset_windows_and_cursor_bindings(db: &Db) {
     let store = db.open();
     let lead = ordinary_agent(&*store, 21);
@@ -2626,6 +2691,7 @@ conformance!(
     observation_and_group_limits,
     zero_usage_is_explicitly_unknown,
     cached_input_is_totalled_and_stored_reports_read_back,
+    usage_groups_show_a_host_named_agent_without_the_host,
     keyset_windows_and_cursor_bindings,
     compaction_retains_usage_and_marks_history_incomplete,
     publication_provenance_is_exact_scope_and_checkpoint_first,

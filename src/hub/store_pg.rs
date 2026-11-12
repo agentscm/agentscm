@@ -1701,7 +1701,7 @@ fn pg_usage_summary(
     let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
     token_groups.truncate(group_limit);
     cost_groups.truncate(group_limit);
-    Ok(UsageSummary {
+    let mut summary = UsageSummary {
         observations: observations as usize,
         coverage: if observations == 0 {
             "unknown"
@@ -1722,7 +1722,9 @@ fn pg_usage_summary(
         groups_complete,
         cost_groups,
         token_groups,
-    })
+    };
+    summary.mask_agents();
+    Ok(summary)
 }
 
 fn pg_insight_input(

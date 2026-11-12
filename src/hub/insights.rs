@@ -519,6 +519,87 @@ pub struct UsageSummary {
     pub groups_complete: bool,
 }
 
+impl UsageSummary {
+    /// Shows each group's agent as every reader of the repository may see it. A completion report
+    /// records the token label, which an older client built from its host name, and the stores
+    /// group by the label as stored. Groups that the masked label makes equal are added together.
+    pub(super) fn mask_agents(&mut self) {
+        fn add(total: &mut Option<i64>, value: Option<i64>) {
+            if let Some(value) = value {
+                *total = Some(total.unwrap_or(0) + value);
+            }
+        }
+        // A masked label can equal one that came before it or one that comes after, so every
+        // group is checked against the ones already kept. A summary holds at most 500 groups.
+        let mut tokens: Vec<TokenGroup> = Vec::with_capacity(self.token_groups.len());
+        for mut group in std::mem::take(&mut self.token_groups) {
+            group.agent = super::viewer::masked_label(&group.agent);
+            let Some(same) = tokens.iter_mut().find(|other| {
+                (
+                    &other.agent,
+                    &other.provider,
+                    &other.model,
+                    other.usage_basis,
+                ) == (
+                    &group.agent,
+                    &group.provider,
+                    &group.model,
+                    group.usage_basis,
+                )
+            }) else {
+                tokens.push(group);
+                continue;
+            };
+            same.observations += group.observations;
+            add(&mut same.input_tokens, group.input_tokens);
+            add(&mut same.output_tokens, group.output_tokens);
+            add(
+                &mut same.cache_read_input_tokens,
+                group.cache_read_input_tokens,
+            );
+            add(
+                &mut same.cache_creation_input_tokens,
+                group.cache_creation_input_tokens,
+            );
+            same.input_known_observations += group.input_known_observations;
+            same.output_known_observations += group.output_known_observations;
+            same.cache_read_input_known_observations += group.cache_read_input_known_observations;
+            same.cache_creation_input_known_observations +=
+                group.cache_creation_input_known_observations;
+        }
+        self.token_groups = tokens;
+        let mut costs: Vec<CostGroup> = Vec::with_capacity(self.cost_groups.len());
+        for mut group in std::mem::take(&mut self.cost_groups) {
+            group.agent = super::viewer::masked_label(&group.agent);
+            let Some(same) = costs.iter_mut().find(|other| {
+                (
+                    &other.agent,
+                    &other.provider,
+                    &other.model,
+                    other.usage_basis,
+                    other.kind,
+                    &other.currency,
+                    &other.basis,
+                ) == (
+                    &group.agent,
+                    &group.provider,
+                    &group.model,
+                    group.usage_basis,
+                    group.kind,
+                    &group.currency,
+                    &group.basis,
+                )
+            }) else {
+                costs.push(group);
+                continue;
+            };
+            same.amount_micros += group.amount_micros;
+            same.observations += group.observations;
+        }
+        self.cost_groups = costs;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkInsight {
@@ -1073,6 +1154,66 @@ mod tests {
         assert_eq!(groups[1].cache_creation_input_tokens, Some(3));
         assert_eq!(groups[1].cache_read_input_known_observations, 2);
         assert_eq!(groups[1].cache_creation_input_known_observations, 1);
+    }
+    #[test]
+    fn usage_groups_show_masked_agents_and_merge_the_ones_that_become_equal() {
+        // What a store returns: one group per stored label.
+        let mut named = observation("client-buildhost-0a1b2c3d");
+        named.request.input_tokens = Some(7);
+        named.request.cache_read_input_tokens = Some(40);
+        named.request.cost = Some(ReportedCost {
+            kind: CostKind::ListPriceEstimate,
+            currency: "USD".into(),
+            amount_micros: 5,
+            basis: "rates-v1".into(),
+        });
+        let mut plain = named.clone();
+        plain.request.agent = "client-host-0a1b2c3d".into();
+        plain.request.input_tokens = None;
+        plain.request.output_tokens = Some(11);
+        let mut other = observation("generic");
+        other.request.input_tokens = Some(1);
+        let mut stored = summarize_usage(&[]).unwrap();
+        for report in [&plain, &named, &other] {
+            let one = summarize_usage(std::slice::from_ref(report)).unwrap();
+            stored.token_groups.extend(one.token_groups);
+            stored.cost_groups.extend(one.cost_groups);
+        }
+        // `summarize_usage` masks as it groups; put the stored label back on the host-named group.
+        stored.token_groups[1].agent = "client-buildhost-0a1b2c3d".into();
+        stored.cost_groups[1].agent = "client-buildhost-0a1b2c3d".into();
+        // A store sorts by the stored label, so the host-named group can also come first.
+        let mut host_first = stored.clone();
+        host_first.token_groups.swap(0, 1);
+        host_first.cost_groups.swap(0, 1);
+        host_first.mask_agents();
+
+        stored.mask_agents();
+        assert_eq!(host_first, stored);
+        assert!(
+            !serde_json::to_string(&stored)
+                .unwrap()
+                .contains("buildhost")
+        );
+        // The same groups the reference summary makes from the three reports.
+        let reference = summarize_usage(&[plain, named, other]).unwrap();
+        let by_agent = |mut groups: Vec<TokenGroup>| {
+            groups.sort_by(|a, b| a.agent.cmp(&b.agent));
+            groups
+        };
+        assert_eq!(
+            by_agent(stored.token_groups.clone()),
+            by_agent(reference.token_groups)
+        );
+        assert_eq!(stored.cost_groups, reference.cost_groups);
+        let merged = &stored.token_groups[0];
+        assert_eq!(merged.agent, "client-host-0a1b2c3d");
+        assert_eq!((merged.observations, merged.input_tokens), (2, Some(7)));
+        assert_eq!(merged.output_tokens, Some(11));
+        assert_eq!(merged.cache_read_input_tokens, Some(80));
+        assert_eq!(merged.input_known_observations, 1);
+        assert_eq!(merged.cache_read_input_known_observations, 2);
+        assert_eq!(stored.cost_groups[0].amount_micros, 10);
     }
     #[test]
     fn a_stored_report_is_shown_without_its_identifiers() {
