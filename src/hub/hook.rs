@@ -1371,7 +1371,23 @@ impl Call {
         } else {
             ", then make the edit again"
         };
+        // Live Work exists but the path is outside its declared scope.
+        let scope_id = work
+            .filter(|(item, _)| matches!(item.state, WorkState::Active | WorkState::Blocked))
+            .map(|(item, _)| item.id.as_str());
         let recovery = match work {
+            _ if self.child && scope_id.is_some() => {
+                let id = scope_id.unwrap_or_default();
+                let tail = if applied {
+                    "Tell your parent, which holds the claim, to record them"
+                } else {
+                    "Finish without this edit and tell your parent it was refused, so it can record them"
+                };
+                format!(
+                    "You are a subagent: these files are outside the scope of {id}, which your parent session leads. Do not start, join or take over Work from here. {tail}: the parent should checkpoint {paths} into its scope{itself}.",
+                    itself = if applied { "" } else { " or make the edit itself" },
+                )
+            }
             _ if self.child && applied => {
                 "You are a subagent: do not start, join or take over Work from here. Tell your parent, which holds the claim, that these files are outside its Work so it can record them."
                     .to_owned()
@@ -1385,10 +1401,11 @@ impl Call {
             ),
             Some((item, true)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
                 format!(
-                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}.",
+                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{named},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":[\"<each current scope path>\",{inner}]}} on standard input.",
                     id = item.id,
                     generation = item.generation,
                     seq = item.updated_seq,
+                    inner = paths.trim_start_matches('[').trim_end_matches(']'),
                 )
             }
             Some((item, _)) if item.state == WorkState::Finished => format!(
@@ -1411,14 +1428,19 @@ impl Call {
                 "Link it: call agentscm_start with session {named}, your task and paths {paths}{again}."
             ),
         };
+        let cause = if scope_id.is_some() {
+            "outside the declared scope of its Work"
+        } else {
+            "not linked to a current assignment of this session"
+        };
         if applied {
             return format!(
-                "{}\nAgentSCM: {EDIT_UNLINKED}: these files are not linked to a current assignment of this session. {recovery} No new file intent was announced.",
+                "{}\nAgentSCM: {EDIT_UNLINKED}: these files are {cause}. {recovery} No new file intent was announced.",
                 self.observed_line()
             );
         }
         format!(
-            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is not linked to a current assignment of this session. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
+            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is {cause}. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
         )
     }
 
@@ -2363,6 +2385,32 @@ mod tests {
             "{child}"
         );
         assert!(!child.contains("call agentscm_start with"), "{child}");
+        // Out-of-scope edits name the scope; a lead also gets the CLI checkpoint route.
+        let active = overlap_side("a", WorkState::Active, ClaimStatus::Active);
+        let lead = edit(json!({})).unlinked_refusal(Some((&active, true)));
+        assert!(
+            lead.contains("this edit was not applied because it is outside the declared scope"),
+            "{lead}"
+        );
+        assert!(
+            lead.contains("agentscm work checkpoint --request -"),
+            "{lead}"
+        );
+        assert!(
+            lead.contains("\"scope\":[\"<each current scope path>\",\"src/a.rs\"]"),
+            "{lead}"
+        );
+        let scoped = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, false)));
+        assert!(
+            scoped.starts_with("AgentSCM: EDIT_UNLINKED: this edit was not applied"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("outside the scope of wrk_a, which your parent session leads")
+                && scoped.contains("parent should checkpoint [\"src/a.rs\"] into its scope")
+                && scoped.contains("Do not start, join or take over Work"),
+            "{scoped}"
+        );
         // Without a usable session ID none is shown or guessed.
         let unnamed = Call::parse(
             Agent::Claude,
