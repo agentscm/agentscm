@@ -44,12 +44,12 @@ use super::connection::{
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
     CoordinationInboxQuery, CoordinationListQuery, CoordinationProposal, CoordinationReply,
-    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationStatus,
-    CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
+    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationResponseKind,
+    CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
+    response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -7584,7 +7584,15 @@ fn checkpoint_overlap_in(
         work_transition::needs_resume(checkpoint.kind)?;
     }
     let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
-        HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
+        HubError::Input(
+            super::error_envelope::InputProblem::new(
+                "expected_updated_seq",
+                super::error_envelope::FieldProblem::Missing,
+                "Send the Work's current updated_seq as expected_updated_seq for a new checkpoint.",
+            )
+            .into_iter()
+            .collect(),
+        )
     })?;
     if expected != item.updated_seq {
         // See SQLite parity: receipt absence is definitive only when
@@ -15249,6 +15257,11 @@ impl Store for PgStore {
                     "coordination request changed; current updated_seq is {}",
                     request.updated_seq
                 )));
+            }
+            if reply.kind == CoordinationResponseKind::Join
+                && let Some(work) = scoped_work(&mut tx, &who, &target.work_id, now, false)?
+            {
+                join_uncovered(reply.kind, &work.scope, &request.proposal.scope)?;
             }
             let updates: i64 = tx
                 .query_one(

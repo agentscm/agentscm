@@ -290,7 +290,8 @@ impl Fixture {
                 tree: git(&self.source, &["rev-parse", "HEAD^{tree}"]),
             },
             context: GitValidationContext {
-                base_ref: "refs/heads/main".into(),
+                // The CLI's default `--base-ref main`, which the Hub must accept (#538).
+                base_ref: "main".into(),
                 merge_base: self.base.clone(),
             },
             base_tip: self.base.clone(),

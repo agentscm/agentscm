@@ -625,6 +625,18 @@ fn wrong_repository_and_stale_head() {
         c.observed[index] = value.into();
         fails(c, "stale attestation");
     }
+    // The CLI records `main` by default; `main` and `refs/heads/main` name one base.
+    for (recorded, observed) in [("main", "refs/heads/main"), ("refs/heads/main", "main")] {
+        let mut c = Case::new();
+        c.record.context.base_ref = recorded.into();
+        c.observed[3] = observed.into();
+        let verdict = c.run();
+        assert_eq!(verdict.state, VerdictState::Success, "{verdict:?}");
+    }
+    let mut c = Case::new();
+    c.record.context.base_ref = "main".into();
+    c.observed[3] = "refs/heads/other".into();
+    fails(c, "stale attestation");
 }
 
 #[test]
