@@ -2190,7 +2190,8 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
+async fn a_refused_start_says_a_quiet_leading_agent_cannot_answer_only_when_its_session_is_not_live()
+ {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");
     let bob = hub.secret(2, "bob-agent");
@@ -2225,6 +2226,7 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
         .await;
     let said = refused(&running);
     assert!(!said.contains("is not running"), "{said}");
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
     // It says when the request is raised to that lead's person if it is not acknowledged.
     assert!(
         said.contains(&format!(
@@ -2244,6 +2246,28 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
         .await;
     assert_eq!(paused["isError"], false, "{paused}");
 
+    // Paused Work, but its session called a moment ago: it can still reply, and nothing says
+    // it is not running.
+    let quiet = hub
+        .tool_result(
+            &carol,
+            "agentscm_start",
+            overlap("add a digest filter", "carol"),
+        )
+        .await;
+    let said = refused(&quiet);
+    assert!(
+        said.contains("is quiet but its session is live") && !said.contains("is not running"),
+        "{said}"
+    );
+    assert!(!said.contains("lapses by itself"), "{said}");
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
+
+    // Once its session has not called for longer than a session lives, it cannot answer. The
+    // reply still promises no lapse: a hold can be retained.
+    let db = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+    db.execute("UPDATE hub_sessions SET updated_at = 0", [])
+        .unwrap();
     let idle = hub
         .tool_result(
             &carol,
@@ -2255,10 +2279,17 @@ async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
     assert!(
         said.contains(&format!("The agent leading {work_id} is not running"))
             && said.contains("It is not raised in the AgentSCM Hub's Needs you")
-            && !said.contains("raised to its person"),
+            && !said.contains("raised to its person")
+            && !said.contains("lapses by itself")
+            && !said.contains("is quiet but its session is live"),
         "{said}"
     );
+    assert!(said.contains("agentscm_work_status says whether its hold lapses or is retained"));
+    assert!(said.contains(INBOX_SENTENCE), "{said}");
 }
+
+const INBOX_SENTENCE: &str =
+    "Read agentscm_coordination_inbox for a reply before planning to wait out a lease.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_are_tool_results_with_fixed_text() {
