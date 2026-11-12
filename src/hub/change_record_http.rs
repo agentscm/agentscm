@@ -21,6 +21,7 @@ use crate::store::digest;
 use super::change_record::{ConversationAudience, SharedBodyRow, SharedBodyState};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Store, unix_now};
+use super::work::WorkRepositoryScope;
 use super::{HubError, HubState, Principal};
 use serde::Deserialize;
 
@@ -470,15 +471,18 @@ async fn upload_body(
     }
     let store = state.store.clone();
     let objects = state.objects.clone();
-    let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
+    let (hub, repository) = (state.clone(), WorkRepositoryScope::of(&principal));
     let token = principal.token_id;
     let admin = state.login.is_admin_user(&principal.owner);
     let (author, repository_id) = (principal.owner.id, principal.repository_id);
     blocking(&state, move || -> Result<Refusal, HubError> {
         let now = unix_now();
-        // Off means off: nothing more is stored once the repository stops sharing or this
-        // person opts out, whatever the client still holds.
-        if !super::conversation_sharing::person_shares(&*store, &author, repository_id)? {
+        let retention = hub.shared_conversation_retention_days(&repository)? * 24 * 60 * 60;
+        // Off means off: nothing more is stored once the repository stops sharing, keeps no
+        // bodies, or this person opts out, whatever the client still holds.
+        if retention == 0
+            || !super::conversation_sharing::person_shares(&*store, &author, repository_id)?
+        {
             return Ok(Err(ApiError::new(StatusCode::FORBIDDEN, "sharing_off")));
         }
         let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
@@ -602,14 +606,15 @@ async fn missing_bodies(
         return Err(ApiError::invalid());
     }
     let store = state.store.clone();
+    let (hub, repository) = (state.clone(), WorkRepositoryScope::of(&principal));
     let token = principal.token_id;
     let digests = request.digests;
     let (author, repository_id) = (principal.owner.id, principal.repository_id);
     let Some((rows, shares)) = ({
         let digests = digests.clone();
         blocking(&state, move || {
-            let shares =
-                super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
+            let shares = hub.shared_conversation_retention_days(&repository)? > 0
+                && super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
             Ok(store
                 .shared_bodies_own(&token, &work_id, &digests, unix_now())?
                 .map(|rows| (rows, shares)))
@@ -618,8 +623,8 @@ async fn missing_bodies(
     }) else {
         return Err(ApiError::not_found());
     };
-    // While sharing is off nothing is missing, so the client sends nothing and its bodies stay
-    // declared `local` on the Hub.
+    // While sharing is off or the repository keeps no bodies nothing is missing, so the client
+    // sends nothing and its bodies stay declared `local` on the Hub.
     if !shares {
         return Ok(Json(ConversationMissingV1::default()));
     }

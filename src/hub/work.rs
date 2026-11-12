@@ -914,6 +914,16 @@ impl WorkCheckpoint {
 }
 
 impl WorkRepositoryScope {
+    /// The repository a repository-bound token works in.
+    pub(super) fn of(principal: &super::Principal) -> Self {
+        Self {
+            provider: principal.owner.identity.provider.clone(),
+            host: principal.owner.identity.host.clone(),
+            repository: principal.repository.clone(),
+            repository_id: principal.repository_id,
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         label("provider", &self.provider)?;
         label("host", &self.host)?;

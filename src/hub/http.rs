@@ -572,9 +572,20 @@ async fn whoami(
     State(state): State<HubState>,
     Reader(principal): Reader,
 ) -> Json<serde_json::Value> {
+    let (hub, repository) = (
+        state.clone(),
+        super::work::WorkRepositoryScope::of(&principal),
+    );
+    // Unknown (null) rather than a failed identity check when the number cannot be read.
+    let retention_days = blocking(&state, move || {
+        hub.shared_conversation_retention_days(&repository)
+    })
+    .await
+    .inspect_err(super::error_envelope::log_internal)
+    .ok();
     let owner = principal.owner;
     Json(json!({
-        "shared_conversation_retention_days": state.shared_conversation_retention_days,
+        "shared_conversation_retention_days": retention_days,
         "token": {
             "id": principal.token_id,
             "name": principal.name,
