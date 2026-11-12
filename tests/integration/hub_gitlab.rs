@@ -1664,3 +1664,32 @@ async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
         .unwrap();
     assert_eq!(forge.state, CatchupCoverageState::ObservedOnly);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renamed_or_moved_project_is_followed_by_its_id() {
+    let env = Env::start().await;
+    add_mr(&env, 91, &["src/a.rs"]);
+    env.poll().await;
+    let before = env.repo();
+    env.fake.with(|s| {
+        s.projects.get_mut(&REPO_ID).unwrap().path_with_namespace = "acme-new/widgets".into();
+    });
+    env.poll().await;
+    let after = env
+        .store
+        .repository_named(&env.host, "acme-new/widgets")
+        .unwrap()
+        .expect("the repository follows its new path");
+    assert_eq!((after.id, after.repository_id), (before.id, REPO_ID));
+    assert!(
+        env.store
+            .repository_named(&env.host, REPO)
+            .unwrap()
+            .is_none(),
+        "the old path no longer names it"
+    );
+    assert_eq!(env.events("repository_renamed").len(), 1);
+    // Unchanged on the next poll: no second rename.
+    env.poll().await;
+    assert_eq!(env.events("repository_renamed").len(), 1);
+}
