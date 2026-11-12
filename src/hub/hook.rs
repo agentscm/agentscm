@@ -24,7 +24,10 @@ use super::advice::{agent_name, unknown};
 use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
-use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
+use super::coordination::{
+    CoordinationInboxQuery, CoordinationRequest, CoordinationStatus, RequestedPathsHold,
+    response_kind_name,
+};
 use super::error_envelope::{self, ErrorCode, ErrorEnvelope};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
@@ -47,6 +50,8 @@ pub const START_CONTEXT: usize = 9_000;
 const SHORTENED: &str = "\nAgentSCM: the rest of this context was cut to fit the agent's context limit; read agentscm_work_status, agentscm_work_briefing and agentscm_work_overview for it.";
 /// For the whole request, body included.
 const BUDGET: Duration = Duration::from_secs(5);
+/// The most a prompt or check hook spends on merged-Work notices, after the person's messages.
+const MERGED_NOTICE_BUDGET: Duration = Duration::from_millis(500);
 const MAX_TASK_BYTES: usize = 500;
 const MAX_AGENT_BYTES: usize = 32;
 const ROOT_HEADER: &str = "x-agentscm-root";
@@ -195,6 +200,9 @@ struct Call {
     /// What the hook client observed a shell call do to the working tree, on the call that ends
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
+    /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
+    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    notice: Option<Shape>,
 }
 
 /// At most this many paths in one observation; more set `truncated`. Defined here, not in the
@@ -304,6 +312,9 @@ struct Outcome {
     status: &'static str,
     /// Why the edit is refused.
     deny: Option<String>,
+    /// Start only: owner finish lines in `text` not yet claimed. `hook` claims each one that
+    /// survives rendering and drops the rest, so a cut line is offered again at a later start.
+    owner_notices: Vec<super::merged_holds::MergedNotice>,
 }
 
 impl Outcome {
@@ -312,6 +323,7 @@ impl Outcome {
             text: String::new(),
             status: "clean",
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 
@@ -321,6 +333,7 @@ impl Outcome {
             text: unknown(reason),
             status: "unknown",
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 
@@ -334,6 +347,7 @@ impl Outcome {
             text,
             status,
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 }
@@ -352,7 +366,7 @@ async fn hook(
     let measured = (token.clone(), repo.clone());
     let started = Instant::now();
     let deadline = started + BUDGET;
-    let call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
+    let mut call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
         Ok(Ok(bytes)) => Call::parse(agent, &bytes, root_header(&parts.headers)),
         Ok(Err(_)) => Call::failed(agent, "hook payload too large"),
         Err(_) => Call::failed(agent, "hub timed out"),
@@ -386,6 +400,7 @@ async fn hook(
                 text: error.hook_note(),
                 status: "unknown",
                 deny: None,
+                owner_notices: Vec::new(),
             },
             Some(error),
         ),
@@ -396,6 +411,7 @@ async fn hook(
                     text: error.hook_note(),
                     status: "unknown",
                     deny: None,
+                    owner_notices: Vec::new(),
                 },
                 Some(error),
             )
@@ -483,12 +499,49 @@ async fn hook(
                                         && reply.responder.session == session
                                 })
                         });
-                        // A prompt repeats every turn, so it carries only what this session must answer.
-                        if call.kind == Kind::Prompt && !reply_needed {
+                        let own = !reply_needed
+                            && request.requester.token == principal.token_id
+                            && request.requester.session == session;
+                        let released =
+                            request.requested_paths == Some(RequestedPathsHold::Released);
+                        // A prompt repeats every turn, so it carries only what this session must
+                        // answer, and a requester's own request only while it has news the
+                        // requester has not acknowledged.
+                        let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
+                            receipt.target_work_id.is_none()
+                                && receipt.agent.token == principal.token_id
+                                && receipt.agent.session == session
+                                && receipt.through_seq >= request.updated_seq
+                        });
+                        if call.kind == Kind::Prompt
+                            && !reply_needed
+                            // A release need not bump the request's seq (a narrowed scope or an
+                            // ended intent), so it shows whether or not the requester acked.
+                            && !(own
+                                && (released
+                                    || (unacknowledged && !request.responses.is_empty())))
+                        {
                             continue;
                         }
                         shown += 1;
-                        outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        if own {
+                            let reply =
+                                request.responses.first().map_or_else(String::new, |reply| {
+                                    let note =
+                                        reply.note.as_deref().map_or_else(String::new, |note| {
+                                            format!(": {}", bounded_hook_text(note, 200))
+                                        });
+                                    format!(" Reply {}{note}.", response_kind_name(reply.kind))
+                                });
+                            let paths = if released {
+                                " The requested paths are released: retry agentscm_start."
+                            } else {
+                                ""
+                            };
+                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        } else {
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
                                 "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline. {NO_BYPASS}",
@@ -522,6 +575,7 @@ async fn hook(
                 );
                 // An unknown reply loses its text after the session's first, so it takes nothing.
                 // A take that finishes past the deadline is offered again later (REOFFER_SECS).
+                let merged_scope = (principal.clone(), session.clone());
                 if context && outcome.status != "unknown" {
                     let (store, via) = (state.store.clone(), call.via.clone());
                     let taken = blocking(&state, move || {
@@ -532,6 +586,46 @@ async fn hook(
                         outcome.text.push_str(&text);
                         if outcome.status == "clean" {
                             outcome.status = "fyi";
+                        }
+                    }
+                }
+                // The lead of Work whose merged pull request closed its issue hears it once. The
+                // claim is the delivery, so it runs only where the text is kept. It runs after the
+                // person's messages and under its own short bound, so it cannot starve them.
+                let (scope, name) = merged_scope;
+                if context && outcome.status != "unknown" && !scope.read_only {
+                    let sub_deadline = Instant::now() + MERGED_NOTICE_BUDGET;
+                    let store = state.store.clone();
+                    let found = blocking(&state, move || {
+                        Ok(super::merged_holds::lead_notices(
+                            &*store,
+                            &scope,
+                            &name,
+                            unix_now(),
+                        ))
+                    });
+                    let notices = timeout_at(deadline.min(sub_deadline), found).await;
+                    let store = state.store.clone();
+                    let lines = match notices {
+                        Ok(Ok(notices)) if !notices.is_empty() => {
+                            blocking(&state, move || {
+                                Ok(super::merged_holds::claim_notices(
+                                    &*store,
+                                    notices,
+                                    unix_now(),
+                                ))
+                            })
+                            .await
+                        }
+                        _ => Ok(Vec::new()),
+                    };
+                    if let Ok(lines) = lines {
+                        for line in lines {
+                            outcome.text.push('\n');
+                            outcome.text.push_str(&line);
+                            if outcome.status == "clean" {
+                                outcome.status = "fyi";
+                            }
                         }
                     }
                 }
@@ -565,6 +659,14 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+    // A lapse notice is the only text an otherwise silent tool call carries.
+    if matches!(call.kind, Kind::Activity(_))
+        && outcome.status == "fyi"
+        && let Some(shape) = call.notice
+    {
+        call.shape = shape;
+    }
+    settle_owner_lines(&state, &call, &mut outcome).await;
     let rendered = call.render(&outcome);
     let sample = super::hook_overhead::sample(
         call.session.as_deref(),
@@ -583,6 +685,60 @@ async fn hook(
         );
     }
     Ok(response)
+}
+
+/// Claims the owner finish lines of a start reply that the rendered text still shows, outside the
+/// call's deadline like the lead notice of a prompt. A line another session won, one the fitting
+/// cut, one that missed the claim's own bound, or any line of an unknown reply is removed or left
+/// unclaimed, so it is offered again at a later start.
+async fn settle_owner_lines(state: &HubState, call: &Call, outcome: &mut Outcome) {
+    let mut pending = std::mem::take(&mut outcome.owner_notices);
+    if outcome.status == "unknown" {
+        for notice in &pending {
+            drop_line(&mut outcome.text, notice.line());
+        }
+        return;
+    }
+    // Dropping a line can bring one the fitting cut back in, so render again until all settle.
+    while !pending.is_empty() {
+        let shown = call.render(outcome).to_string();
+        let (present, cut): (Vec<_>, Vec<_>) = pending.into_iter().partition(|notice| {
+            let escaped = serde_json::to_string(notice.line()).unwrap_or_default();
+            shown.contains(escaped.trim_matches('"'))
+        });
+        pending = cut;
+        if present.is_empty() {
+            return;
+        }
+        let all: Vec<String> = present.iter().map(|n| n.line().to_string()).collect();
+        let store = state.store.clone();
+        let won = tokio::time::timeout(
+            MERGED_NOTICE_BUDGET,
+            blocking(state, move || {
+                Ok(super::merged_holds::claim_notices(
+                    &*store,
+                    present,
+                    unix_now(),
+                ))
+            }),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        let mut lost = false;
+        for line in all.iter().filter(|line| !won.contains(line)) {
+            drop_line(&mut outcome.text, line);
+            lost = true;
+        }
+        if !lost {
+            return;
+        }
+    }
+}
+
+fn drop_line(text: &mut String, line: &str) {
+    *text = text.replacen(&format!("{line}\n"), "", 1);
 }
 
 fn first_note(key: String) -> bool {
@@ -636,6 +792,11 @@ async fn authenticate(
     let principal = blocking(state, move || store.authenticate(&digest, unix_now()))
         .await
         .map_err(reason)?
+        .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
+    // The embedder's grant applies here as on every other token route.
+    let principal = super::access::token(state, principal)
+        .await
+        .map_err(reason)?
         .filter(|principal| !principal.read_only) // a read-only token is as good as an unknown one
         .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
     if repo.is_some_and(|repo| repo != principal.repository) {
@@ -665,7 +826,21 @@ impl Call {
             cleared: false,
             launched: None,
             observed: None,
+            notice: None,
         }
+    }
+
+    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
+    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+        let event = match event {
+            "PreToolUse" => "PreToolUse",
+            "PostToolUse" => "PostToolUse",
+            _ => return self,
+        };
+        if agent == Agent::Claude {
+            self.notice = Some(Shape::Hook(event));
+        }
+        self
     }
 
     /// The shell call this call ends changed these files (observed by the hook client): already
@@ -930,6 +1105,7 @@ impl Call {
             Kind::Activity(phase) => {
                 // Best effort and silent: the touch renews the session's own leases, and a
                 // failure must not disturb the agent. An unnamed session renews nothing.
+                let mut lapsed = None;
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
                     self.note_subagents(state, &principal);
@@ -941,16 +1117,35 @@ impl Call {
                         report: false,
                         ..heartbeat
                     };
-                    if let Err(error) = blocking(state, move || {
-                        store.session_activity(&principal.token_id, &heartbeat, phase, unix_now())
+                    let id = principal.token_id.clone();
+                    let found = blocking(state, move || {
+                        store.session_activity(&id, &heartbeat, phase, unix_now())
                     })
                     .await
-                    {
-                        return Err(reason(error));
-                    }
+                    .map_err(reason)?;
+                    // Once per lapse, to the lead itself: a subagent's context ends with it.
+                    lapsed = found.filter(|text| {
+                        !self.child
+                            && self.notice.is_some()
+                            && first_note(format!("lapse\0{}\0{text}", principal.token_id))
+                    });
                 }
-                // Only a shell call's end that could not observe its changes says anything.
-                Ok(Outcome::advice(self.observed_line(), false))
+                // Only a shell call's end that could not observe its changes, or a lapse the
+                // lead has not been told of, says anything.
+                let mut outcome = Outcome::advice(self.observed_line(), false);
+                if let Some(text) = lapsed {
+                    let text = text.replace("when this was refused", "at this tool call");
+                    outcome.text = format!(
+                        "{}AgentSCM: this session's hold lapsed, so its next edit is refused until it holds the Work again. {text}",
+                        if outcome.text.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}\n", outcome.text)
+                        }
+                    );
+                    outcome.status = "fyi";
+                }
+                Ok(outcome)
             }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
@@ -1042,6 +1237,7 @@ impl Call {
                     let text = self.unlinked_refusal(Some((item, lead)));
                     return Ok(Outcome {
                         deny: self.deny.then(|| text.clone()),
+                        owner_notices: Vec::new(),
                         text,
                         status: if applied { "fyi" } else { "stop" },
                     });
@@ -1096,6 +1292,7 @@ impl Call {
                         };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
+                            owner_notices: Vec::new(),
                             text,
                             status: if applied { "fyi" } else { "stop" },
                         });
@@ -1159,6 +1356,7 @@ impl Call {
                         }
                         Outcome {
                             deny: Some(text.clone()),
+                            owner_notices: Vec::new(),
                             text,
                             status: "stop",
                         }
@@ -1233,10 +1431,45 @@ impl Call {
                     .await
                     .unwrap_or_else(|_| unknown("other agents could not be listed"));
                 let status = Outcome::advice(advice.text.clone(), advice.stop).status;
-                let mut text = if advice.text.is_empty() {
+                // Work of this owner whose merged pull request closed its issue: once each, ever.
+                // The claim is the delivery, so `hook` makes it after rendering, for the lines the
+                // reply still shows, and drops a line another session won.
+                let owner_notices = if !principal.read_only && !self.child {
+                    let (store, scope, name) = (
+                        state.store.clone(),
+                        principal.clone(),
+                        advice.touched.session.clone(),
+                    );
+                    let found = tokio::time::timeout(
+                        MERGED_NOTICE_BUDGET,
+                        blocking(state, move || {
+                            Ok(super::merged_holds::owner_start_notices(
+                                &*store,
+                                &scope,
+                                &name,
+                                unix_now(),
+                            ))
+                        }),
+                    )
+                    .await;
+                    match found {
+                        Ok(Ok(notices)) => notices,
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                let mut head = advice.text.clone();
+                for notice in &owner_notices {
+                    if !head.is_empty() {
+                        head.push('\n');
+                    }
+                    head.push_str(notice.line());
+                }
+                let mut text = if head.is_empty() {
                     listing
                 } else {
-                    format!("{}\n{listing}", advice.text)
+                    format!("{head}\n{listing}")
                 };
                 let store = state.store.clone();
                 let setup = state.onboarding.clone();
@@ -1299,10 +1532,12 @@ impl Call {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }
+                // Claimed by `hook`, once the rendered text shows the line.
                 Ok(Outcome {
                     text,
                     status,
                     deny: None,
+                    owner_notices,
                 })
             }
             Kind::Done => {
@@ -1848,6 +2083,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
+                .noticed(agent, event)
                 .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
@@ -1856,7 +2092,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Kind::Activity(phase(tool, event == "PreToolUse")),
             Shape::Silent,
         )
-        .launched(&v["subagent"]),
+        .launched(&v["subagent"])
+        .noticed(agent, event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";

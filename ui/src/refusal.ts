@@ -1,4 +1,4 @@
-// Why the Hub said no, in the words the agent and the menu bar app print for the same refusal.
+// Why the Hub said no, in the words the agent prints for the same refusal.
 // When the Hub writes the sentence (`message`), this page shows it as is. For a bare code it uses
 // the shared sentence for that code, built from the same fields in the same order as the CLI.
 
@@ -38,8 +38,8 @@ const KNOWN: Record<string, (f: Fields) => string> = {
   insufficient_role: () => 'Your account’s role on the repositories connected to this Hub is too low; ask a repository owner to raise it, then sign in again.',
   not_allowed: () => 'This Hub only lets in people its admins have allowed; ask a Hub admin to add you.',
   user_disabled: () => 'Your account is turned off on this Hub; ask a Hub admin to turn it back on.',
-  login_failed: () => 'Sign-in didn’t finish; choose Sign In in the AgentSCM menu bar app to try again.',
-  sign_in_required: () => 'This computer isn’t signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app.',
+  login_failed: () => 'Sign-in didn’t finish; run agentscm hub login to try again.',
+  sign_in_required: () => 'This computer isn’t signed in to this Hub any more; run agentscm hub login.',
   access_check_unavailable: (f) => `The Hub can’t check your access to ${f.repo ?? 'that repository'}; ask a Hub admin to check that repository’s connection.`,
   permission_unavailable: (f) => `${forge(f.provider)} didn’t answer the Hub’s access check; nothing changed, so try again in a minute.`,
   device_revoked: () => 'This computer was removed from your account; sign in again to add it back.',

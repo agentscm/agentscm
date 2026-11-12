@@ -21,8 +21,7 @@ A developer signs in to a Hub with `agentscm hub login`. Today:
 - `client setup` mints one agent token per checkout for 30 days, the maximum
   (`MAX_AGENT_TOKEN_TTL_SECONDS`). Nothing renews it, so every connected checkout stops after
   30 days.
-- In an unconnected checkout the hook only reports to the tray. The tray's Connect reuses the saved
-  session and cannot start a sign-in (#116).
+- In an unconnected checkout the hook connects nothing (#116).
 
 Goal: sign in once per computer; agents then connect and keep working in any checkout of a
 repository connected to that Hub, for as long as the person keeps the needed role, with no
@@ -79,7 +78,7 @@ renewal. Its cost is a second, equivalent permission check (below), which must f
 
 | Route | Purpose |
 | --- | --- |
-| `GET /v1/hub/device` | This computer and its owner: status for the tray and hook |
+| `GET /v1/hub/device` | This computer and its owner: status for the hook |
 | `POST /v1/hub/device/tokens` | Mint or renew an agent or read-only token for the owner |
 | `DELETE /v1/hub/device/tokens/{id}` | Revoke one of the owner's agent tokens |
 | `DELETE /v1/hub/device` | Sign this computer out (revokes it and its agent tokens) |
@@ -149,8 +148,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 - A refusal (`insufficient_role`, `not_allowed`, `user_disabled`, `access_check_unavailable`,
   `sign_in_required`) is recorded for that checkout. The current token keeps working until it
   expires or is revoked. At the next session start the hook adds one line to the agent context
-  with the Hub's sentence, and the menu bar app marks the checkout **Needs attention** with the
-  same sentence. A Hub or forge that does not answer (`permission_unavailable`, a network error)
+  with the Hub's sentence. A Hub or forge that does not answer (`permission_unavailable`, a network error)
   is not a refusal: nothing is recorded and the next hook call tries again.
 
 ## Auto-connect
@@ -172,14 +170,14 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 - For `not_connected` on an `owner/name`, the Hub asks, for each connected repository with the
   same name (at most five), only that repository's own connection whether the requested one is
   its fork; when its parent or source is that repository, the refusal says so and names it
-  (`fork_of`). No other connection's credential is used for the lookup. The agent and the menu bar app show that sentence. The client
+  (`fork_of`). No other connection's credential is used for the lookup. The agent shows that sentence. The client
   never guesses the upstream and never changes the remote.
 - On success it binds the checkout through the existing connect path: invocation-program fence,
   client lifecycle lock, revalidation of root, origin and `connections.json`, token file under the
   config directory. It **never installs agent files into the checkout** (no `.mcp.json`,
   `.claude/…`, `.git/info/exclude` edits); the user-level plugin that ran the hook keeps working.
   The agent's context gets one line: `AgentSCM: coordinating on owner/repo at <Hub>`.
-- A refusal is recorded for the checkout and shown in the agent's context and the menu bar app.
+- A refusal is recorded for the checkout and shown in the agent's context.
 
 ## Revocation and administration
 
@@ -204,12 +202,11 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 ## Migration
 
 - Saved sign-ins without a credential keep working until their session ends. Connect (`client
-  setup`, tray Connect, auto-connect), renewal, tray Open Hub and `agentscm open` enroll one with
+  setup`, auto-connect), renewal and `agentscm open` enroll one with
   `POST /v1/hub/devices` when they find a live session and no credential, with no prompt.
-- People who signed in before this change, or from the menu bar app, were never asked about
-  auto-connect. The next interactive moment asks once: a one-time menu bar item "Connect agents
-  automatically on <Hub>?" (Yes / Not Now), or the next interactive `agentscm hub` or
-  `agentscm client` command at a terminal. The answer is remembered either way.
+- People who signed in before this change were never asked about auto-connect. The next
+  interactive `agentscm hub` or `agentscm client` command at a terminal asks once. The answer is
+  remembered.
 - Existing 30-day agent tokens keep working until they expire and are renewed into 24-hour device
   tokens once a credential exists. A person whose session has already expired signs in once.
 - The schema change is additive (`hub_devices`, `hub_sign_in_refusals`, nullable

@@ -1344,6 +1344,125 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
     let context = text_at(&answer, CLAUDE_CONTEXT);
     assert!(context.contains("wait for your lead session"), "{answer}");
     assert!(!context.contains(&request), "{answer}");
+
+    // Once the holder answers, the requester's next prompt carries the reply and is never held.
+    {
+        use agentscm::hub::coordination::{
+            CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+        };
+        let lead_token = token_id(&lead);
+        let now = unix_now();
+        let page = hub
+            .store
+            .coordination_inbox(
+                &lead_token,
+                &CoordinationInboxQuery {
+                    session: Some(session.into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap();
+        let open = &page.requests[0];
+        let target = open.targets[0].work_id.clone();
+        let acknowledged = hub
+            .store
+            .coordination_ack(
+                &lead_token,
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: Some(target.clone()),
+                    session: session.into(),
+                    expected_updated_seq: open.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        hub.store
+            .coordination_reply(
+                &lead_token,
+                &CoordinationReply {
+                    request_id: request.clone(),
+                    operation_id: "decline-widget".into(),
+                    target_work_id: target,
+                    session: session.into(),
+                    expected_updated_seq: acknowledged.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: Some("Still editing the widget".into()),
+                    via: agentscm::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        let context = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(context.contains(&request), "{answer}");
+        assert!(context.contains("Reply decline"), "{answer}");
+        assert!(context.contains("Still editing the widget"), "{answer}");
+        assert!(!context.contains("report a split/join"), "{answer}");
+        // Once the requester acknowledges the news, its prompts stay quiet again.
+        let request_now = hub
+            .store
+            .coordination_inbox(
+                &token_id(&other),
+                &CoordinationInboxQuery {
+                    session: Some("other-session".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+            .requests
+            .remove(0);
+        hub.store
+            .coordination_ack(
+                &token_id(&other),
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: None,
+                    session: "other-session".into(),
+                    expected_updated_seq: request_now.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+        // A holder narrowing its scope off the file changes no request seq, yet the release
+        // still reaches the requester's next prompt although it acknowledged the reply.
+        let held = hub
+            .store
+            .work_for_session(&lead_token, session, now)
+            .unwrap()
+            .unwrap();
+        hub.store
+            .work_checkpoint(
+                &lead_token,
+                &agentscm::hub::work::WorkCheckpoint {
+                    work_id: held.id,
+                    operation_id: "narrow-widget".into(),
+                    generation: held.generation,
+                    session: session.into(),
+                    expected_updated_seq: Some(held.updated_seq),
+                    kind: agentscm::hub::work::CheckpointKind::Progress,
+                    summary: "moved off the widget".into(),
+                    next_action: None,
+                    scope: Some(vec!["src/other.rs".into()]),
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        assert!(
+            text_at(&answer, CLAUDE_CONTEXT).contains("requested paths are released"),
+            "{answer}"
+        );
+    }
 }
 
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy
@@ -1411,6 +1530,71 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
     let bash = json!({"hook_event_name":"PreToolUse", "session_id":session,
         "tool_name":"Bash", "tool_input":{"command":"cargo test"}, "cwd":"/work/acme-widgets"});
     assert_eq!(hub.hook("claude", &lead, &bash), json!({}));
+    assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}
+
+/// A subagent's tool calls carry its parent's session and renew the parent's lease as the
+/// parent's own calls do, whatever the tool (#542 item 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subagents_tool_calls_renew_its_parent_sessions_lease() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let started = unix_now() - 600;
+    let item = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("delegating".into()),
+                title: "delegating".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            started,
+        )
+        .unwrap()
+        .item;
+    let expiry = |hub: &Hub| {
+        hub.store
+            .work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::One(&item.id),
+                unix_now(),
+            )
+            .unwrap()
+            .work[0]
+            .activity
+            .lease_expires_at
+            .unwrap()
+    };
+    assert_eq!(expiry(&hub), started + LEASE_SECONDS);
+    let before = unix_now();
+    let read = json!({"hook_event_name":"PostToolUse", "session_id":session,
+        "agent_id":"sub-1", "agent_type":"general-purpose",
+        "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+        "cwd":"/work/acme-widgets"});
+    assert_eq!(hub.hook("claude", &lead, &read), json!({}));
     assert!(expiry(&hub) >= before + LEASE_SECONDS);
 }
 
@@ -1643,6 +1827,181 @@ async fn observed_shell_changes_on_lapsed_work_are_reported_as_applied() {
     );
 }
 
+/// Starts or resumes Work for `session` at `at`, as `agentscm_start` does.
+fn start_work(
+    hub: &Hub,
+    token: &str,
+    session: &str,
+    scope: &[&str],
+    resume: Option<(&str, i64)>,
+    at: i64,
+) -> agentscm::hub::work::WorkItem {
+    hub.store
+        .work_start(
+            token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: resume.map(|(id, _)| id.to_owned()),
+                source: None,
+                request_key: resume.is_none().then(|| "scoped".into()),
+                title: "scoped".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: scope.iter().map(|path| (*path).to_owned()).collect(),
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: resume.map(|(_, generation)| generation),
+                preflight: None,
+            },
+            at,
+        )
+        .unwrap()
+        .item
+}
+
+fn edit_of(tool: &str, session: &str, file: &str) -> Value {
+    let mut payload = fixture("claude-PreToolUse-Edit");
+    payload["tool_name"] = json!(tool);
+    payload["session_id"] = json!(session);
+    payload["tool_input"]["file_path"] = json!(format!("/work/acme-widgets/{file}"));
+    payload
+}
+
+/// #542 items 5 and 13: during a live hold an edit outside the declared scope is refused
+/// whether it is a `Write` or an `Edit` and whether the file exists, since the Hub sees only
+/// the path. A directory entry (`docs/**`) covers every file under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_refusals_follow_the_declared_scope_not_the_tool_or_file() {
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs", "docs/**"],
+        None,
+        unix_now(),
+    );
+    for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
+        let answer = hub.hook_raw("claude", &lead, &edit_of(tool, session, file));
+        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+        assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
+        assert!(
+            reason.contains("outside the declared scope"),
+            "{tool} {file}: {answer}"
+        );
+    }
+    for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
+        hub.hook("claude", &lead, &edit_of(tool, session, file));
+    }
+}
+
+/// #542 item 10: after a lapsed hold is resumed, an out-of-scope refusal quotes the resumed
+/// generation and its current fence, not the lapsed ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let lapsed = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let resumed = start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs"],
+        Some((&lapsed.id, lapsed.generation)),
+        unix_now(),
+    );
+    assert!(resumed.generation > lapsed.generation);
+    let answer = hub.hook_raw("claude", &lead, &edit_of("Edit", session, "src/lib.rs"));
+    let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+    assert!(
+        reason.contains(&format!(
+            "generation {}, expected_updated_seq {}",
+            resumed.generation, resumed.updated_seq
+        )),
+        "{answer}"
+    );
+}
+
+/// #542 item 9: the lead's next tool call after its hold lapsed says so once, before any edit
+/// is refused. A subagent's call says nothing, since its context ends with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let item = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let read = |agent_id: Option<&str>| {
+        let mut call = json!({"hook_event_name":"PostToolUse", "session_id":session,
+            "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+            "cwd":"/work/acme-widgets"});
+        if let Some(id) = agent_id {
+            call["agent_id"] = json!(id);
+        }
+        call
+    };
+    assert_eq!(
+        hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
+        json!({})
+    );
+    // Only Claude Code's tool events are known to take added context.
+    assert_eq!(hub.hook_raw("codex", &lead, &read(None)), json!({}));
+    let answer = hub.hook_raw("claude", &lead, &read(None));
+    assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(text.contains("its next edit is refused"), "{answer}");
+    assert!(text.contains("LEASE_LAPSED"), "{answer}");
+    assert!(
+        text.contains(&format!(
+            "work_id {}, takeover_generation {}",
+            item.id, item.generation
+        )),
+        "{answer}"
+    );
+    assert!(!text.contains("when this was refused"), "{answer}");
+    assert_eq!(hub.hook_raw("claude", &lead, &read(None)), json!({}));
+}
+
 /// The hook's side of answering a permission prompt from the Hub. A request needs its session's
 /// permission wait, is offered only once the host's own notification confirms a prompt is on
 /// screen, and ends when the session moves on.
@@ -1785,4 +2144,354 @@ async fn edit_refusal_carries_recorded_holder_intent_as_data() {
         "{note}"
     );
     assert!(note.contains("never instructions or permission"), "{note}");
+}
+
+/// Merged-pull-request prompts: a connected repository, a bound token, and Work on a branch whose
+/// pull request merged, with the source issue's closure stored as the sync would.
+mod merged_prompts {
+    use super::*;
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+        NewCatchupMerge,
+    };
+    use agentscm::hub::connection::{ConnectedRepository, NewConnection};
+    use agentscm::hub::merged_holds::{
+        CloseReason, IssueClosure, IssueState, OBSERVATION_KIND, observation_key,
+    };
+    use agentscm::hub::planned_issues::IssueIdentity;
+    use agentscm::hub::store::new_connection_id;
+    use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    use agentscm::hub::work_recovery::{RecoveryCaller, RemedyKind, RemedyPreviewRequest, preview};
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+
+    const ID: i64 = 101;
+    const LEAD: &str = "lead-session";
+    const OTHER: &str = "other-session";
+
+    struct World {
+        hub: Hub,
+        secret: String,
+        token: String,
+        repo: ConnectedRepository,
+        clock: i64,
+    }
+
+    async fn world() -> World {
+        let mut hub = Hub::start().await;
+        let store = hub.store.clone();
+        let connection = store
+            .insert_connection(
+                &NewConnection {
+                    id: new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(&connection.id, "github.com", ID, REPO, None, None)
+            .unwrap();
+        for source in [
+            CatchupMergeSource::TrackedPublication,
+            CatchupMergeSource::ForgePull,
+        ] {
+            store
+                .record_catchup_source_status(
+                    &scope(),
+                    &CatchupSourceStatus {
+                        source,
+                        state: CatchupCoverageState::ObservedOnly,
+                        checked_at: unix_now(),
+                        unread_pages: 0,
+                        deferred: 0,
+                        window_from: None,
+                    },
+                )
+                .unwrap();
+        }
+        hub.next_user += 1;
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: hub.next_user,
+                },
+                "merger",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(&*store, &user.id, "agent", REPO, ID, 3600, false).unwrap();
+        let secret = secret.expose().to_owned();
+        let token = store
+            .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id;
+        World {
+            hub,
+            secret,
+            token,
+            repo,
+            clock: 1_000,
+        }
+    }
+
+    fn scope() -> CatchupRepositoryScope {
+        CatchupRepositoryScope {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository: REPO.into(),
+            repository_id: Some(ID),
+        }
+    }
+
+    impl World {
+        /// Work led by `LEAD` on `branch`, linked to issue 7, whose pull request 41 merged.
+        fn merged_work(&self) -> String {
+            let store = &self.hub.store;
+            store.observe_lease_clock(unix_now()).unwrap();
+            let item = store
+                .work_start(
+                    &self.token,
+                    &serde_json::from_value::<WorkStart>(json!({
+                        "request_key": "merged", "title": "Synthetic \"merged\" Work",
+                        "session": LEAD, "scope": ["src/merged.rs"], "branch": "feature/m"
+                    }))
+                    .unwrap(),
+                    unix_now(),
+                )
+                .unwrap()
+                .item;
+            store
+                .work_issue_link_set(
+                    &self.token,
+                    &WorkIssueLinkUpdate {
+                        work_id: item.id.clone(),
+                        operation_id: "link-7".into(),
+                        generation: item.generation,
+                        session: LEAD.into(),
+                        expected_updated_seq: item.updated_seq,
+                        link: Some(IssueIdentity {
+                            provider: "github".into(),
+                            host: "github.com".into(),
+                            repository_id: ID,
+                            number: 7,
+                        }),
+                    },
+                    unix_now(),
+                )
+                .unwrap();
+            let at = unix_now() + 5;
+            store
+                .record_catchup_merge(
+                    &scope(),
+                    &NewCatchupMerge {
+                        source: CatchupMergeSource::ForgePull,
+                        source_id: "forge-pr-41".into(),
+                        occurred_at: Some(at),
+                        title: None,
+                        branch: "feature/m".into(),
+                        base: "main".into(),
+                        head_commit: "b".repeat(40),
+                        merge_commit: format!("{:040x}", 41),
+                        pull_number: 41,
+                        paths: vec!["src/merged.rs".into()],
+                        paths_complete: true,
+                        same_repository_head: true,
+                    },
+                    at + 1,
+                )
+                .unwrap();
+            item.id
+        }
+
+        fn close_issue(&mut self, closure: IssueClosure) {
+            self.clock += 1;
+            self.hub
+                .store
+                .observe(
+                    &self.repo.id,
+                    OBSERVATION_KIND,
+                    &observation_key(7),
+                    &serde_json::to_string(&closure).unwrap(),
+                    self.clock,
+                )
+                .unwrap();
+        }
+
+        fn release(&self, id: &str) {
+            let now = unix_now();
+            let plan = preview(
+                &*self.hub.store,
+                &RecoveryCaller::Agent {
+                    token: &self.token,
+                    session: Some(LEAD),
+                },
+                &RemedyPreviewRequest {
+                    work_id: id.into(),
+                    remedy: RemedyKind::Release,
+                    session: Some(LEAD.into()),
+                    scope: None,
+                    superseded_by: None,
+                },
+                now,
+            )
+            .unwrap();
+            let mut arguments = plan.apply.unwrap().arguments;
+            arguments["operation_id"] = json!("release-merged");
+            arguments["reason"] = json!("synthetic release");
+            let request: WorkTransitionRequest = serde_json::from_value(arguments).unwrap();
+            self.hub
+                .store
+                .work_transition(
+                    &WorkTransitionActor::Agent { token: &self.token },
+                    &request,
+                    now,
+                )
+                .unwrap();
+        }
+
+        fn prompt(&self, session: &str) -> String {
+            let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": session,
+                "cwd": "/work/acme-widgets", "prompt": "not read"});
+            let answer = self.hub.hook("claude", &self.secret, &payload);
+            answer
+                .pointer(CLAUDE_CONTEXT)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        }
+
+        fn start(&self, session: &str) -> String {
+            let mut payload = fixture("claude-SessionStart");
+            payload["session_id"] = json!(session);
+            let answer = self.hub.hook("claude", &self.secret, &payload);
+            text_at(&answer, CLAUDE_CONTEXT).to_owned()
+        }
+    }
+
+    fn completed() -> IssueClosure {
+        IssueClosure {
+            state: IssueState::Closed,
+            reason: CloseReason::Completed,
+            closer_pull: Some(41),
+            closer_repository_id: Some(ID),
+        }
+    }
+
+    fn lines(text: &str, needle: &str) -> usize {
+        text.lines().filter(|line| line.contains(needle)).count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_work_notifies_the_lead_and_the_owner_once() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        let notice = format!(
+            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed as completed by it. Complete it (agentscm_done with outcome complete), or if work remains, release the hold and continue later."
+        );
+        // The lead's next hook says it once.
+        let first = w.prompt(LEAD);
+        assert_eq!(lines(&first, &notice), 1, "{first}");
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 0);
+        // The owner's next session start, another session, says it once.
+        let owner = format!(
+            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed; complete it or say what is left."
+        );
+        let start = w.start(OTHER);
+        assert_eq!(lines(&start, &owner), 1, "{start}");
+        // It sits ahead of the listing and status, which a host's context limit cuts first.
+        let at = start.find(&owner).unwrap();
+        assert!(
+            at < start
+                .find("Current actionable status")
+                .unwrap_or(usize::MAX),
+            "{start}"
+        );
+        assert!(
+            at < start.find("shared work").unwrap_or(usize::MAX),
+            "{start}"
+        );
+        assert_eq!(lines(&w.start("third-session"), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claimed_owner_marker_keeps_the_line_out_of_a_start() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        // Another session already won the claim: this start shows nothing and claims nothing.
+        assert!(
+            w.hub
+                .store
+                .claim_merge_prompt(&id, "owner", unix_now())
+                .unwrap()
+        );
+        assert_eq!(lines(&w.start(OTHER), "merged and #7"), 0);
+        assert!(
+            !w.hub.store.merge_prompt_claimed(&id, "lead").unwrap(),
+            "the lead's own prompt is untouched"
+        );
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_starting_lead_is_told_only_once() {
+        let mut w = world().await;
+        w.merged_work();
+        w.close_issue(completed());
+        let start = w.start(LEAD);
+        assert_eq!(lines(&start, "merged and #7 is closed;"), 1, "{start}");
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreserved_merged_work_still_reaches_its_owner() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.release(&id);
+        let facts = agentscm::hub::merged_holds::repository_facts(
+            &*w.hub.store,
+            "github",
+            &w.repo,
+            unix_now(),
+        )
+        .unwrap();
+        assert!(facts.work.iter().any(|(item, _)| item.id == id));
+        let start = w.start(OTHER);
+        assert_eq!(lines(&start, &format!("Work {id} ")), 1, "{start}");
+        assert_eq!(lines(&w.start("third-session"), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn part_of_work_gets_no_prompt_and_keeps_its_hold() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(IssueClosure {
+            state: IssueState::Open,
+            reason: CloseReason::Other,
+            closer_pull: None,
+            closer_repository_id: None,
+        });
+        assert_eq!(lines(&w.prompt(LEAD), "merged and"), 0);
+        assert_eq!(lines(&w.start(OTHER), "merged and"), 0);
+        // The prompt was never claimed: once the issue closes it is delivered.
+        w.close_issue(completed());
+        assert_eq!(lines(&w.prompt(LEAD), &format!("Work {id} ")), 1);
+        let item = w
+            .hub
+            .store
+            .work_get(&w.token, &id, unix_now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.state, WorkState::Active);
+    }
 }

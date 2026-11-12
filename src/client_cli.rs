@@ -10,8 +10,6 @@ use agentscm::hub::forge_http::{self, check_base_url, send};
 use agentscm::hub::store::unix_now;
 use agentscm::{Error, Result};
 
-#[cfg(target_os = "macos")]
-use crate::client_config::onboarding_client;
 use crate::client_config::{
     Connection, RetiredFile, canonical_root, is_current, load, origin_identity, owned_token_path,
     remove_unreferenced_owned_file, update,
@@ -462,105 +460,6 @@ fn record_agent(root: &Path, agent: crate::client_setup::Agent) -> Result<()> {
     update(root, Some(&saved), Some(replacement))
 }
 
-/// Install one agent into an already bound checkout without minting credentials or contacting Hub.
-#[cfg(target_os = "macos")]
-pub(crate) fn setup_existing_agent(
-    agent: crate::client_setup::Agent,
-    root: &Path,
-    expected_hub: &str,
-    expected_repo: &str,
-    expected_generation: &str,
-    running_program: &Path,
-) -> Result<()> {
-    let _lifecycle = lifecycle_lock()?;
-    let saved = load()?
-        .into_iter()
-        .find(|connection| connection.root == root)
-        .ok_or_else(|| invalid("this checkout is no longer connected"))?;
-    let token = read_token(&saved.token_file)?;
-    integration_replacement(
-        &saved,
-        &token,
-        expected_hub,
-        expected_repo,
-        expected_generation,
-        agent,
-    )?;
-    let stable = installed_program(running_program)?;
-    // The tray asks nothing, so it keeps an agent's existing scope.
-    let scope = tray_scope(agent, root);
-    crate::client_setup::preflight(agent, root, &stable, scope)?;
-    let latest = load()?
-        .into_iter()
-        .find(|connection| connection.root == root)
-        .ok_or_else(|| invalid("this checkout is no longer connected"))?;
-    let latest_token = read_token(&latest.token_file)?;
-    let replacement = integration_replacement(
-        &latest,
-        &latest_token,
-        expected_hub,
-        expected_repo,
-        expected_generation,
-        agent,
-    )?;
-    // Record first so `client remove` can clean up a partially completed install.
-    // The compare-and-swap also fences reapplication if the connection changed during preflight.
-    update(root, Some(&latest), Some(replacement))?;
-    crate::client_setup::install_quiet(agent, root, &stable, scope)
-}
-
-/// The scope the tray sets an agent up in: for all projects only once that was chosen.
-#[cfg(target_os = "macos")]
-fn tray_scope(agent: crate::client_setup::Agent, root: &Path) -> crate::client_setup::Scope {
-    if crate::client_setup::user_scope_installed(agent, root) {
-        crate::client_setup::Scope::User
-    } else {
-        crate::client_setup::Scope::Checkout
-    }
-}
-
-/// `client setup` for a checkout the tray saw an agent use without a connection. The tray has
-/// no terminal, so this never starts a sign-in; it uses the saved session for `hub`.
-#[cfg(target_os = "macos")]
-pub(crate) async fn setup_unconnected(
-    agent: crate::client_setup::Agent,
-    root: &Path,
-    hub: &str,
-    running_program: &Path,
-) -> Result<()> {
-    let root = canonical_root(root)?;
-    let stable = installed_program(running_program)?;
-    let args = ConnectArgs {
-        hub: Some(hub.to_owned()),
-        no_sign_in: true,
-        ..ConnectArgs::default()
-    };
-    setup(
-        &[(agent, tray_scope(agent, &root))],
-        args,
-        root,
-        &stable,
-        None,
-    )
-    .await
-}
-
-/// The stable `~/.agentscm/bin/agentscm` link, which hooks must run, when it is this program.
-#[cfg(target_os = "macos")]
-fn installed_program(running_program: &Path) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| invalid("HOME is not set"))?;
-    let stable = PathBuf::from(home).join(".agentscm/bin/agentscm");
-    let installed = std::fs::canonicalize(&stable).map_err(|_| {
-        invalid("restart AgentSCM from the installed ~/.agentscm/bin/agentscm link")
-    })?;
-    if installed != std::fs::canonicalize(running_program)? {
-        return Err(invalid(
-            "restart AgentSCM from the installed ~/.agentscm/bin/agentscm link",
-        ));
-    }
-    Ok(stable)
-}
-
 pub(crate) fn lifecycle_lock() -> Result<std::fs::File> {
     lifecycle_lock_at(&crate::hub_cli::config_dir()?.join("agentscm/client-lifecycle.lock"))
 }
@@ -577,52 +476,6 @@ fn validate_setup_program(program: &Path) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn integration_replacement(
-    saved: &Connection,
-    token: &str,
-    expected_hub: &str,
-    expected_repo: &str,
-    expected_generation: &str,
-    agent: crate::client_setup::Agent,
-) -> Result<Connection> {
-    integration_replacement_if(
-        saved,
-        token,
-        expected_hub,
-        expected_repo,
-        expected_generation,
-        agent,
-        is_current(saved),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn integration_replacement_if(
-    saved: &Connection,
-    token: &str,
-    expected_hub: &str,
-    expected_repo: &str,
-    expected_generation: &str,
-    agent: crate::client_setup::Agent,
-    current: bool,
-) -> Result<Connection> {
-    if !current
-        || saved.hub != expected_hub
-        || saved.repo != expected_repo
-        || onboarding_client(&saved.root, token) != expected_generation
-    {
-        return Err(invalid(
-            "the checkout connection changed; refresh and try again",
-        ));
-    }
-    let mut replacement = saved.clone();
-    if !replacement.agents.iter().any(|name| name == agent.name()) {
-        replacement.agents.push(agent.name().to_owned());
-    }
-    Ok(replacement)
 }
 
 fn selected_root(given: Option<&Path>) -> Result<PathBuf> {
@@ -2241,82 +2094,6 @@ mod tests {
         assert!(label.starts_with("rm-rfnnnn"), "{label}");
         std::fs::write(&file, " !! \n").unwrap();
         assert!(label_in(Some(dir.path())).unwrap().starts_with("client-"));
-    }
-
-    #[cfg(target_os = "macos")]
-    fn integration_connection(agents: Vec<String>) -> Connection {
-        Connection {
-            root: PathBuf::from("/synthetic/checkout"),
-            origin_host: "github.com".into(),
-            hub: "https://hub.example.test".into(),
-            repo: "acme/widgets".into(),
-            token_file: PathBuf::from("/synthetic/token"),
-            report_completion: false,
-            owned_token_id: None,
-            owned_token_expires_at: None,
-            agents,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn existing_integration_requires_the_exact_current_binding() {
-        let saved = integration_connection(Vec::new());
-        let token = "opaque-token";
-        let generation = onboarding_client(&saved.root, token);
-        for (hub, repo, expected_generation, current) in [
-            (
-                "https://other.example.test",
-                saved.repo.as_str(),
-                generation.as_str(),
-                true,
-            ),
-            (saved.hub.as_str(), "other/repo", generation.as_str(), true),
-            (
-                saved.hub.as_str(),
-                saved.repo.as_str(),
-                "other-generation",
-                true,
-            ),
-            (
-                saved.hub.as_str(),
-                saved.repo.as_str(),
-                generation.as_str(),
-                false,
-            ),
-        ] {
-            assert!(
-                integration_replacement_if(
-                    &saved,
-                    token,
-                    hub,
-                    repo,
-                    expected_generation,
-                    crate::client_setup::Agent::Codex,
-                    current,
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recording_an_existing_integration_is_idempotent() {
-        let saved = integration_connection(vec!["codex".into()]);
-        let token = "opaque-token";
-        let generation = onboarding_client(&saved.root, token);
-        let replacement = integration_replacement_if(
-            &saved,
-            token,
-            &saved.hub,
-            &saved.repo,
-            &generation,
-            crate::client_setup::Agent::Codex,
-            true,
-        )
-        .unwrap();
-        assert_eq!(replacement, saved);
     }
 
     #[test]

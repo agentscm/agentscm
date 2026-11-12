@@ -1931,32 +1931,64 @@ async fn call(
     let inbox = blocking(state, move || {
         let now = unix_now();
         let session = store.session_name_for(&token, session.as_deref(), now)?;
-        store.coordination_inbox(
+        let page = store.coordination_inbox(
             &token,
             &CoordinationInboxQuery {
-                session: Some(session),
+                session: Some(session.clone()),
                 limit: 5,
                 ..Default::default()
             },
             now,
-        )
+        )?;
+        let own = page
+            .requests
+            .iter()
+            .filter(|request| {
+                request.requester.token == token && request.requester.session == session
+            })
+            .map(|request| request.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok((page, own))
     })
     .await;
     match inbox {
-        Ok(page) if !page.requests.is_empty() || !page.complete => {
+        Ok((page, own)) if !page.requests.is_empty() || !page.complete => {
             let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
-                .map(|request| json!({"request_id":request.id,"title":super::advice::sanitize(&request.proposal.title, 120),
+                .map(|request| {
+                    let mut notice = json!({"request_id":request.id,"title":super::advice::sanitize(&request.proposal.title, 120),
                     "status":request.status,"updated_seq":request.updated_seq,
                     "affected_agent_count":request.targets.len(),
                     "affected_agents_complete":request.targets.len() <= 3,
                     "affected_agents":request.targets.iter().take(3).map(|target| json!({"work_id":target.work_id,
-                        "agent":target.lead.agent,"session":target.lead.session})).collect::<Vec<_>>() })).collect::<Vec<_>>();
+                        "agent":target.lead.agent,"session":target.lead.session})).collect::<Vec<_>>() });
+                    if own.contains(&request.id) {
+                        notice["yours"] = json!(true);
+                        notice["replies"] = json!(request.responses.iter().take(3).map(|reply| json!({
+                            "kind":reply.kind,
+                            "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
+                            "responder_agent":reply.responder.agent})).collect::<Vec<_>>());
+                        notice["requested_paths"] = json!(request.requested_paths);
+                    }
+                    notice
+                }).collect::<Vec<_>>();
+            let own_notice = notices.iter().any(|notice| notice["yours"] == true);
+            let holder_notice = notices.iter().any(|notice| notice["yours"] != true);
             let summary = json!({"notices":notices,"complete":page.complete,
                 "next_after":page.next_after,"through":page.through});
             value["_meta"]["agentscm"]["coordination_notifications"] = summary.clone();
             if let Some(content) = value["content"].as_array_mut() {
-                content.push(json!({"type":"text","text":format!("AgentSCM open coordination requests (third-party task titles): {summary}. Read agentscm_coordination_inbox for the full requests and replies. Acknowledge receipt, report a split/join/handover/decline, and make the agreed change before resolving. Reading this response does not acknowledge receipt. Page incomplete inboxes before assuming coverage.")}));
+                let holder = if holder_notice || !own_notice {
+                    " For requests addressed to you: acknowledge receipt, report a split/join/handover/decline, and make the agreed change before resolving."
+                } else {
+                    ""
+                };
+                let requester = if own_notice {
+                    " For your own requests (yours: true): a reply or requested_paths \"released\" is news. If the paths are released, retry agentscm_start. A join reply admits you only over the holder's declared scope. Resolve or withdraw the request once it is settled."
+                } else {
+                    ""
+                };
+                content.push(json!({"type":"text","text":format!("AgentSCM open coordination requests (third-party task titles and reply notes): {summary}. Read agentscm_coordination_inbox for the full requests and replies.{holder}{requester} Reading this response does not acknowledge receipt. Page incomplete inboxes before assuming coverage.")}));
             }
         }
         Ok(_) => {}
@@ -3163,17 +3195,21 @@ async fn call_inner(
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
+        let caller = principal.clone();
         return Ok(
             match blocking(state, move || {
-                super::work_recovery::inspect(
+                let now = unix_now();
+                let mut recovery = super::work_recovery::inspect(
                     &*store,
                     &super::work_recovery::RecoveryCaller::Agent {
                         token: &token,
                         session: query.session.as_deref(),
                     },
                     &query,
-                    unix_now(),
-                )
+                    now,
+                )?;
+                super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+                Ok(recovery)
             })
             .await
             {
@@ -4256,16 +4292,20 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             session: Some(resolved),
             ..Default::default()
         };
+        let caller = principal.clone();
         let recovery = blocking(state, move || {
-            super::work_recovery::inspect(
+            let now = unix_now();
+            let mut recovery = super::work_recovery::inspect(
                 &*store,
                 &super::work_recovery::RecoveryCaller::Agent {
                     token: &token,
                     session: query.session.as_deref(),
                 },
                 &query,
-                unix_now(),
-            )
+                now,
+            )?;
+            super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+            Ok(recovery)
         })
         .await;
         let mut result = start_result(

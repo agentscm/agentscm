@@ -977,6 +977,14 @@ pub trait Store: Send + Sync {
         id: &str,
         now: i64,
     ) -> Result<Option<super::work_links::WorkPrLinkTarget>>;
+    /// Scoped read of the pull request targets the Work declares (`WorkDeclarations.links`).
+    /// Empty when it declares none; `None` when the Work is not in the reader's scope.
+    fn work_declared_links_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Vec<super::work_links::WorkPrLinkTarget>>>;
     /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
     fn work_pr_link_set(
         &self,
@@ -1115,15 +1123,14 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<Vec<SharedBodyRow>>>;
     /// Up to `MAX_CONVERSATION_PAGE_ENTRIES + 1` shared-conversation entries of the Work after
     /// `cursor`, ordered by (session_id bytewise, sequence, digest), when `token`'s repository
-    /// scope contains it: the caller's own declarations, or every author's when `all_authors`
-    /// (a Hub admin; see `conversation_readable`). `None` for an unknown Work; a malformed cursor
-    /// is `Invalid`.
+    /// scope contains it: the caller's own declarations and those `audience` adds. `None` for an
+    /// unknown Work; a malformed cursor is `Invalid`.
     fn shared_conversation_page(
         &self,
         token: &str,
         work_id: &str,
         cursor: Option<&str>,
-        all_authors: bool,
+        audience: super::change_record::ConversationAudience,
         now: i64,
     ) -> Result<Option<Vec<ConversationEntryV1>>>;
     /// Moves `author`'s `declared` body to `available` with `expires_at = now + retention_seconds`.
@@ -1291,14 +1298,15 @@ pub trait Store: Send + Sync {
     fn default_session_bound(&self, token: &str) -> Result<bool>;
     /// A tool call a hook reported that is not an edit check: a touch of the session, which
     /// renews its leases, and for a shell call the start or end that keeps them live while it
-    /// runs, up to the in-flight cap.
+    /// runs, up to the in-flight cap. Returns the `LEASE_LAPSED` text the session's next edit
+    /// would meet when the hold of Work it leads has lapsed, so the hook can say so first.
     fn session_activity(
         &self,
         token: &str,
         call: &SessionCall,
         phase: super::work_lifecycle::CallPhase,
         now: i64,
-    ) -> Result<()>;
+    ) -> Result<Option<String>>;
     /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
     /// observation, every reservation that was live then gets one lease of grace.
     fn observe_lease_clock(&self, now: i64) -> Result<()>;
@@ -1564,6 +1572,27 @@ pub trait Store: Send + Sync {
         limit: usize,
         current: &super::promise::PromiseCurrentAdmissionsV1,
     ) -> Result<PromisePageV1>;
+    /// Records that `audience` (`lead` or `owner`) was told `work`'s merged pull request closed
+    /// its issue. True only for the first claim, so a notice is delivered once however many
+    /// hooks race.
+    fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool>;
+    /// Gives back a claim whose action did not happen, so a later attempt can claim it again.
+    fn unclaim_merge_prompt(&self, work: &str, audience: &str) -> Result<()>;
+    /// Unfinished Work of one repository that holds no reservation and that the repository
+    /// overview hides because its branch merged, oldest first by id, at most `limit`.
+    fn repository_unreserved_merged_work(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<WorkItem>>;
+    /// The unfinished Work that `session` of `token` leads, by id, at most five.
+    fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>>;
+    /// Whether `audience` already holds a merged-prompt marker for `work` (an indexed read of the
+    /// marker's primary key), so a hook can skip Work it has nothing left to say about.
+    fn merge_prompt_claimed(&self, work: &str, audience: &str) -> Result<bool>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.

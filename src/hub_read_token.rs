@@ -18,14 +18,10 @@ pub(crate) enum OpenError {
     InvalidConnection,
     MissingSignIn,
     RejectedSignIn,
-    #[cfg(target_os = "macos")]
-    SignInChanged,
     /// With the Hub's own reason and fix, when it sent one.
     RepositoryNotConnected(Option<String>),
     /// With the Hub's own reason and fix (for example who needs which role), when it sent one.
     AccessDenied(Option<String>),
-    #[cfg(target_os = "macos")]
-    PreparedExpired,
     Unavailable,
 }
 
@@ -39,24 +35,16 @@ impl fmt::Display for OpenError {
         formatter.write_str(match self {
             Self::InvalidConnection => "the checkout connection changed; refresh and try again",
             Self::MissingSignIn => {
-                "no saved sign-in for this Hub; open this checkout's Troubleshooting → Hub Sign-in, copy the command for your forge, and run it in Terminal"
+                "no saved sign-in for this Hub; run `agentscm hub login`"
             }
             Self::RejectedSignIn => {
-                "the saved Hub sign-in is no longer accepted; open this checkout's Troubleshooting → Hub Sign-in, copy the command for your forge, and run it in Terminal"
-            }
-            #[cfg(target_os = "macos")]
-            Self::SignInChanged => {
-                "the saved Hub sign-in changed; try Open Hub again to use the current sign-in"
+                "the saved Hub sign-in is no longer accepted; run `agentscm hub login`"
             }
             Self::RepositoryNotConnected(_) => {
                 "that repository is not connected to this Hub; ask its operator to connect it, then try again"
             }
             Self::AccessDenied(_) => {
                 "this sign-in cannot open that repository; check Hub repository access"
-            }
-            #[cfg(target_os = "macos")]
-            Self::PreparedExpired => {
-                "the read-only Hub session expired before it could open; try again"
             }
             Self::Unavailable => "the Hub is unavailable; try again",
         })
@@ -321,7 +309,7 @@ pub(crate) async fn revoke_token(
 mod tests {
     use agentscm::hub::forge_http;
 
-    const TRAY_TOKEN_NAME: &str = "agentscm-tray";
+    const TOKEN_NAME: &str = "agentscm-local-page";
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -337,7 +325,7 @@ mod tests {
         json!({
             "id": ID,
             "token": SECRET,
-            "name": TRAY_TOKEN_NAME,
+            "name": TOKEN_NAME,
             "repository": "acme/widgets",
             "repository_id": 7,
             "expires_at": expires_at,
@@ -349,7 +337,7 @@ mod tests {
         json!({
             "token": {
                 "id": ID,
-                "name": TRAY_TOKEN_NAME,
+                "name": TOKEN_NAME,
                 "repository": repository,
                 "repository_id": 7,
                 "expires_at": expires_at,
@@ -435,7 +423,7 @@ mod tests {
                 repository: "acme/widgets",
                 origin_host: "github.com",
                 provider: Some("github"),
-                name: TRAY_TOKEN_NAME,
+                name: TOKEN_NAME,
             },
             now,
         )
@@ -476,7 +464,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "name": TRAY_TOKEN_NAME,
+                "name": TOKEN_NAME,
                 "repository": "acme/widgets",
                 "ttl_seconds": TOKEN_TTL_SECONDS,
                 "read_only": true,

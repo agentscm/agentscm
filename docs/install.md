@@ -113,7 +113,7 @@ Flags shown by `npx agentscm --help`:
 | `--dry-run` | Print what would be written and stop without writing. |
 | `--json` | Print one JSON object on stdout when done (`agents.installed`, `agents.skipped`, `agents.needs_user`, `hub`, `hub_up`, `signed_in`); the progress text goes to stderr. Not on Windows. |
 
-These flags still work but are hidden from help, and will go in a later release: `--local`, `--hosted`, `--hub`, `--agent` (the same as `--only`), `--hub-runtime`, `--hub-port`, `--hub-project`, `--github-login`, `--agent-token-file`, `--slack-config-file`, `--provider`, `--no-agents`, `--no-collisions`, `--init` and `--tray`. The rest of this page still uses them.
+These flags still work but are hidden from help, and will go in a later release: `--local`, `--hosted`, `--hub`, `--agent` (the same as `--only`), `--hub-runtime`, `--hub-port`, `--hub-project`, `--github-login`, `--agent-token-file`, `--slack-config-file`, `--provider`, `--no-agents`, `--no-collisions` and `--init`. The rest of this page still uses them.
 
 ### If you are an agent installing AgentSCM for someone
 
@@ -133,7 +133,6 @@ The download and verification steps do not send product telemetry. After verific
 ```sh
 npx agentscm            # setup guide; flags go to `agentscm quickstart`
 npx agentscm uninstall  # any other subcommand is passed through as given
-npx agentscm tray       # macOS status-bar companion; Linux terminal companion
 ```
 
 Needs Node 18 or later. The package has no dependencies and no install scripts. On Windows, run the same command in PowerShell:
@@ -200,85 +199,11 @@ could let two commands change the same files at once. The folder can also keep `
 and, after `agentscm open`, `front-door/` (run `agentscm open --stop` first). To remove everything,
 delete the folder when no AgentSCM command is running.
 
-The optional macOS tray is part of this same binary; no separate app install is needed. Run
-`npx agentscm tray` to open it, or add `--tray` to quickstart to open it after successful setup.
-Click its menu-bar icon to see the work panel; right click for setup and troubleshooting actions.
-Quickstart no longer prompts to enable the tray or Start at Login. Without `--tray`, it prints
-the command for opening the menu-bar app. Opening the tray does not change Start at Login;
-you can enable or disable that option in the tray menu. When quickstart connects agents on macOS it also writes a small
-`~/Applications/AgentSCM.app` that runs `~/.agentscm/bin/agentscm tray`, so Spotlight, Launchpad
-or the Dock can bring the menu bar app back after a restart. It is generated on your Mac, so it
-carries no download quarantine. Running quickstart again leaves it as it is, and an app of that
-name that AgentSCM did not write is never replaced. The alpha binary is not signed or notarized, and the
-tray does not update independently; install a newer AgentSCM release through the same installer.
-Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
-switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
-connection values.
-
-The **Share agent conversations with Hub** item is off by default. Turning it on takes two steps:
-the first click only opens the status window with what sharing does and adds **Confirm: share
-conversations with <hub>** to that checkout's menu, and only that item changes anything. The
-confirmation names the Hub shown, and is refused if the checkout has since been connected to another
-one. Turning it on for a connected
-checkout sets capture up first if it never was (one step, documented defaults; see
-[change capture](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page)) and
-switches that checkout to `shared-conversation` mode: new conversations are redacted on this
-machine on a best-effort basis and uploaded to the Hub, kept for the number of days the Hub reports (30 unless its operator changed it), where only you (the person who shared them) and Hub
-admins can read them. The status window says this before it turns on. The same switch is under
-**Settings → Conversation sharing** on the Hub page opened from this computer. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
-and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.
-It is the same change as `agentscm change-capture set-mode`; see
-[sharing conversations](change-capture.md#sharing-conversations-with-the-hub).
-
-Copied reconnect, repository-guidance and Terminal setup commands use the running executable's
-full path, so they work before `agentscm` is on your shell's `PATH`.
-
-The Start at Login switch shows **On** or **Off**, and **Updating…** while a change is saved.
-**Open Hub** uses the saved sign-in for that exact Hub to create a read-only browser token valid
-for 30 minutes. It opens the Hub UI with that token in the URL fragment; the UI removes the
-fragment immediately. An existing browser sign-in is preserved, so sign out there first when
-switching repositories. If the saved sign-in is missing or expired, the tray shows an error
-with a sign-in instruction. Under **Troubleshooting → Hub Sign-in**, copy the GitHub or GitLab
-login command for that exact Hub and run it in Terminal; then retry Open Hub. A tray built from
-source without `--features ui` has no local Hub page, so Open Hub opens your default Hub's `/ui/`
-page instead and says so in the menu.
-
-**Forget This Checkout…** in a connected checkout's menu runs the same removal as
-`agentscm client remove --root ROOT` after you choose its confirm item: the agents' AgentSCM files,
-the connection and a Hub token setup made (which is revoked) are removed; the folder is not. If the
-Hub cannot revoke that token, the connection is kept and the result says so. Under **Not
-connected**, **Forget This Checkout** only hides the row until an agent runs there again.
-
-For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
-Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
-and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
-that setup without signing in again.
-When the user-scope Claude Code or Codex plugin (or another client-connection hook) runs in a Git
-checkout that has no connection, the hook tells a running tray, and the checkout appears under
-**Not connected** with its repository, agent and last-seen time. A linked worktree is listed as its
-main checkout. Only checkouts whose `origin` is one GitHub or GitLab repository are listed; the
-report stays on this machine and is sent only while a tray is running. Once a tray has received
-it, the hook repeats it at most every five minutes per agent and checkout, so a tray opened during
-a session lists the checkout at the agent's next hook. The tray forgets it after an hour, after
-sleep, or on quit, keeping at most eight. **Connect with**
-an agent runs the same steps as `agentscm client setup --agent AGENT --hub HUB` for the main
-checkout without starting a new sign-in. It uses the Hub another existing checkout of the same
-repository is connected to, when that checkout's folder still exists and its Hub sign-in has not
-expired; otherwise the Hub of your most recent saved sign-in. The result window names the Hub. The row then becomes a normal connected checkout; if that connection
-is removed later, the checkout is listed again only once an agent runs there again. When there is no
-saved sign-in, or it has expired, **Copy Terminal Setup** copies `agentscm quickstart` for that
-checkout. Connect a checkout to a different Hub through quickstart.
-Setup opens a status window with progress, the result and the client's next steps. It does not
-install the coding client itself. Open the configured checkout in that client, review its own
-approvals, and start a fresh session before checking activity in the tray.
-If macOS starts the tray with a minimal `PATH`, an installed Claude Code or Codex CLI may be
-unavailable there. Use **Copy Terminal Setup** for that agent. The tray only copies this
-command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
-command may contact the Hub, request forge sign-in, and create or replace a managed coordination
-token; the native client's own trust prompts still apply.
-Uninstall removes the owned tray login setting and `~/Applications/AgentSCM.app` (only while it is
-exactly what quickstart wrote) before removing its program. A running tray can
-be closed with **Quit AgentSCM Tray**.
+Earlier versions on macOS had a menu bar app and could leave two things behind: a Start at Login
+entry (`~/Library/LaunchAgents/com.counterbranch.agentscm.tray.plist`) and a launcher app
+(`~/Applications/AgentSCM.app`). Setup no longer writes the launcher app. `agentscm uninstall`
+removes both. So does `agentscm tray`, which opens nothing now and exists only for this cleanup on
+macOS, and the next setup run (`npx agentscm`) removes the launcher app.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
 

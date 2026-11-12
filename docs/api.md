@@ -193,6 +193,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `POST /v1/hub/standup/declarations` | Current lead; fenced, retry-safe replacement of durable declarations |
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
 | `POST /v1/hub/standup/reconciliation` | Current lead; fenced server-evidence evaluation, preserves original reports and reservation authority |
+| `GET` or `PUT /v1/hub/standup/merged-release/settings` | `GET`: any token of the repository. `PUT` `{"enabled": bool}`: a token that is not read-only held by a Hub admin or a repository admin; replies `{"repository", "enabled"}`, off by default. When on, the sync poll releases (never completes) the hold of Work whose merged pull request closed its source issue as completed; see [automatic release](standup.md#automatic-release-of-a-merged-works-hold) |
 | `GET /v1/hub/standup/why` | Repository-scoped reader, read-only tokens allowed; exactly one of `commit` (full lowercase SHA) or `path`; the Work recorded for it, newest first, at most 10 |
 | `GET /v1/hub/standup/repositories` | Agent token, read-only allowed; current unfinished Work in every connected repository on the person's forge host that the person can read now, at most 10 per repository and 100 in all |
 
@@ -599,7 +600,7 @@ connected to is not watched, and `provider` is then the token owner's.
 
 ## Hub: requests and replies across versions
 
-The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
+The Hub and the programs that call it are upgraded separately: the `agentscm` commands, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
 
 **The Hub refuses what it does not know.** A request with a field the Hub does not have, or with a value outside the set a field takes, gets `400` with `invalid_request` and changes nothing. The Hub never ignores part of a request, because the ignored part could be the part that mattered. A client must not send a field to a Hub that does not have it yet.
 
@@ -611,7 +612,6 @@ A later Hub can also add a value to a reply field that takes one of a set of val
 |---|---|
 | A command that prints the reply as JSON (`--json`, `work start`, `work transitions`, `promise`) | Prints the reply as the Hub sent it. `work start` also exits non-zero when `item.state` is unknown, because the claim is not confirmed |
 | `work status`, `work recovery` and `skill status` as text | Print the reply as JSON, and on standard error name the field and the value |
-| The menu bar app | Shows the Hub's own text for an unknown state, claim status or recipient kind. Its counts do not change |
 | A client that acts on the whole reply (managed Work, change capture, agent tasks, the hosted workflow client) | Stops with an error that names the field and the value |
 
 If you write your own client, do the same: ignore a field you do not know, and treat a value you do not know as unknown.

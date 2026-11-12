@@ -88,6 +88,17 @@ agentscm hub connections refresh <id>
 
 `list` shows the connection and `refresh` discovers and polls its repositories.
 
+### Who may use the hub, decided by an embedding program
+
+A program that runs the hub as a library can replace the allow list and the forge's role check with its own rules: `HubState::with_access` takes an `agentscm::hub::access::Access`, which answers, for one person, which connected repositories they may use and at which level (`Read`, `Contribute` or `Administer`), or that they may not use the hub at all. The library API is internal and unstable; this is not a configuration setting.
+
+- The hub asks on every request: at sign-in, for every web page, and for every agent token, the agent hooks included. A change takes effect on the next request, with no cache, new sign-in or restart. A token keeps the repository it was minted for by its forge id, so a rename does not end it.
+- Someone it refuses cannot sign in (403 `not_allowed`), even with a forge role. Their open web sign-in gets 403 `not_allowed` and their tokens 403 `insufficient_role` on their next request, as does a request for a repository it does not grant. Administrators in `AGENTSCM_ADMINS` may still sign in, and reach a repository's data only through a grant, but can still switch any connected repository's conversation sharing, skill status and digest. List them by `#id`.
+- Someone with `Read` sees what readers see. A change from a web page gets 403 `read_only`. Their agent tokens act as read-only, including ones minted before. Rows of `GET /v1/hub/session/repositories` carry `read_only`, so a page can hide what that person cannot do.
+- The program can sign a person in on the browser after checking who they are itself, with `agentscm::hub::login::sign_in_browser`. That person is a forge account, so their tasks, sessions and conversations are the ones their agents report.
+- `agentscm::hub::http::serve_with` runs the hub as `hub serve` does, and lets the program change its state and add routes, which get the hub's own body and time bounds (`agentscm::hub::router_with`).
+- `HubState::with_work_history` sets how many seconds of stand-up history each repository keeps, at least a day; `GET /v1/hub/repos/{repo}/retention` reports it as `work.compaction.after_seconds`. Without it every repository keeps a week.
+
 ## 5. Connect the team's clients
 
 Each developer, from a clone of the connected repository:

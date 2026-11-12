@@ -724,8 +724,9 @@ pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
 
 /// Runs a test body in a child copy of this test binary whose `XDG_CONFIG_HOME` is a fresh temp
 /// directory, so no test changes this process's environment (that is not thread-safe under plain
-/// `cargo test`). Pass the body as a closure written directly in the test function: its type name
-/// is how the child finds the test to re-run.
+/// `cargo test`). Claude Code's config directory is `claude` under it, so no test reads the real
+/// one. Pass the body as a closure written directly in the test function: its type name is how
+/// the child finds the test to re-run.
 #[cfg(all(test, unix))]
 pub(crate) fn in_isolated_config_home(body: impl FnOnce(&Path)) {
     const CHILD: &str = "AGENTSCM_TEST_CONFIG_HOME_CHILD";
@@ -743,6 +744,7 @@ pub(crate) fn in_isolated_config_home(body: impl FnOnce(&Path)) {
         .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
         .env(CHILD, home.path())
         .env("XDG_CONFIG_HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.path().join("claude"))
         .output()
         .unwrap();
     assert!(
