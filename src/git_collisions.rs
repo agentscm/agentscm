@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::git_snapshot::Git;
+use crate::hub::hook::OBSERVED_PATHS;
 use crate::{Error, Result};
 
 pub const PROFILE: &str = "agentscm-git-collisions/v1";
@@ -1179,7 +1180,6 @@ pub fn unmerged_paths(
 /// error: a truncated list could hide a change, and a checkout this dirty is not one a shell
 /// call's edits can be attributed in anyway.
 pub const WORKTREE_ENTRIES: usize = 2_000;
-use crate::hub::hook::OBSERVED_PATHS;
 /// Output budget for `git status` and the commit diffs: room for every entry at the path limit.
 const WORKTREE_BYTES: u64 = 4 * 1024 * 1024;
 

@@ -229,7 +229,13 @@ An agent that is not wired, or wired with an older `client setup` that hooked on
 ### Shell-call observation
 
 For Claude Code (`Bash`) and Codex, the hook client also watches the working tree around each shell tool call. Codex is covered through the shell tool names AgentSCM recognises (`Bash`, as the tests use it, and for example `shell`, `exec_command`, `local_shell`); the real Codex shell tool name has not been verified against a live Codex session. On `PreToolUse` the client takes a snapshot of the checkout's changed and untracked files (Git status plus file size and modification time) within 700 ms and keeps it in a private store under the AgentSCM config directory. On `PostToolUse` or `PostToolUseFailure` it takes a second snapshot and compares them within 1000 ms. Both stop at least one second before the hook's own deadline so the Hub call still fits. It sends the Hub the changed paths (at most 200, with `truncated` set when there were more), or an unknown outcome with a reason: `missing_snapshot`, `pre_snapshot_failed`, `invalid_snapshot`, `git_failed`, `no_tool_use_id`, `background` (the call runs in the background) or `local_error` (the client could not find its config directory or the session id, or its snapshot task failed). A call that changed nothing sends nothing. No command text or output is sent for this. Files ignored by the user's global Git excludes file (`core.excludesFile`, else `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`) are not listed; the client reads that setting with the user's own Git. If Git cannot answer in time, fails, or the value is not an absolute UTF-8 path, the snapshot fails (`pre_snapshot_failed` on the call's end) rather than listing files the user keeps out of Git; a setting Git reports as unset, or a file that does not exist, is not a failure. A snapshot too large to store is also `pre_snapshot_failed`, and a missing store on the call's end is `local_error`.
-When the Hub cannot be reached for a shell call's end, the client itself adds a line to the agent's context on every such call, naming the changed paths it saw (or saying it could not observe them), so a one-time "coordination unknown" note does not hide them. The store keeps at most 64 snapshots of at most 1 MiB each (64 MiB at worst) and drops one whose call never ended after one hour.
+The store keeps at most 64 snapshots of at most 1 MiB each (64 MiB at worst) and drops one whose call never ended after one hour.
+
+When the Hub does not report a shell call's end, the client itself adds a line to the agent's context, so a one-time "coordination unknown" note does not hide what the call changed:
+
+- The Hub call failed (it could not be reached, refused the call, or sent an unusable reply): the line names the changed paths the client saw, or says it could not observe them and could not report to the Hub. It is added on every such call.
+- The Hub answered but its reply carries no context for an observation (an older Hub, see the limits below): the line says the Hub did not acknowledge the observation.
+- The hook's own deadline passed before the client finished observing: the line says the hook ran out of time.
 
 What the Hub does with it:
 
@@ -248,6 +254,7 @@ Limits:
 - A file name that is not UTF-8 or contains a control character makes the whole snapshot fail, so the call's outcome is unknown. A single entry that vanishes while the snapshot runs does not: it is recorded without size or time.
 - It runs only on the `--client-connection` route, on Unix. The older `--hub-url` hook route and non-Unix hosts send nothing, and Cursor, Copilot and Gemini CLI are not covered.
 - If the snapshot cannot be taken in time, or the checkout has more than 2,000 changed paths or more than 4 MiB of Git status output, the shell call still runs and the outcome is unknown, never "no change".
+- An older Hub does not handle observations: it answers a shell call's end with an empty reply and ignores `observed`, so it records no intents. The client notices the missing context and says locally that the Hub did not acknowledge the observation.
 - It is observation after the fact. To avoid a collision, call `agentscm_check` with the paths before changing files through a shell.
 
 ### Waiting for you in its session

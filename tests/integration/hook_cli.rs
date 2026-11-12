@@ -1228,6 +1228,84 @@ fn an_observation_the_hub_never_received_still_reaches_the_agent_every_time() {
     );
 }
 
+/// The context the agent gets from a shell call's end after the call wrote `out.txt`, with a Hub
+/// answering that end with `reply`.
+#[cfg(unix)]
+fn shell_end_context(hook: &[&str], failed: bool, reply: Value) -> Option<String> {
+    let dir = home();
+    let (hub, _seen) = serve(move |_| (200, reply.clone()));
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let event = |name: &str| {
+        let payload = json!({"hook_event_name": name, "session_id": "s1", "cwd": root,
+            "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "true"}});
+        run_with(
+            hook,
+            &[("PATH", &path)],
+            &dir,
+            payload.to_string().as_bytes(),
+        )
+    };
+    event("PreToolUse");
+    std::fs::write(root.join("out.txt"), "x").unwrap();
+    let run = event(if failed {
+        "PostToolUseFailure"
+    } else {
+        "PostToolUse"
+    });
+    assert_eq!(run.code, Some(0));
+    run.json()["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_observation_an_older_hub_ignored_is_said_locally() {
+    for (hook, failed) in [(CLAUDE, false), (CLAUDE, true), (CODEX, false)] {
+        let text = shell_end_context(hook, failed, json!({})).unwrap_or_default();
+        assert!(
+            text.contains("but the Hub did not acknowledge them: out.txt"),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_observation_the_hub_acknowledged_adds_no_local_line() {
+    let reply = json!({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+        "additionalContext": "HUB-NOTE"}});
+    let text = shell_end_context(CLAUDE, false, reply).unwrap();
+    assert_eq!(text, "HUB-NOTE");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_call_that_changed_nothing_is_not_called_unacknowledged() {
+    let dir = home();
+    let (hub, _seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let payload = |name: &str| {
+        json!({"hook_event_name": name, "session_id": "s1", "cwd": root,
+            "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "true"}})
+    };
+    for name in ["PreToolUse", "PostToolUse"] {
+        let run = run_with(
+            CLAUDE,
+            &[("PATH", &path)],
+            &dir,
+            payload(name).to_string().as_bytes(),
+        );
+        assert!(
+            !run.stdout.contains("acknowledge"),
+            "{name}: {}",
+            run.stdout
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_commit_made_inside_the_call_reports_its_paths() {
