@@ -189,8 +189,14 @@ mod tests {
             async move { token(&state, principal).await.unwrap().map(|p| p.read_only) }
         };
         let github = |level| grant("github.com", 101, "acme/widgets", level);
-        assert_eq!(read_only(vec![github(Level::Contribute)], Some(101)).await, Some(false));
-        assert_eq!(read_only(vec![github(Level::Read)], Some(101)).await, Some(true));
+        assert_eq!(
+            read_only(vec![github(Level::Contribute)], Some(101)).await,
+            Some(false)
+        );
+        assert_eq!(
+            read_only(vec![github(Level::Read)], Some(101)).await,
+            Some(true)
+        );
         // A rename keeps the grant: tokens are matched by forge id on the owner's host.
         let renamed = grant("github.com", 101, "acme/gadgets", Level::Contribute);
         assert_eq!(read_only(vec![renamed], Some(101)).await, Some(false));
