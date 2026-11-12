@@ -1046,6 +1046,12 @@ impl Verdict {
     }
 }
 
+/// `main` and `refs/heads/main` name the same base: the CLI records the
+/// short name by default, and a record signed with the full ref must still verify.
+fn branch_name(base_ref: &str) -> &str {
+    base_ref.strip_prefix("refs/heads/").unwrap_or(base_ref)
+}
+
 /// The Git state the verifier observed for the exact head being judged.
 #[derive(Clone, Copy, Debug)]
 pub struct Observed<'a> {
@@ -1500,7 +1506,7 @@ fn assess_envelope(
     }
     if record.subject.commit != observed.commit
         || record.subject.tree != observed.tree
-        || record.context.base_ref != observed.base_ref
+        || branch_name(&record.context.base_ref) != branch_name(observed.base_ref)
         || record.context.merge_base != observed.merge_base
     {
         return Verdict::failure(

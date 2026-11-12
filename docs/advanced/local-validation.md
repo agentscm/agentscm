@@ -283,7 +283,7 @@ The comment-event workflow filter remains limited to recognized forge associatio
 
 ## What invalidates an attestation
 
-- A new head commit or tree, or a different merge-base.
+- A new head commit or tree, or a different merge-base or base branch. A base ref recorded as `main` and one recorded as `refs/heads/main` name the same branch, so `reconcile` and a Hub summary both accept either form.
 - A change to the policy, recipe or registry. The verifier re-runs on pushes to `main` that touch the verifier inputs, and daily, so an aged-out attestation's `success` is replaced. A run writes nothing for a head if the pull request's head, base or trusted attestation comments changed while it ran; the newer run owns the verdict.
 - A change to the default branch's verifier configuration directory (`--config-dir`, which must be relative to `--repo`) after the checkout. Before each write `reconcile` re-fetches `origin/<base>` and compares that directory's tree with the checkout's `HEAD`; if they differ it writes nothing for that head, logs that a newer run owns the verdict, counts no error and stops processing further heads (they stay `pending`); if the fetch or a read fails the head stays `pending` and counts as an error. Before any request `reconcile` refuses (exit 2, nothing written) a `--config-dir` that is unsafe, cannot be read at `HEAD`, or has uncommitted or untracked changes, because the guard compares `HEAD`. This covers the configuration only: a change to AgentSCM's own `src/**` verifier code is covered by the queued push run, not by this guard.
 - Age beyond the policy maximum.
