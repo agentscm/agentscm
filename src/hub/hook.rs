@@ -502,9 +502,11 @@ async fn hook(
                         });
                         if call.kind == Kind::Prompt
                             && !reply_needed
+                            // A release need not bump the request's seq (a narrowed scope or an
+                            // ended intent), so it shows whether or not the requester acked.
                             && !(own
-                                && unacknowledged
-                                && (released || !request.responses.is_empty()))
+                                && (released
+                                    || (unacknowledged && !request.responses.is_empty())))
                         {
                             continue;
                         }
@@ -523,7 +525,7 @@ async fn hook(
                             } else {
                                 ""
                             };
-                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         } else {
                             outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         }

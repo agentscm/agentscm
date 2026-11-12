@@ -1427,6 +1427,41 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
             )
             .unwrap();
         assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+        // A holder narrowing its scope off the file changes no request seq, yet the release
+        // still reaches the requester's next prompt although it acknowledged the reply.
+        let held = hub
+            .store
+            .work_for_session(&lead_token, session, now)
+            .unwrap()
+            .unwrap();
+        hub.store
+            .work_checkpoint(
+                &lead_token,
+                &agentscm::hub::work::WorkCheckpoint {
+                    work_id: held.id,
+                    operation_id: "narrow-widget".into(),
+                    generation: held.generation,
+                    session: session.into(),
+                    expected_updated_seq: Some(held.updated_seq),
+                    kind: agentscm::hub::work::CheckpointKind::Progress,
+                    summary: "moved off the widget".into(),
+                    next_action: None,
+                    scope: Some(vec!["src/other.rs".into()]),
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        assert!(
+            text_at(&answer, CLAUDE_CONTEXT).contains("requested paths are released"),
+            "{answer}"
+        );
     }
 }
 
