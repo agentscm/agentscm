@@ -1376,16 +1376,25 @@ impl Call {
             .filter(|(item, _)| matches!(item.state, WorkState::Active | WorkState::Blocked))
             .map(|(item, _)| item.id.as_str());
         let recovery = match work {
-            _ if self.child && scope_id.is_some() => {
-                let id = scope_id.unwrap_or_default();
+            Some((item, lead)) if self.child && scope_id.is_some() => {
+                let sid = session
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default();
                 let tail = if applied {
-                    "Tell your parent, which holds the claim, to record them"
+                    "Tell your parent, which holds the claim, so it can record them"
                 } else {
                     "Finish without this edit and tell your parent it was refused, so it can record them"
                 };
+                let (leader, ask) = if lead {
+                    ("that session", "the parent should checkpoint")
+                } else {
+                    ("another session", "the parent should ask that lead to checkpoint")
+                };
                 format!(
-                    "You are a subagent: these files are outside the scope of {id}, which your parent session leads. Do not start, join or take over Work from here. {tail}: the parent should checkpoint {paths} into its scope{itself}.",
-                    itself = if applied { "" } else { " or make the edit itself" },
+                    "You are a subagent: AgentSCM checks your edits under your parent's session{sid}. These files are outside the scope of {id}, which {leader} leads. Do not start, join or take over Work from here. {tail}: {ask} {paths} into its scope{itself}.",
+                    id = item.id,
+                    itself = if applied || !lead { "" } else { " or make the edit itself" },
                 )
             }
             _ if self.child && applied => {
@@ -1401,11 +1410,17 @@ impl Call {
             ),
             Some((item, true)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
                 format!(
-                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are unavailable or bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{json_session},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":[\"<each current scope path>\",{inner}]}} on standard input.",
+                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are unavailable or bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{json_session},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":{widened}}} on standard input.",
                     id = item.id,
                     generation = item.generation,
                     seq = item.updated_seq,
-                    inner = paths.trim_start_matches('[').trim_end_matches(']'),
+                    widened = {
+                        let mut scope = item.scope.clone();
+                        scope.extend(self.paths.iter().cloned());
+                        scope.sort();
+                        scope.dedup();
+                        serde_json::to_string(&scope).unwrap_or_default()
+                    },
                     json_session = session.as_deref().unwrap_or("\"<your native session ID>\""),
                 )
             }
@@ -2398,19 +2413,26 @@ mod tests {
             "{lead}"
         );
         assert!(
-            lead.contains("\"scope\":[\"<each current scope path>\",\"src/a.rs\"]"),
+            lead.contains("\"scope\":[\"src/a.rs\",\"src/shared.rs\"]"),
             "{lead}"
         );
-        let scoped = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, false)));
+        let scoped = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, true)));
         assert!(
             scoped.starts_with("AgentSCM: EDIT_UNLINKED: this edit was not applied"),
             "{scoped}"
         );
         assert!(
-            scoped.contains("outside the scope of wrk_a, which your parent session leads")
-                && scoped.contains("parent should checkpoint [\"src/a.rs\"] into its scope")
+            scoped.contains("outside the scope of wrk_a, which that session leads")
+                && scoped.contains("the parent should checkpoint [\"src/a.rs\"] into its scope")
                 && scoped.contains("Do not start, join or take over Work"),
             "{scoped}"
+        );
+        // A parent that only helps cannot widen the scope; it asks the lead.
+        let helper = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, false)));
+        assert!(
+            helper.contains("which another session leads")
+                && helper.contains("ask that lead to checkpoint [\"src/a.rs\"]"),
+            "{helper}"
         );
         // Without a usable session ID none is shown or guessed.
         let unnamed = Call::parse(

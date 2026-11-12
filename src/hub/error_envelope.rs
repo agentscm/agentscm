@@ -518,11 +518,12 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
             {
                 "Provide exactly one Work identity: work_id, source or request_key; do not use a title as identity.".into()
             } else {
-                let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
-                format!(
-                    "Correct request field {}; use its documented name, presence and type.",
-                    names.join(", ")
-                )
+                // Hints are fixed text, so the message still echoes no caller value.
+                let named: Vec<String> = fields
+                    .iter()
+                    .map(|field| format!("{}: {}", field.name, field.hint))
+                    .collect();
+                format!("Correct request field {}", named.join(" "))
             };
             envelope.fields = Some(fields.clone());
         }
@@ -889,7 +890,7 @@ mod tests {
         assert!(
             other
                 .message
-                .contains("Correct request field expected_updated_seq;")
+                .contains("Correct request field expected_updated_seq: Provide it.")
         );
         assert_eq!(other.fields.unwrap()[0].name, "expected_updated_seq");
     }
