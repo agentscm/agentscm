@@ -128,6 +128,12 @@ afterEach(() => {
 })
 
 describe('change record response', () => {
+  it.each(['builder’s Codex', 'No action assigned', 'Recipient unknown'])('accepts the actionable-status recipient label %s', (label) => {
+    const response = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    response.summary['review'] = { captured_by: null, diff: null, actual_scope: 'unknown', concerns: [], detail_links: [], next_actor: label, supported_action: null, establishes_approval: false }
+    expect(decodeChangeRecordResponse(response).summary.review?.next_actor).toBe(label)
+  })
+
   it('decodes the bounded projection with inspectable source, intent, decision and independent action dimensions', () => {
     const value = decodeChangeRecordResponse(fixture(), WORK_ID)
     expect(value.summary.intent).toEqual({
@@ -388,7 +394,7 @@ describe('change record route and page', () => {
       actual_scope: 'unknown',
       concerns: ['capture_history_incomplete_or_unknown', 'latest_execution_not_successful', 'current_source_applicability_not_established'],
       detail_links: [`/v1/hub/repos/counterbranch%2Fagentscm/change-records/${WORK_ID}`, '/v1/hub/standup/status'],
-      next_actor: 'builder',
+      next_actor: 'builder’s Codex',
       supported_action: 'Ask builder to decide whether the blocked Work should continue.',
       establishes_approval: false,
     }
@@ -400,9 +406,10 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest verification' })
     expect(screen.getAllByText('Capture a bounded change-record handoff').length).toBeGreaterThan(0)
-    expect(screen.getByText('ui/src/**')).toBeTruthy()
+    expect(screen.getAllByText('ui/src/**').length).toBeGreaterThan(0)
     expect(screen.getByText('240 additional scope entries omitted from this bounded projection.')).toBeTruthy()
     expect(screen.getByText('Git working source')).toBeTruthy()
     expect(screen.getAllByText(HEAD).length).toBeGreaterThan(0)
@@ -434,7 +441,7 @@ describe('change record route and page', () => {
     expect(screen.getByText('capture-agent')).toBeTruthy()
     expect(screen.getByText(/proposed by review-agent/)).toBeTruthy()
     expect(screen.getByText(/Ask builder to decide whether the blocked Work should continue/)).toBeTruthy()
-    fireEvent.click(screen.getByText('Review concerns (3)', { selector: 'summary' }))
+    expect(screen.getByText('builder’s Codex')).toBeTruthy()
     expect(screen.getByText('Capture history is partial or unavailable')).toBeTruthy()
     expect(screen.getByText('The latest execution did not succeed')).toBeTruthy()
     expect(screen.getByText('Applicability to the current source is not established')).toBeTruthy()
@@ -455,6 +462,7 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest verification' })
     expect(screen.getByText('Session session-1')).toBeTruthy()
     expect(screen.getByText('Model model-a · effort high · permission mode plan')).toBeTruthy()
@@ -475,6 +483,7 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest execution' })
     expect(screen.getByText('Execution')).toBeTruthy()
     expect(screen.getAllByText('Succeeded').length).toBeGreaterThan(0)

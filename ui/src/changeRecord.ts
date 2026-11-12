@@ -444,7 +444,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       actual_scope: enumValue(item['actual_scope'], COVERAGE, 'summary.review.actual_scope'),
       concerns,
       detail_links: detailLinks,
-      next_actor: nullableIdentifier(item['next_actor'], 'summary.review.next_actor'),
+      next_actor: nullableText(item['next_actor'], 'summary.review.next_actor'),
       supported_action: nullableText(item['supported_action'], 'summary.review.supported_action'),
       establishes_approval: false as const,
     }

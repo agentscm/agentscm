@@ -513,6 +513,7 @@ function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; rep
     {summary.intent.description ? <p>{summary.intent.description}</p> : null}
     <dl className="tech mb-0">
       <Fact label="Declared source"><code>{summary.intent.repository ?? repo}</code>{summary.intent.branch ? <> · <code>{summary.intent.branch}</code></> : null}{summary.intent.provenance ? <> · {summary.intent.provenance}</> : null}</Fact>
+      <Fact label="Declared scope"><Paths items={summary.intent.scope} max={4} />{summary.intent.scope_omitted > 0 ? <span className="small muted"> {summary.intent.scope_omitted} further entries omitted</span> : null}</Fact>
       <Fact label="Captured source">{diff?.kind === 'git' ? <><code>{diff.worktree_id}</code> · <code>{diff.head}</code>{diffHref ? <> · <a href={diffHref}>Compare exact commits</a></> : <> · <span className="muted">Local comparison unavailable for this repository</span></>}</> : diff?.kind === 'native' ? <>Native revision <code>{diff.revision}</code> · diff unavailable in the local Git explorer</> : <span className="muted">No captured source</span>}</Fact>
       {diff?.kind === 'git' && (diff.dirty || diff.untracked_count > 0 || diff.omissions.length > 0) ? <Fact label="Excluded from commit comparison"><span className="warn-text">Working-tree changes{diff.untracked_count ? `, ${diff.untracked_count} untracked item${diff.untracked_count === 1 ? '' : 's'}` : ''}{diff.omissions.length ? `, ${diff.omissions.map((item) => OMISSION_LABEL[item].toLowerCase()).join(', ')}` : ''}</span></Fact> : null}
       <Fact label="Latest observed receipt">{summary.latest_action ? <><StatusPill status={OUTCOME[summary.latest_action.outcome]} /> <StatusPill status={RESULT[summary.latest_action.result]} /> <StatusPill status={ASSURANCE[summary.latest_action.assurance]} /> <StatusPill status={COVERAGE[summary.latest_action.coverage]} /> <StatusPill status={APPLICABILITY[summary.latest_action.applicability]} /></> : <span className="muted">No action receipt captured; check history is unavailable.</span>}</Fact>
@@ -522,8 +523,8 @@ function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; rep
       <Fact label="Reported next action">{summary.next_action ?? <span className="muted">No next action was reported.</span>}</Fact>
     </dl>
     <Notice tone="warn" title="Approval and readiness are not established">This summary is historical and non-atomic. A passing latest receipt is not a current approval, and findings or check history not shown here remain unavailable.</Notice>
-    {review?.concerns.length ? <details className="disclosure mt-3"><summary>Review concerns ({review.concerns.length})</summary><ul className="mt-3 mb-0">{review.concerns.map((concern) => <li key={concern}>{concernLabel[concern] ?? concern.replaceAll('_', ' ')}</li>)}</ul></details> : null}
-    <details className="disclosure mt-3"><summary>Review references and provenance</summary><dl className="tech mt-3 mb-0"><Fact label="Work version">generation {summary.generation}, event {summary.updated_seq || 'unavailable'}</Fact><Fact label="Assurance">{summary.latest_action ? ASSURANCE[summary.latest_action.assurance].label : 'Unavailable'}; this is separate from the reported result.</Fact><Fact label="Detail destinations">{review?.detail_links.length ? review.detail_links.map((link) => <div key={link}><a href={link}>{link}</a></div>) : <span className="muted">No detail destinations retained.</span>}</Fact></dl></details>
+    {review?.concerns.length ? <div className="mt-3"><strong>Review concerns ({review.concerns.length})</strong><ul className="mt-2 mb-0">{review.concerns.map((concern) => <li key={concern}>{concernLabel[concern] ?? concern.replaceAll('_', ' ')}</li>)}</ul></div> : null}
+    <details className="disclosure mt-3"><summary>Review references and provenance</summary><dl className="tech mt-3 mb-0"><Fact label="Work version">generation {summary.generation}, event {summary.updated_seq || 'unavailable'}</Fact><Fact label="Assurance">{summary.latest_action ? ASSURANCE[summary.latest_action.assurance].label : 'Unavailable'}; this is separate from the reported result.</Fact><Fact label="Authenticated API references" explain="These endpoints require the same repository authorization as this view.">{review?.detail_links.length ? review.detail_links.map((link) => <div key={link}><code className="text-break">{link}</code></div>) : <span className="muted">No detail destinations retained.</span>}</Fact></dl></details>
   </Box>
 }
 
@@ -569,6 +570,9 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
 
       <ReviewOverview summary={summary} repo={repo} />
 
+      <details className="disclosure">
+        <summary>Source, check and decision details</summary>
+        <div className="stack mt-3">
       <div className="grid-2 align-start">
         <Box icon="bullseye" title="Intent and declared scope" explain="Taken from the task record, not pieced together from conversations.">
           <div className="small muted mb-2">Declared scope</div>
@@ -636,6 +640,9 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
           )}
         </Box>
       </div>
+
+        </div>
+      </details>
 
       <Box icon="chat-square-text" title="Conversation" intro="Conversation entries stay closed until you choose to list them." explain="While repository sharing and author consent are both enabled, repository readers can open redacted bodies. Otherwise only the author and Hub admins can read them. Entries expire and this page cannot delete them.">
         <ConversationDisclosure repo={repo} token={token} workId={workId} />
