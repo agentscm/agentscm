@@ -407,6 +407,8 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
 number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
+A program that embeds the Hub may set it per repository instead, from 0 to 3650; at 0 the Hub keeps no
+bodies for that repository, asks for no uploads and the page says nothing is uploaded.
 `client status --check` carries it in the connection's `hub_check` (when the check is valid), and the
 local page's `GET /v1/local/capture` lists it per
 checkout (looked up with the checkout's own agent token and reused for a minute). The page

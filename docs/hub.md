@@ -561,7 +561,8 @@ start; until then they stop working (401 `sign_in_required`).
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
   token's id, name, repository and expiry, and its owner, plus
   `shared_conversation_retention_days`, the days this Hub keeps an uploaded shared conversation
-  (`hub serve --shared-conversation-retention-days`, 1 to 3650). The field is additive: a Hub
+  for the token's repository (`hub serve --shared-conversation-retention-days`, 1 to 3650, unless
+  a program that embeds the Hub sets it per repository, where 0 means it keeps none). The field is additive: a Hub
   that predates it omits it, and clients then say the retention is not known instead of naming a
   number. Every authentication failure returns the same 401 body.
 - `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes

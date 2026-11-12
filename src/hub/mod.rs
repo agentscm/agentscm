@@ -309,8 +309,9 @@ pub async fn work_compaction_loop(state: HubState) {
     }
 }
 
-/// See [`HubState::with_work_history`].
-type WorkHistory = Arc<dyn Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync>;
+/// A per-repository number an embedding program supplies; see [`HubState::with_work_history`]
+/// and [`HubState::with_shared_conversation_retention`].
+type PerRepository = Arc<dyn Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync>;
 
 pub const DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 30;
 pub const MAX_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 3650;
@@ -330,13 +331,15 @@ pub struct HubState {
     demo: bool,
     /// Days an uploaded shared-conversation body stays readable.
     shared_conversation_retention_days: i64,
+    /// Set by an embedding program: days each repository keeps shared-conversation bodies.
+    body_retention: Option<PerRepository>,
     slack: Option<Arc<slack::Slack>>,
     /// The operator-registered context source; `None` unless `hub serve` loaded one.
     pub context_source: Option<Arc<context_source::ContextSource>>,
     /// Set by an embedding program to decide who may use the Hub; `None` keeps the Hub's rules.
     access: Option<Arc<dyn access::Access>>,
     /// Set by an embedding program: seconds of stand-up history each repository keeps.
-    work_history: Option<WorkHistory>,
+    work_history: Option<PerRepository>,
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
     workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
@@ -357,6 +360,7 @@ impl HubState {
             onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
             shared_conversation_retention_days: DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS,
+            body_retention: None,
             slack: None,
             context_source: None,
             access: None,
@@ -398,6 +402,33 @@ impl HubState {
         match &self.work_history {
             None => Ok(WORK_AUTO_COMPACTION_AGE_SECONDS),
             Some(keep) => keep(scope).map(|seconds| seconds.max(86_400)),
+        }
+    }
+
+    /// Lets `keep` decide how many days each repository keeps an uploaded shared-conversation
+    /// body, 0 to [`MAX_SHARED_CONVERSATION_RETENTION_DAYS`]; 0 keeps none, so the Hub asks for no
+    /// uploads and refuses them. Without it every repository keeps the Hub-wide
+    /// [`Self::with_shared_conversation_retention_days`]. It runs on a blocking thread, per upload,
+    /// upload check and retention read; an error fails that request rather than guessing. A body
+    /// keeps the expiry set when it was uploaded.
+    pub fn with_shared_conversation_retention(
+        mut self,
+        keep: impl Fn(&work::WorkRepositoryScope) -> Result<i64> + Send + Sync + 'static,
+    ) -> Self {
+        self.body_retention = Some(Arc::new(keep));
+        self
+    }
+
+    /// Days `scope` keeps an uploaded shared-conversation body. Call it from a blocking thread.
+    pub(crate) fn shared_conversation_retention_days(
+        &self,
+        scope: &work::WorkRepositoryScope,
+    ) -> Result<i64> {
+        match &self.body_retention {
+            None => Ok(self.shared_conversation_retention_days),
+            Some(keep) => {
+                keep(scope).map(|days| days.clamp(0, MAX_SHARED_CONVERSATION_RETENTION_DAYS))
+            }
         }
     }
 
