@@ -24,6 +24,7 @@ title: "Documentation"
 - [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
 - [Join an existing Hub](team-member-onboarding.md) or read the [Hub operator guide](hub.md).
 - [Two-container Hub walkthrough](two-agent-demo.md): Docker, GitHub App and a repository you can connect are required.
+- [Record a deployment from a script](record-deployments.md): one line in a deploy script so the Hub sees the merge go live.
 - [Deployment](deployment.md): local and single-server operating choices. [Hosted setup](hosted.md) is an unsupported alpha path.
 
 ## Catch up and inspect changes

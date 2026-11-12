@@ -2753,7 +2753,8 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
         "callback_urls": [format!("{public}/v1/hub/login/github/callback")],
         "public": false,
         "default_permissions": {"contents": "read", "metadata": "read",
-            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read"}});
+            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read",
+            "deployments": "write"}});
     if webhook_reachable(public) {
         manifest["hook_attributes"] =
             json!({"url": format!("{public}/v1/hub/webhooks/github/{connection}")});

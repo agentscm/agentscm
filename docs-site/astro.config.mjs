@@ -25,6 +25,7 @@ export default defineConfig({
           { label: 'Work intents', link: '/intents/' },
           { label: 'Collision warnings', link: '/collisions/' },
           { label: 'Hub', link: '/hub/' },
+          { label: 'Record a deployment', link: '/record-deployments/' },
           { label: 'Join a team Hub', link: '/team-member-onboarding/' },
           { label: 'Telemetry', link: '/telemetry/' },
         ] },
