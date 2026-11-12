@@ -1627,6 +1627,53 @@ async fn catchup_discovers_ordinary_gitlab_merges_and_keeps_rename_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_merge_requests_keep_their_labels_and_source_project() {
+    let env = Env::start().await;
+    add_mr(&env, 81, &["src/a.rs"]);
+    env.mr(81, |mr| {
+        mr.labels = vec!["bug".into(), "needs review".into()]
+    });
+    env.poll().await;
+    let data = env.pr_data(81);
+    assert_eq!(data["labels"], json!(["bug", "needs review"]));
+    assert_eq!(data["head_repository_id"], json!(REPO_ID));
+    assert_eq!(data["repository_id"], json!(REPO_ID));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_finds_a_fast_forward_gitlab_merge_by_its_head() {
+    use agentscm::hub::catchup::CatchupQuery;
+    use agentscm::hub::store::mint_bound_agent_token;
+    let env = Env::start().await;
+    add_mr(&env, 82, &["src/ff.rs"]);
+    // A fast-forward merge leaves no merge or squash commit: the merged head is the landed commit.
+    env.mr(82, |mr| mr.state = "merged".into());
+    let head = env.fake.with(|s| s.projects[&REPO_ID].mrs[&82].sha.clone());
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: env.host.clone(),
+                user_id: 82,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    env.poll().await;
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(page.merges.len(), 1);
+    assert_eq!(page.merges[0].pull_number, 82);
+    assert_eq!(page.merges[0].merge_commit, head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
     use agentscm::hub::catchup::{CatchupCoverageState, CatchupMergeSource, CatchupQuery};
     use agentscm::hub::store::mint_bound_agent_token;

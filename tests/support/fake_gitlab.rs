@@ -118,6 +118,10 @@ pub struct Mr {
     pub source_project_id: Option<i64>,
     /// RFC 3339 time the listing orders by; creation time unless a test sets it.
     pub updated_at: String,
+    /// Label names, as GitLab lists them.
+    pub labels: Vec<String>,
+    /// The target branch tip the diff was made against (`diff_refs.start_sha` on a single read).
+    pub base_sha: String,
 }
 
 impl Mr {
@@ -140,6 +144,8 @@ impl Mr {
             description: String::new(),
             source_project_id: None,
             updated_at: rfc3339_now(),
+            labels: Vec::new(),
+            base_sha: fake_sha(&format!("main#{iid}")),
         }
     }
 }
@@ -488,7 +494,7 @@ fn mr_json(ctx: &Ctx, p: &Project, m: &Mr) -> Value {
         "id": m.id, "iid": m.iid, "title": m.title, "state": m.state, "draft": m.draft,
         "source_branch": m.source_branch, "target_branch": m.target_branch, "sha": m.sha,
         "merge_commit_sha": m.merge_commit_sha, "squash_commit_sha": null,
-        "description": m.description, "updated_at": m.updated_at,
+        "description": m.description, "updated_at": m.updated_at, "labels": m.labels,
         "source_project_id": m.source_project_id.unwrap_or(p.id), "target_project_id": p.id,
         "author": {"id": m.author_id, "username": m.author_username},
         "web_url": format!("{}/{}/-/merge_requests/{}", ctx.base, p.path_with_namespace, m.iid),
@@ -662,7 +668,13 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
         }
         (&Method::GET, ["merge_requests", iid]) => {
             match iid.parse::<i64>().ok().and_then(|n| project.mrs.get(&n)) {
-                Some(m) => json_reply(200, mr_json(ctx, project, m)),
+                Some(m) => {
+                    // Only a single merge request read carries `diff_refs`, as on GitLab.
+                    let mut body = mr_json(ctx, project, m);
+                    body["diff_refs"] =
+                        json!({"base_sha": m.base_sha, "start_sha": m.base_sha, "head_sha": m.sha});
+                    json_reply(200, body)
+                }
                 None => not_found(),
             }
         }
