@@ -284,7 +284,7 @@ pub(crate) async fn enroll(hub: &str) {
     }
 }
 
-/// A refusal that needs the person, kept per checkout for the hook and the menu bar app:
+/// A refusal that needs the person, kept per checkout for the hook:
 /// `$XDG_CONFIG_HOME/agentscm/attention/<hash of the root>.json`, owner-only.
 fn attention_path(root: &Path) -> Result<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
@@ -450,7 +450,7 @@ pub(crate) async fn renew_command(root: &Path) -> Result<()> {
 
 /// After a sign-in replaced this computer's credential, which revoked every agent token issued
 /// through it: renews each checkout connected to `hub` with a managed token. Each one not
-/// renewed is recorded for its next agent (the menu bar app shows no output) and returned.
+/// renewed is recorded for its next agent and returned.
 pub(crate) async fn renew_after_sign_in(hub: &str) -> Vec<String> {
     let roots: Vec<PathBuf> = load()
         .unwrap_or_default()

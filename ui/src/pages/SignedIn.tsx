@@ -41,14 +41,13 @@ export function signedInFromHash(hash = window.location.hash, origin = window.lo
 // The terminal asks about automatic connection after this page opens, so the redirect may not say.
 const START = {
   on: { icon: 'terminal', title: 'Start your coding agent in any checkout.', body: 'It connects by itself and tells you in one line, for example “AgentSCM: coordinating on owner/repo”.' },
-  off: { icon: 'terminal', title: 'Connect a checkout from the menu bar app.', body: 'Automatic connection is off on this computer, so each repository is connected once from the AgentSCM menu bar app.' },
-  ask: { icon: 'terminal', title: 'Start your coding agent in a checkout.', body: 'With automatic connection on (the terminal asks once), it connects by itself and tells you in one line; otherwise connect each repository once from the AgentSCM menu bar app.' },
+  off: { icon: 'terminal', title: 'Connect a checkout from the terminal.', body: 'Automatic connection is off on this computer, so each repository is connected once: run agentscm client setup in it.' },
+  ask: { icon: 'terminal', title: 'Start your coding agent in a checkout.', body: 'With automatic connection on (the terminal asks once), it connects by itself and tells you in one line; otherwise connect each repository once with agentscm client setup.' },
 }
 
 function next(autoConnect: boolean | null) {
   return [
     START[autoConnect === null ? 'ask' : autoConnect ? 'on' : 'off'],
-    { icon: 'menu-button-wide', title: 'The menu bar app shows Connected.', body: 'If something needs you, it says what and how to fix it.' },
     { icon: 'shield-check', title: 'Remove this computer any time.', body: 'Account menu → Your computers → Revoke.' },
   ]
 }
@@ -93,7 +92,7 @@ export function SignedInPage() {
                 <RefusalNotice refusal={state.refusal} />
               </div>
             ) : (
-              <p className="done-lead">This sign-in link is incomplete. Choose Sign In in the AgentSCM menu bar app to start again.</p>
+              <p className="done-lead">This sign-in link is incomplete. Run agentscm hub login to start again.</p>
             )}
           </>
         )}

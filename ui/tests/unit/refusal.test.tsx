@@ -22,7 +22,7 @@ describe('refusalFrom', () => {
     expect(roleSentence({ login: 'a', has: 'None', visibility: 'internal', repo: 'o/r', needs: 'Developer' })).toBe('a has no access to internal repository o/r; ask a repository owner for Developer or higher')
   })
 
-  it('words every bare refusal code the CLI and tray share', () => {
+  it('words every bare refusal code the CLI shares', () => {
     for (const code of ['not_connected', 'forbidden', 'insufficient_role', 'not_allowed', 'user_disabled', 'login_failed', 'sign_in_required', 'device_revoked']) {
       expect(refusalFrom({ error: code })?.message, code).toMatch(/;/)
     }
@@ -64,7 +64,7 @@ describe('refusalFrom', () => {
 
 describe('RefusalNotice', () => {
   it('renders a plain agentscm command fix as a copyable command', () => {
-    render(<RefusalNotice refusal={{ code: 'sign_in_required', message: 'This computer isn’t signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app.', fix: 'agentscm hub login' }} />)
+    render(<RefusalNotice refusal={{ code: 'sign_in_required', message: 'This computer isn’t signed in to this Hub any more; run agentscm hub login.', fix: 'agentscm hub login' }} />)
     expect(screen.getByRole('alert').textContent).toContain('isn’t signed in')
     expect(screen.getByText('agentscm hub login').tagName).toBe('CODE')
     expect(screen.getByRole('button', { name: /copy/i })).toBeTruthy()

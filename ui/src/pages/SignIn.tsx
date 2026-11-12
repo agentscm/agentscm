@@ -299,7 +299,7 @@ export function SignIn({ notice, refusal: opening = null, onSignedIn }: { notice
             <div className="box-body">
               {notice && <Notice tone="brand" icon="info-circle" title={notice} />}
               <p>
-                In a terminal, run <code>agentscm open</code> in your repository, or choose <strong>Open Hub</strong> in the AgentSCM menu bar app. This page opens connected to your files, saved conversations and your team’s Hub.
+                In a terminal, run <code>agentscm open</code> in your repository. This page opens connected to your files, saved conversations and your team’s Hub.
               </p>
               <p className="signin-fine">Each connection lasts while AgentSCM keeps running on this computer, for up to a week.</p>
             </div>
