@@ -1036,6 +1036,31 @@ fn merged_hold_refusal(
     let stranger = principal(&*ctx.store, secret.expose());
     let stranger_text = refusal(&ctx, &stranger, "session-stranger");
 
+    // The owner's own read-only token sees the facts but is offered no release remedy.
+    let reader = user(&*ctx.store, 61, "reconciler");
+    let (_, secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &reader,
+        "reader",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        true,
+    )
+    .unwrap();
+    let reader = principal(&*ctx.store, secret.expose());
+    assert!(reader.read_only);
+    let reader_text = refusal(&ctx, &reader, "session-reader");
+    assert!(
+        reader_text.contains("Its pull request #41 merged"),
+        "{reader_text}"
+    );
+    assert!(
+        !reader_text.contains("release it without a join request")
+            && !reader_text.contains("agentscm_work_transition"),
+        "{reader_text}"
+    );
+
     // The same owner previews and applies a release from another session, with no join request.
     let now = unix_now();
     let release = preview(

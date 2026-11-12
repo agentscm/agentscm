@@ -15,7 +15,7 @@ use super::store::{ForgeIdentity, Principal, Store, User};
 use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource};
 use super::work_lifecycle::OutcomeValue;
 use super::work_reconcile::{WorkStage, WorkStageV1, work_stages_detailed};
-use super::work_transition::WorkLifecycleReader;
+use super::work_transition::{OperationalSelect, WorkLifecycleReader};
 
 /// Observation kind and key prefix of one issue's closure fact.
 pub const OBSERVATION_KIND: &str = "issue_closure";
@@ -454,18 +454,39 @@ pub fn set_merged_release(
 /// The audience under which a policy release is claimed, once per Work ever.
 const POLICY_RELEASE: &str = "policy_release";
 
+/// After a refused policy release: keeps the `policy_release` claim when a re-read shows the
+/// Work's hold is gone (someone else released it), else gives the claim back so a later run can
+/// release. An unreadable Work counts as still holding. Returns whether the claim was kept.
+pub fn settle_refused_release(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    work: &str,
+    now: i64,
+) -> bool {
+    let gone = store
+        .work_operational(reader, &OperationalSelect::One(work), now)
+        .ok()
+        .and_then(|o| o.work.first().map(|w| w.reservation.basis.is_none()))
+        .unwrap_or(false);
+    if !gone {
+        let _ = store.unclaim_merge_prompt(work, POLICY_RELEASE);
+    }
+    gone
+}
+
 /// For a repository that opted in, releases the hold of each unfinished Work whose every linked
 /// pull request merged and whose source issue the Work's linked pull request closed as completed
-/// (`MergedHold::Settled`), when that issue's closure was read and stored in this poll (`read`). It releases the hold only: the Work stays unfinished with no
-/// outcome. Returns the ids released.
+/// (`MergedHold::Settled`), when that issue's closure was read and stored in this poll (`read`). It
+/// releases the hold only: the Work stays unfinished with no outcome. Returns the ids released.
 ///
 /// The policy releases a Work at most once. It claims the `policy_release` marker (the same
 /// once-ever claim the finish prompts use) before it releases, so a lead or owner who then
 /// resumes the Work keeps the hold: later polls find the marker taken. The claim comes before the
-/// transition so two pollers cannot both release; it is given back when the transition fails
-/// for a reason other than the Work having moved (a store error), so a transient failure does
-/// not spend the one release. A crash between the claim and the transition spends it, which only
-/// leaves the hold to lapse by itself, as it would without the policy.
+/// transition so two pollers cannot both release. It is given back when the transition fails
+/// with a store error, and when it is refused as stale (the Work changed in some unrelated way)
+/// but a re-read still shows the hold, so a later run can release; it is kept only when that
+/// re-read shows the hold is gone. A crash between the claim and the transition spends it, which
+/// only leaves the hold to lapse by itself, as it would without the policy.
 ///
 /// A Work whose own read hit a limit, that declares a pull request not known merged, or that has
 /// another open pull request on its branch is never `Settled`, whatever the rest of the
@@ -483,9 +504,7 @@ pub fn release_settled(
     read: &BTreeSet<u64>,
     now: i64,
 ) -> super::Result<Vec<String>> {
-    use super::work_transition::{
-        OperationalSelect, WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
-    };
+    use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
     let mut released = Vec::new();
     if read.is_empty() || !merged_release_enabled(store, repo.repository_id) {
         return Ok(released);
@@ -543,18 +562,10 @@ pub fn release_settled(
             };
             match store.work_transition(&actor, &request, now) {
                 Ok(_) => Ok(true),
-                // The Work moved or no longer holds: someone else decided, so the claim stays.
+                // The fence moved or the Work no longer holds. The claim stays only when a
+                // re-read shows the hold is gone; otherwise it is given back for a later run.
                 Err(error @ super::HubError::Invalid(_)) => {
-                    // Keep the claim only when the hold is gone; an unrelated fence change or an
-                    // unknown Work leaves the hold, so the release stays possible.
-                    let gone = store
-                        .work_operational(&reader, &OperationalSelect::One(&item.id), now)
-                        .ok()
-                        .and_then(|o| o.work.first().map(|w| w.reservation.basis.is_none()))
-                        .unwrap_or(false);
-                    if !gone {
-                        let _ = store.unclaim_merge_prompt(&item.id, POLICY_RELEASE);
-                    }
+                    settle_refused_release(store, &reader, &item.id, now);
                     Err(error)
                 }
                 Err(error) => {

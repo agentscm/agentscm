@@ -2064,6 +2064,26 @@ mod merged_prompts {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claimed_owner_marker_keeps_the_line_out_of_a_start() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        // Another session already won the claim: this start shows nothing and claims nothing.
+        assert!(
+            w.hub
+                .store
+                .claim_merge_prompt(&id, "owner", unix_now())
+                .unwrap()
+        );
+        assert_eq!(lines(&w.start(OTHER), "merged and #7"), 0);
+        assert!(
+            !w.hub.store.merge_prompt_claimed(&id, "lead").unwrap(),
+            "the lead's own prompt is untouched"
+        );
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_starting_lead_is_told_only_once() {
         let mut w = world().await;
         w.merged_work();

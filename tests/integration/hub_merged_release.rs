@@ -15,7 +15,7 @@ use agentscm::hub::connection::{ConnectedRepository, NewConnection};
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::merged_holds::{
     CloseReason, IssueClosure, IssueState, OBSERVATION_KIND, merged_release_enabled,
-    observation_key, release_settled, set_merged_release,
+    observation_key, release_settled, set_merged_release, settle_refused_release,
 };
 use agentscm::hub::planned_issues::IssueIdentity;
 use agentscm::hub::store::{
@@ -357,6 +357,50 @@ fn other_facts_keep_the_hold(db_with: impl Fn() -> Db) {
     }
 }
 
+/// A refused release keeps the claim only when the hold is gone; a race that left the hold
+/// gives the claim back so a later run releases.
+fn a_refused_release_keeps_the_claim_only_when_the_hold_is_gone(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    let owner = db.store.user_by_id(&w.owner).unwrap().unwrap();
+    let reader = WorkLifecycleReader::Person {
+        owner: &owner,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let now = unix_now() + 10;
+    // The hold is still there: the claim is given back and a later run releases.
+    assert!(
+        db.store
+            .claim_merge_prompt(&w.work, "policy_release", now)
+            .unwrap()
+    );
+    assert!(!settle_refused_release(&*db.store, &reader, &w.work, now));
+    assert!(
+        !db.store
+            .merge_prompt_claimed(&w.work, "policy_release")
+            .unwrap()
+    );
+    assert_eq!(release(db, &w), vec![w.work.clone()]);
+    // The hold is gone: the claim stays.
+    assert!(
+        db.store
+            .merge_prompt_claimed(&w.work, "policy_release")
+            .unwrap()
+    );
+    assert!(settle_refused_release(
+        &*db.store,
+        &reader,
+        &w.work,
+        now + 1
+    ));
+    assert!(
+        db.store
+            .merge_prompt_claimed(&w.work, "policy_release")
+            .unwrap()
+    );
+}
+
 /// The Work's lead takes it over again, so it holds once more.
 fn resume(db: &Db, w: &World) {
     let now = unix_now() + 20;
@@ -607,6 +651,18 @@ fn postgres_on_releases_a_settled_hold_once_and_never_completes() {
         return;
     };
     on_releases_a_settled_hold_once_and_never_completes(&db);
+}
+
+#[test]
+fn sqlite_a_refused_release_keeps_the_claim_only_when_the_hold_is_gone() {
+    a_refused_release_keeps_the_claim_only_when_the_hold_is_gone(&Db::sqlite());
+}
+
+#[test]
+fn postgres_a_refused_release_keeps_the_claim_only_when_the_hold_is_gone() {
+    if let Some(db) = Db::postgres() {
+        a_refused_release_keeps_the_claim_only_when_the_hold_is_gone(&db);
+    }
 }
 
 #[test]

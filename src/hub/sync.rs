@@ -1346,7 +1346,8 @@ async fn poll_issue_closures(
 }
 
 /// For a repository that opted in, releases the hold of Work whose merged pull request closed
-/// its source issue as completed, from the closures read and stored this poll (`read`). A failure never fails the poll.
+/// its source issue as completed, from the closures read and stored this poll (`read`). A failure
+/// never fails the poll.
 async fn release_settled_holds(
     state: &HubState,
     conn: &Connection,

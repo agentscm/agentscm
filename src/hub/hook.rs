@@ -306,6 +306,9 @@ struct Outcome {
     status: &'static str,
     /// Why the edit is refused.
     deny: Option<String>,
+    /// Start only: owner finish lines in `text` not yet claimed. `hook` claims each one that
+    /// survives rendering and drops the rest, so a cut line is offered again at a later start.
+    owner_notices: Vec<super::merged_holds::MergedNotice>,
 }
 
 impl Outcome {
@@ -314,6 +317,7 @@ impl Outcome {
             text: String::new(),
             status: "clean",
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 
@@ -323,6 +327,7 @@ impl Outcome {
             text: unknown(reason),
             status: "unknown",
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 
@@ -336,6 +341,7 @@ impl Outcome {
             text,
             status,
             deny: None,
+            owner_notices: Vec::new(),
         }
     }
 }
@@ -388,6 +394,7 @@ async fn hook(
                 text: error.hook_note(),
                 status: "unknown",
                 deny: None,
+                owner_notices: Vec::new(),
             },
             Some(error),
         ),
@@ -398,6 +405,7 @@ async fn hook(
                     text: error.hook_note(),
                     status: "unknown",
                     deny: None,
+                    owner_notices: Vec::new(),
                 },
                 Some(error),
             )
@@ -608,6 +616,7 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+    settle_owner_lines(&state, &call, &mut outcome).await;
     let rendered = call.render(&outcome);
     let sample = super::hook_overhead::sample(
         call.session.as_deref(),
@@ -626,6 +635,60 @@ async fn hook(
         );
     }
     Ok(response)
+}
+
+/// Claims the owner finish lines of a start reply that the rendered text still shows, outside the
+/// call's deadline like the lead notice of a prompt. A line another session won, one the fitting
+/// cut, one that missed the claim's own bound, or any line of an unknown reply is removed or left
+/// unclaimed, so it is offered again at a later start.
+async fn settle_owner_lines(state: &HubState, call: &Call, outcome: &mut Outcome) {
+    let mut pending = std::mem::take(&mut outcome.owner_notices);
+    if outcome.status == "unknown" {
+        for notice in &pending {
+            drop_line(&mut outcome.text, notice.line());
+        }
+        return;
+    }
+    // Dropping a line can bring one the fitting cut back in, so render again until all settle.
+    while !pending.is_empty() {
+        let shown = call.render(outcome).to_string();
+        let (present, cut): (Vec<_>, Vec<_>) = pending.into_iter().partition(|notice| {
+            let escaped = serde_json::to_string(notice.line()).unwrap_or_default();
+            shown.contains(escaped.trim_matches('"'))
+        });
+        pending = cut;
+        if present.is_empty() {
+            return;
+        }
+        let all: Vec<String> = present.iter().map(|n| n.line().to_string()).collect();
+        let store = state.store.clone();
+        let won = tokio::time::timeout(
+            MERGED_NOTICE_BUDGET,
+            blocking(state, move || {
+                Ok(super::merged_holds::claim_notices(
+                    &*store,
+                    present,
+                    unix_now(),
+                ))
+            }),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        let mut lost = false;
+        for line in all.iter().filter(|line| !won.contains(line)) {
+            drop_line(&mut outcome.text, line);
+            lost = true;
+        }
+        if !lost {
+            return;
+        }
+    }
+}
+
+fn drop_line(text: &mut String, line: &str) {
+    *text = text.replacen(&format!("{line}\n"), "", 1);
 }
 
 fn first_note(key: String) -> bool {
@@ -1085,6 +1148,7 @@ impl Call {
                     let text = self.unlinked_refusal(Some((item, lead)));
                     return Ok(Outcome {
                         deny: self.deny.then(|| text.clone()),
+                        owner_notices: Vec::new(),
                         text,
                         status: if applied { "fyi" } else { "stop" },
                     });
@@ -1139,6 +1203,7 @@ impl Call {
                         };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
+                            owner_notices: Vec::new(),
                             text,
                             status: if applied { "fyi" } else { "stop" },
                         });
@@ -1202,6 +1267,7 @@ impl Call {
                         }
                         Outcome {
                             deny: Some(text.clone()),
+                            owner_notices: Vec::new(),
                             text,
                             status: "stop",
                         }
@@ -1277,9 +1343,8 @@ impl Call {
                     .unwrap_or_else(|_| unknown("other agents could not be listed"));
                 let status = Outcome::advice(advice.text.clone(), advice.stop).status;
                 // Work of this owner whose merged pull request closed its issue: once each, ever.
-                // The claim is the delivery, so it runs last, just before this reply returns, and a
-                // line another session won is dropped. The lines sit right after the advice, ahead
-                // of everything `START_CONTEXT` may cut.
+                // The claim is the delivery, so `hook` makes it after rendering, for the lines the
+                // reply still shows, and drops a line another session won.
                 let owner_notices = if !principal.read_only && !self.child {
                     let (store, scope, name) = (
                         state.store.clone(),
@@ -1378,27 +1443,12 @@ impl Call {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }
-                if !owner_notices.is_empty() {
-                    let all: Vec<String> =
-                        owner_notices.iter().map(|n| n.line().to_string()).collect();
-                    let store = state.store.clone();
-                    let won = blocking(state, move || {
-                        Ok(super::merged_holds::claim_notices(
-                            &*store,
-                            owner_notices,
-                            unix_now(),
-                        ))
-                    })
-                    .await
-                    .unwrap_or_default();
-                    for line in all.iter().filter(|line| !won.contains(line)) {
-                        text = text.replacen(&format!("{line}\n"), "", 1);
-                    }
-                }
+                // Claimed by `hook`, once the rendered text shows the line.
                 Ok(Outcome {
                     text,
                     status,
                     deny: None,
+                    owner_notices,
                 })
             }
             Kind::Done => {
