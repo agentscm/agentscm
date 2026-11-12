@@ -54,10 +54,16 @@ What the columns mean:
   text arrives as a note.
 - **Session end reported.** Setup installs a session-end hook for all five wired agents
   (`SessionEnd`; `sessionEnd` for Cursor and Copilot). When it runs, the Hub releases the
-  session's file intents and never records its Work as finished. Work whose hold is still live
-  stays active: some clients end the session after every turn, so the end may be only the gap
-  between two turns, and the Work's lease runs on from it. Work that holds nothing, or whose hold
-  has lapsed, is paused.
+  session's file intents. It records the session's Work as finished only when that Work's pull
+  request merged (below). Other Work whose hold is still live stays active: some clients end the
+  session after every turn, so the end may be only the gap between two turns, and the Work's lease
+  runs on from it. Work that holds nothing, or whose hold has lapsed, is paused.
+  A session end, or a turn that ends asking its person nothing, completes the active or paused
+  Work the session leads whose pull requests all merged and whose source issue, if it has one,
+  that pull request closed as completed, as the Hub's own
+  [completion of merged Work](standup.md#completion-of-merged-work) does after a lease lapses.
+  The outcome reads `hub_observed_merge`. A turn that asks its person something leaves the Work
+  open.
   A session that is killed sends no end; its hold lapses with its lease
   ([holds stay live](#holds-stay-live-while-the-agent-works)).
 - **Waiting for you reported.** See [waiting for you](#waiting-for-you-in-its-session). In VS

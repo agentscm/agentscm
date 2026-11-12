@@ -2201,8 +2201,11 @@ mod merged_prompts {
     use agentscm::hub::planned_issues::IssueIdentity;
     use agentscm::hub::store::new_connection_id;
     use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    use agentscm::hub::work_lifecycle::OutcomeProvenance;
     use agentscm::hub::work_recovery::{RecoveryCaller, RemedyKind, RemedyPreviewRequest, preview};
-    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    use agentscm::hub::work_transition::{
+        OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
+    };
 
     const ID: i64 = 101;
     const LEAD: &str = "lead-session";
@@ -2533,5 +2536,95 @@ mod merged_prompts {
             .unwrap()
             .unwrap();
         assert_eq!(item.state, WorkState::Active);
+    }
+
+    impl World {
+        fn turn_end(&self, session: &str, extra: Value) -> Value {
+            let mut payload = json!({"hook_event_name": "Stop", "session_id": session,
+                "cwd": "/work/acme-widgets"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            self.hub.hook("claude", &self.secret, &payload)
+        }
+
+        fn session_end(&self, session: &str) {
+            let payload = json!({"hook_event_name": "SessionEnd", "session_id": session,
+                "cwd": "/work/acme-widgets"});
+            self.hub.hook("claude", &self.secret, &payload);
+        }
+
+        /// The Work's state and its outcome's provenance, as the operational read shows them.
+        fn outcome(&self, id: &str) -> (WorkState, OutcomeProvenance) {
+            let operational = self
+                .hub
+                .store
+                .work_operational(
+                    &WorkLifecycleReader::Token(&self.token),
+                    &OperationalSelect::One(id),
+                    unix_now(),
+                )
+                .unwrap();
+            let work = &operational.work[0];
+            (work.state, work.outcome.provenance)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_asks_nothing_completes_merged_work_it_leads() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
+        // A turn that asks its person something leaves the Work open.
+        w.turn_end(
+            LEAD,
+            json!({"asked_nothing": false, "asks": "Shall I merge it?"}),
+        );
+        assert_eq!(w.outcome(&id).0, WorkState::Active);
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_end_completes_merged_work_instead_of_pausing_it() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
+        w.session_end(LEAD);
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_end_leaves_part_of_work_and_another_sessions_work_open() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(IssueClosure {
+            state: IssueState::Open,
+            reason: CloseReason::Other,
+            closer_pull: None,
+            closer_repository_id: None,
+        });
+        w.prompt(LEAD);
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id).0,
+            WorkState::Active,
+            "the issue is still open"
+        );
+        // Another session's end never completes Work it does not lead.
+        w.close_issue(completed());
+        w.prompt(OTHER);
+        w.turn_end(OTHER, json!({"asked_nothing": true}));
+        w.session_end(OTHER);
+        assert_eq!(w.outcome(&id).0, WorkState::Active);
     }
 }
