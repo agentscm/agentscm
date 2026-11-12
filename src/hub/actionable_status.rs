@@ -622,6 +622,13 @@ fn read_scoped(
         .iter()
         .map(|s| (s.key.as_str(), s.updated_at))
         .collect::<BTreeMap<_, _>>();
+    // Which session keys are live; unknown when the list was cut short, since absence proves nothing.
+    let live_keys = (sessions.len() <= MAX_STATUS_WORK).then(|| {
+        sessions
+            .iter()
+            .map(|s| s.key.clone())
+            .collect::<BTreeSet<_>>()
+    });
     let mut work = Vec::new();
     let mut staged = Vec::new();
     let mut items = BTreeMap::new();
@@ -712,7 +719,14 @@ fn read_scoped(
         .filter(|w| w.operational.reservation.status == ReservationStatus::Held)
         .map(|w| w.work_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut actions = request_actions(&requests, &items, &holding, &principal.owner.id, now);
+    let mut actions = request_actions(
+        &requests,
+        &items,
+        &holding,
+        live_keys.as_ref(),
+        &principal.owner.id,
+        now,
+    );
     let pair_is_current = |pair: &crate::hub::work::WorkOverlapPair| {
         [&pair.left, &pair.right].iter().all(|old| {
             items
@@ -1334,11 +1348,14 @@ fn dependency_actions(
 /// it was made is stuck, and that Work's owner is asked, in one row for the request. Only the
 /// acknowledgement counts as responding: a renewed lease, a checkpoint or a live connection
 /// keeps the Work live but does not show its lead reads anything. The text, which the asker
-/// reads too, says why it waits and when it is raised.
+/// reads too, says why it waits and when it is raised. `live` holds the keys of the live
+/// sessions, or is `None` when that list was incomplete: a quiet Work whose lead session is live
+/// can still answer, and one whose session is not in a complete list cannot.
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
     holding: &BTreeSet<&str>,
+    live: Option<&BTreeSet<String>>,
     viewer: &str,
     now: i64,
 ) -> Vec<StatusAction> {
@@ -1430,8 +1447,16 @@ fn request_actions(
             } else {
                 let why = if acknowledged {
                     "Its lead acknowledged it and has not replied yet.".to_owned()
+                } else if item.lead_idle()
+                    && live.is_some_and(|keys| {
+                        keys.contains(&session_key(&item.lead_token, &item.lead_session))
+                    })
+                {
+                    "Its lead's Work is quiet but its session is live, so it can still reply; it is not raised in Needs you.".to_owned()
+                } else if item.lead_idle() && live.is_none() {
+                    "Its lead's Work is quiet and whether its lead can answer is unknown, so it is not raised in Needs you.".to_owned()
                 } else if item.lead_idle() {
-                    "Its lead is not running, so it is not raised in Needs you; its hold lapses by itself if it does not return.".to_owned()
+                    "Its lead is not running, so it is not raised in Needs you; agentscm_work_status says whether its hold lapses or is retained.".to_owned()
                 } else if !request.acknowledgements_complete {
                     "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
                 } else if one_person {
@@ -3999,7 +4024,14 @@ mod tests {
         let id = request.targets[0].work_id.clone();
         let holding = BTreeSet::from([id.as_str()]);
         // The answer is the lead agent's to give, however quiet it is: its person is not asked.
-        let actions = request_actions(&inbox(request.clone()), &items, &holding, "usr_owner", 100);
+        let actions = request_actions(
+            &inbox(request.clone()),
+            &items,
+            &holding,
+            None,
+            "usr_owner",
+            100,
+        );
         assert_eq!(actions.len(), 1);
         assert!(!actions[0].needs_you);
         assert_eq!(actions[0].recipients[0].kind, RecipientKind::LeadAgent);
@@ -4009,6 +4041,7 @@ mod tests {
                 &inbox(request.clone()),
                 &items,
                 &BTreeSet::new(),
+                None,
                 "usr_owner",
                 100
             )
@@ -4016,7 +4049,15 @@ mod tests {
         );
         request.targets[0].generation = 2;
         assert!(
-            request_actions(&inbox(request.clone()), &items, &holding, "usr_owner", 100).is_empty()
+            request_actions(
+                &inbox(request.clone()),
+                &items,
+                &holding,
+                None,
+                "usr_owner",
+                100
+            )
+            .is_empty()
         );
         request.targets[0].generation = 1;
         request
@@ -4033,7 +4074,9 @@ mod tests {
                 created_at: 100,
                 seq: 2,
             });
-        assert!(request_actions(&inbox(request), &items, &holding, "usr_owner", 100).is_empty());
+        assert!(
+            request_actions(&inbox(request), &items, &holding, None, "usr_owner", 100).is_empty()
+        );
     }
 
     /// #486: a live lead that never acknowledges a request. Before the bound its lead agent is
@@ -4068,7 +4111,7 @@ mod tests {
                        now: i64| {
             let items = BTreeMap::from([(id.clone(), item.clone())]);
             let mut actions =
-                request_actions(&inbox(request.clone()), &items, &holding, viewer, now);
+                request_actions(&inbox(request.clone()), &items, &holding, None, viewer, now);
             assert_eq!(actions.len(), 1, "one row per stuck request");
             actions.remove(0)
         };
@@ -4129,11 +4172,36 @@ mod tests {
                 .limits
                 .contains(&"request_acknowledgements_truncated".to_owned())
         );
-        // A lead that is not running will not answer, and its hold lapses by itself.
+        // A quiet lead whose session is not live will not answer; no lapse is promised.
         item.claim_status = ClaimStatus::Stale;
         let quiet = actions(&request, &item, "usr_owner", due);
         assert!(!quiet.needs_you);
         assert_eq!(quiet.recipients[0].kind, RecipientKind::LeadAgent);
+        let with_live = |live: Option<&BTreeSet<String>>| {
+            let items = BTreeMap::from([(id.clone(), item.clone())]);
+            request_actions(
+                &inbox(request.clone()),
+                &items,
+                &holding,
+                live,
+                "usr_owner",
+                due,
+            )
+            .remove(0)
+            .action
+        };
+        let none = BTreeSet::new();
+        let not_running = with_live(Some(&none));
+        assert!(
+            not_running.contains("Its lead is not running"),
+            "{not_running}"
+        );
+        assert!(!not_running.contains("lapses by itself"), "{not_running}");
+        let live = BTreeSet::from([session_key(&item.lead_token, &item.lead_session)]);
+        let said = with_live(Some(&live));
+        assert!(said.contains("its session is live"), "{said}");
+        assert!(!said.contains("not running"), "{said}");
+        assert!(with_live(None).contains("is unknown"));
         // Between two agents of one person the asking agent asks that person in its session.
         item.claim_status = ClaimStatus::Active;
         let mut own = request.clone();
