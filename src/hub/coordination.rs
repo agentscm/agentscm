@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::error_envelope::{FieldProblem, InputProblem};
 use super::handoff::Via;
 use super::intent::text;
-use super::work::{ForgeWorkRef, WorkPathOverlap, validate_id};
+use super::work::{ForgeWorkRef, WorkItem, WorkPathOverlap, WorkState, validate_id};
 use super::{HubError, Result};
 
 pub const MAX_COORDINATION_PAGE: usize = 100;
@@ -134,6 +134,20 @@ pub struct CoordinationRequest {
     /// person who owns it, may then withdraw the request. Left out of the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requester_unavailable: bool,
+    /// Whether the paths an open request asks for are still held by another Work or live
+    /// intent. Derived when the requester reads its own inbox, not stored; absent for a
+    /// settled request and for any other reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_paths: Option<RequestedPathsHold>,
+}
+
+/// Whether the paths a request asks for are still held.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPathsHold {
+    Held,
+    Released,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -451,6 +465,47 @@ pub(super) fn join_uncovered(
     Err(HubError::invalid_or_changed(format!(
         "The requested paths {shown}{more} are wider than your Work's declared scope, so a join would let the requester edit only the files your Work declares. To agree to more, checkpoint your scope to include them and reply join, or grant agentscm_work_overlap_consent for exact named files."
     )))
+}
+
+/// Refuses a helper or reviewer join that the session could not edit under, before anything is
+/// written: the later touch refuses every edit unless this is the session's only eligible Work,
+/// the Work holds a reservation and the paths lie in its scope. `holds_reservation` and
+/// `elsewhere` (the id of another Work the same session is already eligible on) come from the
+/// store. An empty `requested` scope joins without edits and is never refused.
+pub(super) fn helper_join_editable(
+    item: &WorkItem,
+    holds_reservation: bool,
+    elsewhere: Option<&str>,
+    requested: &[String],
+) -> Result<()> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    // Finished, paused or unreserved Work joins and acquires nothing, so no edit follows.
+    if !matches!(item.state, WorkState::Active | WorkState::Blocked) || !holds_reservation {
+        return Ok(());
+    }
+    let uncovered = super::work::uncovered_scope(&item.scope, requested);
+    if !uncovered.is_empty() {
+        let shown =
+            super::intent::display_all(uncovered.iter().take(JOIN_UNCOVERED_SHOWN)).join(", ");
+        let more = uncovered.len().saturating_sub(JOIN_UNCOVERED_SHOWN);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        return Err(HubError::Invalid(format!(
+            "Nothing was joined: {shown}{more} lie outside Work {}'s declared scope, so edits to them would be refused. Ask the lead to checkpoint its scope to include them, use agentscm_work_overlap_consent for exact named files, or start your own Work over them.",
+            item.id
+        )));
+    }
+    if let Some(other) = elsewhere {
+        return Err(HubError::Invalid(format!(
+            "Nothing was joined: this session already edits under Work {other}, and a session edits under one Work at a time. Pause or finish that Work with agentscm_done, or join from another session."
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

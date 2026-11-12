@@ -46,8 +46,8 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
-    response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, RequestedPathsHold, helper_join_editable, join_uncovered,
+    parse_response_kind, parse_status, response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -3836,6 +3836,7 @@ fn coordination_request_at(
         created_seq,
         updated_seq,
         requester_unavailable,
+        requested_paths: None,
     }))
 }
 
@@ -4333,6 +4334,7 @@ fn coordination_page(
            {addressed}
          ORDER BY v.event_seq, r.id LIMIT ?9"
     );
+    let session_name = session;
     let session = session.unwrap_or("");
     let mut statement = tx.prepare(&sql)?;
     let rows = statement
@@ -4357,8 +4359,13 @@ fn coordination_page(
     let mut requests = Vec::new();
     let mut bytes = 0_usize;
     for (id, seq) in rows {
-        let request = coordination_request_at(tx, who, &id, through, now)?
+        let mut request = coordination_request_at(tx, who, &id, through, now)?
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
+        if request.requester.token == who.token
+            && Some(request.requester.session.as_str()) == session_name
+        {
+            request.requested_paths = requested_paths_hold(tx, who, &request, now);
+        }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
             complete = false;
@@ -4381,6 +4388,66 @@ fn coordination_page(
         requests,
         complete,
         retention_gap: after < retention_floor,
+    })
+}
+
+/// Whether the paths an open request asks for are still held by another lead's reservation or
+/// another token's live intent. Only the requester's own inbox asks, and a failed read says
+/// unknown rather than failing the page.
+fn requested_paths_hold(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    request: &CoordinationRequest,
+    now: i64,
+) -> Option<RequestedPathsHold> {
+    if !matches!(
+        request.status,
+        CoordinationStatus::Pending | CoordinationStatus::Responded
+    ) {
+        return None;
+    }
+    let read = || -> Result<bool> {
+        let scope = &request.proposal.scope;
+        let held_work = work_scope_overlaps(tx, who, scope, None, now)?
+            .iter()
+            .any(|overlap| {
+                request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
+                    && overlap.item.lead_token != who.token
+            });
+        if held_work {
+            return Ok(true);
+        }
+        let keys = scope
+            .iter()
+            .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+            .collect::<Vec<_>>();
+        let (points, ranges) = probe_set(&keys);
+        let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+             WHERE p.repository = ?1 AND i.token <> ?2 AND p.expires_at > ?3";
+        if !points.is_empty()
+            && tx.query_row(
+                &format!("SELECT EXISTS ({live} AND p.key IN (SELECT value FROM json_each(?4)))"),
+                params![who.repository, who.token, now, json!(points).to_string()],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(true);
+        }
+        for (start, end) in ranges {
+            if tx.query_row(
+                &format!("SELECT EXISTS ({live} AND p.key >= ?4 AND p.key < ?5)"),
+                params![who.repository, who.token, now, start, end],
+                |row| row.get::<_, bool>(0),
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    Some(match read() {
+        Ok(true) => RequestedPathsHold::Held,
+        Ok(false) => RequestedPathsHold::Released,
+        Err(_) => RequestedPathsHold::Unknown,
     })
 }
 
@@ -4509,6 +4576,28 @@ fn start_overlap_in(
                 return Err(HubError::Invalid(
                     "work has the maximum of 100 participants".into(),
                 ));
+            }
+            if !scope.is_empty() {
+                let elsewhere: Option<String> = tx
+                    .query_row(
+                        "SELECT w.id FROM hub_work_items w
+                         JOIN hub_work_items t ON t.id = ?1
+                         JOIN hub_work_participants p ON p.work = w.id
+                         WHERE w.id <> t.id AND w.provider = t.provider AND w.host = t.host
+                           AND w.repository = t.repository AND w.repository_id IS t.repository_id
+                           AND w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                           AND p.token = ?2 AND p.session = ?3 AND p.generation = w.generation
+                         ORDER BY w.id LIMIT 1",
+                        params![item.id, who.token, start.session],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                helper_join_editable(
+                    &item,
+                    work_holds_reservation(tx, &item.id)?,
+                    elsewhere.as_deref(),
+                    &scope,
+                )?;
             }
             item.participants.push(WorkParticipant {
                 owner: who.owner.id.clone(),
@@ -5804,6 +5893,62 @@ fn release_session_intent(
         .map(Option::unwrap_or_default)
 }
 
+/// After a checkpoint narrowed `item`'s scope from `previous`, frees from each participant
+/// session's intent the paths the Work no longer covers, unless another Work the token is
+/// eligible on does. An intent left with no path is released.
+fn trim_session_intents(
+    tx: &Transaction<'_>,
+    item: &WorkItem,
+    previous: &[String],
+    now: i64,
+) -> Result<()> {
+    for (token, session) in work_transition::claim_sessions(item) {
+        let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
+            continue;
+        };
+        let expires_at: i64 = tx.query_row(
+            "SELECT expires_at FROM hub_intents WHERE id = ?1",
+            [&intent],
+            |row| row.get(0),
+        )?;
+        // An expired intent holds nothing, so there is nothing to trim or announce.
+        if expires_at <= now {
+            continue;
+        }
+        let keys = {
+            let mut statement =
+                tx.prepare("SELECT key FROM hub_intent_paths WHERE intent = ?1 ORDER BY key")?;
+            statement
+                .query_map([&intent], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let elsewhere = other_eligible_scopes(tx, &item.id, &token)?;
+        let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
+        if kept.len() == keys.len() {
+            continue;
+        }
+        if kept.is_empty() {
+            release_in(tx, &token, &intent, now)?;
+            continue;
+        }
+        let paths = display_all(&kept);
+        tx.execute(
+            "UPDATE hub_intents SET paths = ?2, updated_at = ?3 WHERE id = ?1",
+            params![intent, serde_json::json!(paths).to_string(), now],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_intent_paths WHERE intent = ?1 AND key NOT IN
+                 (SELECT value FROM json_each(?2))",
+            params![intent, serde_json::json!(kept).to_string()],
+        )?;
+        append(
+            tx,
+            &Event::intent_paths_changed(&intent, &paths, expires_at)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Releases the token's live intents that no session holds and that cover part of `scope`.
 /// A plain intent announce has no session, so only the path overlap ties it to the Work.
 fn release_sessionless_intents(
@@ -6822,19 +6967,25 @@ fn ask_in(
 /// start or an edit that needs it, as `agentscm_start` and the edit hook say, so it is not free.
 fn unheld(tx: &Transaction<'_>, token: &str, name: &str, key: &str, now: i64) -> Result<Asked> {
     let work = work_who(tx, token, now)?;
-    let overlaps = work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)?;
-    Ok(overlaps
-        .into_iter()
-        .find(|o| {
-            !o.item
-                .participants
-                .iter()
-                .any(|p| p.token == token && p.session == name)
-        })
-        .map_or(Asked::NotHeld, |o| Asked::Reserved {
-            lead: coordination_lead(&o.item),
-            work_id: o.item.id,
-        }))
+    for o in work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)? {
+        // A session eligible on the Work may edit under it, so it is not reserved against it.
+        let eligible = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work = w.id
+             WHERE w.id = ?1 AND w.state IN ('active','blocked')
+               AND w.reservation_basis IS NOT NULL
+               AND p.token = ?2 AND p.session = ?3 AND p.generation = w.generation)",
+            params![o.item.id, token, name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !eligible {
+            return Ok(Asked::Reserved {
+                lead: coordination_lead(&o.item),
+                work_id: o.item.id,
+            });
+        }
+    }
+    Ok(Asked::NotHeld)
 }
 
 /// A refused call asks the holder of each contested file to hand it over, as `agentscm_ask`
@@ -7914,6 +8065,7 @@ fn checkpoint_overlap_in(
     };
     item.last_checkin_at = now;
     item.next_action = checkpoint.next_action.clone();
+    let previous_scope = item.scope.clone();
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
     }
@@ -7998,6 +8150,12 @@ fn checkpoint_overlap_in(
         .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
     adjust_work_payload_capacity(tx, &who, delta, now)?;
     work_dependencies::changed(tx, &who, &item, now)?;
+    if held
+        && checkpoint.kind != super::work::CheckpointKind::Finish
+        && item.scope != previous_scope
+    {
+        trim_session_intents(tx, &item, &previous_scope, now)?;
+    }
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
         // records its own size without one, so a finish is never refused for the cleanup.

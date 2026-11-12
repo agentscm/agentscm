@@ -1841,6 +1841,386 @@ parity_case!(
     default_work_session_is_durably_aliased_to_the_first_hook
 );
 
+parity_case!(
+    refused_helper_start,
+    refused_helper_start_leaves_no_participant
+);
+parity_case!(
+    responded_request_unheld,
+    responded_request_does_not_block_checkpoint_once_unheld
+);
+parity_case!(ask_helped_work, ask_reports_reservation_of_helped_work);
+parity_case!(
+    session_hold_outside_declared_scope,
+    narrowing_a_scope_releases_the_session_hold_on_dropped_paths
+);
+
+fn release_work(store: &dyn Store, who: &str, item: &agentscm::hub::work::WorkItem, session: &str) {
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    let release: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+        "work_id": item.id, "operation_id": "release-op", "generation": item.generation,
+        "expected_updated_seq": item.updated_seq, "session": session,
+        "transition": "release", "reason": "synthetic release"
+    }))
+    .unwrap();
+    store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: who },
+            &release,
+            unix_now() + 50,
+        )
+        .unwrap();
+}
+
+fn scope_item(
+    store: &dyn Store,
+    who: &str,
+    session: &str,
+) -> Option<agentscm::hub::work::WorkItem> {
+    store
+        .work_scope_check(who, session, &["src/a.rs".into()], unix_now() + 60)
+        .unwrap()
+        .item
+}
+
+fn refused_helper_start_leaves_no_participant(db: &Db) {
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let c = token(&*store, 3, "charlie");
+    let d = token(&*store, 4, "delta");
+    let now = unix_now();
+    let lead = |name: &str| start_scope(name, name, WorkRole::Lead, None, &["src/a.rs"]);
+    let target = store.work_start(&b, &lead("b-session"), now).unwrap().item;
+    let helper = |session: &str, scope: &[&str]| {
+        start_scope("helper", session, WorkRole::Helper, Some(&target.id), scope)
+    };
+
+    // A path outside the Work's scope is refused and nothing is written.
+    let refusal = store
+        .work_start(&a, &helper("a-session", &["src/a.rs", "src/b.rs"]), now + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("Nothing was joined"), "{refusal}");
+    assert!(refusal.contains("src/b.rs"), "{refusal}");
+    assert!(
+        refusal.contains("agentscm_work_overlap_consent"),
+        "{refusal}"
+    );
+    assert!(scope_item(&*store, &a, "a-session").is_none());
+    let unchanged = scope_item(&*store, &b, "b-session").unwrap();
+    assert_eq!(unchanged.participants.len(), 1);
+    assert_eq!(unchanged.updated_seq, target.updated_seq);
+
+    // A session already eligible on another Work is refused, naming that Work.
+    let own = store
+        .work_start(
+            &a,
+            &start_scope("own", "a-session", WorkRole::Lead, None, &["docs/own.md"]),
+            now + 2,
+        )
+        .unwrap()
+        .item;
+    let refusal = store
+        .work_start(&a, &helper("a-session", &["src/a.rs"]), now + 3)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains(&own.id), "{refusal}");
+    assert!(refusal.contains("one Work at a time"), "{refusal}");
+    assert_eq!(
+        scope_item(&*store, &b, "b-session")
+            .unwrap()
+            .participants
+            .len(),
+        1
+    );
+
+    // An empty-path join and a covered join from a fresh session still work.
+    let empty = store
+        .work_start(&a, &helper("a-session", &[]), now + 4)
+        .unwrap();
+    assert!(empty.joined);
+    let covered = store
+        .work_start(&c, &helper("c-session", &["src/a.rs"]), now + 5)
+        .unwrap();
+    assert!(covered.joined);
+
+    // A Work that is no longer active still admits a join with paths: nothing is acquired and no
+    // edit could follow.
+    let item = scope_item(&*store, &b, "b-session").unwrap();
+    release_work(&*store, &b, &item, "b-session");
+    let joined = store
+        .work_start(&d, &helper("d-session", &["src/a.rs"]), now + 6)
+        .unwrap();
+    assert!(joined.joined);
+}
+
+fn responded_request_does_not_block_checkpoint_once_unheld(db: &Db) {
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/a.rs"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let own = store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Lead,
+                None,
+                &["docs/own.md"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let desired = ["docs/own.md", "src/a.rs"];
+    let request = match store
+        .work_checkpoint(
+            &a,
+            &checkpoint(
+                &own.id,
+                "propose",
+                "a-session",
+                own.updated_seq,
+                CheckpointKind::Progress,
+                Some(&desired),
+            ),
+            now + 1,
+        )
+        .unwrap_err()
+    {
+        HubError::WorkCoordinationRequired { request, .. } => *request,
+        e => panic!("{e:?}"),
+    };
+    let responded = store
+        .coordination_reply(
+            &b,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "decline".into(),
+                target_work_id: target.id.clone(),
+                session: "b-session".into(),
+                expected_updated_seq: request.updated_seq,
+                kind: CoordinationResponseKind::Decline,
+                note: None,
+                via: agentscm::hub::handoff::Via::Agent,
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(responded.responses.len(), 1);
+    let target_now = scope_item(&*store, &b, "b-session").unwrap();
+    release_work(&*store, &b, &target_now, "b-session");
+    let own_now = store
+        .work_scope_check(&a, "a-session", &["docs/own.md".into()], now + 60)
+        .unwrap()
+        .item
+        .unwrap();
+    let moved = store
+        .work_checkpoint(
+            &a,
+            &checkpoint(
+                &own.id,
+                "expand",
+                "a-session",
+                own_now.updated_seq,
+                CheckpointKind::Progress,
+                Some(&desired),
+            ),
+            now + 61,
+        )
+        .unwrap();
+    assert!(moved.item.scope.contains(&"src/a.rs".to_owned()));
+}
+
+fn ask_reports_reservation_of_helped_work(db: &Db) {
+    use agentscm::hub::handoff::Asked;
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/a.rs"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Helper,
+                Some(&target.id),
+                &["src/a.rs"],
+            ),
+            now + 1,
+        )
+        .unwrap();
+    for (who, session) in [(&a, "a-session"), (&b, "b-session")] {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: Vec::new(),
+            deny: false,
+            report: true,
+        };
+        store.touch_session(who, &call, now + 2).unwrap();
+    }
+    // A helper eligible on the Work may edit under it, and so is not reserved against it.
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 3)
+            .unwrap(),
+        Asked::NotHeld
+    ));
+    assert!(matches!(
+        store
+            .ask_handoff(&b, Some("b-session"), "src/a.rs", None, now + 4)
+            .unwrap(),
+        Asked::NotHeld
+    ));
+    // A stale participant (the Work moved to a later generation) is an outsider again.
+    let handed = scope_item(&*store, &b, "b-session").unwrap();
+    let handed = store
+        .work_checkpoint(
+            &b,
+            &checkpoint(
+                &handed.id,
+                "handover-helped",
+                "b-session",
+                handed.updated_seq,
+                CheckpointKind::Handover,
+                None,
+            ),
+            now + 50,
+        )
+        .unwrap()
+        .item;
+    let c = token(&*store, 3, "charlie");
+    let mut takeover = start_scope(
+        "helped",
+        "c-session",
+        WorkRole::Lead,
+        Some(&target.id),
+        &["src/a.rs"],
+    );
+    takeover.takeover_generation = Some(handed.generation);
+    store.work_start(&c, &takeover, now + 52).unwrap();
+    match store
+        .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 61)
+        .unwrap()
+    {
+        Asked::Reserved { work_id, lead } => {
+            assert_eq!(work_id, target.id);
+            assert_eq!(lead.session, "c-session");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn narrowing_a_scope_releases_the_session_hold_on_dropped_paths(db: &Db) {
+    use agentscm::hub::handoff::Asked;
+    let store = db.open();
+    let a = token(&*store, 1, "alpha");
+    let b = token(&*store, 2, "bravo");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &b,
+            &start_scope(
+                "b-session",
+                "b-session",
+                WorkRole::Lead,
+                None,
+                &["src/store.rs", "src/mod.rs", "docs/a.md"],
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let touch = |who: &str, session: &str, paths: &[&str], at: i64| {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+            deny: false,
+            report: true,
+        };
+        store.touch_session(who, &call, at).unwrap()
+    };
+    touch(&b, "b-session", &["src/store.rs", "src/mod.rs"], now + 1);
+    touch(&a, "a-session", &[], now + 1);
+    let kept = ["docs/a.md", "src/mod.rs"];
+    store
+        .work_checkpoint(
+            &b,
+            &checkpoint(
+                &target.id,
+                "narrow",
+                "b-session",
+                target.updated_seq,
+                CheckpointKind::Progress,
+                Some(&kept),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    // The dropped file is free; the kept one is still held by B's session.
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/store.rs", None, now + 3)
+            .unwrap(),
+        Asked::NotHeld
+    ));
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/mod.rs", None, now + 3)
+            .unwrap(),
+        Asked::Requested { .. } | Asked::Reserved { .. }
+    ));
+    let started = store
+        .work_start(
+            &a,
+            &start_scope(
+                "a-session",
+                "a-session",
+                WorkRole::Lead,
+                None,
+                &["src/store.rs"],
+            ),
+            now + 4,
+        )
+        .unwrap();
+    assert!(started.item.scope.contains(&"src/store.rs".to_owned()));
+}
+
 fn agent(seed: &str) -> CoordinationAgent {
     CoordinationAgent {
         token: format!("tok_{seed:0<32}"),
@@ -1917,6 +2297,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         created_seq: 1,
         updated_seq: 2,
         requester_unavailable: true,
+        requested_paths: None,
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();
@@ -1964,6 +2345,127 @@ parity_case!(
     finished_default_alias,
     finished_default_work_binds_no_hook_session
 );
+
+fn requester_sees_reply_and_release(db: &Db) {
+    use agentscm::hub::coordination::RequestedPathsHold;
+    let store = db.open();
+    let holder = token(&*store, 61, "holder");
+    let requester = token(&*store, 62, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(&holder, &start("holder", "holder-session"), now)
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let inbox = |at: i64| {
+        let page = store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("requester-session".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap();
+        page.requests
+            .into_iter()
+            .find(|candidate| candidate.id == request.id)
+            .unwrap()
+    };
+    assert_eq!(
+        inbox(now + 2).requested_paths,
+        Some(RequestedPathsHold::Held)
+    );
+    assert!(inbox(now + 2).responses.is_empty());
+
+    let ack = CoordinationAck {
+        request_id: request.id.clone(),
+        target_work_id: Some(request.targets[0].work_id.clone()),
+        session: "holder-session".into(),
+        expected_updated_seq: request.updated_seq,
+    };
+    let acknowledged = store.coordination_ack(&holder, &ack, now + 3).unwrap();
+    store
+        .coordination_reply(
+            &holder,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "decline-operation".into(),
+                target_work_id: request.targets[0].work_id.clone(),
+                session: "holder-session".into(),
+                expected_updated_seq: acknowledged.updated_seq,
+                kind: CoordinationResponseKind::Decline,
+                note: Some("Not before the release".into()),
+                via: agentscm::hub::handoff::Via::Agent,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let answered = inbox(now + 5);
+    assert_eq!(answered.responses.len(), 1);
+    assert_eq!(
+        answered.responses[0].kind,
+        CoordinationResponseKind::Decline
+    );
+    assert_eq!(answered.requested_paths, Some(RequestedPathsHold::Held));
+
+    store
+        .work_checkpoint(
+            &holder,
+            &checkpoint(
+                &target.id,
+                "finish-holder",
+                "holder-session",
+                target.updated_seq,
+                CheckpointKind::Finish,
+                None,
+            ),
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(
+        inbox(now + 7).requested_paths,
+        Some(RequestedPathsHold::Released)
+    );
+    // A request settled by its requester carries no hold.
+    let current = inbox(now + 7);
+    store
+        .coordination_withdraw(
+            &requester,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "withdraw-operation".into(),
+                session: "requester-session".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 8,
+        )
+        .unwrap();
+    let page = store
+        .coordination_list(
+            &requester,
+            &CoordinationListQuery {
+                active_only: false,
+                ..CoordinationListQuery::default()
+            },
+            now + 9,
+        )
+        .unwrap();
+    assert!(page.requests.iter().all(|r| r.requested_paths.is_none()));
+}
+
+parity_case!(requester_hold_state, requester_sees_reply_and_release);
 
 fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
@@ -2473,10 +2975,12 @@ fn agreed_overlap_admits_and_checks_only_named_files(db: &Db) {
         )
         .unwrap();
     assert!(store.work_overlap_start(&b, &accepted, now + 11).is_err());
+    // Narrowing also freed the first lead's and the helper's holds on the dropped file, so
+    // nothing remains to collide with and the second lead's held edit is no longer contested.
     let invalidated = touch(&b, "second", &["src/a.rs"], true, now + 11).unwrap();
     assert!(
-        !invalidated.denied.is_empty(),
-        "an already held edit must recheck ended consent"
+        invalidated.denied.is_empty(),
+        "a narrowed scope frees the dropped file for the other lead"
     );
 }
 
