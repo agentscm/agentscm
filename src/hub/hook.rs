@@ -1401,11 +1401,12 @@ impl Call {
             ),
             Some((item, true)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
                 format!(
-                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{named},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":[\"<each current scope path>\",{inner}]}} on standard input.",
+                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}{again}. If your AgentSCM tools are unavailable or bound to another repository, run `agentscm work checkpoint --request -` inside this file's checkout instead, with {{\"work_id\":\"{id}\",\"operation_id\":\"<new operation id>\",\"generation\":{generation},\"expected_updated_seq\":{seq},\"session\":{json_session},\"kind\":\"progress\",\"summary\":\"<short summary>\",\"scope\":[\"<each current scope path>\",{inner}]}} on standard input.",
                     id = item.id,
                     generation = item.generation,
                     seq = item.updated_seq,
                     inner = paths.trim_start_matches('[').trim_end_matches(']'),
+                    json_session = session.as_deref().unwrap_or("\"<your native session ID>\""),
                 )
             }
             Some((item, _)) if item.state == WorkState::Finished => format!(
