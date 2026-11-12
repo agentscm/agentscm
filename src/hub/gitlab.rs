@@ -745,16 +745,28 @@ fn project_info(item: &Value) -> Option<RepoInfo> {
 fn pull_json(mr: &Value) -> Value {
     let merged = mr["state"] == "merged";
     let open = matches!(mr["state"].as_str(), Some("opened" | "locked"));
+    // GitLab lists label names; the sync reads pull request labels as `{name}` objects.
+    let labels: Vec<Value> = mr["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|label| match label {
+            Value::String(name) => json!({"name": name}),
+            other => other.clone(),
+        })
+        .collect();
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
         "merged": merged, "merged_at": mr["merged_at"], "updated_at": mr["updated_at"],
-        "body": mr["description"], "labels": mr["labels"],
+        "body": mr["description"], "labels": labels,
         "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
         "merge_commit_sha": if mr["merge_commit_sha"].is_null() { &mr["squash_commit_sha"] } else { &mr["merge_commit_sha"] },
-        "head": {"ref": mr["source_branch"], "sha": mr["sha"]},
-        "base": {"ref": mr["target_branch"]},
+        "head": {"ref": mr["source_branch"], "sha": mr["sha"], "repo": {"id": mr["source_project_id"]}},
+        // `start_sha` is the target branch's tip the diff was made against, as a pull request's base sha is.
+        // Only a single merge request read carries `diff_refs`; a listing leaves it null.
+        "base": {"ref": mr["target_branch"], "sha": mr["diff_refs"]["start_sha"], "repo": {"id": mr["target_project_id"]}},
         "user": {"login": mr["author"]["username"], "id": mr["author"]["id"]},
         "html_url": mr["web_url"]})
 }
@@ -962,9 +974,32 @@ mod tests {
             (&json!("closed"), &json!(true))
         );
         assert_eq!(pull["merge_commit_sha"], "abc");
-        assert_eq!(pull["head"], json!({"ref": "feat/x", "sha": "head"}));
+        assert_eq!(
+            pull["head"],
+            json!({"ref": "feat/x", "sha": "head", "repo": {"id": null}})
+        );
         assert_eq!(pull["user"], json!({"login": "alice", "id": 5}));
         assert_eq!(pull_json(&json!({"state": "opened"}))["state"], "open");
+    }
+
+    #[test]
+    fn merge_requests_carry_labels_projects_and_base() {
+        let mr = json!({"iid": 4, "state": "merged", "sha": "ff", "merge_commit_sha": null,
+            "squash_commit_sha": null, "labels": ["bug", "needs review"],
+            "source_project_id": 7, "target_project_id": 7,
+            "diff_refs": {"base_sha": "mb", "start_sha": "tip", "head_sha": "ff"}});
+        let pull = pull_json(&mr);
+        assert_eq!(
+            pull["labels"],
+            json!([{"name": "bug"}, {"name": "needs review"}])
+        );
+        assert_eq!(
+            (&pull["head"]["repo"]["id"], &pull["base"]["repo"]["id"]),
+            (&json!(7), &json!(7))
+        );
+        assert_eq!(pull["base"]["sha"], "tip");
+        // A fast-forward merge has no merge commit; catch-up reads the head instead (catchup_sync).
+        assert!(pull["merge_commit_sha"].is_null());
     }
 
     #[test]
