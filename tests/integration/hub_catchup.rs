@@ -4259,6 +4259,7 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic release".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             t0 + 10,
         )
@@ -4478,6 +4479,7 @@ fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
                 transition: WorkTransitionKind::Release,
                 reason: "No more scope is reserved".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             t0 + 10,
         )

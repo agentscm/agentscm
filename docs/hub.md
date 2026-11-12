@@ -295,10 +295,10 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     stops counting the status items they name, on every surface; no one else's are read. See
     [the API](api.md).
   - `POST /v1/hub/session/work/transition` (`repository`, `work_id`, `operation_id`, `generation`,
-    `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
+    `expected_updated_seq`, `transition`, `reason`, optional `superseded_by` and `participants`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
-    release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
-    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. A task's page offers
+    release, retain, complete, abandon, supersede or prune participants; a Hub administrator may
+    release, abandon, supersede or prune participants. Anyone else gets 403 `not_your_work`. A person cannot reopen. A task's page offers
     these as **Release or end this task**, after a preview. See
     [stand-up](standup.md#recover-stuck-work).
   - `POST /v1/hub/session/work/recovery`, `POST /v1/hub/session/work/recovery/preview` and

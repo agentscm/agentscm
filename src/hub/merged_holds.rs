@@ -562,6 +562,7 @@ pub fn release_settled(
                     "Released by repository policy: pull request #{pull} merged and closed #{issue} as completed."
                 ),
                 superseded_by: None,
+                participants: Vec::new(),
             };
             let actor = WorkTransitionActor::Policy {
                 owner: &owner,
@@ -746,6 +747,7 @@ fn complete_one(
             transition: WorkTransitionKind::Complete,
             reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
             superseded_by: None,
+            participants: Vec::new(),
         };
         let actor = WorkTransitionActor::Policy {
             owner: &owner,

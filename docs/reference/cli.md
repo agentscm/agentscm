@@ -108,8 +108,9 @@ with the exact call that applies it. `--path` (repeat it, at most 32) also lists
 those paths with the exact overlapping paths, and your owner's resumable Work there. `--work-id`
 reads one Work item of the repository, whoever owns it. `--session` tells your lead session from
 your owner's other sessions; without it you act as your owner's agent. Page with `--after` set to
-the previous `next_after` and `--limit` (1 to 50, default 20). `--json` prints the versioned
-response.
+the previous `next_after` and `--limit` (1 to 50, default 20). Each Work item may list `findings`
+(for example a lapsed hold or a full participant list) with the remedy proposed for you, if any.
+`--json` prints the versioned response.
 
 ```sh
 agentscm work recovery --session "$SESSION" --path src/billing.rs
@@ -125,7 +126,25 @@ paths for the next lead and frees the rest). `agentscm work transitions` applies
 `{"session": …, "items": [...]}` batch of up to 25 transitions in order, each in its own transaction,
 and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (with a `code` and a
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
-items stay applied, and sending the same batch again is safe.
+items stay applied, and sending the same batch again is safe. A batch item may also be a
+`prune_participants` transition with `participants` (`token` and `session`), for the Work's owner or
+a Hub administrator; it removes those non-lead participants so a full Work can be resumed or reopened.
+
+`agentscm work repair [--session SESSION] [--apply] [--json]` repairs your owner's retained claims
+from the findings of `agentscm work recovery`. It reads every page of your owner's inventory (at most
+20 pages; a longer listing is reported as incomplete) and plans one transition for each finding
+whose proposed remedy is a permitted transition: `release` for a lapsed hold, `prune_participants`
+for a full participant list. A finding it will not apply is listed as skipped with the reason:
+report-only, not permitted, incomplete facts, a resume or handover, input only you can supply, or a
+second repair of the same Work. It never plans `complete`. The default is a dry run that changes
+nothing. `--apply` sends the plan through `work transitions` in chunks of 25, each item with the
+fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`. A rerun reads a
+fresh inventory, so items that already applied are no longer planned; an item that never applied is
+planned again, under the same operation id if its fences are unchanged or with new fences if the Work
+moved. `replayed` is what resending the identical batch through `work transitions` returns. Nothing
+is applied twice. Against a Hub that does not report findings it fails instead of planning nothing. It prints one
+outcome per item and exits non-zero when any item is refused, in conflict or unavailable. `--json`
+prints `{"applied", "planned", "skipped", "results", "complete"}`.
 
 ### `why`
 

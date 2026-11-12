@@ -505,6 +505,7 @@ fn a_retained_reservation_stays_retained(db: &Db) {
                 transition: WorkTransitionKind::Retain,
                 reason: "keep the scope while away".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             now + 2,
         )

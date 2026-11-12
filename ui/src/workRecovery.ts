@@ -14,7 +14,7 @@ import type { BrowserSession } from './devices.ts'
 import { refusalFrom } from './refusal.ts'
 import { withTimeout } from './timeout.ts'
 
-export type RemedyKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'resume' | 'handover'
+export type RemedyKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants' | 'resume' | 'handover'
 /** Transitions a person applies through the Hub; resume, reopen and handover need an agent session. */
 export const PERSON_REMEDIES: RemedyKind[] = ['release', 'complete', 'abandon', 'retain']
 
@@ -55,7 +55,7 @@ export interface BatchItem {
   retry: string
 }
 
-const KINDS = new Set<string>(['release', 'retain', 'complete', 'abandon', 'supersede', 'reopen', 'resume', 'handover'])
+const KINDS = new Set<string>(['release', 'retain', 'complete', 'abandon', 'supersede', 'reopen', 'prune_participants', 'resume', 'handover'])
 const BUCKETS = new Set<string>(['active', 'needs_you', 'resumable', 'finished', 'other'])
 const STANDINGS = new Set<string>(['lead', 'owner', 'admin', 'other'])
 const OUTCOMES = new Set<string>(['applied', 'replayed', 'conflict', 'refused', 'unavailable'])

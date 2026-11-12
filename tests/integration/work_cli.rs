@@ -1088,6 +1088,56 @@ fn recovery_cli_inspects_previews_and_applies_a_batch_with_per_item_outcomes() {
 }
 
 #[test]
+fn repair_cli_plans_without_changing_and_applies_nothing_for_healthy_work() {
+    let hub = Hub::start();
+    let client = hub.bound_client(903, "synthetic-repair-owner", 101);
+    let started = client.start(
+        r#"{"request_key":"repair-cli","title":"Healthy task","session":"live-session","scope":["src/live.rs"]}"#,
+    );
+    assert!(started.status.success(), "{started:?}");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(args)
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let dry = run(&["work", "repair", "--json", "--session", "other-session"]);
+    assert!(dry.status.success(), "{dry:?}");
+    let report: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(report["applied"], false);
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["planned"], serde_json::json!([]));
+    assert_eq!(report["results"], serde_json::json!([]));
+    let text = run(&["work", "repair", "--session", "other-session"]);
+    assert!(text.status.success(), "{text:?}");
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("Dry run: 0 planned, 0 skipped."),
+        "{text:?}"
+    );
+    let applied = run(&[
+        "work",
+        "repair",
+        "--apply",
+        "--json",
+        "--session",
+        "other-session",
+    ]);
+    assert!(applied.status.success(), "{applied:?}");
+    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["results"], serde_json::json!([]));
+    // The healthy Work still holds its claim.
+    let after = run(&["work", "recovery", "--json", "--session", "other-session"]);
+    let page: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(page["work"][0]["bucket"], "active");
+}
+
+#[test]
 fn issue_link_set_preserves_native_identity() {
     let hub = Hub::start();
     let client = hub.bound_client(91, "fixture", 101);

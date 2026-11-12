@@ -528,6 +528,7 @@ fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic reason".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             unix_now(),
         )
@@ -561,6 +562,7 @@ fn start_and_release(hub: &Hub, agent: &Agent, session: &str, scope: &[&str]) ->
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic reason".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             unix_now(),
         )

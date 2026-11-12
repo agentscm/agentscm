@@ -211,6 +211,7 @@ fn stale(store: &dyn Store, who: &Principal, now: i64) -> Result<StaleWork> {
             after,
             limit: MAX_RECOVERY_PAGE,
             paths: Vec::new(),
+            all_owners: false,
         };
         let facts = store.work_recovery_read(&reader, &read, now)?;
         let items: BTreeMap<String, WorkItem> = facts

@@ -4,17 +4,23 @@ use crate::hub_pg;
 
 use std::sync::Arc;
 
+use agentscm::hub::HubError;
 use agentscm::hub::store::{self, ForgeIdentity, Store, User, mint_bound_agent_token, unix_now};
-use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkRole, WorkStart, WorkState};
+use agentscm::hub::work::{
+    CheckpointKind, WorkCheckpoint, WorkItem, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
+};
 use agentscm::hub::work_lifecycle::{
     ActivityStatus, LEASE_SECONDS, Recipient, ReservationStatus, WorkTransitionKind,
 };
 use agentscm::hub::work_recovery::{
-    BatchOutcome, BatchTransitionItem, RecoveryBucket, RecoveryCaller, RecoveryQuery, RefusalCode,
-    RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1, WorkTransitionBatch, apply_batch,
-    inspect, preview,
+    BatchItemV1, BatchOutcome, BatchTransitionItem, FindingKind, RecoveryBucket, RecoveryCaller,
+    RecoveryQuery, RefusalCode, RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1,
+    WorkTransitionBatch, apply_batch, inspect, preview, repair_plan,
 };
-use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader, WorkTransitionActor};
+use agentscm::hub::work_transition::{
+    OperationalSelect, ParticipantRef, WorkLifecycleReader, WorkTransitionActor,
+    WorkTransitionRequest,
+};
 use hub_pg::PgSchema;
 use tempfile::TempDir;
 
@@ -49,6 +55,41 @@ impl Db {
 
     fn open(&self) -> Arc<dyn Store> {
         store::open(&self.url).unwrap()
+    }
+
+    /// Runs raw SQL, to build a database state the Store can no longer reach.
+    fn sql(&self, sql: &str) {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap();
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+    }
+
+    /// The first column of the first row of a query, as an integer or text.
+    fn scalar(&self, sql: &str) -> String {
+        if self._pg.is_some() {
+            let row = postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query_one(&format!("SELECT CAST(({sql}) AS TEXT)"), &[])
+                .unwrap();
+            row.get(0)
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(&format!("SELECT CAST(({sql}) AS TEXT)"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
     }
 }
 
@@ -168,6 +209,7 @@ fn item(
         transition,
         reason: "synthetic recovery".into(),
         superseded_by: None,
+        participants: Vec::new(),
     }
 }
 
@@ -945,6 +987,586 @@ fn people_use_the_same_service(db: &Db) {
     assert_eq!(applied.items[0].outcome, BatchOutcome::Applied);
 }
 
+fn join(store: &dyn Store, who: &Agent, work_id: &str, session: &str, role: WorkRole, now: i64) {
+    let mut join = start("join", session, "src/none/**");
+    join.work_id = Some(work_id.into());
+    join.request_key = None;
+    join.role = role;
+    join.scope = vec![];
+    join.branch = None;
+    join.next_action = None;
+    store.work_start(&who.token, &join, now).unwrap();
+}
+
+fn abandon_with(
+    store: &dyn Store,
+    owner: &Agent,
+    work: &WorkItem,
+    operation: &str,
+    seq: i64,
+    now: i64,
+) -> BatchItemV1 {
+    let batch = WorkTransitionBatch {
+        session: Some("s-a".into()),
+        items: vec![item(
+            &work.id,
+            operation,
+            work.generation,
+            seq,
+            WorkTransitionKind::Abandon,
+        )],
+    };
+    let actor = WorkTransitionActor::Agent {
+        token: &owner.token,
+    };
+    apply_batch(store, &actor, &batch, now)
+        .unwrap()
+        .items
+        .remove(0)
+}
+
+/// A helper from another owner that joins and re-joins moves `updated_seq` but cannot starve the
+/// owner's cleanup: joins alone do not expire the receipt.
+fn a_helper_moving_updated_seq_cannot_starve_owner_cleanup(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 2);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 3);
+    let moved = one(&*store, &caller(&alice, "s-a"), &work.id, now + 4);
+    assert!(moved.work[0].operational.updated_seq > work.updated_seq);
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 5,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Applied);
+}
+
+/// A real change after the observed seq still refuses, even with joins around it.
+fn a_non_join_change_after_the_observed_seq_still_refuses(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let current = one(&*store, &caller(&alice, "s-a"), &work.id, now + 2);
+    store
+        .work_checkpoint(
+            &alice.token,
+            &WorkCheckpoint {
+                work_id: work.id.clone(),
+                operation_id: "progress".into(),
+                generation: work.generation,
+                session: "s-a".into(),
+                expected_updated_seq: Some(current.work[0].operational.updated_seq),
+                kind: CheckpointKind::Progress,
+                summary: "moved on".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: vec![],
+                related_work: vec![],
+            },
+            now + 3,
+        )
+        .unwrap();
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 4);
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 5,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Refused);
+    assert_eq!(result.code.as_deref(), Some("work_changed"));
+}
+
+/// An `expected_updated_seq` that is not a recorded seq of this Work cannot skip over changes.
+fn an_unrecorded_expected_seq_is_not_accepted_over_joins(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let other = store
+        .work_start(&alice.token, &start("b", "s-b", "src/b/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-c", WorkRole::Helper, now + 1);
+    for (n, seq) in [(1, 1), (2, other.updated_seq), (3, work.updated_seq + 1000)] {
+        let op = format!("abandon-{n}");
+        let result = abandon_with(&*store, &alice, &work, &op, seq, now + 2);
+        assert_eq!(result.outcome, BatchOutcome::Refused, "seq {seq}");
+        assert_eq!(result.code.as_deref(), Some("work_changed"), "seq {seq}");
+    }
+    let result = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-ok",
+        work.updated_seq,
+        now + 3,
+    );
+    assert_eq!(result.outcome, BatchOutcome::Applied);
+}
+
+fn current(store: &dyn Store, who: &Agent, id: &str, now: i64) -> WorkItem {
+    store.work_get(&who.token, id, now).unwrap().unwrap()
+}
+
+fn prune_request(
+    work: &WorkItem,
+    operation: &str,
+    session: Option<&str>,
+    targets: &[(&str, &str)],
+) -> WorkTransitionRequest {
+    WorkTransitionRequest {
+        work_id: work.id.clone(),
+        operation_id: operation.into(),
+        generation: work.generation,
+        expected_updated_seq: work.updated_seq,
+        session: session.map(str::to_owned),
+        transition: WorkTransitionKind::PruneParticipants,
+        reason: "synthetic participant repair".into(),
+        superseded_by: None,
+        participants: targets
+            .iter()
+            .map(|(token, session)| ParticipantRef {
+                token: (*token).into(),
+                session: (*session).into(),
+            })
+            .collect(),
+    }
+}
+
+fn as_agent(who: &Agent) -> WorkTransitionActor<'_> {
+    WorkTransitionActor::Agent { token: &who.token }
+}
+
+fn join_many(store: &dyn Store, who: &Agent, work: &str, count: usize, now: i64) {
+    for n in 0..count {
+        join(
+            store,
+            who,
+            work,
+            &format!("h-{n}"),
+            WorkRole::Helper,
+            now + n as i64,
+        );
+    }
+}
+
+fn finish(store: &dyn Store, who: &Agent, work: &WorkItem, session: &str, now: i64) {
+    store
+        .work_checkpoint(
+            &who.token,
+            &WorkCheckpoint {
+                work_id: work.id.clone(),
+                operation_id: "finish".into(),
+                generation: work.generation,
+                session: session.into(),
+                expected_updated_seq: Some(work.updated_seq),
+                kind: CheckpointKind::Finish,
+                summary: "done".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: vec![],
+                related_work: vec![],
+            },
+            now,
+        )
+        .unwrap();
+}
+
+fn takeover(
+    store: &dyn Store,
+    who: &Agent,
+    work: &WorkItem,
+    session: &str,
+    now: i64,
+) -> Result<agentscm::hub::work::WorkStartResult, HubError> {
+    store.work_start(
+        &who.token,
+        &WorkStart {
+            work_id: Some(work.id.clone()),
+            request_key: None,
+            takeover_generation: Some(work.generation),
+            ..start("a", session, "src/a/**")
+        },
+        now,
+    )
+}
+
+fn assert_invalid(result: Result<impl std::fmt::Debug, HubError>, text: &str) {
+    match result {
+        Err(HubError::Invalid(message)) => assert!(message.contains(text), "{message}"),
+        other => panic!("expected a refusal containing {text:?}, got {other:?}"),
+    }
+}
+
+/// A Work at the 100 participant cap refuses a resume and a reopen from a new session; its owner
+/// prunes helpers with the current fences and both then succeed, without moving the lease.
+fn a_full_participant_list_is_repairable_and_resumable(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let full = current(&*store, &alice, &work.id, later);
+    assert_eq!(full.participants.len(), 100);
+    assert_invalid(
+        takeover(&*store, &alice, &full, "s-new", later + 1),
+        "maximum of 100 participants",
+    );
+    let before = db.scalar(&format!(
+        "SELECT COALESCE(reservation_basis, '') || ':' || reservation_expires_at FROM hub_work_items WHERE id = '{}'",
+        work.id
+    ));
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(
+                &full,
+                "prune-1",
+                Some("s-new"),
+                &[(&alice.token, "h-0"), (&alice.token, "h-1")],
+            ),
+            later + 2,
+        )
+        .unwrap();
+    assert!(!pruned.receipt.unwrap().replayed);
+    assert_eq!(pruned.item.participants.len(), 98);
+    assert_eq!(pruned.item.generation, full.generation);
+    assert_eq!(pruned.item.state, full.state);
+    assert_eq!(pruned.item.lead_session, "s-lead");
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT COUNT(*) FROM hub_work_participants WHERE work = '{}'",
+            work.id
+        )),
+        "98"
+    );
+    let after = db.scalar(&format!(
+        "SELECT COALESCE(reservation_basis, '') || ':' || reservation_expires_at FROM hub_work_items WHERE id = '{}'",
+        work.id
+    ));
+    assert_eq!(before, after, "a prune leaves the reservation lease alone");
+    let resumed = takeover(&*store, &alice, &pruned.item, "s-new", later + 3).unwrap();
+    assert!(resumed.took_over);
+
+    // Finished Work at the cap: reopen is refused, prune is allowed, reopen then succeeds.
+    let done = store
+        .work_start(&alice.token, &start("b", "s-b-lead", "src/b/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &done.id, 99, later + 10);
+    finish(
+        &*store,
+        &alice,
+        &current(&*store, &alice, &done.id, later + 200),
+        "s-b-lead",
+        later + 201,
+    );
+    let finished = current(&*store, &alice, &done.id, later + 202);
+    assert_eq!(finished.state, WorkState::Finished);
+    let reopen = |work: &WorkItem, operation: &str| WorkTransitionRequest {
+        transition: WorkTransitionKind::Reopen,
+        ..prune_request(work, operation, Some("s-re"), &[])
+    };
+    assert_invalid(
+        store.work_transition(&as_agent(&alice), &reopen(&finished, "re-1"), later + 203),
+        "maximum of 100 participants",
+    );
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(&finished, "prune-2", Some("s-re"), &[(&alice.token, "h-5")]),
+            later + 204,
+        )
+        .unwrap();
+    assert_eq!(pruned.item.state, WorkState::Finished);
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT COALESCE(terminal_outcome, '') FROM hub_work_items WHERE id = '{}'",
+            done.id
+        )),
+        "completed"
+    );
+    let reopened = store
+        .work_transition(
+            &as_agent(&alice),
+            &reopen(&pruned.item, "re-2"),
+            later + 205,
+        )
+        .unwrap();
+    assert_eq!(reopened.item.state, WorkState::Active);
+    assert_eq!(reopened.item.lead_session, "s-re");
+}
+
+/// Work joined before the cap on other-owner participants can hold more than 25 of them, which
+/// refuses another owner's takeover. The owner prunes enough of them and the takeover succeeds.
+fn legacy_over_share_work_repairs(db: &Db) {
+    let store = db.open();
+    let (alice, bob, carol) = (agent(&*store, 1), agent(&*store, 2), agent(&*store, 3));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    // A snapshot from before the cap: 30 sessions of one other owner.
+    let snapshot = db.scalar(&format!(
+        "SELECT snapshot FROM hub_work_items WHERE id = '{}'",
+        work.id
+    ));
+    let mut value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    for n in 0..30 {
+        value["participants"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "owner": bob.user.id, "login": bob.user.login, "token": bob.token,
+                "agent": "agent2", "session": format!("legacy-{n}"), "role": "helper"
+            }));
+        db.sql(&format!(
+            "INSERT INTO hub_work_participants
+                (work, token, owner, agent, session, role, generation, created_at, updated_at)
+             VALUES ('{}', '{}', '{}', 'agent2', 'legacy-{n}', 'helper', {}, {now}, {now})",
+            work.id, bob.token, bob.user.id, work.generation
+        ));
+    }
+    db.sql(&format!(
+        "UPDATE hub_work_items SET snapshot = '{}' WHERE id = '{}'",
+        value.to_string().replace('\'', "''"),
+        work.id
+    ));
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let over = current(&*store, &alice, &work.id, later);
+    assert_eq!(over.participants.len(), 31);
+    assert_invalid(
+        takeover(&*store, &carol, &over, "s-carol", later + 1),
+        "participants from other owners",
+    );
+    // Five removals leave 25 other-owner participants, which still fills the cap.
+    let first: Vec<_> = (0..5).map(|n| format!("legacy-{n}")).collect();
+    let targets: Vec<_> = first
+        .iter()
+        .map(|s| (bob.token.as_str(), s.as_str()))
+        .collect();
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(&over, "prune-1", Some("s-new"), &targets),
+            later + 2,
+        )
+        .unwrap();
+    assert_invalid(
+        takeover(&*store, &carol, &pruned.item, "s-carol", later + 3),
+        "participants from other owners",
+    );
+    let more: Vec<_> = (5..8).map(|n| format!("legacy-{n}")).collect();
+    let targets: Vec<_> = more
+        .iter()
+        .map(|s| (bob.token.as_str(), s.as_str()))
+        .collect();
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(&pruned.item, "prune-2", Some("s-new"), &targets),
+            later + 4,
+        )
+        .unwrap();
+    let resumed = takeover(&*store, &carol, &pruned.item, "s-carol", later + 5).unwrap();
+    assert!(resumed.took_over);
+}
+
+/// Who may prune, what is refused whole, retries, the audit record and the pruned session's claim.
+fn only_the_owner_or_an_admin_prunes_and_nothing_is_partly_pruned(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let admin = user(&*store, 8);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &alice, &work.id, "s-h1", WorkRole::Helper, now + 1);
+    join(&*store, &alice, &work.id, "s-h2", WorkRole::Helper, now + 2);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 3);
+    store
+        .touch_session(
+            &alice.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some("s-h1".into()),
+                via: "mcp".into(),
+                task: Some("edit".into()),
+                paths: vec!["src/a/x.rs".into()],
+                deny: false,
+                report: false,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let intents = "SELECT COUNT(*) FROM hub_intents WHERE released_at IS NULL";
+    let live = db.scalar(intents);
+    let item = current(&*store, &alice, &work.id, now + 5);
+    let seq = store.latest_event_seq().unwrap();
+    let a = alice.token.as_str();
+    let apply = |actor: &WorkTransitionActor<'_>, request: &WorkTransitionRequest| {
+        store.work_transition(actor, request, now + 6)
+    };
+    // Another owner, the lead's own session, and a Hub-level admin without standing as an agent.
+    assert!(matches!(
+        apply(
+            &as_agent(&bob),
+            &prune_request(&item, "o1", Some("s-b"), &[(a, "s-h1")])
+        ),
+        Err(HubError::Unauthorized)
+    ));
+    assert_invalid(
+        apply(
+            &as_agent(&alice),
+            &prune_request(&item, "o2", Some("s-lead"), &[(a, "s-h1")]),
+        ),
+        "may not request",
+    );
+    // The lead, an absent participant, and a listed pair whose other half is valid: no removal.
+    for (op, targets) in [
+        ("o3", vec![(a, "s-lead")]),
+        ("o4", vec![(a, "s-gone")]),
+        ("o5", vec![(a, "s-h1"), (a, "s-lead")]),
+        ("o6", vec![(a, "s-h1"), (a, "s-gone")]),
+        ("o7", vec![(bob.token.as_str(), "s-h1")]),
+    ] {
+        assert_invalid(
+            apply(
+                &as_agent(&alice),
+                &prune_request(&item, op, Some("s-new"), &targets),
+            ),
+            "current non-lead participant",
+        );
+    }
+    // Shape errors are refused before anything is read.
+    assert_invalid(
+        apply(
+            &as_agent(&alice),
+            &prune_request(&item, "o8", Some("s-new"), &[]),
+        ),
+        "requires participants",
+    );
+    assert_invalid(
+        apply(
+            &as_agent(&alice),
+            &prune_request(&item, "o9", Some("s-new"), &[(a, "s-h1"), (a, "s-h1")]),
+        ),
+        "must not repeat",
+    );
+    let mut stray = prune_request(&item, "o10", Some("s-lead"), &[(a, "s-h1")]);
+    stray.transition = WorkTransitionKind::Release;
+    assert_invalid(
+        apply(&as_agent(&alice), &stray),
+        "only valid for prune_participants",
+    );
+    assert_eq!(
+        current(&*store, &alice, &work.id, now + 7)
+            .participants
+            .len(),
+        4
+    );
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+
+    let request = prune_request(&item, "prune", Some("s-new"), &[(a, "s-h1")]);
+    let applied = apply(&as_agent(&alice), &request).unwrap();
+    assert!(!applied.receipt.as_ref().unwrap().replayed);
+    assert_eq!(applied.item.participants.len(), 3);
+    // The pruned session's file intent on this Work is released with it.
+    assert_eq!(live, "1");
+    assert_eq!(db.scalar(intents), "0");
+    // An exact retry replays; a different list under the same operation id is refused.
+    let replay = apply(&as_agent(&alice), &request).unwrap();
+    assert!(replay.receipt.unwrap().replayed);
+    assert_eq!(replay.item.participants.len(), 3);
+    assert_invalid(
+        apply(
+            &as_agent(&alice),
+            &prune_request(&item, "prune", Some("s-new"), &[(a, "s-h2")]),
+        ),
+        "operation_id was already used",
+    );
+    // A person administrator prunes another owner's helper with no session.
+    let item = current(&*store, &alice, &work.id, now + 8);
+    let by_admin = WorkTransitionActor::Person {
+        user: &admin,
+        repository: REPO,
+        repository_id: REPOSITORY_ID,
+        is_admin: true,
+    };
+    let done = apply(
+        &by_admin,
+        &prune_request(&item, "admin", None, &[(bob.token.as_str(), "s-b")]),
+    )
+    .unwrap();
+    assert_eq!(done.item.participants.len(), 2);
+
+    let events: Vec<_> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "work_transition")
+        .collect();
+    assert_eq!(events.len(), 2);
+    for event in &events {
+        assert!(!event.data.contains(&alice.token), "{}", event.data);
+        assert!(!event.data.contains(&bob.token), "{}", event.data);
+    }
+    let first: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
+    assert_eq!(first["transition"], "prune_participants");
+    assert_eq!(first["removed_participants"][0]["session"], "s-h1");
+    assert_eq!(first["removed_participants"][0]["agent"], "agent1");
+    assert_eq!(first["removed_participants"][0]["owner"], alice.user.id);
+    assert_eq!(first["actor"]["kind"], "owner");
+    let second: serde_json::Value = serde_json::from_str(&events[1].data).unwrap();
+    assert_eq!(second["actor"]["kind"], "admin");
+    assert_eq!(second["removed_participants"][0]["owner"], bob.user.id);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -956,6 +1578,706 @@ macro_rules! conformance {
             })*
         }
     };
+}
+
+fn person<'a>(user: &'a User, is_admin: bool) -> RecoveryCaller<'a> {
+    RecoveryCaller::Person {
+        user,
+        repository: REPO,
+        repository_id: REPOSITORY_ID,
+        is_admin,
+    }
+}
+
+fn all_owners() -> RecoveryQuery {
+    RecoveryQuery {
+        all_owners: true,
+        ..RecoveryQuery::default()
+    }
+}
+
+fn finding_kinds(recovery: &WorkRecoveryV1, id: &str) -> Vec<FindingKind> {
+    recovery
+        .work
+        .iter()
+        .find(|work| work.work_id == id)
+        .unwrap()
+        .findings
+        .iter()
+        .map(|finding| finding.kind)
+        .collect()
+}
+
+/// A Hub administrator pages every owner's Work through the person route's service; nobody else
+/// may, and an owner or an agent still reads only their own.
+fn an_admin_inventories_every_owner_and_owners_see_their_own(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let (stranger, admin) = (user(&*store, 7), user(&*store, 8));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let a = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let b = store
+        .work_start(&bob.token, &start("b", "s-b", "src/b/**"), now)
+        .unwrap()
+        .item;
+
+    let seen = inspect(&*store, &person(&admin, true), &all_owners(), now + 1).unwrap();
+    let ids: Vec<_> = seen.work.iter().map(|work| work.work_id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&a.id.as_str()) && ids.contains(&b.id.as_str()));
+    assert!(
+        seen.work
+            .iter()
+            .all(|work| work.standing == Standing::Admin)
+    );
+    // Admin standing keeps the transitions an administrator already had.
+    assert_eq!(
+        permitted(&seen, &a.id),
+        [
+            RemedyKind::Abandon,
+            RemedyKind::Release,
+            RemedyKind::Supersede
+        ]
+    );
+    // Without all_owners an administrator reads their own Work, which is none.
+    let own = read(
+        &*store,
+        &person(&admin, true),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert!(own.work.is_empty());
+
+    for refused in [
+        inspect(&*store, &person(&stranger, false), &all_owners(), now + 1),
+        inspect(&*store, &person(&alice.user, false), &all_owners(), now + 1),
+        inspect(&*store, &caller(&alice, "s-a"), &all_owners(), now + 1),
+        inspect(
+            &*store,
+            &person(&admin, true),
+            &RecoveryQuery {
+                work_id: Some(a.id.clone()),
+                all_owners: true,
+                ..RecoveryQuery::default()
+            },
+            now + 1,
+        ),
+    ] {
+        match refused {
+            Err(HubError::Invalid(message)) => assert!(
+                message.contains("Hub administrator") || message.contains("work_id"),
+                "{message}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-a"),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert_eq!(mine.work.len(), 1);
+    assert_eq!(mine.work[0].work_id, a.id);
+    assert_eq!(mine.work[0].standing, Standing::Lead);
+    let theirs = read(
+        &*store,
+        &person(&alice.user, false),
+        RecoveryQuery::default(),
+        now + 1,
+    );
+    assert_eq!(theirs.work.len(), 1);
+}
+
+/// A Work left alone for a long time gets findings, but none proposes `complete`, and the
+/// remedies it lists are the ones it had without them.
+fn inventory_never_proposes_complete_from_age(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let admin = user(&*store, 8);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + 2 * 86_400;
+    tick(&*store, now, now + LEASE_SECONDS + 1);
+    store.observe_lease_clock(later).unwrap();
+
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-new"),
+        RecoveryQuery::default(),
+        later,
+    );
+    let kinds = finding_kinds(&mine, &work.id);
+    assert!(kinds.contains(&FindingKind::LapsedHold), "{kinds:?}");
+    assert!(kinds.contains(&FindingKind::AbandonedSession), "{kinds:?}");
+    let entry = &mine.work[0];
+    let lapsed = entry
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::LapsedHold)
+        .unwrap();
+    assert_eq!(lapsed.proposed, Some(RemedyKind::Release));
+    assert!(
+        lapsed.evidence.contains("lapsed at Unix"),
+        "{}",
+        lapsed.evidence
+    );
+    let abandoned = entry
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::AbandonedSession)
+        .unwrap();
+    assert_eq!(abandoned.proposed, Some(RemedyKind::Resume));
+    // Other standing is told, never proposed, a takeover of a stale claim.
+    let theirs = read(
+        &*store,
+        &caller(&bob, "s-b"),
+        RecoveryQuery {
+            work_id: Some(work.id.clone()),
+            ..RecoveryQuery::default()
+        },
+        later,
+    );
+    assert!(
+        theirs.work[0]
+            .findings
+            .iter()
+            .all(|finding| finding.proposed.is_none())
+    );
+    let everyone = inspect(&*store, &person(&admin, true), &all_owners(), later).unwrap();
+    for recovery in [&mine, &theirs, &everyone] {
+        for work in &recovery.work {
+            assert!(
+                work.findings
+                    .iter()
+                    .all(|finding| finding.proposed != Some(RemedyKind::Complete)),
+                "{:?}",
+                work.findings
+            );
+        }
+    }
+    // The remedies are the same with or without the inventory's findings: complete stays refused
+    // to the admin and is never added.
+    assert_eq!(
+        permitted(&everyone, &work.id),
+        [
+            RemedyKind::Abandon,
+            RemedyKind::Release,
+            RemedyKind::Supersede
+        ]
+    );
+}
+
+/// Reading an inventory with findings writes nothing.
+fn read_only_inventory_changes_nothing(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let admin = user(&*store, 8);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let state = || {
+        (
+            db.scalar("SELECT COUNT(*) FROM hub_events"),
+            db.scalar(&format!(
+                "SELECT updated_seq FROM hub_work_items WHERE id = '{}'",
+                work.id
+            )),
+            db.scalar("SELECT COUNT(*) FROM hub_work_participants"),
+        )
+    };
+    let before = state();
+    let page = inspect(&*store, &person(&admin, true), &all_owners(), later).unwrap();
+    assert!(!page.work[0].findings.is_empty());
+    let mine = read(
+        &*store,
+        &caller(&alice, "s-new"),
+        RecoveryQuery::default(),
+        later,
+    );
+    assert!(!mine.work[0].findings.is_empty());
+    assert_eq!(state(), before);
+    assert_eq!(
+        current(&*store, &alice, &work.id, later).updated_seq,
+        work.updated_seq
+    );
+}
+
+/// A full participant list is reported, the prune the inventory proposes previews and applies
+/// as returned, and a new session can then take the Work over.
+fn the_inventory_proposes_a_prune_that_frees_a_full_list(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let me = caller(&alice, "s-new");
+    let page = one(&*store, &me, &work.id, later);
+    let cap = page.work[0]
+        .findings
+        .iter()
+        .find(|finding| finding.kind == FindingKind::ParticipantCap)
+        .expect("a full list is reported");
+    assert_eq!(cap.proposed, Some(RemedyKind::PruneParticipants));
+    assert!(cap.complete);
+    assert!(
+        cap.evidence.contains("100 participants"),
+        "{}",
+        cap.evidence
+    );
+    assert!(permitted(&page, &work.id).contains(&RemedyKind::PruneParticipants));
+
+    let previewed = preview(
+        &*store,
+        &me,
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-new".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(previewed.permitted, "{:?}", previewed.refusal);
+    assert_eq!(previewed.effects.fenced.len(), 1);
+    assert_eq!(
+        previewed.effects.reservation,
+        previewed.operational.reservation.status
+    );
+    let json = serde_json::to_string(&previewed.effects).unwrap();
+    assert!(
+        !json.contains(&alice.token) && !json.contains("h-0"),
+        "{json}"
+    );
+    let apply = previewed.apply.clone().unwrap();
+    assert_eq!(apply.tool.as_deref(), Some("agentscm_work_transition"));
+    assert_eq!(apply.arguments["transition"], "prune_participants");
+    assert_eq!(apply.arguments["participants"].as_array().unwrap().len(), 1);
+    // The call carries a digest, never a native session id.
+    assert!(
+        !apply.arguments.to_string().contains("h-"),
+        "{}",
+        apply.arguments
+    );
+
+    let mut request: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+        "work_id": apply.arguments["work_id"],
+        "operation_id": "prune-from-preview",
+        "generation": apply.arguments["generation"],
+        "expected_updated_seq": apply.arguments["expected_updated_seq"],
+        "session": apply.arguments["session"],
+        "transition": apply.arguments["transition"],
+        "reason": "synthetic participant repair",
+        "participants": apply.arguments["participants"],
+    }))
+    .unwrap();
+    let pruned = store
+        .work_transition(&as_agent(&alice), &request, later + 2)
+        .unwrap();
+    assert_eq!(pruned.item.participants.len(), 99);
+    // The same call again replays.
+    request.operation_id = "prune-from-preview".into();
+    assert!(
+        store
+            .work_transition(&as_agent(&alice), &request, later + 3)
+            .unwrap()
+            .receipt
+            .unwrap()
+            .replayed
+    );
+    // With room left, the finding and the prune are gone.
+    let after = one(&*store, &me, &work.id, later + 4);
+    assert!(!finding_kinds(&after, &work.id).contains(&FindingKind::ParticipantCap));
+    assert!(!permitted(&after, &work.id).contains(&RemedyKind::PruneParticipants));
+    let resumed = takeover(&*store, &alice, &pruned.item, "s-new", later + 5).unwrap();
+    assert!(resumed.took_over);
+}
+
+/// A Work whose participant list is not full lists no prune option, even for its owner, and a
+/// direct preview of one refuses it as not needed.
+fn a_healthy_work_lists_no_prune_option(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let me = caller(&alice, "s-new");
+    let page = one(&*store, &me, &work.id, later);
+    assert!(
+        page.work[0]
+            .remedies
+            .iter()
+            .all(|remedy| remedy.remedy != RemedyKind::PruneParticipants)
+    );
+    let refused = preview(
+        &*store,
+        &me,
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-new".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(!refused.permitted);
+    assert_eq!(
+        refused.refusal.as_ref().unwrap().code,
+        RefusalCode::WrongState
+    );
+}
+
+/// Another owner's agent can read a Work but is offered no transition and no prune on it.
+fn other_owners_items_are_refused_not_taken(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(&*store, &alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let theirs = read(
+        &*store,
+        &caller(&bob, "s-b"),
+        RecoveryQuery {
+            work_id: Some(work.id.clone()),
+            ..RecoveryQuery::default()
+        },
+        later,
+    );
+    let entry = &theirs.work[0];
+    assert_eq!(entry.standing, Standing::Other);
+    assert!(
+        entry
+            .remedies
+            .iter()
+            .all(|remedy| !remedy.permitted || remedy.remedy == RemedyKind::Resume)
+    );
+    // Prune is not offered at all to a caller without standing, and a direct preview refuses it.
+    assert!(
+        entry
+            .remedies
+            .iter()
+            .all(|remedy| remedy.remedy != RemedyKind::PruneParticipants)
+    );
+    let refused = preview(
+        &*store,
+        &caller(&bob, "s-b"),
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-b".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(!refused.permitted);
+    assert_eq!(
+        refused.refusal.as_ref().unwrap().code,
+        RefusalCode::NotAuthorized
+    );
+    assert!(
+        entry
+            .findings
+            .iter()
+            .all(|finding| finding.proposed.is_none())
+    );
+}
+
+/// One Work of the owner whose participant list is full, read after its lead went quiet.
+fn crowded(store: &dyn Store, alice: &Agent) -> (String, i64) {
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(store, alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(store, now, later);
+    (work.id, later)
+}
+
+fn repair_batch(plan: &agentscm::hub::work_recovery::RepairPlanV1) -> WorkTransitionBatch {
+    WorkTransitionBatch {
+        session: Some("s-sweeper".into()),
+        items: plan.planned.iter().map(|p| p.item.clone()).collect(),
+    }
+}
+
+/// A client that lost the reply sends the same plan again: every item replays, nothing is written
+/// twice, and a fresh inventory no longer proposes the repair.
+fn interrupted_repair_replays_applied_items(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (id, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let inventory = || read(&*store, &me, RecoveryQuery::default(), later + 1);
+    let plan = repair_plan(&inventory());
+    // The lapsed hold's facts are incomplete without hook coverage, so only the prune is planned.
+    assert_eq!(plan.planned.len(), 1, "{plan:?}");
+    assert_eq!(plan.planned[0].remedy, RemedyKind::PruneParticipants);
+    assert_eq!(plan.planned[0].work_id, id);
+    assert_eq!(plan.planned[0].item.participants.len(), 1);
+    assert_eq!(
+        plan.planned[0].item.operation_id,
+        format!(
+            "repair:{id}:{}:{}:prune_participants",
+            plan.planned[0].item.generation, plan.planned[0].item.expected_updated_seq
+        )
+    );
+    let actor = WorkTransitionActor::Agent {
+        token: &alice.token,
+    };
+    let batch = repair_batch(&plan);
+    let first = apply_batch(&*store, &actor, &batch, later + 2).unwrap();
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Applied),
+        "{first:?}"
+    );
+    let events = || db.scalar("SELECT COUNT(*) FROM hub_events");
+    let before = events();
+    let again = apply_batch(&*store, &actor, &batch, later + 3).unwrap();
+    assert!(
+        again
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Replayed),
+        "{again:?}"
+    );
+    assert_eq!(events(), before, "a replay writes no second audit event");
+    let after = repair_plan(&inventory());
+    assert!(
+        after.planned.is_empty(),
+        "an applied repair is not proposed again: {after:?}"
+    );
+}
+
+/// Once compaction has removed the receipts, the same plan is refused, never applied
+/// a second time.
+fn retention_gap_retry_refuses_not_replays(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (_, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let plan = repair_plan(&read(&*store, &me, RecoveryQuery::default(), later + 1));
+    assert_eq!(plan.planned.len(), 1);
+    let actor = WorkTransitionActor::Agent {
+        token: &alice.token,
+    };
+    let batch = repair_batch(&plan);
+    let first = apply_batch(&*store, &actor, &batch, later + 2).unwrap();
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Applied),
+        "{first:?}"
+    );
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let compact_at = later + 10 * 86_400;
+    let pass = store
+        .work_compact(&scope, later + 86_400, true, compact_at)
+        .unwrap();
+    assert!(pass.applied);
+    // A new token of the same owner, valid at the retry: the retry is judged on the fences.
+    let (fresh_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &alice.user.id,
+        "agent-retry",
+        REPO,
+        REPOSITORY_ID,
+        30 * 86_400,
+        false,
+    )
+    .unwrap();
+    let fresh = WorkTransitionActor::Agent {
+        token: &fresh_token,
+    };
+    let events = db.scalar("SELECT COUNT(*) FROM hub_events");
+    let retry = apply_batch(&*store, &fresh, &batch, compact_at + 1).unwrap();
+    for item in &retry.items {
+        assert_eq!(item.outcome, BatchOutcome::Refused, "{item:?}");
+        assert_eq!(item.code.as_deref(), Some("work_changed"), "{item:?}");
+    }
+    assert_eq!(retry.applied, 0);
+    assert_eq!(db.scalar("SELECT COUNT(*) FROM hub_events"), events);
+}
+
+/// An expected seq that is still a recorded event of the Work, with only joins after it, is
+/// refused once it lies below the repository's event floor.
+fn a_recorded_seq_below_the_event_floor_is_refused(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    // A synthetic snapshot: the floor sits above the recorded start event.
+    let floor = work.updated_seq + 1;
+    db.sql("DELETE FROM hub_work_retention");
+    db.sql(&format!(
+        "INSERT INTO hub_work_retention (provider, host, repository, repository_id, event_floor_seq, snapshot_floor_seq, updated_at) \
+         VALUES ('github', 'github.com', '{REPO}', {REPOSITORY_ID}, {floor}, 0, {now})"
+    ));
+    let refused = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 2,
+    );
+    assert_eq!(refused.outcome, BatchOutcome::Refused, "{refused:?}");
+    assert_eq!(refused.code.as_deref(), Some("work_changed"));
+    // At or above the floor the same shape passes.
+    db.sql(&format!(
+        "UPDATE hub_work_retention SET event_floor_seq = {}",
+        work.updated_seq
+    ));
+    let applied = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-2",
+        work.updated_seq,
+        now + 3,
+    );
+    assert_eq!(applied.outcome, BatchOutcome::Applied, "{applied:?}");
+}
+
+/// Pruning finished Work changes neither who stated its outcome nor its recent outcome.
+fn pruning_finished_work_keeps_its_outcome_and_provenance(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let live = current(&*store, &alice, &work.id, now + 2);
+    let complete = WorkTransitionRequest {
+        transition: WorkTransitionKind::Complete,
+        ..prune_request(&live, "complete-1", Some("s-a"), &[])
+    };
+    let done = store
+        .work_transition(&as_agent(&alice), &complete, now + 3)
+        .unwrap()
+        .item;
+    assert_eq!(done.state, WorkState::Finished);
+    let overview = |at: i64| {
+        let query = agentscm::hub::work::WorkOverviewQuery {
+            recent_since: Some(now - 10),
+            ..Default::default()
+        };
+        store
+            .work_overview(&alice.token, &query, at)
+            .unwrap()
+            .recent
+    };
+    let provenance = |at: i64| {
+        one(&*store, &caller(&alice, "s-a"), &work.id, at).work[0]
+            .operational
+            .outcome
+            .provenance
+    };
+    let (before_recent, before) = (overview(now + 4), provenance(now + 4));
+    assert_eq!(before_recent.len(), 1, "{before_recent:?}");
+    assert_eq!(
+        before,
+        agentscm::hub::work_lifecycle::OutcomeProvenance::AgentReport
+    );
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(&done, "prune-1", Some("s-owner"), &[(&bob.token, "s-b")]),
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(pruned.item.participants.len(), 1);
+    assert_eq!(provenance(now + 6), before);
+    assert_eq!(overview(now + 6), before_recent);
+}
+
+/// A participant that rejoined after the plan was read is not removed: prune needs the exact
+/// `expected_updated_seq`, with no allowance for joins.
+fn a_prune_refuses_after_a_rejoin_since_the_plan(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let planned = current(&*store, &alice, &work.id, now + 2);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 3);
+    assert_invalid(
+        store.work_transition(
+            &as_agent(&alice),
+            &prune_request(&planned, "prune-1", Some("s-owner"), &[(&bob.token, "s-b")]),
+            now + 4,
+        ),
+        "work changed",
+    );
+    assert_eq!(
+        current(&*store, &alice, &work.id, now + 5)
+            .participants
+            .len(),
+        2
+    );
 }
 
 conformance!(
@@ -970,4 +2292,21 @@ conformance!(
     a_scoped_handover_frees_only_what_it_drops,
     ending_work_names_the_requests_and_dependents_it_reaches,
     people_use_the_same_service,
+    a_helper_moving_updated_seq_cannot_starve_owner_cleanup,
+    a_non_join_change_after_the_observed_seq_still_refuses,
+    an_unrecorded_expected_seq_is_not_accepted_over_joins,
+    a_full_participant_list_is_repairable_and_resumable,
+    legacy_over_share_work_repairs,
+    only_the_owner_or_an_admin_prunes_and_nothing_is_partly_pruned,
+    an_admin_inventories_every_owner_and_owners_see_their_own,
+    inventory_never_proposes_complete_from_age,
+    read_only_inventory_changes_nothing,
+    the_inventory_proposes_a_prune_that_frees_a_full_list,
+    a_healthy_work_lists_no_prune_option,
+    other_owners_items_are_refused_not_taken,
+    interrupted_repair_replays_applied_items,
+    retention_gap_retry_refuses_not_replays,
+    a_recorded_seq_below_the_event_floor_is_refused,
+    pruning_finished_work_keeps_its_outcome_and_provenance,
+    a_prune_refuses_after_a_rejoin_since_the_plan,
 );

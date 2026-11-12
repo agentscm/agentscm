@@ -130,7 +130,7 @@ use super::work_reconciliation::{
     WorkDeclarationsView,
 };
 use super::work_recovery::{
-    MAX_RECOVERY_LISTED, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
+    MAX_RECOVERY_LISTED, ParticipantMark, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
 };
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
@@ -1943,6 +1943,8 @@ fn terminal_provenance(
         .query_row(
             "SELECT kind, data FROM hub_events
              WHERE subject = ?1 AND kind IN ('work_checkpoint', 'work_transition')
+               AND NOT (kind = 'work_transition'
+                        AND json_extract(data, '$.transition') = 'prune_participants')
              ORDER BY seq DESC LIMIT 1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2633,6 +2635,24 @@ fn open_requests_by_work(
         }
     }
     Ok(by_work)
+}
+
+/// When each participant of `id` joined and last changed.
+fn participant_marks(tx: &Transaction<'_>, id: &str) -> Result<Vec<ParticipantMark>> {
+    let mut statement = tx.prepare(
+        "SELECT token, session, generation, updated_at FROM hub_work_participants WHERE work = ?1",
+    )?;
+    let marks = statement
+        .query_map(params![id], |row| {
+            Ok(ParticipantMark {
+                token: row.get(0)?,
+                session: row.get(1)?,
+                generation: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(marks)
 }
 
 /// The unfinished Work that depends on `id`; recovery applies its own smaller projection bound.
@@ -7735,12 +7755,14 @@ impl SqliteStore {
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
                    AND ((e.kind = 'work_checkpoint'
                          AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
-                        OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                        OR (e.kind = 'work_transition' AND v.state = 'finished'
+                            AND json_extract(e.data, '$.transition') <> 'prune_participants'))
                    AND NOT (EXISTS (
                        SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
                        WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
                          AND e2.at <= ?6
-                         AND (e2.kind = 'work_transition'
+                         AND ((e2.kind = 'work_transition'
+                               AND json_extract(e2.data, '$.transition') <> 'prune_participants')
                               OR json_extract(v2.snapshot, '$.current.kind') = 'finish')))
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
@@ -11729,7 +11751,20 @@ impl Store for SqliteStore {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let held = basis_column.is_some();
-        work_transition::check(&item, held, &acting, request)?;
+        let only_joins_since = item.updated_seq != request.expected_updated_seq
+            && request.transition != work_transition::WorkTransitionKind::PruneParticipants
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = ?1 AND seq = ?2 AND seq < ?3)
+                    AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = ?1
+                        AND seq > ?2 AND seq <= ?3 AND kind <> 'work_joined')
+                    AND ?2 >= COALESCE((SELECT MAX(r.event_floor_seq) FROM hub_work_retention r
+                        JOIN hub_work_items w ON w.id = ?1 AND r.provider = w.provider
+                        AND r.host = w.host AND r.repository = w.repository
+                        AND r.repository_id IS w.repository_id), 0)",
+                params![item.id, request.expected_updated_seq, item.updated_seq],
+                |row| row.get::<_, bool>(0),
+            )?;
+        work_transition::check(&item, held, &acting, request, only_joins_since)?;
         if request.transition == work_transition::WorkTransitionKind::Retain
             && let Some((renewed, expired)) = lapsed_at(&tx, &item.id, now)?
         {
@@ -11779,23 +11814,37 @@ impl Store for SqliteStore {
             lead_session: item.lead_session.clone(),
         };
         let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
-        let columns = work_transition::apply(&mut item, request, &acting, now)?;
+        let columns = work_transition::apply(&mut item, request, &acting, &prior, now)?;
         let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
         let seq = append(&tx, &event)?;
         item.updated_seq = seq;
         let snapshot = save_work_version(&tx, &item, seq)?;
-        set_work_reservation(
-            &tx,
-            &item.id,
-            columns
-                .outcome
-                .map(work_transition::TerminalOutcome::column),
-            columns.basis.map(work_transition::ReservationBasis::column),
-            now,
-        )?;
+        // A prune changes neither the outcome nor the reservation, so its lease is not reset.
+        if request.transition != work_transition::WorkTransitionKind::PruneParticipants {
+            set_work_reservation(
+                &tx,
+                &item.id,
+                columns
+                    .outcome
+                    .map(work_transition::TerminalOutcome::column),
+                columns.basis.map(work_transition::ReservationBasis::column),
+                now,
+            )?;
+        }
         let reclaimed = lapse_reservations(&tx, &who, &lapsed, &item.id, now)?;
         if request.superseded_by.is_some() {
             replace_relations(&tx, &who, &item.id, &item.depends_on, &item.related_work)?;
+        }
+        for removed in &columns.removed {
+            tx.execute(
+                "DELETE FROM hub_work_participants WHERE work = ?1 AND token = ?2 AND session = ?3",
+                params![item.id, removed.token, removed.session],
+            )?;
+            // The intent a pruned session holds for this Work goes with it, unless the session is
+            // still eligible on other Work.
+            if !session_eligible_elsewhere(&tx, &item.id, &removed.token, &removed.session)? {
+                release_session_intent(&tx, &removed.token, &removed.session, now)?;
+            }
         }
         if request.transition == work_transition::WorkTransitionKind::Reopen {
             tx.execute(
@@ -11931,7 +11980,7 @@ impl Store for SqliteStore {
                 let mut statement = tx.prepare(
                     "SELECT id FROM hub_work_items
                      WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-                       AND owner = ?5 AND state <> 'finished' AND id > ?6
+                       AND (?8 OR owner = ?5) AND state <> 'finished' AND id > ?6
                      ORDER BY id LIMIT ?7",
                 )?;
                 let mut ids = statement
@@ -11943,7 +11992,8 @@ impl Store for SqliteStore {
                             who.repository_id,
                             who.owner.id,
                             read.after.as_deref().unwrap_or(""),
-                            i64::try_from(read.limit + 1).unwrap_or(i64::MAX)
+                            i64::try_from(read.limit + 1).unwrap_or(i64::MAX),
+                            read.all_owners
                         ],
                         |row| row.get::<_, String>(0),
                     )?
@@ -12013,10 +12063,12 @@ impl Store for SqliteStore {
                 .into_iter()
                 .take(MAX_RECOVERY_LISTED + 1)
                 .collect();
+            let marks = participant_marks(&tx, &row.item.id)?;
             recovery.push(RecoveryRow {
                 row,
                 requests,
                 dependents,
+                marks,
             });
         }
         let forge_window_from = forge_window_from(&tx, &who)?;

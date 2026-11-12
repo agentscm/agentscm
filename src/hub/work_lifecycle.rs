@@ -287,16 +287,21 @@ pub enum WorkTransitionKind {
     Abandon,
     Supersede,
     Reopen,
+    /// Removes named non-lead participants from the Work. A participant repair: it changes no
+    /// state, outcome or reservation, so a state never lists it among its operational remedies;
+    /// recovery offers it when the participant list needs repair.
+    PruneParticipants,
 }
 
 impl WorkTransitionKind {
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Release,
         Self::Retain,
         Self::Complete,
         Self::Abandon,
         Self::Supersede,
         Self::Reopen,
+        Self::PruneParticipants,
     ];
 
     pub(super) fn as_str(self) -> &'static str {
@@ -307,6 +312,7 @@ impl WorkTransitionKind {
             Self::Abandon => "abandon",
             Self::Supersede => "supersede",
             Self::Reopen => "reopen",
+            Self::PruneParticipants => "prune_participants",
         }
     }
 }
@@ -352,10 +358,13 @@ pub(super) fn decide_transition(
     reservation_held: bool,
 ) -> Decision {
     use WorkActorKind::{Admin, Lead, Owner};
-    use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
+    use WorkTransitionKind::{
+        Abandon, Complete, PruneParticipants, Release, Reopen, Retain, Supersede,
+    };
     let authorized = match kind {
         _ if via == ActorVia::Policy => matches!(kind, Release | Complete),
         Release | Abandon | Supersede => true,
+        PruneParticipants => actor != Lead,
         Retain | Complete => actor != Admin,
         Reopen => actor != Admin && via == ActorVia::Agent,
     };
@@ -371,7 +380,7 @@ pub(super) fn decide_transition(
     let finished = state == WorkState::Finished;
     match kind {
         Reopen if !finished => Err(Refusal::WrongState),
-        Reopen => Ok(()),
+        Reopen | PruneParticipants => Ok(()),
         _ if finished => Err(Refusal::WrongState),
         Release | Retain if !reservation_held => Err(Refusal::NoReservation),
         _ => Ok(()),
@@ -382,6 +391,7 @@ pub(super) fn decide_transition(
 pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTransitionKind> {
     let mut found: Vec<_> = WorkTransitionKind::ALL
         .into_iter()
+        .filter(|kind| *kind != WorkTransitionKind::PruneParticipants)
         .filter(|kind| {
             // Each kind is allowed to at least one actor in the matrix; probe with the actor
             // that is allowed most often so the answer depends only on state and reservation.
@@ -911,12 +921,13 @@ mod tests {
             WorkTransitionKind::Abandon => "YYYY",
             WorkTransitionKind::Supersede => "YYYY",
             WorkTransitionKind::Reopen => "YY..",
+            WorkTransitionKind::PruneParticipants => ".YYY",
         };
         if row.as_bytes()[actor] == b'.' {
             return Err(Refusal::NotAuthorized);
         }
         match (kind, finished) {
-            (WorkTransitionKind::Reopen, true) => Ok(()),
+            (WorkTransitionKind::Reopen | WorkTransitionKind::PruneParticipants, true) => Ok(()),
             (WorkTransitionKind::Reopen, false) => Err(Refusal::WrongState),
             (_, true) => Err(Refusal::WrongState),
             (WorkTransitionKind::Release | WorkTransitionKind::Retain, false) if !held => {
@@ -944,7 +955,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 6 * 4 * 5 * 2);
+        assert_eq!(checked, 7 * 4 * 5 * 2);
     }
 
     #[test]
@@ -1080,6 +1091,10 @@ mod tests {
         assert_eq!(json(&ReservationBasis::Retained), "\"retained\"");
         assert_eq!(json(&TerminalOutcome::Superseded), "\"superseded\"");
         assert_eq!(json(&WorkTransitionKind::Supersede), "\"supersede\"");
+        assert_eq!(
+            json(&WorkTransitionKind::PruneParticipants),
+            "\"prune_participants\""
+        );
         assert_eq!(json(&WorkActorKind::Admin), "\"admin\"");
         assert_eq!(json(&OutcomeProvenance::AgentReport), "\"agent_report\"");
         assert_eq!(

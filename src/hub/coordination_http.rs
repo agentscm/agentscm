@@ -422,6 +422,8 @@ struct PersonTransition {
     reason: String,
     #[serde(default)]
     superseded_by: Option<String>,
+    #[serde(default)]
+    participants: Vec<super::work_transition::ParticipantRef>,
 }
 
 /// A signed-in person releases, retains or ends Work they own, or, as a Hub administrator,
@@ -456,6 +458,7 @@ async fn person_transition(
         transition: body.transition,
         reason: body.reason,
         superseded_by: body.superseded_by,
+        participants: body.participants,
     };
     let store = state.store.clone();
     let mut result = blocking(&state, move || {
@@ -513,6 +516,9 @@ struct PersonRecovery {
     after: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Page every owner's Work; only a Hub administrator may.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 /// What a signed-in person can recover in one repository: their own Work, and anyone's as a
@@ -531,6 +537,7 @@ async fn person_recovery(
         after: body.after,
         limit: body.limit,
         session: None,
+        all_owners: body.all_owners,
     };
     let store = state.store.clone();
     Ok(Json(

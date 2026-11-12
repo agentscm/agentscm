@@ -484,6 +484,10 @@ impl WorkEnded {
             return None;
         }
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
+        // Removing participants neither ends nor reopens the Work.
+        if v.get("transition")?.as_str()? == "prune_participants" {
+            return None;
+        }
         let actor = v.get("actor")?;
         Some(Self {
             transition: v.get("transition")?.as_str()?.to_owned(),

@@ -765,6 +765,7 @@ fn takeovers_by_other_owners_respect_their_share(db: &Db) {
         transition: WorkTransitionKind::Reopen,
         reason: "synthetic reason".into(),
         superseded_by: None,
+        participants: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(
@@ -800,6 +801,7 @@ fn a_pause_or_retain_never_revives_a_lapsed_lease(db: &Db) {
         transition: WorkTransitionKind::Retain,
         reason: "synthetic reason".into(),
         superseded_by: None,
+        participants: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(&WorkTransitionActor::Agent { token: &alice.token }, &retain, after),

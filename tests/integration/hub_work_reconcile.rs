@@ -3077,6 +3077,7 @@ fn dependency_fanout_does_not_block_cleanup(fixture: &StoreFixture) {
                     transition: WorkTransitionKind::Release,
                     reason: "Keep the declared dependency while releasing scope".into(),
                     superseded_by: None,
+                    participants: Vec::new(),
                 },
                 unix_now(),
             )

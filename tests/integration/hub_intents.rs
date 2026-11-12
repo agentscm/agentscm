@@ -1181,6 +1181,7 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic reason".into(),
                 superseded_by: None,
+                participants: Vec::new(),
             },
             unix_now(),
         )

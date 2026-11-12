@@ -4015,6 +4015,7 @@ fn transition_request(
         transition,
         reason: "synthetic reason".into(),
         superseded_by: None,
+        participants: Vec::new(),
     }
 }
 
@@ -4212,6 +4213,8 @@ fn transition_matrix_covers_every_actor_and_kind(db: &Db) {
                         "{label}"
                     );
                 }
+                // Covered by the participant repair tests in hub_recovery.
+                WorkTransitionKind::PruneParticipants => unreachable!("not in the table"),
             }
         }
     }
@@ -6376,6 +6379,7 @@ fn read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores(db: &Db)
         transition: WorkTransitionKind::Release,
         reason: "synthetic reason".into(),
         superseded_by: None,
+        participants: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(&by_agent(&reader), &request, now),
