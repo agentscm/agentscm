@@ -478,11 +478,9 @@ pub(super) fn helper_join_editable(
     if requested.is_empty() {
         return Ok(());
     }
+    // Finished, paused or unreserved Work joins and acquires nothing, so no edit follows.
     if !matches!(item.state, WorkState::Active | WorkState::Blocked) || !holds_reservation {
-        return Err(HubError::Invalid(format!(
-            "Nothing was joined: Work {} is not active with a held reservation, so no edit could run under a join. Resume or take over the Work, or ask its lead.",
-            item.id
-        )));
+        return Ok(());
     }
     let uncovered = super::work::uncovered_scope(&item.scope, requested);
     if !uncovered.is_empty() {

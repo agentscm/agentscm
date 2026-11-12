@@ -1156,6 +1156,8 @@ pub(super) fn uncovered_scope(declared: &[String], requested: &[String]) -> Vec<
 /// The intent keys that survive a scope change: a key stays unless the previous scope covered it
 /// and neither the new scope nor another scope the session is eligible on does. Keys the Work
 /// never covered (advisory holds from before it) are not the checkpoint's to free.
+// ponytail: a dropped directory key is dropped whole even if part of it stays in the new scope;
+// only advisory callers are affected and the next touch restores it.
 pub(super) fn keys_kept_after_narrowing(
     keys: &[String],
     previous: &[String],

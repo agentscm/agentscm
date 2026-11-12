@@ -492,10 +492,19 @@ async fn hook(
                         let released =
                             request.requested_paths == Some(RequestedPathsHold::Released);
                         // A prompt repeats every turn, so it carries only what this session must
-                        // answer, and a requester's own request only once it has news.
+                        // answer, and a requester's own request only while it has news the
+                        // requester has not acknowledged.
+                        let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
+                            receipt.target_work_id.is_none()
+                                && receipt.agent.token == principal.token_id
+                                && receipt.agent.session == session
+                                && receipt.through_seq >= request.updated_seq
+                        });
                         if call.kind == Kind::Prompt
                             && !reply_needed
-                            && !(own && (released || !request.responses.is_empty()))
+                            && !(own
+                                && unacknowledged
+                                && (released || !request.responses.is_empty()))
                         {
                             continue;
                         }

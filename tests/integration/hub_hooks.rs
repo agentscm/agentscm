@@ -1400,6 +1400,33 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
         assert!(context.contains("Reply decline"), "{answer}");
         assert!(context.contains("Still editing the widget"), "{answer}");
         assert!(!context.contains("report a split/join"), "{answer}");
+        // Once the requester acknowledges the news, its prompts stay quiet again.
+        let request_now = hub
+            .store
+            .coordination_inbox(
+                &token_id(&other),
+                &CoordinationInboxQuery {
+                    session: Some("other-session".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+            .requests
+            .remove(0);
+        hub.store
+            .coordination_ack(
+                &token_id(&other),
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: None,
+                    session: "other-session".into(),
+                    expected_updated_seq: request_now.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
     }
 }
 

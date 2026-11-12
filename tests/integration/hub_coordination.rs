@@ -1927,15 +1927,14 @@ fn refused_helper_start_leaves_no_participant(db: &Db) {
         .unwrap();
     assert!(covered.joined);
 
-    // A Work that is no longer active refuses a join with paths.
+    // A Work that is no longer active still admits a join with paths: nothing is acquired and no
+    // edit could follow.
     let item = scope_item(&*store, &b, "b-session").unwrap();
     release_work(&*store, &b, &item, "b-session");
-    let refusal = store
+    let joined = store
         .work_start(&d, &helper("d-session", &["src/a.rs"]), now + 6)
-        .unwrap_err()
-        .to_string();
-    assert!(refusal.contains("Nothing was joined"), "{refusal}");
-    assert!(refusal.contains("Resume or take over"), "{refusal}");
+        .unwrap();
+    assert!(joined.joined);
 }
 
 fn responded_request_does_not_block_checkpoint_once_unheld(db: &Db) {
@@ -2075,22 +2074,56 @@ fn ask_reports_reservation_of_helped_work(db: &Db) {
         };
         store.touch_session(who, &call, now + 2).unwrap();
     }
-    match store
-        .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 3)
-        .unwrap()
-    {
-        Asked::Reserved { work_id, lead } => {
-            assert_eq!(work_id, target.id);
-            assert_eq!(lead.session, "b-session");
-        }
-        other => panic!("{other:?}"),
-    }
+    // A helper eligible on the Work may edit under it, and so is not reserved against it.
+    assert!(matches!(
+        store
+            .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 3)
+            .unwrap(),
+        Asked::NotHeld
+    ));
     assert!(matches!(
         store
             .ask_handoff(&b, Some("b-session"), "src/a.rs", None, now + 4)
             .unwrap(),
         Asked::NotHeld
     ));
+    // A stale participant (the Work moved to a later generation) is an outsider again.
+    let handed = scope_item(&*store, &b, "b-session").unwrap();
+    let handed = store
+        .work_checkpoint(
+            &b,
+            &checkpoint(
+                &handed.id,
+                "handover-helped",
+                "b-session",
+                handed.updated_seq,
+                CheckpointKind::Handover,
+                None,
+            ),
+            now + 50,
+        )
+        .unwrap()
+        .item;
+    let c = token(&*store, 3, "charlie");
+    let mut takeover = start_scope(
+        "helped",
+        "c-session",
+        WorkRole::Lead,
+        Some(&target.id),
+        &["src/a.rs"],
+    );
+    takeover.takeover_generation = Some(handed.generation);
+    store.work_start(&c, &takeover, now + 52).unwrap();
+    match store
+        .ask_handoff(&a, Some("a-session"), "src/a.rs", None, now + 61)
+        .unwrap()
+    {
+        Asked::Reserved { work_id, lead } => {
+            assert_eq!(work_id, target.id);
+            assert_eq!(lead.session, "c-session");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 fn narrowing_a_scope_releases_the_session_hold_on_dropped_paths(db: &Db) {

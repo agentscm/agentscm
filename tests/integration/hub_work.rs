@@ -3867,10 +3867,9 @@ fn helper_join_on_finished_work_acquires_nothing(db: &Db) {
         (&helper, "s-h", WorkRole::Helper),
         (&carol, "s-r", WorkRole::Reviewer),
     ] {
-        // No paths: a join with paths on Work that cannot hold them is refused.
-        let mut request = join(&started.id, session, role);
-        request.scope.clear();
-        let joined = store.work_start(&who.token, &request, now + 2).unwrap();
+        let joined = store
+            .work_start(&who.token, &join(&started.id, session, role), now + 2)
+            .unwrap();
         assert!(joined.joined);
         assert_eq!(joined.item.state, WorkState::Finished);
         assert_eq!(joined.item.generation, finished.generation);

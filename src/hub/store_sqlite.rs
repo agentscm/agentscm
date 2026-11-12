@@ -5881,6 +5881,15 @@ fn trim_session_intents(
         let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
             continue;
         };
+        let expires_at: i64 = tx.query_row(
+            "SELECT expires_at FROM hub_intents WHERE id = ?1",
+            [&intent],
+            |row| row.get(0),
+        )?;
+        // An expired intent holds nothing, so there is nothing to trim or announce.
+        if expires_at <= now {
+            continue;
+        }
         let keys = {
             let mut statement =
                 tx.prepare("SELECT key FROM hub_intent_paths WHERE intent = ?1 ORDER BY key")?;
@@ -5898,11 +5907,6 @@ fn trim_session_intents(
             continue;
         }
         let paths = display_all(&kept);
-        let expires_at: i64 = tx.query_row(
-            "SELECT expires_at FROM hub_intents WHERE id = ?1",
-            [&intent],
-            |row| row.get(0),
-        )?;
         tx.execute(
             "UPDATE hub_intents SET paths = ?2, updated_at = ?3 WHERE id = ?1",
             params![intent, serde_json::json!(paths).to_string(), now],
@@ -6938,14 +6942,25 @@ fn ask_in(
 /// start or an edit that needs it, as `agentscm_start` and the edit hook say, so it is not free.
 fn unheld(tx: &Transaction<'_>, token: &str, name: &str, key: &str, now: i64) -> Result<Asked> {
     let work = work_who(tx, token, now)?;
-    let overlaps = work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)?;
-    Ok(overlaps
-        .into_iter()
-        .find(|o| !(o.item.lead_token == token && o.item.lead_session == name))
-        .map_or(Asked::NotHeld, |o| Asked::Reserved {
-            lead: coordination_lead(&o.item),
-            work_id: o.item.id,
-        }))
+    for o in work_scope_overlaps(tx, &work, &[key.to_owned()], None, now)? {
+        // A session eligible on the Work may edit under it, so it is not reserved against it.
+        let eligible = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work = w.id
+             WHERE w.id = ?1 AND w.state IN ('active','blocked')
+               AND w.reservation_basis IS NOT NULL
+               AND p.token = ?2 AND p.session = ?3 AND p.generation = w.generation)",
+            params![o.item.id, token, name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !eligible {
+            return Ok(Asked::Reserved {
+                lead: coordination_lead(&o.item),
+                work_id: o.item.id,
+            });
+        }
+    }
+    Ok(Asked::NotHeld)
 }
 
 /// A refused call asks the holder of each contested file to hand it over, as `agentscm_ask`
