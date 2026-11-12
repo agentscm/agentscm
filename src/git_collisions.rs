@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::git_snapshot::Git;
+use crate::hub::hook::OBSERVED_PATHS;
 use crate::{Error, Result};
 
 pub const PROFILE: &str = "agentscm-git-collisions/v1";
@@ -1175,6 +1176,381 @@ pub fn unmerged_paths(
         .collect())
 }
 
+/// At most this many changed entries in one working-tree snapshot. Past it the snapshot is an
+/// error: a truncated list could hide a change, and a checkout this dirty is not one a shell
+/// call's edits can be attributed in anyway.
+pub const WORKTREE_ENTRIES: usize = 2_000;
+/// Output budget for `git status` and the commit diffs: room for every entry at the path limit.
+const WORKTREE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// One path that `git status` reported: its two-letter porcelain status, and the file's size and
+/// modification time (nanoseconds since the Unix epoch) when it exists on disk, so that a second
+/// write to an already-dirty file still shows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeEntry {
+    pub status: String,
+    pub size: Option<u64>,
+    pub mtime_ns: Option<i64>,
+}
+
+/// A bounded, deterministic picture of a checkout: its `HEAD` and every path that differs from it
+/// (modified, added, deleted or untracked; `.git/` is never listed, and neither are files that
+/// Git ignores, by the repository's rules or, when [`worktree_state`] is given it, the user's
+/// global excludes file). An untracked nested repository or linked worktree is one entry, its path
+/// ending in `/`, so changes inside it, and inside a submodule, are not observed. Two of these
+/// taken around a shell call are compared with [`changed_during`]. Stored between hook
+/// processes, so decode it strictly and call [`WorktreeState::valid`] on what was read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeState {
+    /// The commit `HEAD` names; `None` on an unborn branch.
+    pub head: Option<String>,
+    pub entries: BTreeMap<String, WorktreeEntry>,
+}
+
+fn is_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn in_git_dir(path: &str) -> bool {
+    path == ".git" || path.starts_with(".git/")
+}
+
+impl WorktreeState {
+    pub fn valid(&self) -> bool {
+        self.head.as_deref().is_none_or(is_oid)
+            && self.entries.len() <= WORKTREE_ENTRIES
+            && self.entries.iter().all(|(path, entry)| {
+                let plain = path.strip_suffix('/').unwrap_or(path);
+                advisory_path(plain)
+                    && !in_git_dir(plain)
+                    && entry.status.len() == 2
+                    && entry.status.bytes().all(|b| b" MADRCUT?".contains(&b))
+            })
+    }
+}
+
+/// The paths that changed between two snapshots, sorted, without duplicates, relative to the
+/// repository root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observed {
+    pub paths: Vec<String>,
+    /// More than [`OBSERVED_PATHS`] changed; `paths` holds the first ones in path order.
+    pub truncated: bool,
+}
+
+fn worktree_git<'a>(git_path: &'a Path, repository: &'a Path, deadline: Instant) -> Git<'a> {
+    Git {
+        exe: git_path,
+        repository,
+        deadline: Some(deadline),
+    }
+}
+
+fn utf8_path(bytes: &[u8]) -> Result<String> {
+    let path = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Invalid("git reported a path that is not UTF-8".into()))?;
+    if !advisory_path(path) {
+        return Err(Error::Invalid(format!("git reported an odd path {path:?}")));
+    }
+    Ok(path.to_owned())
+}
+
+/// A status record's path. An untracked nested repository or linked worktree is printed with a
+/// trailing `/`, which is kept as the marker of a directory entry.
+fn status_path(bytes: &[u8]) -> Result<String> {
+    match bytes.strip_suffix(b"/") {
+        Some(plain) => Ok(format!("{}/", utf8_path(plain)?)),
+        None => utf8_path(bytes),
+    }
+}
+
+/// Size and modification time (ns since the epoch) of an entry; none when it cannot be read, for
+/// instance because it was removed or replaced while the snapshot ran.
+fn entry_metadata(path: &Path) -> (Option<u64>, Option<i64>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (None, None);
+    };
+    let nanos = meta
+        .modified()
+        .ok()
+        .map(|time| match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => i128::try_from(after.as_nanos()).unwrap_or(i128::MAX),
+            Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(0),
+        });
+    (
+        Some(meta.len()),
+        nanos.map(|nanos| i64::try_from(nanos).unwrap_or(i64::MAX)),
+    )
+}
+
+/// The excludes file Git would use in `repository`, for [`worktree_state`]: the effective
+/// `core.excludesFile` read in `repository` with the user's own environment, inside `deadline`,
+/// so a repository's own setting wins over the user's global one, as it does for Git. Without a
+/// setting, the default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore`. `Ok(None)` is a confirmed absence: Git reported no setting and there is no
+/// default file, or the configured file does not exist (Git ignores a missing excludes file).
+/// Anything that leaves the setting unknown (a timeout, Git not starting, an exit status other
+/// than "not set", output that is unreadable, too long, not UTF-8 or not an absolute path) is an
+/// error: the caller must not snapshot without the user's excludes then, as that could list
+/// files the user keeps out of Git on purpose.
+pub fn global_excludes_file(
+    git_path: &Path,
+    repository: &Path,
+    deadline: Instant,
+) -> Result<Option<PathBuf>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(git_path)
+        .args(["config", "--type=path", "--get", "core.excludesFile"])
+        .current_dir(repository)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| Error::Invalid("git config did not start".into()))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Invalid("git config timed out".into()));
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(EXCLUDES_VALUE_BYTES + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| Error::Invalid("git config output was unreadable".into()))?;
+    }
+    match classify_excludes(status.code(), &out)? {
+        Some(path) => Ok(path),
+        None => Ok(default_excludes(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )),
+    }
+}
+
+const EXCLUDES_VALUE_BYTES: u64 = 4096;
+
+/// What `git config --get core.excludesFile` said: `None` when nothing is set (exit status 1, so
+/// the default applies), `Some(None)` for a configured file that is empty or missing, `Some(file)`
+/// for a usable one, and an error for anything else.
+fn classify_excludes(code: Option<i32>, out: &[u8]) -> Result<Option<Option<PathBuf>>> {
+    match code {
+        Some(1) => Ok(None),
+        Some(0) => {
+            if out.len() as u64 > EXCLUDES_VALUE_BYTES {
+                return Err(Error::Invalid("core.excludesFile is too long".into()));
+            }
+            let text = std::str::from_utf8(out)
+                .map_err(|_| Error::Invalid("core.excludesFile is not UTF-8".into()))?
+                .trim_end_matches('\n');
+            if text.is_empty() {
+                return Ok(Some(None));
+            }
+            let path = PathBuf::from(text);
+            if !path.is_absolute() {
+                return Err(Error::Invalid("core.excludesFile is not absolute".into()));
+            }
+            Ok(Some(path.is_file().then_some(path)))
+        }
+        _ => Err(Error::Invalid("git config failed".into())),
+    }
+}
+
+/// Git's default global excludes file, when it exists.
+fn default_excludes(
+    xdg: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let base = match xdg.filter(|value| !value.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg),
+        None => Path::new(home.filter(|value| !value.is_empty())?).join(".config"),
+    };
+    let path = base.join("git").join("ignore");
+    (path.is_absolute() && path.is_file()).then_some(path)
+}
+
+/// Snapshots the checkout at `repository`. Any Git failure, a passed `deadline`, output over the
+/// budget, more than [`WORKTREE_ENTRIES`] entries or a path that is not plain UTF-8 or holds a
+/// control character is an error, never an empty or partial snapshot. A metadata problem with one
+/// entry (it vanished while the snapshot ran) is not: that entry is recorded without size or time.
+/// The shared Git environment reads no user configuration, so files that only the user's global
+/// excludes file ignores would be listed; pass `excludes` (see [`global_excludes_file`]) to hide
+/// them. Repository-configured clean filters still run, as for [`collisions`]: point this only at
+/// repositories you trust.
+pub fn worktree_state(
+    git_path: &Path,
+    repository: &Path,
+    deadline: Instant,
+    excludes: Option<&Path>,
+) -> Result<WorktreeState> {
+    let git = worktree_git(git_path, repository, deadline);
+    // Exit 1 is an unborn branch (`--quiet` makes it silent); anything else is a real failure.
+    let (code, out) = git.run_code(
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        None,
+        WORKTREE_BYTES,
+        true,
+    )?;
+    let head = if code == 0 {
+        let oid = lossy(&out).trim().to_owned();
+        if !is_oid(&oid) {
+            return Err(Error::Invalid("git returned an invalid HEAD".into()));
+        }
+        Some(oid)
+    } else {
+        None
+    };
+    // Status paths are relative to the top level, which `repository` may be inside.
+    let top = git.run(&["rev-parse", "--show-toplevel"], None, WORKTREE_BYTES)?;
+    let top = top.strip_suffix(b"\n").unwrap_or(&top);
+    let top = PathBuf::from(std::ffi::OsStr::from_bytes(top));
+    // A path that cannot be handed to Git is an error, not a reason to list what it would hide.
+    let excludes = excludes
+        .map(|path| match path.to_str() {
+            Some(path) if Path::new(path).is_absolute() => Ok(format!("core.excludesFile={path}")),
+            _ => Err(Error::Invalid(
+                "the excludes file is not an absolute UTF-8 path".into(),
+            )),
+        })
+        .transpose()?;
+    let mut args = Vec::new();
+    if let Some(setting) = &excludes {
+        args.extend(["-c", setting]);
+    }
+    args.extend([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    ]);
+    let status = git.run(&args, None, WORKTREE_BYTES)?;
+    let mut entries = BTreeMap::new();
+    for record in status.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        // "XY path"
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(Error::Invalid("unrecognized git status record".into()));
+        }
+        let path = status_path(&record[3..])?;
+        if in_git_dir(path.strip_suffix('/').unwrap_or(&path)) {
+            continue;
+        }
+        if entries.len() >= WORKTREE_ENTRIES {
+            return Err(Error::Invalid(format!(
+                "more than {WORKTREE_ENTRIES} changed paths"
+            )));
+        }
+        let (size, mtime_ns) = entry_metadata(&top.join(path.trim_end_matches('/')));
+        entries.insert(
+            path,
+            WorktreeEntry {
+                status: lossy(&record[..2]),
+                size,
+                mtime_ns,
+            },
+        );
+    }
+    let state = WorktreeState { head, entries };
+    debug_assert!(state.valid());
+    Ok(state)
+}
+
+/// Paths that differ between two commits, or between a commit and the empty tree.
+fn commit_paths(
+    git: &Git,
+    before: Option<&str>,
+    after: Option<&str>,
+    out: &mut BTreeSet<String>,
+) -> Result<()> {
+    let tree = |head: Option<&str>| -> Result<String> {
+        match head {
+            Some(head) => Ok(head.to_owned()),
+            None => git.text(&["hash-object", "-t", "tree", "/dev/null"]),
+        }
+    };
+    let (a, b) = (tree(before)?, tree(after)?);
+    let listed = git.run(
+        &[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &a,
+            &b,
+        ],
+        None,
+        WORKTREE_BYTES,
+    )?;
+    for field in listed.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+        out.insert(utf8_path(field)?);
+    }
+    Ok(())
+}
+
+/// The paths whose state differed between `before` and `after`: in one but not the other, or with
+/// a different status, size or modification time, plus the paths of commits created in between
+/// (when `HEAD` moved, the difference between the two commits; an unborn side counts as the empty
+/// tree). `.git/` is never reported.
+///
+/// This observes changes during the interval; it does not attribute them to one caller, since
+/// anything else writing the checkout then is included. Size and modification time can miss a
+/// rewrite of an already-dirty file that keeps its size within the filesystem's timestamp
+/// resolution. Any Git failure, a passed `deadline` or output over the budget is an error, never
+/// an empty result.
+pub fn changed_during(
+    git_path: &Path,
+    repository: &Path,
+    before: &WorktreeState,
+    after: &WorktreeState,
+    deadline: Instant,
+) -> Result<Observed> {
+    if !before.valid() || !after.valid() {
+        return Err(Error::Invalid("invalid working-tree snapshot".into()));
+    }
+    let mut changed: BTreeSet<String> = before
+        .entries
+        .keys()
+        .chain(after.entries.keys())
+        .filter(|path| before.entries.get(*path) != after.entries.get(*path))
+        .cloned()
+        .collect();
+    if before.head != after.head {
+        let git = worktree_git(git_path, repository, deadline);
+        commit_paths(
+            &git,
+            before.head.as_deref(),
+            after.head.as_deref(),
+            &mut changed,
+        )?;
+    } else if Instant::now() >= deadline {
+        return Err(Error::Invalid("deadline passed".into()));
+    }
+    // A directory entry is reported by its plain path.
+    let changed: BTreeSet<String> = changed
+        .into_iter()
+        .map(|path| path.strip_suffix('/').map_or(path.clone(), str::to_owned))
+        .filter(|path| !in_git_dir(path))
+        .collect();
+    let truncated = changed.len() > OBSERVED_PATHS;
+    Ok(Observed {
+        paths: changed.into_iter().take(OBSERVED_PATHS).collect(),
+        truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,6 +1591,107 @@ mod tests {
         assert!(parse_history(b"").unwrap().is_empty());
         assert!(parse_history(b"\0a@x.invalid\0soon\0").is_err());
         assert!(parse_history(b"path\0").is_err());
+    }
+
+    #[test]
+    fn the_default_global_excludes_file_is_used_only_when_it_exists() {
+        use std::ffi::OsStr;
+        let dir = tempfile::tempdir().unwrap();
+        let (xdg, home) = (dir.path().join("xdg"), dir.path().join("home"));
+        let (xdg, home) = (xdg.as_os_str(), home.as_os_str());
+        assert_eq!(default_excludes(Some(xdg), Some(home)), None);
+        let in_home = Path::new(home).join(".config/git");
+        std::fs::create_dir_all(&in_home).unwrap();
+        std::fs::write(in_home.join("ignore"), "x\n").unwrap();
+        assert_eq!(
+            default_excludes(None, Some(home)),
+            Some(in_home.join("ignore"))
+        );
+        // An empty variable counts as unset; a set XDG_CONFIG_HOME wins.
+        assert_eq!(
+            default_excludes(Some(OsStr::new("")), Some(home)),
+            Some(in_home.join("ignore"))
+        );
+        assert_eq!(default_excludes(Some(xdg), Some(home)), None);
+        assert_eq!(default_excludes(None, None), None);
+    }
+
+    #[test]
+    fn the_excludes_setting_is_classified_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ignore");
+        std::fs::write(&file, "x\n").unwrap();
+        let text = format!("{}\n", file.display());
+        // Not set: the default applies.
+        assert_eq!(classify_excludes(Some(1), b"").unwrap(), None);
+        // Set to an existing file, a missing one, or nothing.
+        assert_eq!(
+            classify_excludes(Some(0), text.as_bytes()).unwrap(),
+            Some(Some(file))
+        );
+        let missing = dir.path().join("missing");
+        let missing = format!("{}\n", missing.display());
+        assert_eq!(
+            classify_excludes(Some(0), missing.as_bytes()).unwrap(),
+            Some(None)
+        );
+        assert_eq!(classify_excludes(Some(0), b"\n").unwrap(), Some(None));
+        // Unknown: other statuses, a signal, unreadable or unusable values.
+        assert!(classify_excludes(Some(2), b"").is_err());
+        assert!(classify_excludes(Some(128), b"/x\n").is_err());
+        assert!(classify_excludes(None, b"").is_err());
+        assert!(classify_excludes(Some(0), b"relative/path\n").is_err());
+        assert!(classify_excludes(Some(0), b"/bad\xff\n").is_err());
+        assert!(classify_excludes(Some(0), &vec![b'a'; 4097]).is_err());
+    }
+
+    #[test]
+    fn an_unusable_excludes_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let soon = Instant::now() + std::time::Duration::from_secs(5);
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/odd\xff"));
+        for path in [odd, Path::new("relative")] {
+            assert!(worktree_state(Path::new("git"), dir.path(), soon, Some(path)).is_err());
+        }
+    }
+
+    /// A stand-in `git` that runs `body`, to exercise how the excludes lookup reads its result.
+    fn fake_git(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("git");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_excludes_lookup_fails_closed_when_git_cannot_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ignore");
+        std::fs::write(&file, "x\n").unwrap();
+        let ask = |body: &str, wait: u64| {
+            let git = fake_git(dir.path(), body);
+            global_excludes_file(
+                &git,
+                repo.path(),
+                Instant::now() + std::time::Duration::from_millis(wait),
+            )
+        };
+        assert_eq!(
+            ask(&format!("echo '{}'", file.display()), 5000).unwrap(),
+            Some(file.clone())
+        );
+        assert!(ask("exit 2", 5000).is_err());
+        assert!(ask("exec sleep 5", 300).is_err());
+        let missing = global_excludes_file(
+            &dir.path().join("no-such-git"),
+            repo.path(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(missing.is_err());
+        // Exit status 1 is Git saying nothing is set: not an error.
+        assert!(ask("exit 1", 5000).is_ok());
     }
 
     #[test]
