@@ -260,6 +260,13 @@ pub trait ConnectionCredentials: Send + std::marker::Sync + 'static {
     /// deliveries skip an inactive repository, which stays connected. Runs on a blocking
     /// thread, once per repository per poll and per delivery.
     fn active(&self, connection: &Connection, repository: &ConnectedRepository) -> bool;
+
+    /// The GitLab namespace whose projects a GitLab connection (not an `app`) connects on each
+    /// poll, or `None` for none. Runs on a blocking thread once per poll.
+    fn namespace(&self, connection: &Connection) -> Option<gitlab::Namespace> {
+        let _ = connection;
+        None
+    }
 }
 
 pub struct Sync {
@@ -1001,11 +1008,26 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
     .await?;
     let mut reports = Vec::new();
     let mut marked = false;
-    if conn.kind == "app" {
-        match discover(state, conn).await {
-            Ok(()) => {
+    let found = match conn.kind.as_str() {
+        "app" => Some(discover(state, conn).await.map(|()| 0)),
+        _ => match followed_namespace(state, conn).await? {
+            Some(namespace) => Some(follow_namespace(state, conn, namespace).await),
+            None => None,
+        },
+    };
+    if let Some(found) = found {
+        match found {
+            Ok(unread) => {
                 mark_enabled(state, conn).await?;
                 marked = true;
+                // A connection-level report: the namespace listing passed its page cap.
+                if unread > 0 {
+                    reports.push(PollReport {
+                        connection: conn.id.clone(),
+                        truncated: json!({"namespace_projects": unread}),
+                        ..PollReport::default()
+                    });
+                }
             }
             Err(error) => {
                 catchup_connection_status(
@@ -1069,6 +1091,55 @@ async fn discover(state: &HubState, conn: &Connection) -> Gh<()> {
         .await?;
     }
     Ok(())
+}
+
+/// The GitLab namespace the embedder has this connection follow, if any.
+async fn followed_namespace(
+    state: &HubState,
+    conn: &Connection,
+) -> Result<Option<gitlab::Namespace>> {
+    let Some(credentials) = state.sync.credentials.clone() else {
+        return Ok(None);
+    };
+    if conn.provider != "gitlab" {
+        return Ok(None);
+    }
+    let conn = conn.clone();
+    blocking(state, move || Ok(credentials.namespace(&conn))).await
+}
+
+/// Connects every project of `namespace`, as [`discover`] does an installation's
+/// repositories; returns the listing's pages left unread past its cap. Detaches nothing.
+async fn follow_namespace(
+    state: &HubState,
+    conn: &Connection,
+    namespace: gitlab::Namespace,
+) -> Gh<u32> {
+    let (gitlab::Namespace::Group(id) | gitlab::Namespace::User(id)) = namespace;
+    let (Ok(ForgeApi::Gitlab(api)), true) = (state.sync.forge(conn), id > 0) else {
+        return Err(GhError::Failed(
+            "a followed namespace needs a GitLab connection and a positive id".into(),
+        ));
+    };
+    let token = state.sync.token(conn, None).await?;
+    let (projects, unread) = api.namespace_projects(&token, namespace).await?;
+    let (id, host) = (conn.id.clone(), conn.host.clone());
+    db(state, move |store| {
+        for project in projects {
+            // A project another connection already holds stays with it.
+            store.upsert_repository(
+                &id,
+                &host,
+                project.repository_id,
+                &project.full_name,
+                project.node_id.as_deref(),
+                None,
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(unread)
 }
 
 /// Stored pull request observations by number.

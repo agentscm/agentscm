@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use agentscm::backend::LocalBackend;
 use agentscm::hub::HubError;
 use agentscm::hub::connection::{ConnectedRepository, Connection, NewConnection, Observed};
+use agentscm::hub::gitlab::Namespace;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::sync::{self, ConnectionCredentials, PollReport, Sync, SyncConfig};
@@ -1670,11 +1671,12 @@ async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
 
 // ---- connections whose credential an embedder supplies ----
 
-/// An embedder: a token per connection and repositories it does not bind.
+/// An embedder: a token per connection, repositories it does not bind, and followed namespaces.
 #[derive(Default)]
 struct Embedder {
     tokens: HashMap<String, String>,
     inactive: BTreeSet<i64>,
+    namespaces: HashMap<String, Namespace>,
 }
 
 impl ConnectionCredentials for Embedder {
@@ -1692,6 +1694,10 @@ impl ConnectionCredentials for Embedder {
 
     fn active(&self, _: &Connection, repository: &ConnectedRepository) -> bool {
         !self.inactive.contains(&repository.repository_id)
+    }
+
+    fn namespace(&self, connection: &Connection) -> Option<Namespace> {
+        self.namespaces.get(&connection.id).copied()
     }
 }
 
@@ -1802,6 +1808,7 @@ async fn embedded_connections_poll_with_their_own_tokens_and_skip_inactive_repos
         ]
         .into(),
         inactive: [103].into(),
+        ..Embedder::default()
     };
     let hub = embedded_hub(&fake, Some(embedder)).await;
     for (connection, id, name) in [
@@ -1880,5 +1887,92 @@ async fn an_embedded_connection_without_an_embedder_fails_as_a_credential() {
     assert!(
         fake.with(|s| s.requests.is_empty()),
         "GitLab is never called"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followed_namespace_connects_its_projects_across_pages_up_to_the_cap() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        let mut add = |id: i64, name: String, namespaces: Vec<i64>, archived: bool| {
+            let mut project = Project::new(id, &name, "internal");
+            project.namespaces = namespaces;
+            project.archived = archived;
+            s.projects.insert(id, project);
+        };
+        add(1, "acme/old".into(), vec![7], true);
+        add(2, "other/thing".into(), vec![9], false);
+        add(3, "acme/top".into(), vec![7], false);
+        // 1,050 more in a subgroup: eleven pages of 100, one past the cap.
+        for id in 10..1060 {
+            add(id, format!("acme/sub/p{id}"), vec![8, 7], false);
+        }
+        add(5000, "someone/own".into(), vec![55], false);
+    });
+    add_token(&fake, "token-a", "robot-a", &[]);
+    add_token(&fake, "token-b", "robot-b", &[]);
+    let embedder = Embedder {
+        tokens: [
+            (EMBEDDED_A.to_owned(), "token-a".to_owned()),
+            (EMBEDDED_B.to_owned(), "token-b".to_owned()),
+        ]
+        .into(),
+        // Only a few are bound, so the poll reads those and the listing alone covers the rest.
+        inactive: (10..1060).filter(|id| *id != 10 && *id != 150).collect(),
+        namespaces: [
+            (EMBEDDED_A.to_owned(), Namespace::Group(7)),
+            (EMBEDDED_B.to_owned(), Namespace::User(55)),
+        ]
+        .into(),
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    let capped: Vec<&PollReport> = reports.iter().filter(|r| r.repository.is_empty()).collect();
+    assert_eq!(capped.len(), 1, "{reports:?}");
+    assert_eq!(capped[0].connection, EMBEDDED_A);
+    assert_eq!(capped[0].truncated, json!({"namespace_projects": 1}));
+
+    let connected = |connection: &str| -> BTreeSet<i64> {
+        hub.store
+            .repositories(connection)
+            .unwrap()
+            .iter()
+            .map(|r| r.repository_id)
+            .collect()
+    };
+    let group = connected(EMBEDDED_A);
+    assert_eq!(group.len(), 1000, "ten pages of 100");
+    assert!(group.contains(&3) && group.contains(&10) && group.contains(&150));
+    assert!(!group.contains(&1), "an archived project is skipped");
+    assert!(
+        !group.contains(&2),
+        "another group's project is not followed"
+    );
+    assert_eq!(connected(EMBEDDED_B), [5000].into());
+
+    let polled: BTreeSet<String> = reports
+        .iter()
+        .filter(|r| !r.repository.is_empty())
+        .map(|r| r.repository.clone())
+        .collect();
+    assert_eq!(
+        polled,
+        ["acme/sub/p10", "acme/sub/p150", "acme/top", "someone/own"]
+            .map(String::from)
+            .into()
+    );
+    let listings: Vec<String> = fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.path_and_query.contains("/groups/7/projects"))
+            .map(|r| r.path_and_query.clone())
+            .collect()
+    });
+    assert_eq!(listings.len(), 10, "{listings:?}");
+    assert!(
+        listings
+            .iter()
+            .all(|q| q.contains("include_subgroups=true") && q.contains("archived=false"))
     );
 }
