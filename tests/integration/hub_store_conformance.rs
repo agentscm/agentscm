@@ -8,7 +8,9 @@ use agentscm::hub::connection::{
     ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
     Observed,
 };
-use agentscm::hub::external_runs::{ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun};
+use agentscm::hub::external_runs::{
+    ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, ExternalSource,
+};
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::skills::{EvidenceRow, SkillAdoption};
 use agentscm::hub::store::{
@@ -2494,6 +2496,7 @@ fn external_run_journal(db: &Db) {
     let ci = |run_id: i64, attempt: i64, outcome: ExternalOutcome, at: i64| ExternalRun {
         provider: "github".into(),
         kind: ExternalKind::Ci,
+        source: ExternalSource::Forge,
         run_id,
         attempt,
         commit_sha: sha.clone(),
@@ -2559,6 +2562,22 @@ fn external_run_journal(db: &Db) {
         ]
     );
     assert_eq!(of(ExternalKind::Deployment, 2).len(), 2);
+    // The source is part of the key: an id another source already uses is a separate row.
+    // GitLab rows are only the Hub's own; a CI run is only ever read from the forge.
+    let mut workflow = deploy(9, "production");
+    workflow.source = ExternalSource::Workflow;
+    assert_eq!(observe(&workflow), ExternalObserved::Changed);
+    let mut recorded = deploy(1, "production");
+    (recorded.provider, recorded.source) = ("gitlab".into(), ExternalSource::Recorded);
+    assert_eq!(observe(&recorded), ExternalObserved::Changed);
+    assert_eq!(of(ExternalKind::Deployment, 50).len(), 5);
+    assert!(of(ExternalKind::Deployment, 50).contains(&workflow));
+    let mut gitlab_read = recorded.clone();
+    gitlab_read.source = ExternalSource::Forge;
+    assert!(store.observe_external_run(&repo.id, &gitlab_read).is_err());
+    let mut agent_ci = ci(1, 1, ExternalOutcome::Running, 1);
+    agent_ci.source = ExternalSource::Agent;
+    assert!(store.observe_external_run(&repo.id, &agent_ci).is_err());
     assert_eq!(
         store
             .external_runs(&repo.id, &"c".repeat(40), ExternalKind::Ci, 50)

@@ -2,22 +2,401 @@
 //! Observations only: nothing here feeds checks, admission or publication updates.
 use axum::Router;
 use axum::extract::{Json, Path, State};
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::HubState;
 use super::connection::{ConnectedRepository, Connection, is_lower_hex};
-use super::github::{Gh, GhError, parse_rfc3339};
-use super::http::{ApiError, Reader, blocking};
+use super::forge_api::ForgeApi;
+use super::github::{self, Gh, GhError, parse_rfc3339};
+use super::gitlab;
+use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::intent::scope;
 use super::publish::{Update, merged_commit, publication_on_forge};
-use super::store::{Event, unix_now};
+use super::store::{Event, Principal, Store, unix_now};
 use super::sync::find_repository;
 use super::{HubError, Result};
 
 pub fn routes() -> Router<HubState> {
-    Router::new().route("/v1/hub/repos/{repo}/after-merge", get(after_merge))
+    Router::new()
+        .route("/v1/hub/repos/{repo}/after-merge", get(after_merge))
+        .route("/v1/hub/repos/{repo}/deployments", post(record))
+        .route(
+            "/v1/hub/repos/{repo}/deploy-workflow",
+            get(view_deploy_workflow).put(set_deploy_workflow),
+        )
+}
+
+fn deploy_workflow_key(repository_id: i64) -> String {
+    format!("deploy_workflow:repo:{repository_id}")
+}
+
+/// A workflow file the forge names in a run's `path`: `.github/workflows/NAME.yml` or `.yaml`.
+fn valid_workflow_path(path: &str) -> bool {
+    path.len() <= MAX_TEXT_CHARS
+        && path.strip_prefix(".github/workflows/").is_some_and(|name| {
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.starts_with('.')
+                && (name.ends_with(".yml") || name.ends_with(".yaml"))
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+}
+
+/// The workflow whose successful run on a merge commit counts as that commit's deployment,
+/// keyed by the forge's repository id so a rename keeps it.
+pub(super) fn deploy_workflow(store: &dyn Store, repository_id: i64) -> Result<Option<String>> {
+    Ok(store
+        .get_setting(&deploy_workflow_key(repository_id))?
+        .filter(|path| valid_workflow_path(path)))
+}
+
+/// Whether the Hub reads runs and deployments for `repo` after a merge: a GitHub repository
+/// listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`, or one with a deploy workflow set.
+pub(super) async fn watched(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+) -> Result<bool> {
+    if conn.provider != "github" {
+        return Ok(false);
+    }
+    if state.sync.external_runs_enabled(&repo.full_name) {
+        return Ok(true);
+    }
+    let (store, id) = (state.store.clone(), repo.repository_id);
+    blocking(state, move || Ok(deploy_workflow(&*store, id)?.is_some())).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetDeployWorkflow {
+    workflow: Option<String>,
+}
+
+/// The forge id of the token's connected repository; `not_connected` when there is none.
+async fn connected_id(
+    state: &HubState,
+    principal: &Principal,
+) -> std::result::Result<i64, ApiError> {
+    match connected(state, principal).await? {
+        Some((_, repository)) => Ok(repository.repository_id),
+        None => Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected")),
+    }
+}
+
+async fn view_deploy_workflow(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    // A repository the Hub has not connected has no deploy workflow.
+    let workflow = match connected(&state, &principal).await? {
+        Some((_, repository)) => {
+            let (store, id) = (state.store.clone(), repository.repository_id);
+            blocking(&state, move || deploy_workflow(&*store, id)).await?
+        }
+        None => None,
+    };
+    Ok(Json(
+        json!({"repository": principal.repository, "workflow": workflow}),
+    ))
+}
+
+/// Names the GitHub Actions workflow that deploys the repository, or clears it with `null`. A
+/// repository admin (or a Hub admin) sets it, as for the digest switch.
+async fn set_deploy_workflow(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path(repo): Path<String>,
+    JsonBody(body): JsonBody<SetDeployWorkflow>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let id = connected_id(&state, &principal).await?;
+    if body
+        .workflow
+        .as_deref()
+        .is_some_and(|path| !valid_workflow_path(path))
+    {
+        return Err(ApiError::invalid().with_message(
+            "Name the workflow by its file, such as .github/workflows/deploy.yml, or send null.",
+        ));
+    }
+    let admin = state.login.is_admin_user(&principal.owner)
+        || super::login::devices::mint_access(
+            &state,
+            &principal.owner,
+            &principal.repository,
+            "deploy_workflow",
+        )
+        .await?
+        .1;
+    if !admin {
+        return Err(ApiError::forbidden()
+            .with_message("Only a repository admin or a Hub admin names the deploy workflow."));
+    }
+    let (store, actor, workflow) = (
+        state.store.clone(),
+        principal.owner.id.clone(),
+        body.workflow,
+    );
+    let saved = blocking(&state, move || {
+        // An empty value reads as none: the settings table keeps no deletes.
+        let value = workflow.unwrap_or_default();
+        store.set_setting(&deploy_workflow_key(id), &value, &actor)?;
+        deploy_workflow(&*store, id)
+    })
+    .await?;
+    Ok(Json(
+        json!({"repository": principal.repository, "workflow": saved}),
+    ))
+}
+
+/// What a deploy script reports: the commit now in `environment`, in `status`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordRequest {
+    commit: String,
+    environment: String,
+    status: RecordStatus,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordStatus {
+    Success,
+    Failure,
+    InProgress,
+}
+
+impl RecordStatus {
+    fn github(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::InProgress => "in_progress",
+        }
+    }
+
+    fn gitlab(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failed",
+            Self::InProgress => "running",
+        }
+    }
+
+    fn outcome(self) -> ExternalOutcome {
+        match self {
+            Self::Success => ExternalOutcome::Succeeded,
+            Self::Failure => ExternalOutcome::Failed,
+            Self::InProgress => ExternalOutcome::Running,
+        }
+    }
+}
+
+/// Records on the forge, with the credential the Hub holds for the token's repository, that a
+/// commit is in an environment, and stores it as a `recorded` deployment. The commit's newest
+/// deployment to that environment is reused and gets a status only when its newest one differs,
+/// so a repeat writes nothing. A forge that refuses the write records nothing anywhere.
+async fn record(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path(repo): Path<String>,
+    JsonBody(request): JsonBody<RecordRequest>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let environment = request.environment.trim().to_owned();
+    let url_ok = request.url.as_deref().is_none_or(|url| {
+        url.len() <= MAX_URL_BYTES
+            && (url.starts_with("https://") || url.starts_with("http://"))
+            && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+    });
+    if !is_lower_hex(&request.commit, 40)
+        || environment.is_empty()
+        || !bounded(&environment)
+        || !url_ok
+    {
+        return Err(ApiError::invalid().with_message(
+            "Send a full lowercase commit id, an environment of 1 to 200 characters and an \
+             optional http(s) url.",
+        ));
+    }
+    let found = connected(&state, &principal).await?;
+    let Some((conn, repository)) = found else {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected"));
+    };
+    // One record at a time per repository, so two runs for one commit cannot both create one.
+    let _guard = state.sync.lock_repo(&repository.id).await;
+    let want = Want {
+        sha: &request.commit,
+        environment: &environment,
+        status: request.status,
+        url: request.url.as_deref(),
+    };
+    let written = async {
+        let token = state.sync.token(&conn, repository.installation_id).await?;
+        match state.sync.forge(&conn)? {
+            ForgeApi::Github(api) => on_github(api, &token, &repository, &want).await,
+            ForgeApi::Gitlab(api) => on_gitlab(api, &token, &repository, &want).await,
+        }
+    }
+    .await;
+    let (run, changed) = written.map_err(|error| refused(error, &conn, &repository))?;
+    let (store, id, stored) = (state.store.clone(), repository.id.clone(), run.clone());
+    blocking(&state, move || store.observe_external_run(&id, &stored)).await?;
+    Ok(Json(json!({"recorded": changed, "provider": run.provider,
+        "repository": repository.full_name, "commit": run.commit_sha,
+        "environment": run.environment, "outcome": run.outcome.as_str(),
+        "source": run.source.as_str(), "deployment_id": run.run_id})))
+}
+
+struct Want<'a> {
+    sha: &'a str,
+    environment: &'a str,
+    status: RecordStatus,
+    url: Option<&'a str>,
+}
+
+impl Want<'_> {
+    fn run(&self, provider: &str, source: ExternalSource, id: i64) -> ExternalRun {
+        ExternalRun {
+            provider: provider.into(),
+            kind: ExternalKind::Deployment,
+            source,
+            run_id: id,
+            attempt: 1,
+            commit_sha: self.sha.into(),
+            branch: None,
+            environment: Some(self.environment.into()),
+            name: String::new(),
+            outcome: self.status.outcome(),
+            provider_updated_at: unix_now(),
+            html_url: None,
+        }
+    }
+}
+
+async fn on_github(
+    api: &github::Api,
+    token: &str,
+    repo: &ConnectedRepository,
+    want: &Want<'_>,
+) -> Gh<(ExternalRun, bool)> {
+    let (name, state) = (repo.full_name.as_str(), want.status.github());
+    let found = api
+        .find_deployment(token, name, want.sha, want.environment)
+        .await?;
+    let (deployment, changed) = match found {
+        Some(deployment) => {
+            let id = deployment["id"].as_i64().unwrap_or_default();
+            let newest = api.deployment_status(token, name, id).await?;
+            let same = newest.is_some_and(|status| {
+                status["state"] == state
+                    && want.url.is_none_or(|url| status["environment_url"] == url)
+            });
+            if !same {
+                api.create_deployment_status(token, name, id, state, want.url)
+                    .await?;
+            }
+            (deployment, !same)
+        }
+        None => {
+            let deployment = api
+                .create_deployment(token, name, want.sha, want.environment, recorded_payload())
+                .await?;
+            let id = deployment["id"].as_i64().unwrap_or_default();
+            api.create_deployment_status(token, name, id, state, want.url)
+                .await?;
+            (deployment, true)
+        }
+    };
+    // A deployment someone else made (an Actions environment, say) stays theirs.
+    let source = if deployment["payload"] == recorded_payload() {
+        ExternalSource::Recorded
+    } else {
+        ExternalSource::Forge
+    };
+    let id = deployment["id"].as_i64().unwrap_or_default();
+    Ok((want.run("github", source, id), changed))
+}
+
+async fn on_gitlab(
+    api: &gitlab::Api,
+    token: &str,
+    repo: &ConnectedRepository,
+    want: &Want<'_>,
+) -> Gh<(ExternalRun, bool)> {
+    let (project, status) = (repo.repository_id, want.status.gitlab());
+    let (id, changed) = match api
+        .find_deployment(token, project, want.sha, want.environment)
+        .await?
+    {
+        Some((id, current)) if current == status => (id, false),
+        Some((id, _)) => {
+            api.update_deployment(token, project, id, status).await?;
+            (id, true)
+        }
+        None => {
+            // shortcut: the ref recorded is the default branch, as a script deploys from it;
+            // a deploy of another branch would need a ref field.
+            let branch = api.default_branch(token, project).await?;
+            let id = api
+                .create_deployment(token, project, want.sha, &branch, want.environment, status)
+                .await?;
+            (id, true)
+        }
+    };
+    Ok((want.run("gitlab", ExternalSource::Recorded, id), changed))
+}
+
+/// A plain reason for a forge write that did not happen. Nothing was recorded in any case.
+fn refused(error: GhError, conn: &Connection, repo: &ConnectedRepository) -> ApiError {
+    let name = &repo.full_name;
+    match error {
+        GhError::Auth(detail) | GhError::Failed(detail) if detail.starts_with("403") => {
+            let message = match (conn.provider.as_str(), conn.kind.as_str()) {
+                ("gitlab", _) => format!(
+                    "The Hub's GitLab connection may not write deployments on {name}: its \
+                     token needs the api scope and at least the Developer role. Nothing was \
+                     recorded."
+                ),
+                (_, "pat") => format!(
+                    "The Hub's GitHub token may not write deployments on {name}: it needs the \
+                     repository permission Deployments: Read and write. Nothing was recorded."
+                ),
+                _ => format!(
+                    "The Hub's GitHub App may not write deployments on {name}: give the App the \
+                     repository permission Deployments: Read and write, then accept the change \
+                     on its installation. Nothing was recorded."
+                ),
+            };
+            ApiError::new(StatusCode::FORBIDDEN, "forge_permission_missing").with_message(message)
+        }
+        GhError::Limited(_) => ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+            .with_message("The forge rate limit is spent; nothing was recorded, so retry later."),
+        GhError::Auth(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+            .with_message(
+                "The forge refused the Hub's credential; ask a Hub admin to check the \
+                 connection. Nothing was recorded.",
+            ),
+        GhError::Failed(detail) | GhError::TooLarge(detail) => {
+            crate::hub::error_envelope::log_internal(&format!(
+                "hub: record deployment for {name}: {detail}"
+            ));
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable").with_message(
+                "The forge did not record the deployment; retry later. It may have been \
+                 recorded if the forge answered after a timeout.",
+            )
+        }
+    }
 }
 
 const OPT_IN: &str = "AGENTSCM_GITHUB_EXTERNAL_RUNS";
@@ -26,14 +405,14 @@ const OPT_IN: &str = "AGENTSCM_GITHUB_EXTERNAL_RUNS";
 /// the watcher decides it: the connected repository's connection must be GitHub, and the
 /// repository's current name must be listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A repository the
 /// Hub has no connection for is not watched, however it is listed.
-async fn after_merge(
-    State(state): State<HubState>,
-    Reader(principal): Reader,
-    Path(repo): Path<String>,
-) -> std::result::Result<Json<Value>, ApiError> {
-    scope(&principal, &repo)?;
+/// The connection and connected repository of the token's repository, found as the watcher
+/// finds them; `None` when the Hub has not connected it.
+async fn connected(
+    state: &HubState,
+    principal: &Principal,
+) -> Result<Option<(Connection, ConnectedRepository)>> {
     let (store, who) = (state.store.clone(), principal.clone());
-    let found = blocking(&state, move || {
+    blocking(state, move || {
         let Some(repository) = find_repository(
             &*store,
             &who.owner.identity.host,
@@ -47,7 +426,16 @@ async fn after_merge(
             .connection(&repository.connection)?
             .map(|connection| (connection, repository)))
     })
-    .await?;
+    .await
+}
+
+async fn after_merge(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let found = connected(&state, &principal).await?;
     Ok(Json(match found {
         None => json!({"repository": principal.repository,
             "provider": principal.owner.identity.provider, "connected": false,
@@ -56,7 +444,7 @@ async fn after_merge(
             let supported = connection.provider == "github";
             json!({"repository": principal.repository, "provider": connection.provider,
                 "connected": true, "supported": supported,
-                "watched": supported && state.sync.external_runs_enabled(&repository.full_name),
+                "watched": watched(&state, &connection, &repository).await?,
                 "opt_in": OPT_IN})
         }
     }))
@@ -144,13 +532,48 @@ impl ExternalOutcome {
     }
 }
 
-/// One attempt of a provider run, keyed by (repository, provider, kind, `run_id`, `attempt`).
+/// Where an external run came from, strongest evidence first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExternalSource {
+    /// Read from the forge: a CI run, or a deployment AgentSCM did not write.
+    Forge,
+    /// A run of the repository's deploy workflow.
+    Workflow,
+    /// A deployment the Hub wrote on the forge for `POST /v1/hub/repos/{repo}/deployments`.
+    Recorded,
+    /// An agent's own report, stored in the Hub only; never proof.
+    Agent,
+}
+
+impl ExternalSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forge => "forge",
+            Self::Workflow => "workflow",
+            Self::Recorded => "recorded",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "forge" => Some(Self::Forge),
+            "workflow" => Some(Self::Workflow),
+            "recorded" => Some(Self::Recorded),
+            "agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
+}
+
+/// One attempt of a run, keyed by (repository, provider, kind, source, `run_id`, `attempt`).
 /// Text fields come from the provider and are untrusted display data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalRun {
-    /// Only `github` for now.
+    /// `github`, or `gitlab` for rows the Hub wrote itself (it reads no GitLab runs).
     pub provider: String,
     pub kind: ExternalKind,
+    pub source: ExternalSource,
     pub run_id: i64,
     pub attempt: i64,
     pub commit_sha: String,
@@ -168,7 +591,7 @@ pub struct ExternalRun {
 
 /// Column order read by both backends' row mappers.
 pub(super) const EXTERNAL_RUN_COLUMNS: &str = "provider, kind, run_id, attempt, commit_sha, branch,
-    environment, name, outcome, provider_updated_at, html_url";
+    environment, name, outcome, provider_updated_at, html_url, source";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalObserved {
@@ -210,7 +633,18 @@ impl ExternalRun {
         });
         let outcome_ok =
             self.kind == ExternalKind::Deployment || self.outcome != ExternalOutcome::Superseded;
-        if self.provider != "github"
+        let provider_ok = match self.provider.as_str() {
+            "github" => true,
+            "gitlab" => matches!(
+                self.source,
+                ExternalSource::Recorded | ExternalSource::Agent
+            ),
+            _ => false,
+        };
+        let source_ok =
+            self.kind == ExternalKind::Deployment || self.source == ExternalSource::Forge;
+        if !provider_ok
+            || !source_ok
             || self.run_id < 1
             || self.attempt < 1
             || self.provider_updated_at < 0
@@ -258,6 +692,13 @@ struct WireDeployment {
     environment: String,
     description: Option<String>,
     updated_at: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// The `payload` the Hub writes on a deployment it records, so a later read knows it.
+pub fn recorded_payload() -> Value {
+    json!({"agentscm": "recorded"})
 }
 
 #[derive(Deserialize)]
@@ -316,6 +757,7 @@ pub fn ci_run(value: &Value, repo_id: i64, sha: &str, branch: &str, web: &str) -
     let run = ExternalRun {
         provider: "github".into(),
         kind: ExternalKind::Ci,
+        source: ExternalSource::Forge,
         run_id: run.id,
         attempt: run.run_attempt.unwrap_or(1),
         commit_sha: run.head_sha,
@@ -329,6 +771,23 @@ pub fn ci_run(value: &Value, repo_id: i64, sha: &str, branch: &str, web: &str) -
     match run.validate() {
         Ok(()) => Ci::Run(run),
         Err(_) => Ci::Invalid,
+    }
+}
+
+/// A run of the deploy workflow as a `workflow` deployment of its commit, named after the
+/// workflow (or its file when it has no name): the run's outcome is the deployment's.
+fn workflow_deployment(ci: &ExternalRun, value: &Value) -> ExternalRun {
+    let label = value["name"]
+        .as_str()
+        .map(clipped)
+        .filter(|name| !name.trim().is_empty() && bounded(name))
+        .unwrap_or_else(|| ci.name.clone());
+    ExternalRun {
+        kind: ExternalKind::Deployment,
+        source: ExternalSource::Workflow,
+        branch: None,
+        environment: Some(label),
+        ..ci.clone()
     }
 }
 
@@ -362,6 +821,11 @@ pub fn deployment(
     let run = ExternalRun {
         provider: "github".into(),
         kind: ExternalKind::Deployment,
+        source: if deployment.payload == recorded_payload() {
+            ExternalSource::Recorded
+        } else {
+            ExternalSource::Forge
+        },
         run_id: deployment.id,
         attempt: 1,
         commit_sha: deployment.sha,
@@ -387,7 +851,7 @@ pub(super) async fn reconcile_repo(
     repo: &ConnectedRepository,
     token: &str,
 ) -> Gh<()> {
-    if conn.provider != "github" || !state.sync.external_runs_enabled(&repo.full_name) {
+    if !watched(state, conn, repo).await? {
         return Ok(());
     }
     // The external reads turn a 403 into `Auth("403 ...")`, whether or not it carried rate-limit
@@ -524,11 +988,19 @@ async fn commit_runs(
     let name = repo.full_name.as_str();
     let (runs, runs_done) = api.workflow_runs(token, name, sha).await?;
     let (deployments, deployments_done) = api.deployments(token, name, sha).await?;
+    let (store, id) = (state.store.clone(), repo.repository_id);
+    let deploy_path = blocking(state, move || deploy_workflow(&*store, id)).await?;
     let mut found = Vec::new();
+    let mut workflow_deploys = Vec::new();
     let mut complete = runs_done && deployments_done;
     for run in &runs {
         match ci_run(run, repo.repository_id, sha, base, web) {
-            Ci::Run(run) => found.push(run),
+            Ci::Run(ci) => {
+                if deploy_path.as_deref() == Some(ci.name.as_str()) {
+                    workflow_deploys.push(workflow_deployment(&ci, run));
+                }
+                found.push(ci);
+            }
             Ci::Invalid => complete = false,
             Ci::Other => {}
         }
@@ -553,6 +1025,7 @@ async fn commit_runs(
     if dropped > 0 {
         eprintln!("hub: external runs for {name} {sha}: {dropped} items not matched");
     }
+    found.extend(workflow_deploys);
     for run in found {
         let (store, id) = (state.store.clone(), repo.id.clone());
         blocking(state, move || store.observe_external_run(&id, &run)).await?;
@@ -564,6 +1037,7 @@ impl Event {
     /// Carries identifiers and the outcome only; the provider's text stays in the table.
     pub(super) fn external_run_observed(repository: &str, run: &ExternalRun) -> Result<Self> {
         let data = json!({"provider": run.provider, "kind": run.kind.as_str(),
+            "source": run.source.as_str(),
             "run_id": run.run_id, "attempt": run.attempt, "commit_sha": run.commit_sha,
             "outcome": run.outcome.as_str(), "provider_updated_at": run.provider_updated_at});
         Self::new("external_run_observed", repository, data)
@@ -578,6 +1052,7 @@ mod tests {
         ExternalRun {
             provider: "github".into(),
             kind: ExternalKind::Ci,
+            source: ExternalSource::Forge,
             run_id: 7,
             attempt: 1,
             commit_sha: "a".repeat(40),

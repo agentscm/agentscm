@@ -644,7 +644,7 @@ pub(crate) async fn check_hub(
     };
     let retention_days = reply["shared_conversation_retention_days"]
         .as_i64()
-        .filter(|days| (1..=3650).contains(days));
+        .filter(|days| (0..=3650).contains(days));
     let (mut check, participation) = finalize_hub_check(
         expires_at,
         unix_now(),

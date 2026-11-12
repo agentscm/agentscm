@@ -449,6 +449,9 @@ pub(crate) async fn plugin_capture(
         Ok(None) if session_start && answer == SharingAnswer::NoAnswer => {
             return change_capture_client::unknown_sharing(&checkout);
         }
+        Ok(None) if session_start => {
+            return change_capture_client::unconfigured_sharing(&connection.repo, answer);
+        }
         Ok(None) => return None,
         Err(_) => {
             eprintln!(
@@ -1803,7 +1806,7 @@ mod tests {
                 {
                     (
                         200,
-                        r#"{"sharing":true,"notified":true,"enabled":true,"opted_out":false}"#,
+                        r#"{"sharing":true,"notified":true,"enabled":true,"opted_out":false,"consented":true}"#,
                     )
                 } else if target
                     && head.starts_with("GET /v1/hub/repos/acme%2Fwidgets/change-records/current?")

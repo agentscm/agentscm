@@ -213,6 +213,7 @@ error_codes! {
     OwnerDisabled => ("owner_disabled", 409, false, AskOwner, "The owner is disabled; ask a Hub administrator to review access."),
     OwnerWrongForge => ("owner_wrong_forge", 409, false, ProvideField, "The owner belongs to another forge; select an owner on this repository's forge."),
     RepositoryRenamed => ("repository_renamed", 409, false, InspectWork, "The repository identity changed; refresh it before enrolling."),
+    ForgePermissionMissing => ("forge_permission_missing", 403, false, AskOwner, "The Hub's forge app may not do this on the repository; ask a forge owner to grant the permission the message names. Nothing was recorded."),
 }
 
 impl ErrorCode {

@@ -58,6 +58,7 @@ mod continuity_cli;
 #[cfg(unix)]
 mod continuity_remote;
 mod demo_cli;
+mod deployed_cli;
 mod digest_cli;
 mod distribution;
 #[cfg(unix)]
@@ -335,6 +336,8 @@ enum Command {
     /// Run a trusted-local, pinned skill intent review operation from JSON stdin.
     #[cfg(unix)]
     IntentReview(intent_review_cli::IntentReviewArgs),
+    /// Record on the forge that a commit is live in an environment, from a deploy script.
+    Deployed(deployed_cli::DeployedArgs),
     /// Show the Work recorded for a commit, a file or a line, with its decisions.
     Why(why_cli::WhyArgs),
     /// Coordinate durable engineering work, claims and resumable check-ins.
@@ -1072,6 +1075,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::Intent { command } => intent_cli::run(command).await?,
         #[cfg(unix)]
         Command::IntentReview(args) => print_json(&intent_review_cli::run(args)?),
+        Command::Deployed(args) => deployed_cli::run(args).await?,
         Command::Why(args) => print_json(&why_cli::run(args).await?),
         Command::Work { command } => work_cli::run(command).await?,
         Command::Digest { command } => digest_cli::run(command).await?,

@@ -21,6 +21,9 @@ use crate::store::digest;
 use super::change_record::{ConversationAudience, SharedBodyRow, SharedBodyState};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Store, unix_now};
+use super::viewer::Shown;
+use super::work::WorkRepositoryScope;
+use super::work_http::actionable_status;
 use super::{HubError, HubState, Principal};
 use serde::Deserialize;
 
@@ -167,15 +170,39 @@ async fn show(
     Path((repo, work_id)): Path<(String, String)>,
 ) -> Result<Json<ChangeRecordResponseV1>, ApiError> {
     scope(&principal, &repo)?;
-    let store = state.store.clone();
-    let summary = blocking(&state, move || {
-        store.change_record(&principal.token_id, &work_id, unix_now())
-    })
-    .await?
-    .ok_or_else(ApiError::not_found)?;
+    let summary = read_summary(&state, &principal, &work_id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
     let response = ChangeRecordResponseV1::bounded(summary)?;
     response.validate_encoded_size()?;
     Ok(Json(response))
+}
+
+/// Shared HTTP/MCP read so both transports expose the same exact-version status enrichment.
+pub(super) async fn read_summary(
+    state: &HubState,
+    principal: &Principal,
+    work_id: &str,
+) -> super::Result<Option<crate::change_record::ChangeRecordSummaryV1>> {
+    let store = state.store.clone();
+    let setup = state.onboarding.clone();
+    let principal = principal.clone();
+    let work_id = work_id.to_owned();
+    blocking(state, move || {
+        let now = unix_now();
+        let Some(mut summary) = store.change_record(&principal.token_id, &work_id, now)? else {
+            return Ok(None);
+        };
+        let status = actionable_status::read(&*store, &setup, &principal, now)
+            .map(|mut status| {
+                status.show(super::viewer::Viewer(&principal.owner.id));
+                status
+            })
+            .ok();
+        super::change_record::enrich_actionable_status(&mut summary, status.as_ref());
+        Ok(Some(summary))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -470,15 +497,18 @@ async fn upload_body(
     }
     let store = state.store.clone();
     let objects = state.objects.clone();
-    let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
+    let (hub, repository) = (state.clone(), WorkRepositoryScope::of(&principal));
     let token = principal.token_id;
     let admin = state.login.is_admin_user(&principal.owner);
     let (author, repository_id) = (principal.owner.id, principal.repository_id);
     blocking(&state, move || -> Result<Refusal, HubError> {
         let now = unix_now();
-        // Off means off: nothing more is stored once the repository stops sharing or this
-        // person opts out, whatever the client still holds.
-        if !super::conversation_sharing::person_shares(&*store, &author, repository_id)? {
+        let retention = hub.shared_conversation_retention_days(&repository)? * 24 * 60 * 60;
+        // Off means off: nothing more is stored once the repository stops sharing, keeps no
+        // bodies, or this person opts out, whatever the client still holds.
+        if retention == 0
+            || !super::conversation_sharing::person_shares(&*store, &author, repository_id)?
+        {
             return Ok(Err(ApiError::new(StatusCode::FORBIDDEN, "sharing_off")));
         }
         let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
@@ -602,14 +632,15 @@ async fn missing_bodies(
         return Err(ApiError::invalid());
     }
     let store = state.store.clone();
+    let (hub, repository) = (state.clone(), WorkRepositoryScope::of(&principal));
     let token = principal.token_id;
     let digests = request.digests;
     let (author, repository_id) = (principal.owner.id, principal.repository_id);
     let Some((rows, shares)) = ({
         let digests = digests.clone();
         blocking(&state, move || {
-            let shares =
-                super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
+            let shares = hub.shared_conversation_retention_days(&repository)? > 0
+                && super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
             Ok(store
                 .shared_bodies_own(&token, &work_id, &digests, unix_now())?
                 .map(|rows| (rows, shares)))
@@ -618,8 +649,8 @@ async fn missing_bodies(
     }) else {
         return Err(ApiError::not_found());
     };
-    // While sharing is off nothing is missing, so the client sends nothing and its bodies stay
-    // declared `local` on the Hub.
+    // While sharing is off or the repository keeps no bodies nothing is missing, so the client
+    // sends nothing and its bodies stay declared `local` on the Hub.
     if !shares {
         return Ok(Json(ConversationMissingV1::default()));
     }

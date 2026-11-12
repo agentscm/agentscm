@@ -3427,6 +3427,12 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     assert_eq!(names, [REPO, "acme/docs"]);
     let widgets = &body["repositories"][0];
     assert_eq!(widgets["repository_id"], REPO_ID);
+    // Each row names its forge, so a page tells GitHub from GitLab without other reads.
+    let host = env.store.connections().unwrap()[0].host.clone();
+    assert_eq!(
+        (&widgets["provider"], &widgets["host"]),
+        (&json!("github"), &json!(host))
+    );
     assert_eq!(widgets["agents"], 1);
     assert_eq!(widgets["needs_you"], 0);
     assert_eq!(
@@ -3452,6 +3458,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             "agents",
             "complete",
             "coverage",
+            "host",
             "last_activity_at",
             "needs_you",
             "provider",

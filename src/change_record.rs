@@ -455,8 +455,61 @@ pub enum DecisionSourceRefV1 {
 pub struct IntentSummaryV1 {
     /// Existing bounded Work title; it is not derived from conversation content.
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// `native` or `forge`; request provenance is not approval.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provenance: String,
     pub scope: Vec<String>,
     pub scope_omitted: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedAttributionV1 {
+    pub agent: String,
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DiffReferenceV1 {
+    Native {
+        repository: String,
+        revision: String,
+        change_id: String,
+    },
+    Git {
+        repository: String,
+        worktree_id: String,
+        base: String,
+        head: String,
+        dirty: bool,
+        untracked_count: u32,
+        omissions: Vec<CaptureOmissionV1>,
+        snapshot_coverage: CoverageV1,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewProjectionV1 {
+    pub captured_by: Option<CapturedAttributionV1>,
+    pub diff: Option<DiffReferenceV1>,
+    /// Current checkout bytes are unavailable to the Hub; changed paths require the referenced diff.
+    pub actual_scope: CoverageV1,
+    pub concerns: Vec<String>,
+    pub detail_links: Vec<String>,
+    /// Masked retained lead identity. It is attribution, not proof that the actor is available.
+    pub next_actor: Option<String>,
+    /// `None` when this pure projection lacks the operational/reconciliation facts required by
+    /// actionable status to support an instruction.
+    pub supported_action: Option<String>,
+    pub establishes_approval: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -541,6 +594,10 @@ pub struct ChangeRecordSummaryV1 {
     pub schema_version: u16,
     pub work_id: String,
     pub generation: i64,
+    /// Work event sequence used to join non-atomic actionable-status reads without treating a
+    /// different version of the same generation as current.
+    #[serde(default)]
+    pub updated_seq: i64,
     pub as_of: i64,
     pub intent: IntentSummaryV1,
     pub subject: Option<SubjectSummaryV1>,
@@ -556,6 +613,8 @@ pub struct ChangeRecordSummaryV1 {
     pub next_action: Option<String>,
     pub completeness: CompletenessV1,
     pub unknowns: Vec<UnknownFactV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewProjectionV1>,
 }
 
 /// Setup facts from the latest setup observation of one session. `None` means not observed.

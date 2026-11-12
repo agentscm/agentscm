@@ -98,6 +98,7 @@ A program that runs the hub as a library can replace the allow list and the forg
 - The program can sign a person in on the browser after checking who they are itself, with `agentscm::hub::login::sign_in_browser`. That person is a forge account, so their tasks, sessions and conversations are the ones their agents report.
 - `agentscm::hub::http::serve_with` runs the hub as `hub serve` does, and lets the program change its state and add routes, which get the hub's own body and time bounds (`agentscm::hub::router_with`).
 - `HubState::with_work_history` sets how many seconds of stand-up history each repository keeps, at least a day; `GET /v1/hub/repos/{repo}/retention` reports it as `work.compaction.after_seconds`. Without it every repository keeps a week.
+- `HubState::with_shared_conversation_retention` sets how many days each repository keeps an uploaded shared conversation, 0 to 3650; 0 keeps none, so the hub asks that repository's clients for no uploads and refuses them (403 `sharing_off`). `GET /v1/hub/whoami` and `GET /v1/hub/repos/{repo}/retention` (`shared_conversations.retention_days`) report it. A body keeps the expiry set at its upload. Without it every repository keeps `--shared-conversation-retention-days`.
 
 ## 5. Connect the team's clients
 

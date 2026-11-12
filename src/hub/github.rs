@@ -991,6 +991,78 @@ impl Api {
             .and_then(|list| list.first().cloned()))
     }
 
+    /// The newest deployment of exactly `sha` to `environment`, with a positive id; `None` when
+    /// there is none.
+    pub async fn find_deployment(
+        &self,
+        token: &str,
+        full_name: &str,
+        sha: &str,
+        environment: &str,
+    ) -> Gh<Option<Value>> {
+        let environment = crate::forge::encode_path_segment(environment);
+        let path = format!(
+            "/repos/{full_name}/deployments?sha={sha}&environment={environment}&per_page=1"
+        );
+        let list = self.get(token, &path).await?.ok("deployments")?;
+        let Some(list) = list.as_array() else {
+            return Err(GhError::Failed("unreadable reply from deployments".into()));
+        };
+        Ok(list
+            .first()
+            .filter(|item| item["id"].as_i64().is_some_and(|id| id > 0))
+            .cloned())
+    }
+
+    /// Records a deployment of `sha` to `environment` carrying `payload`, and returns it. It
+    /// merges nothing and waits for no checks: the commit is already deployed.
+    pub async fn create_deployment(
+        &self,
+        token: &str,
+        full_name: &str,
+        sha: &str,
+        environment: &str,
+        payload: Value,
+    ) -> Gh<Value> {
+        let url = format!("{}/repos/{full_name}/deployments", self.base);
+        let body = json!({"ref": sha, "environment": environment, "auto_merge": false,
+            "required_contexts": [], "payload": payload});
+        let reply = self.write(token, Method::POST, &url, body).await?;
+        match reply.body["id"].as_i64() {
+            Some(id) if id > 0 && reply.status == 201 && reply.body["sha"] == sha => Ok(reply.body),
+            _ => Err(GhError::Failed(format!(
+                "{} from deployments: {}",
+                reply.status,
+                refusal(&reply.body)
+            ))),
+        }
+    }
+
+    /// Adds a status (`success`, `failure`, `in_progress`, ...) to deployment `id`.
+    pub async fn create_deployment_status(
+        &self,
+        token: &str,
+        full_name: &str,
+        id: i64,
+        state: &str,
+        environment_url: Option<&str>,
+    ) -> Gh<()> {
+        let url = format!("{}/repos/{full_name}/deployments/{id}/statuses", self.base);
+        let mut body = json!({"state": state});
+        if let Some(target) = environment_url {
+            body["environment_url"] = json!(target);
+        }
+        let reply = self.write(token, Method::POST, &url, body).await?;
+        if reply.status != 201 || reply.body["state"] != state {
+            return Err(GhError::Failed(format!(
+                "{} from deployment statuses: {}",
+                reply.status,
+                refusal(&reply.body)
+            )));
+        }
+        Ok(())
+    }
+
     async fn external_list(
         &self,
         path: &str,
@@ -1736,14 +1808,16 @@ fn sha_of(body: &Value) -> Gh<String> {
 }
 
 /// The forge's message for a refused write, bounded and without control characters.
-fn refusal(body: &Value) -> String {
-    body["message"]
-        .as_str()
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect()
+/// The forge's own reason, cut to 200 characters. GitLab can send it as an object of field
+/// errors, which is shown as JSON.
+pub(super) fn refusal(body: &Value) -> String {
+    let message = &body["message"];
+    let text = match message {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 fn last_page(link: &str) -> Option<u32> {

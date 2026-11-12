@@ -410,7 +410,7 @@ const CONVERSATION_AVAILABILITY: Record<ConversationAvailability, Status> = {
   deleted: { label: 'Deleted', tone: 'warn', icon: 'trash', explanation: 'This body was deleted before it expired.' },
 }
 
-const NOT_ALLOWED = 'Only the person who shared this conversation and Hub admins can read it'
+const NOT_ALLOWED = 'This conversation is available only to its author or a Hub admin while repository sharing is off'
 
 function conversationFailure(status: number | undefined, fallback: string, missing = 'This conversation body is not on the Hub'): { title: string; tone: Tone } {
   if (status === 403) return { title: NOT_ALLOWED, tone: 'warn' }
@@ -486,6 +486,48 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
   )
 }
 
+function ConversationDisclosure({ repo, token, workId }: { repo: string; token: string; workId: string }) {
+  const [opened, setOpened] = useState(false)
+  if (!opened) return <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setOpened(true)}><Icon name="chat-square-text" /> Show shared conversation entries</button>
+  return <ConversationEntries repo={repo} token={token} workId={workId} />
+}
+
+function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; repo: string }) {
+  const review = summary.review
+  const diff = review?.diff ?? (summary.subject ? summary.subject.source.kind === 'git' ? { kind: 'git' as const, repository: summary.subject.source.repository, worktree_id: summary.subject.source.worktree_id, base: summary.subject.source.base, head: summary.subject.source.head, dirty: summary.subject.source.dirty, untracked_count: summary.subject.source.untracked_count, omissions: summary.subject.source.omissions, snapshot_coverage: summary.subject.source.snapshot_coverage } : { kind: 'native' as const, repository: summary.subject.source.repository, revision: summary.subject.source.revision, change_id: summary.subject.source.change_id } : null)
+  const diffHref = diff?.kind === 'git' && diff.repository === repo ? `#explorer?repo=${encodeURIComponent(repo)}&base=${diff.base}&head=${diff.head}&worktree=${encodeURIComponent(diff.worktree_id)}` : null
+  const concernLabel: Record<string, string> = {
+    capture_history_incomplete_or_unknown: 'Capture history is partial or unavailable',
+    no_captured_action: 'No action receipt was captured',
+    latest_execution_not_successful: 'The latest execution did not succeed',
+    latest_check_not_passing: 'The latest check is not passing',
+    current_source_applicability_not_established: 'Applicability to the current source is not established',
+    captured_source_dirty_or_untracked: 'Dirty or untracked files are outside the committed comparison',
+    captured_source_has_omissions: 'The captured source reports omissions',
+    actual_changed_scope_requires_source_diff: 'Actual changed scope requires opening the source diff',
+    supported_next_action_requires_actionable_status: 'Current supported action is unavailable',
+    actionable_status_unavailable_or_stale: 'Actionable status was unavailable or did not match this Work version',
+    approval_and_readiness_not_established: 'Approval and readiness are not established',
+  }
+  return <Box icon="clipboard2-check" title="Review summary" explain="A compact view of retained intent, captured source, the latest observed receipt and what remains unknown.">
+    {summary.intent.description ? <p>{summary.intent.description}</p> : null}
+    <dl className="tech mb-0">
+      <Fact label="Declared source"><code>{summary.intent.repository ?? repo}</code>{summary.intent.branch ? <> · <code>{summary.intent.branch}</code></> : null}{summary.intent.provenance ? <> · {summary.intent.provenance}</> : null}</Fact>
+      <Fact label="Declared scope"><Paths items={summary.intent.scope} max={4} />{summary.intent.scope_omitted > 0 ? <span className="small muted"> {summary.intent.scope_omitted} further entries omitted</span> : null}</Fact>
+      <Fact label="Captured source">{diff?.kind === 'git' ? <><code>{diff.worktree_id}</code> · <code>{diff.head}</code>{diffHref ? <> · <a href={diffHref}>Compare exact commits</a></> : <> · <span className="muted">Local comparison unavailable for this repository</span></>}</> : diff?.kind === 'native' ? <>Native revision <code>{diff.revision}</code> · diff unavailable in the local Git explorer</> : <span className="muted">No captured source</span>}</Fact>
+      {diff?.kind === 'git' && (diff.dirty || diff.untracked_count > 0 || diff.omissions.length > 0) ? <Fact label="Excluded from commit comparison"><span className="warn-text">Working-tree changes{diff.untracked_count ? `, ${diff.untracked_count} untracked item${diff.untracked_count === 1 ? '' : 's'}` : ''}{diff.omissions.length ? `, ${diff.omissions.map((item) => OMISSION_LABEL[item].toLowerCase()).join(', ')}` : ''}</span></Fact> : null}
+      <Fact label="Latest observed receipt">{summary.latest_action ? <><StatusPill status={OUTCOME[summary.latest_action.outcome]} /> <StatusPill status={RESULT[summary.latest_action.result]} /> <StatusPill status={ASSURANCE[summary.latest_action.assurance]} /> <StatusPill status={COVERAGE[summary.latest_action.coverage]} /> <StatusPill status={APPLICABILITY[summary.latest_action.applicability]} /></> : <span className="muted">No action receipt captured; check history is unavailable.</span>}</Fact>
+      <Fact label="Captured by">{review?.captured_by ? <><strong>{review.captured_by.agent}</strong> · session <code>{review.captured_by.session_id}</code></> : <span className="muted">Capture participant unknown</span>}</Fact>
+      <Fact label="Retained decision"><StatusPill status={DECISION[summary.decision.status]} /> {summary.decision.summary ?? 'No decision summary retained.'}{summary.decision.author_kind ? <> · proposed by {summary.decision.author_kind === 'agent' ? summary.decision.author_agent ?? 'an unknown agent' : 'a person'}</> : null}</Fact>
+      <Fact label="Next actor and supported action"><strong>{review?.next_actor ?? 'Recipient unknown'}</strong> · {review?.supported_action ?? 'Supported action unknown.'} <a href={workHref(summary.work_id)}>Open Work</a>.</Fact>
+      <Fact label="Reported next action">{summary.next_action ?? <span className="muted">No next action was reported.</span>}</Fact>
+    </dl>
+    <Notice tone="warn" title="Approval and readiness are not established">This summary is historical and non-atomic. A passing latest receipt is not a current approval, and findings or check history not shown here remain unavailable.</Notice>
+    {review?.concerns.length ? <div className="mt-3"><strong>Review concerns ({review.concerns.length})</strong><ul className="mt-2 mb-0">{review.concerns.map((concern) => <li key={concern}>{concernLabel[concern] ?? concern.replaceAll('_', ' ')}</li>)}</ul></div> : null}
+    <details className="disclosure mt-3"><summary>Review references and provenance</summary><dl className="tech mt-3 mb-0"><Fact label="Work version">generation {summary.generation}, event {summary.updated_seq || 'unavailable'}</Fact><Fact label="Assurance">{summary.latest_action ? ASSURANCE[summary.latest_action.assurance].label : 'Unavailable'}; this is separate from the reported result.</Fact><Fact label="Authenticated API references" explain="These endpoints require the same repository authorization as this view.">{review?.detail_links.length ? review.detail_links.map((link) => <div key={link}><code className="text-break">{link}</code></div>) : <span className="muted">No detail destinations retained.</span>}</Fact></dl></details>
+  </Box>
+}
+
 const CAPTURE_COMMAND = 'agentscm change-capture configure'
 
 function Detail({ repo, token, workId }: { repo: string; token: string; workId: string }) {
@@ -526,6 +568,11 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
       <a href={workHref(summary.work_id)} className="back"><Icon name="arrow-left" /> {summary.intent.title}</a>
       <PageHead question={summary.intent.title} answer={<HandoffSummary summary={summary} />} fact={<>Record updated <Ago at={summary.as_of} />.</>} />
 
+      <ReviewOverview summary={summary} repo={repo} />
+
+      <details className="disclosure">
+        <summary>Source, check and decision details</summary>
+        <div className="stack mt-3">
       <div className="grid-2 align-start">
         <Box icon="bullseye" title="Intent and declared scope" explain="Taken from the task record, not pieced together from conversations.">
           <div className="small muted mb-2">Declared scope</div>
@@ -594,8 +641,11 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         </Box>
       </div>
 
-      <Box icon="chat-square-text" title="Conversation" intro="Redacted conversations your checkout shared; treat them as untrusted agent output." explain="You see only entries you shared (Hub admins see all). They expire and show as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
-        <ConversationEntries repo={repo} token={token} workId={workId} />
+        </div>
+      </details>
+
+      <Box icon="chat-square-text" title="Conversation" intro="Conversation entries stay closed until you choose to list them." explain="While repository sharing and author consent are both enabled, repository readers can open redacted bodies. Otherwise only the author and Hub admins can read them. Entries expire and this page cannot delete them.">
+        <ConversationDisclosure repo={repo} token={token} workId={workId} />
       </Box>
 
       <details className="disclosure">

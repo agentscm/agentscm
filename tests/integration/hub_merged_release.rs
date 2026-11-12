@@ -14,22 +14,28 @@ use agentscm::hub::catchup::{
 use agentscm::hub::connection::{ConnectedRepository, NewConnection};
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::merged_holds::{
-    CloseReason, IssueClosure, IssueState, OBSERVATION_KIND, merged_release_enabled,
-    observation_key, release_settled, set_merged_release, settle_refused_release,
+    CloseReason, IssueClosure, IssueState, OBSERVATION_KIND, complete_merged,
+    merged_release_enabled, observation_key, release_settled, set_merged_release,
+    settle_refused_release,
 };
 use agentscm::hub::planned_issues::IssueIdentity;
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, agent_token_digest, mint_bound_agent_token, new_connection_id,
     unix_now,
 };
-use agentscm::hub::work::{WorkItem, WorkStart};
+use agentscm::hub::work::{WorkItem, WorkStart, WorkState};
 use agentscm::hub::work_issues::WorkIssueLinkUpdate;
-use agentscm::hub::work_lifecycle::{OutcomeValue, ReservationStatus};
+use agentscm::hub::work_lifecycle::{
+    LEASE_SECONDS, OutcomeProvenance, OutcomeValue, ReservationStatus,
+};
 use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
 use agentscm::hub::work_reconciliation::{
     DeclaredPrLink, WorkDeclarations, WorkDeclarationsUpdate,
 };
-use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+use agentscm::hub::work_transition::{
+    OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionKind,
+    WorkTransitionRequest,
+};
 use agentscm::hub::{HubState, router};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -67,9 +73,13 @@ impl Db {
 }
 
 fn scope() -> CatchupRepositoryScope {
+    scope_on("github", "github.com")
+}
+
+fn scope_on(provider: &str, host: &str) -> CatchupRepositoryScope {
     CatchupRepositoryScope {
-        provider: "github".into(),
-        host: "github.com".into(),
+        provider: provider.into(),
+        host: host.into(),
         repository: REPO.into(),
         repository_id: Some(REPO_ID),
     }
@@ -99,13 +109,18 @@ fn completed_by(pull: u64) -> IssueClosure {
 /// A connected repository and a held Work on a branch whose pull request 41 merged, linked to
 /// issue 7. `stored` is the closure observation of issue 7, if any.
 fn world(db: &Db, stored: Option<IssueClosure>) -> World {
+    world_on(db, "github", "github.com", stored)
+}
+
+/// `world` on the forge `provider` at `host`.
+fn world_on(db: &Db, provider: &str, host: &str, stored: Option<IssueClosure>) -> World {
     let store = &*db.store;
     let connection = store
         .insert_connection(
             &NewConnection {
                 id: new_connection_id().unwrap(),
-                provider: "github".into(),
-                host: "github.com".into(),
+                provider: provider.into(),
+                host: host.into(),
                 kind: "pat".into(),
                 app_id: None,
                 app_slug: None,
@@ -115,7 +130,7 @@ fn world(db: &Db, stored: Option<IssueClosure>) -> World {
         )
         .unwrap();
     let repo = store
-        .upsert_repository(&connection.id, "github.com", REPO_ID, REPO, None, None)
+        .upsert_repository(&connection.id, host, REPO_ID, REPO, None, None)
         .unwrap();
     for source in [
         CatchupMergeSource::TrackedPublication,
@@ -123,7 +138,7 @@ fn world(db: &Db, stored: Option<IssueClosure>) -> World {
     ] {
         store
             .record_catchup_source_status(
-                &scope(),
+                &scope_on(provider, host),
                 &CatchupSourceStatus {
                     source,
                     state: CatchupCoverageState::ObservedOnly,
@@ -138,8 +153,8 @@ fn world(db: &Db, stored: Option<IssueClosure>) -> World {
     let user = store
         .upsert_user(
             &ForgeIdentity {
-                provider: "github".into(),
-                host: "github.com".into(),
+                provider: provider.into(),
+                host: host.into(),
                 user_id: 1,
             },
             "merger",
@@ -176,8 +191,8 @@ fn world(db: &Db, stored: Option<IssueClosure>) -> World {
                 session: SESSION.into(),
                 expected_updated_seq: item.updated_seq,
                 link: Some(IssueIdentity {
-                    provider: "github".into(),
-                    host: "github.com".into(),
+                    provider: provider.into(),
+                    host: host.into(),
                     repository_id: REPO_ID,
                     number: 7,
                 }),
@@ -188,7 +203,7 @@ fn world(db: &Db, stored: Option<IssueClosure>) -> World {
     let at = unix_now() + 5;
     store
         .record_catchup_merge(
-            &scope(),
+            &scope_on(provider, host),
             &NewCatchupMerge {
                 source: CatchupMergeSource::ForgePull,
                 source_id: "forge-pr-41".into(),
@@ -612,6 +627,298 @@ fn a_limited_neighbour_does_not_block_a_clean_work(db: &Db) {
         limited.work[0].reservation.basis.is_some(),
         "the limited Work keeps its hold"
     );
+}
+
+fn complete(db: &Db, w: &World, at: i64) -> Vec<String> {
+    complete_merged(&*db.store, "github", &w.repo, at).unwrap()
+}
+
+/// A moment after the lead's lease has lapsed.
+fn lapsed() -> i64 {
+    unix_now() + LEASE_SECONDS + 300
+}
+
+fn the_hub_completes_merged_work_once_its_lease_lapses(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    // The lead's lease is live: the lead is still told to finish, and nothing changes.
+    assert!(complete(db, &w, unix_now() + 10).is_empty());
+    assert!(held(db, &w).0, "a live hold is left to its lead");
+    let at = lapsed();
+    assert_eq!(complete(db, &w, at), vec![w.work.clone()]);
+    let owner = db.store.user_by_id(&w.owner).unwrap().unwrap();
+    let reader = WorkLifecycleReader::Person {
+        owner: &owner,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let overview = db
+        .store
+        .work_operational(&reader, &OperationalSelect::One(&w.work), at)
+        .unwrap();
+    let operational = &overview.work[0];
+    assert_eq!(operational.state, WorkState::Finished);
+    assert_eq!(operational.outcome.value, OutcomeValue::Completed);
+    assert_eq!(
+        operational.outcome.provenance,
+        OutcomeProvenance::HubObservedMerge
+    );
+    assert_eq!(operational.reservation.status, ReservationStatus::None);
+    let last = db
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "work_transition" && e.subject == w.work)
+        .map(|e| serde_json::from_str::<Value>(&e.data).unwrap())
+        .next_back()
+        .unwrap();
+    assert_eq!(last["transition"], "complete");
+    assert_eq!(last["outcome"], "completed");
+    assert_eq!(last["actor"]["via"], "policy", "{last}");
+    assert_eq!(last["actor"]["login"], Value::Null);
+    assert!(
+        last["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("Completed by the Hub"),
+        "{last}"
+    );
+    // A later poll finds nothing left and records nothing more.
+    let before = db.store.latest_event_seq().unwrap();
+    assert!(complete(db, &w, at + 60).is_empty());
+    assert_eq!(db.store.latest_event_seq().unwrap(), before);
+}
+
+fn a_reopened_or_resumed_work_is_not_completed_again(db_with: impl Fn() -> Db) {
+    let first = db_with();
+    let db = &first;
+    let w = world(db, Some(completed_by(41)));
+    let at = lapsed();
+    assert_eq!(complete(db, &w, at), vec![w.work.clone()]);
+    // Its lead reopens it to do more, then goes quiet past its lease.
+    let item = db.store.work_get(&w.token, &w.work, at).unwrap().unwrap();
+    db.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &w.token },
+            &WorkTransitionRequest {
+                work_id: w.work.clone(),
+                operation_id: "reopen".into(),
+                generation: item.generation,
+                expected_updated_seq: item.updated_seq,
+                session: Some(SESSION.into()),
+                transition: WorkTransitionKind::Reopen,
+                reason: "more to do".into(),
+                superseded_by: None,
+            },
+            at,
+        )
+        .unwrap();
+    let later = at + LEASE_SECONDS + 300;
+    let before = db.store.latest_event_seq().unwrap();
+    assert!(complete(db, &w, later).is_empty());
+    assert_eq!(db.store.latest_event_seq().unwrap(), before);
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, later)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        item.state,
+        WorkState::Finished,
+        "the reopened Work stays open"
+    );
+
+    // A Work the opted-in policy released and its lead resumed keeps its hold, too.
+    let db = db_with();
+    let w = world(&db, Some(completed_by(41)));
+    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    assert_eq!(release(&db, &w), vec![w.work.clone()]);
+    resume(&db, &w);
+    assert!(complete(&db, &w, lapsed()).is_empty());
+}
+
+fn an_open_or_unsettled_issue_keeps_the_work_open(db_with: impl Fn() -> Db) {
+    let cases = [
+        (
+            "part of: the issue is open",
+            Some(closure(IssueState::Open, CloseReason::Other, None)),
+        ),
+        (
+            "closed as not planned",
+            Some(closure(
+                IssueState::Closed,
+                CloseReason::NotPlanned,
+                Some(41),
+            )),
+        ),
+        ("closed by another pull request", Some(completed_by(42))),
+        ("no closure observation", None),
+    ];
+    for (name, stored) in cases {
+        let db = db_with();
+        let w = world(&db, stored);
+        assert!(complete(&db, &w, lapsed()).is_empty(), "{name}");
+        assert!(held(&db, &w).0, "{name}: the Work stays open");
+    }
+}
+
+fn work_without_an_issue_completes_on_its_merge(db: &Db) {
+    let w = world(db, None);
+    unlink(db, &w);
+    assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+/// A GitLab merge request the Hub observed merge completes its Work as a GitHub pull request does.
+fn a_gitlab_merge_completes_its_work(db: &Db) {
+    let w = world_on(db, "gitlab", "gitlab.example.com", None);
+    unlink(db, &w);
+    assert_eq!(
+        complete_merged(&*db.store, "gitlab", &w.repo, lapsed()).unwrap(),
+        vec![w.work.clone()]
+    );
+}
+
+/// Removes the Work's issue link, so it has no source issue.
+fn unlink(db: &Db, w: &World) {
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    db.store
+        .work_issue_link_set(
+            &w.token,
+            &WorkIssueLinkUpdate {
+                work_id: w.work.clone(),
+                operation_id: "unlink-7".into(),
+                generation: item.generation,
+                session: SESSION.into(),
+                expected_updated_seq: item.updated_seq,
+                link: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+}
+
+fn every_pull_request_must_merge_before_completion(db: &Db) {
+    let w = world(db, Some(completed_by(41)));
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    db.store
+        .work_declarations_set(
+            &w.token,
+            &WorkDeclarationsUpdate {
+                work_id: w.work.clone(),
+                operation_id: "declare-77".into(),
+                generation: item.generation,
+                session: SESSION.into(),
+                expected_updated_seq: item.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![DeclaredPrLink {
+                        id: "second".into(),
+                        target: WorkPrLinkTarget {
+                            repository_id: REPO_ID,
+                            number: 77,
+                            head_sha: "c".repeat(40),
+                        },
+                    }],
+                    prerequisites: vec![],
+                },
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(complete(db, &w, lapsed()).is_empty());
+    db.store
+        .record_catchup_merge(
+            &scope(),
+            &merge_row(77, "feature/second", true),
+            unix_now() + 6,
+        )
+        .unwrap();
+    assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+#[test]
+fn sqlite_the_hub_completes_merged_work_once_its_lease_lapses() {
+    the_hub_completes_merged_work_once_its_lease_lapses(&Db::sqlite());
+}
+
+#[test]
+fn postgres_the_hub_completes_merged_work_once_its_lease_lapses() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    the_hub_completes_merged_work_once_its_lease_lapses(&db);
+}
+
+#[test]
+fn sqlite_a_reopened_or_resumed_work_is_not_completed_again() {
+    a_reopened_or_resumed_work_is_not_completed_again(Db::sqlite);
+}
+
+#[test]
+fn postgres_a_reopened_or_resumed_work_is_not_completed_again() {
+    if Db::postgres().is_none() {
+        return;
+    }
+    a_reopened_or_resumed_work_is_not_completed_again(|| Db::postgres().unwrap());
+}
+
+#[test]
+fn sqlite_an_open_or_unsettled_issue_keeps_the_work_open() {
+    an_open_or_unsettled_issue_keeps_the_work_open(Db::sqlite);
+}
+
+#[test]
+fn postgres_an_open_or_unsettled_issue_keeps_the_work_open() {
+    if Db::postgres().is_none() {
+        return;
+    }
+    an_open_or_unsettled_issue_keeps_the_work_open(|| Db::postgres().unwrap());
+}
+
+#[test]
+fn sqlite_work_without_an_issue_completes_on_its_merge() {
+    work_without_an_issue_completes_on_its_merge(&Db::sqlite());
+}
+
+#[test]
+fn postgres_work_without_an_issue_completes_on_its_merge() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    work_without_an_issue_completes_on_its_merge(&db);
+}
+
+#[test]
+fn sqlite_a_gitlab_merge_completes_its_work() {
+    a_gitlab_merge_completes_its_work(&Db::sqlite());
+}
+
+#[test]
+fn postgres_a_gitlab_merge_completes_its_work() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    a_gitlab_merge_completes_its_work(&db);
+}
+
+#[test]
+fn sqlite_every_pull_request_must_merge_before_completion() {
+    every_pull_request_must_merge_before_completion(&Db::sqlite());
+}
+
+#[test]
+fn postgres_every_pull_request_must_merge_before_completion() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    every_pull_request_must_merge_before_completion(&db);
 }
 
 #[test]

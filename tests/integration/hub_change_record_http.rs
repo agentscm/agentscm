@@ -460,6 +460,24 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
         "repository_path"
     );
     assert_eq!(summary["intent"]["title"], "prepare a concise handoff");
+    assert_eq!(summary["intent"]["repository"], REPOSITORY);
+    assert_eq!(summary["review"]["actual_scope"], "unknown");
+    assert_eq!(summary["review"]["establishes_approval"], false);
+    assert_eq!(
+        summary["updated_seq"],
+        hub.store
+            .work_get(&writer_token, &work.id, unix_now())
+            .unwrap()
+            .unwrap()
+            .updated_seq
+    );
+    assert!(summary["review"]["next_actor"].is_string());
+    assert!(summary["review"]["supported_action"].is_string());
+    assert_eq!(summary["review"]["diff"]["head"], "1".repeat(40));
+    assert_ne!(
+        summary["review"]["captured_by"]["session_id"],
+        "http-change-record"
+    );
     assert!(summary["intent"]["scope"].as_array().unwrap().len() <= 16);
     assert!(summary["intent"]["scope_omitted"].as_u64().unwrap() >= 240);
     assert!(summary["decision"]["source_refs"].as_array().unwrap().len() <= 16);
@@ -1684,6 +1702,15 @@ mod shared_bodies {
         }
 
         async fn start_undeclared_for(retention_days: i64) -> Self {
+            Self::start_undeclared_with(move |state| {
+                state
+                    .with_shared_conversation_retention_days(retention_days)
+                    .unwrap()
+            })
+            .await
+        }
+
+        async fn start_undeclared_with(customize: impl FnOnce(HubState) -> HubState) -> Self {
             let directory = TempDir::new().unwrap();
             let database = format!("sqlite://{}", directory.path().join("hub.sqlite").display());
             let store = store::open(&database).unwrap();
@@ -1699,10 +1726,10 @@ mod shared_bodies {
                 (name == "AGENTSCM_ADMINS").then(|| "github:#900".to_owned())
             })
             .unwrap();
-            let state = HubState::new(store.clone(), backend.clone())
-                .with_login(Login::new(login).unwrap())
-                .with_shared_conversation_retention_days(retention_days)
-                .unwrap();
+            let state = customize(
+                HubState::new(store.clone(), backend.clone())
+                    .with_login(Login::new(login).unwrap()),
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1736,6 +1763,17 @@ mod shared_bodies {
             let helper = user(&*store, 12, "helper");
             let (helper_token, helper_secret) = token(&*store, &helper, "helper", false);
             let (_, helper_read_only_secret) = token(&*store, &helper, "helper-reader", true);
+            // Positive-path fixtures opt each author in explicitly. Repository enablement alone
+            // is intentionally insufficient.
+            for author in [&owner, &helper] {
+                store
+                    .set_setting(
+                        &format!("conversation_sharing:opt_out:{author}:77"),
+                        "0",
+                        author,
+                    )
+                    .unwrap();
+            }
             let work = store
                 .work_start(
                     &owner_token,
@@ -1830,7 +1868,17 @@ mod shared_bodies {
         }
 
         async fn start_for(retention_days: i64) -> Self {
-            let fixture = Self::start_undeclared_for(retention_days).await;
+            Self::start_with(move |state| {
+                state
+                    .with_shared_conversation_retention_days(retention_days)
+                    .unwrap()
+            })
+            .await
+        }
+
+        /// A declared body on a Hub an embedding program changed with `customize`.
+        async fn start_with(customize: impl FnOnce(HubState) -> HubState) -> Self {
+            let fixture = Self::start_undeclared_with(customize).await;
             let token = fixture.owner_token();
             fixture
                 .store
@@ -2062,6 +2110,69 @@ mod shared_bodies {
         }
     }
 
+    /// whoami and the repository's retention read, both with the owner's token.
+    async fn reported_days(f: &Fixture) -> (Value, Value) {
+        let get = |path: String| async move {
+            let reply = f
+                .client
+                .get(format!("{}{path}", f.base))
+                .bearer_auth(&f.owner_secret)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::OK);
+            json_of(reply).await
+        };
+        let whoami = get("/v1/hub/whoami".into()).await;
+        let retention = get(format!("/v1/hub/repos/{REPOSITORY_PATH}/retention")).await;
+        (
+            whoami["shared_conversation_retention_days"].clone(),
+            retention["shared_conversations"]["retention_days"].clone(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_embedding_program_sets_how_long_each_repository_keeps_bodies() {
+        // Without the hook the Hub-wide number applies.
+        let f = Fixture::start_for(7).await;
+        assert_eq!(reported_days(&f).await, (json!(7), json!(7)));
+
+        // The hook's number replaces it for reads and for the expiry an upload sets.
+        let f = Fixture::start_with(|state| {
+            state.with_shared_conversation_retention(|scope| {
+                assert_eq!(scope.repository_id, Some(77));
+                Ok(365)
+            })
+        })
+        .await;
+        assert_eq!(reported_days(&f).await, (json!(365), json!(365)));
+        let before = unix_now();
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        let expires = f.row().expires_at.unwrap();
+        assert!(expires >= before + 365 * DAY && expires <= unix_now() + 365 * DAY);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_that_keeps_no_bodies_asks_for_none_and_refuses_uploads() {
+        let f =
+            Fixture::start_with(|state| state.with_shared_conversation_retention(|_| Ok(0))).await;
+        assert_eq!(reported_days(&f).await, (json!(0), json!(0)));
+        let (status, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["missing"], json!([]));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_stores_the_exact_body_and_replays_idempotently() {
         let f = Fixture::start().await;
@@ -2114,9 +2225,10 @@ mod shared_bodies {
                 .await,
             StatusCode::FORBIDDEN
         );
+        // Hub administration does not substitute for the uploader's own consent.
         assert_eq!(
             f.put(&f.admin_secret, &undeclared_sha, undeclared).await,
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
         for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
             assert_eq!(
@@ -2401,6 +2513,7 @@ mod shared_bodies {
             .parse::<Value>()
             .unwrap();
         assert_eq!(answer["sharing"], true);
+        assert_eq!(answer["consented"], true);
         assert_eq!(answer["source"], "repository");
         f.share(false);
         // Nothing is missing, so a client sends nothing, and a direct upload is refused.
@@ -2415,6 +2528,52 @@ mod shared_bodies {
         );
         assert_eq!(f.row().state, SharedBodyState::Declared);
         f.share(true);
+        // Notice-only and invalid legacy choices do not become consent after re-enablement.
+        f.store
+            .set_setting(
+                &format!("conversation_sharing:opt_out:{}:77", f.owner),
+                "invalid",
+                &f.owner,
+            )
+            .unwrap();
+        f.store
+            .set_setting(
+                &format!("conversation_sharing:notified:{}:77", f.owner),
+                "1",
+                &f.owner,
+            )
+            .unwrap();
+        let denied: Value = sharing(&f.owner_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(denied["notified"], true);
+        assert_eq!(denied["consented"], false);
+        assert_eq!(denied["sharing"], false);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        // The existing explicit opt-in operation writes the positive choice.
+        let opt_in = f
+            .client
+            .put(format!(
+                "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing/me",
+                f.base
+            ))
+            .bearer_auth(&f.owner_secret)
+            .header("content-type", "application/json")
+            .body(json!({"opted_out": false}).to_string())
+            .send()
+            .await
+            .unwrap();
+        let opted_in: Value = serde_json::from_str(&opt_in.text().await.unwrap()).unwrap();
+        assert_eq!(opted_in["consented"], true);
+        assert_eq!(opted_in["sharing"], true);
         // Opting out is per person and stops that person's uploads on every token.
         let opt_out = f
             .client
@@ -2446,7 +2605,7 @@ mod shared_bodies {
             .unwrap()
             .parse::<Value>()
             .unwrap();
-        assert_eq!(other["sharing"], true, "another person still shares");
+        assert_eq!(other["sharing"], false, "another person has not opted in");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
