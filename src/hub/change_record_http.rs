@@ -21,7 +21,9 @@ use crate::store::digest;
 use super::change_record::{ConversationAudience, SharedBodyRow, SharedBodyState};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Store, unix_now};
+use super::viewer::Shown;
 use super::work::WorkRepositoryScope;
+use super::work_http::actionable_status;
 use super::{HubError, HubState, Principal};
 use serde::Deserialize;
 
@@ -168,15 +170,39 @@ async fn show(
     Path((repo, work_id)): Path<(String, String)>,
 ) -> Result<Json<ChangeRecordResponseV1>, ApiError> {
     scope(&principal, &repo)?;
-    let store = state.store.clone();
-    let summary = blocking(&state, move || {
-        store.change_record(&principal.token_id, &work_id, unix_now())
-    })
-    .await?
-    .ok_or_else(ApiError::not_found)?;
+    let summary = read_summary(&state, &principal, &work_id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
     let response = ChangeRecordResponseV1::bounded(summary)?;
     response.validate_encoded_size()?;
     Ok(Json(response))
+}
+
+/// Shared HTTP/MCP read so both transports expose the same exact-version status enrichment.
+pub(super) async fn read_summary(
+    state: &HubState,
+    principal: &Principal,
+    work_id: &str,
+) -> super::Result<Option<crate::change_record::ChangeRecordSummaryV1>> {
+    let store = state.store.clone();
+    let setup = state.onboarding.clone();
+    let principal = principal.clone();
+    let work_id = work_id.to_owned();
+    blocking(state, move || {
+        let now = unix_now();
+        let Some(mut summary) = store.change_record(&principal.token_id, &work_id, now)? else {
+            return Ok(None);
+        };
+        let status = actionable_status::read(&*store, &setup, &principal, now)
+            .map(|mut status| {
+                status.show(super::viewer::Viewer(&principal.owner.id));
+                status
+            })
+            .ok();
+        super::change_record::enrich_actionable_status(&mut summary, status.as_ref());
+        Ok(Some(summary))
+    })
+    .await
 }
 
 #[derive(Deserialize)]

@@ -13301,9 +13301,9 @@ impl Store for SqliteStore {
             "WITH page AS (
                  SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
                  WHERE work=?1 AND (?2 IS NULL OR (session_id,sequence,digest) > (?2,?3,?4))
-                   AND (?6 OR author=?7 OR (?8 IS NOT NULL AND NOT EXISTS (
+                   AND (?6 OR author=?7 OR (?8 IS NOT NULL AND EXISTS (
                         SELECT 1 FROM hub_settings o
-                         WHERE o.key = ?8 || author || ':' || ?9 AND o.value <> '0')))
+                         WHERE o.key = ?8 || author || ':' || ?9 AND o.value = '0')))
                  ORDER BY session_id,sequence,digest LIMIT ?5)
              SELECT page.*, e.event, e.observed_at FROM page
              JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -13320,8 +13320,8 @@ impl Store for SqliteStore {
                     MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1,
                     audience == ConversationAudience::Everyone,
                     who.owner.id,
-                    // Set only for readers of a sharing repository: an author who opted out is
-                    // left out, with what they shared before.
+                    // Set only for readers of a sharing repository: an author is included only
+                    // after their affirmative opt-in, including for bodies shared before it.
                     opt_out_prefix,
                     who.repository_id
                 ],
@@ -13979,8 +13979,8 @@ impl Store for SqliteStore {
                         received_order DESC) AS scope_rank
                 FROM scope_state
             )
-            SELECT start_request,finish_request,source_id FROM ranked
-            WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",params![work_id,item.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?))).optional()?.map(|(start,finish,source_id)| -> Result<StoredActionV1> {Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id})}).transpose()?;
+            SELECT start_request,finish_request,source_id,author_token FROM ranked
+            WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",params![work_id,item.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?.map(|(start,finish,source_id,author_token)| -> Result<StoredActionV1> {Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id,author_token})}).transpose()?;
         let decision = tx
             .query_row(
                 "SELECT event_seq,snapshot FROM hub_work_versions
