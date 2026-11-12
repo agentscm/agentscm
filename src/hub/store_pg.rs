@@ -31,8 +31,8 @@ use super::catchup::{
     repository_namespace, source_name, tracked_publication_merge,
 };
 use super::change_record::{
-    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
-    StoredDecisionV1, project as project_change_record,
+    ConversationAudience, SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState,
+    StoredActionV1, StoredDecisionV1, project as project_change_record,
 };
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -12778,7 +12778,7 @@ impl Store for PgStore {
         token: &str,
         work_id: &str,
         cursor: Option<&str>,
-        all_authors: bool,
+        audience: ConversationAudience,
         now: i64,
     ) -> Result<Option<Vec<ConversationEntryV1>>> {
         let after = cursor.map(parse_conversation_cursor).transpose()?;
@@ -12791,6 +12791,9 @@ impl Store for PgStore {
             if scoped_work(&mut tx, &who, work_id, now, false)?.is_none() {
                 return Ok(None);
             }
+            let opt_out_prefix = (audience == ConversationAudience::Sharing
+                && who.repository_id.is_some())
+            .then_some(super::conversation_sharing::OPT_OUT_KEY_PREFIX);
             let rows = tx.query(
                 &format!(
                     "WITH page AS (
@@ -12798,7 +12801,10 @@ impl Store for PgStore {
                          WHERE work=$1 AND ($2::text IS NULL
                            OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
                               > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
-                           AND ($6::boolean OR author=$7)
+                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
+                                SELECT 1 FROM hub_settings o
+                                 WHERE o.key = $8::text || author || ':' || $9::bigint::text
+                                   AND o.value <> '0')))
                          ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
                      SELECT page.*, e.event, e.observed_at FROM page
                      JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -12811,8 +12817,12 @@ impl Store for PgStore {
                     &after.as_ref().map(|after| after.1 as i64),
                     &after.as_ref().map(|after| after.2.as_str()),
                     &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
-                    &all_authors,
+                    &(audience == ConversationAudience::Everyone),
                     &who.owner.id,
+                    // Set only for readers of a sharing repository: an author who opted out is
+                    // left out, with what they shared before.
+                    &opt_out_prefix,
+                    &who.repository_id,
                 ],
             )?;
             let entries = rows

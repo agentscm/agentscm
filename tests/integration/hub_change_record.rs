@@ -12,7 +12,7 @@ use agentscm::change_record::{
     SessionSetupV1, SetupObservationV1, SourceBindingV1, SubagentFactV1, ToolCompletionV1,
     ToolFactV1, ToolKindV1,
 };
-use agentscm::hub::change_record::SharedBodyState;
+use agentscm::hub::change_record::{ConversationAudience, SharedBodyState};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::work::{
     CheckpointKind, SourceRef, WorkCheckpoint, WorkItem, WorkRole, WorkStart,
@@ -1554,6 +1554,111 @@ fn postgres_shared_body_lifecycle() {
     }
 }
 
+/// What a listing covers for a Hub admin (`true`) and for anyone else while nothing is shared.
+fn audience(admin: bool) -> ConversationAudience {
+    if admin {
+        ConversationAudience::Everyone
+    } else {
+        ConversationAudience::Own
+    }
+}
+
+/// While a repository shares, a reader lists every author's entries except those of an author
+/// who opted out, whose earlier entries leave the listing too.
+fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
+    use ConversationAudience::{Everyone, Own, Sharing};
+    const REPOSITORY_ID: i64 = 77;
+    let store = db.open();
+    let person = |user_id: i64, login: &str| {
+        let identity = ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        store.upsert_user(&identity, login).unwrap()
+    };
+    let (author, reader) = (person(51, "author"), person(52, "reader"));
+    let bound = |owner: &str, name: &str| {
+        store::mint_bound_agent_token(&*store, owner, name, REPO, REPOSITORY_ID, 3600, false)
+            .unwrap()
+            .0
+    };
+    let (author_token, reader_token) = (bound(&author.id, "writer"), bound(&reader.id, "reader"));
+    let now = unix_now();
+    let work = store
+        .work_start(
+            &author_token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("opt-out-listing".into()),
+                title: "share a conversation".into(),
+                description: None,
+                session: "session-1".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/**".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+                preflight: None,
+            },
+            now,
+        )
+        .unwrap()
+        .item;
+    let shared = shared_batch(&work.id, work.generation, "one", 1, b"{\"a\":1}", 7);
+    store.change_ingest(&author_token, &shared, now).unwrap();
+    let listed = |token: &str, audience| {
+        store
+            .shared_conversation_page(token, &work.id, None, audience, now)
+            .unwrap()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(listed(&reader_token, Own), 0);
+    assert_eq!(listed(&reader_token, Sharing), 1);
+
+    let opt_out = |user: &str, repository_id: i64| {
+        format!("conversation_sharing:opt_out:{user}:{repository_id}")
+    };
+    store
+        .set_setting(&opt_out(&author.id, REPOSITORY_ID), "1", &author.id)
+        .unwrap();
+    assert_eq!(listed(&reader_token, Sharing), 0);
+    // The author still lists their own, and a Hub admin lists every author's.
+    assert_eq!(listed(&author_token, Sharing), 1);
+    assert_eq!(listed(&reader_token, Everyone), 1);
+
+    // Opting in again shows it again; another person's opt-out, or the author's in another
+    // repository, hides nothing here.
+    store
+        .set_setting(&opt_out(&author.id, REPOSITORY_ID), "0", &author.id)
+        .unwrap();
+    store
+        .set_setting(&opt_out(&reader.id, REPOSITORY_ID), "1", &reader.id)
+        .unwrap();
+    store
+        .set_setting(&opt_out(&author.id, REPOSITORY_ID + 1), "1", &author.id)
+        .unwrap();
+    assert_eq!(listed(&reader_token, Sharing), 1);
+}
+
+#[test]
+fn sqlite_opting_out_leaves_the_listing_other_readers_get() {
+    opting_out_leaves_the_listing_other_readers_get(&Db::sqlite());
+}
+
+#[test]
+fn postgres_opting_out_leaves_the_listing_other_readers_get() {
+    if let Some(db) = Db::postgres() {
+        opting_out_leaves_the_listing_other_readers_get(&db);
+    }
+}
+
 fn shared_conversation_listing(db: &Db) {
     let (store, token, work_id, generation) = setup(db);
     let stranger = store
@@ -1600,7 +1705,7 @@ fn shared_conversation_listing(db: &Db) {
     }
 
     let page = store
-        .shared_conversation_page(&token, &work_id, None, false, now)
+        .shared_conversation_page(&token, &work_id, None, ConversationAudience::Own, now)
         .unwrap()
         .unwrap();
     let order: Vec<(&str, u64)> = page
@@ -1636,7 +1741,13 @@ fn shared_conversation_listing(db: &Db) {
     // A cursor continues strictly after its entry, for a position that no longer needs to exist.
     for (index, entry) in page.iter().enumerate() {
         let rest = store
-            .shared_conversation_page(&token, &work_id, Some(&entry.cursor()), false, now)
+            .shared_conversation_page(
+                &token,
+                &work_id,
+                Some(&entry.cursor()),
+                ConversationAudience::Own,
+                now,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(rest, page[index + 1..], "{index}");
@@ -1657,7 +1768,7 @@ fn shared_conversation_listing(db: &Db) {
         .unwrap();
     let states = |at: i64| -> Vec<ContentAvailabilityV1> {
         store
-            .shared_conversation_page(&token, &work_id, None, false, at)
+            .shared_conversation_page(&token, &work_id, None, ConversationAudience::Own, at)
             .unwrap()
             .unwrap()
             .iter()
@@ -1669,7 +1780,7 @@ fn shared_conversation_listing(db: &Db) {
     assert_eq!(states(now + 100), [Expired, Local, Deleted, Local]);
     assert_eq!(
         store
-            .shared_conversation_page(&token, &work_id, None, false, now)
+            .shared_conversation_page(&token, &work_id, None, ConversationAudience::Own, now)
             .unwrap()
             .unwrap()[0]
             .expires_at,
@@ -1680,7 +1791,7 @@ fn shared_conversation_listing(db: &Db) {
     // absent; bad cursors fail.
     let other = |all_authors: bool| {
         store
-            .shared_conversation_page(&stranger_token, &work_id, None, all_authors, now)
+            .shared_conversation_page(&stranger_token, &work_id, None, audience(all_authors), now)
             .unwrap()
             .unwrap()
     };
@@ -1694,13 +1805,19 @@ fn shared_conversation_listing(db: &Db) {
     );
     assert!(
         store
-            .shared_conversation_page(&token, "work_unknown", None, false, now)
+            .shared_conversation_page(&token, "work_unknown", None, ConversationAudience::Own, now)
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .shared_conversation_page(&token, &work_id, Some("garbage"), false, now)
+            .shared_conversation_page(
+                &token,
+                &work_id,
+                Some("garbage"),
+                ConversationAudience::Own,
+                now,
+            )
             .is_err()
     );
 }
@@ -1787,7 +1904,7 @@ fn shared_bodies_are_rows_per_author(db: &Db) {
     // The listing is the caller's own entries, or every author's for an admin.
     let listed = |who: &str, all: bool| {
         store
-            .shared_conversation_page(who, &work_id, None, all, now)
+            .shared_conversation_page(who, &work_id, None, audience(all), now)
             .unwrap()
             .unwrap()
             .len()

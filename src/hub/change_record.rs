@@ -126,6 +126,18 @@ pub fn conversation_readable(author: &str, caller: &str, admin: bool) -> bool {
     admin || author == caller
 }
 
+/// Whose shared bodies a listing covers besides the caller's own, which it always covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationAudience {
+    /// Nobody else's.
+    Own,
+    /// Every author who has not opted out of sharing in the repository: what a reader sees while
+    /// the repository shares. Opting out hides what the author shared before as well.
+    Sharing,
+    /// Every author's: a Hub admin.
+    Everyone,
+}
+
 /// Every declaration of one digest in a Work, with who is asking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedBodyAccess {
