@@ -7,7 +7,7 @@ use std::sync::Arc;
 use agentscm::hub::HubError;
 use agentscm::hub::store::{self, ForgeIdentity, Store, User, mint_bound_agent_token, unix_now};
 use agentscm::hub::work::{
-    CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, WorkStart, WorkState,
+    CheckpointKind, WorkCheckpoint, WorkItem, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::{
     ActivityStatus, LEASE_SECONDS, Recipient, ReservationStatus, WorkTransitionKind,
@@ -15,7 +15,7 @@ use agentscm::hub::work_lifecycle::{
 use agentscm::hub::work_recovery::{
     BatchItemV1, BatchOutcome, BatchTransitionItem, FindingKind, RecoveryBucket, RecoveryCaller,
     RecoveryQuery, RefusalCode, RemedyKind, RemedyPreviewRequest, Standing, WorkRecoveryV1,
-    WorkTransitionBatch, apply_batch, inspect, preview,
+    WorkTransitionBatch, apply_batch, inspect, preview, repair_plan,
 };
 use agentscm::hub::work_transition::{
     OperationalSelect, ParticipantRef, WorkLifecycleReader, WorkTransitionActor,
@@ -1964,6 +1964,125 @@ fn other_owners_items_are_refused_not_taken(db: &Db) {
     );
 }
 
+/// One Work of the owner whose participant list is full, read after its lead went quiet.
+fn crowded(store: &dyn Store, alice: &Agent) -> (String, i64) {
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join_many(store, alice, &work.id, 99, now + 1);
+    let later = now + LEASE_SECONDS + 1;
+    tick(store, now, later);
+    (work.id, later)
+}
+
+fn repair_batch(plan: &agentscm::hub::work_recovery::RepairPlanV1) -> WorkTransitionBatch {
+    WorkTransitionBatch {
+        session: Some("s-sweeper".into()),
+        items: plan.planned.iter().map(|p| p.item.clone()).collect(),
+    }
+}
+
+/// A client that lost the reply sends the same plan again: every item replays, nothing is written
+/// twice, and a fresh inventory no longer proposes the repair.
+fn interrupted_repair_replays_applied_items(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (id, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let inventory = || read(&*store, &me, RecoveryQuery::default(), later + 1);
+    let plan = repair_plan(&inventory());
+    // The lapsed hold's facts are incomplete without hook coverage, so only the prune is planned.
+    assert_eq!(plan.planned.len(), 1, "{plan:?}");
+    assert_eq!(plan.planned[0].remedy, RemedyKind::PruneParticipants);
+    assert_eq!(plan.planned[0].work_id, id);
+    assert_eq!(plan.planned[0].item.participants.len(), 1);
+    assert_eq!(
+        plan.planned[0].item.operation_id,
+        format!(
+            "repair:{id}:{}:{}:prune_participants",
+            plan.planned[0].item.generation, plan.planned[0].item.expected_updated_seq
+        )
+    );
+    let actor = WorkTransitionActor::Agent {
+        token: &alice.token,
+    };
+    let batch = repair_batch(&plan);
+    let first = apply_batch(&*store, &actor, &batch, later + 2).unwrap();
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Applied),
+        "{first:?}"
+    );
+    let events = || db.scalar("SELECT COUNT(*) FROM hub_events");
+    let before = events();
+    let again = apply_batch(&*store, &actor, &batch, later + 3).unwrap();
+    assert!(
+        again
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Replayed),
+        "{again:?}"
+    );
+    assert_eq!(events(), before, "a replay writes no second audit event");
+    let after = repair_plan(&inventory());
+    assert!(
+        after.planned.is_empty(),
+        "an applied repair is not proposed again: {after:?}"
+    );
+}
+
+/// Once compaction has removed the receipts, the same plan is refused, never applied
+/// a second time.
+fn retention_gap_retry_refuses_not_replays(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (_, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let plan = repair_plan(&read(&*store, &me, RecoveryQuery::default(), later + 1));
+    assert_eq!(plan.planned.len(), 1);
+    let actor = WorkTransitionActor::Agent {
+        token: &alice.token,
+    };
+    let batch = repair_batch(&plan);
+    let first = apply_batch(&*store, &actor, &batch, later + 2).unwrap();
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Applied),
+        "{first:?}"
+    );
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let compact_at = later + 10 * 86_400;
+    let pass = store
+        .work_compact(&scope, later + 86_400, true, compact_at)
+        .unwrap();
+    assert!(pass.applied);
+    let events = db.scalar("SELECT COUNT(*) FROM hub_events");
+    let retry = apply_batch(&*store, &actor, &batch, compact_at + 1).unwrap();
+    for item in &retry.items {
+        assert_eq!(item.outcome, BatchOutcome::Refused, "{item:?}");
+        // The fences moved when the repair applied, so the retry is refused, whichever check
+        // meets it first.
+        assert!(
+            matches!(item.code.as_deref(), Some("work_changed" | "unauthorized")),
+            "{item:?}"
+        );
+    }
+    assert_eq!(retry.applied, 0);
+    assert_eq!(db.scalar("SELECT COUNT(*) FROM hub_events"), events);
+}
+
 conformance!(
     an_owner_retires_an_obsolete_hold_and_keeps_its_follow_up,
     the_owner_resumes_expired_work_after_a_session_restart,
@@ -1987,4 +2106,6 @@ conformance!(
     read_only_inventory_changes_nothing,
     the_inventory_proposes_a_prune_that_frees_a_full_list,
     other_owners_items_are_refused_not_taken,
+    interrupted_repair_replays_applied_items,
+    retention_gap_retry_refuses_not_replays,
 );

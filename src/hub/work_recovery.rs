@@ -1690,6 +1690,248 @@ impl Shown for WorkTransitionBatchV1 {
     }
 }
 
+/// One repair a plan would apply: the finding that proposed it and the batch item that does it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairItemV1 {
+    pub work_id: String,
+    pub finding: FindingKind,
+    pub remedy: RemedyKind,
+    pub item: BatchTransitionItem,
+}
+
+/// A finding a plan leaves alone, and why.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairSkipV1 {
+    pub work_id: String,
+    pub finding: FindingKind,
+    pub reason: String,
+}
+
+/// What `agentscm work repair` would apply and what it leaves for a person.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct RepairPlanV1 {
+    pub planned: Vec<RepairItemV1>,
+    pub skipped: Vec<RepairSkipV1>,
+}
+
+/// One item's outcome in a repair report.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairResultV1 {
+    pub work_id: String,
+    pub operation_id: String,
+    pub outcome: BatchOutcome,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl From<&BatchItemV1> for RepairResultV1 {
+    fn from(item: &BatchItemV1) -> Self {
+        Self {
+            work_id: item.work_id.clone(),
+            operation_id: item.operation_id.clone(),
+            outcome: item.outcome,
+            code: item.code.clone(),
+            message: item.message.clone(),
+        }
+    }
+}
+
+/// The document `agentscm work repair --json` prints.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairReportV1 {
+    /// True when the plan was sent; false for a dry run.
+    pub applied: bool,
+    pub planned: Vec<RepairItemV1>,
+    pub skipped: Vec<RepairSkipV1>,
+    pub results: Vec<RepairResultV1>,
+    /// False when the inventory was cut short, so the plan may miss Work.
+    pub complete: bool,
+}
+
+impl RepairReportV1 {
+    /// Items the Hub did not apply or replay.
+    pub fn failed(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| !matches!(r.outcome, BatchOutcome::Applied | BatchOutcome::Replayed))
+            .count()
+    }
+}
+
+/// Builds the repairs a caller's own inventory proposes. It never plans `complete`, a resume or
+/// a handover, anything the caller must supply input for, or more than one repair per Work (a
+/// second would run against a fence the first moves). Each item's `operation_id` is fixed by
+/// the fences it carries, so replaying a plan replays what applied.
+pub fn repair_plan(recovery: &WorkRecoveryV1) -> RepairPlanV1 {
+    let mut plan = RepairPlanV1::default();
+    for work in &recovery.work {
+        for finding in &work.findings {
+            match repair_item(work, finding) {
+                Ok(_) if plan.planned.iter().any(|p| p.work_id == work.work_id) => {
+                    plan.skipped.push(RepairSkipV1 {
+                        work_id: work.work_id.clone(),
+                        finding: finding.kind,
+                        reason: "another repair of this Work is planned first; its fence moves, so rerun after it applies".to_owned(),
+                    });
+                }
+                Ok(item) => plan.planned.push(item),
+                Err(reason) => plan.skipped.push(RepairSkipV1 {
+                    work_id: work.work_id.clone(),
+                    finding: finding.kind,
+                    reason,
+                }),
+            }
+        }
+    }
+    plan
+}
+
+fn repair_item(
+    work: &RecoveryWorkV1,
+    finding: &FindingV1,
+) -> std::result::Result<RepairItemV1, String> {
+    if work.standing == Standing::Other {
+        return Err("another owner's Work; the caller cannot change it".to_owned());
+    }
+    let Some(remedy) = finding.proposed else {
+        return Err(match finding.kind {
+            FindingKind::OrphanedRequests | FindingKind::ContradictoryBlocker => {
+                "report only: this finding proposes no remedy".to_owned()
+            }
+            _ => "no remedy is proposed: none is permitted to this caller".to_owned(),
+        });
+    };
+    if remedy == RemedyKind::Complete {
+        return Err(
+            "complete is never planned: age and silence do not show that work is done".to_owned(),
+        );
+    }
+    let Some(transition) = remedy.transition() else {
+        return Err(match remedy {
+            RemedyKind::Resume => {
+                "needs a fresh start: resume through agentscm_start with takeover_generation"
+                    .to_owned()
+            }
+            _ => "needs the lead's handover checkpoint".to_owned(),
+        });
+    };
+    let Some(option) = work.remedies.iter().find(|o| o.remedy == remedy) else {
+        return Err(format!("the inventory lists no {} remedy", word(&remedy)));
+    };
+    if !option.permitted {
+        return Err(match &option.refusal {
+            Some(r) => format!("not permitted ({}): {}", word(&r.code), r.message),
+            None => "not permitted".to_owned(),
+        });
+    }
+    let Some(apply) = &option.apply else {
+        return Err("the inventory gives no apply call".to_owned());
+    };
+    let extra: Vec<&str> = apply
+        .caller_supplies
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !matches!(*name, "operation_id" | "reason"))
+        .collect();
+    if !extra.is_empty() {
+        return Err(format!("needs input from the caller: {}", extra.join(", ")));
+    }
+    if !finding.complete {
+        return Err("its facts are incomplete; inspect it with agentscm work recovery".to_owned());
+    }
+    let args = &apply.arguments;
+    let (Some(generation), Some(seq)) = (
+        args.get("generation").and_then(Value::as_i64),
+        args.get("expected_updated_seq").and_then(Value::as_i64),
+    ) else {
+        return Err("the apply call carries no fences".to_owned());
+    };
+    if args.get("work_id").and_then(Value::as_str) != Some(work.work_id.as_str()) {
+        return Err("the apply call names another Work".to_owned());
+    }
+    let participants = match args.get("participants") {
+        None => Vec::new(),
+        Some(list) => serde_json::from_value(list.clone())
+            .map_err(|_| "the apply call lists participants this version cannot read".to_owned())?,
+    };
+    Ok(RepairItemV1 {
+        work_id: work.work_id.clone(),
+        finding: finding.kind,
+        remedy,
+        item: BatchTransitionItem {
+            work_id: work.work_id.clone(),
+            operation_id: format!(
+                "repair:{}:{generation}:{seq}:{}",
+                work.work_id,
+                word(&remedy)
+            ),
+            generation,
+            expected_updated_seq: seq,
+            transition,
+            reason: format!("repair: {}", word(&finding.kind)),
+            superseded_by: None,
+            participants,
+        },
+    })
+}
+
+/// A short reading of a repair report.
+pub fn render_repair(report: &RepairReportV1) -> String {
+    let mut lines = Vec::new();
+    if report.results.is_empty() {
+        for p in &report.planned {
+            lines.push(format!(
+                "would {} {} ({})",
+                word(&p.remedy),
+                p.work_id,
+                word(&p.finding)
+            ));
+        }
+    } else {
+        for r in &report.results {
+            lines.push(format!(
+                "{} {}{}",
+                word(&r.outcome),
+                r.work_id,
+                r.code
+                    .as_deref()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    for s in &report.skipped {
+        lines.push(format!(
+            "skipped {} ({}): {}",
+            s.work_id,
+            word(&s.finding),
+            s.reason
+        ));
+    }
+    if !report.complete {
+        lines.push(
+            "The listing is incomplete: more Work exists than was read; rerun to continue."
+                .to_owned(),
+        );
+    }
+    lines.push(if report.applied {
+        format!(
+            "{} planned, {} applied or replayed, {} not applied, {} skipped.",
+            report.planned.len(),
+            report.results.len() - report.failed(),
+            report.failed(),
+            report.skipped.len()
+        )
+    } else {
+        format!(
+            "Dry run: {} planned, {} skipped. Nothing changed; add --apply to apply the plan.",
+            report.planned.len(),
+            report.skipped.len()
+        )
+    });
+    lines.join("\n")
+}
+
 /// A short reading of an inspection for an agent's reply.
 pub fn render_text(recovery: &WorkRecoveryV1) -> String {
     let mut lines = Vec::new();
@@ -2261,6 +2503,188 @@ mod tests {
             ..subject
         };
         assert!(!findings(&subject, &caller, &owner, &[], true)[0].complete);
+    }
+
+    fn finding(kind: FindingKind, proposed: Option<RemedyKind>) -> FindingV1 {
+        FindingV1 {
+            kind,
+            evidence: "synthetic".to_owned(),
+            complete: true,
+            proposed,
+        }
+    }
+
+    fn option(remedy: RemedyKind, id: &str, seq: i64, permitted: bool) -> RemedyOptionV1 {
+        RemedyOptionV1 {
+            remedy,
+            permitted,
+            refusal: (!permitted).then(|| RemedyRefusalV1 {
+                code: RefusalCode::HoldLive,
+                message: "a live hold".to_owned(),
+            }),
+            apply: permitted.then(|| ApplyV1 {
+                tool: None,
+                route: "/v1/hub/standup/work-transitions".to_owned(),
+                arguments: json!({"work_id": id, "generation": 4, "expected_updated_seq": seq}),
+                caller_supplies: vec!["operation_id".to_owned(), "reason".to_owned()],
+            }),
+        }
+    }
+
+    fn recovered(
+        id: &str,
+        standing: Standing,
+        findings: Vec<FindingV1>,
+        remedies: Vec<RemedyOptionV1>,
+    ) -> RecoveryWorkV1 {
+        let it = item(WorkState::Active);
+        RecoveryWorkV1 {
+            work_id: id.to_owned(),
+            title: "t".to_owned(),
+            source: it.source.clone(),
+            owner_login: "owner".to_owned(),
+            lead_agent: "claude".to_owned(),
+            standing,
+            bucket: RecoveryBucket::Resumable,
+            why: "w".to_owned(),
+            follow_up: follow_up(&it, true),
+            requests: Vec::new(),
+            dependents: Vec::new(),
+            affected_complete: true,
+            operational: view(&it, None, 0),
+            remedies,
+            findings,
+        }
+    }
+
+    fn inventory(work: Vec<RecoveryWorkV1>) -> WorkRecoveryV1 {
+        WorkRecoveryV1 {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            observed_at: 100,
+            read_only: false,
+            work,
+            next_after: None,
+            complete: true,
+            conflicts: Vec::new(),
+            conflicts_complete: true,
+            resumable: Vec::new(),
+            resumable_complete: true,
+        }
+    }
+
+    #[test]
+    fn a_repair_plan_is_deterministic_and_skips_everything_it_must_not_apply() {
+        let (a, b, c, d, e, f) = ("wrk_a", "wrk_b", "wrk_c", "wrk_d", "wrk_e", "wrk_f");
+        let mut incomplete = finding(FindingKind::LapsedHold, Some(RemedyKind::Release));
+        incomplete.complete = false;
+        let all = inventory(vec![
+            recovered(
+                a,
+                Standing::Owner,
+                vec![finding(FindingKind::LapsedHold, Some(RemedyKind::Release))],
+                vec![option(RemedyKind::Release, a, 9, true)],
+            ),
+            recovered(
+                b,
+                Standing::Owner,
+                vec![
+                    finding(FindingKind::ParticipantCap, Some(RemedyKind::Complete)),
+                    finding(FindingKind::AbandonedSession, Some(RemedyKind::Resume)),
+                    finding(FindingKind::OrphanedRequests, None),
+                    finding(FindingKind::ContradictoryBlocker, None),
+                ],
+                vec![option(RemedyKind::Complete, b, 1, true)],
+            ),
+            recovered(
+                c,
+                Standing::Other,
+                vec![finding(FindingKind::LapsedHold, Some(RemedyKind::Release))],
+                vec![option(RemedyKind::Release, c, 1, true)],
+            ),
+            recovered(
+                d,
+                Standing::Owner,
+                vec![finding(FindingKind::LapsedHold, Some(RemedyKind::Release))],
+                vec![option(RemedyKind::Release, d, 1, false)],
+            ),
+            recovered(
+                e,
+                Standing::Owner,
+                vec![incomplete],
+                vec![option(RemedyKind::Release, e, 1, true)],
+            ),
+            recovered(
+                f,
+                Standing::Owner,
+                vec![
+                    finding(FindingKind::LapsedHold, Some(RemedyKind::Release)),
+                    finding(
+                        FindingKind::ParticipantCap,
+                        Some(RemedyKind::PruneParticipants),
+                    ),
+                ],
+                vec![
+                    option(RemedyKind::Release, f, 3, true),
+                    option(RemedyKind::PruneParticipants, f, 3, true),
+                ],
+            ),
+        ]);
+        let plan = repair_plan(&all);
+        assert_eq!(plan, repair_plan(&all));
+        let ids: Vec<&str> = plan
+            .planned
+            .iter()
+            .map(|p| p.item.operation_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["repair:wrk_a:4:9:release", "repair:wrk_f:4:3:release"]
+        );
+        assert_eq!(plan.planned[0].item.reason, "repair: lapsed_hold");
+        assert!(
+            plan.planned
+                .iter()
+                .all(|p| p.remedy != RemedyKind::Complete)
+        );
+        let reason = |work: &str, kind| {
+            plan.skipped
+                .iter()
+                .find(|s| s.work_id == work && s.finding == kind)
+                .unwrap_or_else(|| panic!("{work} {kind:?}"))
+                .reason
+                .as_str()
+        };
+        assert!(reason(b, FindingKind::ParticipantCap).starts_with("complete is never planned"));
+        assert!(reason(b, FindingKind::AbandonedSession).starts_with("needs a fresh start"));
+        assert!(reason(b, FindingKind::OrphanedRequests).starts_with("report only"));
+        assert!(reason(b, FindingKind::ContradictoryBlocker).starts_with("report only"));
+        assert!(reason(c, FindingKind::LapsedHold).starts_with("another owner's Work"));
+        assert!(reason(d, FindingKind::LapsedHold).contains("hold_live"));
+        assert!(reason(e, FindingKind::LapsedHold).contains("incomplete"));
+        assert!(reason(f, FindingKind::ParticipantCap).contains("planned first"));
+        assert_eq!(plan.skipped.len(), 8);
+    }
+
+    #[test]
+    fn a_repair_needing_caller_input_is_skipped() {
+        let mut supersede = option(RemedyKind::Supersede, "wrk_a", 1, true);
+        supersede
+            .apply
+            .as_mut()
+            .unwrap()
+            .caller_supplies
+            .push("superseded_by".to_owned());
+        let plan = repair_plan(&inventory(vec![recovered(
+            "wrk_a",
+            Standing::Owner,
+            vec![finding(
+                FindingKind::LapsedHold,
+                Some(RemedyKind::Supersede),
+            )],
+            vec![supersede],
+        )]));
+        assert!(plan.planned.is_empty());
+        assert!(plan.skipped[0].reason.contains("superseded_by"));
     }
 
     #[test]

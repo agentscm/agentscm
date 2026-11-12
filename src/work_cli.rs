@@ -18,8 +18,9 @@ use agentscm::hub::work::{
 use agentscm::hub::work_links::WorkPrLinkUpdate;
 use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
 use agentscm::hub::work_recovery::{
-    RecoveryQuery, RemedyKind, RemedyPreviewRequest, WorkRecoveryV1, WorkTransitionBatch,
-    WorkTransitionBatchV1,
+    BatchOutcome, MAX_BATCH_TRANSITIONS, RecoveryQuery, RemedyKind, RemedyPreviewRequest,
+    RepairPlanV1, RepairReportV1, RepairResultV1, WorkRecoveryV1, WorkTransitionBatch,
+    WorkTransitionBatchV1, render_repair, repair_plan,
 };
 use agentscm::{Error, Result};
 use clap::Subcommand;
@@ -268,6 +269,20 @@ pub enum WorkCommand {
         #[arg(long)]
         superseded_by: Option<String>,
     },
+    /// Plan the repairs your owner's inventory proposes for retained claims: release a lapsed hold
+    /// or prune a full participant list. Dry run by default; --apply sends the plan with fixed
+    /// operation ids, so a rerun replays what applied. Never completes, resumes or hands over.
+    Repair {
+        /// Your agent session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Apply the plan; without it nothing changes.
+        #[arg(long)]
+        apply: bool,
+        /// Print one JSON document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Apply up to 25 Work transitions in order, each on its own, with one outcome per item.
     /// Exits non-zero when any item was not applied; earlier items stay applied.
     Transitions {
@@ -398,6 +413,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::RecoveryPreview { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
+        | WorkCommand::Repair { apply, .. }
         | WorkCommand::RepairMerge { apply, .. }
         | WorkCommand::RepairRepository { apply, .. } => *apply,
         WorkCommand::CoordinationAck { .. }
@@ -1001,6 +1017,25 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
+        WorkCommand::Repair {
+            session,
+            apply,
+            json,
+        } => {
+            let report = repair(&hub, session, apply).await?;
+            if json {
+                println!("{}", serde_json::to_value(&report)?);
+            } else {
+                println!("{}", render_repair(&report));
+            }
+            if report.failed() > 0 {
+                return Err(Error::Conflict(format!(
+                    "{} repairs were not applied; rerunning the command replays the applied ones and retries the rest",
+                    report.failed()
+                )));
+            }
+            return Ok(());
+        }
         WorkCommand::Transitions { request } => {
             let request: WorkTransitionBatch = read_request(&request)?;
             let reply = hub
@@ -1089,6 +1124,89 @@ impl Started {
 struct BatchCounts {
     items: Vec<IgnoredAny>,
     not_applied: usize,
+}
+
+/// Pages of the inventory a repair reads before it says the listing is incomplete.
+const REPAIR_PAGES: usize = 20;
+
+/// Reads the caller's owner inventory, plans repairs and, with `apply`, sends them.
+async fn repair(hub: &Hub, session: Option<String>, apply: bool) -> Result<RepairReportV1> {
+    let mut plan = RepairPlanV1::default();
+    let mut after = None;
+    let mut complete = false;
+    for _ in 0..REPAIR_PAGES {
+        let query = RecoveryQuery {
+            work_id: None,
+            paths: Vec::new(),
+            after: after.take(),
+            limit: Some(50),
+            session: session.clone(),
+            all_owners: false,
+        };
+        let reply = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/recovery",
+                Some(serde_json::to_value(query)?),
+            )
+            .await?;
+        let page: WorkRecoveryV1 = reply::decode(&reply).map_err(|e| invalid(&e.to_string()))?;
+        let part = repair_plan(&page);
+        plan.planned.extend(part.planned);
+        plan.skipped.extend(part.skipped);
+        match page.next_after {
+            Some(next) if !page.complete => after = Some(next),
+            _ => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    let mut results = Vec::new();
+    if apply {
+        for (index, chunk) in plan.planned.chunks(MAX_BATCH_TRANSITIONS).enumerate() {
+            let batch = WorkTransitionBatch {
+                session: session.clone(),
+                items: chunk.iter().map(|p| p.item.clone()).collect(),
+            };
+            let sent = hub
+                .call(
+                    Method::POST,
+                    "/v1/hub/standup/work-transitions?intent=1",
+                    Some(serde_json::to_value(batch)?),
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|reply| {
+                    reply::decode::<WorkTransitionBatchV1>(&reply).map_err(|e| e.to_string())
+                });
+            match sent {
+                Ok(done) => results.extend(done.items.iter().map(RepairResultV1::from)),
+                Err(message) => {
+                    // Whether these applied is unknown; the fixed ids make a rerun settle it.
+                    results.extend(
+                        plan.planned[index * MAX_BATCH_TRANSITIONS..]
+                            .iter()
+                            .map(|p| RepairResultV1 {
+                                work_id: p.work_id.clone(),
+                                operation_id: p.item.operation_id.clone(),
+                                outcome: BatchOutcome::Unavailable,
+                                code: Some("unavailable".to_owned()),
+                                message: Some(message.clone()),
+                            }),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    Ok(RepairReportV1 {
+        applied: apply,
+        planned: plan.planned,
+        skipped: plan.skipped,
+        results,
+        complete,
+    })
 }
 
 fn read_request<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {

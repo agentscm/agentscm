@@ -130,6 +130,19 @@ items stay applied, and sending the same batch again is safe. A batch item may a
 `prune_participants` transition with `participants` (`token` and `session`), for the Work's owner or
 a Hub administrator; it removes those non-lead participants so a full Work can be resumed or reopened.
 
+`agentscm work repair [--session SESSION] [--apply] [--json]` repairs your owner's retained claims
+from the findings of `agentscm work recovery`. It reads every page of your owner's inventory (at most
+20 pages; a longer listing is reported as incomplete) and plans one transition for each finding
+whose proposed remedy is a permitted transition: `release` for a lapsed hold, `prune_participants`
+for a full participant list. A finding it will not apply is listed as skipped with the reason:
+report-only, not permitted, incomplete facts, a resume or handover, input only you can supply, or a
+second repair of the same Work. It never plans `complete`. The default is a dry run that changes
+nothing. `--apply` sends the plan through `work transitions` in chunks of 25, each item with the
+fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`, so rerunning
+after an interruption replays what applied (`replayed`) and a moved fence is refused. It prints one
+outcome per item and exits non-zero when any item is refused, in conflict or unavailable. `--json`
+prints `{"applied", "planned", "skipped", "results", "complete"}`.
+
 ### `why`
 
 `agentscm why <commit | path | path:line>` asks the Hub which Work produced a commit or a file,
