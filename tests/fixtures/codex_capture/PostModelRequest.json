@@ -1,0 +1,18 @@
+{
+  "session_id": "11111111-2222-7333-8444-555555555555",
+  "transcript_path": null,
+  "cwd": "/work/acme-widgets",
+  "model": "model-fixture",
+  "turn_id": "aaaaaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee",
+  "hook_event_name": "PostModelRequest",
+  "status": "completed",
+  "error": null,
+  "token_usage": {
+    "input_tokens": 1200,
+    "cached_input_tokens": 1000,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 80,
+    "reasoning_output_tokens": 30,
+    "total_tokens": 1280
+  }
+}

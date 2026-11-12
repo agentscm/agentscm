@@ -291,6 +291,11 @@ are omitted from legacy canonical records when absent. `measurement_scope` is ei
 exclude cumulative session records, which are retained only as separate evidence. This prevents a
 provider's final total from being added to the request records that contributed to it.
 
+The Hub keeps the four token counts apart as they were reported. It does not add cached input to
+`input_tokens` or take it out, and it does not know whether a reporter's `input_tokens` already
+contains its cached input: that is the reporter's convention. For a client that caches, most input
+can be cached input, so read the cache sums beside `input_tokens` before judging how much was read.
+
 `usage_basis` is `reported` for a client-supplied record. `provider_result` means the caller says
 the counts came from a structured provider result; the Hub does not verify that claim. A cost, when
 present, has a three-letter currency, an integer `amount_micros`, a caller-supplied basis label, and
@@ -308,7 +313,7 @@ not overwritten. `observation_id` makes an exact retry by the same author idempo
 with different content or from another author is rejected. For unfinished work, the author must be
 a current participant in the named session and generation. After a reported finish, only the
 current lead can report against that same generation. Records are scoped to the authenticated
-repository. Stored observations retain the session label and author token ID reference for authorization and retry handling, not the token secret. Insight responses omit these identifiers and do not contain prompts, responses or
+repository. Stored observations retain the session label and author token ID reference for authorization and retry handling, not the token secret. Insight responses and the [stored report read](#reading-stored-usage-reports) omit these identifiers and do not contain prompts, responses or
 transcript contents.
 
 ## Reading insights
@@ -321,7 +326,7 @@ membership and ordering. They do not freeze each item's metrics: every page proj
 at that response's `as_of`. Counts and sums displayed for a page are page-only unless the response
 explicitly says otherwise.
 
-`GET /v1/hub/standup/work/{work_id}/insights` returns the bounded detail for one work item. The equivalent read tools are `agentscm_work_insights` for a page and `agentscm_work_insight` for one item.
+`GET /v1/hub/standup/work/{work_id}/insights` returns the bounded detail for one work item. The equivalent read tools are `agentscm_work_insights` for a page and `agentscm_work_insight` for one item. To read the reports behind a work item's usage summary, see [reading stored usage reports](#reading-stored-usage-reports).
 
 Duration fields can be `null`. If history is missing, truncated or crosses a retention gap, all timing and coordination-signal fields are unknown. Otherwise, blocked, paused, handover and finished duration are wall time in the reported state. Active duration is counted only through the stored last check-in plus the 15-minute active window; later time is unknown. These values are derived from retained reports and do not measure actual keyboard, tool or model execution time. Failed attempts are shown only when present in retained usage reports.
 
@@ -330,6 +335,47 @@ Both endpoints are read-only. They return projection evidence and never approve,
 The list projection returns at most 20 token groups and 20 cost groups per work item; one-item
 detail returns at most 500 of each. Totals and known-report counts still cover all retained reports.
 `groups_complete: false` means only the grouped breakdown was truncated.
+
+A group's `agent` is the label the report gave, with one exception: a generated label that names a
+host is shown without the host name, as in [other owners' agents](standup.md#other-owners-agents),
+because every reader of the repository sees these groups. Groups that differ only by that host name
+are added together.
+
+The usage summary and each token group carry four sums: `input_tokens`, `output_tokens`,
+`cache_read_input_tokens` and `cache_creation_input_tokens`. Each has a count of the reports that
+gave it: `input_known_observations`, `output_known_observations`,
+`cache_read_input_known_observations` and `cache_creation_input_known_observations`. The same rules
+hold for all four. A sum is `null` when no counted report gave that count, and is never zero for
+that reason; a reported zero is known and is counted. Cumulative session reports are in no sum and
+no count. Each sum covers at most 500 reports of at most 1,000,000,000,000 each, so it stays an
+exact JSON integer. A Hub older than the cache sums leaves the four cache fields out: read that as
+not reported by the Hub, not as zero.
+
+## Reading stored usage reports
+
+`GET /v1/hub/standup/work/{work_id}/usage` returns the usage reports stored for one work item,
+oldest first, for the same readers as the insight read: any token of the repository, read-only
+included. The read tool is `agentscm_work_usage_reports`; it is listed with the full tool set
+(`/mcp?tools=all`) and to read-only tokens, and is callable either way. The read changes nothing.
+
+`limit` is 1 to 100 and defaults to 100. `after` is the number of reports to skip, 0 to 500. The
+reply is `{version, as_of, work_id, items, next_after}`. Pass `next_after` as `after` to read the
+next page; it is `null` on the last page. Reports are immutable and a work item keeps at most 500,
+so five pages read everything. A report stored while you page can appear on two pages if it sorts
+before your position; none is skipped. Tell reports apart by `id`.
+
+Each item carries what the report measured and the labels it gave: `received_at`, `generation`,
+`phase`, `outcome`, `agent`, `provider`, `model`, `usage_basis`, `source_commit`, the four token
+counts, `measurement_scope` and `cost`. An unknown count or cost is `null`, never zero. Cumulative
+session reports are listed with `measurement_scope: "session_cumulative"`; they are the reports the
+insight totals leave out, so do not add them to the others.
+
+The read leaves out the session, the author token reference and every identifier the reporter
+supplied: the observation ID, action and attempt IDs, and the provider request and event IDs.
+`id` is a digest of the work item and the observation ID, the same one that
+[value-metrics](#recorded-contribution-projection) evidence uses for a report, so it is stable
+across reads without revealing the observation ID. A generated agent label that names a host is
+shown without the host name, as in [other owners' agents](standup.md#other-owners-agents).
 
 `publications_complete` describes lookup coverage of retained records, not a complete check
 history. It is false when the stable repository identity is unavailable, evidence limits omit
