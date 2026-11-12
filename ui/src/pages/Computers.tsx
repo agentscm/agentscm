@@ -63,7 +63,7 @@ function RevokeButton({ device, auth, onDone }: { device: Device; auth: DeviceAu
   const [step, setStep] = useState<'idle' | 'confirm' | 'busy'>('idle')
   const [error, setError] = useState<unknown>(null)
   if (device.revokedAt) return null
-  if (device.current) return <span className="computer-note">Sign this computer out from the menu bar app.</span>
+  if (device.current) return <span className="computer-note">Sign this computer out with agentscm hub logout.</span>
   if (step === 'idle')
     return (
       <button type="button" className="btn btn-sm btn-outline-danger" onClick={() => setStep('confirm')}>
@@ -100,7 +100,7 @@ function RevokeButton({ device, auth, onDone }: { device: Device; auth: DeviceAu
           {error instanceof ApiError && error.refusal
             ? error.refusal.message
             : error instanceof ApiError && error.status === 400
-              ? 'This computer can’t remove itself here; use Sign Out in its menu bar app.'
+              ? 'This computer can’t remove itself here; run agentscm hub logout on it.'
               : error instanceof ApiError && error.status === 403
                 ? 'Your browser sign-in needs a refresh; reload the page and try again.'
                 : 'The Hub didn’t confirm the revoke. Nothing changed; try again.'}

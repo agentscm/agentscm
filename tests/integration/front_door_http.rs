@@ -105,12 +105,12 @@ fn fake_hub_reporting(
             let (status, body) = if line.starts_with("POST /v1/hub/tokens ") {
                 (
                     201,
-                    json!({"id": MINTED_ID, "token": MINTED, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}),
+                    json!({"id": MINTED_ID, "token": MINTED, "name": "agentscm-local-page", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}),
                 )
             } else if line.starts_with("GET /v1/hub/whoami ")
                 && request.contains("authorization: Bearer synthetic-agent-token")
             {
-                // The checkout's own agent token, as the tray's Hub check reads it.
+                // The checkout's own agent token, as the Hub check reads it.
                 let mut body = json!({"token": {"id": "tok_agent", "name": "agent", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": false}, "owner": {"provider": provider, "host": host, "user_id": 1, "login": "synthetic"}});
                 if let Some(days) = retention_days {
                     body["shared_conversation_retention_days"] = json!(days);
@@ -119,7 +119,7 @@ fn fake_hub_reporting(
             } else if line.starts_with("GET /v1/hub/whoami ") {
                 (
                     200,
-                    json!({"token": {"id": MINTED_ID, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}, "owner": {"provider": minted_provider, "host": host, "user_id": 1, "login": "synthetic"}}),
+                    json!({"token": {"id": MINTED_ID, "name": "agentscm-local-page", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}, "owner": {"provider": minted_provider, "host": host, "user_id": 1, "login": "synthetic"}}),
                 )
             } else if line.starts_with("GET /v1/hub/repos/acme%2Fwidgets/refused") {
                 (401, json!({"error": "unauthorized"}))

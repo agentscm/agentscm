@@ -189,9 +189,8 @@ async fn hook(
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
-    let wants_capture = client_connection
-        && agent == "claude"
-        && crate::change_capture_cli::captures_claude_event(&payload);
+    let wants_capture =
+        client_connection && crate::change_capture_cli::captured_harness(agent, &payload).is_some();
     // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
     #[cfg(not(unix))]
     let wants_capture = false;
@@ -205,6 +204,7 @@ async fn hook(
     #[cfg(unix)]
     let spawn_capture = || {
         tokio::spawn(capture(
+            agent.to_owned(),
             body.clone(),
             std::sync::Arc::clone(&payload),
             budget,
@@ -218,7 +218,7 @@ async fn hook(
     let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
     let reply = if client_connection
-        && CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+        && capture_only(agent, payload["hook_event_name"].as_str().unwrap_or(""))
         && !observes_shell(agent, &payload)
     {
         fail_open(agent, &payload, None)
@@ -264,9 +264,16 @@ async fn hook(
 /// Change capture for one call of the plugin's hook, run beside coordination: context for the
 /// session, when capture has some.
 #[cfg(unix)]
-async fn capture(body: Vec<u8>, payload: std::sync::Arc<Value>, budget: Instant) -> Option<String> {
-    let routed = route_client("claude", &payload).ok()?;
+async fn capture(
+    agent: String,
+    body: Vec<u8>,
+    payload: std::sync::Arc<Value>,
+    budget: Instant,
+) -> Option<String> {
+    let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
+    let routed = route_client(&agent, &payload).ok()?;
     crate::change_capture_cli::plugin_capture(
+        harness,
         &body,
         &payload,
         routed.checkout,
@@ -402,9 +409,24 @@ async fn observe_shell(
 const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
 const CAPTURE_SESSION_START_BUDGET: Duration = Duration::from_millis(4000);
 
-/// Claude Code events the plugin registers only so capture sees them. A subagent's start and
+/// Events the plugin registers only so capture sees them. A Claude Code subagent's start and
 /// stop are not among them: the Hub keeps each session's subagents from those.
-const CAPTURE_ONLY_EVENTS: [&str; 3] = ["PostToolUseFailure", "MessageDisplay", "PreCompact"];
+fn capture_only(agent: &str, event: &str) -> bool {
+    match agent {
+        "codex" => matches!(
+            event,
+            "UserPromptSubmit"
+                | "PostModelRequest"
+                | "PreCompact"
+                | "SubagentStart"
+                | "SubagentStop"
+        ),
+        _ => matches!(
+            event,
+            "PostToolUseFailure" | "MessageDisplay" | "PreCompact"
+        ),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn coordinate(
@@ -439,7 +461,6 @@ async fn coordinate(
         deadline += SESSION_START_LIMIT - LIMIT;
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let activity = std::sync::Arc::new(ActivityTracker::new(agent));
     let local_note = std::sync::Arc::new(std::sync::Mutex::new(None));
     let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
     let measured = Instant::now();
@@ -457,7 +478,6 @@ async fn coordinate(
         std::sync::Arc::clone(&payload),
         HubCallContext {
             original_body: body,
-            activity_tracker: activity.clone(),
             local_note: local_note.clone(),
             observed: observed.clone(),
             deadline,
@@ -482,7 +502,6 @@ async fn coordinate(
         Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
         Err(_) => {
-            activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
             call.abort();
             unknown_output(agent, &payload, "hub unreachable")
         }
@@ -583,7 +602,6 @@ type ObservedSlot = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
 
 struct HubCallContext {
     original_body: Vec<u8>,
-    activity_tracker: std::sync::Arc<ActivityTracker>,
     local_note: LocalObservation,
     observed: ObservedSlot,
     deadline: Instant,
@@ -601,7 +619,6 @@ async fn call_hub(
 ) -> Result<Value, HookFailure> {
     let HubCallContext {
         original_body,
-        activity_tracker,
         local_note,
         observed: observed_slot,
         deadline,
@@ -634,14 +651,7 @@ async fn call_hub(
                     }
                 }
                 routed => routed,
-            }
-            .inspect_err(|reason| {
-                if [NO_CONNECTION, NO_EDIT_CONNECTION].contains(&reason.as_str())
-                    || reason.starts_with(AUTO_CONNECT_REFUSED)
-                {
-                    report_unconnected(&agent, &payload);
-                }
-            })?;
+            }?;
             // Routing has verified the checkout identity. Start local observation
             // without delaying token renewal or the Hub registration request.
             #[cfg(unix)]
@@ -761,10 +771,6 @@ async fn call_hub(
     if token.is_empty() {
         return Err("no token".into());
     }
-    let activity_binding = client_connection
-        .as_ref()
-        .map(|connection| crate::client_activity::activity_binding(connection, &token));
-    let mut activity = ActivityAttempt::new(activity_tracker, activity_binding);
     let outbound_body = if plugin_route || agent == "codex" {
         serde_json::to_vec(&outbound).map_err(|_| "payload unreadable")?
     } else {
@@ -809,7 +815,6 @@ async fn call_hub(
     };
     match status {
         200 if reply.is_object() => {
-            activity.finish(successful_hook_outcome(&outbound));
             let reply = if agent == "gemini" && plugin_route {
                 gemini_reply(reply, &payload)
             } else {
@@ -820,29 +825,16 @@ async fn call_hub(
                 None => reply,
             })
         }
-        200 => {
-            activity.finish(crate::client_activity::ActivityOutcome::InvalidResponse);
-            Err(HookFailure::remote(
-                agentscm::hub::error_envelope::ErrorEnvelope::local(
-                    agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
-                ),
-                &token,
-            ))
-        }
-        401 | 403 => {
-            activity.finish(crate::client_activity::ActivityOutcome::TokenRejected);
-            Err(HookFailure::remote(
-                agentscm::hub::error_envelope::decode(status, &reply),
-                &token,
-            ))
-        }
-        _ => {
-            activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
-            Err(HookFailure::remote(
-                agentscm::hub::error_envelope::decode(status, &reply),
-                &token,
-            ))
-        }
+        200 => Err(HookFailure::remote(
+            agentscm::hub::error_envelope::ErrorEnvelope::local(
+                agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
+            ),
+            &token,
+        )),
+        _ => Err(HookFailure::remote(
+            agentscm::hub::error_envelope::decode(status, &reply),
+            &token,
+        )),
     }
 }
 
@@ -1310,123 +1302,13 @@ fn write_branch_cache(path: &Path, snapshot: &agentscm::git_collisions::Advisory
     file.write_all(&bytes).is_ok()
 }
 
-struct ActivityTracker {
-    agent: String,
-    binding: std::sync::OnceLock<String>,
-    finished: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    recorded:
-        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::client_activity::ActivityOutcome>>>>,
-}
-
-impl ActivityTracker {
-    fn new(agent: &str) -> Self {
-        Self {
-            agent: agent.to_owned(),
-            binding: std::sync::OnceLock::new(),
-            finished: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            recorded: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn recording(
-        recorded: std::sync::Arc<std::sync::Mutex<Vec<crate::client_activity::ActivityOutcome>>>,
-    ) -> Self {
-        Self {
-            agent: "codex".into(),
-            binding: std::sync::OnceLock::from("0".repeat(64)),
-            finished: std::sync::atomic::AtomicBool::new(false),
-            recorded: Some(recorded),
-        }
-    }
-
-    fn set_binding(&self, binding: Option<String>) {
-        if let Some(binding) = binding {
-            let _ = self.binding.set(binding);
-        }
-    }
-
-    fn binding(&self) -> Option<&str> {
-        self.binding.get().map(String::as_str)
-    }
-
-    fn finish(&self, outcome: crate::client_activity::ActivityOutcome) {
-        use std::sync::atomic::Ordering;
-        if self.finished.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let Some(binding) = self.binding() else {
-            return;
-        };
-        #[cfg(test)]
-        if let Some(recorded) = &self.recorded {
-            recorded.lock().unwrap().push(outcome);
-        } else {
-            crate::client_activity::observe(
-                binding,
-                Some(&self.agent),
-                crate::client_activity::ActivityPath::Hook,
-                outcome,
-            );
-        }
-        #[cfg(not(test))]
-        crate::client_activity::observe(
-            binding,
-            Some(&self.agent),
-            crate::client_activity::ActivityPath::Hook,
-            outcome,
-        );
-    }
-}
-
-struct ActivityAttempt {
-    tracker: std::sync::Arc<ActivityTracker>,
-}
-
-impl ActivityAttempt {
-    fn new(tracker: std::sync::Arc<ActivityTracker>, binding: Option<String>) -> Self {
-        tracker.set_binding(binding);
-        Self { tracker }
-    }
-
-    fn finish(&mut self, outcome: crate::client_activity::ActivityOutcome) {
-        self.tracker.finish(outcome);
-    }
-}
-
-impl Drop for ActivityAttempt {
-    fn drop(&mut self) {
-        self.tracker
-            .finish(crate::client_activity::ActivityOutcome::Unavailable);
-    }
-}
-
-fn successful_hook_outcome(payload: &Value) -> crate::client_activity::ActivityOutcome {
-    let ended = matches!(
-        payload["hook_event_name"].as_str(),
-        Some("SessionEnd" | "sessionEnd")
-    ) || payload["event"].as_str() == Some("done")
-        || payload["reason"].as_str() == Some("client-session-end");
-    if ended {
-        crate::client_activity::ActivityOutcome::SessionEnded
-    } else {
-        crate::client_activity::ActivityOutcome::Acknowledged
-    }
-}
-
 const MAX_WORKSPACE_ROOTS: usize = 16;
 /// Every new worktree of a connected checkout is covered, so this means the repository itself.
 const NO_CONNECTION: &str =
     "no client connection for this repository; run `agentscm quickstart` in it once";
 const NO_EDIT_CONNECTION: &str = "no client connection for an edit path";
-/// How often one agent re-reports the same unconnected checkout to the tray, and how long that
-/// report may hold the hook.
-const UNCONNECTED_EVERY: Duration = Duration::from_secs(5 * 60);
 /// The Hub renews a session's lease at most this often, so activity in between stays local.
 const ACTIVITY_EVERY: Duration = Duration::from_secs(60);
-const UNCONNECTED_WAIT: Duration = Duration::from_millis(500);
 const MAX_EDIT_PATHS: usize = 256;
 const PATCH_HEADERS: [&str; 4] = [
     "*** Update File: ",
@@ -1911,75 +1793,6 @@ fn with_note(reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
         }
         _ => Value::Object(top),
     }
-}
-
-/// Tell a running tray that this agent works in a Git checkout with no client connection, so it
-/// can offer to connect it. Throttled per agent and checkout, bounded in time, and local only.
-fn report_unconnected(agent: &str, payload: &Value) {
-    #[cfg(unix)]
-    if let (Ok(config), Some(socket)) = (config_dir(), crate::client_activity::socket_path()) {
-        report_unconnected_at(
-            &config,
-            &socket,
-            agent,
-            cwd_of(payload),
-            client_config::load,
-        );
-    }
-    #[cfg(not(unix))]
-    let _ = (agent, payload);
-}
-
-#[cfg(unix)]
-fn report_unconnected_at(
-    config: &Path,
-    socket: &Path,
-    agent: &str,
-    cwd: PathBuf,
-    load: fn() -> agentscm::Result<Vec<Connection>>,
-) {
-    let Some(checkout) = repo_root(&cwd) else {
-        return;
-    };
-    let main = client_config::main_checkout(&checkout);
-    let key = format!("unconnected\0{agent}\0{}", main.display());
-    // A report no tray received must not start the interval, so a tray opened later hears the
-    // next hook.
-    if marked_within(config, &key, UNCONNECTED_EVERY)
-        || !crate::client_activity::listening_at(socket)
-    {
-        return;
-    }
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let connections = load().unwrap_or_default();
-        let _ = sender.send(unconnected_checkout(&cwd, &connections));
-    });
-    let settled = match receiver.recv_timeout(UNCONNECTED_WAIT) {
-        Ok(Some((root, host, repo))) => {
-            crate::client_activity::observe_unconnected_at(socket, &root, &host, &repo, agent)
-        }
-        // Nothing to report, or Git is too slow: neither changes before the interval ends.
-        Ok(None) | Err(_) => true,
-    };
-    if settled {
-        mark(config, &key);
-    }
-}
-
-/// The main worktree, forge host and repository of the checkout containing `cwd`, when it has
-/// a supported `origin` and no client connection covers it.
-fn unconnected_checkout(
-    cwd: &Path,
-    connections: &[Connection],
-) -> Option<(PathBuf, String, String)> {
-    let checkout = repo_root(cwd)?;
-    if client_config::connection_for_checkout(connections, &checkout).is_some() {
-        return None;
-    }
-    let main = client_config::main_checkout(&checkout);
-    let (host, repo) = client_config::origin_identity(&main).ok()?;
-    Some((main, host, repo))
 }
 
 #[cfg(test)]
@@ -3639,62 +3452,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalized_lifecycle_alone_marks_session_end() {
-        use crate::client_activity::ActivityOutcome::{Acknowledged, SessionEnded};
-        assert_eq!(
-            successful_hook_outcome(&json!({"hook_event_name":"SessionEnd"})),
-            SessionEnded
-        );
-        assert_eq!(
-            successful_hook_outcome(&json!({"event":"done"})),
-            SessionEnded
-        );
-        assert_eq!(
-            successful_hook_outcome(&json!({"reason":"client-session-end"})),
-            SessionEnded
-        );
-        assert_eq!(
-            successful_hook_outcome(&json!({"reason":"transport-error"})),
-            Acknowledged
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_and_cancelled_attempts_report_exact_outcomes() {
-        use crate::client_activity::ActivityOutcome::{Acknowledged, TokenRejected, Unavailable};
-        let completed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        {
-            let tracker = std::sync::Arc::new(ActivityTracker::recording(completed.clone()));
-            let mut attempt = ActivityAttempt::new(tracker, None);
-            attempt.finish(Acknowledged);
-        }
-        {
-            let tracker = std::sync::Arc::new(ActivityTracker::recording(completed.clone()));
-            let mut attempt = ActivityAttempt::new(tracker, None);
-            attempt.finish(TokenRejected);
-        }
-        assert_eq!(*completed.lock().unwrap(), [Acknowledged, TokenRejected]);
-
-        let cancelled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = cancelled.clone();
-        let tracker = std::sync::Arc::new(ActivityTracker::recording(recorded));
-        let timed = tracker.clone();
-        let mut task = tokio::spawn(async move {
-            let _attempt = ActivityAttempt::new(tracker, None);
-            std::future::pending::<()>().await;
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(1), &mut task)
-                .await
-                .is_err()
-        );
-        timed.finish(Unavailable);
-        task.abort();
-        timed.finish(Acknowledged);
-        assert_eq!(*cancelled.lock().unwrap(), [Unavailable]);
-    }
-
     #[tokio::test]
     async fn branch_observation_wait_keeps_completed_handles_and_bounds_slow_ones() {
         let payload = json!({"hook_event_name":"SessionStart", "session_id":"deadline"});
@@ -5079,44 +4836,6 @@ mod tests {
     }
 
     #[test]
-    fn only_unconnected_checkouts_with_a_supported_origin_are_reported() {
-        let parent = tempfile::tempdir().unwrap();
-        let plain = parent.path().join("plain");
-        std::fs::create_dir(&plain).unwrap();
-        assert_eq!(unconnected_checkout(&plain, &[]), None);
-
-        let checkout = parent.path().join("main");
-        std::fs::create_dir_all(checkout.join("src")).unwrap();
-        git(&checkout, &["init", "--quiet"]);
-        let main = checkout.canonicalize().unwrap();
-        assert_eq!(unconnected_checkout(&main, &[]), None, "no origin");
-        git(
-            &checkout,
-            &["remote", "add", "origin", "file:///synthetic/widgets.git"],
-        );
-        assert_eq!(unconnected_checkout(&main, &[]), None, "unsupported origin");
-
-        git(
-            &checkout,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/acme/widgets.git",
-            ],
-        );
-        let linked = linked_worktree(&main, &main.join(".claude/worktrees/task"));
-        let expected = Some((main.clone(), "github.com".into(), "acme/widgets".into()));
-        for cwd in [main.join("src"), linked.clone()] {
-            assert_eq!(unconnected_checkout(&cwd, &[]), expected);
-        }
-        let connections = [connection(&main, "acme/widgets")];
-        for cwd in [main.join("src"), linked] {
-            assert_eq!(unconnected_checkout(&cwd, &connections), None);
-        }
-    }
-
-    #[test]
     fn markers_record_when_a_key_was_last_marked() {
         let config = tempfile::tempdir().unwrap();
         let (config, every, key) = (
@@ -5131,75 +4850,6 @@ mod tests {
         assert!(!marked_within(config, key, Duration::ZERO));
         mark(config, key);
         assert!(marked_within(config, key, every));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_a_delivered_report_starts_the_throttle_interval() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::net::UnixDatagram;
-
-        fn no_connections() -> agentscm::Result<Vec<Connection>> {
-            Ok(Vec::new())
-        }
-        let parent = tempfile::tempdir().unwrap();
-        let repo = parent.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git(&repo, &["init", "--quiet"]);
-        git(
-            &repo,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/acme/widgets.git",
-            ],
-        );
-        let repo = repo.canonicalize().unwrap();
-        let config = parent.path().join("config");
-        let tray = parent.path().join("tray");
-        std::fs::create_dir(&tray).unwrap();
-        std::fs::set_permissions(&tray, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = tray.join("activity.sock");
-        let key = format!("unconnected\0claude\0{}", repo.display());
-        let report = || {
-            report_unconnected_at(&config, &socket, "claude", repo.clone(), no_connections);
-        };
-
-        report();
-        assert!(!marked_within(&config, &key, UNCONNECTED_EVERY), "no tray");
-        drop(UnixDatagram::bind(&socket).unwrap());
-        report();
-        assert!(
-            !marked_within(&config, &key, UNCONNECTED_EVERY),
-            "stale socket"
-        );
-        std::fs::remove_file(&socket).unwrap();
-
-        let receiver = UnixDatagram::bind(&socket).unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        report();
-        assert!(marked_within(&config, &key, UNCONNECTED_EVERY));
-        let mut bytes = [0_u8; 4096];
-        let size = receiver.recv(&mut bytes).unwrap();
-        let sent: Value = serde_json::from_slice(&bytes[..size]).unwrap();
-        assert_eq!(sent["root"], json!(repo));
-        assert_eq!(sent["repo"], "acme/widgets");
-        report();
-        assert!(receiver.recv(&mut bytes).is_err(), "throttled while marked");
-
-        // A checkout with nothing to report is not checked again on every hook.
-        let plain = parent.path().join("plain");
-        std::fs::create_dir(&plain).unwrap();
-        git(&plain, &["init", "--quiet"]);
-        let plain = plain.canonicalize().unwrap();
-        report_unconnected_at(&config, &socket, "claude", plain.clone(), no_connections);
-        assert!(marked_within(
-            &config,
-            &format!("unconnected\0claude\0{}", plain.display()),
-            UNCONNECTED_EVERY
-        ));
-        assert!(receiver.recv(&mut bytes).is_err(), "nothing to report");
     }
 
     #[test]
@@ -5412,6 +5062,25 @@ mod tests {
                 unknown_output(agent, &event("PreToolUse"), "no token"),
                 json!({})
             );
+        }
+    }
+
+    #[test]
+    fn events_only_capture_reads_stay_off_the_hub_per_agent() {
+        // Coordination uses Claude Code's prompt and subagent events; Codex's are capture's alone.
+        for event in ["UserPromptSubmit", "SubagentStart", "SubagentStop"] {
+            assert!(capture_only("codex", event), "{event}");
+            assert!(!capture_only("claude", event), "{event}");
+        }
+        assert!(capture_only("codex", "PostModelRequest"));
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            assert!(!capture_only("codex", event), "{event}");
+        }
+        #[cfg(unix)]
+        for event in agentscm::change_capture::codex::HOOK_EVENTS {
+            let payload = json!({"hook_event_name": event});
+            assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
+            assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
         }
     }
 }

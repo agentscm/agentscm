@@ -12,7 +12,7 @@ the Hub from your computer:
 agentscm open
 ```
 
-Run it in any connected checkout (or choose **Open Hub** in the AgentSCM menu bar app on macOS).
+Run it in any connected checkout.
 Your browser opens the Hub on **Repository explorer**, already connected: the page names your
 computer and repository, shows your files and saved conversations, and shows your team's work.
 There is no token to paste and no address to enter.
@@ -29,7 +29,7 @@ pushes and edits to `AGENTS.md` or `CLAUDE.md`.
 
 ## Sign in once per computer
 
-`agentscm hub login` (or **Sign In with GitHub…** in the menu bar app) signs this computer in to
+`agentscm hub login` signs this computer in to
 the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser lands
 on the Hub page saying who signed in and as which computer. The terminal says it is waiting, every
 30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
@@ -48,9 +48,8 @@ the forge did not accept the code. What signing in gives you:
   connected to that Hub, and names any it could not renew with the command that reconnects it.
 - **Agents connect themselves**, if you say so. AgentSCM's agent plugin runs a quick check
   whenever an agent starts. The sign-in asks once at a terminal: "Turn on
-  auto-connect for <hub>? [Y/n]" (`--no-auto-connect` answers no). A sign-in from the menu bar
-  app, or one made before this question existed, is asked in the menu bar app or at the next
-  interactive `agentscm hub` or `agentscm client` command. Change it with
+  auto-connect for <hub>? [Y/n]" (`--no-auto-connect` answers no). A sign-in made before this
+  question existed is asked at the next interactive `agentscm hub` or `agentscm client` command. Change it with
   `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts a session
   in a checkout that has no connection, its hook connects the checkout to the first such Hub (the
   default Hub first, at most four) that has the repository and where you have the role, and the
@@ -82,15 +81,14 @@ stops coordination (the token was refused, or access ended), that reason replace
   and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks
   the forge with the repository connection's own credential, never a stored token of yours. When
-  something refuses, the agent's context, the menu bar app (**Needs attention**), `agentscm open`
+  something refuses, the agent's context, `agentscm open`
   and the CLI show the Hub's own sentence, such as
   `alice has Read on public repository acme/widgets; ask a repository owner for Triage or higher`,
   and the current token keeps working until it ends or is revoked. When the Hub or the forge does
   not answer, nothing is marked as needing attention; the next hook call tries again.
 
 `agentscm hub whoami` shows, for each saved Hub, who this computer is signed in as, the
-computer's name, whether auto-connect is on and the checkouts connected to it; the menu bar app
-shows the same at the top of its menu. Until you choose, `whoami` says what auto-connect does and
+computer's name, whether auto-connect is on and the checkouts connected to it. Until you choose, `whoami` says what auto-connect does and
 prints the command that chooses it (`agentscm hub auto-connect on|off --hub URL`). `agentscm client
 doctor` checks a checkout's connection through this computer's credential, the way the next renewal
 would, so it reports a verified connection even when no agent is running. It also prints one line
@@ -109,7 +107,7 @@ not be told. Hub administrators can revoke any computer. See
 [computer credentials](hub.md#computer-credentials).
 
 Sign-ins made before computers had credentials keep working until their session ends; while that
-session lives, the next connect, renewal, Open Hub or `agentscm open` enrolls this computer without
+session lives, the next connect, renewal or `agentscm open` enrolls this computer without
 asking. Existing 30-day tokens keep working and are renewed into 24-hour ones once the computer
 has a credential. A sign-in that has already expired needs one more sign-in.
 
@@ -117,9 +115,7 @@ has a credential. A sign-in that has already expired needs one more sign-in.
 
 - The first `agentscm open` starts AgentSCM's local Hub page in the background, on
   `http://127.0.0.1:7340` (or another free port). It keeps running after the terminal closes;
-  `agentscm open --stop` stops it. The macOS menu bar app starts the same page when it starts
-  (if this computer has a connected checkout), so its Open Hub opens at once, and stops the page
-  again when you quit it, if it was the one that started it.
+  `agentscm open --stop` stops it.
 - The page is the same Hub page your team's Hub serves, served from your computer. It reads your
   files and saved conversations directly. It fetches team data from each repository's own Hub
   with a read-only token for that one repository, minted from this computer's Hub sign-in. That
@@ -135,8 +131,8 @@ has a credential. A sign-in that has already expired needs one more sign-in.
 
 ## Conversation sharing from the page
 
-Turning a switch on sets capture up for that checkout if it never was (same defaults as the menu
-bar app; see [sharing conversations](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page))
+Turning a switch on sets capture up for that checkout if it never was (one step, documented defaults; see
+[sharing conversations](change-capture.md#one-step-setup-from-the-local-page))
 and switches it to `shared-conversation`. The page first shows what that does: conversations are
 redacted on this computer (best effort), uploaded to that checkout's Hub, kept for the number of days that Hub reports (or, if it did not
 say, for as long as its operator sets, 30 days unless changed) and readable by you and Hub admins. Only after you confirm does it send the request, with an
@@ -154,7 +150,7 @@ and try again. Two
 checkouts of one repository and Hub are listed and controlled separately. The request also carries
 the repository and Hub the page showed; if the checkout is connected to anything else by then, the
 service refuses to turn sharing on and changes nothing.
-A page opened from a Hub elsewhere has no such control and points to the menu bar app and `agentscm open`.
+A page opened from a Hub elsewhere has no such control and points to `agentscm open`.
 
 ## How the connection is protected
 
@@ -168,7 +164,7 @@ A page opened from a Hub elsewhere has no such control and points to the menu ba
   accepts the exchange only from its own page.
 - The connection lives only in the running service's memory. Stopping or restarting the service
   ends every browser connection, so a connection taken from a browser cannot be used against a
-  later service or another program on the same port. Choose Open Hub or run `agentscm open`
+  later service or another program on the same port. Run `agentscm open`
   again to reconnect.
 - The service answers only on loopback, refuses requests that name another host (DNS
   rebinding) and refuses pages from any other origin. It forwards only the Hub reads the page
@@ -181,21 +177,17 @@ A page opened from a Hub elsewhere has no such control and points to the menu ba
   the token minted from that sign-in is revoked the next time the page reads that Hub, and
   otherwise expires.
 - For a self-hosted forge, the service mints a token only for the forge the Hub reports for the
-  checkout's own connection, as the menu bar app checks it.
+  checkout's own connection.
 
 ## Lifetime and disconnecting
 
-- A connection lasts while the local service runs, for up to seven days. To renew it, choose Open
-  Hub or run `agentscm open` again.
+- A connection lasts while the local service runs, for up to seven days. To renew it, run `agentscm open` again.
 - If a repository stops being connected on this computer (its checkout moved, or its connection
   was removed), the page says so and offers the others; the browser stays connected.
 - **Settings → This computer → Disconnect this browser** ends the connection for this browser.
 - `agentscm open --stop` ends every connection.
 
-## Without the menu bar app
-
-Everything above works from a terminal on macOS and Linux with `agentscm open`. The tray only adds
-a menu item for it.
+## Hosted team Hub
 
 The hosted team Hub keeps working as before for shared work, signed in with a read-only token. Its
 This computer pages explain that your files and conversations open with `agentscm open`. The

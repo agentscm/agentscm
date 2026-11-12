@@ -10,10 +10,12 @@ use agentscm::change_capture::claude_code::{self, CaptureRequest};
 use agentscm::change_capture::{
     CaptureError, ConfiguredRecipeReconcileRequest, ConfiguredRecipeRunRequest, DeferredReasonV1,
     GitSourceRequest, LocalSpool, ObservedCommandRequest, ObservedStop, RecipeReconcileOutcome,
-    export_spool_archive, inspect_spool, reconcile_retained_configured_recipe,
+    codex, export_spool_archive, inspect_spool, reconcile_retained_configured_recipe,
     run_configured_recipe_with_cancellation, run_observed_command,
 };
-use agentscm::change_record::{ActionOutcomeV1, CaptureModeV1, CoverageV1};
+use agentscm::change_record::{
+    ActionOutcomeV1, AgentHarnessV1, CaptureEnvelopeV1, CaptureModeV1, CoverageV1,
+};
 use agentscm::execution::Cancellation;
 use agentscm::{Error, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -56,7 +58,9 @@ pub enum ChangeCaptureCommand {
     /// Consume one Claude Code native hook payload from stdin without blocking the host session.
     HookClaude,
     /// Import the visible portion of one explicitly selected Claude Code session log.
-    ImportClaude(ImportClaudeArgs),
+    ImportClaude(ImportArgs),
+    /// Import the visible portion and token usage of one explicitly selected Codex session file.
+    ImportCodex(ImportArgs),
     /// Run one local command after durably binding source, recipe and setup.
     Observe(ObserveArgs),
     /// Print a bounded page of shareable pending envelopes; local bodies stay in the spool.
@@ -154,11 +158,11 @@ pub struct ReconcileRecipeArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ImportClaudeArgs {
+pub struct ImportArgs {
     /// Absolute private spool directory outside repository source.
     #[arg(long)]
     spool: PathBuf,
-    /// Explicit Claude Code JSONL file selected by the local operator.
+    /// Explicit session JSONL file selected by the local operator.
     #[arg(long)]
     input: PathBuf,
     #[arg(long)]
@@ -292,7 +296,8 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::RunRecipe(args) => run_recipe(args).await,
         ChangeCaptureCommand::ReconcileRecipe(args) => reconcile_recipe(args).await,
         ChangeCaptureCommand::HookClaude => hook_claude().await,
-        ChangeCaptureCommand::ImportClaude(args) => import_claude(args),
+        ChangeCaptureCommand::ImportClaude(args) => import(args, AgentHarnessV1::ClaudeCode),
+        ChangeCaptureCommand::ImportCodex(args) => import(args, AgentHarnessV1::Codex),
         ChangeCaptureCommand::Observe(args) => observe(args),
         ChangeCaptureCommand::Pending(args) => pending(args),
         ChangeCaptureCommand::Deferred(args) => deferred(args),
@@ -362,20 +367,33 @@ async fn hook_claude() -> Result<i32> {
         return Ok(0);
     }
     let hub = change_capture_client::CaptureHub::new(connection).ok();
-    if let Some(context) =
-        capture_claude(&input, &payload, &binding, &spool, hub.as_ref(), None).await
+    if let Some(context) = capture_native(
+        AgentHarnessV1::ClaudeCode,
+        &input,
+        &payload,
+        &binding,
+        &spool,
+        hub.as_ref(),
+        None,
+    )
+    .await
     {
         println!("{}", session_start_output(context)?);
     }
     Ok(0)
 }
 
-/// Whether capture records this Claude Code hook event.
-pub(crate) fn captures_claude_event(payload: &Value) -> bool {
-    payload
-        .get("hook_event_name")
-        .and_then(Value::as_str)
-        .is_some_and(change_capture_client::is_claude_capture_event)
+/// The harness whose hook events capture records for the hook client's `agent`, when `payload`
+/// is one of them.
+pub(crate) fn captured_harness(agent: &str, payload: &Value) -> Option<AgentHarnessV1> {
+    let event = payload.get("hook_event_name").and_then(Value::as_str)?;
+    match agent {
+        "claude" if change_capture_client::is_claude_capture_event(event) => {
+            Some(AgentHarnessV1::ClaudeCode)
+        }
+        "codex" if codex::HOOK_EVENTS.contains(&event) => Some(AgentHarnessV1::Codex),
+        _ => None,
+    }
 }
 
 /// Capture from the AgentSCM plugin hook for `checkout`, a connected checkout or a linked
@@ -383,15 +401,13 @@ pub(crate) fn captures_claude_event(payload: &Value) -> bool {
 /// checkout's binding at session start when the Hub shares and there is none, so a new worktree
 /// needs no setup. Returns context for the session (the one-time notice, recipe guidance).
 pub(crate) async fn plugin_capture(
+    harness: AgentHarnessV1,
     input: &[u8],
     payload: &Value,
     checkout: std::path::PathBuf,
     connection: crate::client_config::Connection,
     deadline: tokio::time::Instant,
 ) -> Option<String> {
-    if !captures_claude_event(payload) {
-        return None;
-    }
     let hub = change_capture_client::CaptureHub::new(connection.clone()).ok()?;
     let session_start =
         payload.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart");
@@ -406,7 +422,21 @@ pub(crate) async fn plugin_capture(
     let create = answer.sharing().is_some_and(|answer| answer.sharing);
     let found = tokio::task::spawn_blocking({
         let (checkout, connection) = (checkout.clone(), connection.clone());
-        move || change_capture_client::followed_binding(&checkout, &connection, create)
+        move || {
+            let followed = change_capture_client::followed_binding(&checkout, &connection, create);
+            // A binding with hooks of its own has them for Claude Code only, so this hook is the
+            // one that captures Codex for it.
+            if harness == AgentHarnessV1::Codex && matches!(followed, Ok(None)) {
+                let own = change_capture_client::binding_for_payload(&json!({"cwd": checkout}))
+                    .ok()
+                    .flatten()
+                    .filter(|(binding, ..)| !binding.follows_hub);
+                if let Some((binding, spool, _)) = own {
+                    return Ok(Some((binding, spool)));
+                }
+            }
+            followed
+        }
     })
     .await
     .ok()?;
@@ -427,14 +457,24 @@ pub(crate) async fn plugin_capture(
             return None;
         }
     };
-    capture_claude(input, payload, &binding, &spool, Some(&hub), Some(deadline)).await
+    capture_native(
+        harness,
+        input,
+        payload,
+        &binding,
+        &spool,
+        Some(&hub),
+        Some(deadline),
+    )
+    .await
 }
 
 /// Records one native hook event for `binding` and delivers what is pending. Fails open: every
 /// problem is a warning. Returns the session-start context, if any. Past `deadline` a Hub call is
 /// given up: an unresolved target leaves a sanitized deferred fact, and pending records wait for
 /// the next hook.
-async fn capture_claude(
+async fn capture_native(
+    harness: AgentHarnessV1,
     input: &[u8],
     payload: &Value,
     binding: &change_capture_client::CaptureBinding,
@@ -524,6 +564,9 @@ async fn capture_claude(
     let live_mode = change_capture_client::mode_under_hub(binding, sharing.sharing());
     let event = payload.get("hook_event_name").and_then(Value::as_str);
     let session_start = event == Some("SessionStart");
+    let claude = harness == AgentHarnessV1::ClaudeCode;
+    // A Codex model request is token usage, not an event of the session.
+    let model_request = !claude && event == Some("PostModelRequest");
     if session_start {
         sweep_session_files();
     }
@@ -536,6 +579,11 @@ async fn capture_claude(
     let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
         Ok(Some(target)) => target,
+        // Usage belongs to Work: without a target it is not kept and leaves no deferred fact.
+        _ if model_request => {
+            let _ = deliver().await;
+            return None;
+        }
         Ok(None) => {
             // A session's opening prompt comes before it claims Work. With sharing on, keep the
             // prompt locally so it reaches the Work this session claims next.
@@ -546,7 +594,9 @@ async fn capture_claude(
                 hold_prompt(&session_file(binding, &session_id), input);
             }
             // Replies before the claim are not the Work's: recovery starts after them.
-            skip_transcript(&replies, payload, false);
+            if claude {
+                skip_transcript(&replies, payload, false);
+            }
             let retained = claude_code::deferred_native_hook(
                 input,
                 DeferredReasonV1::NoCurrentAuthorizedWork,
@@ -617,7 +667,20 @@ async fn capture_claude(
         parent_session_id,
         capture_mode,
         live_capture_mode: live_mode,
+        harness,
     };
+    if model_request {
+        let usage = payload
+            .as_object()
+            .and_then(|payload| codex::usage_from_hook(payload, &request));
+        if let Some(usage) = usage
+            && spool.append(&CaptureEnvelopeV1::Usage(usage)).is_err()
+        {
+            eprintln!("AgentSCM local capture warning: a model request's usage was not retained");
+        }
+        let _ = deliver().await;
+        return None;
+    }
     // Prompts held before the claim come first, and only into a shared conversation.
     let held = take_held_prompts(&session_file(binding, &session_id));
     if capture_mode == CaptureModeV1::SharedConversation {
@@ -629,10 +692,18 @@ async fn capture_claude(
             }
         }
     }
-    // A session first seen with Work (or on an older build) recovers only replies from now on.
-    skip_transcript(&replies, payload, true);
-    if event == Some("MessageDisplay") {
-        note_fragment(&replies, payload);
+    if claude {
+        // A session first seen with Work (or on an older build) recovers only replies from now on.
+        skip_transcript(&replies, payload, true);
+        if event == Some("MessageDisplay") {
+            note_fragment(&replies, payload);
+        }
+    } else if event == Some("Stop")
+        && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
+        && claude_code::capture_native_hook(&reply, &request, &actions, spool).is_err()
+    {
+        // Codex names a turn's last reply only when the turn ends; it comes before that end.
+        eprintln!("AgentSCM local capture warning: the turn's last reply was not retained");
     }
     match claude_code::capture_native_hook(input, &request, &actions, spool) {
         Ok(report) => {
@@ -653,7 +724,8 @@ async fn capture_claude(
             }
         ),
     }
-    if event == Some("Stop")
+    if claude
+        && event == Some("Stop")
         && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
     {
         for (hash, reply) in missed_replies(&replies, std::path::Path::new(transcript), &session_id)
@@ -669,8 +741,20 @@ async fn capture_claude(
             }
         }
     }
+    // A captured Claude Code session reports its token counts and model names by default: a
+    // binding with no history root of its own uses Claude Code's projects folder. Either way the
+    // reader takes only this session's own file under that root.
+    let history_root = claude
+        .then(|| {
+            binding.claude_history_root.clone().or_else(|| {
+                crate::client_plugin::claude_config_dir(&binding.root)
+                    .ok()
+                    .map(|config| config.join("projects"))
+            })
+        })
+        .flatten();
     if let (Some(history_root), Some(transcript_path)) = (
-        binding.claude_history_root.as_deref(),
+        history_root.as_deref(),
         payload
             .get("transcript_path")
             .and_then(Value::as_str)
@@ -724,11 +808,14 @@ async fn capture_claude(
             );
         }
     }
-    match change_capture_client::session_start_context(binding) {
-        Ok(Some(additional_context)) => context.push(additional_context),
-        Ok(None) => {}
-        Err(_) => {
-            eprintln!("AgentSCM local capture warning: configured recipe guidance is unavailable")
+    // The recipe runner takes its session from Claude Code, so only Claude Code is told of it.
+    if claude {
+        match change_capture_client::session_start_context(binding) {
+            Ok(Some(additional_context)) => context.push(additional_context),
+            Ok(None) => {}
+            Err(_) => eprintln!(
+                "AgentSCM local capture warning: configured recipe guidance is unavailable"
+            ),
         }
     }
     (!context.is_empty()).then(|| context.join("\n\n"))
@@ -1239,14 +1326,14 @@ async fn reconcile_recipe(args: ReconcileRecipeArgs) -> Result<i32> {
     Ok(if unresolved { 2 } else { 0 })
 }
 
-fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
+fn import(args: ImportArgs, harness: AgentHarnessV1) -> Result<i32> {
     let metadata = fs::symlink_metadata(&args.input)?;
     if !args.input.is_absolute()
         || !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
     {
         return Err(Error::Invalid(
-            "Claude Code import must be an absolute regular JSONL file".into(),
+            "a session import must be an absolute regular JSONL file".into(),
         ));
     }
     let spool = LocalSpool::open(&args.spool).map_err(capture_error)?;
@@ -1259,24 +1346,35 @@ fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
         parent_session_id: args.parent_session_id,
         capture_mode: args.capture_mode.into(),
         live_capture_mode: args.capture_mode.into(),
+        harness,
     };
-    let report =
-        claude_code::import_jsonl(BufReader::new(File::open(args.input)?), &request, &spool)
-            .map_err(capture_error)?;
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "batches": report.batches,
-            "events": report.events,
-            "gaps": report.gaps,
-            "private_blocks_ignored": report.private_blocks_ignored,
-            "conversation_content": match request.capture_mode {
-                CaptureModeV1::MetadataOnly => "not_retained",
-                CaptureModeV1::LocalConversation => "local_only",
-                CaptureModeV1::SharedConversation => "shared_after_redaction",
-            },
-        }))?
-    );
+    let input = BufReader::new(File::open(args.input)?);
+    let (report, usage) = match harness {
+        AgentHarnessV1::ClaudeCode => (
+            claude_code::import_jsonl(input, &request, &spool).map_err(capture_error)?,
+            None,
+        ),
+        AgentHarnessV1::Codex => {
+            let (report, usage) =
+                codex::import_rollout(input, &request, &spool).map_err(capture_error)?;
+            (report, Some(usage))
+        }
+    };
+    let mut output = json!({
+        "batches": report.batches,
+        "events": report.events,
+        "gaps": report.gaps,
+        "private_blocks_ignored": report.private_blocks_ignored,
+        "conversation_content": match request.capture_mode {
+            CaptureModeV1::MetadataOnly => "not_retained",
+            CaptureModeV1::LocalConversation => "local_only",
+            CaptureModeV1::SharedConversation => "shared_after_redaction",
+        },
+    });
+    if let Some(usage) = usage {
+        output["usage_observations"] = json!(usage);
+    }
+    println!("{output}");
     Ok(0)
 }
 
@@ -1516,6 +1614,7 @@ mod tests {
         ActionOutcomeV1, AgentHarnessV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1,
         CapturedEventKindV1, CapturedEventV1, GapReasonV1, SCHEMA_VERSION_V1, SessionIdentityV1,
     };
+    use serde_json::{Value, json};
     use std::path::Path;
 
     use crate::change_capture_client::{CaptureBinding, CaptureHub};
@@ -1646,7 +1745,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(super::capture_claude(
+            .block_on(super::capture_native(
+                AgentHarnessV1::ClaudeCode,
                 input.as_bytes(),
                 &payload,
                 binding,
@@ -1865,6 +1965,180 @@ mod tests {
                 "{context}"
             );
             assert!(!context.contains("sharing is on"), "{context}");
+        });
+    }
+
+    /// Runs the capture hook for a Codex `payload` of the fixture session.
+    fn codex_hook(binding: &CaptureBinding, spool: &LocalSpool, hub: &CaptureHub, payload: Value) {
+        let input = payload.to_string();
+        let context = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::capture_native(
+                AgentHarnessV1::Codex,
+                input.as_bytes(),
+                &payload,
+                binding,
+                spool,
+                Some(hub),
+                None,
+            ));
+        assert_eq!(context, None);
+    }
+
+    fn codex_model_request() -> Value {
+        json!({
+            "session_id": "session_fixture", "hook_event_name": "PostModelRequest",
+            "turn_id": "turn_1", "model": "model-fixture", "status": "completed",
+            "token_usage": {
+                "input_tokens": 1200, "cached_input_tokens": 1000, "output_tokens": 80,
+                "reasoning_output_tokens": 30, "total_tokens": 1280,
+            },
+        })
+    }
+
+    #[test]
+    fn codex_records_request_usage_and_a_turns_last_reply_for_the_sessions_work() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, true);
+            let bound = CaptureBinding {
+                hub: url,
+                ..binding(config)
+            };
+            codex_hook(&bound, &spool, &hub, codex_model_request());
+            codex_hook(
+                &bound,
+                &spool,
+                &hub,
+                json!({
+                    "session_id": "session_fixture", "hook_event_name": "Stop",
+                    "turn_id": "turn_1", "last_assistant_message": "Done.",
+                }),
+            );
+            let pending = spool.pending(100).unwrap();
+            let usage: Vec<_> = pending
+                .iter()
+                .filter_map(|envelope| match envelope {
+                    CaptureEnvelopeV1::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(usage.len(), 1, "{pending:?}");
+            assert_eq!(usage[0].work_id, "wrk_11111111111111111111111111111111");
+            assert_eq!(
+                (usage[0].input_tokens, usage[0].cache_read_input_tokens),
+                (Some(200), Some(1000))
+            );
+            // The model request is usage only; the reply comes before the end of its turn.
+            let kinds: Vec<_> = pending
+                .iter()
+                .filter_map(|envelope| match envelope {
+                    CaptureEnvelopeV1::EventBatch(batch) => Some(batch),
+                    _ => None,
+                })
+                .inspect(|batch| assert_eq!(batch.session.harness, AgentHarnessV1::Codex))
+                .flat_map(|batch| batch.events.iter())
+                .filter(|event| event.gap.is_none())
+                .map(|event| event.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    CapturedEventKindV1::AssistantMessage,
+                    CapturedEventKindV1::TurnEnded
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn a_codex_model_request_without_work_keeps_nothing() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, false);
+            let bound = CaptureBinding {
+                hub: url,
+                ..binding(config)
+            };
+            codex_hook(&bound, &spool, &hub, codex_model_request());
+            assert!(spool.pending(100).unwrap().is_empty());
+            assert!(spool.deferred(100).unwrap().is_empty());
+        });
+    }
+
+    /// The fixture session's Claude Code history file in a project folder under `root`, holding
+    /// one request's usage.
+    fn history_under(root: &Path) -> std::path::PathBuf {
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("session_fixture.jsonl");
+        let line = json!({
+            "type": "assistant", "sessionId": "session_fixture", "uuid": "a1",
+            "timestamp": "2026-11-01T10:00:00Z", "requestId": "req_1",
+            "message": {"model": "model-fixture", "usage": {
+                "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100,
+            }},
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    }
+
+    /// Starts the fixture Claude Code session with `transcript` as its history file, in a new
+    /// store, and counts the usage reports capture wrote.
+    fn usage_at_start(binding: &CaptureBinding, hub: &CaptureHub, transcript: &Path) -> usize {
+        let name = format!(
+            "spool-{}",
+            std::fs::read_dir(&binding.root).unwrap().count()
+        );
+        let spool = LocalSpool::open_with_limits(binding.root.join(name), SMALL).unwrap();
+        let payload = json!({
+            "session_id": "session_fixture", "hook_event_name": "SessionStart",
+            "source": "startup", "cwd": binding.root, "transcript_path": transcript,
+        });
+        let input = payload.to_string();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::capture_native(
+                AgentHarnessV1::ClaudeCode,
+                input.as_bytes(),
+                &payload,
+                binding,
+                &spool,
+                Some(hub),
+                None,
+            ));
+        let pending = spool.pending(100).unwrap();
+        pending
+            .iter()
+            .filter(|envelope| matches!(envelope, CaptureEnvelopeV1::Usage(_)))
+            .count()
+    }
+
+    #[test]
+    fn claude_usage_is_read_by_default_and_only_from_the_sessions_own_history() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let (hub, url) = loopback(config, true);
+            let bound = |history_root: Option<&str>| CaptureBinding {
+                hub: url.clone(),
+                claude_history_root: history_root.map(|root| config.join(root)),
+                ..binding(config)
+            };
+            // No history root is set: Claude Code's own projects folder is read.
+            let default = history_under(&config.join("claude/projects"));
+            assert_eq!(usage_at_start(&bound(None), &hub, &default), 1);
+            // A history file anywhere else is not.
+            let elsewhere = history_under(&config.join("elsewhere"));
+            assert_eq!(usage_at_start(&bound(None), &hub, &elsewhere), 0);
+            // A binding's own history root replaces the default.
+            assert_eq!(
+                usage_at_start(&bound(Some("elsewhere")), &hub, &elsewhere),
+                1
+            );
+            assert_eq!(usage_at_start(&bound(Some("elsewhere")), &hub, &default), 0);
         });
     }
 }

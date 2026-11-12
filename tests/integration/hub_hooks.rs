@@ -1344,6 +1344,125 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
     let context = text_at(&answer, CLAUDE_CONTEXT);
     assert!(context.contains("wait for your lead session"), "{answer}");
     assert!(!context.contains(&request), "{answer}");
+
+    // Once the holder answers, the requester's next prompt carries the reply and is never held.
+    {
+        use agentscm::hub::coordination::{
+            CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+        };
+        let lead_token = token_id(&lead);
+        let now = unix_now();
+        let page = hub
+            .store
+            .coordination_inbox(
+                &lead_token,
+                &CoordinationInboxQuery {
+                    session: Some(session.into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap();
+        let open = &page.requests[0];
+        let target = open.targets[0].work_id.clone();
+        let acknowledged = hub
+            .store
+            .coordination_ack(
+                &lead_token,
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: Some(target.clone()),
+                    session: session.into(),
+                    expected_updated_seq: open.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        hub.store
+            .coordination_reply(
+                &lead_token,
+                &CoordinationReply {
+                    request_id: request.clone(),
+                    operation_id: "decline-widget".into(),
+                    target_work_id: target,
+                    session: session.into(),
+                    expected_updated_seq: acknowledged.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: Some("Still editing the widget".into()),
+                    via: agentscm::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        let context = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(context.contains(&request), "{answer}");
+        assert!(context.contains("Reply decline"), "{answer}");
+        assert!(context.contains("Still editing the widget"), "{answer}");
+        assert!(!context.contains("report a split/join"), "{answer}");
+        // Once the requester acknowledges the news, its prompts stay quiet again.
+        let request_now = hub
+            .store
+            .coordination_inbox(
+                &token_id(&other),
+                &CoordinationInboxQuery {
+                    session: Some("other-session".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+            .requests
+            .remove(0);
+        hub.store
+            .coordination_ack(
+                &token_id(&other),
+                &CoordinationAck {
+                    request_id: request.clone(),
+                    target_work_id: None,
+                    session: "other-session".into(),
+                    expected_updated_seq: request_now.updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+        // A holder narrowing its scope off the file changes no request seq, yet the release
+        // still reaches the requester's next prompt although it acknowledged the reply.
+        let held = hub
+            .store
+            .work_for_session(&lead_token, session, now)
+            .unwrap()
+            .unwrap();
+        hub.store
+            .work_checkpoint(
+                &lead_token,
+                &agentscm::hub::work::WorkCheckpoint {
+                    work_id: held.id,
+                    operation_id: "narrow-widget".into(),
+                    generation: held.generation,
+                    session: session.into(),
+                    expected_updated_seq: Some(held.updated_seq),
+                    kind: agentscm::hub::work::CheckpointKind::Progress,
+                    summary: "moved off the widget".into(),
+                    next_action: None,
+                    scope: Some(vec!["src/other.rs".into()]),
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answer = hub.hook("claude", &other, &prompt);
+        assert!(
+            text_at(&answer, CLAUDE_CONTEXT).contains("requested paths are released"),
+            "{answer}"
+        );
+    }
 }
 
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy
@@ -1411,6 +1530,71 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
     let bash = json!({"hook_event_name":"PreToolUse", "session_id":session,
         "tool_name":"Bash", "tool_input":{"command":"cargo test"}, "cwd":"/work/acme-widgets"});
     assert_eq!(hub.hook("claude", &lead, &bash), json!({}));
+    assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}
+
+/// A subagent's tool calls carry its parent's session and renew the parent's lease as the
+/// parent's own calls do, whatever the tool (#542 item 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subagents_tool_calls_renew_its_parent_sessions_lease() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let started = unix_now() - 600;
+    let item = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("delegating".into()),
+                title: "delegating".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            started,
+        )
+        .unwrap()
+        .item;
+    let expiry = |hub: &Hub| {
+        hub.store
+            .work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::One(&item.id),
+                unix_now(),
+            )
+            .unwrap()
+            .work[0]
+            .activity
+            .lease_expires_at
+            .unwrap()
+    };
+    assert_eq!(expiry(&hub), started + LEASE_SECONDS);
+    let before = unix_now();
+    let read = json!({"hook_event_name":"PostToolUse", "session_id":session,
+        "agent_id":"sub-1", "agent_type":"general-purpose",
+        "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+        "cwd":"/work/acme-widgets"});
+    assert_eq!(hub.hook("claude", &lead, &read), json!({}));
     assert!(expiry(&hub) >= before + LEASE_SECONDS);
 }
 
@@ -1641,6 +1825,181 @@ async fn observed_shell_changes_on_lapsed_work_are_reported_as_applied() {
         !answer.to_string().contains("permissionDecision"),
         "{answer}"
     );
+}
+
+/// Starts or resumes Work for `session` at `at`, as `agentscm_start` does.
+fn start_work(
+    hub: &Hub,
+    token: &str,
+    session: &str,
+    scope: &[&str],
+    resume: Option<(&str, i64)>,
+    at: i64,
+) -> agentscm::hub::work::WorkItem {
+    hub.store
+        .work_start(
+            token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: resume.map(|(id, _)| id.to_owned()),
+                source: None,
+                request_key: resume.is_none().then(|| "scoped".into()),
+                title: "scoped".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: scope.iter().map(|path| (*path).to_owned()).collect(),
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: resume.map(|(_, generation)| generation),
+                preflight: None,
+            },
+            at,
+        )
+        .unwrap()
+        .item
+}
+
+fn edit_of(tool: &str, session: &str, file: &str) -> Value {
+    let mut payload = fixture("claude-PreToolUse-Edit");
+    payload["tool_name"] = json!(tool);
+    payload["session_id"] = json!(session);
+    payload["tool_input"]["file_path"] = json!(format!("/work/acme-widgets/{file}"));
+    payload
+}
+
+/// #542 items 5 and 13: during a live hold an edit outside the declared scope is refused
+/// whether it is a `Write` or an `Edit` and whether the file exists, since the Hub sees only
+/// the path. A directory entry (`docs/**`) covers every file under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_refusals_follow_the_declared_scope_not_the_tool_or_file() {
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs", "docs/**"],
+        None,
+        unix_now(),
+    );
+    for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
+        let answer = hub.hook_raw("claude", &lead, &edit_of(tool, session, file));
+        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+        assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
+        assert!(
+            reason.contains("outside the declared scope"),
+            "{tool} {file}: {answer}"
+        );
+    }
+    for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
+        hub.hook("claude", &lead, &edit_of(tool, session, file));
+    }
+}
+
+/// #542 item 10: after a lapsed hold is resumed, an out-of-scope refusal quotes the resumed
+/// generation and its current fence, not the lapsed ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let lapsed = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let resumed = start_work(
+        &hub,
+        &token,
+        session,
+        &["src/widget.rs"],
+        Some((&lapsed.id, lapsed.generation)),
+        unix_now(),
+    );
+    assert!(resumed.generation > lapsed.generation);
+    let answer = hub.hook_raw("claude", &lead, &edit_of("Edit", session, "src/lib.rs"));
+    let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+    assert!(
+        reason.contains(&format!(
+            "generation {}, expected_updated_seq {}",
+            resumed.generation, resumed.updated_seq
+        )),
+        "{answer}"
+    );
+}
+
+/// #542 item 9: the lead's next tool call after its hold lapsed says so once, before any edit
+/// is refused. A subagent's call says nothing, since its context ends with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    let item = start_work(&hub, &token, session, &["src/widget.rs"], None, begun);
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let read = |agent_id: Option<&str>| {
+        let mut call = json!({"hook_event_name":"PostToolUse", "session_id":session,
+            "tool_name":"Read", "tool_input":{"file_path":"/work/acme-widgets/src/lib.rs"},
+            "cwd":"/work/acme-widgets"});
+        if let Some(id) = agent_id {
+            call["agent_id"] = json!(id);
+        }
+        call
+    };
+    assert_eq!(
+        hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
+        json!({})
+    );
+    // Only Claude Code's tool events are known to take added context.
+    assert_eq!(hub.hook_raw("codex", &lead, &read(None)), json!({}));
+    let answer = hub.hook_raw("claude", &lead, &read(None));
+    assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(text.contains("its next edit is refused"), "{answer}");
+    assert!(text.contains("LEASE_LAPSED"), "{answer}");
+    assert!(
+        text.contains(&format!(
+            "work_id {}, takeover_generation {}",
+            item.id, item.generation
+        )),
+        "{answer}"
+    );
+    assert!(!text.contains("when this was refused"), "{answer}");
+    assert_eq!(hub.hook_raw("claude", &lead, &read(None)), json!({}));
 }
 
 /// The hook's side of answering a permission prompt from the Hub. A request needs its session's

@@ -42,7 +42,6 @@ mod autopsy_cli;
 mod change_capture_cli;
 #[cfg(unix)]
 mod change_capture_client;
-mod client_activity;
 mod client_cli;
 mod client_config;
 mod client_mcp;
@@ -123,7 +122,6 @@ mod slack_cli;
 mod team_cli;
 mod telemetry;
 mod telemetry_cli;
-mod tray;
 #[cfg(unix)]
 mod walkthrough_cli;
 mod why_cli;
@@ -166,8 +164,9 @@ enum Command {
         #[command(subcommand)]
         command: walkthrough_cli::WalkthroughCommand,
     },
-    /// Open the optional native status-bar companion (macOS).
-    Tray(tray::TrayArgs),
+    /// Removed: the menu bar app. Kept so an old Start at Login entry cleans itself up.
+    #[command(hide = true)]
+    Tray(quickstart::RetiredTrayArgs),
     /// Open this checkout's Hub page in your browser, connected to this computer's files and
     /// saved conversations. Starts the local page when needed; `--stop` stops it.
     #[cfg(unix)]
@@ -757,7 +756,7 @@ const CORE_HELP: [(&str, &[&str]); 3] = [
             "client doctor",
         ],
     ),
-    ("Every day", &["open", "tray"]),
+    ("Every day", &["open"]),
 ];
 
 /// The command line as people see it: the core commands in groups instead of every command.
@@ -965,7 +964,7 @@ enum RunExit {
 
 async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
-        Command::Tray(args) => tray::run(args).await?,
+        Command::Tray(_) => quickstart::retired_tray()?,
         #[cfg(unix)]
         Command::Open(args) => open_cli::run(args).await?,
         #[cfg(unix)]
