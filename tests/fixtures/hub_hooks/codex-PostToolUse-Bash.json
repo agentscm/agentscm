@@ -1,0 +1,16 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/work/.codex/sessions/rollout-11111111.jsonl",
+  "cwd": "/work/acme-widgets",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "turn_id": "turn-0001",
+  "tool_name": "Bash",
+  "tool_use_id": "call_SYNTHETIC0002",
+  "tool_input": { "command": "cargo fmt" },
+  "observed": {
+    "outcome": "unknown",
+    "reason": "missing_snapshot"
+  }
+}

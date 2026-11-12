@@ -179,7 +179,8 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "PermissionRequest":[{"hooks":[hook(43_200)]}],
         "Stop":[{"hooks":[hook(3), wait]}],
         "SessionEnd":[{"hooks":[hook(3), wait_end]}],
-        // Only change capture uses these, for checkouts whose Hub shares agent conversations.
+        // A failed shell call also ends its observation of the working tree (PostToolUseFailure).
+        // Change capture alone uses the rest, for checkouts whose Hub shares agent conversations.
         "PostToolUseFailure":[{"hooks":[hook(3)]}],
         "MessageDisplay":[{"hooks":[hook(3)]}],
         "PreCompact":[{"hooks":[hook(3)]}],
