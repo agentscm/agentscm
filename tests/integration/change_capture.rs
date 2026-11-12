@@ -6396,13 +6396,8 @@ fn codex_import_selects_visible_history_and_usage_and_leaves_the_rest() {
                 Some(Failed)
             ),
             (ToolStarted, Some(Search), None, Some("ws_1"), None),
-            (
-                ToolFinished,
-                Some(Search),
-                None,
-                Some("ws_1"),
-                Some(Returned)
-            ),
+            // A web search's record has no status, so how it ended is not reported.
+            (ToolFinished, Some(Search), None, Some("ws_1"), None),
             (AssistantMessage, None, None, None, None),
         ]
     );

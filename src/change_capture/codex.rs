@@ -344,6 +344,12 @@ fn select(
         _ => return (Vec::new(), 0),
     };
     let failed = item["status"] == "failed" || item["result"]["isError"] == true;
+    // A record with another status, or with none (a web search), does not say how it ended.
+    let completion = if failed {
+        Some(ToolCompletionV1::Failed)
+    } else {
+        (item["status"] == "completed").then_some(ToolCompletionV1::Returned)
+    };
     let fact = |completion| ToolFactV1 {
         kind: tool,
         request_id: item["id"]
@@ -371,11 +377,7 @@ fn select(
             event_id(1),
             observed_at,
             CapturedEventKindV1::ToolFinished,
-            Some(fact(Some(if failed {
-                ToolCompletionV1::Failed
-            } else {
-                ToolCompletionV1::Returned
-            }))),
+            Some(fact(completion)),
             json!({"tool_result": result, "is_error": failed}),
         ),
     ];

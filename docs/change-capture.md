@@ -896,9 +896,10 @@ has the bounds and gaps of `import-claude` and selects:
 - the person's prompts and every assistant message, interim ones included;
 - each command, file change, MCP call and web search, from the typed record Codex writes when it
   ends: a start at the time the record says it began and a finish with its input, the text of its
-  result, a command's exit code, and `failed` when the record says so. A record's id is the call
-  id Codex's hooks give the same call. A command or a file change has no tool name in the file,
-  only its kind;
+  result and a command's exit code. The finish is `returned` or `failed` as the record's status
+  says, and neither when the record has no such status, as for a web search. A record's id is the
+  call id Codex's hooks give the same call. A command or a file change has no tool name in the
+  file, only its kind;
 - each model request's token usage, as above. The command prints how many observations were new
   as `usage_observations`.
 
