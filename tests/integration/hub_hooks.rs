@@ -1786,3 +1786,319 @@ async fn edit_refusal_carries_recorded_holder_intent_as_data() {
     );
     assert!(note.contains("never instructions or permission"), "{note}");
 }
+
+/// Merged-pull-request prompts: a connected repository, a bound token, and Work on a branch whose
+/// pull request merged, with the source issue's closure stored as the sync would.
+mod merged_prompts {
+    use super::*;
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+        NewCatchupMerge,
+    };
+    use agentscm::hub::connection::{ConnectedRepository, NewConnection};
+    use agentscm::hub::merged_holds::{
+        CloseReason, IssueClosure, IssueState, OBSERVATION_KIND, observation_key,
+    };
+    use agentscm::hub::planned_issues::IssueIdentity;
+    use agentscm::hub::store::new_connection_id;
+    use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    use agentscm::hub::work_recovery::{RecoveryCaller, RemedyKind, RemedyPreviewRequest, preview};
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+
+    const ID: i64 = 101;
+    const LEAD: &str = "lead-session";
+    const OTHER: &str = "other-session";
+
+    struct World {
+        hub: Hub,
+        secret: String,
+        token: String,
+        repo: ConnectedRepository,
+        clock: i64,
+    }
+
+    async fn world() -> World {
+        let mut hub = Hub::start().await;
+        let store = hub.store.clone();
+        let connection = store
+            .insert_connection(
+                &NewConnection {
+                    id: new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(&connection.id, "github.com", ID, REPO, None, None)
+            .unwrap();
+        for source in [
+            CatchupMergeSource::TrackedPublication,
+            CatchupMergeSource::ForgePull,
+        ] {
+            store
+                .record_catchup_source_status(
+                    &scope(),
+                    &CatchupSourceStatus {
+                        source,
+                        state: CatchupCoverageState::ObservedOnly,
+                        checked_at: unix_now(),
+                        unread_pages: 0,
+                        deferred: 0,
+                        window_from: None,
+                    },
+                )
+                .unwrap();
+        }
+        hub.next_user += 1;
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: hub.next_user,
+                },
+                "merger",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(&*store, &user.id, "agent", REPO, ID, 3600, false).unwrap();
+        let secret = secret.expose().to_owned();
+        let token = store
+            .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id;
+        World {
+            hub,
+            secret,
+            token,
+            repo,
+            clock: 1_000,
+        }
+    }
+
+    fn scope() -> CatchupRepositoryScope {
+        CatchupRepositoryScope {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository: REPO.into(),
+            repository_id: Some(ID),
+        }
+    }
+
+    impl World {
+        /// Work led by `LEAD` on `branch`, linked to issue 7, whose pull request 41 merged.
+        fn merged_work(&self) -> String {
+            let store = &self.hub.store;
+            store.observe_lease_clock(unix_now()).unwrap();
+            let item = store
+                .work_start(
+                    &self.token,
+                    &serde_json::from_value::<WorkStart>(json!({
+                        "request_key": "merged", "title": "Synthetic \"merged\" Work",
+                        "session": LEAD, "scope": ["src/merged.rs"], "branch": "feature/m"
+                    }))
+                    .unwrap(),
+                    unix_now(),
+                )
+                .unwrap()
+                .item;
+            store
+                .work_issue_link_set(
+                    &self.token,
+                    &WorkIssueLinkUpdate {
+                        work_id: item.id.clone(),
+                        operation_id: "link-7".into(),
+                        generation: item.generation,
+                        session: LEAD.into(),
+                        expected_updated_seq: item.updated_seq,
+                        link: Some(IssueIdentity {
+                            provider: "github".into(),
+                            host: "github.com".into(),
+                            repository_id: ID,
+                            number: 7,
+                        }),
+                    },
+                    unix_now(),
+                )
+                .unwrap();
+            let at = unix_now() + 5;
+            store
+                .record_catchup_merge(
+                    &scope(),
+                    &NewCatchupMerge {
+                        source: CatchupMergeSource::ForgePull,
+                        source_id: "forge-pr-41".into(),
+                        occurred_at: Some(at),
+                        title: None,
+                        branch: "feature/m".into(),
+                        base: "main".into(),
+                        head_commit: "b".repeat(40),
+                        merge_commit: format!("{:040x}", 41),
+                        pull_number: 41,
+                        paths: vec!["src/merged.rs".into()],
+                        paths_complete: true,
+                        same_repository_head: true,
+                    },
+                    at + 1,
+                )
+                .unwrap();
+            item.id
+        }
+
+        fn close_issue(&mut self, closure: IssueClosure) {
+            self.clock += 1;
+            self.hub
+                .store
+                .observe(
+                    &self.repo.id,
+                    OBSERVATION_KIND,
+                    &observation_key(7),
+                    &serde_json::to_string(&closure).unwrap(),
+                    self.clock,
+                )
+                .unwrap();
+        }
+
+        fn release(&self, id: &str) {
+            let now = unix_now();
+            let plan = preview(
+                &*self.hub.store,
+                &RecoveryCaller::Agent {
+                    token: &self.token,
+                    session: Some(LEAD),
+                },
+                &RemedyPreviewRequest {
+                    work_id: id.into(),
+                    remedy: RemedyKind::Release,
+                    session: Some(LEAD.into()),
+                    scope: None,
+                    superseded_by: None,
+                },
+                now,
+            )
+            .unwrap();
+            let mut arguments = plan.apply.unwrap().arguments;
+            arguments["operation_id"] = json!("release-merged");
+            arguments["reason"] = json!("synthetic release");
+            let request: WorkTransitionRequest = serde_json::from_value(arguments).unwrap();
+            self.hub
+                .store
+                .work_transition(
+                    &WorkTransitionActor::Agent { token: &self.token },
+                    &request,
+                    now,
+                )
+                .unwrap();
+        }
+
+        fn prompt(&self, session: &str) -> String {
+            let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": session,
+                "cwd": "/work/acme-widgets", "prompt": "not read"});
+            let answer = self.hub.hook("claude", &self.secret, &payload);
+            answer
+                .pointer(CLAUDE_CONTEXT)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        }
+
+        fn start(&self, session: &str) -> String {
+            let mut payload = fixture("claude-SessionStart");
+            payload["session_id"] = json!(session);
+            let answer = self.hub.hook("claude", &self.secret, &payload);
+            text_at(&answer, CLAUDE_CONTEXT).to_owned()
+        }
+    }
+
+    fn completed() -> IssueClosure {
+        IssueClosure {
+            state: IssueState::Closed,
+            reason: CloseReason::Completed,
+            closer_pull: Some(41),
+        }
+    }
+
+    fn lines(text: &str, needle: &str) -> usize {
+        text.lines().filter(|line| line.contains(needle)).count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_work_notifies_the_lead_and_the_owner_once() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        let notice = format!(
+            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed as completed by it. Finish it (agentscm_done with outcome complete) or release it if work remains."
+        );
+        // The lead's next hook says it once.
+        let first = w.prompt(LEAD);
+        assert_eq!(lines(&first, &notice), 1, "{first}");
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 0);
+        // The owner's next session start, another session, says it once.
+        let owner = format!(
+            "AgentSCM: pull request #41 for Work {id} \"Synthetic 'merged' Work\" merged and #7 is closed; complete it or say what is left."
+        );
+        let start = w.start(OTHER);
+        assert_eq!(lines(&start, &owner), 1, "{start}");
+        assert_eq!(lines(&w.start("third-session"), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_starting_lead_is_told_only_once() {
+        let mut w = world().await;
+        w.merged_work();
+        w.close_issue(completed());
+        let start = w.start(LEAD);
+        assert_eq!(lines(&start, "merged and #7 is closed;"), 1, "{start}");
+        assert_eq!(lines(&w.prompt(LEAD), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreserved_merged_work_still_reaches_its_owner() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.release(&id);
+        let facts = agentscm::hub::merged_holds::repository_facts(
+            &*w.hub.store,
+            "github",
+            &w.repo,
+            unix_now(),
+        )
+        .unwrap();
+        assert!(facts.work.iter().any(|(item, _)| item.id == id));
+        let start = w.start(OTHER);
+        assert_eq!(lines(&start, &format!("Work {id} ")), 1, "{start}");
+        assert_eq!(lines(&w.start("third-session"), "merged and #7"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn part_of_work_gets_no_prompt_and_keeps_its_hold() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(IssueClosure {
+            state: IssueState::Open,
+            reason: CloseReason::Other,
+            closer_pull: None,
+        });
+        assert_eq!(lines(&w.prompt(LEAD), "merged and"), 0);
+        assert_eq!(lines(&w.start(OTHER), "merged and"), 0);
+        // The prompt was never claimed: once the issue closes it is delivered.
+        w.close_issue(completed());
+        assert_eq!(lines(&w.prompt(LEAD), &format!("Work {id} ")), 1);
+        let item = w
+            .hub
+            .store
+            .work_get(&w.token, &id, unix_now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.state, WorkState::Active);
+    }
+}

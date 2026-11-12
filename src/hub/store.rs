@@ -1552,6 +1552,22 @@ pub trait Store: Send + Sync {
         limit: usize,
         current: &super::promise::PromiseCurrentAdmissionsV1,
     ) -> Result<PromisePageV1>;
+    /// Records that `audience` (`lead` or `owner`) was told `work`'s merged pull request closed
+    /// its issue. True only for the first claim, so a notice is delivered once however many
+    /// hooks race.
+    fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool>;
+    /// Unfinished Work of one repository that holds no reservation and that the repository
+    /// overview hides because its branch merged, oldest first by id, at most `limit`.
+    fn repository_unreserved_merged_work(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<WorkItem>>;
+    /// The unfinished Work that `session` of `token` leads, by id, at most five.
+    fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.

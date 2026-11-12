@@ -1132,6 +1132,100 @@ fn work_reconcile_merged_hold_refusal() {
     }
 }
 
+/// Release `id` through the recovery preview and its apply call, as an owner does.
+fn release_work(ctx: &Ctx, id: &str, session: &str) {
+    use agentscm::hub::work_recovery::{RecoveryCaller, RemedyKind, RemedyPreviewRequest, preview};
+    let now = unix_now();
+    let release = preview(
+        &*ctx.store,
+        &RecoveryCaller::Agent {
+            token: ctx.token(),
+            session: Some(session),
+        },
+        &RemedyPreviewRequest {
+            work_id: id.into(),
+            remedy: RemedyKind::Release,
+            session: Some(session.into()),
+            scope: None,
+            superseded_by: None,
+        },
+        now,
+    )
+    .unwrap();
+    let mut arguments = release.apply.unwrap().arguments;
+    arguments["operation_id"] = json!("release-merged-unreserved");
+    arguments["reason"] = json!("synthetic release");
+    let request: agentscm::hub::work_transition::WorkTransitionRequest =
+        serde_json::from_value(arguments).unwrap();
+    ctx.store
+        .work_transition(
+            &agentscm::hub::work_transition::WorkTransitionActor::Agent { token: ctx.token() },
+            &request,
+            now,
+        )
+        .unwrap();
+}
+
+/// Merged Work that holds no reservation is still in the repository facts, so its issue's
+/// closure is fetched and its owner can be told; a merge prompt is claimed once per audience.
+fn merged_unreserved_facts(fixture: &StoreFixture) {
+    use agentscm::hub::merged_holds::{MergedHold, repository_facts};
+    let ctx = setup(fixture);
+    ctx.store.observe_lease_clock(unix_now()).unwrap();
+    let work = branch_work(&ctx, "u", "src/u", "feature/u");
+    branch_merge(&ctx, 51, "feature/u", unix_now() + 5, true);
+    let listed = |ctx: &Ctx| {
+        repository_facts(&*ctx.store, "github", &ctx.repo, unix_now())
+            .unwrap()
+            .work
+            .into_iter()
+            .find(|(item, _)| item.id == work.id)
+    };
+    let (_, held) = listed(&ctx).expect("held merged Work is listed");
+    assert_eq!(held.hold, MergedHold::MergedOnly { pull: 51 });
+    release_work(&ctx, &work.id, "session-u");
+    let overview = ctx
+        .store
+        .work_overview(ctx.token(), &Default::default(), unix_now())
+        .unwrap();
+    assert!(overview.current.iter().all(|item| item.id != work.id));
+    assert_eq!(overview.settled_count, 1);
+    let (item, unreserved) = listed(&ctx).expect("unreserved merged Work is listed");
+    assert_eq!(item.id, work.id);
+    assert_eq!(unreserved.hold, MergedHold::MergedOnly { pull: 51 });
+}
+
+#[test]
+fn work_reconcile_merged_unreserved_facts() {
+    run_both(merged_unreserved_facts);
+}
+
+fn merge_prompt_claim(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let work = ctx.start("p", "src/p", &[]);
+    assert!(ctx.store.claim_merge_prompt(&work.id, "lead", 10).unwrap());
+    assert!(!ctx.store.claim_merge_prompt(&work.id, "lead", 11).unwrap());
+    assert!(ctx.store.claim_merge_prompt(&work.id, "owner", 12).unwrap());
+    assert!(!ctx.store.claim_merge_prompt(&work.id, "owner", 13).unwrap());
+    let led = ctx
+        .store
+        .session_led_work(ctx.token(), "session-p")
+        .unwrap();
+    assert_eq!(led.len(), 1);
+    assert_eq!(led[0].id, work.id);
+    assert!(
+        ctx.store
+            .session_led_work(ctx.token(), "session-other")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn work_reconcile_merge_prompt_claim() {
+    run_both(merge_prompt_claim);
+}
+
 fn status_stage(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let setup_observations = agentscm::hub::onboarding::Observations::default();

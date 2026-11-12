@@ -268,10 +268,18 @@ pub fn repository_facts(
         },
         now,
     )?;
-    let items: Vec<_> = overview
-        .current
+    // The overview hides unreserved Work whose branch merged; the merged facts are about it.
+    let hidden = store.repository_unreserved_merged_work(
+        &principal.owner,
+        &repo.full_name,
+        repo.repository_id,
+        MAX_WORK_PAGE,
+        now,
+    )?;
+    let listed: Vec<&WorkItem> = overview.current.iter().chain(&hidden).collect();
+    let items: Vec<_> = listed
         .iter()
-        .map(|item| (item, OutcomeValue::None))
+        .map(|item| (*item, OutcomeValue::None))
         .collect();
     let reader = WorkLifecycleReader::Person {
         owner: &principal.owner,
@@ -279,8 +287,7 @@ pub fn repository_facts(
         repository_id: repo.repository_id,
     };
     let (stages, limits) = work_stages(store, &principal, &reader, &items, now);
-    let mut work: Vec<_> = overview
-        .current
+    let mut work: Vec<_> = listed
         .iter()
         .map(|item| {
             let facts = facts(
@@ -292,7 +299,7 @@ pub fn repository_facts(
                 &repo.full_name,
                 repo.repository_id,
             );
-            (item.clone(), facts)
+            ((*item).clone(), facts)
         })
         .collect();
     work.sort_by(|a, b| a.0.id.cmp(&b.0.id));
@@ -336,6 +343,120 @@ pub fn work_facts(
         &repo.full_name,
         repo.repository_id,
     ))
+}
+
+/// The most owner start lines one session start carries.
+// ponytail: ten lines, oldest Work id first; upgrade: a count line and a page when more wait.
+const MAX_START_LINES: usize = 10;
+
+fn merged_line(item: &WorkItem, pull: u64, issue: u64, ending: &str) -> String {
+    format!(
+        "AgentSCM: pull request #{pull} for Work {id} \"{title}\" merged and #{issue} is closed{ending}",
+        id = item.id,
+        title = super::advice::sanitize(&item.title, 80),
+    )
+}
+
+/// A notice not yet delivered: `claim` it, and show the line only when the claim is won.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedNotice {
+    work: String,
+    /// The audience the line is for (`lead` or `owner`).
+    audience: &'static str,
+    /// Audiences claimed with it, so the same session is not told twice.
+    also: Option<&'static str>,
+    line: String,
+}
+
+/// Claims each notice once ever and returns the lines of those this call won. Run it only when
+/// the lines will be delivered: the claim is the delivery.
+pub fn claim_notices(store: &dyn Store, notices: Vec<MergedNotice>, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    for notice in notices {
+        if !store
+            .claim_merge_prompt(&notice.work, notice.audience, now)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(also) = notice.also {
+            let _ = store.claim_merge_prompt(&notice.work, also, now);
+        }
+        lines.push(notice.line);
+    }
+    lines
+}
+
+/// The unclaimed notice for each unfinished Work that `session` of `principal` leads whose merged
+/// pull request closed its source issue.
+pub fn lead_notices(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Vec<MergedNotice> {
+    let Ok(led) = store.session_led_work(&principal.token_id, session) else {
+        return Vec::new();
+    };
+    led.into_iter()
+        .filter_map(|item| {
+            let hold = work_facts(store, principal, &item, now)?.hold;
+            let MergedHold::Settled { pull, issue } = hold else {
+                return None;
+            };
+            Some(MergedNotice {
+                work: item.id.clone(),
+                audience: "lead",
+                also: None,
+                line: merged_line(
+                    &item,
+                    pull,
+                    issue,
+                    " as completed by it. Finish it (agentscm_done with outcome complete) or release it if work remains.",
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The unclaimed notice for each unfinished Work in the principal's repository that its owner
+/// owns, held or not, whose merged pull request closed its source issue. `session` is the session
+/// that is starting: when it leads such Work, the lead notice is claimed with the owner's.
+pub fn owner_start_notices(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Vec<MergedNotice> {
+    let Ok(Some(repo)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(facts) = repository_facts(store, &principal.owner.identity.provider, &repo, now) else {
+        return Vec::new();
+    };
+    facts
+        .work
+        .into_iter()
+        .filter(|(item, _)| item.owner == principal.owner.id)
+        .filter_map(|(item, facts)| {
+            let MergedHold::Settled { pull, issue } = facts.hold else {
+                return None;
+            };
+            let leads = item.lead_token == principal.token_id && item.lead_session == session;
+            Some(MergedNotice {
+                work: item.id.clone(),
+                audience: "owner",
+                also: leads.then_some("lead"),
+                line: merged_line(&item, pull, issue, "; complete it or say what is left."),
+            })
+        })
+        .take(MAX_START_LINES)
+        .collect()
 }
 
 /// The sentence a refusal adds when the holding Work's linked pull request merged. Numbers only:

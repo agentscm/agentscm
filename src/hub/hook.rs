@@ -520,6 +520,44 @@ async fn hook(
                     call.context_hook,
                     unix_now(),
                 );
+                // The lead of Work whose merged pull request closed its issue hears it once. The
+                // claim is the delivery, so it runs only where the text is kept.
+                if context && outcome.status != "unknown" && !principal.read_only {
+                    let (store, scope, name) =
+                        (state.store.clone(), principal.clone(), session.clone());
+                    let found = blocking(&state, move || {
+                        Ok(super::merged_holds::lead_notices(
+                            &*store,
+                            &scope,
+                            &name,
+                            unix_now(),
+                        ))
+                    });
+                    let notices = timeout_at(deadline, found).await;
+                    let store = state.store.clone();
+                    let lines = match notices {
+                        Ok(Ok(notices)) if !notices.is_empty() => {
+                            blocking(&state, move || {
+                                Ok(super::merged_holds::claim_notices(
+                                    &*store,
+                                    notices,
+                                    unix_now(),
+                                ))
+                            })
+                            .await
+                        }
+                        _ => Ok(Vec::new()),
+                    };
+                    if let Ok(lines) = lines {
+                        for line in lines {
+                            outcome.text.push('\n');
+                            outcome.text.push_str(&line);
+                            if outcome.status == "clean" {
+                                outcome.status = "fyi";
+                            }
+                        }
+                    }
+                }
                 // An unknown reply loses its text after the session's first, so it takes nothing.
                 // A take that finishes past the deadline is offered again later (REOFFER_SECS).
                 if context && outcome.status != "unknown" {
@@ -1277,6 +1315,47 @@ impl Call {
                 if let Some(block) = super::context_source::render(&operator_context) {
                     text.push('\n');
                     text.push_str(&block);
+                }
+                // Work of this owner whose merged pull request closed its issue: once each, ever.
+                // The claim is the delivery, so a line is claimed only when it is kept here.
+                if !principal.read_only && !self.child {
+                    let (store, scope, name) = (
+                        state.store.clone(),
+                        principal.clone(),
+                        advice.touched.session.clone(),
+                    );
+                    let found = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        blocking(state, move || {
+                            Ok(super::merged_holds::owner_start_notices(
+                                &*store,
+                                &scope,
+                                &name,
+                                unix_now(),
+                            ))
+                        }),
+                    )
+                    .await;
+                    let store = state.store.clone();
+                    let lines = match found {
+                        Ok(Ok(notices)) if !notices.is_empty() => {
+                            blocking(state, move || {
+                                Ok(super::merged_holds::claim_notices(
+                                    &*store,
+                                    notices,
+                                    unix_now(),
+                                ))
+                            })
+                            .await
+                        }
+                        _ => Ok(Vec::new()),
+                    };
+                    if let Ok(lines) = lines {
+                        for line in lines {
+                            text.push('\n');
+                            text.push_str(&line);
+                        }
+                    }
                 }
                 text.push('\n');
                 text.push_str(&match briefing {

@@ -17887,6 +17887,71 @@ impl Store for SqliteStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(events)
     }
+
+    fn claim_merge_prompt(&self, work: &str, audience: &str, now: i64) -> Result<bool> {
+        let conn = self.conn();
+        let inserted = conn.execute(
+            "INSERT INTO hub_work_merge_prompts (work, audience, delivered_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (work, audience) DO NOTHING",
+            params![work, audience, now],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    fn repository_unreserved_merged_work(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<WorkItem>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let catchup_repository = repository_namespace(repository, Some(repository_id));
+        let catchup_key = catchup_repository_key(Some(repository_id));
+        let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
+        let mut items = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT w.snapshot FROM hub_work_items w
+                 WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id = ?4
+                   AND w.state <> 'finished' AND w.reservation_basis IS NULL AND {settled}
+                 ORDER BY w.id LIMIT ?8"
+            ))?;
+            statement
+                .query_map(
+                    params![
+                        owner.identity.provider,
+                        owner.identity.host,
+                        repository,
+                        repository_id,
+                        catchup_repository,
+                        catchup_key,
+                        AUTO_PAUSE_SUMMARY,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .map(|snapshot| json_value::<WorkItem>(&snapshot?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        project_claims(&tx, &mut items, now)?;
+        tx.commit()?;
+        Ok(items)
+    }
+
+    fn session_led_work(&self, token: &str, session: &str) -> Result<Vec<WorkItem>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT snapshot FROM hub_work_items
+             WHERE lead_token = ?1 AND lead_session = ?2 AND state <> 'finished'
+             ORDER BY id LIMIT 5",
+        )?;
+        statement
+            .query_map(params![token, session], |row| row.get::<_, String>(0))?
+            .map(|snapshot| json_value::<WorkItem>(&snapshot?))
+            .collect()
+    }
 }
 
 #[cfg(test)]
