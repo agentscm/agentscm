@@ -138,8 +138,11 @@ for a full participant list. A finding it will not apply is listed as skipped wi
 report-only, not permitted, incomplete facts, a resume or handover, input only you can supply, or a
 second repair of the same Work. It never plans `complete`. The default is a dry run that changes
 nothing. `--apply` sends the plan through `work transitions` in chunks of 25, each item with the
-fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`, so rerunning
-after an interruption replays what applied (`replayed`) and a moved fence is refused. It prints one
+fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`. A rerun reads a
+fresh inventory, so items that already applied are no longer planned; an item that never applied is
+planned again, under the same operation id if its fences are unchanged or with new fences if the Work
+moved. `replayed` is what resending the identical batch through `work transitions` returns. Nothing
+is applied twice. Against a Hub that does not report findings it fails instead of planning nothing. It prints one
 outcome per item and exits non-zero when any item is refused, in conflict or unavailable. `--json`
 prints `{"applied", "planned", "skipped", "results", "complete"}`.
 

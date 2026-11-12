@@ -20,7 +20,7 @@ use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
 use agentscm::hub::work_recovery::{
     BatchOutcome, MAX_BATCH_TRANSITIONS, RecoveryQuery, RemedyKind, RemedyPreviewRequest,
     RepairPlanV1, RepairReportV1, RepairResultV1, WorkRecoveryV1, WorkTransitionBatch,
-    WorkTransitionBatchV1, render_repair, repair_plan,
+    WorkTransitionBatchV1, render_repair, repair_plan, require_findings,
 };
 use agentscm::{Error, Result};
 use clap::Subcommand;
@@ -271,7 +271,7 @@ pub enum WorkCommand {
     },
     /// Plan the repairs your owner's inventory proposes for retained claims: release a lapsed hold
     /// or prune a full participant list. Dry run by default; --apply sends the plan with fixed
-    /// operation ids, so a rerun replays what applied. Never completes, resumes or hands over.
+    /// operation ids; a rerun reads a fresh inventory and applies nothing twice. Never completes, resumes or hands over.
     Repair {
         /// Your agent session.
         #[arg(long)]
@@ -1030,7 +1030,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             }
             if report.failed() > 0 {
                 return Err(Error::Conflict(format!(
-                    "{} repairs were not applied; rerunning the command replays the applied ones and retries the rest",
+                    "{} repairs were not applied; rerun the command: it reads a fresh inventory, plans only what is still needed and applies nothing twice",
                     report.failed()
                 )));
             }
@@ -1151,6 +1151,7 @@ async fn repair(hub: &Hub, session: Option<String>, apply: bool) -> Result<Repai
             )
             .await?;
         let page: WorkRecoveryV1 = reply::decode(&reply).map_err(|e| invalid(&e.to_string()))?;
+        require_findings(&page).map_err(invalid)?;
         let part = repair_plan(&page);
         plan.planned.extend(part.planned);
         plan.skipped.extend(part.skipped);

@@ -1915,6 +1915,47 @@ fn the_inventory_proposes_a_prune_that_frees_a_full_list(db: &Db) {
     assert!(resumed.took_over);
 }
 
+/// A Work whose participant list is not full lists no prune option, even for its owner, and a
+/// direct preview of one refuses it as not needed.
+fn a_healthy_work_lists_no_prune_option(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-lead", "src/a/**"), now)
+        .unwrap()
+        .item;
+    let later = now + LEASE_SECONDS + 1;
+    tick(&*store, now, later);
+    let me = caller(&alice, "s-new");
+    let page = one(&*store, &me, &work.id, later);
+    assert!(
+        page.work[0]
+            .remedies
+            .iter()
+            .all(|remedy| remedy.remedy != RemedyKind::PruneParticipants)
+    );
+    let refused = preview(
+        &*store,
+        &me,
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-new".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(!refused.permitted);
+    assert_eq!(
+        refused.refusal.as_ref().unwrap().code,
+        RefusalCode::WrongState
+    );
+}
+
 /// Another owner's agent can read a Work but is offered no transition and no prune on it.
 fn other_owners_items_are_refused_not_taken(db: &Db) {
     let store = db.open();
@@ -1945,17 +1986,31 @@ fn other_owners_items_are_refused_not_taken(db: &Db) {
             .iter()
             .all(|remedy| !remedy.permitted || remedy.remedy == RemedyKind::Resume)
     );
-    let prune = entry
-        .remedies
-        .iter()
-        .find(|remedy| remedy.remedy == RemedyKind::PruneParticipants)
-        .unwrap();
-    assert!(!prune.permitted);
+    // Prune is not offered at all to a caller without standing, and a direct preview refuses it.
+    assert!(
+        entry
+            .remedies
+            .iter()
+            .all(|remedy| remedy.remedy != RemedyKind::PruneParticipants)
+    );
+    let refused = preview(
+        &*store,
+        &caller(&bob, "s-b"),
+        &RemedyPreviewRequest {
+            work_id: work.id.clone(),
+            remedy: RemedyKind::PruneParticipants,
+            session: Some("s-b".into()),
+            scope: None,
+            superseded_by: None,
+        },
+        later + 1,
+    )
+    .unwrap();
+    assert!(!refused.permitted);
     assert_eq!(
-        prune.refusal.as_ref().unwrap().code,
+        refused.refusal.as_ref().unwrap().code,
         RefusalCode::NotAuthorized
     );
-    assert!(prune.apply.is_none());
     assert!(
         entry
             .findings
@@ -2247,6 +2302,7 @@ conformance!(
     inventory_never_proposes_complete_from_age,
     read_only_inventory_changes_nothing,
     the_inventory_proposes_a_prune_that_frees_a_full_list,
+    a_healthy_work_lists_no_prune_option,
     other_owners_items_are_refused_not_taken,
     interrupted_repair_replays_applied_items,
     retention_gap_retry_refuses_not_replays,

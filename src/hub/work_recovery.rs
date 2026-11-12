@@ -392,6 +392,10 @@ pub struct WorkRecoveryV1 {
     /// instead of starting a duplicate. Each is also in `work`.
     pub resumable: Vec<String>,
     pub resumable_complete: bool,
+    /// True when this Hub reports `findings`. An older Hub sends none, so an empty `findings`
+    /// list there means "not reported", never "nothing to repair".
+    #[serde(default)]
+    pub findings_reported: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -975,6 +979,14 @@ fn options(
 ) -> Vec<RemedyOptionV1> {
     RemedyKind::ALL
         .into_iter()
+        // Prune is listed only where it can be applied: for the owner or an administrator, on a
+        // Work whose participant list needs it. Everywhere else it would only add noise, and a
+        // client that does not know the remedy would fall back to raw JSON for every reply.
+        .filter(|remedy| {
+            *remedy != RemedyKind::PruneParticipants
+                || (matches!(subject.standing, Standing::Owner | Standing::Admin)
+                    && !subject.prune.is_empty())
+        })
         .map(|remedy| {
             let refusal = decide(remedy, subject, caller, viewer);
             RemedyOptionV1 {
@@ -1332,6 +1344,7 @@ pub fn inspect(
         resumable_complete: facts.matches_complete && facts.matches.len() <= MAX_RECOVERY_LISTED,
         resumable,
         work,
+        findings_reported: true,
     })
 }
 
@@ -1762,6 +1775,16 @@ impl RepairReportV1 {
             .iter()
             .filter(|r| !matches!(r.outcome, BatchOutcome::Applied | BatchOutcome::Replayed))
             .count()
+    }
+}
+
+/// An inventory from a Hub that sends no findings plans nothing, so a repair must refuse it
+/// instead of reporting an empty plan as success.
+pub fn require_findings(recovery: &WorkRecoveryV1) -> std::result::Result<(), &'static str> {
+    if recovery.findings_reported {
+        Ok(())
+    } else {
+        Err("this Hub does not report repair findings; update the Hub before running work repair")
     }
 }
 
@@ -2621,7 +2644,22 @@ mod tests {
             conflicts_complete: true,
             resumable: Vec::new(),
             resumable_complete: true,
+            findings_reported: true,
         }
+    }
+
+    #[test]
+    fn a_reply_without_findings_reported_is_refused_by_repair() {
+        let mut reply = serde_json::to_value(inventory(Vec::new())).unwrap();
+        reply.as_object_mut().unwrap().remove("findings_reported");
+        let page: WorkRecoveryV1 = crate::hub::reply::decode(&reply).unwrap();
+        assert!(!page.findings_reported);
+        assert!(
+            require_findings(&page)
+                .unwrap_err()
+                .contains("update the Hub")
+        );
+        assert!(require_findings(&inventory(Vec::new())).is_ok());
     }
 
     #[test]
