@@ -14,7 +14,7 @@ use super::http::{ApiError, Reader, blocking};
 use super::intent::scope;
 use super::pickup::{MAX_PICKUPS_PER_OWNER, PICKUP_RETAIN_SECONDS, PICKUP_TTL_SECONDS};
 use super::work::{WORK_PAYLOAD_CAPACITY_BYTES, WorkRepositoryScope};
-use super::{HubState, WORK_AUTO_COMPACTION_AGE_SECONDS, WORK_COMPACTION_INTERVAL};
+use super::{HubState, WORK_COMPACTION_INTERVAL};
 
 pub fn routes() -> Router<HubState> {
     Router::new().route("/v1/hub/repos/{repo}/retention", get(show))
@@ -33,8 +33,14 @@ async fn show(
         repository: principal.repository.clone(),
         repository_id: principal.repository_id,
     };
-    let store = state.store.clone();
-    let used = blocking(&state, move || store.work_payload_used(&used_scope)).await?;
+    let (store, hub) = (state.store.clone(), state.clone());
+    let (used, kept) = blocking(&state, move || {
+        Ok((
+            store.work_payload_used(&used_scope)?,
+            hub.work_history_seconds(&used_scope)?,
+        ))
+    })
+    .await?;
     Ok(Json(json!({
         "repository": principal.repository,
         "shared_conversations": {
@@ -46,7 +52,7 @@ async fn show(
             "payload_capacity_bytes": WORK_PAYLOAD_CAPACITY_BYTES,
             "payload_used_bytes": used,
             "compaction": {
-                "after_seconds": WORK_AUTO_COMPACTION_AGE_SECONDS,
+                "after_seconds": kept,
                 "interval_seconds": WORK_COMPACTION_INTERVAL.as_secs(),
             },
         },
@@ -72,7 +78,9 @@ mod tests {
     use crate::backend::LocalBackend;
     use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
     use crate::hub::work::WORK_PAYLOAD_CAPACITY_BYTES;
-    use crate::hub::{HubState, WORK_AUTO_COMPACTION_AGE_SECONDS, router};
+    use crate::hub::{HubState, WORK_AUTO_COMPACTION_AGE_SECONDS, router_with};
+    use axum::Router;
+    use axum::routing::get;
     use reqwest::Method;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -86,6 +94,13 @@ mod tests {
 
     impl Hub {
         async fn start() -> Self {
+            Self::start_with(|state| (state, Router::new())).await
+        }
+
+        /// A Hub an embedding program changed with `customize`.
+        async fn start_with(
+            customize: impl FnOnce(HubState) -> (HubState, Router<HubState>),
+        ) -> Self {
             let dir = TempDir::new().unwrap();
             let database = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
             let store = tokio::task::spawn_blocking(move || store::open(&database))
@@ -95,7 +110,8 @@ mod tests {
             let objects = LocalBackend::open(dir.path().join("objects")).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let app = router(HubState::new(store.clone(), Arc::new(objects)));
+            let (state, extra) = customize(HubState::new(store.clone(), Arc::new(objects)));
+            let app = router_with(state, extra);
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             Self {
                 base,
@@ -254,5 +270,44 @@ mod tests {
             )
             .await;
         assert_eq!(other["work"]["payload_used_bytes"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_embedding_program_sets_history_per_repository_and_serves_its_own_routes() {
+        let hub = Hub::start_with(|state| {
+            let state = state.with_work_history(|scope| {
+                Ok(if scope.repository == "acme/widgets" {
+                    90 * 86_400
+                } else {
+                    60
+                })
+            });
+            let extra = Router::new().route("/v1/hub/embedded", get(|| async { "embedded" }));
+            (state, extra)
+        })
+        .await;
+        let widgets = hub.token(1, "acme/widgets", 101, true).await;
+        let other = hub.token(2, "acme/private", 202, true).await;
+        let after = |body: Value| body["work"]["compaction"]["after_seconds"].clone();
+        let (_, kept) = hub.call(Method::GET, ROUTE, Some(&widgets), None).await;
+        assert_eq!(after(kept), json!(90 * 86_400));
+        // Never less than a day, the operator command's own floor.
+        let (_, short) = hub
+            .call(
+                Method::GET,
+                "/v1/hub/repos/acme%2Fprivate/retention",
+                Some(&other),
+                None,
+            )
+            .await;
+        assert_eq!(after(short), json!(86_400));
+        let embedded = hub
+            .client
+            .get(format!("{}/v1/hub/embedded", hub.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(embedded.status(), 200);
+        assert_eq!(embedded.text().await.unwrap(), "embedded");
     }
 }

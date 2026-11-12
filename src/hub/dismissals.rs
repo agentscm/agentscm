@@ -136,7 +136,15 @@ async fn scoped(
 ) -> std::result::Result<(String, String), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
-    let repo = super::login::devices::mint_check(state, &user, repository, "dismissals").await?;
+    // A person's own dismissals change nothing anyone else sees, so reading is enough.
+    let repo = super::login::devices::mint_check(
+        state,
+        &user,
+        repository,
+        "dismissals",
+        super::access::Level::Read,
+    )
+    .await?;
     let key = setting_key(&user.id, repo.repository_id);
     Ok((user.id, key))
 }

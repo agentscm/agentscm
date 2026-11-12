@@ -185,8 +185,14 @@ async fn create(
     )
     .map_err(pickup_error)?;
     // The same allow-list and forge role checks a read-token mint makes.
-    let repository =
-        super::login::devices::mint_check(&state, &user, &body.repository, "pickup").await?;
+    let repository = super::login::devices::mint_check(
+        &state,
+        &user,
+        &body.repository,
+        "pickup",
+        super::access::Level::Contribute,
+    )
+    .await?;
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {

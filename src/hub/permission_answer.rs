@@ -1582,8 +1582,14 @@ async fn answer(
             answers: body.answers,
         },
     };
-    let repo =
-        super::login::devices::mint_check(&state, &user, &body.repository, "permissions").await?;
+    let repo = super::login::devices::mint_check(
+        &state,
+        &user,
+        &body.repository,
+        "permissions",
+        super::access::Level::Contribute,
+    )
+    .await?;
     let requests = state.onboarding.permissions();
     let repository_id = Some(repo.repository_id);
     let token = requests.token_for(&user.id, repository_id, &body.request_id)?;
