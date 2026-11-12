@@ -118,10 +118,6 @@ fn local_snapshot_keeps_two_hubs_and_binding_generations_isolated() {
         value["connections"][0]["binding"]["generation"],
         value["connections"][1]["binding"]["generation"]
     );
-    assert_ne!(
-        value["connections"][0]["binding"]["activity_generation"],
-        value["connections"][1]["binding"]["activity_generation"]
-    );
 }
 
 #[test]
@@ -220,7 +216,6 @@ fn in_flight_token_rotation_clears_retired_binding_proof() {
     let status = &value["connections"][0];
     assert_eq!(status["binding"]["state"], "unknown");
     assert!(status["binding"].get("generation").is_none());
-    assert!(status["binding"].get("activity_generation").is_none());
     assert_eq!(status["credential"]["state"], "unknown");
     assert_eq!(status["hub_check"]["state"], "unavailable");
     assert_eq!(status["recent_participation"], serde_json::json!([]));

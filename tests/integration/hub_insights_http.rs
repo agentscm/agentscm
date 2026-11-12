@@ -162,6 +162,10 @@ fn assert_unknown_completion(insight: &Value) {
     assert_eq!(usage["output_tokens"], Value::Null);
     assert_eq!(usage["input_known_observations"], 0);
     assert_eq!(usage["output_known_observations"], 0);
+    assert_eq!(usage["cache_read_input_tokens"], Value::Null);
+    assert_eq!(usage["cache_creation_input_tokens"], Value::Null);
+    assert_eq!(usage["cache_read_input_known_observations"], 0);
+    assert_eq!(usage["cache_creation_input_known_observations"], 0);
     assert_eq!(usage["missing_cost_observations"], 1);
     assert_eq!(usage["reported_failed_attempts"], 0);
     assert!(usage["cost_groups"].as_array().unwrap().is_empty());
@@ -678,6 +682,7 @@ async fn reader_http_and_generic_mcp_reads_are_side_effect_free_and_usage_is_wri
         .collect();
     assert!(names.contains(&"agentscm_work_insight"));
     assert!(names.contains(&"agentscm_work_insights"));
+    assert!(names.contains(&"agentscm_work_usage_reports"));
     assert!(!names.contains(&"agentscm_work_usage"));
 
     let (status, mcp) = hub
@@ -691,6 +696,135 @@ async fn reader_http_and_generic_mcp_reads_are_side_effect_free_and_usage_is_wri
     assert_eq!(status, StatusCode::OK, "{mcp}");
     assert_eq!(mcp["result"]["isError"], false);
     assert_eq!(mcp["result"]["structuredContent"]["work_id"], id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stored_usage_reports_read_back_over_http_and_mcp_with_cached_input() {
+    let hub = Hub::start().await;
+    let writer = hub.token(false);
+    let reader = hub.token(true);
+    let work = start_work(&hub, &writer).await;
+    let id = work["item"]["id"].as_str().unwrap();
+    let mut cached = usage(id, "private-observation-one");
+    cached["cache_read_input_tokens"] = json!(400);
+    cached["provider_request_id"] = json!("private-request");
+    for report in [cached, usage(id, "private-observation-two")] {
+        let (status, body) = hub
+            .request(
+                reqwest::Method::POST,
+                "/v1/hub/standup/usage",
+                &writer,
+                Some(report),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let usage = insight(&hub, &reader, id).await["usage"].clone();
+    assert_eq!(usage["cache_read_input_tokens"], 400);
+    assert_eq!(usage["cache_read_input_known_observations"], 1);
+    assert_eq!(usage["cache_creation_input_tokens"], Value::Null);
+    assert_eq!(usage["cache_creation_input_known_observations"], 0);
+    assert_eq!(usage["token_groups"][0]["cache_read_input_tokens"], 400);
+    assert_eq!(
+        usage["token_groups"][0]["cache_creation_input_tokens"],
+        Value::Null
+    );
+
+    let path = format!("/v1/hub/standup/work/{id}/usage");
+    let (status, all) = hub
+        .request(reqwest::Method::GET, &path, &reader, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["version"], 1);
+    assert_eq!(all["work_id"], id);
+    assert_eq!(all["next_after"], Value::Null);
+    let items = all["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let cached = items
+        .iter()
+        .find(|item| item["cache_read_input_tokens"] == 400)
+        .unwrap();
+    // Unknown counts are null in a report too, and nothing identifies the session or caller.
+    assert_eq!(cached["input_tokens"], Value::Null);
+    assert_eq!(cached["cache_creation_input_tokens"], Value::Null);
+    assert_eq!(cached["output_tokens"], 37);
+    assert_eq!(cached["cost"]["amount_micros"], 1234);
+    assert_eq!(cached["model"], "model/2026.experimental");
+    assert!(cached["id"].as_str().unwrap().starts_with("usage-"));
+    let text = all.to_string();
+    assert!(!text.contains("private-") && !text.contains("surface-session"));
+
+    let (status, first) = hub
+        .request(
+            reqwest::Method::GET,
+            &format!("{path}?limit=1"),
+            &writer,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["next_after"], 1);
+    let (status, second) = hub
+        .request(
+            reqwest::Method::GET,
+            &format!("{path}?limit=1&after=1"),
+            &writer,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["next_after"], Value::Null);
+    assert_eq!(json!([first["items"][0], second["items"][0]]), all["items"]);
+
+    for query in ["limit=0", "limit=101", "after=501", "after=x", "page=2"] {
+        let (status, body) = hub
+            .request(
+                reqwest::Method::GET,
+                &format!("{path}?{query}"),
+                &reader,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+    let (status, _) = hub
+        .request(
+            reqwest::Method::GET,
+            "/v1/hub/standup/work/wrk_00000000000000000000000000000000/usage",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, mcp) = hub
+        .request(
+            reqwest::Method::POST,
+            "/mcp",
+            &reader,
+            Some(rpc(
+                "agentscm_work_usage_reports",
+                json!({"work_id":id,"limit":1,"after":1}),
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{mcp}");
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"]["items"], second["items"]);
+    let (_, missing) = hub
+        .request(
+            reqwest::Method::POST,
+            "/mcp",
+            &reader,
+            Some(rpc(
+                "agentscm_work_usage_reports",
+                json!({"work_id":"wrk_00000000000000000000000000000000"}),
+            )),
+        )
+        .await;
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -751,10 +885,37 @@ fn scoped_openapi_tracks_the_strict_usage_contract_and_all_routes() {
     for path in [
         "/v1/hub/standup/usage",
         "/v1/hub/standup/work/{id}/insights",
+        "/v1/hub/standup/work/{id}/usage",
         "/v1/hub/standup/insights",
     ] {
         assert!(document["paths"].get(path).is_some(), "missing {path}");
     }
+    let schemas = &document["components"]["schemas"];
+    for (schema, cache_fields) in [("UsageSummary", 4), ("TokenGroup", 4), ("UsageReport", 2)] {
+        let required = schemas[schema]["required"].as_array().unwrap();
+        let cache = required
+            .iter()
+            .filter(|field| field.as_str().unwrap().starts_with("cache_"))
+            .count();
+        assert_eq!(cache, cache_fields, "{schema}");
+        // Every listed property is required, so an unknown count is an explicit null.
+        assert_eq!(
+            required.len(),
+            schemas[schema]["properties"].as_object().unwrap().len(),
+            "{schema}"
+        );
+    }
+    for hidden in ["session", "observation_id", "provider_request_id"] {
+        assert!(schemas["UsageReport"]["properties"].get(hidden).is_none());
+    }
+    let page = &document["paths"]["/v1/hub/standup/work/{id}/usage"]["get"]["parameters"];
+    assert!(page.as_array().unwrap().iter().any(|parameter| {
+        parameter["name"] == "limit"
+            && parameter["schema"]["maximum"] == agentscm::hub::insights::MAX_USAGE_PAGE
+    }));
+    assert!(page.as_array().unwrap().iter().any(|parameter| {
+        parameter["name"] == "after" && parameter["schema"]["maximum"] == MAX_OBSERVATIONS
+    }));
     let usage = &document["components"]["schemas"]["UsageRecord"];
     assert_eq!(usage["additionalProperties"], false);
     assert_eq!(

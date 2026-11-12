@@ -101,6 +101,7 @@ fn capture_request(work_id: &str, session_id: &str, prefix: &str) -> CaptureRequ
         parent_session_id: None,
         capture_mode: CaptureModeV1::LocalConversation,
         live_capture_mode: CaptureModeV1::LocalConversation,
+        harness: agentscm::change_record::AgentHarnessV1::ClaudeCode,
     }
 }
 

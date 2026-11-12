@@ -69,8 +69,6 @@ pub(crate) struct BindingStatus {
     pub(crate) state: BindingState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) generation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) activity_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,12 +309,6 @@ fn invalid(message: &str) -> Error {
     Error::Invalid(message.to_owned())
 }
 
-/// Produce a local-only snapshot unless `check` explicitly enables bounded Hub reads.
-#[cfg(target_os = "macos")]
-pub(crate) async fn snapshot(check: bool) -> Result<Snapshot> {
-    snapshot_for(check, None).await
-}
-
 pub(crate) async fn snapshot_for(check: bool, root: Option<&Path>) -> Result<Snapshot> {
     let snapshot_at = unix_now();
     let mut connections = load()?;
@@ -440,7 +432,6 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
         binding: BindingStatus {
             state: BindingState::Unknown,
             generation: None,
-            activity_generation: None,
         },
         credential,
         health: Health::Unreachable,
@@ -460,9 +451,6 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
     let generation = token
         .as_deref()
         .map(|token| onboarding_client(&connection.root, token));
-    let activity_generation = token
-        .as_deref()
-        .map(|token| crate::client_activity::activity_binding(&connection, token));
     let credential = credential_status(&connection, token.is_some(), now);
     let mut hub_check = HubCheck::Skipped;
     let mut recent_participation = Vec::new();
@@ -501,7 +489,6 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
                 BindingState::Mismatch
             },
             generation,
-            activity_generation,
         },
         credential,
         hub_check,

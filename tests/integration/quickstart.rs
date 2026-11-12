@@ -4003,6 +4003,55 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     assert_eq!(rows[0]["state"], "ready", "{rows}");
 }
 
+/// The Start at Login entry the removed menu bar app wrote, exactly as it wrote it.
+#[cfg(target_os = "macos")]
+fn old_login_entry(machine: &Machine) -> PathBuf {
+    let path = machine
+        .home
+        .path()
+        .join("Library/LaunchAgents/com.counterbranch.agentscm.tray.plist");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let stable = machine.bin_dir().join("agentscm");
+    let config = machine.home.path().join(".config");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.counterbranch.agentscm.tray</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--no-telemetry</string><string>tray</string><string>--foreground</string></array>\n<key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+        stable.display(),
+        config.display()
+    );
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// What an old Start at Login entry still runs: it opens nothing, and takes the entry and the
+/// app launcher of earlier versions away.
+#[test]
+fn the_retired_tray_command_removes_what_the_menu_bar_app_left() {
+    let machine = Machine::new();
+    #[cfg(target_os = "macos")]
+    let (entry, app) = {
+        let app = machine.home.path().join("Applications/AgentSCM.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            "<plist><string>com.counterbranch.agentscm.launcher</string></plist>",
+        )
+        .unwrap();
+        std::fs::write(app.join("Contents/MacOS/AgentSCM"), "#!/bin/sh\n").unwrap();
+        (old_login_entry(&machine), app)
+    };
+    let ran = machine.run(
+        machine.home.path(),
+        &["--no-telemetry", "tray", "--foreground"],
+    );
+    assert!(ran.status.success(), "{ran:?}");
+    assert!(
+        out(&ran).contains("menu bar app has been removed"),
+        "{ran:?}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(!entry.exists() && !app.exists());
+}
+
 #[test]
 fn uninstall_removes_everything_quickstart_set_up() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
@@ -4145,22 +4194,7 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
         installed.clone()
     };
     #[cfg(target_os = "macos")]
-    let tray_login = {
-        let path = machine
-            .home
-            .path()
-            .join("Library/LaunchAgents/com.counterbranch.agentscm.tray.plist");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let stable = machine.bin_dir().join("agentscm");
-        let config = machine.home.path().join(".config");
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.counterbranch.agentscm.tray</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--no-telemetry</string><string>tray</string><string>--foreground</string></array>\n<key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
-            stable.display(),
-            config.display()
-        );
-        std::fs::write(&path, body).unwrap();
-        path
-    };
+    let login_entry = old_login_entry(&machine);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -4287,7 +4321,7 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
     assert!(uninstalled.status.success(), "{uninstalled:?}");
     assert!(!machine.bin_dir().exists());
     #[cfg(target_os = "macos")]
-    assert!(!tray_login.exists());
+    assert!(!login_entry.exists());
     master.write_all(b"\n").unwrap();
     assert!(
         !setup.wait().unwrap().success(),
