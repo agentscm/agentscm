@@ -285,7 +285,8 @@ confirmation turns sharing on. Turning sharing off needs no confirmation.
   hex, recorded in the binding); worktree id `checkout_<32 random hex characters>`; setup digest 32
   random bytes in hex; base ref the checkout's default branch from `origin/HEAD` as `origin/<name>`
   when that resolves to a commit, else `origin/main`; one action rule,
-  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root; default spool
+  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root of its own, so
+  usage is read from Claude Code's projects directory (see below); default spool
   limits; hooks in `ROOT/.claude/settings.local.json`. The ids are random, not derived from the
   path, so they cannot be recomputed offline from Hub records by guessing paths and two computers
   with the same path never share one; the saved binding is what keeps them stable across
@@ -495,10 +496,14 @@ agentscm change-capture configure \
   --recipe-file /absolute/private/test-recipe.json
 ```
 
-`--claude-history-root` is optional. When configured, the Claude hook may read only the regular
-JSONL file whose basename exactly matches the observed native session id and whose canonical path
-remains beneath that non-symlink directory. A caller-supplied transcript path alone grants no read
-authority. The reader follows a bounded per-session offset and file identity; replacement,
+A captured Claude Code session reports its token counts and model names by default, in every
+capture mode. The hook reads them from the session's own history file: the regular JSONL file whose
+basename exactly matches the observed native session id and whose canonical path remains beneath
+the history root. The history root is Claude Code's projects directory (`projects` under
+`$CLAUDE_CONFIG_DIR`, else under `~/.claude`), unless `--claude-history-root` names another
+non-symlink directory. A caller-supplied transcript path alone grants no read authority: a file
+outside the root, or named for another session, is not read, and usage stays unknown. A subagent's
+history is a separate file and is not read. The reader follows a bounded per-session offset and file identity; replacement,
 truncation, malformed complete records, foreign session records, or a changed Work association
 produce an explicit capture gap. Replacement and truncation stop that cursor. A Work or generation
 change rebinds at the opened snapshot's end of file: boundary records remain unattributed and later

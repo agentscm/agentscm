@@ -433,9 +433,10 @@ does not expose Hub work tools. The equivalent universal CLI path is
 the same record. Grok has no native AgentSCM adapter; when configured as a Hub MCP client, it can
 use the same MCP tool.
 
-These tools accept structured caller reports. The optional Claude change-capture history reader
-can submit observed request usage automatically when an explicit local history root is configured,
-and change capture submits a Codex session's request usage from its `PostModelRequest` hook.
+These tools accept structured caller reports. Change capture submits a captured session's request
+usage automatically: for Claude Code from the session's own history file, in Claude Code's projects
+directory unless the checkout names another history root, and for Codex from its
+`PostModelRequest` hook.
 Use `unknown` for an agent, provider or model label the client cannot determine, and omit token or
 cost fields that are unavailable. Do not
 treat missing values as zero. A `provider_result` basis is still a caller report; the Hub does not

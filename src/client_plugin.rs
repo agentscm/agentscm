@@ -598,7 +598,7 @@ fn check_existing_hooks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn claude_config_dir(root: &Path) -> Result<PathBuf> {
+pub(crate) fn claude_config_dir(root: &Path) -> Result<PathBuf> {
     let path = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
