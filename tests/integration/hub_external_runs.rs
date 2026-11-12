@@ -1072,3 +1072,108 @@ async fn the_cli_records_through_the_hub_with_no_forge_token() {
     assert!(String::from_utf8_lossy(&other.stderr).contains("acme/other"));
     assert_eq!(env.fake.with(|s| s.repos[&REPO_ID].deployments.len()), 1);
 }
+
+#[tokio::test]
+async fn a_deploy_workflow_run_is_a_workflow_deployment_without_the_opt_in() {
+    let env = Env::start(false).await;
+    // What `PUT .../deploy-workflow` stores once a repository admin names the workflow.
+    env.store
+        .set_setting(
+            &format!("deploy_workflow:repo:{REPO_ID}"),
+            ".github/workflows/deploy.yml",
+            "usr_admin",
+        )
+        .unwrap();
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        let mut deploy = run_json(REPO_ID, 5, MERGED, "main", "completed", Some("success"));
+        deploy["path"] = ".github/workflows/deploy.yml".into();
+        deploy["name"] = "Deploy to production".into();
+        r.runs.push(deploy);
+        r.runs.push(run_json(
+            REPO_ID,
+            6,
+            MERGED,
+            "main",
+            "completed",
+            Some("success"),
+        ));
+    });
+    env.pass().await;
+    let deployed: Vec<_> = env
+        .runs(MERGED)
+        .into_iter()
+        .filter(|run| run.kind == ExternalKind::Deployment)
+        .collect();
+    assert_eq!(
+        deployed.len(),
+        1,
+        "only the deploy workflow's run: {deployed:?}"
+    );
+    assert_eq!(deployed[0].source, ExternalSource::Workflow);
+    assert_eq!(deployed[0].run_id, 5);
+    assert_eq!(
+        deployed[0].environment.as_deref(),
+        Some("Deploy to production")
+    );
+    assert_eq!(deployed[0].outcome, ExternalOutcome::Succeeded);
+
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["watched"], true);
+    assert_eq!(external["state"], "observed");
+    assert_eq!(external["ci"].as_array().unwrap().len(), 2);
+    assert_eq!(external["deployments"][0]["source"], "workflow");
+}
+
+#[tokio::test]
+async fn the_deploy_workflow_setting_reads_validates_and_needs_an_admin() {
+    let env = Env::start(false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/hub/repos/acme%2Fwidgets/deploy-workflow",
+        listener.local_addr().unwrap()
+    );
+    let app = agentscm::hub::router(env.state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let read = client
+        .get(&url)
+        .bearer_auth(&env.secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status().as_u16(), 200);
+    let read: Value = serde_json::from_str(&read.text().await.unwrap()).unwrap();
+    assert_eq!(read["workflow"], Value::Null);
+    let put = |body: Value| {
+        client
+            .put(&url)
+            .bearer_auth(&env.secret)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+    };
+    for bad in [
+        "deploy.yml",
+        ".github/workflows/../x.yml",
+        ".github/workflows/a/b.yml",
+    ] {
+        let status = put(json!({"workflow": bad}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 400, "{bad}");
+    }
+    // The fake GitHub gives this agent's owner no admin role, and the Hub has no admins.
+    let refused = put(json!({"workflow": ".github/workflows/deploy.yml"}))
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 403);
+    assert!(
+        env.store
+            .get_setting(&format!("deploy_workflow:repo:{REPO_ID}"))
+            .unwrap()
+            .is_none()
+    );
+}

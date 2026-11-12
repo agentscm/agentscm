@@ -1323,6 +1323,10 @@ sync poll release the hold of Work whose merged pull request closed its source i
 ([automatic release](standup.md#automatic-release-of-a-merged-works-hold)). It is off by default,
 and only a Hub admin or a repository admin can switch it on with `PUT`.
 
+Without any setting, the sync poll also completes Work whose pull request it observed merge once no
+live session holds it, with the outcome provenance `hub_observed_merge`
+([completion of merged Work](standup.md#completion-of-merged-work)).
+
 **Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
 digest once a week as a private direct message to each person who has a Slack binding for the
 repository, has not switched theirs off and has something in it. Each stale Work row has buttons

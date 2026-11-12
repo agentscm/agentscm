@@ -1118,7 +1118,7 @@ async fn external_view(
     if !publication_on_forge(state, publication, &repo).await {
         return Ok(None);
     }
-    let watched = conn.provider == "github" && state.sync.external_runs_enabled(&repo.full_name);
+    let watched = super::external_runs::watched(state, &conn, &repo).await?;
     let (store, id, commit) = (state.store.clone(), repo.id.clone(), sha.clone());
     // Each kind has its own cap, so many CI runs cannot hide the deployments.
     let (mut ci_runs, mut deployed, marker) = blocking(state, move || {

@@ -15,7 +15,7 @@ use super::gitlab;
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::intent::scope;
 use super::publish::{Update, merged_commit, publication_on_forge};
-use super::store::{Event, unix_now};
+use super::store::{Event, Principal, Store, unix_now};
 use super::sync::find_repository;
 use super::{HubError, Result};
 
@@ -23,6 +23,138 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/repos/{repo}/after-merge", get(after_merge))
         .route("/v1/hub/repos/{repo}/deployments", post(record))
+        .route(
+            "/v1/hub/repos/{repo}/deploy-workflow",
+            get(view_deploy_workflow).put(set_deploy_workflow),
+        )
+}
+
+fn deploy_workflow_key(repository_id: i64) -> String {
+    format!("deploy_workflow:repo:{repository_id}")
+}
+
+/// A workflow file the forge names in a run's `path`: `.github/workflows/NAME.yml` or `.yaml`.
+fn valid_workflow_path(path: &str) -> bool {
+    path.len() <= MAX_TEXT_CHARS
+        && path.strip_prefix(".github/workflows/").is_some_and(|name| {
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.starts_with('.')
+                && (name.ends_with(".yml") || name.ends_with(".yaml"))
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+}
+
+/// The workflow whose successful run on a merge commit counts as that commit's deployment,
+/// keyed by the forge's repository id so a rename keeps it.
+pub(super) fn deploy_workflow(store: &dyn Store, repository_id: i64) -> Result<Option<String>> {
+    Ok(store
+        .get_setting(&deploy_workflow_key(repository_id))?
+        .filter(|path| valid_workflow_path(path)))
+}
+
+/// Whether the Hub reads runs and deployments for `repo` after a merge: a GitHub repository
+/// listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`, or one with a deploy workflow set.
+pub(super) async fn watched(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+) -> Result<bool> {
+    if conn.provider != "github" {
+        return Ok(false);
+    }
+    if state.sync.external_runs_enabled(&repo.full_name) {
+        return Ok(true);
+    }
+    let (store, id) = (state.store.clone(), repo.repository_id);
+    blocking(state, move || Ok(deploy_workflow(&*store, id)?.is_some())).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetDeployWorkflow {
+    workflow: Option<String>,
+}
+
+/// The forge id of the token's connected repository; `not_connected` when there is none.
+async fn connected_id(
+    state: &HubState,
+    principal: &Principal,
+) -> std::result::Result<i64, ApiError> {
+    match connected(state, principal).await? {
+        Some((_, repository)) => Ok(repository.repository_id),
+        None => Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected")),
+    }
+}
+
+async fn view_deploy_workflow(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    // A repository the Hub has not connected has no deploy workflow.
+    let workflow = match connected(&state, &principal).await? {
+        Some((_, repository)) => {
+            let (store, id) = (state.store.clone(), repository.repository_id);
+            blocking(&state, move || deploy_workflow(&*store, id)).await?
+        }
+        None => None,
+    };
+    Ok(Json(
+        json!({"repository": principal.repository, "workflow": workflow}),
+    ))
+}
+
+/// Names the GitHub Actions workflow that deploys the repository, or clears it with `null`. A
+/// repository admin (or a Hub admin) sets it, as for the digest switch.
+async fn set_deploy_workflow(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path(repo): Path<String>,
+    JsonBody(body): JsonBody<SetDeployWorkflow>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let id = connected_id(&state, &principal).await?;
+    if body
+        .workflow
+        .as_deref()
+        .is_some_and(|path| !valid_workflow_path(path))
+    {
+        return Err(ApiError::invalid().with_message(
+            "Name the workflow by its file, such as .github/workflows/deploy.yml, or send null.",
+        ));
+    }
+    let admin = state.login.is_admin_user(&principal.owner)
+        || super::login::devices::mint_access(
+            &state,
+            &principal.owner,
+            &principal.repository,
+            "deploy_workflow",
+        )
+        .await?
+        .1;
+    if !admin {
+        return Err(ApiError::forbidden()
+            .with_message("Only a repository admin or a Hub admin names the deploy workflow."));
+    }
+    let (store, actor, workflow) = (
+        state.store.clone(),
+        principal.owner.id.clone(),
+        body.workflow,
+    );
+    let saved = blocking(&state, move || {
+        // An empty value reads as none: the settings table keeps no deletes.
+        let value = workflow.unwrap_or_default();
+        store.set_setting(&deploy_workflow_key(id), &value, &actor)?;
+        deploy_workflow(&*store, id)
+    })
+    .await?;
+    Ok(Json(
+        json!({"repository": principal.repository, "workflow": saved}),
+    ))
 }
 
 /// What a deploy script reports: the commit now in `environment`, in `status`.
@@ -97,22 +229,7 @@ async fn record(
              optional http(s) url.",
         ));
     }
-    let (store, who) = (state.store.clone(), principal.clone());
-    let found = blocking(&state, move || {
-        let Some(repository) = find_repository(
-            &*store,
-            &who.owner.identity.host,
-            &who.repository,
-            who.repository_id,
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(store
-            .connection(&repository.connection)?
-            .map(|connection| (connection, repository)))
-    })
-    .await?;
+    let found = connected(&state, &principal).await?;
     let Some((conn, repository)) = found else {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected"));
     };
@@ -288,14 +405,14 @@ const OPT_IN: &str = "AGENTSCM_GITHUB_EXTERNAL_RUNS";
 /// the watcher decides it: the connected repository's connection must be GitHub, and the
 /// repository's current name must be listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A repository the
 /// Hub has no connection for is not watched, however it is listed.
-async fn after_merge(
-    State(state): State<HubState>,
-    Reader(principal): Reader,
-    Path(repo): Path<String>,
-) -> std::result::Result<Json<Value>, ApiError> {
-    scope(&principal, &repo)?;
+/// The connection and connected repository of the token's repository, found as the watcher
+/// finds them; `None` when the Hub has not connected it.
+async fn connected(
+    state: &HubState,
+    principal: &Principal,
+) -> Result<Option<(Connection, ConnectedRepository)>> {
     let (store, who) = (state.store.clone(), principal.clone());
-    let found = blocking(&state, move || {
+    blocking(state, move || {
         let Some(repository) = find_repository(
             &*store,
             &who.owner.identity.host,
@@ -309,7 +426,16 @@ async fn after_merge(
             .connection(&repository.connection)?
             .map(|connection| (connection, repository)))
     })
-    .await?;
+    .await
+}
+
+async fn after_merge(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let found = connected(&state, &principal).await?;
     Ok(Json(match found {
         None => json!({"repository": principal.repository,
             "provider": principal.owner.identity.provider, "connected": false,
@@ -318,7 +444,7 @@ async fn after_merge(
             let supported = connection.provider == "github";
             json!({"repository": principal.repository, "provider": connection.provider,
                 "connected": true, "supported": supported,
-                "watched": supported && state.sync.external_runs_enabled(&repository.full_name),
+                "watched": watched(&state, &connection, &repository).await?,
                 "opt_in": OPT_IN})
         }
     }))
@@ -648,6 +774,23 @@ pub fn ci_run(value: &Value, repo_id: i64, sha: &str, branch: &str, web: &str) -
     }
 }
 
+/// A run of the deploy workflow as a `workflow` deployment of its commit, named after the
+/// workflow (or its file when it has no name): the run's outcome is the deployment's.
+fn workflow_deployment(ci: &ExternalRun, value: &Value) -> ExternalRun {
+    let label = value["name"]
+        .as_str()
+        .map(clipped)
+        .filter(|name| !name.trim().is_empty() && bounded(name))
+        .unwrap_or_else(|| ci.name.clone());
+    ExternalRun {
+        kind: ExternalKind::Deployment,
+        source: ExternalSource::Workflow,
+        branch: None,
+        environment: Some(label),
+        ..ci.clone()
+    }
+}
+
 /// A deployment of exactly `sha` with its newest status (`None` reads as pending); `None` when
 /// it is for another commit, malformed or out of bounds.
 pub fn deployment(
@@ -708,7 +851,7 @@ pub(super) async fn reconcile_repo(
     repo: &ConnectedRepository,
     token: &str,
 ) -> Gh<()> {
-    if conn.provider != "github" || !state.sync.external_runs_enabled(&repo.full_name) {
+    if !watched(state, conn, repo).await? {
         return Ok(());
     }
     // The external reads turn a 403 into `Auth("403 ...")`, whether or not it carried rate-limit
@@ -845,11 +988,19 @@ async fn commit_runs(
     let name = repo.full_name.as_str();
     let (runs, runs_done) = api.workflow_runs(token, name, sha).await?;
     let (deployments, deployments_done) = api.deployments(token, name, sha).await?;
+    let (store, id) = (state.store.clone(), repo.repository_id);
+    let deploy_path = blocking(state, move || deploy_workflow(&*store, id)).await?;
     let mut found = Vec::new();
+    let mut workflow_deploys = Vec::new();
     let mut complete = runs_done && deployments_done;
     for run in &runs {
         match ci_run(run, repo.repository_id, sha, base, web) {
-            Ci::Run(run) => found.push(run),
+            Ci::Run(ci) => {
+                if deploy_path.as_deref() == Some(ci.name.as_str()) {
+                    workflow_deploys.push(workflow_deployment(&ci, run));
+                }
+                found.push(ci);
+            }
             Ci::Invalid => complete = false,
             Ci::Other => {}
         }
@@ -874,6 +1025,7 @@ async fn commit_runs(
     if dropped > 0 {
         eprintln!("hub: external runs for {name} {sha}: {dropped} items not matched");
     }
+    found.extend(workflow_deploys);
     for run in found {
         let (store, id) = (state.store.clone(), repo.id.clone());
         blocking(state, move || store.observe_external_run(&id, &run)).await?;

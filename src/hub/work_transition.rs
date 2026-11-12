@@ -38,8 +38,9 @@ pub enum WorkTransitionActor<'a> {
         repository_id: i64,
         is_admin: bool,
     },
-    /// The Hub applying a repository's opted-in policy for the Work's owner, who is not asked.
-    /// It has the owner's standing, may only release, and the event records no login.
+    /// The Hub acting on provider facts for the Work's owner, who is not asked: a repository's
+    /// opted-in release, or the completion of Work whose pull request merged. It has the owner's
+    /// standing, may only release or complete, and the event records no login.
     Policy {
         owner: &'a User,
         repository: &'a str,
@@ -748,6 +749,8 @@ pub(super) fn provenance_from_event(kind: &str, data: &str) -> OutcomeProvenance
                 (Some("agent"), _) => OutcomeProvenance::AgentReport,
                 (Some("person"), Some("admin")) => OutcomeProvenance::Admin,
                 (Some("person"), _) => OutcomeProvenance::Person,
+                // The policy actor states an outcome only for a merge it observed.
+                (Some("policy"), _) => OutcomeProvenance::HubObservedMerge,
                 _ => OutcomeProvenance::Unknown,
             }
         }
