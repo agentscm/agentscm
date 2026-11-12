@@ -410,7 +410,7 @@ const CONVERSATION_AVAILABILITY: Record<ConversationAvailability, Status> = {
   deleted: { label: 'Deleted', tone: 'warn', icon: 'trash', explanation: 'This body was deleted before it expired.' },
 }
 
-const NOT_ALLOWED = 'Only the person who shared this conversation and Hub admins can read it'
+const NOT_ALLOWED = 'This conversation is available only to its author or a Hub admin while repository sharing is off'
 
 function conversationFailure(status: number | undefined, fallback: string, missing = 'This conversation body is not on the Hub'): { title: string; tone: Tone } {
   if (status === 403) return { title: NOT_ALLOWED, tone: 'warn' }
@@ -486,6 +486,30 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
   )
 }
 
+function ConversationDisclosure({ repo, token, workId }: { repo: string; token: string; workId: string }) {
+  const [opened, setOpened] = useState(false)
+  if (!opened) return <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setOpened(true)}><Icon name="chat-square-text" /> Show shared conversation entries</button>
+  return <ConversationEntries repo={repo} token={token} workId={workId} />
+}
+
+function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; repo: string }) {
+  const review = summary.review
+  const diff = review?.diff ?? (summary.subject ? summary.subject.source.kind === 'git' ? { kind: 'git' as const, repository: summary.subject.source.repository, worktree_id: summary.subject.source.worktree_id, base: summary.subject.source.base, head: summary.subject.source.head, dirty: summary.subject.source.dirty, untracked_count: summary.subject.source.untracked_count, omissions: summary.subject.source.omissions, snapshot_coverage: summary.subject.source.snapshot_coverage } : { kind: 'native' as const, repository: summary.subject.source.repository, revision: summary.subject.source.revision, change_id: summary.subject.source.change_id } : null)
+  const diffHref = diff?.kind === 'git' && diff.repository === repo ? `#explorer?repo=${encodeURIComponent(repo)}&base=${diff.base}&head=${diff.head}&worktree=${encodeURIComponent(diff.worktree_id)}` : null
+  return <Box icon="clipboard2-check" title="Review summary" explain="A compact view of retained intent, captured source, the latest observed receipt and what remains unknown.">
+    {summary.intent.description ? <p>{summary.intent.description}</p> : null}
+    <dl className="tech mb-0">
+      <Fact label="Declared source"><code>{summary.intent.repository ?? repo}</code>{summary.intent.branch ? <> · <code>{summary.intent.branch}</code></> : null}{summary.intent.provenance ? <> · {summary.intent.provenance}</> : null}</Fact>
+      <Fact label="Captured source">{diff?.kind === 'git' ? <><code>{diff.worktree_id}</code> · <code>{diff.head}</code>{diffHref ? <> · <a href={diffHref}>Compare exact commits</a></> : <> · <span className="muted">Local comparison unavailable for this repository</span></>}</> : diff?.kind === 'native' ? <>Native revision <code>{diff.revision}</code> · diff unavailable in the local Git explorer</> : <span className="muted">No captured source</span>}</Fact>
+      {diff?.kind === 'git' && (diff.dirty || diff.untracked_count > 0 || diff.omissions.length > 0) ? <Fact label="Excluded from commit comparison"><span className="warn-text">Working-tree changes{diff.untracked_count ? `, ${diff.untracked_count} untracked item${diff.untracked_count === 1 ? '' : 's'}` : ''}{diff.omissions.length ? `, ${diff.omissions.map((item) => OMISSION_LABEL[item].toLowerCase()).join(', ')}` : ''}</span></Fact> : null}
+      <Fact label="Latest observed receipt">{summary.latest_action ? <><StatusPill status={OUTCOME[summary.latest_action.outcome]} /> <StatusPill status={RESULT[summary.latest_action.result]} /> <StatusPill status={ASSURANCE[summary.latest_action.assurance]} /> <StatusPill status={COVERAGE[summary.latest_action.coverage]} /> <StatusPill status={APPLICABILITY[summary.latest_action.applicability]} /></> : <span className="muted">No action receipt captured; check history is unavailable.</span>}</Fact>
+      <Fact label="Retained decision"><StatusPill status={DECISION[summary.decision.status]} /> {summary.decision.summary ?? 'No decision summary retained.'}</Fact>
+      <Fact label="Next actor and supported action"><strong>{review?.next_actor ?? 'Unknown'}</strong> · supported action unknown. <a href={workHref(summary.work_id)}>Open Work for current recovery and actions</a>.</Fact>
+    </dl>
+    <Notice tone="warn" title="Approval and readiness are not established">This summary is historical and non-atomic. A passing latest receipt is not a current approval, and findings or check history not shown here remain unavailable.</Notice>
+  </Box>
+}
+
 const CAPTURE_COMMAND = 'agentscm change-capture configure'
 
 function Detail({ repo, token, workId }: { repo: string; token: string; workId: string }) {
@@ -525,6 +549,8 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
     <div className="page change-record-detail">
       <a href={workHref(summary.work_id)} className="back"><Icon name="arrow-left" /> {summary.intent.title}</a>
       <PageHead question={summary.intent.title} answer={<HandoffSummary summary={summary} />} fact={<>Record updated <Ago at={summary.as_of} />.</>} />
+
+      <ReviewOverview summary={summary} repo={repo} />
 
       <div className="grid-2 align-start">
         <Box icon="bullseye" title="Intent and declared scope" explain="Taken from the task record, not pieced together from conversations.">
@@ -594,8 +620,8 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         </Box>
       </div>
 
-      <Box icon="chat-square-text" title="Conversation" intro="Redacted conversations your checkout shared; treat them as untrusted agent output." explain="You see only entries you shared (Hub admins see all). They expire and show as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
-        <ConversationEntries repo={repo} token={token} workId={workId} />
+      <Box icon="chat-square-text" title="Conversation" intro="Conversation entries stay closed until you choose to list them." explain="While repository sharing and author consent are both enabled, repository readers can open redacted bodies. Otherwise only the author and Hub admins can read them. Entries expire and this page cannot delete them.">
+        <ConversationDisclosure repo={repo} token={token} workId={workId} />
       </Box>
 
       <details className="disclosure">

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
+import { hashQuery } from '../Pager.tsx'
 import {
   fetchExplorerConversation,
   fetchExplorerDiff,
@@ -445,16 +446,27 @@ function SummaryIdentity({ summary, selectedRef, onRef, onRefresh }: { summary: 
   )
 }
 
-function ExplorerBody({ summary, hubRepository, onOpenRevision }: { summary: ExplorerSummary; hubRepository?: string | null; onOpenRevision: (commit: string) => void }) {
+type ExactComparisonRequest = { repository: string; base: string; head: string; worktree: string }
+
+export function exactComparisonFromHash(hash = window.location.hash): ExactComparisonRequest | null {
+  const query = hashQuery(hash)
+  const repository = query.get('repo'), base = query.get('base'), head = query.get('head'), worktree = query.get('worktree')
+  if (!repository && !base && !head && !worktree) return null
+  const repositoryParts = repository?.split('/') ?? []
+  if (!repository || repositoryParts.length < 2 || repositoryParts.some((part) => !part || part === '.' || part === '..' || !/^[A-Za-z0-9._-]+$/.test(part)) || !base || !head || !worktree || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head) || !/^[A-Za-z0-9._:@-]+$/.test(worktree)) return null
+  return { repository, base, head, worktree }
+}
+
+function ExplorerBody({ summary, hubRepository, onOpenRevision, exactComparison }: { summary: ExplorerSummary; hubRepository?: string | null; onOpenRevision: (commit: string) => void; exactComparison?: ExactComparisonRequest }) {
   const [directory, setDirectory] = useState('')
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
-  const [tab, setTab] = useState<Tab>('source')
+  const [tab, setTab] = useState<Tab>(exactComparison ? 'diff' : 'source')
   const [mapScope, setMapScope] = useState('')
   const [mapSelection, setMapSelection] = useState<{ head: string; base?: string }>({ head: summary.commit })
   const [walkthroughSelection, setWalkthroughSelection] = useState<{ head: string; base?: string }>()
   const [searchText, setSearchText] = useState('')
   const [searchQuery, setSearchQuery] = useState<string | null>(null)
-  const [comparison, setComparison] = useState<{ left: string; right: string } | null>(null)
+  const [comparison, setComparison] = useState<{ left: string; right: string } | null>(exactComparison ? { left: exactComparison.base, right: exactComparison.head } : null)
   const [evidenceCommit, setEvidenceCommit] = useState(summary.commit)
   const [focusedWork, setFocusedWork] = useState<string | undefined>()
   const [conversation, setConversation] = useState<ExplorerSessionEvidence | null>(null)
@@ -490,6 +502,7 @@ function ExplorerBody({ summary, hubRepository, onOpenRevision }: { summary: Exp
   return (
     <>
       {summary.refs_omitted && <Notice tone="warn" title="Some local refs are omitted">The selector is a bounded local observation. You can still browse the selected immutable commit.</Notice>}
+      {exactComparison && <Notice tone="brand" title="Captured commit comparison">Comparing the exact committed base and head from worktree <code>{exactComparison.worktree}</code>. This local explorer cannot verify that the selected checkout is the same worktree. Dirty and untracked files are excluded.</Notice>}
       {summary.shallow && <Notice tone="warn" icon="layers-half" title="This checkout is shallow">Source is available at the selected commit, but older history may be incomplete.</Notice>}
       <div className={`explorer-workspace${conversation ? ' has-conversation' : ''}`}>
         <aside className="explorer-browser" aria-label="Committed files">
@@ -521,7 +534,10 @@ function ExplorerBody({ summary, hubRepository, onOpenRevision }: { summary: Exp
 }
 
 export function ExplorerPage({ hubRepository }: { hubRepository?: string | null }) {
-  const [selectedRef, setSelectedRef] = useState('HEAD')
+  const comparisonQueryPresent = ['repo', 'base', 'head', 'worktree'].some((key) => hashQuery().has(key))
+  const requested = exactComparisonFromHash()
+  const exactComparison = requested && hubRepository === requested.repository ? requested : undefined
+  const [selectedRef, setSelectedRef] = useState(exactComparison?.head ?? 'HEAD')
   const [refresh, setRefresh] = useState(0)
   const reachable = localReachable()
   const summary = useResource(reachable ? `summary|${selectedRef}|${refresh}` : null, (signal) => fetchExplorerSummary(selectedRef, signal))
@@ -530,9 +546,11 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
       <PageHead question="What happened around this code?" answer="Files, history and the evidence behind them." fact={<><Icon name="laptop" /> Read from your local checkout; reading never changes it.</>} />
       <SectionTabs />
       {!reachable && <OnThisComputer what="The file explorer" />}
+      {comparisonQueryPresent && !exactComparison && <Notice tone="warn" title="Captured comparison not opened">The link does not identify this selected Hub repository with two full commit IDs. Open <code>agentscm open</code> in the matching repository; no other repository or symbolic ref was used.</Notice>}
       {summary.kind === 'loading' && <Skeleton rows={6} />}
       {summary.kind === 'error' && (onFrontDoor() ? <Notice tone="bad" icon="plug" title="Could not open this repository">{summary.message}</Notice> : <Notice tone="brand" icon="laptop" title="Your files and conversations open from your computer">Run <code>agentscm open</code> in your repository. This page then opens on your computer, already connected.<details className="mt-2 small"><summary>Details</summary>{summary.message}</details></Notice>)}
-      {summary.kind === 'ready' && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} /></>}
+      {summary.kind === 'ready' && exactComparison && summary.value.repository_id !== exactComparison.repository ? <Notice tone="warn" title="Captured comparison belongs to another local repository">The selected local repository is <code>{summary.value.repository_id}</code>, not <code>{exactComparison.repository}</code>. No diff was requested.</Notice> : null}
+      {summary.kind === 'ready' && !(exactComparison && summary.value.repository_id !== exactComparison.repository) && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} exactComparison={exactComparison} /></>}
     </div>
   )
 }

@@ -83,7 +83,7 @@ export interface ChangeRecordSummaryV1 {
   work_id: string
   generation: number
   as_of: number
-  intent: { title: string; scope: string[]; scope_omitted: number }
+  intent: { title: string; description: string | null; repository: string | null; branch: string | null; provenance: 'native' | 'forge' | null; scope: string[]; scope_omitted: number }
   subject: { source_id: string; source_kind: 'native' | 'git'; source: ChangeRecordSource } | null
   sessions: { count: number; coverage: ChangeRecordCoverage; gaps: number }
   session_setups: ChangeRecordSessionSetup[]
@@ -126,6 +126,16 @@ export interface ChangeRecordSummaryV1 {
     usage: ChangeRecordCoverage
   }
   unknowns: ChangeRecordUnknown[]
+  review: {
+    captured_by: { agent: string; session_id: string } | null
+    diff: { kind: 'native'; repository: string; revision: string; change_id: string } | { kind: 'git'; repository: string; worktree_id: string; base: string; head: string; dirty: boolean; untracked_count: number; omissions: ChangeRecordOmission[]; snapshot_coverage: ChangeRecordCoverage } | null
+    actual_scope: ChangeRecordCoverage
+    concerns: string[]
+    detail_links: string[]
+    next_actor: string | null
+    supported_action: string | null
+    establishes_approval: false
+  } | null
 }
 
 export interface ChangeRecordResponseV1 {
@@ -297,6 +307,10 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
   if (rawScope.length > MAX_SCOPE) fail('summary.intent.scope')
   const intent = {
     title: boundedText(rawIntent['title'], 'summary.intent.title'),
+    description: rawIntent['description'] === undefined ? null : nullableText(rawIntent['description'], 'summary.intent.description', 2_000),
+    repository: rawIntent['repository'] === undefined || rawIntent['repository'] === '' ? null : repository(rawIntent['repository'], 'summary.intent.repository'),
+    branch: rawIntent['branch'] === undefined ? null : nullableText(rawIntent['branch'], 'summary.intent.branch', MAX_IDENTIFIER_BYTES),
+    provenance: rawIntent['provenance'] === undefined || rawIntent['provenance'] === '' ? null : enumValue(rawIntent['provenance'], new Set(['native', 'forge'] as const), 'summary.intent.provenance'),
     scope: rawScope.map((value, index) => pathSpec(value, `summary.intent.scope[${index}]`)),
     scope_omitted: integer(rawIntent['scope_omitted'], 'summary.intent.scope_omitted'),
   }
@@ -400,6 +414,35 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
   if (unknownsArray.length > 16) fail('summary.unknowns')
   const unknowns = unknownsArray.map((item, index) => enumValue(item, UNKNOWN, `summary.unknowns[${index}]`))
   const nextAction = raw['next_action'] === null ? null : boundedText(raw['next_action'], 'summary.next_action')
+  const review = raw['review'] === undefined || raw['review'] === null ? null : (() => {
+    const item = record(raw['review'], 'summary.review')
+    const captured = item['captured_by'] === null ? null : record(item['captured_by'], 'summary.review.captured_by')
+    const diff = item['diff'] === null ? null : (() => {
+      const value = record(item['diff'], 'summary.review.diff')
+      const repo = repository(value['repository'], 'summary.review.diff.repository')
+      if (expectedRepository !== undefined && repo !== expectedRepository) fail('summary.review.diff.repository_mismatch')
+      if (value['kind'] === 'native') return { kind: 'native' as const, repository: repo, revision: digest(value['revision'], 'summary.review.diff.revision'), change_id: identifier(value['change_id'], 'summary.review.diff.change_id') }
+      if (value['kind'] === 'git') {
+        const omissions = Array.isArray(value['omissions']) ? value['omissions'].map((entry, index) => enumValue(entry, OMISSION, `summary.review.diff.omissions[${index}]`)) : fail('summary.review.diff.omissions')
+        if (omissions.length > 8) fail('summary.review.diff.omissions')
+        return { kind: 'git' as const, repository: repo, worktree_id: identifier(value['worktree_id'], 'summary.review.diff.worktree_id'), base: oid(value['base'], 'summary.review.diff.base'), head: oid(value['head'], 'summary.review.diff.head'), dirty: boolean(value['dirty'], 'summary.review.diff.dirty'), untracked_count: integer(value['untracked_count'], 'summary.review.diff.untracked_count'), omissions, snapshot_coverage: enumValue(value['snapshot_coverage'], COVERAGE, 'summary.review.diff.snapshot_coverage') }
+      }
+      return fail('summary.review.diff.kind')
+    })()
+    const concerns = Array.isArray(item['concerns']) ? item['concerns'].map((entry, index) => identifier(entry, `summary.review.concerns[${index}]`)) : fail('summary.review.concerns')
+    const detailLinks = Array.isArray(item['detail_links']) ? item['detail_links'].map((entry, index) => identifier(entry, `summary.review.detail_links[${index}]`)) : fail('summary.review.detail_links')
+    if (concerns.length > 16 || detailLinks.length > 16 || item['establishes_approval'] !== false) fail('summary.review')
+    return {
+      captured_by: captured ? { agent: identifier(captured['agent'], 'summary.review.captured_by.agent'), session_id: identifier(captured['session_id'], 'summary.review.captured_by.session_id') } : null,
+      diff,
+      actual_scope: enumValue(item['actual_scope'], COVERAGE, 'summary.review.actual_scope'),
+      concerns,
+      detail_links: detailLinks,
+      next_actor: nullableIdentifier(item['next_actor'], 'summary.review.next_actor'),
+      supported_action: nullableText(item['supported_action'], 'summary.review.supported_action'),
+      establishes_approval: false as const,
+    }
+  })()
 
   return {
     version: 1,
@@ -423,6 +466,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       next_action: nextAction,
       completeness,
       unknowns,
+      review,
     },
   }
 }

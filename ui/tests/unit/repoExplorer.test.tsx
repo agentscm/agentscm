@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildExplorerContextPacket,
+  exactComparisonFromHash,
   ExplorerPage,
 } from '../../src/pages/Explorer.tsx'
 import {
@@ -122,6 +123,28 @@ describe('repository explorer decoders', () => {
 })
 
 describe('repository explorer journey', () => {
+  it('accepts only repository-bound full object IDs for captured comparisons', () => {
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`)).toEqual({ repository: REPO, base: PARENT, head: COMMIT, worktree: 'worktree-1' })
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=main&head=${COMMIT}&worktree=worktree-1`)).toBeNull()
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=${PARENT}&head=HEAD&worktree=worktree-1`)).toBeNull()
+    expect(exactComparisonFromHash(`#explorer?repo=../other&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`)).toBeNull()
+  })
+
+  it('refuses a captured comparison routed to another Hub repository without requesting its commits', async () => {
+    window.location.hash = `#explorer?repo=other/repository&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`
+    const seen: URL[] = []
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      const url = new URL(String(input), 'http://localhost'); seen.push(url)
+      if (url.pathname.endsWith('/summary')) return json(summary())
+      if (url.pathname.endsWith('/tree')) return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path: '', entries: [], next: null, complete: true, limit_state: 'complete' })
+      throw new Error(`unexpected URL ${url}`)
+    })
+    render(<ExplorerPage hubRepository={REPO} />)
+    expect(await screen.findByText('Captured comparison not opened')).toBeTruthy()
+    expect(seen.some((url) => url.pathname.endsWith('/diff'))).toBe(false)
+    expect(seen.find((url) => url.pathname.endsWith('/summary'))?.searchParams.get('ref')).toBe('HEAD')
+  })
+
   it('renders and copies an unknown working-tree observation without claiming cleanliness', async () => {
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {
       const url = new URL(String(input), 'http://localhost')
