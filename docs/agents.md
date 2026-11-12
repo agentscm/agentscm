@@ -191,8 +191,16 @@ Optional selected conversation/tool bodies, captured source bytes and command ou
 operator's private local spool. Ordinary shell success is an execution outcome, not a passing
 verification. The local client reports pass/fail only for an exact configured verification recipe
 match; the Hub stores that as caller asserted and does not validate it against an independent recipe
-registry. Other agent hosts do not have equivalent coverage in this path. See the
-[implementation status](implementation/agentscm-build-status.md) for qualification limits.
+registry. See the [implementation status](implementation/agentscm-build-status.md) for
+qualification limits.
+
+A Codex session is captured through the plugin's hook, with no `configure` step, as far as Codex's
+hooks expose it: prompts, tool starts and finishes, the last assistant message of each turn and
+each model request's token usage ([Codex adapter](change-capture.md#codex-adapter)). For that the
+Codex plugin also registers `UserPromptSubmit`, `PostModelRequest`, `PreCompact`, `SubagentStart`
+and `SubagentStop`, which only change capture reads and which never reach the Hub. Codex runs these
+new entries only after you trust them in `/hooks`. Cursor, Copilot and Gemini CLI sessions are not
+captured.
 
 ## What `agentscm hook` does
 
@@ -394,7 +402,8 @@ the same record. Grok has no native AgentSCM adapter; when configured as a Hub M
 use the same MCP tool.
 
 These tools accept structured caller reports. The optional Claude change-capture history reader
-can submit observed request usage automatically when an explicit local history root is configured.
+can submit observed request usage automatically when an explicit local history root is configured,
+and change capture submits a Codex session's request usage from its `PostModelRequest` hook.
 Use `unknown` for an agent, provider or model label the client cannot determine, and omit token or
 cost fields that are unavailable. Do not
 treat missing values as zero. A `provider_result` basis is still a caller report; the Hub does not

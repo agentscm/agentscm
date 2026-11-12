@@ -95,7 +95,13 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
             "timeout":PERMISSION_LIMIT,
             "statusMessage":"AgentSCM: your Hub can answer; move the mouse to answer here"}]}],
         "Stop":[{"hooks":[hook("AgentSCM: note this chat's turn ended", 3), wait]}],
-        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3), wait_end]}]
+        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3), wait_end]}],
+        // Only change capture uses these, for checkouts that capture.
+        "UserPromptSubmit":[{"hooks":[hook("AgentSCM: note this prompt", 3)]}],
+        "PostModelRequest":[{"hooks":[hook("AgentSCM: note this request's token use", 3)]}],
+        "PreCompact":[{"hooks":[hook("AgentSCM: note this compaction", 3)]}],
+        "SubagentStart":[{"hooks":[hook("AgentSCM: note this subagent", 3)]}],
+        "SubagentStop":[{"hooks":[hook("AgentSCM: note this subagent's end", 3)]}]
     }});
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
         "description":"Coordination hooks for configured AgentSCM checkouts.",
@@ -1540,16 +1546,27 @@ mod tests {
         ] {
             assert!(claude.iter().any(|wired| wired == event), "{event}");
         }
+        let codex = events(codex_package_files("/opt/agentscm"));
         assert_eq!(
-            events(codex_package_files("/opt/agentscm")),
+            codex,
             [
                 "PermissionRequest",
+                "PostModelRequest",
                 "PostToolUse",
+                "PreCompact",
                 "PreToolUse",
                 "SessionEnd",
                 "SessionStart",
-                "Stop"
+                "Stop",
+                "SubagentStart",
+                "SubagentStop",
+                "UserPromptSubmit"
             ]
         );
+        // Change capture reads no Codex event the plugin does not register.
+        #[cfg(unix)]
+        for event in agentscm::change_capture::codex::HOOK_EVENTS {
+            assert!(codex.iter().any(|wired| wired == event), "{event}");
+        }
     }
 }

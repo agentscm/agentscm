@@ -15,6 +15,7 @@ use agentscm::change_capture::claude_code::{
     NativeResultSourceV1, capture_hook, capture_native_hook, capture_provider_usage,
     deferred_native_hook, import_jsonl,
 };
+use agentscm::change_capture::codex;
 use agentscm::change_capture::spool::ProviderHistoryCursorV1;
 use agentscm::change_capture::{
     AppendOutcome, ConfiguredRecipeRunRequest, ConfiguredRecipeV1, DeferredHookV1,
@@ -49,6 +50,7 @@ fn capture_request(mode: CaptureModeV1) -> CaptureRequest {
         parent_session_id: None,
         capture_mode: mode,
         live_capture_mode: mode,
+        harness: AgentHarnessV1::ClaudeCode,
     }
 }
 
@@ -3032,6 +3034,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
         live_capture_mode: CaptureModeV1::MetadataOnly,
+        harness: AgentHarnessV1::ClaudeCode,
     };
     capture_hook(
         br#"{"hook_event_name":"SessionStart","session_id":"session_repeated","source":"startup"}"#,
@@ -3056,6 +3059,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
             parent_session_id: None,
             capture_mode: CaptureModeV1::MetadataOnly,
             live_capture_mode: CaptureModeV1::MetadataOnly,
+            harness: AgentHarnessV1::ClaudeCode,
         };
         let pre = serde_json::to_vec(&serde_json::json!({
             "hook_event_name": "PreToolUse",
@@ -4285,6 +4289,7 @@ fn legacy_managed_marker_without_capture_binding_stays_unassociated() {
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
         live_capture_mode: CaptureModeV1::MetadataOnly,
+        harness: AgentHarnessV1::ClaudeCode,
     };
     let actions = ActionCaptureConfig {
         source: git_request(&canonical),
@@ -6146,4 +6151,353 @@ fn a_tool_claim_ends_when_no_start_can_follow_and_expires_when_its_other_phase_n
         1
     );
     assert_eq!(claims(), 0);
+}
+
+const CODEX_SESSION: &str = "11111111-2222-7333-8444-555555555555";
+
+fn codex_request(mode: CaptureModeV1) -> CaptureRequest {
+    CaptureRequest {
+        // A usage observation names real Work.
+        work_id: format!("wrk_{}", "1".repeat(32)),
+        observed_session_id: CODEX_SESSION.into(),
+        canonical_session_id: CODEX_SESSION.into(),
+        harness: AgentHarnessV1::Codex,
+        ..capture_request(mode)
+    }
+}
+
+fn codex_fixture(name: &str) -> Vec<u8> {
+    fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex_capture")
+            .join(name),
+    )
+    .unwrap()
+}
+
+fn pending_usage(spool: &LocalSpool) -> Vec<UsageRecord> {
+    spool
+        .pending(100)
+        .unwrap()
+        .into_iter()
+        .filter_map(|envelope| match envelope {
+            CaptureEnvelopeV1::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn codex_hooks_record_prompt_tool_result_and_last_reply_as_codex() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: Vec::new(),
+    };
+    let stop = codex_fixture("Stop.json");
+    let reply = serde_json::from_slice::<serde_json::Value>(&stop).unwrap();
+    let reply = codex::last_message_hook(reply.as_object().unwrap()).unwrap();
+    for input in [
+        codex_fixture("UserPromptSubmit.json"),
+        codex_fixture("PreToolUse.json"),
+        codex_fixture("PostToolUse.json"),
+        reply.clone(),
+        stop,
+    ] {
+        let report = capture_native_hook(&input, &request, &actions, &spool).unwrap();
+        assert_eq!(report.event, HookCaptureOutcome::Stored);
+    }
+    // A turn that ends again with the same last message records that message once.
+    assert_eq!(
+        capture_native_hook(&reply, &request, &actions, &spool)
+            .unwrap()
+            .event,
+        HookCaptureOutcome::Duplicate
+    );
+
+    let events = captured_events(&spool);
+    assert!(
+        events
+            .iter()
+            .all(|(session, _)| session.harness == AgentHarnessV1::Codex)
+    );
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|(_, event)| event.kind)
+        .filter(|kind| *kind != CapturedEventKindV1::Gap)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            CapturedEventKindV1::UserPrompt,
+            CapturedEventKindV1::ToolStarted,
+            CapturedEventKindV1::ToolFinished,
+            CapturedEventKindV1::AssistantMessage,
+            CapturedEventKindV1::TurnEnded,
+        ]
+    );
+    let finished = events
+        .iter()
+        .find(|(_, event)| event.kind == CapturedEventKindV1::ToolFinished)
+        .and_then(|(_, event)| event.tool.clone())
+        .unwrap();
+    assert_eq!(finished.request_id.as_deref(), Some("call_1"));
+    assert_eq!(finished.completion, Some(ToolCompletionV1::Returned));
+
+    // Bodies stay in the private spool, as for Claude Code.
+    let shared = serde_json::to_string(&spool.pending(100).unwrap()).unwrap();
+    let retained = retained_bytes(spool.root());
+    for body in [
+        "VISIBLE_PROMPT_902",
+        "VISIBLE_RESULT_905",
+        "VISIBLE_ANSWER_908",
+    ] {
+        assert!(!shared.contains(body));
+        assert!(contains_bytes(&retained, body.as_bytes()));
+    }
+}
+
+#[test]
+fn codex_stop_without_a_last_message_records_no_reply() {
+    for message in [serde_json::Value::Null, serde_json::json!("  ")] {
+        let stop = serde_json::json!({
+            "hook_event_name": "Stop", "session_id": CODEX_SESSION, "turn_id": "turn_1",
+            "last_assistant_message": message,
+        });
+        assert!(codex::last_message_hook(stop.as_object().unwrap()).is_none());
+    }
+}
+
+#[test]
+fn codex_model_request_usage_keeps_cached_input_apart_and_matches_the_session_file() {
+    let request = codex_request(CaptureModeV1::MetadataOnly);
+    let hook = serde_json::from_slice::<serde_json::Value>(&codex_fixture("PostModelRequest.json"))
+        .unwrap();
+    let usage = codex::usage_from_hook(hook.as_object().unwrap(), &request).unwrap();
+    usage.validate().unwrap();
+    assert_eq!(usage.agent, "codex");
+    assert_eq!(usage.model, "model-fixture");
+    assert_eq!(usage.usage_basis, UsageBasis::ProviderResult);
+    assert_eq!(
+        usage.measurement_scope,
+        Some(UsageMeasurementScope::Request)
+    );
+    // Codex reports 1200 input tokens of which 1000 were cached.
+    assert_eq!(usage.input_tokens, Some(200));
+    assert_eq!(usage.cache_read_input_tokens, Some(1000));
+    assert_eq!(usage.cache_creation_input_tokens, None);
+    assert_eq!(usage.output_tokens, Some(80));
+
+    // The session file's record of the same request is the same observation.
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    assert_eq!(
+        spool
+            .append(&CaptureEnvelopeV1::Usage(usage.clone()))
+            .unwrap(),
+        AppendOutcome::Stored
+    );
+    let (_, recorded) = codex::import_rollout(
+        Cursor::new(codex_fixture("rollout.jsonl")),
+        &request,
+        &spool,
+    )
+    .unwrap();
+    assert_eq!(recorded, 1);
+    let observed = pending_usage(&spool);
+    assert_eq!(observed.len(), 2);
+    assert!(observed.contains(&usage));
+
+    // No counts, no observation: a failed or cancelled request reports none.
+    let mut failed = hook.clone();
+    failed["token_usage"] = serde_json::Value::Null;
+    assert!(codex::usage_from_hook(failed.as_object().unwrap(), &request).is_none());
+    // Cached input that exceeds the input it is part of leaves the uncached count unknown.
+    let mut odd = hook;
+    odd["token_usage"]["cached_input_tokens"] = serde_json::json!(5000);
+    let odd = codex::usage_from_hook(odd.as_object().unwrap(), &request).unwrap();
+    assert_eq!(odd.input_tokens, None);
+    assert_eq!(odd.cache_read_input_tokens, Some(5000));
+}
+
+#[test]
+fn codex_import_selects_visible_history_and_usage_and_leaves_the_rest() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let rollout = codex_fixture("rollout.jsonl");
+    let (report, recorded) =
+        codex::import_rollout(Cursor::new(&rollout), &request, &spool).unwrap();
+    assert_eq!(recorded, 2);
+    assert_eq!(report.private_blocks_ignored, 1);
+    // The retrospective-history gap, and one for the record that is not JSON.
+    assert_eq!(report.gaps, 2);
+
+    let events = captured_events(&spool);
+    assert!(
+        events
+            .iter()
+            .all(|(session, _)| session.harness == AgentHarnessV1::Codex)
+    );
+    let tools: Vec<_> = events
+        .iter()
+        .filter(|(_, event)| event.kind != CapturedEventKindV1::Gap)
+        .map(|(_, event)| {
+            let tool = event.tool.as_ref();
+            (
+                event.kind,
+                tool.and_then(|tool| tool.name.as_deref()),
+                tool.and_then(|tool| tool.request_id.as_deref()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            (CapturedEventKindV1::UserPrompt, None, None),
+            (CapturedEventKindV1::AssistantMessage, None, None),
+            (
+                CapturedEventKindV1::ToolStarted,
+                Some("exec_command"),
+                Some("call_1")
+            ),
+            (CapturedEventKindV1::ToolFinished, None, Some("call_1")),
+            (
+                CapturedEventKindV1::ToolStarted,
+                Some("apply_patch"),
+                Some("call_2")
+            ),
+            (CapturedEventKindV1::ToolFinished, None, Some("call_2")),
+            (CapturedEventKindV1::AssistantMessage, None, None),
+        ]
+    );
+    // The file's own times, not the import's.
+    assert!(events.iter().all(|(_, event)| event.observed_at > 0));
+
+    let shared = serde_json::to_string(&spool.pending(100).unwrap()).unwrap();
+    let retained = retained_bytes(spool.root());
+    for visible in [
+        "VISIBLE_PROMPT_902",
+        "VISIBLE_COMMENTARY_904",
+        "VISIBLE_RESULT_905",
+        "VISIBLE_PATCH_906",
+        "VISIBLE_PATCH_RESULT_907",
+        "VISIBLE_ANSWER_908",
+    ] {
+        assert!(!shared.contains(visible), "{visible} left the spool");
+        assert!(contains_bytes(&retained, visible.as_bytes()), "{visible}");
+    }
+    // Instructions, the environment note, reasoning and images are never selected.
+    for private in [
+        "BASE_INSTRUCTIONS_899",
+        "DEVELOPER_INSTRUCTIONS_900",
+        "ENV_901",
+        "PRIVATE_REASONING_903",
+        "IMAGE_BYTES_909",
+    ] {
+        assert!(!contains_bytes(&retained, private.as_bytes()), "{private}");
+    }
+
+    let usage = pending_usage(&spool);
+    assert_eq!(
+        usage
+            .iter()
+            .map(|usage| (
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.output_tokens
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (Some(200), Some(1000), Some(80)),
+            (Some(300), Some(1200), Some(40)),
+        ]
+    );
+    assert!(usage.iter().all(|usage| usage.model == "model-fixture"));
+
+    // Importing the same file again adds nothing.
+    let pending = spool.pending(100).unwrap().len();
+    let (_, again) = codex::import_rollout(Cursor::new(&rollout), &request, &spool).unwrap();
+    assert_eq!((again, spool.pending(100).unwrap().len()), (0, pending));
+}
+
+#[test]
+fn codex_import_refuses_another_session_and_skips_a_parent_copy() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let mut other = codex_request(CaptureModeV1::LocalConversation);
+    other.observed_session_id = "another-session".into();
+    other.canonical_session_id = "another-session".into();
+    assert!(
+        codex::import_rollout(Cursor::new(codex_fixture("rollout.jsonl")), &other, &spool).is_err()
+    );
+    // A file that does not start with a session record is not a Codex session file.
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let headless = br#"{"timestamp":"2026-11-01T10:00:00Z","ordinal":0,"type":"event_msg","payload":{"type":"task_started"}}
+"#;
+    assert!(codex::import_rollout(Cursor::new(&headless[..]), &request, &spool).is_err());
+
+    // A subagent's file opens with a copy of its parent's history: only its own records count.
+    let line = |ordinal: u64, text: &str| {
+        serde_json::json!({
+            "timestamp": "2026-11-01T10:00:01Z", "ordinal": ordinal, "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {
+                "type": "AgentMessage", "id": format!("item_{ordinal}"),
+                "content": [{"type": "Text", "text": text}],
+            }},
+        })
+        .to_string()
+    };
+    let fork = [
+        serde_json::json!({
+            "timestamp": "2026-11-01T10:00:00Z", "ordinal": 0, "type": "session_meta",
+            "payload": {"id": CODEX_SESSION, "subagent_history_start_ordinal": 2},
+        })
+        .to_string(),
+        line(1, "PARENT_REPLY_910"),
+        line(2, "OWN_REPLY_911"),
+    ]
+    .join("\n");
+    let (report, _) = codex::import_rollout(Cursor::new(fork), &request, &spool).unwrap();
+    assert_eq!(report.events, 2);
+    let retained = retained_bytes(spool.root());
+    assert!(contains_bytes(&retained, b"OWN_REPLY_911"));
+    assert!(!contains_bytes(&retained, b"PARENT_REPLY_910"));
+}
+
+#[test]
+fn codex_import_keeps_every_output_of_one_call() {
+    // Codex writes a long-running call's output as several records under one call id.
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::MetadataOnly);
+    let output = |ordinal: u64| {
+        serde_json::json!({
+            "timestamp": "2026-11-01T10:00:01Z", "ordinal": ordinal, "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "call_1", "output": "more"},
+        })
+        .to_string()
+    };
+    let file = [
+        serde_json::json!({
+            "timestamp": "2026-11-01T10:00:00Z", "ordinal": 0, "type": "session_meta",
+            "payload": {"id": CODEX_SESSION},
+        })
+        .to_string(),
+        output(1),
+        output(2),
+    ]
+    .join("\n");
+    let (report, _) = codex::import_rollout(Cursor::new(file), &request, &spool).unwrap();
+    assert_eq!(report.events, 3);
+    let finished = captured_events(&spool)
+        .into_iter()
+        .filter(|(_, event)| event.kind == CapturedEventKindV1::ToolFinished)
+        .count();
+    assert_eq!(finished, 2);
 }

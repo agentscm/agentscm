@@ -1,0 +1,14 @@
+{
+  "session_id": "11111111-2222-7333-8444-555555555555",
+  "transcript_path": null,
+  "cwd": "/work/acme-widgets",
+  "model": "model-fixture",
+  "permission_mode": "default",
+  "turn_id": "aaaaaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "call_1",
+  "tool_input": {
+    "command": "printf hi"
+  }
+}
