@@ -41,8 +41,8 @@ const flag = (value: unknown, path: string): boolean => {
   return value
 }
 
-/** A retention the Hub could have configured (1 to 3650 days), else unknown. */
-const retentionDays = (value: unknown): number | null => (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 3650 ? value : null)
+/** A retention the Hub could have configured (0 to 3650 days; 0 keeps none), else unknown. */
+const retentionDays = (value: unknown): number | null => (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 3650 ? value : null)
 
 export function decodeCheckout(value: unknown, path = 'checkout'): SharingCheckout {
   const raw = object(value, path)

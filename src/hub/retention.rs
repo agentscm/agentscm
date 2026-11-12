@@ -27,24 +27,20 @@ async fn show(
     Path(repo): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     scope(&principal, &repo)?;
-    let used_scope = WorkRepositoryScope {
-        provider: principal.owner.identity.provider.clone(),
-        host: principal.owner.identity.host.clone(),
-        repository: principal.repository.clone(),
-        repository_id: principal.repository_id,
-    };
+    let used_scope = WorkRepositoryScope::of(&principal);
     let (store, hub) = (state.store.clone(), state.clone());
-    let (used, kept) = blocking(&state, move || {
+    let (used, kept, body_days) = blocking(&state, move || {
         Ok((
             store.work_payload_used(&used_scope)?,
             hub.work_history_seconds(&used_scope)?,
+            hub.shared_conversation_retention_days(&used_scope)?,
         ))
     })
     .await?;
     Ok(Json(json!({
         "repository": principal.repository,
         "shared_conversations": {
-            "retention_days": state.shared_conversation_retention_days,
+            "retention_days": body_days,
             "readable_by": ["author", "hub_admin"],
             "deletable_early_by": ["author", "hub_admin"],
         },
@@ -301,6 +297,9 @@ mod tests {
             )
             .await;
         assert_eq!(after(short), json!(86_400));
+        // Without its own hook, shared-conversation bodies keep the Hub-wide number.
+        let (_, bodies) = hub.call(Method::GET, ROUTE, Some(&widgets), None).await;
+        assert_eq!(bodies["shared_conversations"]["retention_days"], 30);
         let embedded = hub
             .client
             .get(format!("{}/v1/hub/embedded", hub.base))
@@ -309,5 +308,45 @@ mod tests {
             .unwrap();
         assert_eq!(embedded.status(), 200);
         assert_eq!(embedded.text().await.unwrap(), "embedded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_embedding_program_sets_body_retention_per_repository() {
+        let hub = Hub::start_with(|state| {
+            let state = state.with_shared_conversation_retention(|scope| {
+                Ok(match scope.repository.as_str() {
+                    "acme/widgets" => 365,
+                    "acme/private" => 0,
+                    _ => 99_999,
+                })
+            });
+            (state, Router::new())
+        })
+        .await;
+        let days = |body: Value| body["shared_conversations"]["retention_days"].clone();
+        let widgets = hub.token(1, "acme/widgets", 101, true).await;
+        let (_, kept) = hub.call(Method::GET, ROUTE, Some(&widgets), None).await;
+        assert_eq!(days(kept), json!(365));
+        let none = hub.token(2, "acme/private", 202, true).await;
+        let (_, kept) = hub
+            .call(
+                Method::GET,
+                "/v1/hub/repos/acme%2Fprivate/retention",
+                Some(&none),
+                None,
+            )
+            .await;
+        assert_eq!(days(kept), json!(0));
+        // Never more than ten years, the Hub-wide flag's own ceiling.
+        let long = hub.token(3, "acme/archive", 303, true).await;
+        let (_, kept) = hub
+            .call(
+                Method::GET,
+                "/v1/hub/repos/acme%2Farchive/retention",
+                Some(&long),
+                None,
+            )
+            .await;
+        assert_eq!(days(kept), json!(3650));
     }
 }
