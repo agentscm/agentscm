@@ -425,12 +425,15 @@ enum Expect {
     /// The one-time note at this JSON pointer, where the host cannot refuse a session's first
     /// edit while it has declared no Work.
     Undeclared(&'static str),
+    /// A shell call's end that reports what the hook client observed: context with this text,
+    /// never a refusal.
+    Observed(&'static str),
 }
 
 const CLAUDE_CONTEXT: &str = "/hookSpecificOutput/additionalContext";
 
 fn expectations() -> Vec<(&'static str, Expect)> {
-    use Expect::{Allow, Context, Empty, Generic, Undeclared};
+    use Expect::{Allow, Context, Empty, Generic, Observed, Undeclared};
     vec![
         ("claude-SessionStart", Context(CLAUDE_CONTEXT)),
         ("claude-PreToolUse-Edit", Empty),
@@ -444,6 +447,8 @@ fn expectations() -> Vec<(&'static str, Expect)> {
         ("claude-Stop", Empty),
         ("claude-SessionEnd", Empty),
         ("codex-SessionStart", Context(CLAUDE_CONTEXT)),
+        ("claude-PostToolUse-Bash", Observed("already applied")),
+        ("codex-PostToolUse-Bash", Observed("(missing_snapshot)")),
         ("codex-PreToolUse", Empty),
         ("codex-PermissionRequest", Empty),
         ("codex-Stop", Empty),
@@ -521,6 +526,15 @@ async fn every_fixture_gets_its_agents_output_shape() {
                 assert!(
                     text.lines().next().unwrap().contains(WORK_UNDECLARED),
                     "{name}: {answer}"
+                );
+                assert_eq!(answer.as_object().unwrap().len(), 1, "{name}");
+            }
+            Expect::Observed(needle) => {
+                let text = text_at(&answer, CLAUDE_CONTEXT);
+                assert!(text.contains(needle), "{name}: {answer}");
+                assert_eq!(
+                    answer["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+                    "{name}"
                 );
                 assert_eq!(answer.as_object().unwrap().len(), 1, "{name}");
             }
@@ -1398,6 +1412,172 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
         "tool_name":"Bash", "tool_input":{"command":"cargo test"}, "cwd":"/work/acme-widgets"});
     assert_eq!(hub.hook("claude", &lead, &bash), json!({}));
     assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}
+
+/// A shell call's end reports what the hook client observed. Files it changed are applied, so
+/// a session with no Work is told to declare it every time, never that anything was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_shell_changes_without_work_ask_for_a_start_every_time() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let changed = fixture("claude-PostToolUse-Bash");
+    let ask = "This session has no Work: call `agentscm_start` with these paths now";
+    for _ in 0..2 {
+        let answer = hub.hook_raw("claude", &secret, &changed);
+        let text = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(
+            text.contains("AgentSCM observed these files change during this shell call (already applied; another process may also have changed them): [\"src/gadget.rs\",\"src/widget.rs\"]"),
+            "{answer}"
+        );
+        assert!(text.contains(ask), "{answer}");
+        assert!(
+            !text.contains("not applied") && !text.contains(WORK_UNDECLARED),
+            "{answer}"
+        );
+        assert!(
+            !answer.to_string().contains("permissionDecision"),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+            "{answer}"
+        );
+    }
+    // The observed paths are held as this session's intents, as a check after the edit does.
+    let held = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].paths, ["src/gadget.rs", "src/widget.rs"]);
+    assert_eq!(held[0].via, ["hook:claude"]);
+
+    // A subagent asks its parent to start the Work.
+    let mut child = changed.clone();
+    child["agent_id"] = json!("sub-1");
+    child["agent_type"] = json!("general-purpose");
+    let answer = hub.hook_raw("claude", &secret, &child);
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(
+        text.contains("Tell the session that started you to call `agentscm_start` with these paths; do not start Work yourself."),
+        "{answer}"
+    );
+    assert!(!text.contains(ask), "{answer}");
+
+    // A failed call that changed files is read the same way, on its own event.
+    let mut failed = changed.clone();
+    failed["hook_event_name"] = json!("PostToolUseFailure");
+    let answer = hub.hook_raw("claude", &secret, &failed);
+    assert_eq!(
+        answer["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure",
+        "{answer}"
+    );
+    assert!(text_at(&answer, CLAUDE_CONTEXT).contains(ask), "{answer}");
+
+    // The client could not tell: no path check, only the request for one.
+    let mut unknown = changed.clone();
+    unknown["observed"] = json!({"outcome": "unknown", "reason": "pre_snapshot_failed"});
+    let answer = hub.hook_raw("claude", &secret, &unknown);
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert_eq!(
+        text,
+        "AgentSCM could not observe which files this shell call changed (pre_snapshot_failed). If it changed files, call `agentscm_check` with those paths."
+    );
+    // A field that is not what the client sends is read as unknown, never as a change.
+    for bad in [
+        json!({"outcome": "changed", "paths": ["../outside"]}),
+        json!({"outcome": "changed", "paths": []}),
+        json!({"outcome": "unknown", "reason": "made-up"}),
+        json!("changed"),
+    ] {
+        let mut malformed = changed.clone();
+        malformed["observed"] = bad.clone();
+        let answer = hub.hook_raw("claude", &secret, &malformed);
+        let text = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(text.contains("(invalid)"), "{bad}: {answer}");
+        assert!(!text.contains("agentscm_start"), "{bad}: {answer}");
+    }
+    // Nothing observed: silent, as before.
+    let mut quiet = changed.clone();
+    quiet.as_object_mut().unwrap().remove("observed");
+    assert_eq!(hub.hook_raw("claude", &secret, &quiet), json!({}));
+    quiet["hook_event_name"] = json!("PostToolUseFailure");
+    assert_eq!(hub.hook_raw("claude", &secret, &quiet), json!({}));
+}
+
+/// The files a shell call changed are checked like an edit after the fact: another agent's hold
+/// on one is named, and the call's end brings the lease back from its in-flight length, for a
+/// failed call as for a finished one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_shell_changes_name_a_holder_and_a_failed_call_still_ends() {
+    use agentscm::hub::work_lifecycle::{IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS};
+    use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+    let mut hub = Hub::start().await;
+    let holder = hub.agent();
+    let lead = hub.agent();
+    hub.hook("claude", &holder, &fixture("claude-PreToolUse-Write"));
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let item = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("shell".into()),
+                title: "shell".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into(), "src/gadget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    let expiry = |hub: &Hub| {
+        hub.store
+            .work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::One(&item.id),
+                unix_now(),
+            )
+            .unwrap()
+            .work[0]
+            .activity
+            .lease_expires_at
+            .unwrap()
+    };
+    let before = unix_now();
+    hub.hook("claude", &lead, &fixture("claude-PreToolUse-Bash"));
+    assert!(expiry(&hub) >= before + IN_FLIGHT_CAP_SECONDS);
+    let mut failed = fixture("claude-PostToolUse-Bash");
+    failed["hook_event_name"] = json!("PostToolUseFailure");
+    failed["observed"] = json!({"outcome": "changed", "paths": ["src/widget.rs"]});
+    let answer = hub.hook_raw("claude", &lead, &failed);
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(
+        text.starts_with("AgentSCM observed these files change"),
+        "{answer}"
+    );
+    // The holder is named by kind and digest, as a held-file note after an edit names it.
+    assert!(text.contains("user1's Claude Code session"), "{answer}");
+    assert!(text.contains("src/widget.rs"), "{answer}");
+    // This session has Work covering the files, so it is not asked to start any.
+    assert!(!text.contains("This session has no Work"), "{answer}");
+    assert!(!text.contains("not applied"), "{answer}");
+    assert!(expiry(&hub) <= unix_now() + LEASE_SECONDS, "call not ended");
 }
 
 /// The hook's side of answering a permission prompt from the Hub. A request needs its session's
