@@ -686,6 +686,7 @@ pub fn complete_merged(
                 transition: WorkTransitionKind::Complete,
                 reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
                 superseded_by: None,
+                participants: Vec::new(),
             };
             let actor = WorkTransitionActor::Policy {
                 owner: &owner,
