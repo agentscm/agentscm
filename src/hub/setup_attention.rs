@@ -86,7 +86,7 @@ impl SetupReason {
                 "Ask the agent to use a native edit tool on a disposable file in the same session, then call agentscm_setup_status again."
             }
             Self::TokenExpired | Self::TokenRevoked => {
-                "Sign this computer in to the Hub again (`agentscm hub login`, or Sign In in the menu bar app) so the agent gets a new token."
+                "Sign this computer in to the Hub again (`agentscm hub login`) so the agent gets a new token."
             }
         }
     }

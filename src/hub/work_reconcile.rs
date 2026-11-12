@@ -813,7 +813,27 @@ pub(super) fn work_stages(
     items: &[(&WorkItem, OutcomeValue)],
     now: i64,
 ) -> (BTreeMap<String, WorkStageV1>, BTreeSet<String>) {
+    let (stages, limits, _) = work_stages_detailed(store, principal, reader, items, now);
+    (stages, limits)
+}
+
+/// `work_stages` and, per unfinished Work, whether "every pull request of this Work merged" is
+/// not established: some limit hit while reading its own link, a pull request it declares (v2) is
+/// not known merged, or its branch has another open candidate beside its explicit link. A Work
+/// not in the set may rely on a merged stage alone.
+pub(super) fn work_stages_detailed(
+    store: &dyn Store,
+    principal: &Principal,
+    reader: &WorkLifecycleReader<'_>,
+    items: &[(&WorkItem, OutcomeValue)],
+    now: i64,
+) -> (
+    BTreeMap<String, WorkStageV1>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+) {
     let mut limits = BTreeSet::new();
+    let mut unsettled = BTreeSet::new();
     let mut stages = BTreeMap::new();
     let scope = catchup_scope(principal);
     let branches: Vec<String> = items
@@ -839,18 +859,34 @@ pub(super) fn work_stages(
     }
     for (item, outcome) in items {
         let finished = (*outcome != OutcomeValue::None).then_some(*outcome);
+        let mut unsettled_here = false;
         let link = if finished.is_some() {
             StageLink::None { limited: false }
         } else {
             match store.work_pr_target_scoped(reader, &item.id, now) {
-                Ok(Some(target)) => StageLink::Link(PrLinkV1 {
-                    basis: LinkBasis::CallerReported,
-                    number: target.number,
-                    head_sha: target.head_sha,
-                }),
+                Ok(Some(target)) => {
+                    // Another open pull request on the branch is a second candidate. Not
+                    // seeing the observations cannot show there is none.
+                    match (&observed, item.branch.as_deref().filter(|b| !b.is_empty())) {
+                        (Err(_), Some(_)) => unsettled_here = true,
+                        (Ok(observed), Some(branch)) => {
+                            unsettled_here = observed.truncated
+                                || observed.by_branch.get(branch).is_some_and(|open| {
+                                    open.iter().any(|(number, _)| *number != target.number)
+                                });
+                        }
+                        _ => {}
+                    }
+                    StageLink::Link(PrLinkV1 {
+                        basis: LinkBasis::CallerReported,
+                        number: target.number,
+                        head_sha: target.head_sha,
+                    })
+                }
                 Ok(None) => {
                     let inference = infer_from(item, &observed, merged.as_ref());
                     limits.extend(inference.limits.iter().map(|l| (*l).to_owned()));
+                    unsettled_here = !inference.limits.is_empty();
                     match inference.link {
                         Some(link) => StageLink::Link(link),
                         None => StageLink::None {
@@ -860,10 +896,31 @@ pub(super) fn work_stages(
                 }
                 Err(_) => {
                     limits.insert("work_link_unavailable".to_owned());
+                    unsettled_here = true;
                     StageLink::Unreadable
                 }
             }
         };
+        if finished.is_none() && !unsettled_here {
+            // Every pull request the Work declares must be known merged here; a target in
+            // another repository, a failed read or a failed merge lookup is not.
+            unsettled_here = match store.work_declared_links_scoped(reader, &item.id, now) {
+                Ok(declared) => declared.unwrap_or_default().iter().any(|target| {
+                    Some(target.repository_id) != principal.repository_id
+                        || store
+                            .catchup_merges_for_pull(&scope, target.number)
+                            .ok()
+                            .is_none_or(|merges| merges.is_empty())
+                }),
+                Err(_) => {
+                    limits.insert("work_link_unavailable".to_owned());
+                    true
+                }
+            };
+        }
+        if unsettled_here {
+            unsettled.insert(item.id.clone());
+        }
         let stage = stage_for(
             finished,
             link,
@@ -881,7 +938,7 @@ pub(super) fn work_stages(
         );
         stages.insert(item.id.clone(), stage);
     }
-    (stages, limits)
+    (stages, limits, unsettled)
 }
 
 /// The most recent merges `recent_merges` lists.

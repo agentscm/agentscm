@@ -620,7 +620,8 @@ fn refuse(status: StatusCode, error: &str, message: &str) -> Response {
     response
 }
 
-const RECONNECT: &str = "This browser is not connected to this computer. Run `agentscm open` in your checkout, or choose Open Hub in the AgentSCM menu bar app.";
+const RECONNECT: &str =
+    "This browser is not connected to this computer. Run `agentscm open` in your checkout.";
 const REPOSITORY_GONE: &str = "That repository is no longer connected on this computer. Choose another one, or run `agentscm open` in its checkout.";
 
 pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
+use agentscm::hub::access::{Access, Grant, Level};
 use agentscm::hub::handoff::Via;
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::login::{Login, LoginConfig};
@@ -235,6 +236,8 @@ struct Env {
     workspace: Option<Arc<Workspace>>,
     /// `AGENTSCM_HUB_APPS_FILE` for the next `serve`.
     apps: Option<String>,
+    /// An embedder's access rules for the next `serve`.
+    access: Option<Arc<dyn Access>>,
     http: reqwest::Client,
     dir: TempDir,
 }
@@ -255,6 +258,7 @@ impl Env {
             .unwrap(),
             workspace: None,
             apps: None,
+            access: None,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             dir,
         };
@@ -319,6 +323,10 @@ impl Env {
         .with_sync(Sync::new(sync_config).unwrap());
         let state = match &self.workspace {
             Some(workspace) => state.with_workspace(workspace.clone()),
+            None => state,
+        };
+        let state = match &self.access {
+            Some(access) => state.with_access(access.clone()),
             None => state,
         };
         sync::start(&state).await.unwrap();
@@ -1324,9 +1332,10 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert!(ok, "{stderr}");
 
     // The next session connects the checkout and says so in one line, writing no file in it.
+    // That line is not always first: a Hub that shares agent conversations says so before it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+        context(&reply).contains(&format!("AgentSCM: coordinating on {REPO} at "))
             && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
@@ -1403,7 +1412,7 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     );
     let reply = machine.session_start("s2");
     assert!(
-        context(&reply).starts_with("AgentSCM: alice has no access on private repository"),
+        context(&reply).contains("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
 
@@ -1480,7 +1489,7 @@ async fn signing_in_again_keeps_connected_checkouts_working() {
         )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
         "{stderr}"
     );
-    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    // The next agent in the checkout is told too.
     let reply = machine.session_start("s2");
     assert!(context(&reply).contains("was not renewed"), "{reply}");
 }
@@ -3446,6 +3455,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             "last_activity_at",
             "needs_you",
             "provider",
+            "read_only",
             "repository",
             "repository_id",
             "status_counts",
@@ -3453,6 +3463,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             "unfinished"
         ]
     );
+    assert_eq!(widgets["read_only"], false);
 
     let (status, started) = env
         .call(
@@ -5812,4 +5823,158 @@ async fn another_apps_credentials_cannot_spend_a_code_and_a_dropped_app_stays_re
         )
         .await;
     assert_eq!(status, 401);
+}
+
+/// An embedder's access rules for the tests: a forge user id to the repositories they may use.
+struct Grants {
+    store: Arc<dyn Store>,
+    people: Mutex<HashMap<i64, Vec<(&'static str, Level)>>>,
+}
+
+impl Access for Grants {
+    fn grants(&self, person: &store::User) -> agentscm::hub::Result<Option<Vec<Grant>>> {
+        let Some(named) = self
+            .people
+            .lock()
+            .unwrap()
+            .get(&person.identity.user_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut grants = Vec::new();
+        for (name, level) in named {
+            if let Some(repository) = self.store.repository_named(&person.identity.host, name)? {
+                grants.push(Grant { repository, level });
+            }
+        }
+        Ok(Some(grants))
+    }
+}
+
+async fn whoami(env: &Env, secret: &str) -> (u16, Value) {
+    let response = env
+        .http
+        .get(format!("{}/v1/hub/whoami", env.hub))
+        .bearer_auth(secret)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn an_embedders_grants_decide_who_signs_in_and_who_may_change_anything() {
+    let mut env = Env::start("github").await;
+    // A forge role alone no longer lets a person in.
+    env.role(EMU, "write", "write", 30);
+    let grants = Arc::new(Grants {
+        store: env.store.clone(),
+        people: Mutex::new(HashMap::from([
+            (ALICE, vec![(REPO, Level::Contribute)]),
+            (BOB, vec![(REPO, Level::Read)]),
+        ])),
+    });
+    env.access = Some(grants.clone());
+    env.hub = env.serve("").await;
+
+    let stranger = web_callback(&env, EMU).await;
+    assert!(set_cookie(&stranger, "__Host-agentscm_session").is_none());
+
+    let alice = page(&env, ALICE).await;
+    let bob = page(&env, BOB).await;
+    for page in [&alice, &bob] {
+        let (status, body) = page_post(
+            &env,
+            page,
+            true,
+            "/v1/hub/session/read-token",
+            json!({"repository": REPO}),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let (_, listed) = with_cookie(
+            &env.hub,
+            Method::GET,
+            "/v1/hub/session/repositories",
+            &page.cookie,
+            None,
+        )
+        .await;
+        let rows = listed["repositories"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{listed}");
+        assert_eq!(rows[0]["read_only"], json!(page.id == bob.id), "{listed}");
+    }
+
+    // A person who may only read changes nothing, through a page or through a token.
+    let pickup = json!({"repository": REPO, "title": "Finish the widget"});
+    let (status, body) =
+        page_post(&env, &bob, true, "/v1/hub/session/pickups", pickup.clone()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("read_only")),
+        "{body}"
+    );
+    let (status, body) = page_post(&env, &alice, true, "/v1/hub/session/pickups", pickup).await;
+    assert_eq!(status, 200, "{body}");
+    // Bob's writing token, as from before he could only read, now only reads.
+    let (bob_token, bob_secret) = agent_for(&env, &bob.id, "bob-agent", false);
+    let (alice_token, alice_secret) = agent_for(&env, &alice.id, "alice-agent", false);
+    let (status, me) = whoami(&env, &bob_secret).await;
+    assert_eq!(
+        (status, &me["token"]["read_only"]),
+        (200, &json!(true)),
+        "{me}"
+    );
+    let (_, me) = whoami(&env, &alice_secret).await;
+    assert_eq!(me["token"]["read_only"], json!(false), "{me}");
+    // Nor can his page answer through that token.
+    let answer = |token: &str| json!({"token": token, "path": "src/lib.rs", "accept": true});
+    let (status, body) = page_post(
+        &env,
+        &bob,
+        true,
+        "/v1/hub/session/handoff/answer",
+        answer(&bob_token),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("not_your_agent")),
+        "{body}"
+    );
+    let (status, body) = page_post(
+        &env,
+        &alice,
+        true,
+        "/v1/hub/session/handoff/answer",
+        answer(&alice_token),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Once the embedder stops granting her, Alice's sign-in and her agent's token stop on their
+    // next request, without a new sign-in or a restart.
+    grants.people.lock().unwrap().remove(&ALICE);
+    let (status, body) = with_cookie(
+        &env.hub,
+        Method::GET,
+        "/v1/hub/session",
+        &alice.cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("not_allowed")),
+        "{body}"
+    );
+    let (status, body) = whoami(&env, &alice_secret).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
 }

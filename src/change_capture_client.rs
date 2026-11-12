@@ -122,7 +122,8 @@ pub struct ConfigureArgs {
     /// Claude project-local settings. Defaults to ROOT/.claude/settings.local.json.
     #[arg(long)]
     claude_settings: Option<PathBuf>,
-    /// Explicit Claude-managed history root. Omit to leave provider usage unavailable.
+    /// Claude-managed history root that provider usage is read from. Omit to use Claude Code's
+    /// own projects directory.
     #[arg(long)]
     claude_history_root: Option<PathBuf>,
     /// Maximum retained metadata records in this private spool.

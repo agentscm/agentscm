@@ -166,6 +166,8 @@ mod hub_mcp;
 #[cfg(unix)]
 mod hub_merge_queue;
 #[cfg(unix)]
+mod hub_merged_release;
+#[cfg(unix)]
 mod hub_narrative;
 mod hub_planned_issues;
 #[cfg(unix)]

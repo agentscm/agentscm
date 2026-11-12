@@ -87,11 +87,7 @@ unless `--own-connection` is also passed. With `--own-connection` and no `--hub`
 keeps its main checkout's Hub. `client remove` in such a worktree removes the agents' files it
 holds and leaves the main checkout's connection and token alone.
 
-On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
-there is no separate app install. Start at Login is off until the member enables it in the menu.
-If the user-scope plugin runs in a checkout that was never connected, the tray lists that checkout
-under **Not connected** and offers **Connect**, which runs `client setup` with the member's saved
-Hub sign-in. On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
+`agentscm client status --check` shows these connections. Activity is based on
 recent observed MCP and native hook participation, so missing or idle activity remains unknown.
 
 The table lists the checkout files a `--checkout-only` setup writes; by default the same entries go
@@ -227,7 +223,7 @@ You sign in once per computer, not once per repository or per day:
    If you lose it, your agents are told why and what to ask for.
 4. `agentscm hub whoami` shows who this computer is signed in as, and
    `agentscm hub devices list|rename|revoke` manages your computers.
-5. If you signed in before this existed, the next connect, renewal or Open Hub while that sign-in
+5. If you signed in before this existed, the next connect, renewal or `agentscm open` while that sign-in
    is still live signs this computer in without asking.
 
 See [connect this computer](connect-this-computer.md#sign-in-once-per-computer) for the details
@@ -379,7 +375,7 @@ agents that need a setup step. That covers a reported login, trust, quota, unsup
 blocker, and an agent that verified MCP while no edit hook has reached the Hub. It also covers the
 case where none of your agent tokens for the repository works any more: the newest one expired or
 was revoked within the last day, for example because the computer stopped renewing it. When that
-agent leads unfinished Work, the same row appears in Needs you and counts in the menu bar app;
+agent leads unfinished Work, the same row appears in Needs you;
 otherwise it only badges Setup. A session that merely started and never ran setup verification is
 not a problem. Other people's setup problems are never shown to you. The reported problems come
 from the Hub's 15-minute observations, so a Hub restart clears them until the agent verifies again.

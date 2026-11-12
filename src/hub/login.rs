@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::access::{self, Decision};
 use super::forge_http::{Forge, check_base_url};
 use super::http::{ApiError, JsonBody, Reader, bearer, blocking};
 use super::store::{
@@ -676,11 +677,16 @@ impl FromRequestParts<HubState> for HumanSession {
     ) -> std::result::Result<Self, ApiError> {
         if parts.headers.contains_key(header::AUTHORIZATION) {
             let digest = session_digest(bearer(parts)?)?;
-            return state
+            let human = state
                 .login
                 .session(&digest)
-                .map(Self)
-                .ok_or_else(ApiError::unauthorized);
+                .ok_or_else(ApiError::unauthorized)?;
+            if !human.admin
+                && matches!(access::decide(state, &human.user).await?, Decision::Refused)
+            {
+                return Err(not_allowed());
+            }
+            return Ok(Self(human));
         }
         let secret = browser_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         let digest = super::store::browser_session_digest(secret)?;
@@ -714,13 +720,22 @@ impl FromRequestParts<HubState> for HumanSession {
         // This sign-in outlives restarts, so leaving the allow list must end it too.
         let login = &state.login;
         let admin = login.is_admin_user(&user);
-        if login.has_allow_list()
-            && !admin
-            && !login.is_allowed(&user.identity.provider, user.identity.user_id, &user.login)
-        {
-            return Err(
-                ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
-            );
+        if !admin {
+            let allowed = match access::decide(state, &user).await? {
+                Decision::HubRules => {
+                    !login.has_allow_list()
+                        || login.is_allowed(
+                            &user.identity.provider,
+                            user.identity.user_id,
+                            &user.login,
+                        )
+                }
+                Decision::Refused => false,
+                Decision::Granted(_) => true,
+            };
+            if !allowed {
+                return Err(not_allowed());
+            }
         }
         Ok(Self(Human {
             key: String::new(),
@@ -1050,30 +1065,13 @@ async fn callback_inner(
         Err(error) => return refuse(error),
     };
     if pending.web {
-        let secret = random_hex()?;
-        let digest = super::store::browser_session_digest(&secret)?;
-        let (store, owner, now) = (state.store.clone(), signed.user.id.clone(), unix_now());
-        blocking(state, move || {
-            store.insert_browser_session(&owner, &digest, now + SESSION_SECONDS, now)
-        })
-        .await?;
         let location = if apps::return_path(&pending.return_to) {
             pending.return_to.clone()
         } else {
             format!("{}#home", pending.return_to)
         };
         let mut response = found(&location, cookie_attributes("", 0))?;
-        response.headers_mut().append(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&browser_cookie_attributes(
-                &secret,
-                super::store::BROWSER_SESSION_MAX_SECONDS,
-            ))
-            .map_err(|_| ApiError::invalid())?,
-        );
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        add_browser_session(state, &signed.user.id, &mut response).await?;
         return Ok(response);
     }
     if pending.workspace {
@@ -1326,38 +1324,37 @@ async fn sign_in(
             );
         }
     } else if !admin {
-        if state.login.has_allow_list() && !state.login.is_allowed(provider.name, id, &login) {
-            refuse("not_allowed").await;
-            return Err(
-                ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
-            );
-        }
-        if !reads_connected(state, provider, forge, token).await? {
-            refuse("no_repository_role").await;
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(format!(
-                "{login} has no role on a repository connected to this Hub; ask a repository owner to add you, then sign in again"
-            )));
+        match access::decide(state, &candidate).await? {
+            Decision::Refused => {
+                refuse("not_allowed").await;
+                return Err(not_allowed());
+            }
+            // The embedder already said which repositories this person may use.
+            Decision::Granted(_) => {}
+            Decision::HubRules => {
+                if state.login.has_allow_list()
+                    && !state.login.is_allowed(provider.name, id, &login)
+                {
+                    refuse("not_allowed").await;
+                    return Err(not_allowed());
+                }
+                if !reads_connected(state, provider, forge, token).await? {
+                    refuse("no_repository_role").await;
+                    return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(format!(
+                        "{login} has no role on a repository connected to this Hub; ask a repository owner to add you, then sign in again"
+                    )));
+                }
+            }
         }
     }
     let store = state.store.clone();
+    let recorded = if method == "workspace" {
+        "browser"
+    } else {
+        method
+    };
     let user = blocking(state, move || {
-        let mut user = store.upsert_user(&identity, &login)?;
-        if !user.disabled {
-            if user.name != name {
-                store.set_user_name(&user.id, name.as_deref())?;
-                user.name = name;
-            }
-            store.record_sign_in(
-                &user.id,
-                if method == "workspace" {
-                    "browser"
-                } else {
-                    method
-                },
-                admin,
-            )?;
-        }
-        Ok(user)
+        store_person(&*store, &identity, &login, name, recorded, admin)
     })
     .await?;
     if user.disabled {
@@ -1393,6 +1390,115 @@ async fn sign_in(
         user,
         admin,
     })
+}
+
+/// Stores a signed-in person with their profile name and records the sign-in, unless a Hub
+/// admin turned them off.
+fn store_person(
+    store: &dyn super::Store,
+    identity: &ForgeIdentity,
+    login: &str,
+    name: Option<String>,
+    method: &str,
+    admin: bool,
+) -> Result<User> {
+    let mut user = store.upsert_user(identity, login)?;
+    if !user.disabled {
+        if user.name != name {
+            store.set_user_name(&user.id, name.as_deref())?;
+            user.name = name;
+        }
+        store.record_sign_in(&user.id, method, admin)?;
+    }
+    Ok(user)
+}
+
+/// Stores a web-page sign-in for `owner` and adds its cookie to `response`.
+async fn add_browser_session(
+    state: &HubState,
+    owner: &str,
+    response: &mut Response,
+) -> ApiResult<()> {
+    let secret = random_hex()?;
+    let digest = super::store::browser_session_digest(&secret)?;
+    let (store, owner, now) = (state.store.clone(), owner.to_owned(), unix_now());
+    blocking(state, move || {
+        store.insert_browser_session(&owner, &digest, now + SESSION_SECONDS, now)
+    })
+    .await?;
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&browser_cookie_attributes(
+            &secret,
+            super::store::BROWSER_SESSION_MAX_SECONDS,
+        ))
+        .map_err(|_| ApiError::invalid())?,
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(())
+}
+
+/// Signs a person in on this browser, as a Git host's web sign-in does, for a program that
+/// embeds the Hub and has checked who they are itself. Stores them as the Git host account
+/// `identity` with `login` and the profile `name`, and redirects to `location`, a path on
+/// this Hub. Refuses a person the [`access::Access`] set with `HubState::with_access` does not
+/// admit (everyone, without one), unless they are a Hub admin, and one a Hub admin turned off.
+pub async fn sign_in_browser(
+    state: &HubState,
+    identity: ForgeIdentity,
+    login: String,
+    name: Option<String>,
+    location: &str,
+) -> ApiResult<Response> {
+    let local = location.starts_with('/')
+        && !location.starts_with("//")
+        && location.len() <= 2000
+        && !location
+            .bytes()
+            .any(|b| b == b'\\' || b.is_ascii_whitespace() || b.is_ascii_control());
+    if !local {
+        return Err(ApiError::invalid());
+    }
+    identity.validate()?;
+    validate_login(&login)?;
+    let admin = state
+        .login
+        .is_admin(&identity.provider, identity.user_id, &login);
+    let candidate = User {
+        id: String::new(),
+        identity: identity.clone(),
+        login: login.clone(),
+        name: None,
+        disabled: false,
+    };
+    if !admin
+        && !matches!(
+            access::decide(state, &candidate).await?,
+            Decision::Granted(_)
+        )
+    {
+        devices::record_refusal(state, &candidate, "not_allowed", "sign_in").await;
+        return Err(not_allowed());
+    }
+    let name = name.as_deref().and_then(clean_display_name);
+    let store = state.store.clone();
+    let user = blocking(state, move || {
+        store_person(&*store, &identity, &login, name, "browser", admin)
+    })
+    .await?;
+    if user.disabled {
+        devices::record_refusal(state, &candidate, "user_disabled", "sign_in").await;
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "user_disabled").with_message(DISABLED));
+    }
+    let mut response = found(location, cookie_attributes("", 0))?;
+    add_browser_session(state, &user.id, &mut response).await?;
+    Ok(response)
+}
+
+fn not_allowed() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
 }
 
 #[derive(Deserialize)]
@@ -1711,10 +1817,24 @@ async fn create_token(
         provider.host.clone(),
         repository.clone(),
     );
-    match blocking(&state, move || store.repository_named(&host, &named)).await? {
+    let connected = match blocking(&state, move || store.repository_named(&host, &named)).await? {
         None => return Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected")),
         Some(connected) if connected.repository_id != repository_id => return Err(forbidden()),
-        Some(_) => {}
+        Some(connected) => connected,
+    };
+    // An embedder's grant must allow the repository too, and a writing token where they contribute.
+    let decision = access::decide(&state, &human.user).await?;
+    if !matches!(decision, Decision::HubRules) {
+        let need = if body.read_only {
+            access::Level::Read
+        } else {
+            access::Level::Contribute
+        };
+        match decision.level(&connected.id) {
+            None => return Err(access::not_granted()),
+            Some(level) if level < need => return Err(ApiError::read_only()),
+            Some(_) => {}
+        }
     }
     let store = state.store.clone();
     let (owner, name, stored) = (human.user.id, body.name.clone(), repository.clone());
@@ -1863,6 +1983,82 @@ async fn enable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grants every repository for anyone with a forge user id of 1 and refuses everyone else.
+    struct OnlyFirst;
+
+    impl access::Access for OnlyFirst {
+        fn grants(&self, person: &User) -> Result<Option<Vec<access::Grant>>> {
+            Ok((person.identity.user_id == 1).then(Vec::new))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_embedder_signs_a_person_in_on_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let state = HubState::new(
+            store.clone(),
+            std::sync::Arc::new(
+                crate::backend::LocalBackend::open(dir.path().join("objects")).unwrap(),
+            ),
+        )
+        .with_access(std::sync::Arc::new(OnlyFirst));
+        let person = |user_id| ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        let Ok(signed) =
+            sign_in_browser(&state, person(1), "maya".into(), Some(" Maya ".into()), "/").await
+        else {
+            panic!("a granted person signs in");
+        };
+        assert_eq!(signed.status(), StatusCode::FOUND);
+        assert_eq!(signed.headers()[header::LOCATION], "/");
+        let secret = signed
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                value
+                    .to_str()
+                    .ok()?
+                    .strip_prefix(&format!("{BROWSER_COOKIE}="))?
+                    .split(';')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap();
+        let digest = super::super::store::browser_session_digest(&secret).unwrap();
+        let (user, _) = store
+            .browser_session(&digest, unix_now(), unix_now() + SESSION_SECONDS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (user.login.as_str(), user.name.as_deref()),
+            ("maya", Some("Maya"))
+        );
+
+        // Someone the embedder refuses is not stored, and the page must be on this Hub.
+        let refused = sign_in_browser(&state, person(2), "omar".into(), None, "/").await;
+        assert_eq!(refused.err().map(|error| error.code()), Some("not_allowed"));
+        assert!(store.user_for_identity(&person(2)).unwrap().is_none());
+        for elsewhere in [
+            "//evil.example/",
+            "https://evil.example/",
+            "/a\\b",
+            "/a b",
+            "",
+        ] {
+            let away = sign_in_browser(&state, person(1), "maya".into(), None, elsewhere).await;
+            assert!(away.is_err(), "{elsewhere:?}");
+        }
+    }
 
     #[test]
     fn web_sign_in_returns_only_to_a_same_origin_page() {

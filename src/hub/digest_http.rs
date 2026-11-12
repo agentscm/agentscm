@@ -91,6 +91,10 @@ pub fn routes() -> Router<HubState> {
             get(view).put(set_enabled),
         )
         .route("/v1/hub/standup/digest/settings/me", put(set_mine))
+        .route(
+            "/v1/hub/standup/merged-release/settings",
+            get(view_release).put(set_release),
+        )
 }
 
 async fn read(
@@ -188,6 +192,68 @@ async fn set_mine(
         blocking(&state, move || {
             set_opted_out(&*store, &principal.owner.id, repository_id, body.opted_out)?;
             view_of(&*store, &principal)
+        })
+        .await?,
+    ))
+}
+
+/// Whether a repository releases the hold of Work its merged pull request finished.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MergedReleaseSettings {
+    pub repository: String,
+    pub enabled: bool,
+}
+
+fn release_view_of(store: &dyn Store, principal: &Principal) -> MergedReleaseSettings {
+    MergedReleaseSettings {
+        repository: principal.repository.clone(),
+        enabled: principal
+            .repository_id
+            .is_some_and(|id| super::merged_holds::merged_release_enabled(store, id)),
+    }
+}
+
+async fn view_release(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> std::result::Result<Json<MergedReleaseSettings>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || Ok(release_view_of(&*store, &principal))).await?,
+    ))
+}
+
+async fn set_release(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(body): JsonBody<SetEnabled>,
+) -> std::result::Result<Json<MergedReleaseSettings>, ApiError> {
+    let repository_id = principal.repository_id.ok_or_else(no_repository_id)?;
+    // The same standing as the digest switch: a Hub admin or a repository admin.
+    let admin = state.login.is_admin_user(&principal.owner)
+        || super::login::devices::mint_access(
+            &state,
+            &principal.owner,
+            &principal.repository,
+            "merged_release",
+        )
+        .await?
+        .1;
+    if !admin {
+        return Err(ApiError::forbidden().with_message(
+            "Only a repository admin or a Hub admin switches automatic release of merged Work on or off",
+        ));
+    }
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::merged_holds::set_merged_release(
+                &*store,
+                repository_id,
+                body.enabled,
+                &principal.owner.id,
+            )?;
+            Ok(release_view_of(&*store, &principal))
         })
         .await?,
     ))

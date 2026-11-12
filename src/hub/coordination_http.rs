@@ -290,17 +290,29 @@ pub(super) fn not_your_agent() -> ApiError {
         .with_message("That agent is not yours, or it is no longer connected")
 }
 
-/// Whether `token` is an active agent token of `owner` that can act (not read-only).
+/// Whether `token` is an active agent token of `owner` that can act (not read-only), on a
+/// repository the embedder's `access`, when set, still lets them contribute to.
 pub(super) fn owns_agent(
     store: &dyn super::Store,
-    owner: &str,
+    access: Option<&dyn super::access::Access>,
+    owner: &super::store::User,
     token: &str,
     now: i64,
 ) -> Result<bool> {
-    Ok(store
-        .list_agent_tokens(owner)?
-        .iter()
-        .any(|t| t.id == token && !t.revoked && !t.read_only && t.expires_at > now))
+    let Some(t) = store
+        .list_agent_tokens(&owner.id)?
+        .into_iter()
+        .find(|t| t.id == token && !t.revoked && !t.read_only && t.expires_at > now)
+    else {
+        return Ok(false);
+    };
+    let Some(access) = access else {
+        return Ok(true);
+    };
+    Ok(access.grants(owner)?.is_some_and(|grants| {
+        super::access::token_level(&grants, &owner.identity.host, t.repository_id)
+            >= Some(super::access::Level::Contribute)
+    }))
 }
 
 #[derive(Deserialize)]
@@ -323,13 +335,14 @@ async fn person_reply(
     person: Person,
     JsonBody(body): JsonBody<PersonReply>,
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
-    let (owner, via) = (person.user.id, person.via);
-    let store = state.store.clone();
+    let (owner, via) = (person.user, person.via);
+    let (store, access) = (state.store.clone(), state.access.clone());
     let result = blocking(&state, move || {
         let now = unix_now();
-        if !owns_agent(&*store, &owner, &body.token, now)? {
+        if !owns_agent(&*store, access.as_deref(), &owner, &body.token, now)? {
             return Err(HubError::Unauthorized);
         }
+        let owner = owner.id;
         let reply = CoordinationReply {
             request_id: body.request_id,
             operation_id: body.operation_id,
@@ -371,11 +384,11 @@ async fn person_withdraw(
     human: HumanSession,
     JsonBody(body): JsonBody<PersonWithdraw>,
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
-    let owner = human.web_user()?.id.clone();
-    let store = state.store.clone();
+    let owner = human.web_user()?.clone();
+    let (store, access) = (state.store.clone(), state.access.clone());
     let result = blocking(&state, move || {
         let now = unix_now();
-        if !owns_agent(&*store, &owner, &body.token, now)? {
+        if !owns_agent(&*store, access.as_deref(), &owner, &body.token, now)? {
             return Err(HubError::Unauthorized);
         }
         let withdraw = CoordinationWithdraw {
@@ -426,9 +439,14 @@ async fn person_transition(
     let is_admin = human.admin().is_ok();
     super::store::validate_repository(&body.repository)?;
     // The same allow-list and current forge role checks a read-token mint makes.
-    let repository =
-        super::login::devices::mint_check(&state, &user, &body.repository, "work_transition")
-            .await?;
+    let repository = super::login::devices::mint_check(
+        &state,
+        &user,
+        &body.repository,
+        "work_transition",
+        super::access::Level::Contribute,
+    )
+    .await?;
     let request = super::work_transition::WorkTransitionRequest {
         work_id: body.work_id,
         operation_id: body.operation_id,
@@ -473,7 +491,14 @@ async fn person_repository(
     via: &'static str,
 ) -> std::result::Result<super::connection::ConnectedRepository, ApiError> {
     super::store::validate_repository(repository)?;
-    super::login::devices::mint_check(state, user, repository, via).await
+    super::login::devices::mint_check(
+        state,
+        user,
+        repository,
+        via,
+        super::access::Level::Contribute,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -634,11 +659,11 @@ async fn person_answer(
     person: Person,
     JsonBody(body): JsonBody<PersonAnswer>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (owner, via) = (person.user.id, person.via);
-    let store = state.store.clone();
+    let (owner, via) = (person.user, person.via);
+    let (store, access) = (state.store.clone(), state.access.clone());
     let answered = blocking(&state, move || {
         let now = unix_now();
-        if !owns_agent(&*store, &owner, &body.token, now)? {
+        if !owns_agent(&*store, access.as_deref(), &owner, &body.token, now)? {
             return Err(HubError::Unauthorized);
         }
         store.answer_handoff_via(
@@ -678,12 +703,12 @@ async fn person_ask(
     human: HumanSession,
     JsonBody(body): JsonBody<PersonAsk>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let owner = human.web_user()?.id.clone();
-    let viewer = owner.clone();
-    let store = state.store.clone();
+    let owner = human.web_user()?.clone();
+    let viewer = owner.id.clone();
+    let (store, access) = (state.store.clone(), state.access.clone());
     let asked = blocking(&state, move || {
         let now = unix_now();
-        if !owns_agent(&*store, &owner, &body.token, now)? {
+        if !owns_agent(&*store, access.as_deref(), &owner, &body.token, now)? {
             return Err(HubError::Unauthorized);
         }
         store.ask_handoff_via(

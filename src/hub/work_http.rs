@@ -607,15 +607,18 @@ async fn recovery(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            super::work_recovery::inspect(
+            let now = unix_now();
+            let mut recovery = super::work_recovery::inspect(
                 &*store,
                 &super::work_recovery::RecoveryCaller::Agent {
                     token: &principal.token_id,
                     session: query.session.as_deref(),
                 },
                 &query,
-                unix_now(),
-            )
+                now,
+            )?;
+            super::merged_holds::annotate_conflicts(&*store, &principal, &mut recovery, now);
+            Ok(recovery)
         })
         .await?,
     ))

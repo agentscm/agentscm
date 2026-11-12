@@ -171,7 +171,7 @@ error_codes! {
     PermissionUnavailable => ("permission_unavailable", 503, true, Wait, "The forge did not answer the access check; nothing changed, so try again in a minute."),
     HubUnreachable => ("hub_unreachable", 503, true, Reconnect, "The Hub is unreachable; check the connection before relying on coordination."),
     InvalidResponse => ("invalid_response", 502, false, UpdateClient, "The Hub reply could not be read; check client and Hub compatibility."),
-    SignInRequired => ("sign_in_required", 401, false, SignIn, "This computer isn't signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app or run agentscm hub login"),
+    SignInRequired => ("sign_in_required", 401, false, SignIn, "This computer isn't signed in to this Hub any more; run agentscm hub login"),
     InvalidOrChanged => ("invalid_or_changed", 400, false, InspectWork, "The request is invalid or changed; refresh current Work before sending a new request."),
     NotAdopted => ("not_adopted", 409, false, AskOwner, "The skill is not adopted; ask the repository owner to review its adoption."),
     RunFull => ("run_full", 409, false, ContactOperator, "The run evidence limit was reached; ask the operator to inspect retained evidence."),

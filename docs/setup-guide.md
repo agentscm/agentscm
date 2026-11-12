@@ -27,9 +27,7 @@ Your choice is stored in the per-user telemetry configuration. `agentscm telemet
    - **Join one (`--hub-url URL`).** Connects this computer to a Hub that already runs. Deploying a Hub for a team is your job: see [hosted setup](hosted.md) and ask your coding agent to work through it with you. To share a Hub from your own computer, see [Tailscale](install.md#share-your-local-hub-over-tailscale).
 3. **Signs you in** through your browser (device code if the Hub offers it). When an agent runs the command, it prints the sign-in link and waits for you to finish. With `--agent-token-file` it skips sign-in and uses that token.
 4. **Sets up every agent it found**, at user scope, for all your projects. For each agent it runs the same code as [`agentscm client setup`](team-member-onboarding.md): it installs the hooks, the MCP server and the coordination skill (see [coding agents in every project](install.md#coding-agents-in-every-project)), and for Claude Code allows the AgentSCM tools in `~/.claude/settings.json`. `--only AGENT` limits it to the agents you name. A checkout is connected to the Hub automatically when an agent first starts in it, so a fresh clone or a new worktree needs no setup. If one agent fails, the others still finish and the output says which failed, in one line each.
-5. **Summary**, and a record in `~/.config/agentscm/quickstart.json` (0600) of what it changed, which `uninstall` reads. Running quickstart again detects what exists and keeps it. A run that writes nothing says **No changes made.** It ends with what to do next: fully quit and reopen your agents, then ask one in a repository, "Get started with AgentSCM". Codex also needs you to run `/hooks` once and trust the AgentSCM hooks. It prints the undo command and, on macOS, how to open the menu bar app (`agentscm tray`).
-
-On macOS the tray is optional. Pass `--tray` to open it after successful setup. Quickstart never enables Start at Login; that setting is in the tray menu and is off by default.
+5. **Summary**, and a record in `~/.config/agentscm/quickstart.json` (0600) of what it changed, which `uninstall` reads. Running quickstart again detects what exists and keeps it. A run that writes nothing says **No changes made.** It ends with what to do next: fully quit and reopen your agents, then ask one in a repository, "Get started with AgentSCM". Codex also needs you to run `/hooks` once and trust the AgentSCM hooks. It prints the undo command.
 
 To preview, run `agentscm quickstart --dry-run`: it prints what it would do and writes nothing.
 
@@ -82,7 +80,6 @@ The flags `--hub-url`, `--yes`, `--only`, `--dry-run` and `--json` are the ones 
 | `--provider github\|gitlab` | Forge to sign in with (inferred from `github.com` or `gitlab.com`; select explicitly for a self-managed forge, including nested GitLab groups). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |
 | `--init` | Also run `agentscm init-repo` for this repository. Without it, quickstart writes nothing to the repository. |
-| `--tray` | On macOS, open the optional status-bar companion after setup succeeds. `--yes` does not open it unless this flag is present. |
 | `--no-collisions` | Skip the collision check. |
 
 Quickstart's origin detection ignores URLs containing passwords, HTTPS userinfo, queries or fragments.
