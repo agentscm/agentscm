@@ -4,6 +4,8 @@
 //! stored here, and never appears in an error.
 use std::collections::HashMap;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
@@ -269,8 +271,8 @@ impl Api {
             })
     }
 
-    /// A JSON file of at most `max` bytes at `branch`, re-serialized; None when it does not
-    /// exist. Raw files that are not JSON are an error (the reply reader only keeps JSON).
+    /// The exact bytes of a file of at most `max` bytes at `branch`; None when it does not exist.
+    /// Errors read like GitHub's, so a caller tells an answer (unreadable, too large) from an outage.
     pub async fn file(
         &self,
         token: &str,
@@ -283,7 +285,7 @@ impl Api {
             return Err(GhError::Failed("bad branch name".into()));
         }
         let url = format!(
-            "/projects/{project}/repository/files/{}/raw?ref={}",
+            "/projects/{project}/repository/files/{}?ref={}",
             encode(path),
             encode(branch)
         );
@@ -291,10 +293,22 @@ impl Api {
         if reply.status == 404 {
             return Ok(None);
         }
-        let body = reply.ok("projects")?;
-        let bytes = serde_json::to_vec(&body).unwrap_or_default();
-        if body.is_null() || bytes.len() > max {
-            return Err(GhError::Failed("unreadable or oversized file".into()));
+        let body = reply.ok("repository/files")?;
+        let unreadable = || GhError::Failed("unreadable reply from repository/files".into());
+        if body["encoding"] != "base64" {
+            return Err(unreadable());
+        }
+        if body["size"].as_u64().is_none_or(|size| size > max as u64) {
+            return Err(GhError::Failed(format!("file is larger than {max} bytes")));
+        }
+        let text: String = body["content"]
+            .as_str()
+            .ok_or_else(unreadable)?
+            .split_whitespace()
+            .collect();
+        let bytes = STANDARD.decode(text).map_err(|_| unreadable())?;
+        if bytes.len() > max {
+            return Err(unreadable());
         }
         Ok(Some(bytes))
     }

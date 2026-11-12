@@ -1664,3 +1664,26 @@ async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
         .unwrap();
     assert_eq!(forge.state, CatchupCoverageState::ObservedOnly);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gitlab_files_are_read_as_their_exact_bytes() {
+    use agentscm::hub::github::GhError;
+    let env = Env::start().await;
+    // Not JSON, not even UTF-8: the bytes come back as stored, so a digest of them matches the pin.
+    let raw = b"---\nname: check\n---\nRun the checks.\n\xff".to_vec();
+    env.fake.with(|s| {
+        let files = &mut s.projects.get_mut(&REPO_ID).unwrap().files;
+        files.insert(("main".into(), "skills/check/SKILL.md".into()), raw.clone());
+    });
+    let api = agentscm::hub::gitlab::Api::new(&format!("{}/api/v4", env.fake.base)).unwrap();
+    let read = |path: &'static str, max: usize| api.file(TOKEN, REPO_ID, path, "main", max);
+    assert_eq!(
+        read("skills/check/SKILL.md", 1024).await.unwrap(),
+        Some(raw.clone())
+    );
+    assert_eq!(read("skills/missing.md", 1024).await.unwrap(), None);
+    match read("skills/check/SKILL.md", 4).await {
+        Err(GhError::Failed(detail)) => assert!(detail.starts_with("file is larger"), "{detail}"),
+        other => panic!("an oversized file is an answer, not an outage: {other:?}"),
+    }
+}

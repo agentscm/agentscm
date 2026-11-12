@@ -203,6 +203,8 @@ pub struct Project {
     pub default_branch: Option<String>,
     /// A bare Git repository behind the branch reads and MR creation, if any.
     pub git: Option<std::path::PathBuf>,
+    /// File bytes by (ref, path), for `repository/files/:path?ref=`.
+    pub files: BTreeMap<(String, String), Vec<u8>>,
 }
 
 impl Project {
@@ -218,6 +220,7 @@ impl Project {
             commits: BTreeMap::new(),
             default_branch: Some("main".into()),
             git: None,
+            files: BTreeMap::new(),
         }
     }
 }
@@ -859,6 +862,24 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             Some((parents, _)) => json_reply(200, json!({"id": sha, "parent_ids": parents})),
             None => not_found(),
         },
+        (&Method::GET, ["repository", "files", path]) => {
+            let at = query
+                .iter()
+                .find(|(k, _)| k == "ref")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            match project.files.get(&(at, (*path).to_owned())) {
+                Some(bytes) => {
+                    use base64::Engine;
+                    json_reply(
+                        200,
+                        json!({"file_path": path, "size": bytes.len(), "encoding": "base64",
+                            "content": base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                    )
+                }
+                None => not_found(),
+            }
+        }
         (&Method::GET, ["repository", "tree"]) => {
             let sha = query
                 .iter()
