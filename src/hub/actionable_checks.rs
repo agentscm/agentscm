@@ -291,7 +291,9 @@ impl Blocker {
             "its owner holds them in AgentSCM".to_owned()
         } else {
             match self.active_at {
-                Some(at) if self.idle(now) => format!("no push, review or comment since {}", utc(at)),
+                Some(at) if self.idle(now) => {
+                    format!("no push, review or comment since {}", utc(at))
+                }
                 Some(at) => format!("last push, review or comment {}", utc(at)),
                 None => "last activity unknown".to_owned(),
             }
@@ -329,60 +331,56 @@ fn held_merges(
         limits.insert("merge_hold_intents_truncated".into());
         intents.truncate(PULLS);
     }
-    let files = |pr: &Value| -> BTreeSet<String> {
-        pr["files"]
+    // Each open pull request once: its files, and its owners as `People::of` finds them (the
+    // author who uses this Hub, the owner of the publication that opened it, the Work on its
+    // branch). Pull requests the Hub opened share one bot author, so the author alone is not who.
+    let mut owned = BTreeMap::new();
+    for (number, pr) in open {
+        let (persons, work_ids) = people.of(Some(pr), None)?;
+        let files: BTreeSet<String> = pr["files"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .filter(|p| !p.chars().any(char::is_control))
             .map(str::to_owned)
-            .collect()
-    };
-    let mut owners = BTreeMap::new();
+            .collect();
+        owned.insert(*number, (persons, work_ids, files));
+    }
+    // A file list the forge cut short could hide a file an active owner shares.
+    let complete = complete && open.values().all(|pr| pr["files_truncated"] == false);
     let mut actions = Vec::new();
     for number in ready {
         let waiting = &open[number];
-        let Some(author) = waiting["author"]["id"].as_i64() else {
-            continue;
-        };
-        let (persons, work_ids) = people.of(Some(waiting), None)?;
+        let (persons, work_ids, mine) = &owned[number];
         if work_ids.is_empty() {
             continue;
         }
-        let mine = files(waiting);
         let mut blockers = Vec::new();
         for (other, pr) in open {
-            if other == number || pr["author"]["id"].as_i64() == Some(author) {
+            let (theirs, _, files) = &owned[other];
+            let same = if theirs.is_empty() {
+                // Nobody on this Hub owns it: only its forge author says whose it is.
+                let Some(author) = pr["author"]["id"].as_i64() else {
+                    limits.insert("merge_hold_author_unknown".into());
+                    continue;
+                };
+                waiting["author"]["id"].as_i64() == Some(author)
+            } else {
+                theirs.keys().any(|owner| persons.contains_key(owner))
+            };
+            if other == number || same {
                 continue;
             }
-            let shared: Vec<String> = files(pr).intersection(&mine).cloned().collect();
+            let shared: Vec<String> = files.intersection(mine).cloned().collect();
             if shared.is_empty() {
                 continue;
             }
-            let Some(their) = pr["author"]["id"].as_i64() else {
-                limits.insert("merge_hold_author_unknown".into());
-                continue;
-            };
-            let user = match owners.get(&their) {
-                Some(user) => user,
-                None => {
-                    let identity = ForgeIdentity {
-                        provider: who.owner.identity.provider.clone(),
-                        host: who.owner.identity.host.clone(),
-                        user_id: their,
-                    };
-                    let user = store.user_for_identity(&identity)?.map(|u| u.id);
-                    owners.entry(their).or_insert(user)
-                }
-            };
             let held = intents.iter().any(|i| {
-                Some(&i.owner.id) == user.as_ref()
-                    && i.paths.iter().any(|spec| {
-                        shared
-                            .iter()
-                            .any(|f| overlaps(key_of(f), key_of(spec)))
-                    })
+                theirs.contains_key(&i.owner.id)
+                    && i.paths
+                        .iter()
+                        .any(|spec| shared.iter().any(|f| overlaps(key_of(f), key_of(spec))))
             });
             blockers.push(Blocker {
                 number: *other,
@@ -421,7 +419,7 @@ fn held_merges(
             actions.push(action(
                 id,
                 "merge_held",
-                (persons, work_ids),
+                (persons.clone(), work_ids.clone()),
                 format!(
                     "{held} None has had a push, review or comment for {} hours, and none is held in AgentSCM. Decide: merge #{number} first and leave one comment on each naming the shared files, or wait for {owner}.",
                     MERGE_HOLD_IDLE_SECONDS / 3600
@@ -449,7 +447,7 @@ fn held_merges(
             let mut row = action(
                 id,
                 "merge_held",
-                (agents, work_ids),
+                (agents, work_ids.clone()),
                 if complete {
                     format!(
                         "{held} An owner is still active, so settle the merge order with that owner's agent before merging #{number}. AgentSCM changed nothing."
@@ -724,8 +722,8 @@ pub(super) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{failed_check_text, required};
     use super::RecipientKind;
+    use super::{failed_check_text, required};
     use crate::hub::store::{self, ForgeIdentity, Store};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -772,7 +770,10 @@ mod tests {
             "scope": ["src/shared.rs"], "branch": "feature/ready"
         }))
         .unwrap();
-        let work = store.work_start(&viewer.token_id, &request, now).unwrap().item;
+        let work = store
+            .work_start(&viewer.token_id, &request, now)
+            .unwrap()
+            .item;
         let items = BTreeMap::from([(work.id.clone(), work.clone())]);
         let connection = store
             .insert_connection(
@@ -789,7 +790,14 @@ mod tests {
             )
             .unwrap();
         let repo = store
-            .upsert_repository(&connection.id, "github.com", 101, "acme/widgets", None, None)
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
             .unwrap();
         let (head, base) = ("a".repeat(40), "b".repeat(40));
         let mut stamp = now * 1000;
@@ -833,7 +841,11 @@ mod tests {
                 .into_iter()
                 .filter(|a| a.kind == "merge_held")
                 .collect();
-            assert_eq!(held.len(), 1, "{label}: exactly one row per waiting pull request");
+            assert_eq!(
+                held.len(),
+                1,
+                "{label}: exactly one row per waiting pull request"
+            );
             assert_eq!(held[0].id, format!("held:{}:20", repo.id));
             assert_eq!(held[0].work_ids, vec![work.id.clone()]);
             held.into_iter().next().unwrap()
@@ -849,10 +861,27 @@ mod tests {
         assert!(idle.needs_you);
         assert!(matches!(idle.recipients[0].kind, RecipientKind::Person));
         assert!(
-            idle.action.contains("#21 by @other (src/shared.rs; no push, review or comment since")
-                && idle.action.contains("merge #20 first and leave one comment on each"),
+            idle.action
+                .contains("#21 by @other (src/shared.rs; no push, review or comment since")
+                && idle
+                    .action
+                    .contains("merge #20 first and leave one comment on each"),
             "{}",
             idle.action
+        );
+
+        // A file list the forge cut short could hide an active owner's file: nobody is asked.
+        let mut cut = pull(21, "other", 502, &["src/shared.rs"], ago(5 * 3600));
+        cut["files_truncated"] = json!(true);
+        observe("pull_request", "21", cut);
+        let unknown = held("cut file list");
+        assert!(!unknown.needs_you);
+        assert!(
+            unknown
+                .action
+                .contains("could not read every open pull request"),
+            "{}",
+            unknown.action
         );
 
         // A comment ten minutes ago keeps the overlap between agents.
@@ -863,8 +892,15 @@ mod tests {
         );
         let active = held("recent activity");
         assert!(!active.needs_you);
-        assert!(matches!(active.recipients[0].kind, RecipientKind::LeadAgent));
-        assert!(active.action.contains("An owner is still active"), "{}", active.action);
+        assert!(matches!(
+            active.recipients[0].kind,
+            RecipientKind::LeadAgent
+        ));
+        assert!(
+            active.action.contains("An owner is still active"),
+            "{}",
+            active.action
+        );
 
         // Quiet again, but the other owner's agent holds the shared file live.
         observe(
@@ -905,7 +941,10 @@ mod tests {
         let run = |state: &str, conclusion: Option<&str>| json!({"state": state, "conclusion": conclusion});
         let status = |name: &str, state: &str| json!({"name": name, "state": state, "head_relation": "same"});
         assert!(super::green(&snapshot(
-            json!([run("completed", Some("success")), run("completed", Some("skipped"))]),
+            json!([
+                run("completed", Some("success")),
+                run("completed", Some("skipped"))
+            ]),
             // The newest row per context counts: an earlier failure was superseded.
             json!([status("ci", "success"), status("ci", "failure")])
         )));
