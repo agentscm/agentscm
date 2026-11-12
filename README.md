@@ -125,10 +125,12 @@ working-file capture handles dirty source and reports omissions. Outcome, eviden
 coverage, source drift and freshness stay separate. A local receipt remains a caller assertion,
 not independently verified execution.
 
-Claude Code has the fuller capture adapter. Codex currently exposes session boundaries and
-selected edit starts, **not** prompts, assistant messages, all tool completions or retrospective
-visible history. Capture is best effort and bounded; missing events and unavailable evidence
-must remain visible. See [capture and qualification](docs/change-capture.md).
+Claude Code has the fuller capture adapter. Codex is captured as far as its hooks expose a
+session: prompts, tool starts and finishes, the last assistant message of each turn and each model
+request's token usage, with past sessions imported from a session file; **not** interim assistant
+messages, tool failures or hosted tool calls. Capture is best effort and bounded; missing events
+and unavailable evidence must remain visible. See
+[capture and qualification](docs/change-capture.md).
 
 Conversation capture defaults to **metadata-only**: no conversation bodies are retained or sent
 to the Hub. Per checkout, you can opt into local conversations or shared conversations.

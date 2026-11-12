@@ -273,9 +273,9 @@ sessions reported setup it also carries up to 16 `session_setups` (model, effort
 mode per session) and `session_setups_omitted`.
 
 `pending` shows shareable queued envelopes. `deferred` shows sanitized hooks that could not resolve
-current authorized Work and will never be rewritten into an associated action. `observe` and
-`import-claude` are explicit local operations; run their `--help` before supplying source, session
-and operation identities. See [local change capture](../change-capture.md) for privacy, source and
+current authorized Work and will never be rewritten into an associated action. `observe`,
+`import-claude` and `import-codex` are explicit local operations; run their `--help` before
+supplying source, session and operation identities. See [local change capture](../change-capture.md) for privacy, source and
 qualification limits. Real-host and complete integrated qualification remain pending.
 
 ### `attached-worktree` (experimental, Unix)

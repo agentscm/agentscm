@@ -23,8 +23,9 @@ while the setting is off.
 
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
-spool. Claude thinking and redacted-thinking blocks are never selected. Passive hook capture does
-not call a model or send content to a provider.
+spool. Claude thinking and redacted-thinking blocks and Codex reasoning are never selected. Passive
+hook capture does not call a model or send content to a provider. Capture records Claude Code and
+Codex sessions; what differs for Codex is in the [Codex adapter](#codex-adapter).
 
 Capture has three modes per checkout, and `metadata-only` is the default:
 
@@ -120,7 +121,7 @@ read is moved to quarantine and a new one is started, which leaves the bodies it
 good. Bodies kept before this ledger existed are never freed, because nothing says whether local
 content shares their file. Once a body is freed, the local [repository
 explorer](repository-explorer.md) shows it as missing; the Hub copy is the one to read.
-`import-claude` retains every body before it appends any batch, so a very long import on raised
+An import (`import-claude`, `import-codex`) retains every body before it appends any batch, so a very long import on raised
 limits, whose store a live session tidies meanwhile, can stop with a refusal; run it again. A later
 batch of the same Work that names a body already answered 204 adds no new fact, so the body can be
 freed while that batch is still pending; this matters only if the Hub then loses its copy.
@@ -165,8 +166,9 @@ default that applies to every repository without its own setting. The routes are
   plugin hook asks the Hub at each session start; when the Hub shares and the checkout has no
   capture binding, it creates one with the one-step defaults below, marked `follows_hub`, and
   installs no hooks of its own: the plugin hook captures for it, including the events it
-  registers only for capture (`PostToolUseFailure`, `MessageDisplay`, `PreCompact`,
-  `SubagentStart`, `SubagentStop`). Capture starts with that session. A binding that follows the
+  registers only for capture (for Claude Code `PostToolUseFailure`, `MessageDisplay`,
+  `PreCompact`, `SubagentStart`, `SubagentStop`; for Codex see the
+  [Codex adapter](#codex-adapter)). Capture starts with that session. A binding that follows the
   Hub is written as config version 7, which older binaries refuse.
 - **People are told and can opt out.** The first time a person's session shares in a
   repository, its agent is told in the session-start context that conversations are shared,
@@ -806,9 +808,130 @@ Read the resulting shared projection without running a model or mutating Hub sta
 agentscm change-capture show --root /absolute/repository --work-id wrk_example
 ```
 
-## Codex status
+## Codex adapter
 
-The existing Codex hook integration exposes session boundaries and selected edit starts. It does
-not currently expose user prompts, assistant messages, every tool completion, or retrospective
-visible history to this adapter. The capability declaration therefore reports those fields as
-unavailable and does not claim complete Codex session capture.
+Codex command hooks use the same event names and fields as Claude Code's, so Codex is captured by
+the same hook path, with `codex` recorded as the session's harness. The modes, redaction, the
+spool and its bounds, gaps and the repository's sharing setting apply unchanged. The AgentSCM
+plugin's hook (`agentscm hook codex --client-connection`) captures for a checkout whose binding
+follows the Hub, and also for one configured by hand, whose own hooks are Claude Code's. There is
+no `configure` step for Codex. Live capture reads only what a hook payload carries.
+
+| Fact | Hook event | Notes |
+|---|---|---|
+| Session start and end | `SessionStart`, `SessionEnd` | A `fork` start, like a resume, does not prove earlier history was observed. Codex gives every end the reason `other`, and ends and starts the session again around each non-interactive `resume`. |
+| Prompt | `UserPromptSubmit` | The `prompt` field. A prompt before the session has Work is held as for Claude Code. |
+| Tool start | `PreToolUse` | Tool name, call identity and input. A shell command is `Bash`, an MCP tool `mcp__server__tool`. |
+| Tool finish with its result | `PostToolUse` | The `tool_response` field: for a shell command, its output as text. Recorded as `returned`. |
+| Assistant message | `Stop` | The `last_assistant_message` field: the last message of the turn, recorded just before the turn's end. |
+| Token usage of one model request | `PostModelRequest` | See [token usage](#codex-token-usage). |
+| Compaction, subagent start and stop | `PreCompact`, `SubagentStart`, `SubagentStop` | Markers, as for Claude Code. |
+
+The plugin registers `UserPromptSubmit`, `PostModelRequest`, `PreCompact`, `SubagentStart` and
+`SubagentStop` only for capture; they never reach the Hub's hook endpoint. Codex runs a new or
+changed hook entry only after its person trusts it in `/hooks`, so a checkout that installed the
+plugin before these entries existed records them once they are trusted.
+
+What Codex does not expose to a hook is not recorded, and is not guessed:
+
+- **An assistant message before a turn's last one.** No hook carries it. `import-codex` reads it
+  from the session file.
+- **Whether a tool call failed.** There is no failure hook. A shell command runs `PostToolUse`
+  whatever its exit code, and its response is its output with no exit code, so it is `returned`
+  and an action's outcome is `unknown`. An MCP call that failed, and a call that a `PreToolUse`
+  hook refused, run no `PostToolUse`: each is recorded as started and never finished.
+  `import-codex` reads the exit code and the failure from the session file.
+- **Hosted tool calls**, such as web search. They run no hook.
+- **Reasoning.** Codex stores it encrypted; the adapter never reads it.
+- **An identity for a prompt or a session boundary.** `UserPromptSubmit` names the turn, not the
+  prompt, and `SessionStart` and `SessionEnd` name nothing, so each is recorded with an
+  `identity_uncertain` gap, like any event without a provider identity, and a Codex session is
+  never complete.
+- **A model request's identity** (see below), and **a reason for a session's end**.
+- **A subagent's own prompts and replies.** Its tool calls and model requests are recorded when
+  Codex runs the session's hooks for them; that was read from the hook schemas, which give those
+  events an `agent_id`. The session that was run had no subagent.
+
+### Codex token usage
+
+`PostModelRequest` runs after each model request with its `model`, `status` and `token_usage`. A
+request that reports counts becomes one request-scoped usage observation (`usage_basis`
+`provider_result`, agent `codex`, provider `unknown`) and is submitted through the Work usage
+endpoint, like Claude Code's. A request with no `token_usage` records nothing, so its usage stays
+unknown. Usage belongs to Work: a model request made before the session has Work is not recorded
+and leaves no deferred fact.
+
+Codex counts cached input inside `input_tokens`, and a usage observation keeps the two apart. The
+adapter therefore records `input_tokens` minus `cached_input_tokens` as input and
+`cached_input_tokens` as cache-read input. When cached input is larger than input, input is
+unknown. `cache_write_input_tokens` is recorded as cache-creation input only when it is positive,
+because Codex writes 0 when a provider reports none; it is not subtracted from input.
+`reasoning_output_tokens` is part of `output_tokens` and is not kept separately.
+
+The payload does not name the request, so an observation is identified by its turn and its six
+counts. The session file's record of the same request has the same turn and counts, so a session
+that was recorded live and is imported later is not counted twice. Two requests of one turn with
+identical counts are recorded once.
+
+### Importing a Codex session file
+
+Codex keeps the whole of a session only in its session file (`rollout-*.jsonl` under its
+`sessions` directory). Codex documents that file's format as not stable for hooks, so no hook
+reads it; `import-codex` reads one file that a person names:
+
+```text
+agentscm change-capture import-codex \
+  --spool /absolute/private/spool \
+  --input /absolute/codex-home/sessions/2026/11/01/rollout-example.jsonl \
+  --work-id wrk_example --generation 1 \
+  --session-id 11111111-2222-7333-8444-555555555555 \
+  --operation-prefix import:example \
+  --capture-mode local-conversation
+```
+
+`--session-id` is the id in the file's first record, which is also the end of the file's name; a
+file that starts with another session's record, or with no session record, is refused. The import
+has the bounds and gaps of `import-claude` and selects:
+
+- the person's prompts and every assistant message, interim ones included;
+- each command, file change, MCP call and web search, from the typed record Codex writes when it
+  ends: a start at the time the record says it began and a finish with its input, the text of its
+  result and a command's exit code. The finish is `returned` or `failed` as the record's status
+  says, and neither when the record has no such status, as for a web search. A record's id is the
+  call id Codex's hooks give the same call. A command or a file change has no tool name in the
+  file, only its kind;
+- each model request's token usage, as above. The command prints how many observations were new
+  as `usage_observations`.
+
+It does not select reasoning (counted as `private_blocks_ignored`), images, the instructions and
+environment notes Codex adds around a prompt, or the model-level call records, which in recent
+versions are scripts that wrap the calls above; plan updates and calls between agents, which the
+file has only at that level, are therefore not imported. A subagent's file opens with a copy of its parent's
+history; those records are skipped, and the subagent's file is imported as a session of its own,
+with `--parent-session-id` when the parent is known. Importing a file again adds nothing. A
+session that was recorded live gets its events a second time under the import's identities, as
+with `import-claude`; its usage is not repeated.
+
+### Codex qualification
+
+Checked on 2026-11-12 against Codex CLI 0.167.1:
+
+- **Its hook input schemas** (`codex-rs/hooks/schema/generated`) and hooks documentation, for the
+  events and fields above.
+- **One session run with these hooks** (`codex exec`, then `codex exec resume`, with a hook that
+  logged each payload and handed it to the plugin's hook client) against a local Hub. The Hub
+  recorded the session start, the prompt, three shell commands with their results, eight other
+  tool starts, the last reply, the turn's end and the session's end, and one usage observation
+  for each of the nine model requests made after the session had Work. The session's ten requests
+  had the same turn and counts in the hook payloads and in the session file, and importing that
+  file afterwards added only the one request made before the session had Work. This run is where
+  the notes on shell responses, failed MCP calls and refused calls come from. It had no subagent,
+  no compaction and no hosted tool call.
+- **180 session files** written by versions 0.154.0 to 0.167.1 on one macOS machine, for the
+  import. Each imports with as many events and usage observations as it has records of its own;
+  together they hold about 7,700 typed tool records, 600 of them failed. In all of their roughly
+  8,600 model requests `total_tokens` was `input_tokens` plus `output_tokens`, cached input was no
+  larger than input, and none reported a cache write.
+
+Hook fixtures have the schemas' fields and that session's value shapes, with every value made up.
+The source code states the capabilities as `change_capture::codex::CAPABILITIES`.
