@@ -954,24 +954,27 @@ async fn mark_enabled(state: &HubState, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The repositories of `conn` the embedder has the Hub read; all of them without one.
+/// The repositories of `conn` the embedder has the Hub read (all of them without one), and whether
+/// the stored list was cut at its limit, so some repositories were not considered at all.
 async fn active_repositories(
     state: &HubState,
     conn: &Connection,
-) -> Result<Vec<ConnectedRepository>> {
+) -> Result<(Vec<ConnectedRepository>, bool)> {
     let id = conn.id.clone();
     let repos = db(state, move |store| store.repositories(&id)).await?;
+    let cut = i64::try_from(repos.len()).unwrap_or(i64::MAX) >= super::store::LIST_LIMIT;
     let Some(credentials) = state.sync.credentials.clone() else {
-        return Ok(repos);
+        return Ok((repos, cut));
     };
     let conn = conn.clone();
-    blocking(state, move || {
+    let active = blocking(state, move || {
         Ok(repos
             .into_iter()
             .filter(|repo| credentials.active(&conn, repo))
             .collect())
     })
-    .await
+    .await?;
+    Ok((active, cut))
 }
 
 // Discovery can fail before a repository token/read is attempted. Its last successful
@@ -981,7 +984,9 @@ async fn catchup_connection_status(
     conn: &Connection,
     coverage: super::catchup::CatchupCoverageState,
 ) -> Result<()> {
-    for repo in active_repositories(state, conn).await? {
+    // Every repository, active or not: one no longer read must not keep advertising a complete source.
+    let id = conn.id.clone();
+    for repo in db(state, move |store| store.repositories(&id)).await? {
         let _guard = state.sync.lock_repo(&repo.id).await;
         if coverage == super::catchup::CatchupCoverageState::Unavailable {
             provider_health(state, conn, &repo, "unavailable", None).await?;
@@ -1030,18 +1035,31 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
                 }
             }
             Err(error) => {
-                catchup_connection_status(
-                    state,
-                    conn,
-                    super::catchup::CatchupCoverageState::Unavailable,
-                )
-                .await?;
-                failed(state, conn, "installations", error).await?;
-                return Ok(reports);
+                // A credential or rate-limit failure stops the round, as does any failed app
+                // discovery. A namespace listing that only failed (a wrong or forbidden group)
+                // still polls the repositories already connected.
+                let stop = failed(state, conn, "installations", error).await? || conn.kind == "app";
+                if stop {
+                    catchup_connection_status(
+                        state,
+                        conn,
+                        super::catchup::CatchupCoverageState::Unavailable,
+                    )
+                    .await?;
+                    return Ok(reports);
+                }
             }
         }
     }
-    let mut repos = active_repositories(state, conn).await?;
+    let (mut repos, cut) = active_repositories(state, conn).await?;
+    if cut {
+        // Repositories past the stored list's limit are not polled this round; say so.
+        reports.push(PollReport {
+            connection: conn.id.clone(),
+            truncated: json!({"repositories": super::store::LIST_LIMIT}),
+            ..PollReport::default()
+        });
+    }
     // Start somewhere else each round, so a limit or a slow repository does not starve the rest.
     if !repos.is_empty() {
         let start = state.sync.round.fetch_add(1, Ordering::Relaxed) % repos.len();

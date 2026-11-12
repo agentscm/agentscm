@@ -1929,9 +1929,21 @@ async fn a_followed_namespace_connects_its_projects_across_pages_up_to_the_cap()
 
     let reports = sync::poll_once(&hub.state).await.unwrap();
     let capped: Vec<&PollReport> = reports.iter().filter(|r| r.repository.is_empty()).collect();
-    assert_eq!(capped.len(), 1, "{reports:?}");
-    assert_eq!(capped[0].connection, EMBEDDED_A);
-    assert_eq!(capped[0].truncated, json!({"namespace_projects": 1}));
+    assert!(
+        capped.iter().all(|r| r.connection == EMBEDDED_A),
+        "{reports:?}"
+    );
+    // The listing passed its page cap, and the 1,000 connected repositories fill the stored list.
+    assert_eq!(
+        capped
+            .iter()
+            .map(|r| r.truncated.clone())
+            .collect::<Vec<_>>(),
+        [
+            json!({"namespace_projects": 1}),
+            json!({"repositories": 1000})
+        ]
+    );
 
     let connected = |connection: &str| -> BTreeSet<i64> {
         hub.store
@@ -1974,5 +1986,42 @@ async fn a_followed_namespace_connects_its_projects_across_pages_up_to_the_cap()
         listings
             .iter()
             .all(|q| q.contains("include_subgroups=true") && q.contains("archived=false"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_namespace_listing_that_fails_still_polls_the_connected_repositories() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        let mut project = Project::new(101, "team-a/one", "private");
+        project.mrs.insert(1, Mr::new(1, "feat/1", &["src/a.rs"]));
+        s.projects.insert(101, project);
+    });
+    add_token(&fake, "token-a", "robot-a", &[101]);
+    let embedder = Embedder {
+        tokens: [(EMBEDDED_A.to_owned(), "token-a".to_owned())].into(),
+        // A group the token cannot read: the listing answers 404.
+        namespaces: [(EMBEDDED_A.to_owned(), Namespace::Group(999))].into(),
+        ..Embedder::default()
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+    hub.store
+        .upsert_repository(EMBEDDED_A, &hub.host, 101, "team-a/one", None, None)
+        .unwrap();
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    assert!(
+        reports.iter().any(|r| r.repository == "team-a/one"),
+        "{reports:?}"
+    );
+    let conn = hub
+        .store
+        .connections()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == EMBEDDED_A)
+        .unwrap();
+    assert_eq!(
+        conn.status, "enabled",
+        "a listing answer is not a credential failure"
     );
 }
