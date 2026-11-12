@@ -429,6 +429,7 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
             "agentscm_work_repositories",
             "agentscm_work_search",
             "agentscm_work_status",
+            "agentscm_work_usage_reports",
             "agentscm_workflow_runs_list",
             "agentscm_workflow_status"
         ]

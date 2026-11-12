@@ -66,7 +66,8 @@ use super::handoff::{
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
     MAX_OBSERVATIONS, MAX_PUBLICATIONS, PublicationEvidence, RecordedCheck, TokenGroup,
-    UsageReceipt, UsageRecord, UsageSummary, WorkInsight,
+    UsageReceipt, UsageRecord, UsageReport, UsageReportPage, UsageReportQuery, UsageSummary,
+    WorkInsight,
 };
 use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Overlap, Plan, Who, announced,
@@ -1685,11 +1686,13 @@ fn pg_usage_summary(
     work: &str,
     group_limit: usize,
 ) -> Result<UsageSummary> {
-    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative'",&[&work])?;
+    // The cache counts have no column of their own: they are read from the stored report, where
+    // an absent count and a null are both unknown, so neither is summed or counted as known.
+    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint,SUM((request::jsonb->>'cache_read_input_tokens')::bigint)::bigint,SUM((request::jsonb->>'cache_creation_input_tokens')::bigint)::bigint,COUNT(request::jsonb->>'cache_read_input_tokens')::bigint,COUNT(request::jsonb->>'cache_creation_input_tokens')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative'",&[&work])?;
     let observations: i64 = r.get(0);
     let mut token_groups = Vec::new();
-    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
-        let basis:String=r.get(3); token_groups.push(TokenGroup { agent:r.get(0),provider:r.get(1),model:r.get(2),usage_basis:serde_json::from_str(&format!("\"{basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,observations:r.get::<_,i64>(4) as usize,input_tokens:r.get(5),output_tokens:r.get(6),input_known_observations:r.get::<_,i64>(7) as usize,output_known_observations:r.get::<_,i64>(8) as usize });
+    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,SUM((request::jsonb->>'cache_read_input_tokens')::bigint)::bigint,SUM((request::jsonb->>'cache_creation_input_tokens')::bigint)::bigint,COUNT(request::jsonb->>'cache_read_input_tokens')::bigint,COUNT(request::jsonb->>'cache_creation_input_tokens')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
+        let basis:String=r.get(3); token_groups.push(TokenGroup { agent:r.get(0),provider:r.get(1),model:r.get(2),usage_basis:serde_json::from_str(&format!("\"{basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,observations:r.get::<_,i64>(4) as usize,input_tokens:r.get(5),output_tokens:r.get(6),cache_read_input_tokens:r.get(9),cache_creation_input_tokens:r.get(10),input_known_observations:r.get::<_,i64>(7) as usize,output_known_observations:r.get::<_,i64>(8) as usize,cache_read_input_known_observations:r.get::<_,i64>(11) as usize,cache_creation_input_known_observations:r.get::<_,i64>(12) as usize });
     }
     let mut cost_groups = Vec::new();
     for r in tx.query("SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros)::bigint,COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND cost_amount_micros IS NOT NULL AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\",cost_kind COLLATE \"C\",cost_currency COLLATE \"C\",cost_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
@@ -1698,7 +1701,7 @@ fn pg_usage_summary(
     let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
     token_groups.truncate(group_limit);
     cost_groups.truncate(group_limit);
-    Ok(UsageSummary {
+    let mut summary = UsageSummary {
         observations: observations as usize,
         coverage: if observations == 0 {
             "unknown"
@@ -1708,14 +1711,20 @@ fn pg_usage_summary(
         .into(),
         input_tokens: r.get(1),
         output_tokens: r.get(2),
+        cache_read_input_tokens: r.get(7),
+        cache_creation_input_tokens: r.get(8),
         input_known_observations: r.get::<_, i64>(3) as usize,
         output_known_observations: r.get::<_, i64>(4) as usize,
+        cache_read_input_known_observations: r.get::<_, i64>(9) as usize,
+        cache_creation_input_known_observations: r.get::<_, i64>(10) as usize,
         missing_cost_observations: r.get::<_, i64>(5) as usize,
         reported_failed_attempts: r.get::<_, i64>(6) as usize,
         groups_complete,
         cost_groups,
         token_groups,
-    })
+    };
+    summary.mask_agents();
+    Ok(summary)
 }
 
 fn pg_insight_input(
@@ -13576,6 +13585,38 @@ impl Store for PgStore {
             let phase=enum_name(&usage.phase)?;let outcome=enum_name(&usage.outcome)?;let basis=enum_name(&usage.usage_basis)?;let cost_kind=usage.cost.as_ref().map(|c|enum_name(&c.kind)).transpose()?;let currency=usage.cost.as_ref().map(|c|c.currency.as_str());let amount=usage.cost.as_ref().map(|c|c.amount_micros);let cost_basis=usage.cost.as_ref().map(|c|c.basis.as_str());
             tx.execute("INSERT INTO hub_work_model_usage (work,observation_id,author_token,request,generation,session,phase,outcome,agent,model_provider,model,usage_basis,source_commit,input_tokens,output_tokens,cost_kind,cost_currency,cost_amount_micros,cost_basis,received_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",&[&usage.work_id,&usage.observation_id,&token,&request,&usage.generation,&usage.session,&phase,&outcome,&usage.agent,&usage.provider,&usage.model,&basis,&usage.source_commit,&usage.input_tokens,&usage.output_tokens,&cost_kind,&currency,&amount,&cost_basis,&now])?;
             adjust_work_payload_capacity(&mut tx,&who,work_payload_row_bytes(request.len())?,now)?;tx.commit()?;Ok(UsageReceipt{work_id:usage.work_id.clone(),observation_id:usage.observation_id.clone(),received_at:now,replayed:false})})
+    }
+
+    fn work_usage_reports(
+        &self,
+        token: &str,
+        id: &str,
+        query: &UsageReportQuery,
+        now: i64,
+    ) -> Result<Option<UsageReportPage>> {
+        query.validate()?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let rows = tx.query(
+                "SELECT request,received_at FROM hub_work_model_usage WHERE work=$1
+                  ORDER BY received_at,observation_id COLLATE \"C\" LIMIT $2 OFFSET $3",
+                &[&item.id, &((query.limit + 1) as i64), &(query.after as i64)],
+            )?;
+            tx.commit()?;
+            let items = rows
+                .iter()
+                .map(|r| {
+                    let request: String = r.get(0);
+                    Ok(UsageReport::stored(json_value(&request)?, r.get(1)))
+                })
+                .collect::<Result<_>>()?;
+            Ok(Some(UsageReportPage::of(item.id, query, items, now)))
+        })
     }
 
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>> {
