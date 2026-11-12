@@ -422,8 +422,9 @@ fn the_repo_guard_and_git_root_are_sent() {
     std::fs::create_dir_all(&sub).unwrap();
     let seen = seen_for(&sub, &["--repo", "acme/widgets"]);
     assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme%2Fwidgets");
-    let root = std::fs::canonicalize(repo.path()).unwrap();
-    assert_eq!(seen.root, root.to_str().unwrap());
+    // The root keeps the spelling of the agent's working directory (on macOS `/var`, not the resolved
+    // `/private/var`), because the Hub matches edit paths against it by their exact spelling.
+    assert_eq!(seen.root, repo.path().to_str().unwrap());
     // The equals form works too.
     let seen = seen_for(&sub, &["--repo=acme/widgets"]);
     assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme%2Fwidgets");
