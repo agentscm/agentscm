@@ -42,8 +42,8 @@ use super::connection::{
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
     CoordinationInboxQuery, CoordinationListQuery, CoordinationProposal, CoordinationReply,
-    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationStatus,
-    CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
+    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationResponseKind,
+    CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
@@ -16519,14 +16519,10 @@ impl Store for SqliteStore {
                 request.updated_seq
             )));
         }
-        if let Some(work) = scoped_work(&tx, &who, &target.work_id, now)? {
-            // The requester joins as helper over the paths that overlap, not its whole proposal.
-            let overlapping = target
-                .reasons
-                .iter()
-                .map(|r| r.your_path.clone())
-                .collect::<Vec<_>>();
-            join_uncovered(reply.kind, &work.scope, &overlapping)?;
+        if reply.kind == CoordinationResponseKind::Join
+            && let Some(work) = scoped_work(&tx, &who, &target.work_id, now)?
+        {
+            join_uncovered(reply.kind, &work.scope, &request.proposal.scope)?;
         }
         let updates: i64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_coordination_responses WHERE request = ?1",

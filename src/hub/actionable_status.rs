@@ -1456,7 +1456,7 @@ fn request_actions(
                 } else if item.lead_idle() && live.is_none() {
                     "Its lead's Work is quiet and whether its lead can answer is unknown, so it is not raised in Needs you.".to_owned()
                 } else if item.lead_idle() {
-                    "Its lead is not running, so it is not raised in Needs you; agentscm_work_status says whether its hold lapses or is retained.".to_owned()
+                    "Its lead is not running, so it is not raised in Needs you; its Work row says whether its hold lapses or is retained.".to_owned()
                 } else if !request.acknowledgements_complete {
                     "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
                 } else if one_person {

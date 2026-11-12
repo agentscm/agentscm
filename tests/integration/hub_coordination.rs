@@ -1738,7 +1738,7 @@ fn join_reply_outside_the_holders_scope_is_refused(db: &Db) {
         )
         .unwrap_err()
         .to_string();
-    assert!(refusal.contains("src/"), "{refusal}");
+    assert!(refusal.contains("src/**"), "{refusal}");
     assert!(
         refusal.contains("agentscm_work_overlap_consent"),
         "{refusal}"

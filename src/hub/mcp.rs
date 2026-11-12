@@ -4159,8 +4159,14 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             // Work that reports nothing may still be answered by a session that is calling.
             let lead_live = match &work.coordination_request {
                 Some(request) => {
-                    let sessions = store.live_sessions(&caller, now, LEAD_SESSION_LIMIT + 1)?;
-                    let complete = sessions.len() <= LEAD_SESSION_LIMIT;
+                    // The read only feeds advice: a failed read leaves every lead unknown.
+                    let sessions = store
+                        .live_sessions(&caller, now, LEAD_SESSION_LIMIT + 1)
+                        .ok();
+                    let complete = sessions
+                        .as_ref()
+                        .is_some_and(|sessions| sessions.len() <= LEAD_SESSION_LIMIT);
+                    let sessions = sessions.unwrap_or_default();
                     request
                         .targets
                         .iter()

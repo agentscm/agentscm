@@ -233,8 +233,9 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     `target_work_id`, `session`, `expected_updated_seq`, `kind`, optional `note`) is
     `POST /v1/hub/standup/coordination/reply` for the agent that leads the target Work. Same
     kinds (`propose_split`, `join`, `handover`, `decline`), 500-byte note, `operation_id`
-    replay and `expected_updated_seq` check. A `join` is refused when the target Work's declared
-    scope does not cover the paths that overlap it; the refusal names them and points to
+    replay and `expected_updated_seq` check. A `join` is refused when a requested path that overlaps
+    the target Work is wider than that Work's declared scope, because a helper edits only inside
+    it; the refusal names those paths and points to a scope checkpoint or
     `agentscm_work_overlap_consent`. Reply: the updated request.
   - `POST /v1/hub/session/coordination/withdraw` (`token`, `request_id`, `operation_id`, `session`,
     `expected_updated_seq`, `target_work_id`, `target_generation`) is
