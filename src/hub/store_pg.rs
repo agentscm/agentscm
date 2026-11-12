@@ -44,12 +44,12 @@ use super::connection::{
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
     CoordinationInboxQuery, CoordinationListQuery, CoordinationProposal, CoordinationReply,
-    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationStatus,
-    CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
+    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationResponseKind,
+    CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, join_uncovered, parse_response_kind, parse_status,
+    response_kind_name, status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -15302,6 +15302,11 @@ impl Store for PgStore {
                     "coordination request changed; current updated_seq is {}",
                     request.updated_seq
                 )));
+            }
+            if reply.kind == CoordinationResponseKind::Join
+                && let Some(work) = scoped_work(&mut tx, &who, &target.work_id, now, false)?
+            {
+                join_uncovered(reply.kind, &work.scope, &request.proposal.scope)?;
             }
             let updates: i64 = tx
                 .query_one(
