@@ -16,10 +16,34 @@ pub(super) const PRE_SNAPSHOT: Duration = Duration::from_millis(700);
 /// The longest the post-call snapshot and comparison may take together.
 pub(super) const POST_DIFF: Duration = Duration::from_millis(1000);
 
-const MAX_FILES: usize = 256;
-const EXPIRY: Duration = Duration::from_secs(4 * 60 * 60);
-/// Room for a snapshot at its entry limit.
-const MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// At most this many stored snapshots, each at most [`MAX_BYTES`]: the store never holds more than
+/// 64 MiB. A snapshot too large to store is reported as unknown, not as no change.
+const MAX_FILES: usize = 64;
+/// Time left for the Hub call when the hook's own deadline bounds an observation.
+const HUB_RESERVE: Duration = Duration::from_secs(1);
+
+/// When a snapshot or comparison must stop: its own limit, but never so late that the hook's
+/// `hook_deadline` leaves less than [`HUB_RESERVE`] for the Hub call.
+pub(super) fn bounded(limit: Duration, hook_deadline: Instant) -> Instant {
+    let now = Instant::now();
+    (now + limit).min(hook_deadline.checked_sub(HUB_RESERVE).unwrap_or(now))
+}
+
+/// A shell call the agent runs in the background: its post-call event fires at launch, so the
+/// working tree then says nothing about what the call goes on to do.
+pub(super) fn is_background(payload: &Value) -> bool {
+    payload["tool_input"]["run_in_background"] == true
+}
+
+/// What a post-call event reports when this process could not even try to observe.
+pub(super) fn local_error(payload: &Value) -> Option<Value> {
+    (payload["hook_event_name"] != "PreToolUse")
+        .then(|| Outcome::Unknown("local_error").to_json())
+        .flatten()
+}
+/// A snapshot whose call never ended (its post-call hook did not run) is dropped after this.
+const EXPIRY: Duration = Duration::from_secs(60 * 60);
+const MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,11 +52,20 @@ struct Stored {
     created: u64,
     /// `None` marks a pre-call snapshot that failed.
     state: Option<WorktreeState>,
+    /// The user's global excludes file the pre-call snapshot used, so the post-call one hides the
+    /// same files.
+    #[serde(default)]
+    excludes: Option<String>,
 }
 
 impl Stored {
     fn valid(&self, root: &Path) -> bool {
-        self.root == root.to_string_lossy() && self.state.as_ref().is_none_or(WorktreeState::valid)
+        self.root == root.to_string_lossy()
+            && self.state.as_ref().is_none_or(WorktreeState::valid)
+            && self
+                .excludes
+                .as_deref()
+                .is_none_or(|path| Path::new(path).is_absolute())
     }
 }
 
@@ -206,11 +239,14 @@ pub(super) fn pre(
     if !prepare(&dir) {
         return;
     }
-    let state = git_collisions::worktree_state(git, root, deadline).ok();
+    // Resolution trouble only means ignored-by-the-user files may show; it is not an error.
+    let excludes = git_collisions::global_excludes_file(git, deadline);
+    let state = git_collisions::worktree_state(git, root, deadline, excludes.as_deref()).ok();
     let stored = Stored {
         root: root.to_string_lossy().into_owned(),
         created: now(),
         state,
+        excludes: excludes.map(|path| path.to_string_lossy().into_owned()),
     };
     write(&dir, &key(agent, session, id, root), &stored);
 }
@@ -243,7 +279,8 @@ pub(super) fn post(
     let Some(before) = stored.state else {
         return Outcome::Unknown("pre_snapshot_failed");
     };
-    let Ok(after) = git_collisions::worktree_state(git, root, deadline) else {
+    let excludes = stored.excludes.as_deref().map(Path::new);
+    let Ok(after) = git_collisions::worktree_state(git, root, deadline, excludes) else {
         return Outcome::Unknown("git_failed");
     };
     match git_collisions::changed_during(git, root, &before, &after, deadline) {
@@ -277,6 +314,48 @@ mod tests {
             truncated: true,
         };
         assert_eq!(ok.to_json().unwrap()["truncated"], true);
+    }
+
+    #[test]
+    fn every_reason_sent_is_one_the_hub_accepts() {
+        for reason in [
+            "missing_snapshot",
+            "pre_snapshot_failed",
+            "invalid_snapshot",
+            "git_failed",
+            "no_tool_use_id",
+            "background",
+            "local_error",
+        ] {
+            assert!(
+                git_collisions::OBSERVED_UNKNOWN.contains(&reason),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_calls_and_local_failures_are_unknown_not_unchanged() {
+        let end = json!({"hook_event_name":"PostToolUse","tool_input":{"run_in_background":true}});
+        assert!(is_background(&end));
+        assert!(!is_background(
+            &json!({"tool_input":{"run_in_background":false}})
+        ));
+        assert!(!is_background(&json!({"tool_input":{"command":"ls"}})));
+        assert_eq!(local_error(&end).unwrap()["reason"], "local_error");
+        assert_eq!(local_error(&json!({"hook_event_name":"PreToolUse"})), None);
+    }
+
+    #[test]
+    fn the_hub_call_keeps_its_reserve_of_the_hook_deadline() {
+        let hook = Instant::now() + Duration::from_secs(2);
+        let end = bounded(Duration::from_secs(30), hook);
+        assert!(end <= hook - HUB_RESERVE);
+        // Plenty of time: the observation's own limit applies.
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(bounded(POST_DIFF, far) < Instant::now() + POST_DIFF + Duration::from_millis(50));
+        // No time at all is a deadline already passed.
+        assert!(bounded(POST_DIFF, Instant::now()) <= Instant::now());
     }
 
     #[test]

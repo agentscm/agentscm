@@ -1087,12 +1087,26 @@ fn shell_event(
     dir: &TempDir,
     seen: &Receiver<Seen>,
     root: &std::path::Path,
+    call: (&str, &str, &str),
+    path: &str,
+) -> Option<Value> {
+    let input = json!({"command": "echo SYNTHETIC-COMMAND-TEXT > out.txt"});
+    shell_event_with(hook, dir, seen, root, call, path, input)
+}
+
+#[cfg(unix)]
+fn shell_event_with(
+    hook: &[&str],
+    dir: &TempDir,
+    seen: &Receiver<Seen>,
+    root: &std::path::Path,
     (event, tool, id): (&str, &str, &str),
     path: &str,
+    input: Value,
 ) -> Option<Value> {
     let payload = json!({"hook_event_name": event, "session_id": "s1", "cwd": root,
         "tool_name": tool, "tool_use_id": id,
-        "tool_input": {"command": "echo SYNTHETIC-COMMAND-TEXT > out.txt"},
+        "tool_input": input,
         "tool_response": {"stdout": "SYNTHETIC-OUTPUT-TEXT"}});
     let run = run_with(hook, &[("PATH", path)], dir, payload.to_string().as_bytes());
     assert_eq!(run.code, Some(0), "{event}");
@@ -1208,6 +1222,34 @@ fn a_post_without_a_pre_is_unknown_and_a_snapshot_is_used_once() {
     assert!(first.get("observed").is_none(), "{first}");
     let again = shell_event(CLAUDE, &dir, &seen, &root, at("PostToolUse", "t1"), &path).unwrap();
     assert_eq!(again["observed"]["reason"], "missing_snapshot", "{again}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_background_shell_call_is_unknown_not_unchanged() {
+    let dir = home();
+    let (hub, seen) = empty_hub();
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let input = json!({"command": "sleep 1; echo x > out.txt", "run_in_background": true});
+    let at = |event| (event, "Bash", "bg1");
+    let pre = shell_event_with(
+        CLAUDE,
+        &dir,
+        &seen,
+        &root,
+        at("PreToolUse"),
+        &path,
+        input.clone(),
+    );
+    assert!(pre.is_none_or(|pre| pre.get("observed").is_none()));
+    let post = shell_event_with(CLAUDE, &dir, &seen, &root, at("PostToolUse"), &path, input)
+        .expect("a post request");
+    assert_eq!(
+        post["observed"],
+        json!({"outcome": "unknown", "reason": "background"}),
+        "{post}"
+    );
 }
 
 #[cfg(unix)]

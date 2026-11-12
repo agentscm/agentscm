@@ -1482,8 +1482,8 @@ async fn observed_shell_changes_without_work_ask_for_a_start_every_time() {
     );
     // A field that is not what the client sends is read as unknown, never as a change.
     for bad in [
-        json!({"outcome": "changed", "paths": ["../outside"]}),
-        json!({"outcome": "changed", "paths": []}),
+        json!({"outcome": "changed", "paths": ["../outside"], "truncated": false}),
+        json!({"outcome": "changed", "paths": [], "truncated": false}),
         json!({"outcome": "unknown", "reason": "made-up"}),
         json!("changed"),
     ] {
@@ -1564,7 +1564,8 @@ async fn observed_shell_changes_name_a_holder_and_a_failed_call_still_ends() {
     assert!(expiry(&hub) >= before + IN_FLIGHT_CAP_SECONDS);
     let mut failed = fixture("claude-PostToolUse-Bash");
     failed["hook_event_name"] = json!("PostToolUseFailure");
-    failed["observed"] = json!({"outcome": "changed", "paths": ["src/widget.rs"]});
+    failed["observed"] =
+        json!({"outcome": "changed", "paths": ["src/widget.rs"], "truncated": false});
     let answer = hub.hook_raw("claude", &lead, &failed);
     let text = text_at(&answer, CLAUDE_CONTEXT);
     assert!(

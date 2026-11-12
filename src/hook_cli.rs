@@ -342,17 +342,33 @@ fn observes_shell(agent: &str, payload: &Value) -> bool {
 /// `observed` field of the Hub payload (none when nothing did). Runs Git, so off the async
 /// threads, and within its own bounded deadline.
 #[cfg(unix)]
-async fn observe_shell(agent: &str, payload: &Value, checkout: &Path) -> Option<Value> {
-    use shell_observation::{POST_DIFF, PRE_SNAPSHOT, post, pre};
-    let config = config_dir().ok()?;
-    let session = session_of(payload)?.to_owned();
-    let id = bounded_string(&payload["tool_use_id"], 256).map(str::to_owned);
+async fn observe_shell(
+    agent: &str,
+    payload: &Value,
+    checkout: &Path,
+    hook_deadline: Instant,
+) -> Option<Value> {
+    use shell_observation::{
+        Outcome, POST_DIFF, PRE_SNAPSHOT, bounded, is_background, local_error, post, pre,
+    };
     let before = payload["hook_event_name"] == "PreToolUse";
+    if is_background(payload) {
+        // Nothing to compare: the call goes on after this event.
+        return (!before)
+            .then(|| Outcome::Unknown("background").to_json())
+            .flatten();
+    }
+    let (Ok(config), Some(session)) = (config_dir(), session_of(payload)) else {
+        return local_error(payload);
+    };
+    let session = session.to_owned();
+    let id = bounded_string(&payload["tool_use_id"], 256).map(str::to_owned);
     let (agent, checkout) = (agent.to_owned(), checkout.to_owned());
-    tokio::task::spawn_blocking(move || {
+    let failed = local_error(payload);
+    let observed = tokio::task::spawn_blocking(move || {
         let git = git_exe();
         if before {
-            let deadline = Instant::now() + PRE_SNAPSHOT;
+            let deadline = bounded(PRE_SNAPSHOT, hook_deadline);
             pre(
                 &config,
                 &agent,
@@ -364,7 +380,7 @@ async fn observe_shell(agent: &str, payload: &Value, checkout: &Path) -> Option<
             );
             return None;
         }
-        let deadline = Instant::now() + POST_DIFF;
+        let deadline = bounded(POST_DIFF, hook_deadline);
         post(
             &config,
             &agent,
@@ -376,9 +392,9 @@ async fn observe_shell(agent: &str, payload: &Value, checkout: &Path) -> Option<
         )
         .to_json()
     })
-    .await
-    .ok()
-    .flatten()
+    .await;
+    // A task that did not finish says so on a call's end, never "no change".
+    observed.unwrap_or(failed)
 }
 
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
@@ -626,7 +642,8 @@ async fn call_hub(
             }
             #[cfg(unix)]
             if observes_shell(&agent, &payload)
-                && let Some(observation) = observe_shell(&agent, &payload, &routed.checkout).await
+                && let Some(observation) =
+                    observe_shell(&agent, &payload, &routed.checkout, deadline).await
             {
                 routed.payload["observed"] = observation;
             }

@@ -1251,7 +1251,43 @@ mod worktree_observation {
     }
 
     fn state(repo: &Path) -> WorktreeState {
-        worktree_state(&git_path(), repo, soon()).unwrap()
+        worktree_state(&git_path(), repo, soon(), None).unwrap()
+    }
+
+    #[test]
+    fn a_nested_repository_and_a_linked_worktree_do_not_break_the_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let nested = repo.join("nested");
+        fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-q", "-b", "main"]);
+        fs::write(nested.join("f"), "x\n").unwrap();
+        git(&repo, &["worktree", "add", "-q", "-b", "side", "inner/wt"]);
+        let before = state(&repo);
+        assert!(before.valid());
+        assert!(before.entries.contains_key("nested/"), "{before:?}");
+        assert!(before.entries.contains_key("inner/wt/"), "{before:?}");
+        assert!(before.entries["nested/"].size.is_some());
+        fs::write(repo.join("a"), "changed\n").unwrap();
+        let observed = between(&repo, &before, &state(&repo));
+        assert_eq!(paths(&observed), ["a"]);
+        // Removing the nested directory is reported by its plain path.
+        fs::remove_dir_all(&nested).unwrap();
+        let gone = between(&repo, &before, &state(&repo));
+        assert!(paths(&gone).contains(&"nested"), "{gone:?}");
+    }
+
+    #[test]
+    fn a_globally_ignored_file_is_hidden_when_the_excludes_file_is_given() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        let excludes = dir.path().join("global-ignore");
+        fs::write(&excludes, ".envrc\n").unwrap();
+        fs::write(repo.join(".envrc"), "x\n").unwrap();
+        fs::write(repo.join("kept"), "x\n").unwrap();
+        let with = worktree_state(&git_path(), &repo, soon(), Some(&excludes)).unwrap();
+        assert!(!with.entries.contains_key(".envrc") && with.entries.contains_key("kept"));
+        assert!(state(&repo).entries.contains_key(".envrc"));
     }
 
     fn between(repo: &Path, before: &WorktreeState, after: &WorktreeState) -> Observed {
@@ -1408,7 +1444,15 @@ mod worktree_observation {
         for i in 0..WORKTREE_ENTRIES + 1 {
             fs::write(repo.join(format!("f{i:05}")), "").unwrap();
         }
-        assert!(worktree_state(&git_path(), &repo, soon()).is_err());
+        assert!(worktree_state(&git_path(), &repo, soon(), None).is_err());
+    }
+
+    #[test]
+    fn a_name_with_a_control_character_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with(dir.path(), &[("a", "1\n")]);
+        fs::write(repo.join("odd\u{1}name"), "").unwrap();
+        assert!(worktree_state(&git_path(), &repo, soon(), None).is_err());
     }
 
     #[test]
@@ -1416,7 +1460,7 @@ mod worktree_observation {
         let dir = TempDir::new().unwrap();
         let repo = repo_with(dir.path(), &[("a", "1\n")]);
         let past = Instant::now() - Duration::from_secs(1);
-        assert!(worktree_state(&git_path(), &repo, past).is_err());
+        assert!(worktree_state(&git_path(), &repo, past, None).is_err());
         let snapshot = state(&repo);
         assert!(changed_during(&git_path(), &repo, &snapshot, &snapshot, past).is_err());
         // A moved HEAD needs Git, which is not run after the deadline.
@@ -1426,7 +1470,7 @@ mod worktree_observation {
         // Not a repository.
         let plain = dir.path().join("plain");
         fs::create_dir(&plain).unwrap();
-        assert!(worktree_state(&git_path(), &plain, soon()).is_err());
+        assert!(worktree_state(&git_path(), &plain, soon(), None).is_err());
     }
 
     #[test]

@@ -151,7 +151,9 @@ should resume). The edit proceeds either way.
   edit, not files written by shell commands. For Claude Code and Codex the hook client
   observes a shell call's file changes and the Hub records the first 50 changed paths as
   intents after the call, as an already-applied edit that refuses nothing (see
-  [shell-call observation](agents.md#shell-call-observation) and its limits).
+  [shell-call observation](agents.md#shell-call-observation) and its limits). When a changed
+  path lies outside the scope of the session's Work, no intents are recorded and no holder
+  is named.
 - An intent expires two hours after its last announce. SessionEnd may not run after a
   crash, so that expiry is the backstop. A session that announces more than 256 files
   keeps the most recent 256.

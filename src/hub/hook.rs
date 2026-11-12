@@ -198,17 +198,11 @@ struct Call {
 }
 
 /// The most paths one observation may name, as the hook client bounds them.
-const MAX_OBSERVED_PATHS: usize = 200;
+const MAX_OBSERVED_PATHS: usize = crate::git_collisions::OBSERVED_PATHS;
 /// How many observed paths a reply names.
 const SHOWN_OBSERVED: usize = 20;
-/// Why the hook client could not observe a shell call (`shell_observation.rs`).
-const OBSERVED_UNKNOWN: [&str; 5] = [
-    "missing_snapshot",
-    "pre_snapshot_failed",
-    "invalid_snapshot",
-    "git_failed",
-    "no_tool_use_id",
-];
+/// Why the hook client could not observe a shell call, shared with the client.
+const OBSERVED_UNKNOWN: [&str; 7] = crate::git_collisions::OBSERVED_UNKNOWN;
 
 /// The `observed` field of a shell call's end, decoded strictly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,11 +229,10 @@ impl Observed {
                 .and_then(|reason| OBSERVED_UNKNOWN.iter().find(|known| **known == reason))
                 .map_or(invalid, |reason| Self::Unknown(reason)),
             Some("changed") if only(&["outcome", "paths", "truncated"]) => {
-                let truncated = match map.get("truncated") {
-                    None => false,
-                    Some(Value::Bool(truncated)) => *truncated,
-                    Some(_) => return invalid,
+                let Some(Value::Bool(truncated)) = map.get("truncated") else {
+                    return invalid;
                 };
+                let mut truncated = *truncated;
                 let Some(listed) = map.get("paths").and_then(Value::as_array) else {
                     return invalid;
                 };
@@ -248,16 +241,22 @@ impl Observed {
                 }
                 let mut paths = BTreeSet::new();
                 for path in listed {
-                    match path.as_str() {
-                        Some(path)
-                            if relative(path, &[]).as_deref() == Some(path)
-                                && !path.contains('*')
-                                && spec_key(path).is_ok() =>
-                        {
-                            paths.insert(path.to_owned());
-                        }
-                        _ => return invalid,
+                    let Some(path) = path.as_str() else {
+                        return invalid;
+                    };
+                    // The client accepts a few names the Hub cannot hold (`*`, a drive-like
+                    // `c:x`): drop those and say the list is incomplete, rather than lose it all.
+                    if relative(path, &[]).as_deref() == Some(path)
+                        && !path.contains('*')
+                        && spec_key(path).is_ok()
+                    {
+                        paths.insert(path.to_owned());
+                    } else {
+                        truncated = true;
                     }
+                }
+                if paths.is_empty() {
+                    return invalid;
                 }
                 Self::Changed {
                     paths: paths.into_iter().collect(),
@@ -689,6 +688,7 @@ impl Call {
     fn observed_line(&self) -> String {
         match &self.observed {
             None => String::new(),
+            Some(Observed::Unknown("background")) => "AgentSCM cannot observe this shell call's changes: it continues in the background, so what it changes later is not observed. If it changed files, call `agentscm_check` with those paths.".to_owned(),
             Some(Observed::Unknown(reason)) => format!(
                 "AgentSCM could not observe which files this shell call changed ({reason}). If it changed files, call `agentscm_check` with those paths."
             ),
@@ -1061,6 +1061,17 @@ impl Call {
                                 ""
                             };
                             if applied {
+                                // The change is made; the advice to hold the scope first is for
+                                // the next one.
+                                let detail = detail
+                                    .replace(
+                                        "Hold it again before editing",
+                                        "Hold it again before the next change",
+                                    )
+                                    .replace(
+                                        "request fresh admission before editing",
+                                        "request fresh admission before the next change",
+                                    );
                                 format!(
                                     "{observed}\nAgentSCM: {detail}{child} No new file intent was announced."
                                 )
@@ -1082,16 +1093,6 @@ impl Call {
                 };
                 let mut outcome = Outcome::advice(advice.text, advice.stop);
                 outcome.deny = advice.deny;
-                if applied {
-                    outcome.text = if outcome.text.is_empty() {
-                        observed.clone()
-                    } else {
-                        format!("{observed}\n{}", outcome.text)
-                    };
-                    if outcome.status == "clean" {
-                        outcome.status = "fyi";
-                    }
-                }
                 // A session that declared no Work is invisible to its person and the team, and
                 // its waits never reach them. Its first edit of a file that can be held is refused
                 // once with the start call, or noted beside the edit where the host cannot refuse;
@@ -1103,14 +1104,25 @@ impl Call {
                     .cloned()
                     .collect();
                 if applied {
-                    // The files are already changed and nothing can be refused, so the session
-                    // is told every time, not once: each shell call that changes files is a
-                    // chance to declare the Work they belong to.
+                    // The line that asks for Work comes right after the account of the change, so
+                    // that cutting a long reply to fit never drops it.
+                    let mut lead = observed.clone();
                     if coverage.item.is_none() && !holdable.is_empty() {
-                        outcome.text =
-                            format!("{}\n{}", outcome.text, self.applied_undeclared(&holdable));
+                        lead = format!("{lead}\n{}", self.applied_undeclared(&holdable));
                     }
-                } else if coverage.item.is_none()
+                    outcome.text = if outcome.text.is_empty() {
+                        lead
+                    } else {
+                        format!("{lead}\n{}", outcome.text)
+                    };
+                    if outcome.status == "clean" {
+                        outcome.status = "fyi";
+                    }
+                }
+                // For files a shell call already changed nothing can be refused, so the session is
+                // told every time, not once, ahead of the other advice (above).
+                if !applied
+                    && coverage.item.is_none()
                     && !self.child
                     && !holdable.is_empty()
                     && let Some(native) = self.session.as_deref()
@@ -2198,22 +2210,42 @@ mod tests {
             json!({"outcome":"changed","paths":"a"}),
             json!({"outcome":"changed","paths":[1]}),
             json!({"outcome":"changed","paths":["a"],"truncated":"yes"}),
-            json!({"outcome":"changed","paths":["a"],"extra":1}),
-            json!({"outcome":"changed","paths":too_many}),
-            json!({"outcome":"changed","paths":["/etc/passwd"]}),
-            json!({"outcome":"changed","paths":["../x"]}),
-            json!({"outcome":"changed","paths":["a/../b"]}),
-            json!({"outcome":"changed","paths":["src/**"]}),
-            json!({"outcome":"changed","paths":["a\nb"]}),
-            json!({"outcome":"changed","paths":["ok", ""]}),
+            json!({"outcome":"changed","paths":["a"],"truncated":false,"extra":1}),
+            // The client always says whether the list is complete.
+            json!({"outcome":"changed","paths":["a"]}),
+            json!({"outcome":"changed","paths":too_many,"truncated":false}),
+            // No path survives.
+            json!({"outcome":"changed","paths":["/etc/passwd"],"truncated":false}),
+            json!({"outcome":"changed","paths":["../x"],"truncated":false}),
+            json!({"outcome":"changed","paths":["a/../b"],"truncated":false}),
+            json!({"outcome":"changed","paths":["src/**"],"truncated":false}),
+            json!({"outcome":"changed","paths":["a\nb"],"truncated":false}),
+            json!({"outcome":"changed","paths":["", "*"],"truncated":false}),
             json!({"outcome":"unknown"}),
             json!({"outcome":"unknown","reason":"made up"}),
             json!({"outcome":"unknown","reason":"git_failed","paths":["a"]}),
         ] {
             assert_eq!(decode(bad.clone()), invalid, "{bad}");
         }
+        // One path the Hub cannot hold is dropped and the list marked incomplete.
+        assert_eq!(
+            decode(
+                json!({"outcome":"changed","paths":["ok","*","c:x","a\u{200b}b"],"truncated":false})
+            ),
+            Observed::Changed {
+                paths: vec!["ok".into()],
+                truncated: true
+            }
+        );
+        // The Hub and the client agree on the bounds and the reasons.
+        assert_eq!(MAX_OBSERVED_PATHS, crate::git_collisions::OBSERVED_PATHS);
+        assert!(decode(json!({"outcome":"unknown","reason":"background"})) != invalid);
+        assert!(decode(json!({"outcome":"unknown","reason":"local_error"})) != invalid);
         // A malformed field still ends the call and says it could not tell.
-        let call = shell_end(json!({}), json!({"outcome":"changed","paths":["/x"]}));
+        let call = shell_end(
+            json!({}),
+            json!({"outcome":"changed","paths":["/x"],"truncated":false}),
+        );
         assert_eq!(call.kind, Kind::Activity(CallPhase::End));
         assert!(
             call.observed_line().contains("(invalid)"),
@@ -2239,7 +2271,10 @@ mod tests {
         assert!(!line.contains("and more"), "{line}");
         // The reply names a bounded list and says there is more.
         let many: Vec<String> = (0..30).map(|n| format!("f{n:02}")).collect();
-        let long = shell_end(json!({}), json!({"outcome":"changed","paths":many}));
+        let long = shell_end(
+            json!({}),
+            json!({"outcome":"changed","paths":many,"truncated":false}),
+        );
         let line = long.observed_line();
         assert!(line.contains("f19") && !line.contains("f20"), "{line}");
         assert!(line.contains(", and more."), "{line}");
@@ -2267,7 +2302,16 @@ mod tests {
         assert!(own.contains("\"native-id\""), "{own}");
         let child = shell_end(
             json!({"agent_id":"sub"}),
-            json!({"outcome":"changed","paths":["src/a.rs"]}),
+            json!({"outcome":"changed","paths":["src/a.rs"],"truncated":false}),
+        );
+        let background = shell_end(
+            json!({}),
+            json!({"outcome":"unknown","reason":"background"}),
+        );
+        let line = background.observed_line();
+        assert!(
+            line.contains("continues in the background") && line.contains("`agentscm_check`"),
+            "{line}"
         );
         assert_eq!(
             child.applied_undeclared(&child.paths),
