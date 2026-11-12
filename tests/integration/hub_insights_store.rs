@@ -2407,6 +2407,11 @@ fn value_aged_finished_followups_keep_actionable_and_period_cohorts_separate(db:
     store
         .skill_adoption_put(&SkillAdoption {
             repository: REPOSITORY.into(),
+            repository_scope: store::repository_scope(
+                "github.com",
+                REPOSITORY,
+                Some(REPOSITORY_ID),
+            ),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&lock).unwrap(),
             default_branch: Some("main".into()),

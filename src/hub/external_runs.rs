@@ -409,9 +409,9 @@ async fn pass(
 ) -> Gh<()> {
     let oldest = unix_now() - state.sync.config()?.activity_days * 86_400;
     let (after_number, after_id) = state.sync.external_cursor(&repo.id);
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let unmerged = blocking(state, move || {
-        store.pull_publications(&name, after_number, MAX_PER_PASS)
+        store.pull_publications(&scope, after_number, MAX_PER_PASS)
     })
     .await?;
     let full = unmerged.len() >= MAX_PER_PASS;

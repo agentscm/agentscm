@@ -141,6 +141,71 @@ pub struct Principal {
     pub owner: User,
 }
 
+/// Statements (PostgreSQL form; `$1` the repository's id scope, `$2` its name scope) that move
+/// rows a token without a repository id wrote under a repository's name, before that repository
+/// was connected under the name, to the repository's id scope, where that token now reads them.
+/// A key already taken under the id scope keeps its row; the name-scoped one is left unread.
+pub(super) const ADOPT_NAME_SCOPE: [&str; 10] = [
+    "UPDATE hub_intents SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_intent_paths SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_handoffs SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_contested_edits SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_duplicate_starts SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_hook_overhead SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_publications SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_skill_evidence SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_candidate_heads SET repository_scope = $1 WHERE repository_scope = $2
+     AND NOT EXISTS (SELECT 1 FROM hub_candidate_heads h
+         WHERE h.repository_scope = $1 AND h.branch = hub_candidate_heads.branch)",
+    "UPDATE hub_skill_adoptions SET repository_scope = $1 WHERE repository_scope = $2
+     AND NOT EXISTS (SELECT 1 FROM hub_skill_adoptions a WHERE a.repository_scope = $1)",
+];
+
+/// [`principal_scope`] from a request handler; the store is read only for a token with no
+/// repository id.
+pub(super) async fn scope_of(state: &super::HubState, who: &Principal) -> Result<String> {
+    if who.repository_id.is_some() {
+        return Ok(repository_scope(
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        ));
+    }
+    let (store, who) = (state.store.clone(), who.clone());
+    super::http::blocking(state, move || principal_scope(&*store, &who)).await
+}
+
+/// The key the token's repository rows are stored under (see [`repository_scope`]). A token
+/// minted without a repository id takes the id of the repository connected under its name on its
+/// owner's host, as its forge reads do (`sync::find_repository`); with none, its name.
+pub fn principal_scope(store: &dyn Store, who: &Principal) -> Result<String> {
+    let host = &who.owner.identity.host;
+    let repository_id = match who.repository_id {
+        Some(id) => Some(id),
+        None => store
+            .repository_named(host, &who.repository)?
+            .map(|repo| repo.repository_id),
+    };
+    Ok(repository_scope(host, &who.repository, repository_id))
+}
+
+impl super::connection::ConnectedRepository {
+    /// The key this repository's rows are stored under; see [`repository_scope`].
+    pub fn repository_scope(&self) -> String {
+        repository_scope(&self.host, &self.full_name, Some(self.repository_id))
+    }
+}
+
+/// The key one repository's rows are stored under: its forge host and stable repository id, or
+/// its host and name when the caller has no id. Two repositories with the same name, on two hosts
+/// or one after another on one host, never share a key, and a renamed repository keeps its own.
+pub fn repository_scope(host: &str, repository: &str, repository_id: Option<i64>) -> String {
+    format!(
+        "{host}/{}",
+        super::catchup::repository_namespace(repository, repository_id)
+    )
+}
+
 /// A token as its owner sees it; never holds the secret or digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentToken {
@@ -549,8 +614,9 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<Pickup>>;
-    /// Live intents in `repository`, ordered by id, at most `limit`.
-    fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
+    /// Live intents of the repository with `scope` (see [`repository_scope`]), ordered by id,
+    /// at most `limit`.
+    fn live_intents(&self, scope: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// Live intents in the principal's repository and forge scope, ordered by id.
     fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// `intent_notice` and `pr_notice` events addressed to the token's intents with seq > `after`, oldest first, at most `limit`.
@@ -699,12 +765,12 @@ pub trait Store: Send + Sync {
     fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
     /// Rows of `repo` that may show a success (state `success` or an uncertain post) as
     /// `(number, context, row)`, by number then context, at most `limit`. Rows on a context in
-    /// `enabled`, and rows of a pull request whose newest publication in `full_name` is merged,
-    /// are left out: neither is a retire candidate.
+    /// `enabled`, and rows of a pull request whose newest publication in the repository with
+    /// `scope` (see [`repository_scope`]) is merged, are left out: neither is a retire candidate.
     fn forge_checks_showing_success(
         &self,
         repo: &str,
-        full_name: &str,
+        scope: &str,
         enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>>;
@@ -829,12 +895,14 @@ pub trait Store: Send + Sync {
         binding: Option<&str>,
         now: i64,
     ) -> Result<Create>;
-    fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
-    /// Publications of `repository` (matched exactly, as [`Store::publication`]), newest first by
-    /// `created_at`, then `id`, strictly older than the `before` publication, at most `limit`.
+    /// The publication `id` when it belongs to the repository with `scope` (see
+    /// [`repository_scope`]).
+    fn publication(&self, scope: &str, id: &str) -> Result<Option<Publication>>;
+    /// Publications of the repository with `scope`, newest first by `created_at`, then `id`,
+    /// strictly older than the `before` publication, at most `limit`.
     fn publications(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
@@ -844,20 +912,15 @@ pub trait Store: Send + Sync {
     /// reads more than that window; the result says where it stopped.
     fn publication_search(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         search: &str,
         limit: usize,
     ) -> Result<PublicationSearch>;
-    /// The newest publication of each pull request number above `after` in `repository`
-    /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
-    /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
-    fn pull_publications(
-        &self,
-        repository: &str,
-        after: i64,
-        limit: usize,
-    ) -> Result<Vec<Publication>>;
+    /// The newest publication of each pull request number above `after` in the repository with
+    /// `scope` (see [`repository_scope`]), omitting pull requests whose newest publication is
+    /// merged, by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
+    fn pull_publications(&self, scope: &str, after: i64, limit: usize) -> Result<Vec<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Propose or atomically apply a repair for one exact retained publication-projection failure.
@@ -1199,19 +1262,22 @@ pub trait Store: Send + Sync {
         author: &str,
         retry_at: i64,
     ) -> Result<()>;
-    fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>>;
+    /// The adoption of the repository with `scope` (see [`repository_scope`]); every skill
+    /// table is keyed by the scope.
+    fn skill_adoption(&self, scope: &str) -> Result<Option<SkillAdoption>>;
     /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
     /// replaces a `default_branch` row, which any `default_branch` row replaces.
     fn skill_adoption_put(&self, adoption: &SkillAdoption) -> Result<SkillAdoption>;
     /// Drops the repository's adoption from `source`, or from every source when `None`.
-    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()>;
+    fn skill_adoption_clear(&self, scope: &str, source: Option<&str>) -> Result<()>;
     fn skill_evidence_add(&self, row: &EvidenceRow) -> Result<()>;
     /// A run's evidence in recorded order.
-    fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;
-    /// Runs of `repo`, most recently active first, optionally one branch or one run id.
+    fn skill_evidence(&self, scope: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;
+    /// Runs of the repository with `scope`, most recently active first, optionally one branch
+    /// or one run id.
     fn skill_run_heads(
         &self,
-        repo: &str,
+        scope: &str,
         branch: Option<&str>,
         run_id: Option<&str>,
         limit: usize,

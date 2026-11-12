@@ -442,10 +442,15 @@ async fn mcp(
             // The skill tools matter only where the repository adopted skills. A failed read
             // lists them: listing is advice, and must not cost an agent its tools.
             let skills = all_tools || principal.read_only || {
-                let (store, repo) = (state.store.clone(), principal.repository.clone());
-                blocking(&state, move || store.skill_adoption(&repo))
-                    .await
-                    .map_or(true, |adoption| adoption.is_some())
+                match super::store::scope_of(&state, &principal).await {
+                    Ok(scope) => {
+                        let store = state.store.clone();
+                        blocking(&state, move || store.skill_adoption(&scope))
+                            .await
+                            .map_or(true, |adoption| adoption.is_some())
+                    }
+                    Err(_) => true,
+                }
             };
             Ok(json!({"tools": tools(principal.read_only, &settings, all_tools, skills)}))
         }
@@ -3372,11 +3377,14 @@ async fn picker_call(
     if !(1..=super::publish::MAX_LISTED).contains(&limit) {
         return invalid_args(name, "limit is out of range");
     }
-    let repository = principal.repository.clone();
+    let scope = match super::store::scope_of(state, principal).await {
+        Ok(scope) => scope,
+        Err(error) => return work_failure(&error),
+    };
     match blocking(state, move || {
         super::publish::publication_page(
             &*store,
-            &repository,
+            &scope,
             args.cursor.as_deref(),
             search.as_deref(),
             limit,

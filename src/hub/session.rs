@@ -915,9 +915,9 @@ pub async fn others_for(
     own_intent: Option<&str>,
 ) -> Result<String> {
     let store = state.store.clone();
-    let repository = principal.repository.clone();
+    let scope = super::store::scope_of(state, principal).await?;
     let (intents, truncated) = blocking(state, move || {
-        live_intents_capped(&*store, &repository, unix_now())
+        live_intents_capped(&*store, &scope, unix_now())
     })
     .await?;
     let mut text = advice::others(&intents, own_intent, &principal.repository, unix_now());

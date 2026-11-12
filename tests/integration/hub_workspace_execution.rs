@@ -3633,7 +3633,10 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         let publication_id = result["id"].as_str().unwrap();
         assert_eq!(
             env.store
-                .publication("synthetic/project", publication_id)
+                .publication(
+                    &crate::repository_scope::connected(&*env.store, "synthetic/project"),
+                    publication_id
+                )
                 .unwrap()
                 .unwrap()
                 .branch_state,
@@ -3699,7 +3702,10 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         // Adoption by the detached recovery sets the PR number; sync alone does not.
         let attempting = || {
             env.store
-                .publication("synthetic/project", publication_id)
+                .publication(
+                    &crate::repository_scope::connected(&*env.store, "synthetic/project"),
+                    publication_id,
+                )
                 .unwrap()
                 .unwrap()
                 .pr_number
@@ -3997,7 +4003,10 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
                 .unwrap();
             assert_eq!(
                 env.store
-                    .publication("synthetic/project", publication_id)
+                    .publication(
+                        &crate::repository_scope::connected(&*env.store, "synthetic/project"),
+                        publication_id
+                    )
                     .unwrap()
                     .unwrap()
                     .merge_commit

@@ -2287,7 +2287,8 @@ fn upgrade_from_migration_3(db: &Db) {
     .unwrap();
     let store = db.open();
     assert_eq!(db.versions(), store::integer_migration_versions());
-    let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
+    let scope = crate::repository_scope::github("acme/widgets", Some(4242));
+    let intents = store.live_intents(&scope, unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
     let con = store
         .insert_connection(&app("github.com"), "usr_admin")
@@ -2394,7 +2395,10 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
     assert_eq!(db.versions(), store::integer_migration_versions());
-    let p = store.publication(REPO, &id).unwrap().unwrap();
+    let p = store
+        .publication(&crate::repository_scope::github(REPO, None), &id)
+        .unwrap()
+        .unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);
     assert_eq!((p.pr_number, p.created_at, p.updated_at), (Some(7), 10, 11));
@@ -2435,11 +2439,13 @@ fn pull_publications_are_newest_per_pull_request(db: &Db) {
     let row = |id: &str, repository: &str, pr: &str, merged: &str, created: i64| {
         format!(
             "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
-                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at,
+                repository_scope)
              VALUES ('{id}','{repository}','tok_pp','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
-                {merged},{created},{created});",
+                {merged},{created},{created},'scope:{}');",
             "a".repeat(64),
-            "b".repeat(40)
+            "b".repeat(40),
+            repository.to_ascii_lowercase()
         )
     };
     let mut sql = String::from(
@@ -2463,13 +2469,13 @@ fn pull_publications_are_newest_per_pull_request(db: &Db) {
     db.exec(&sql).unwrap();
     let ids = |after: i64, limit: usize| {
         store
-            .pull_publications("acme/widgets", after, limit)
+            .pull_publications("scope:acme/widgets", after, limit)
             .unwrap()
             .into_iter()
             .map(|p| p.id)
             .collect::<Vec<_>>()
     };
-    // Newest per number, the merged lineage omitted, the repository matched ignoring case.
+    // Newest per number, the merged lineage omitted, only rows of the repository's scope.
     assert_eq!(ids(0, 50), ["p1-new", "p2", "p4"]);
     assert_eq!(ids(1, 50), ["p2", "p4"]);
     assert_eq!(ids(0, 2), ["p1-new", "p2"]);
@@ -2611,9 +2617,10 @@ fn merged_publications_skip_unmerged_ones(db: &Db) {
         let updated = if id == "stale" { 0 } else { 5 };
         sql.push_str(&format!(
             "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,
-                branch,base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+                branch,base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at,
+                repository_scope)
              VALUES ('{id}','{repository}','tok_mp','{}',1,'{}','b-{id}','main','{{}}','created',
-                1,{merged},1,{updated});",
+                1,{merged},1,{updated},'scope:{repository}');",
             "a".repeat(64),
             "b".repeat(40)
         ));
@@ -2664,9 +2671,10 @@ fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
     ] {
         sql.push_str(&format!(
             "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
-                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at,
+                repository_scope)
              VALUES ('{id}','Acme/Widgets','tok_fm','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
-                {merged},{created},{created});",
+                {merged},{created},{created},'scope:acme/widgets');",
             "a".repeat(64),
             "b".repeat(40)
         ));
@@ -2684,7 +2692,7 @@ fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
             .unwrap();
     }
     let numbers = store
-        .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 10)
+        .forge_checks_showing_success(&repo.id, "scope:acme/widgets", &[], 10)
         .unwrap()
         .into_iter()
         .map(|(n, _, _)| n)
@@ -2697,6 +2705,7 @@ fn skill_adoption_and_evidence(db: &Db) {
     let store = db.open();
     let adoption = |source: &str, lock: &str| SkillAdoption {
         repository: REPO.into(),
+        repository_scope: REPO.into(),
         source: source.into(),
         lock_json: lock.into(),
         default_branch: (source == "default_branch").then(|| "main".to_owned()),
@@ -2749,6 +2758,7 @@ fn skill_adoption_and_evidence(db: &Db) {
     let row = |id: &str, run: &str, branch: &str, at: i64| EvidenceRow {
         id: id.into(),
         repository: REPO.into(),
+        repository_scope: REPO.into(),
         branch: branch.into(),
         run_id: run.into(),
         skill: "pr-gate".into(),
@@ -3547,6 +3557,414 @@ fn local_ci_corrupt_records_are_refused(db: &Db) {
     assert_eq!(ci.store.local_ci_device("lcd_b").unwrap().unwrap(), good);
 }
 
+/// The `repository_scope` migration gives each existing row its writer's scope and keeps every
+/// row. Rows are written through the store, the schema is put back as it was before the migration
+/// (losing only the new column), and the reopened store runs the migration again.
+fn repository_scope_backfill(db: &Db) {
+    use agentscm::hub::publish::{Manifest, NewPublication, derive_id};
+    let store = db.open();
+    let github = |id: i64| ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: id,
+    };
+    let alice = store.upsert_user(&github(1), "alice").unwrap();
+    let dave = store.upsert_user(&github(4), "dave").unwrap();
+    let bound = mint_bound_agent_token(&*store, &alice.id, "bound", REPO, 1001, TTL, false)
+        .unwrap()
+        .0;
+    // No repository id: it takes the connected repository's; with none connected, its name.
+    let connected = mint_agent_token(&*store, &dave.id, "connected", "acme/gadgets", TTL)
+        .unwrap()
+        .0;
+    let unconnected = mint_agent_token(&*store, &dave.id, "unconnected", "acme/tools", TTL)
+        .unwrap()
+        .0;
+    let connection = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    store
+        .upsert_repository(
+            &connection.id,
+            "github.com",
+            3003,
+            "acme/gadgets",
+            None,
+            None,
+        )
+        .unwrap();
+    let now = unix_now();
+    for (n, token) in [&bound, &connected, &unconnected].into_iter().enumerate() {
+        let intent = NewIntent {
+            id: format!("int_{n:032x}"),
+            task: "t".into(),
+            branch: None,
+            base: None,
+            machine: None,
+            paths: vec![format!("src/{n}.rs")],
+            ttl_seconds: 600,
+        };
+        store.announce_intent(token, &intent, now).unwrap();
+    }
+    let manifest: Manifest = serde_json::from_value(json!({
+        "revision": "a".repeat(64), "event_seq": 3, "commit": "b".repeat(40),
+        "tree": "c".repeat(40), "parent": "d".repeat(40), "branch": "feat/x", "base": "main",
+        "title": "t", "body": "", "message": "msg\n",
+        "author": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "committer": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "changes": [{"path": "a.txt", "mode": "100644", "blob": "e".repeat(40),
+            "sha256": "f".repeat(64), "size": 5}]
+    }))
+    .unwrap();
+    let publication = derive_id(REPO, 3, &"b".repeat(40), "feat/x");
+    store
+        .create_publication(
+            &bound,
+            &NewPublication {
+                id: publication.clone(),
+                manifest,
+            },
+            now,
+        )
+        .unwrap();
+    let sample = agentscm::hub::hook_overhead::Sample {
+        session: "s".into(),
+        agent: "agent".into(),
+        hub_calls: 1,
+        injected_start: 0,
+        injected_refusal: 0,
+        injected_other: 0,
+        client: None,
+    };
+    store.hook_overhead(&bound, REPO, &sample, now).unwrap();
+    let adoption = |repository: &str, source: &str, reported_by: Option<&str>| SkillAdoption {
+        repository: repository.into(),
+        repository_scope: format!("unused/{repository}"),
+        source: source.into(),
+        lock_json: "{}".into(),
+        default_branch: None,
+        observed_at: 1,
+        reported_by: reported_by.map(str::to_owned),
+        local_skills: None,
+    };
+    store
+        .skill_adoption_put(&adoption("acme/gadgets", "default_branch", None))
+        .unwrap();
+    store
+        .skill_adoption_put(&adoption(REPO, "reported_by_checkout", Some(&bound)))
+        .unwrap();
+    store
+        .skill_adoption_put(&adoption("acme/unknown", "default_branch", None))
+        .unwrap();
+    drop(store);
+
+    // The schema before the migration.
+    db.exec(
+        "DROP INDEX hub_intents_live;
+         ALTER TABLE hub_intents DROP COLUMN repository_scope;
+         CREATE INDEX hub_intents_live ON hub_intents (repository, expires_at);
+         DROP INDEX hub_intent_paths_key;
+         ALTER TABLE hub_intent_paths DROP COLUMN repository_scope;
+         CREATE INDEX hub_intent_paths_key ON hub_intent_paths (repository, key);
+         DROP INDEX hub_handoffs_scope;
+         ALTER TABLE hub_handoffs DROP COLUMN repository_scope;
+         DROP INDEX hub_contested_edits_scope;
+         ALTER TABLE hub_contested_edits DROP COLUMN repository_scope;
+         CREATE INDEX hub_contested_edits_scope ON hub_contested_edits (repository, observed_at);
+         DROP INDEX hub_duplicate_starts_scope;
+         ALTER TABLE hub_duplicate_starts DROP COLUMN repository_scope;
+         CREATE INDEX hub_duplicate_starts_scope ON hub_duplicate_starts (repository, observed_at);
+         DROP INDEX hub_hook_overhead_scope;
+         ALTER TABLE hub_hook_overhead DROP COLUMN repository_scope;
+         CREATE INDEX hub_hook_overhead_scope ON hub_hook_overhead (repository, updated_at);
+         DROP INDEX hub_publications_repository;
+         DROP INDEX hub_publications_pull;
+         DROP INDEX hub_publications_commit;
+         ALTER TABLE hub_publications DROP COLUMN repository_scope;
+         CREATE INDEX hub_publications_repository ON hub_publications (repository, created_at);
+         CREATE INDEX hub_publications_pull ON hub_publications (lower(repository), pr_number, created_at);
+         CREATE INDEX hub_publications_commit ON hub_publications (repository, commit_sha);
+         DROP TABLE hub_candidate_heads;
+         CREATE TABLE hub_candidate_heads (repository TEXT NOT NULL, branch TEXT NOT NULL,
+             publication TEXT NOT NULL, PRIMARY KEY (repository, branch));
+         DROP INDEX hub_skill_evidence_branch;
+         ALTER TABLE hub_skill_evidence DROP COLUMN repository_scope;
+         CREATE INDEX hub_skill_evidence_branch ON hub_skill_evidence (repository, branch);
+         CREATE TABLE hub_skill_adoptions_copy AS SELECT repository, source, lock_json,
+             default_branch, observed_at, reported_by, local_skills FROM hub_skill_adoptions;
+         DROP TABLE hub_skill_adoptions;
+         CREATE TABLE hub_skill_adoptions (repository TEXT NOT NULL PRIMARY KEY,
+             source TEXT NOT NULL, lock_json TEXT NOT NULL, default_branch TEXT,
+             observed_at BIGINT NOT NULL, reported_by TEXT, local_skills TEXT);
+         INSERT INTO hub_skill_adoptions SELECT * FROM hub_skill_adoptions_copy;
+         DROP TABLE hub_skill_adoptions_copy;
+         DELETE FROM hub_named_migrations WHERE name = 'repository_scope';",
+    )
+    .unwrap();
+    // Rows only the old schema could hold: a candidate head, and contested-edit rows of a known
+    // token and of one the Hub no longer has.
+    db.exec(&format!(
+        "INSERT INTO hub_candidate_heads VALUES ('{REPO}', 'feat/x', '{publication}');
+         INSERT INTO hub_contested_edits (repository, token, session, path, hold, kind, outcome,
+             observed_at) VALUES ('{REPO}', '{bound}', 's', 'src/a.rs', 'int_x', 'notice',
+             'proceeded', 1), ('acme/gone', 'tok_gone', 's', 'src/a.rs', 'int_x', 'notice',
+             'proceeded', 1);"
+    ))
+    .unwrap();
+
+    let store = db.open();
+    assert!(db.named().iter().any(|name| name == "repository_scope"));
+    let bound_scope = store::repository_scope("github.com", REPO, Some(1001));
+    let connected_scope = store::repository_scope("github.com", "acme/gadgets", Some(3003));
+    let unconnected_scope = store::repository_scope("github.com", "acme/tools", None);
+    let count = |table: &str, scope: &str| {
+        db.count(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE repository_scope = '{scope}'"
+        ))
+    };
+    for (table, scope, rows) in [
+        ("hub_intents", &bound_scope, 1),
+        ("hub_intents", &connected_scope, 1),
+        ("hub_intents", &unconnected_scope, 1),
+        ("hub_intent_paths", &bound_scope, 1),
+        ("hub_intent_paths", &connected_scope, 1),
+        ("hub_publications", &bound_scope, 1),
+        ("hub_candidate_heads", &bound_scope, 1),
+        ("hub_hook_overhead", &bound_scope, 1),
+        ("hub_contested_edits", &bound_scope, 1),
+        // No token accounts for it: it keeps its bare name, which no caller's scope equals.
+        ("hub_contested_edits", &"acme/gone".to_owned(), 1),
+        ("hub_skill_adoptions", &connected_scope, 1),
+        ("hub_skill_adoptions", &bound_scope, 1),
+        ("hub_skill_adoptions", &"acme/unknown".to_owned(), 1),
+    ] {
+        assert_eq!(count(table, scope), rows, "{table} {scope}");
+    }
+    for (table, rows) in [
+        ("hub_intents", 3),
+        ("hub_intent_paths", 3),
+        ("hub_publications", 1),
+        ("hub_candidate_heads", 1),
+        ("hub_contested_edits", 2),
+        ("hub_skill_adoptions", 3),
+    ] {
+        assert_eq!(
+            db.count(&format!("SELECT COUNT(*) FROM {table}")),
+            rows,
+            "{table}"
+        );
+    }
+    // The store reads the backfilled rows under the same scopes it now writes.
+    assert_eq!(
+        store.live_intents(&connected_scope, now, 10).unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .publication(&bound_scope, &publication)
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.skill_adoption(&connected_scope).unwrap().is_some());
+}
+
+/// Three repositories named `acme/widgets`: one on github.com, one on gitlab.com with the same
+/// forge id, and one on github.com with another id (as after the first was renamed and its name
+/// reused). Each reads only its own intents, publications, skill rows and hook overhead.
+fn same_name_repositories_stay_apart(db: &Db) {
+    use agentscm::hub::publish::{Create, Manifest, NewPublication, derive_id};
+    let store = db.open();
+    let user = |provider: &str, host: &str, id: i64| {
+        let identity = ForgeIdentity {
+            provider: provider.into(),
+            host: host.into(),
+            user_id: id,
+        };
+        store.upsert_user(&identity, &format!("user{id}")).unwrap()
+    };
+    let (alice, bob, carol) = (
+        user("github", "github.com", 1),
+        user("gitlab", "gitlab.com", 2),
+        user("github", "github.com", 3),
+    );
+    let bound = |owner: &str, id: i64| {
+        mint_bound_agent_token(&*store, owner, "agent", REPO, id, TTL, false)
+            .unwrap()
+            .0
+    };
+    let tokens = [
+        bound(&alice.id, 1001),
+        bound(&bob.id, 1001),
+        bound(&carol.id, 2002),
+    ];
+    let scopes = [
+        store::repository_scope("github.com", REPO, Some(1001)),
+        store::repository_scope("gitlab.com", REPO, Some(1001)),
+        store::repository_scope("github.com", REPO, Some(2002)),
+    ];
+    assert!(scopes[0] != scopes[1] && scopes[1] != scopes[2] && scopes[0] != scopes[2]);
+    let now = unix_now();
+    let intent = |n: u32| NewIntent {
+        id: format!("int_{n:032x}"),
+        task: "t".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec!["src/a.rs".into()],
+        ttl_seconds: 600,
+    };
+    // The same file in each repository: no announce sees another repository's.
+    for (n, token) in (1..).zip(&tokens) {
+        let announced = store.announce_intent(token, &intent(n), now).unwrap();
+        assert!(
+            announced.overlaps.is_empty(),
+            "{n}: {:?}",
+            announced.overlaps
+        );
+    }
+    for (n, scope) in (1..).zip(&scopes) {
+        let live = store.live_intents(scope, now, 10).unwrap();
+        assert_eq!(
+            live.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            [intent(n).id]
+        );
+    }
+
+    // A publication id comes from the name, so the second repository derives the first's: it
+    // must not get the first's row back, nor read it by id, list or pull request.
+    let manifest: Manifest = serde_json::from_value(json!({
+        "revision": "a".repeat(64), "event_seq": 3, "commit": "b".repeat(40),
+        "tree": "c".repeat(40), "parent": "d".repeat(40), "branch": "feat/x", "base": "main",
+        "title": "t", "body": "", "message": "msg\n",
+        "author": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "committer": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "changes": [{"path": "a.txt", "mode": "100644", "blob": "e".repeat(40),
+            "sha256": "f".repeat(64), "size": 5}]
+    }))
+    .unwrap();
+    let new = NewPublication {
+        id: derive_id(REPO, 3, &"b".repeat(40), "feat/x"),
+        manifest,
+    };
+    assert!(matches!(
+        store.create_publication(&tokens[0], &new, now).unwrap(),
+        Create::Done(_)
+    ));
+    assert!(matches!(
+        store.create_publication(&tokens[1], &new, now).unwrap(),
+        Create::Conflict
+    ));
+    assert!(store.publication(&scopes[0], &new.id).unwrap().is_some());
+    for scope in &scopes[1..] {
+        assert_eq!(store.publication(scope, &new.id).unwrap(), None);
+        assert!(store.publications(scope, None, 10).unwrap().is_empty());
+        assert!(store.pull_publications(scope, 0, 10).unwrap().is_empty());
+        let found = store.publication_search(scope, None, "feat", 10).unwrap();
+        assert!(found.rows.is_empty());
+    }
+    assert_eq!(store.publications(&scopes[0], None, 10).unwrap().len(), 1);
+
+    // Skill adoptions and evidence.
+    store
+        .skill_adoption_put(&SkillAdoption {
+            repository: REPO.into(),
+            repository_scope: scopes[0].clone(),
+            source: "default_branch".into(),
+            lock_json: "{}".into(),
+            default_branch: Some("main".into()),
+            observed_at: 1,
+            reported_by: None,
+            local_skills: None,
+        })
+        .unwrap();
+    store
+        .skill_evidence_add(&EvidenceRow {
+            id: "evd_1".into(),
+            repository: REPO.into(),
+            repository_scope: scopes[0].clone(),
+            branch: "feat/x".into(),
+            run_id: "run_a".into(),
+            skill: "pr-gate".into(),
+            skill_sha256: "0".repeat(64),
+            gate: "tests".into(),
+            kind: "revision_tests".into(),
+            head_sha: "a".repeat(40),
+            assurance: "self_reported".into(),
+            summary: "ok".into(),
+            url: None,
+            pull_request: None,
+            detail: None,
+            token_id: tokens[0].clone(),
+            session: "s".into(),
+            agent: "agent".into(),
+            recorded_at: 1,
+        })
+        .unwrap();
+    assert!(store.skill_adoption(&scopes[0]).unwrap().is_some());
+    assert_eq!(store.skill_evidence(&scopes[0], "run_a").unwrap().len(), 1);
+    for scope in &scopes[1..] {
+        assert_eq!(store.skill_adoption(scope).unwrap(), None);
+        assert!(store.skill_evidence(scope, "run_a").unwrap().is_empty());
+        assert!(
+            store
+                .skill_run_heads(scope, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Hook overhead rows take the writing token's repository.
+    let sample = agentscm::hub::hook_overhead::Sample {
+        session: "s".into(),
+        agent: "agent".into(),
+        hub_calls: 1,
+        injected_start: 0,
+        injected_refusal: 0,
+        injected_other: 0,
+        client: None,
+    };
+    store.hook_overhead(&tokens[0], REPO, &sample, now).unwrap();
+    let rows = |scope: &str| {
+        db.count(&format!(
+            "SELECT COUNT(*) FROM hub_hook_overhead WHERE repository_scope = '{scope}'"
+        ))
+    };
+    assert_eq!(
+        scopes.iter().map(|s| rows(s)).collect::<Vec<_>>(),
+        [1, 0, 0]
+    );
+
+    // A token with no repository id reads the repository connected under its name on its host.
+    let connection = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    store
+        .upsert_repository(&connection.id, "github.com", 2002, REPO, None, None)
+        .unwrap();
+    let dave = user("github", "github.com", 4);
+    let (_, secret) = mint_agent_token(&*store, &dave.id, "unbound", REPO, TTL).unwrap();
+    let principal = store
+        .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.repository_id, None);
+    assert_eq!(
+        store::principal_scope(&*store, &principal).unwrap(),
+        scopes[2]
+    );
+    let shared = store
+        .announce_intent(&principal.token_id, &intent(4), now)
+        .unwrap();
+    assert_eq!(
+        shared
+            .overlaps
+            .iter()
+            .map(|o| o.intent.id.clone())
+            .collect::<Vec<_>>(),
+        [intent(3).id]
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -3828,6 +4246,8 @@ conformance!(
     upgrade_from_migration_14_with_publication,
     url_errors,
     skill_adoption_and_evidence,
+    same_name_repositories_stay_apart,
+    repository_scope_backfill,
     devices_and_refusals,
     browser_sessions,
     local_ci_enroll_read_list_and_advance,

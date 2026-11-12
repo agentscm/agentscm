@@ -321,6 +321,8 @@ pub(super) fn plan(
 pub(super) struct Who {
     pub token: String,
     pub repository: String,
+    /// What the token's repository rows are keyed by; see [`super::store::repository_scope`].
+    pub scope: String,
     pub agent: String,
     pub owner: User,
 }
@@ -660,14 +662,15 @@ async fn announce(
     ))
 }
 
-/// At most `MAX_LIVE_INTENTS` live intents of `repository`, and whether more exist (then any
-/// overlap check over them is incomplete).
+/// At most `MAX_LIVE_INTENTS` live intents of the repository with `scope` (see
+/// [`super::store::repository_scope`]), and whether more exist (then any overlap check over them
+/// is incomplete).
 pub(super) fn live_intents_capped(
     store: &dyn Store,
-    repository: &str,
+    scope: &str,
     now: i64,
 ) -> Result<(Vec<Intent>, bool)> {
-    let mut intents = store.live_intents(repository, now, MAX_LIVE_INTENTS + 1)?;
+    let mut intents = store.live_intents(scope, now, MAX_LIVE_INTENTS + 1)?;
     let truncated = intents.len() > MAX_LIVE_INTENTS;
     intents.truncate(MAX_LIVE_INTENTS);
     Ok((intents, truncated))
@@ -679,9 +682,10 @@ async fn list(
     Path(repo): Path<String>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
+    let rows = super::store::scope_of(&state, &principal).await?;
     let store = state.store.clone();
     let (intents, truncated) = blocking(&state, move || {
-        live_intents_capped(&*store, &repo, unix_now())
+        live_intents_capped(&*store, &rows, unix_now())
     })
     .await?;
     let intents: Vec<Value> = intents

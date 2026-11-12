@@ -1016,7 +1016,11 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
     assert!(
         fixture
             .store
-            .live_intents(REPOSITORY, now + 3, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 3,
+                100
+            )
             .unwrap()
             .is_empty()
     );

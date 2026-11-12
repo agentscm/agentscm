@@ -129,7 +129,9 @@ fn full_key(who: &Agent, session: &str) -> String {
 }
 
 fn live(store: &dyn Store, now: i64) -> Vec<Intent> {
-    store.live_intents(REPO, now, 10).unwrap()
+    store
+        .live_intents(&crate::repository_scope::github(REPO, None), now, 10)
+        .unwrap()
 }
 
 /// The live paths of the token's intent.

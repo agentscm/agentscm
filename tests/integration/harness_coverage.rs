@@ -191,7 +191,7 @@ impl Bench {
         // routes the same hold also came through may be listed beside it.
         let via = format!("hook:{agent}");
         self.store
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
             .unwrap()
             .into_iter()
             .filter(|intent| intent.via.contains(&via))

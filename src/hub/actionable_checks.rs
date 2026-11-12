@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 use super::conflicts::capture;
 use super::{ActionableStatus, RecipientKind, StatusAction, StatusRecipient, StatusWork};
 use crate::hub::advice::sanitize;
-use crate::hub::store::{ForgeIdentity, Principal, Store, lower_hex_of, session_key};
+use crate::hub::store::{
+    ForgeIdentity, Principal, Store, lower_hex_of, principal_scope, session_key,
+};
 use crate::hub::work::{CheckpointKind, ClaimStatus, WorkItem};
 use crate::hub::{HubError, Result};
 use crate::skill_workflow::supported::{self, RunState};
@@ -110,8 +112,7 @@ impl People<'_> {
                     people.insert(user.id.clone(), person(&user.id, &user.login));
                 }
             }
-            // Publications are keyed by repository name alone, so only the exact pull request
-            // URL proves one opened this pull request rather than a same-named one elsewhere.
+            // Only the exact pull request URL proves a publication opened this pull request.
             if let Some((_, owner)) = pr["number"]
                 .as_i64()
                 .and_then(|n| self.publications.get(&n))
@@ -231,7 +232,7 @@ pub(super) fn read(
         Some(id) => store.repository_by_id(&who.owner.identity.host, id)?,
         None => store.repository_named(&who.owner.identity.host, &who.repository)?,
     };
-    let publications = store.pull_publications(&who.repository, 0, PULLS)?;
+    let publications = store.pull_publications(&principal_scope(store, who)?, 0, PULLS)?;
     if publications.len() >= PULLS {
         limits.insert("check_publications_truncated".to_owned());
     }
@@ -363,7 +364,12 @@ pub(super) fn read(
     // A pr-gate run whose Stop hook blocks at a gate its agent must act on, once no session
     // that recorded its evidence is live: nobody is working through the gate any more. Only
     // runs on an open pull request or unfinished Work count; older branches are history.
-    let views = crate::hub::skills::views(store, &who.repository, None, None, RUNS)?;
+    let scope = principal_scope(store, who)?;
+    let repo = crate::hub::skills::Repo {
+        name: &who.repository,
+        scope: &scope,
+    };
+    let views = crate::hub::skills::views(store, repo, None, None, RUNS)?;
     if views.len() >= RUNS {
         limits.insert("skill_runs_truncated".into());
     }

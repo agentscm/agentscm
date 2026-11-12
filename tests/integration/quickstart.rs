@@ -340,7 +340,14 @@ fn edit(machine: &Machine, cwd: &Path, session: &str, file: &str) -> Output {
 }
 
 fn live_paths(hub: &Hub, repo: &str) -> Vec<Vec<String>> {
-    let live = hub.store.live_intents(repo, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(repo, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     live.into_iter().map(|i| i.paths).collect()
 }
 

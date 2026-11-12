@@ -1483,9 +1483,9 @@ async fn forge_recover_call(
     )?;
     let principal = forge_principal(&state, &actor, &repository).await?;
     let store = state.store.clone();
-    let repo = repository.clone();
+    let scope = super::store::scope_of(&state, &principal).await?;
     let retained = blocking(&state, move || {
-        store.publication(&repo, &request.publication_id)
+        store.publication(&scope, &request.publication_id)
     })
     .await?
     .ok_or(HubError::Unauthorized)?;

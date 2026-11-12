@@ -562,7 +562,10 @@ async fn hooks_register_one_session_and_done_releases_it() {
     let bob = hub.agent();
     hub.hook("claude", &alice, &fixture("claude-SessionStart"));
     hub.hook("claude", &alice, &fixture("claude-PreToolUse-Edit"));
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].paths, ["src/widget.rs"]);
     assert_eq!(live[0].via, ["hook:claude"]);
@@ -574,11 +577,17 @@ async fn hooks_register_one_session_and_done_releases_it() {
     );
     assert_eq!(answer["status"], "clean");
     assert_eq!(
-        hub.store.live_intents(REPO, unix_now(), 10).unwrap().len(),
+        hub.store
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+            .unwrap()
+            .len(),
         2
     );
     hub.hook("claude", &alice, &fixture("claude-SessionEnd"));
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].via, ["hook:generic"]);
 }
@@ -835,7 +844,10 @@ async fn sessions_sharing_one_token_name_the_holder_and_only_it_hears() {
     let asks = "asks to take over src/widget.rs";
 
     hub.hook("claude", &secret, &edit("holder-s", "src/widget.rs"));
-    let token = hub.store.live_intents(REPO, unix_now(), 10).unwrap()[0]
+    let token = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap()[0]
         .token
         .clone();
     let key = |session: &str| {
@@ -887,7 +899,10 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     let first = hub.agent();
     hub.hook("claude", &first, &fixture("claude-PreToolUse-Write"));
     // The holder is named by the digest of its session, never by the session id or token label.
-    let held = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let held = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     let digest = lower_hex_of(
         format!(
             "agentscm.hub.session-view.v1\0{}\0{}",
@@ -968,7 +983,7 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     );
     assert!(
         hub.store
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
             .unwrap()
             .iter()
             .all(|i| { !i.paths.contains(&"src/gadget.rs".to_owned()) })
@@ -1138,7 +1153,10 @@ async fn encoded_repository_guards_are_judged_identically_to_raw_guards() {
                 !accepted,
                 "{guard}: {reply}"
             );
-            let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+            let live = hub
+                .store
+                .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+                .unwrap();
             assert_eq!(live.len(), usize::from(accepted), "{guard}");
             if accepted {
                 assert_eq!(live[0].paths, ["src/widget.rs"]);
@@ -1245,7 +1263,10 @@ async fn the_root_header_sets_what_paths_are_relative_to() {
         let (status, _) =
             hub.post_with("/v1/hub/hook/claude", Some(secret), header, body.as_bytes());
         assert_eq!(status, 200);
-        let token = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+        let token = hub
+            .store
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+            .unwrap();
         let mut all: Vec<_> = token.into_iter().map(|i| i.paths).collect();
         all.sort();
         all
@@ -1628,7 +1649,10 @@ async fn observed_shell_changes_without_work_ask_for_a_start_every_time() {
         );
     }
     // The observed paths are held as this session's intents, as a check after the edit does.
-    let held = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let held = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].paths, ["src/gadget.rs", "src/widget.rs"]);
     assert_eq!(held[0].via, ["hook:claude"]);

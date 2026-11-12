@@ -121,6 +121,8 @@ pub struct NewPublication {
 pub struct Publication {
     pub id: String,
     pub repository: String,
+    /// What the creating token's repository rows are keyed by; see [`super::store::repository_scope`].
+    pub repository_scope: String,
     pub token: String,
     /// The user who owns the creating token; only they may upload and run.
     pub owner: String,
@@ -194,8 +196,10 @@ pub(super) fn candidate_continuation(
 }
 
 impl Create {
-    pub(super) fn of_existing(found: Publication, repository: &str, manifest: &str) -> Self {
-        if found.repository == repository && found.manifest == manifest {
+    /// The stored publication when it is this request's: the same repository scope (an id is
+    /// derived from the repository name, which another repository can share) and manifest.
+    pub(super) fn of_existing(found: Publication, scope: &str, manifest: &str) -> Self {
+        if found.repository_scope == scope && found.manifest == manifest {
             Self::Done(found)
         } else {
             Self::Conflict
@@ -671,7 +675,8 @@ pub struct PublicationSearch {
 pub(super) const PUBLICATION_SELECT: &str = "SELECT p.id, p.repository, p.token, t.name, u.login,
         p.revision, p.event_seq, p.commit_sha, p.branch, p.base, CASE WHEN octet_length(p.manifest)<=2097152 THEN p.manifest END, p.branch_state,
         p.branch_message, p.pr_number, p.pr_node_id, p.pr_url, p.merge_commit, p.error,
-        p.created_at, p.updated_at, t.owner, CASE WHEN p.authorization_binding IS NULL THEN NULL WHEN octet_length(p.authorization_binding)<=65536 THEN p.authorization_binding ELSE 'invalid oversized binding' END
+        p.created_at, p.updated_at, t.owner, CASE WHEN p.authorization_binding IS NULL THEN NULL WHEN octet_length(p.authorization_binding)<=65536 THEN p.authorization_binding ELSE 'invalid oversized binding' END,
+        p.repository_scope
     FROM hub_publications p JOIN hub_agent_tokens t ON t.id = p.token
     JOIN hub_users u ON u.id = t.owner";
 
@@ -743,13 +748,15 @@ pub(super) async fn target(
     Ok(found)
 }
 
+/// The publication `id` of the caller's repository: its repository scope, not its name.
 async fn load(
     state: &HubState,
-    repository: &str,
+    principal: &Principal,
     id: &str,
 ) -> std::result::Result<Publication, ApiError> {
-    let (store, repository, id) = (state.store.clone(), repository.to_owned(), id.to_owned());
-    let publication = blocking(state, move || store.publication(&repository, &id))
+    let scope = super::store::scope_of(state, principal).await?;
+    let (store, id) = (state.store.clone(), id.to_owned());
+    let publication = blocking(state, move || store.publication(&scope, &id))
         .await?
         .ok_or_else(ApiError::not_found)?;
     publication.manifest()?;
@@ -870,7 +877,7 @@ async fn upload(
     body: Bytes,
 ) -> std::result::Result<StatusCode, ApiError> {
     scope(&principal, &repo)?;
-    let publication = load(&state, &repo, &id).await?;
+    let publication = load(&state, &principal, &id).await?;
     owned(&principal, &publication)?;
     if !hex_of(&sha256, 64) {
         return Err(ApiError::invalid());
@@ -933,8 +940,8 @@ pub(super) async fn candidate_on_host(
 }
 
 /// Whether a forge-side read or post for `publication` may use `repository`'s pull request of the
-/// same number. Event publications are GitHub-only. A candidate publication is keyed by name alone,
-/// so it counts only on the host it was published to and where no other host shares the name.
+/// same number. Event publications are GitHub-only. A candidate publication counts only on the
+/// host it was published to, and not while another host connects the same name.
 pub(super) async fn publication_on_forge(
     state: &HubState,
     publication: &Publication,
@@ -976,10 +983,11 @@ async fn list(
     }
     let search = super::store::search_text(query.q.as_deref())?;
     let store = state.store.clone();
+    let scope = super::store::scope_of(&state, &principal).await?;
     let page = blocking(&state, move || {
         publication_page(
             &*store,
-            &repo,
+            &scope,
             query.before.as_deref(),
             search.as_deref(),
             limit,
@@ -990,24 +998,25 @@ async fn list(
     Ok(Json(page))
 }
 
-/// One page of the listing as JSON; `None` when `before` names no publication of `repo`.
+/// One page of the listing as JSON; `None` when `before` names no publication of the repository
+/// with `scope` (see [`super::store::repository_scope`]).
 pub(super) fn publication_page(
     store: &dyn Store,
-    repo: &str,
+    scope: &str,
     before: Option<&str>,
     search: Option<&str>,
     limit: usize,
 ) -> Result<Option<Value>> {
     // An unknown cursor is a bad request, not an empty page.
     if let Some(before) = before
-        && store.publication(repo, before)?.is_none()
+        && store.publication(scope, before)?.is_none()
     {
         return Ok(None);
     }
     let (mut rows, search_info) = match search {
-        None => (store.publications(repo, before, limit + 1)?, None),
+        None => (store.publications(scope, before, limit + 1)?, None),
         Some(search) => {
-            let found = store.publication_search(repo, before, search, limit + 1)?;
+            let found = store.publication_search(scope, before, search, limit + 1)?;
             (found.rows, Some((found.searched_to, found.window_full)))
         }
     };
@@ -1046,7 +1055,7 @@ async fn show(
     Path((repo, id)): Path<(String, String)>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
-    let mut publication = load(&state, &repo, &id).await?;
+    let mut publication = load(&state, &principal, &id).await?;
     // Reading the merge from the forge records it and can mark the connection failed, so a
     // read-only caller gets the stored row; agent reads and the sync still record merges.
     if !principal.read_only
@@ -1054,8 +1063,8 @@ async fn show(
         && read_due(&id)
         && let Some(candidate) = publication.manifest().ok().map(|m| m.candidate.is_some())
         && let Ok((conn, repository)) = target(&state, &principal, false, candidate).await
-        // Publications are keyed by repository name alone: read the merge only from the forge the
-        // candidate was published to, and never where another forge host shares the name.
+        // Read the merge only from the forge the candidate was published to, and never while
+        // another forge host connects the same name.
         && (!candidate || candidate_on_host(&state, &publication, &repository).await)
     {
         match merged_commit(&state, &conn, &repository, number, &publication.commit).await {
@@ -1271,8 +1280,8 @@ pub(super) async fn merged_commit(
 }
 
 /// Whether a repository of the same name is also connected on another configured forge host.
-/// Publications and candidate lineages are keyed by repository name alone, so two forges
-/// sharing a name could be read as each other's.
+/// Rows are kept by repository scope, but a publication id is derived from the name, so two
+/// forges sharing a name would derive each other's ids; candidates there are refused.
 async fn name_shared_across_hosts(
     state: &HubState,
     repository: &ConnectedRepository,
@@ -1320,7 +1329,7 @@ async fn run(
     Path((repo, id)): Path<(String, String)>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
-    let publication = load(&state, &repo, &id).await?;
+    let publication = load(&state, &principal, &id).await?;
     owned(&principal, &publication)?;
     if publication.authorization_binding.is_some() {
         return Err(conflict("workspace_publication_required"));
@@ -1345,7 +1354,7 @@ async fn recover(
     Path((repo, id)): Path<(String, String)>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
-    let publication = load(&state, &repo, &id).await?;
+    let publication = load(&state, &principal, &id).await?;
     owned(&principal, &publication)?;
     if publication.authorization_binding.is_some() {
         return Err(conflict("workspace_publication_required"));
@@ -1391,15 +1400,15 @@ pub(super) async fn execute(
     let _guard = state.sync.lock_repo(&repository.id).await;
     // Everything is read again under the lock: a run ahead of this one may have recorded
     // progress, and the connection may have been switched off or failed while this one waited.
-    let (store, name, id, connection) = (
+    let (store, scope, id, connection) = (
         state.store.clone(),
-        publication.repository.clone(),
+        publication.repository_scope.clone(),
         publication.id.clone(),
         repository.connection.clone(),
     );
     let (publication, conn) = blocking(&state, move || {
         Ok((
-            store.publication(&name, &id)?,
+            store.publication(&scope, &id)?,
             store.connection(&connection)?,
         ))
     })
@@ -1745,8 +1754,8 @@ async fn candidate_pull(
             ));
         }
         let store = state.store.clone();
-        let full = full.clone();
-        let retained = blocking(state, move || store.publication(&full, &id))
+        let scope = publication.repository_scope.clone();
+        let retained = blocking(state, move || store.publication(&scope, &id))
             .await?
             .ok_or_else(|| Stop::Message("previous candidate publication missing".into()))?;
         let old = retained.manifest()?;

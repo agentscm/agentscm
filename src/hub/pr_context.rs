@@ -90,7 +90,12 @@ pub async fn read(
         );
         // Reuse supported-skill evaluation. The scan is deliberately bounded and never
         // described as exhaustive, including when an unknown catalog entry was skipped.
-        let runs = super::skills::views(&*store, &principal.repository, None, None, RUN_SCAN)?;
+        let scope = super::store::principal_scope(&*store, &principal)?;
+        let skills_repo = super::skills::Repo {
+            name: &principal.repository,
+            scope: &scope,
+        };
+        let runs = super::skills::views(&*store, skills_repo, None, None, RUN_SCAN)?;
         let mut result = project(&principal.repository, &request, &rows, &overview, &runs)?;
         if result["availability"] == "not_observed" {
             // A closed PR's open-state observation is forgotten; its provider merge fact is kept.

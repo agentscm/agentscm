@@ -4362,7 +4362,17 @@ fn owner_and_admin_act_after_the_lead_token_is_revoked(db: &Db) {
     );
     announce(&*store, &alice, "default", "src/a.rs", now + 2);
     announce(&*store, &helper, "default", "src/b.rs", now + 2);
-    assert_eq!(store.live_intents(REPO, now + 3, 10).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .live_intents(
+                &crate::repository_scope::github(REPO, Some(REPOSITORY_ID)),
+                now + 3,
+                10
+            )
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(store.revoke_agent_token(&alice.token).unwrap());
 
     let item = current_item(&*store, &helper, &first.id, now + 4);
@@ -4377,7 +4387,13 @@ fn owner_and_admin_act_after_the_lead_token_is_revoked(db: &Db) {
     assert_eq!(released.item.current, item.current);
     assert_eq!(released.item.blocker, item.blocker);
     // The lead's and the helper's claims are both gone.
-    let live = store.live_intents(REPO, now + 5, 10).unwrap();
+    let live = store
+        .live_intents(
+            &crate::repository_scope::github(REPO, Some(REPOSITORY_ID)),
+            now + 5,
+            10,
+        )
+        .unwrap();
     assert!(
         live.is_empty(),
         "{:?}",

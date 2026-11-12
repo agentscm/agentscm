@@ -115,7 +115,7 @@ fn id(n: u128) -> String {
 fn attributed_overlap_and_notice(db: &Db) {
     let store = db.open();
     let alice = agent_in(&*store, REPO, "github", 1, "billing-agent");
-    let bob = agent_in(&*store, REPO, "gitlab", 2, "docs-agent");
+    let bob = agent_in(&*store, REPO, "github", 2, "docs-agent");
     let first = announce(&*store, &alice, 1, &["src/billing/**"], T0);
     assert!(first.overlaps.is_empty());
     let second = announce(&*store, &bob, 2, &["src/billing/invoice.rs"], T0);
@@ -138,7 +138,7 @@ fn attributed_overlap_and_notice(db: &Db) {
     assert_eq!(notice["about"], json!(id(2)));
     assert_eq!(notice["agent"], "docs-agent");
     assert_eq!(notice["owner"]["login"], "user2");
-    assert_eq!(notice["owner"]["provider"], "gitlab");
+    assert_eq!(notice["owner"]["provider"], "github");
     assert_eq!(notice["owner"]["id"], json!(bob.owner.id));
     assert_eq!(notice["repository"], REPO);
     assert_eq!(notice["their_paths"], json!(["src/billing/invoice.rs"]));
@@ -242,7 +242,12 @@ fn invalid_requests_are_rejected_without_events(db: &Db) {
         Err(HubError::Invalid(_))
     ));
     assert!(intent_events(&*store).is_empty());
-    assert!(store.live_intents(REPO, T0, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0, 10)
+            .unwrap()
+            .is_empty()
+    );
     // The maximum is accepted.
     let max = NewIntent {
         ttl_seconds: MAX_INTENT_TTL_SECONDS,
@@ -279,7 +284,12 @@ fn server_clock_expiry_and_renew(db: &Db) {
             .unwrap()
             .is_none()
     );
-    assert!(store.live_intents(REPO, T0 + 61, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 61, 10)
+            .unwrap()
+            .is_empty()
+    );
 
     let second = NewIntent {
         ttl_seconds: 60,
@@ -298,9 +308,16 @@ fn server_clock_expiry_and_renew(db: &Db) {
     let seen = store.announce_intent(&b.token, &probe, T0 + 100).unwrap();
     assert_eq!(seen.overlaps.len(), 1);
     assert_eq!(seen.overlaps[0].intent.expires_at, T0 + 130);
-    let live = store.live_intents(REPO, T0 + 100, 10).unwrap();
+    let live = store
+        .live_intents(&crate::repository_scope::github(REPO, None), T0 + 100, 10)
+        .unwrap();
     assert!(live.iter().any(|intent| intent.id == id(4)));
-    assert!(store.live_intents(REPO, T0 + 130, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 130, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn release_stops_notices(db: &Db) {
@@ -316,7 +333,13 @@ fn release_stops_notices(db: &Db) {
             .is_none()
     );
     assert!(!store.release_intent(&b.token, &id(1), T0 + 1).unwrap());
-    assert_eq!(store.live_intents(REPO, T0 + 1, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 1, 10)
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(store.release_intent(&a.token, &id(1), T0 + 10).unwrap());
     assert!(!store.release_intent(&a.token, &id(1), T0 + 11).unwrap());
     assert!(!store.release_intent(&a.token, &id(99), T0 + 11).unwrap());
@@ -326,7 +349,12 @@ fn release_stops_notices(db: &Db) {
             .unwrap()
             .is_none()
     );
-    assert!(store.live_intents(REPO, T0 + 12, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 12, 10)
+            .unwrap()
+            .is_empty()
+    );
     let got = announce(&*store, &b, 2, &["r/f"], T0 + 20);
     assert!(got.overlaps.is_empty());
     assert!(notices(&*store, &a).is_empty());
@@ -344,16 +372,26 @@ fn repository_scope(db: &Db) {
     assert!(got.overlaps.is_empty());
     assert!(notices(&*store, &a).is_empty());
     assert!(notices(&*store, &x).is_empty());
-    let widgets = store.live_intents(REPO, T0, 10).unwrap();
+    let widgets = store
+        .live_intents(&crate::repository_scope::github(REPO, None), T0, 10)
+        .unwrap();
     assert_eq!(widgets.iter().map(|i| &i.id).collect::<Vec<_>>(), [&id(1)]);
-    let other = store.live_intents("acme/other", T0, 10).unwrap();
+    let other = store
+        .live_intents(&crate::repository_scope::github("acme/other", None), T0, 10)
+        .unwrap();
     assert_eq!(other.iter().map(|i| &i.id).collect::<Vec<_>>(), [&id(2)]);
     // An id held by another token is refused, in the same repository or another.
     for taker in [&x, &c] {
         let result = store.announce_intent(&taker.token, &intent(1, &["z"]), T0);
         assert!(matches!(result, Err(HubError::Invalid(_))));
     }
-    assert_eq!(store.live_intents(REPO, T0, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn idempotent_and_incremental(db: &Db) {
@@ -901,7 +939,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
     }
     assert!(
         hub.store
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
             .unwrap()
             .is_empty()
     );

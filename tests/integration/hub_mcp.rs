@@ -1967,7 +1967,14 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
             .is_some_and(|alternatives| (1..=3).contains(&alternatives.len())),
         "{conflict}"
     );
-    let live = hub.store.live_intents(REPO, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         live.iter()
             .all(|intent| !intent.paths.contains(&"src/conflicted.rs".to_owned())),
@@ -3266,6 +3273,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
     hub.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope("github.com", REPO, None),
             source: "default_branch".into(),
             lock_json: r#"{"version":1,"skills":[]}"#.into(),
             default_branch: Some("main".into()),

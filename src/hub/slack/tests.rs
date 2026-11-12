@@ -560,7 +560,11 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     );
     let holders: Vec<String> = tokio::task::block_in_place(|| {
         f.store()
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
             .into_iter()
             .filter(|i| i.paths.contains(&PATH.to_owned()))
@@ -2313,7 +2317,14 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
                     .unwrap();
             }
             "release" => {
-                let held = f.store().live_intents(REPO, unix_now(), 100).unwrap();
+                let held = f
+                    .store()
+                    .live_intents(
+                        &store::repository_scope("github.com", REPO, Some(101)),
+                        unix_now(),
+                        100,
+                    )
+                    .unwrap();
                 f.store()
                     .release_intent(
                         &f.alice,

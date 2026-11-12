@@ -97,8 +97,18 @@ fn suite(store: Arc<dyn Store>) {
     ));
     assert_eq!(events(&*store).len(), 1);
     assert_eq!(events(&*store)[0].0, "publication_requested");
-    assert!(store.publication("acme/other", id).unwrap().is_none());
-    assert_eq!(store.publication(REPO, id).unwrap(), Some(first));
+    assert!(
+        store
+            .publication(&crate::repository_scope::github("acme/other", None), id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .publication(&crate::repository_scope::github(REPO, None), id)
+            .unwrap(),
+        Some(first)
+    );
     let mut bad = new("t");
     bad.manifest.changes[0].size = 9 * 1024 * 1024;
     assert!(matches!(
@@ -227,26 +237,47 @@ fn suite(store: Arc<dyn Store>) {
     done(store.create_publication(&capped, &over, now).unwrap());
 
     // Listing is newest first by created time, then id, and pages strictly before a cursor.
-    let all = store.publications(REPO, None, 100).unwrap();
+    let all = store
+        .publications(&crate::repository_scope::github(REPO, None), None, 100)
+        .unwrap();
     assert!(all.len() > 2);
     assert!(
         all.windows(2)
             .all(|w| (w[0].created_at, &w[0].id) > (w[1].created_at, &w[1].id))
     );
-    assert_eq!(store.publications(REPO, None, 1).unwrap(), all[..1]);
     assert_eq!(
-        store.publications(REPO, Some(&all[1].id), 100).unwrap(),
+        store
+            .publications(&crate::repository_scope::github(REPO, None), None, 1)
+            .unwrap(),
+        all[..1]
+    );
+    assert_eq!(
+        store
+            .publications(
+                &crate::repository_scope::github(REPO, None),
+                Some(&all[1].id),
+                100
+            )
+            .unwrap(),
         all[2..]
     );
     assert!(
         store
-            .publications(REPO, Some("pub_missing"), 100)
+            .publications(
+                &crate::repository_scope::github(REPO, None),
+                Some("pub_missing"),
+                100
+            )
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .publications("acme/other", None, 100)
+            .publications(
+                &crate::repository_scope::github("acme/other", None),
+                None,
+                100
+            )
             .unwrap()
             .is_empty()
     );
@@ -260,7 +291,7 @@ fn suite(store: Arc<dyn Store>) {
     );
     let found = |q: &str| -> Vec<String> {
         store
-            .publication_search(REPO, None, q, 100)
+            .publication_search(&crate::repository_scope::github(REPO, None), None, q, 100)
             .unwrap()
             .rows
             .into_iter()
@@ -285,21 +316,39 @@ fn suite(store: Arc<dyn Store>) {
     assert!(found("100%").is_empty() && found("p_b").is_empty() && found("\\").is_empty());
     assert_eq!(
         found("alice").len(),
-        store.publications(REPO, None, 100).unwrap().len()
+        store
+            .publications(&crate::repository_scope::github(REPO, None), None, 100)
+            .unwrap()
+            .len()
     );
     let page = store
-        .publication_search(REPO, None, "feat/n", 2)
+        .publication_search(
+            &crate::repository_scope::github(REPO, None),
+            None,
+            "feat/n",
+            2,
+        )
         .unwrap()
         .rows;
     let rest = store
-        .publication_search(REPO, Some(&page[1].id), "feat/n", 100)
+        .publication_search(
+            &crate::repository_scope::github(REPO, None),
+            Some(&page[1].id),
+            "feat/n",
+            100,
+        )
         .unwrap()
         .rows;
     assert_eq!(page.len() + rest.len(), found("feat/n").len());
     assert!(rest.iter().all(|p| p.branch.starts_with("feat/n")));
     assert!(
         store
-            .publication_search("acme/other", None, "alice", 100)
+            .publication_search(
+                &crate::repository_scope::github("acme/other", None),
+                None,
+                "alice",
+                100
+            )
             .unwrap()
             .rows
             .is_empty()
@@ -459,7 +508,11 @@ fn candidate_suite(store: Arc<dyn Store>) {
     let c = candidate(3, "agents/lineage", Some(&b.id));
     done(store.create_publication(&token, &c, now).unwrap());
     assert_eq!(
-        store.publication(REPO, &b.id).unwrap().unwrap().manifest,
+        store
+            .publication(&crate::repository_scope::github(REPO, None), &b.id)
+            .unwrap()
+            .unwrap()
+            .manifest,
         b.manifest.canonical()
     );
     store
@@ -627,8 +680,15 @@ fn a_corrupt_manifest_row_still_lists_and_does_not_break_search() {
         .unwrap();
     let ids = |q: Option<&str>| -> Vec<String> {
         match q {
-            None => store.publications(REPO, None, 100).unwrap(),
-            Some(q) => store.publication_search(REPO, None, q, 100).unwrap().rows,
+            None => store
+                .publications(&crate::repository_scope::github(REPO, None), None, 100)
+                .unwrap(),
+            Some(q) => {
+                store
+                    .publication_search(&crate::repository_scope::github(REPO, None), None, q, 100)
+                    .unwrap()
+                    .rows
+            }
         }
         .into_iter()
         .map(|p| p.id)
@@ -673,20 +733,41 @@ fn window_suite(store: Arc<dyn Store>) {
             oldest = made.id;
         }
     }
-    let first = store.publication_search(REPO, None, "needle", 5).unwrap();
+    let first = store
+        .publication_search(
+            &crate::repository_scope::github(REPO, None),
+            None,
+            "needle",
+            5,
+        )
+        .unwrap();
     assert!(first.rows.is_empty() && first.window_full);
     let stopped = first.searched_to.unwrap();
     // The window is the 256 newest: the 256th row from the top is the oldest examined.
-    let newest = store.publications(REPO, None, 256).unwrap();
+    let newest = store
+        .publications(&crate::repository_scope::github(REPO, None), None, 256)
+        .unwrap();
     assert_eq!(stopped, newest[255].id);
     let second = store
-        .publication_search(REPO, Some(&stopped), "needle", 5)
+        .publication_search(
+            &crate::repository_scope::github(REPO, None),
+            Some(&stopped),
+            "needle",
+            5,
+        )
         .unwrap();
     assert_eq!(second.rows.len(), 1);
     assert_eq!(second.rows[0].id, oldest);
     assert!(!second.window_full);
     // More matches than the page: the extra row is returned for the caller to cut.
-    let many = store.publication_search(REPO, None, "bulk", 5).unwrap();
+    let many = store
+        .publication_search(
+            &crate::repository_scope::github(REPO, None),
+            None,
+            "bulk",
+            5,
+        )
+        .unwrap();
     assert_eq!(many.rows.len(), 5);
     assert!(many.window_full);
 }

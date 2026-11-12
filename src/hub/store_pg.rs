@@ -102,8 +102,8 @@ use super::store::{
     NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
     SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
     like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
-    validate_display_name, validate_login,
+    plan_local_ci_change, plan_local_ci_enroll, plan_named, repository_scope, search_number,
+    session_key, unix_now, validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -4295,13 +4295,19 @@ fn requested_paths_hold(
                 .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
                 .collect::<Vec<_>>();
             let (points, ranges) = probe_set(&keys);
+            let rows = resolved_scope(
+                tx,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
             let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id=p.intent
-                 WHERE p.repository=$1 AND i.token<>$2 AND p.expires_at>$3";
+                 WHERE p.repository_scope=$1 AND i.token<>$2 AND p.expires_at>$3";
             if !points.is_empty() {
                 held = tx
                     .query_opt(
                         &format!("{live} AND p.key = ANY($4) LIMIT 1"),
-                        &[&who.repository, &who.token, &now, &points],
+                        &[&rows, &who.token, &now, &points],
                     )?
                     .is_some();
             }
@@ -4312,7 +4318,7 @@ fn requested_paths_hold(
                 held = tx
                     .query_opt(
                         &format!("{live} AND p.key >= $4 AND p.key < $5 LIMIT 1"),
-                        &[&who.repository, &who.token, &now, start, end],
+                        &[&rows, &who.token, &now, start, end],
                     )?
                     .is_some();
             }
@@ -5229,27 +5235,77 @@ fn briefing_page(
     })
 }
 
+/// The scope a caller's repository rows are kept under, as [`super::store::principal_scope`]
+/// finds it: without a repository id, the id of the repository connected under the name.
+fn resolved_scope(
+    tx: &mut postgres::Transaction<'_>,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<String> {
+    let repository_id = match repository_id {
+        Some(id) => Some(id),
+        None => tx
+            .query_opt(
+                "SELECT repository_id FROM hub_repositories
+                 WHERE host = $1 AND lower(full_name) = lower($2) ORDER BY created_at, id LIMIT 1",
+                &[&host, &repository],
+            )?
+            .map(|row| row.get(0)),
+    };
+    Ok(repository_scope(host, repository, repository_id))
+}
+
+/// See [`super::store::ADOPT_NAME_SCOPE`]; run when `repo` is connected or renamed.
+fn adopt_name_scope(tx: &mut postgres::Transaction<'_>, repo: &ConnectedRepository) -> Result<()> {
+    let (scope, named) = (
+        repo.repository_scope(),
+        repository_scope(&repo.host, &repo.full_name, None),
+    );
+    for statement in super::store::ADOPT_NAME_SCOPE {
+        tx.execute(statement, &[&scope, &named])?;
+    }
+    Ok(())
+}
+
+/// The scope a token's repository rows are kept under; `Unauthorized` for an unknown token.
+fn token_scope(tx: &mut postgres::Transaction<'_>, token: &str) -> Result<String> {
+    let row = tx
+        .query_opt(
+            "SELECT u.host, t.repository, t.repository_id
+             FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner WHERE t.id = $1",
+            &[&token],
+        )?
+        .ok_or(HubError::Unauthorized)?;
+    let (host, repository): (String, String) = (row.get(0), row.get(1));
+    resolved_scope(tx, &host, &repository, row.get(2))
+}
+
 /// Rechecks inside the write transaction that the token is still usable; the
 /// share lock makes a concurrent revoke or disable wait for this transaction.
 fn active_token(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<Who> {
     let row = tx
         .query_opt(
-            "SELECT t.repository, t.name, u.id, u.provider, u.host, u.forge_user_id, u.login
+            "SELECT t.repository, t.name, u.id, u.provider, u.host, u.forge_user_id, u.login,
+                    t.repository_id
              FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
              WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled
              FOR SHARE",
             &[&token, &now],
         )?
         .ok_or(HubError::Unauthorized)?;
+    let (host, repository): (String, String) = (row.get(4), row.get(0));
+    let scope = resolved_scope(tx, &host, &repository, row.get(7))?;
     Ok(Who {
         token: token.to_owned(),
-        repository: row.get(0),
+        repository,
+        scope,
         agent: row.get(1),
         owner: User {
             id: row.get(2),
             identity: ForgeIdentity {
                 provider: row.get(3),
-                host: row.get(4),
+                host,
                 user_id: row.get(5),
             },
             login: row.get(6),
@@ -5290,6 +5346,7 @@ fn publication_row(row: &postgres::Row) -> Result<Publication> {
         token: row.get(2),
         owner: row.get(20),
         authorization_binding: row.get(21),
+        repository_scope: row.get(22),
         agent: row.get(3),
         owner_login: row.get(4),
         revision: row.get(5),
@@ -5460,18 +5517,18 @@ fn probe(
     now: i64,
 ) -> Result<BTreeSet<String>> {
     let (points, ranges) = probe_set(keys);
-    let live = "repository = $1 AND intent <> $2 AND expires_at > $3";
+    let live = "repository_scope = $1 AND intent <> $2 AND expires_at > $3";
     let mut rows = Vec::new();
     if !points.is_empty() {
         let sql =
             format!("SELECT DISTINCT intent FROM hub_intent_paths WHERE {live} AND key = ANY($4)");
-        rows.extend(tx.query(&sql, &[&who.repository, &own, &now, &points])?);
+        rows.extend(tx.query(&sql, &[&who.scope, &own, &now, &points])?);
     }
     let sql = format!(
         "SELECT DISTINCT intent FROM hub_intent_paths WHERE {live} AND key >= $4 AND key < $5"
     );
     for (start, end) in &ranges {
-        rows.extend(tx.query(&sql, &[&who.repository, &own, &now, start, end])?);
+        rows.extend(tx.query(&sql, &[&who.scope, &own, &now, start, end])?);
     }
     Ok(rows.iter().map(|row| row.get(0)).collect())
 }
@@ -5592,8 +5649,8 @@ fn announce_in(
     let expires_at = now + intent.ttl_seconds;
     lock_repository(tx, &who.repository)?;
     tx.execute(
-        "DELETE FROM hub_intent_paths WHERE repository = $1 AND expires_at <= $2",
-        &[&who.repository, &now],
+        "DELETE FROM hub_intent_paths WHERE repository_scope = $1 AND expires_at <= $2",
+        &[&who.scope, &now],
     )?;
     let existing = tx
         .query_opt(
@@ -5637,8 +5694,8 @@ fn announce_in(
         Plan::Write { announce, .. } => {
             let written = tx.execute(
                 "INSERT INTO hub_intents (id, repository, token, task, branch, base, machine,
-                     paths, expires_at, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                     paths, expires_at, created_at, updated_at, repository_scope)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)
                  ON CONFLICT (id) DO UPDATE SET task = excluded.task,
                      branch = excluded.branch, base = excluded.base,
                      machine = excluded.machine, paths = excluded.paths,
@@ -5655,6 +5712,7 @@ fn announce_in(
                     &paths_json,
                     &expires_at,
                     &now,
+                    &who.scope,
                 ],
             )?;
             // Another repository's announce may have inserted this id after our read.
@@ -5666,9 +5724,9 @@ fn announce_in(
                 &[&intent.id],
             )?;
             tx.execute(
-                "INSERT INTO hub_intent_paths (intent, repository, key, expires_at)
-                 SELECT $1, $2, unnest($3::text[]), $4::bigint",
-                &[&intent.id, &who.repository, &keys, &expires_at],
+                "INSERT INTO hub_intent_paths (intent, repository, key, expires_at, repository_scope)
+                 SELECT $1, $2, unnest($3::text[]), $4::bigint, $5",
+                &[&intent.id, &who.repository, &keys, &expires_at, &who.scope],
             )?;
             let event = if *announce {
                 Event::intent_announced(who, intent, &paths, expires_at)?
@@ -6466,8 +6524,8 @@ fn contested_in(
         wrote |= tx.execute(
             "INSERT INTO hub_contested_edits
                  (repository, token, session, path, hold, kind, outcome, observed_at,
-                  resolved_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+                  resolved_at, repository_scope)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
             &[
                 &who.repository,
                 &token,
@@ -6478,13 +6536,14 @@ fn contested_in(
                 &outcome,
                 &now,
                 &resolved_at,
+                &who.scope,
             ],
         )? > 0;
     }
     if wrote {
         tx.execute(
-            "DELETE FROM hub_contested_edits WHERE repository = $1 AND observed_at < $2",
-            &[&who.repository, &(now - RETAIN_SECONDS)],
+            "DELETE FROM hub_contested_edits WHERE repository_scope = $1 AND observed_at < $2",
+            &[&who.scope, &(now - RETAIN_SECONDS)],
         )?;
         tx.execute(
             "DELETE FROM hub_contested_edits WHERE (token, session, path, hold, kind) IN (
@@ -6525,7 +6584,7 @@ fn contested_settle(
 /// The window's contested-edit rows with each hold as it stands now, and whether all are there.
 fn contested_facts(
     tx: &mut postgres::Transaction<'_>,
-    repository: &str,
+    scope: &str,
     since: i64,
     until: i64,
     now: i64,
@@ -6542,9 +6601,9 @@ fn contested_facts(
                            AND s.intent IS NOT NULL)),
                  EXISTS (SELECT 1 FROM hub_intents i WHERE i.id = c.hold)
              FROM hub_contested_edits c
-             WHERE c.repository = $1 AND c.observed_at >= $2 AND c.observed_at <= $3
+             WHERE c.repository_scope = $1 AND c.observed_at >= $2 AND c.observed_at <= $3
              ORDER BY c.observed_at, c.token, c.session, c.path, c.hold, c.kind LIMIT $5",
-            &[&repository, &since, &until, &now, &(MAX_READ as i64 + 1)],
+            &[&scope, &since, &until, &now, &(MAX_READ as i64 + 1)],
         )?
         .iter()
         .map(|r| {
@@ -6560,9 +6619,9 @@ fn contested_facts(
     // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
     let pruned: bool = tx
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM hub_contested_edits WHERE repository = $1
+            "SELECT EXISTS (SELECT 1 FROM hub_contested_edits WHERE repository_scope = $1
                  GROUP BY token HAVING COUNT(*) >= $2 AND MIN(observed_at) > $3)",
-            &[&repository, &MAX_ROWS_PER_TOKEN, &since],
+            &[&scope, &MAX_ROWS_PER_TOKEN, &since],
         )?
         .get(0);
     let complete = complete(rows.len(), since, now, pruned);
@@ -6584,10 +6643,11 @@ fn duplicate_start_in(
     now: i64,
 ) -> Result<()> {
     use super::duplicate_starts::{MAX_ROWS_PER_TOKEN, RETAIN_SECONDS, event};
+    let scope = token_scope(tx, &who.token)?;
     let inserted = tx.execute(
-        "INSERT INTO hub_duplicate_starts
-             (repository, token, session, owner, holder_work, holder_owner, observed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        "INSERT INTO hub_duplicate_starts (repository, token, session, owner, holder_work,
+             holder_owner, observed_at, repository_scope)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         &[
             &who.repository,
             &who.token,
@@ -6596,6 +6656,7 @@ fn duplicate_start_in(
             &seen.holder_work,
             &seen.holder_owner,
             &now,
+            &scope,
         ],
     )?;
     if inserted == 0 {
@@ -6603,8 +6664,8 @@ fn duplicate_start_in(
     }
     append(tx, &event(&who.token, seen, answer, now)?)?;
     tx.execute(
-        "DELETE FROM hub_duplicate_starts WHERE repository = $1 AND observed_at < $2",
-        &[&who.repository, &(now - RETAIN_SECONDS)],
+        "DELETE FROM hub_duplicate_starts WHERE repository_scope = $1 AND observed_at < $2",
+        &[&scope, &(now - RETAIN_SECONDS)],
     )?;
     tx.execute(
         "DELETE FROM hub_duplicate_starts WHERE (token, session, holder_work) IN (
@@ -6621,7 +6682,7 @@ fn duplicate_start_in(
 /// created Work of their own linked to the issue, or drew a contested-edit row on a holder's file.
 fn duplicate_start_facts(
     tx: &mut postgres::Transaction<'_>,
-    repository: &str,
+    scope: &str,
     since: i64,
     until: i64,
     now: i64,
@@ -6650,14 +6711,14 @@ fn duplicate_start_facts(
                  OR EXISTS (SELECT 1 FROM hub_contested_edits c
                      JOIN hub_agent_tokens t ON t.id = c.token
                      JOIN hub_intents i ON i.id = c.hold
-                     WHERE t.owner = d.owner AND c.repository = d.repository
+                     WHERE t.owner = d.owner AND c.repository_scope = d.repository_scope
                        AND i.token = w.lead_token
                        AND c.observed_at BETWEEN d.observed_at AND d.observed_at + $4)
              FROM hub_duplicate_starts d LEFT JOIN hub_work_items w ON w.id = d.holder_work
-             WHERE d.repository = $1 AND d.observed_at >= $2 AND d.observed_at <= $3
+             WHERE d.repository_scope = $1 AND d.observed_at >= $2 AND d.observed_at <= $3
              ORDER BY d.observed_at, d.token, d.session, d.holder_work LIMIT $5",
             &[
-                &repository,
+                &scope,
                 &since,
                 &until,
                 &WINDOW_SECONDS,
@@ -6670,9 +6731,9 @@ fn duplicate_start_facts(
     // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
     let pruned: bool = tx
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM hub_duplicate_starts WHERE repository = $1
+            "SELECT EXISTS (SELECT 1 FROM hub_duplicate_starts WHERE repository_scope = $1
                  GROUP BY token HAVING COUNT(*) >= $2 AND MIN(observed_at) > $3)",
-            &[&repository, &MAX_ROWS_PER_TOKEN, &since],
+            &[&scope, &MAX_ROWS_PER_TOKEN, &since],
         )?
         .get(0);
     let complete = complete(rows.len(), since, now, pruned);
@@ -6682,7 +6743,7 @@ fn duplicate_start_facts(
 /// The hook overhead rows of sessions active in the window, and whether all are there.
 fn overhead_facts(
     tx: &mut postgres::Transaction<'_>,
-    repository: &str,
+    scope: &str,
     since: i64,
     until: i64,
     now: i64,
@@ -6695,9 +6756,9 @@ fn overhead_facts(
                  client_calls, client_ms_total, client_ms_max, client_timeouts,
                  client_failed_open, first_at, updated_at
              FROM hub_hook_overhead
-             WHERE repository = $1 AND updated_at >= $2 AND first_at <= $3
+             WHERE repository_scope = $1 AND updated_at >= $2 AND first_at <= $3
              ORDER BY updated_at DESC, token, session, agent LIMIT $4",
-            &[&repository, &since, &until, &(MAX_READ as i64 + 1)],
+            &[&scope, &since, &until, &(MAX_READ as i64 + 1)],
         )?
         .iter()
         .map(|r| SessionOverhead {
@@ -6719,14 +6780,14 @@ fn overhead_facts(
     // A token at its cap pruned rows only if its oldest kept row is newer than the window start.
     let pruned: bool = tx
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM hub_hook_overhead WHERE repository = $1
+            "SELECT EXISTS (SELECT 1 FROM hub_hook_overhead WHERE repository_scope = $1
                  GROUP BY token HAVING COUNT(*) >= $2 AND MIN(updated_at) > $3)",
-            &[&repository, &MAX_ROWS_PER_TOKEN, &since],
+            &[&scope, &MAX_ROWS_PER_TOKEN, &since],
         )?
         .get(0);
     // Calls this process dropped, or has not written yet, are missing from the rows.
     let complete = complete(rows.len(), since, now, pruned)
-        && super::hook_overhead::all_written(repository, since, until);
+        && super::hook_overhead::all_written(scope, since, until);
     Ok((rows.into_iter().take(MAX_READ).collect(), complete))
 }
 
@@ -6746,8 +6807,8 @@ fn ask_in(
     let ids: Vec<String> = tx
         .query(
             "SELECT DISTINCT intent FROM hub_intent_paths
-             WHERE repository = $1 AND key = $2 AND expires_at > $3",
-            &[&who.repository, &key, &now],
+             WHERE repository_scope = $1 AND key = $2 AND expires_at > $3",
+            &[&who.scope, &key, &now],
         )?
         .iter()
         .map(|row| row.get(0))
@@ -6771,9 +6832,9 @@ fn ask_in(
     let queued: Vec<String> = tx
         .query(
             "SELECT holder_intent FROM hub_handoffs
-             WHERE repository = $1 AND path = $2 AND state = 'pending'
+             WHERE repository_scope = $1 AND path = $2 AND state = 'pending'
                AND created_at > $3",
-            &[&who.repository, &key, &cutoff(now)],
+            &[&who.scope, &key, &cutoff(now)],
         )?
         .iter()
         .map(|row| row.get(0))
@@ -6806,15 +6867,15 @@ fn ask_in(
         return unheld(tx, token, name, key, now);
     };
     tx.execute(
-        "DELETE FROM hub_handoffs WHERE repository = $1 AND created_at < $2",
-        &[&who.repository, &(now - STALE_SESSION_SECONDS)],
+        "DELETE FROM hub_handoffs WHERE repository_scope = $1 AND created_at < $2",
+        &[&who.scope, &(now - STALE_SESSION_SECONDS)],
     )?;
     let id = new_id("hof")?;
     tx.execute(
         "INSERT INTO hub_handoffs (id, repository, path, requester_token,
              requester_session, holder_token, holder_session, holder_intent, note,
-             state, created_at, asked_via_hub)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11)",
+             state, created_at, asked_via_hub, repository_scope)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12)",
         &[
             &id,
             &who.repository,
@@ -6827,6 +6888,7 @@ fn ask_in(
             &note,
             &now,
             &via.hub(),
+            &who.scope,
         ],
     )?;
     let event = Event::handoff_request(token, &id, name, key, note, &holder, (auto, via))?;
@@ -9247,14 +9309,14 @@ impl Store for PgStore {
                  JOIN hub_users u ON u.id = t.owner
                  LEFT JOIN hub_sessions rs
                    ON rs.token = h.requester_token AND rs.session = h.requester_session
-                 WHERE h.repository = $1 AND h.path = $2 AND h.holder_token = $3
+                 WHERE h.repository_scope = $1 AND h.path = $2 AND h.holder_token = $3
                    AND h.state = 'pending' AND h.created_at > $4
                    AND h.holder_session = $5
                  ORDER BY CASE WHEN $6::boolean AND h.requester_token = h.holder_token
                                THEN 1 ELSE 0 END,
                           h.created_at, h.id LIMIT 1",
                 &[
-                    &who.repository,
+                    &who.scope,
                     &key,
                     &token,
                     &cutoff(now),
@@ -9583,14 +9645,14 @@ impl Store for PgStore {
         })
     }
 
-    fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>> {
+    fn live_intents(&self, scope: &str, now: i64, limit: usize) -> Result<Vec<Intent>> {
         self.run(true, |client| {
             let rows = client.query(
                 &format!(
-                    "{INTENT_SELECT} WHERE i.repository = $1 AND i.released_at IS NULL
+                    "{INTENT_SELECT} WHERE i.repository_scope = $1 AND i.released_at IS NULL
                      AND i.expires_at > $2 ORDER BY i.id LIMIT $3"
                 ),
-                &[&repository, &now, &(limit as i64)],
+                &[&scope, &now, &(limit as i64)],
             )?;
             finish(rows.iter().map(intent_row).collect())
         })
@@ -9980,6 +10042,7 @@ impl Store for PgStore {
                     pulls_etag: None,
                 };
                 append(&mut tx, &Event::repository_connected(&repo)?)?;
+                adopt_name_scope(&mut tx, &repo)?;
                 repo
             } else {
                 let row = tx.query_one(
@@ -9991,6 +10054,7 @@ impl Store for PgStore {
                     if repo.full_name != full_name {
                         let previous = std::mem::replace(&mut repo.full_name, full_name.to_owned());
                         append(&mut tx, &Event::repository_renamed(&repo, &previous)?)?;
+                        adopt_name_scope(&mut tx, &repo)?;
                     }
                     // Not events: they say how to reach the repository, not what it is.
                     repo.node_id = node_id.map(str::to_owned).or(repo.node_id);
@@ -10334,7 +10398,7 @@ impl Store for PgStore {
     fn forge_checks_showing_success(
         &self,
         repo: &str,
-        full_name: &str,
+        scope: &str,
         enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>> {
@@ -10348,11 +10412,11 @@ impl Store for PgStore {
                      WHERE repository = $1 AND (state = 'success' OR phase = 'attempting')
                        AND context <> ALL($3)
                        AND (SELECT q.merge_commit FROM hub_publications q
-                            WHERE lower(q.repository) = lower($2)
+                            WHERE q.repository_scope = $2
                               AND q.pr_number = hub_forge_checks.number
                             ORDER BY q.created_at DESC, q.id DESC LIMIT 1) IS NULL
                      ORDER BY number, context LIMIT $4",
-                    &[&repo, &full_name, &enabled, &limit],
+                    &[&repo, &scope, &enabled, &limit],
                 )?
                 .iter()
                 .map(|row| {
@@ -10849,12 +10913,12 @@ impl Store for PgStore {
             let m = &new.manifest;
             let manifest = m.canonical();
             if let Some(found) = publication_by_id(&mut tx, &new.id, false)? {
-                return Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.repository, &manifest) } else { Create::Conflict });
+                return Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.scope, &manifest) } else { Create::Conflict });
             }
             // Serialize candidate/integrated reservations for this repository/branch,
             // including tokens owned by different actors.
-            tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", who.repository, m.branch)])?;
-            let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository=$1 AND branch=$2", &[&who.repository, &m.branch])?.map(|r| r.get(0));
+            tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", who.scope, m.branch)])?;
+            let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository_scope=$1 AND branch=$2", &[&who.scope, &m.branch])?.map(|r| r.get(0));
             let previous = match &head { Some(id) => publication_by_id(&mut tx,id,false)?, None => None };
             if head.is_some() && previous.is_none() { return Err(HubError::Unavailable("candidate lineage record missing".into())); }
             if binding.is_none() && previous.as_ref().is_some_and(|p| p.authorization_binding.is_some()) {
@@ -10862,11 +10926,11 @@ impl Store for PgStore {
             }
             if !super::publish::candidate_continuation(new, previous.as_ref(), &who.owner.id)? { return Ok(Create::Conflict); }
             if m.candidate.is_some() && head.is_none() {
-                let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_publications WHERE repository=$1 AND branch=$2)", &[&who.repository, &m.branch])?.get(0);
+                let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_publications WHERE repository_scope=$1 AND branch=$2)", &[&who.scope, &m.branch])?.get(0);
                 if occupied { return Ok(Create::Conflict); }
             }
             if m.candidate.is_some() {
-                tx.execute("INSERT INTO hub_candidate_heads VALUES($1,$2,$3) ON CONFLICT(repository,branch) DO UPDATE SET publication=excluded.publication", &[&who.repository, &m.branch, &new.id])?;
+                tx.execute("INSERT INTO hub_candidate_heads (repository_scope, branch, publication) VALUES($1,$2,$3) ON CONFLICT(repository_scope,branch) DO UPDATE SET publication=excluded.publication", &[&who.scope, &m.branch, &new.id])?;
             }
             let unfinished: i64 = tx
                 .query_one(
@@ -10880,8 +10944,10 @@ impl Store for PgStore {
             }
             let inserted = tx.execute(
                 "INSERT INTO hub_publications (id, repository, token, revision, event_seq,
-                     commit_sha, branch, base, manifest, created_at, updated_at, authorization_binding)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11) ON CONFLICT (id) DO NOTHING",
+                     commit_sha, branch, base, manifest, created_at, updated_at, authorization_binding,
+                     repository_scope)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12)
+                 ON CONFLICT (id) DO NOTHING",
                 &[
                     &new.id,
                     &who.repository,
@@ -10894,6 +10960,7 @@ impl Store for PgStore {
                     &manifest,
                     &now,
                     &binding,
+                    &who.scope,
                 ],
             )?;
             if inserted > 0 {
@@ -10906,20 +10973,20 @@ impl Store for PgStore {
                 HubError::Unavailable("publication not found after insert".into())
             })?;
             tx.commit()?;
-            Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.repository, &manifest) } else { Create::Conflict })
+            Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.scope, &manifest) } else { Create::Conflict })
         })
     }
 
-    fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>> {
+    fn publication(&self, scope: &str, id: &str) -> Result<Option<Publication>> {
         self.run(true, |client| {
             let mut tx = client.transaction()?;
-            Ok(publication_by_id(&mut tx, id, false)?.filter(|p| p.repository == repository))
+            Ok(publication_by_id(&mut tx, id, false)?.filter(|p| p.repository_scope == scope))
         })
     }
 
     fn publications(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>> {
@@ -10928,12 +10995,12 @@ impl Store for PgStore {
             client
                 .query(
                     &format!(
-                        "{PUBLICATION_SELECT} WHERE p.repository = $1
+                        "{PUBLICATION_SELECT} WHERE p.repository_scope = $1
                          AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
-                             FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                             FROM hub_publications q WHERE q.repository_scope = $1 AND q.id = $2))
                          ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
                     ),
-                    &[&repository, &before, &limit],
+                    &[&scope, &before, &limit],
                 )?
                 .iter()
                 .map(publication_row)
@@ -10943,7 +11010,7 @@ impl Store for PgStore {
 
     fn publication_search(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         search: &str,
         limit: usize,
@@ -10952,11 +11019,11 @@ impl Store for PgStore {
             let scan = SEARCH_SCAN_ROWS as i64;
             let window: Vec<(i64, String)> = client
                 .query(
-                    "SELECT p.created_at, p.id FROM hub_publications p WHERE p.repository = $1
+                    "SELECT p.created_at, p.id FROM hub_publications p WHERE p.repository_scope = $1
                      AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
-                         FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                         FROM hub_publications q WHERE q.repository_scope = $1 AND q.id = $2))
                      ORDER BY p.created_at DESC, p.id DESC LIMIT $3",
-                    &[&repository, &before, &scan],
+                    &[&scope, &before, &scan],
                 )?
                 .iter()
                 .map(|row| (row.get(0), row.get(1)))
@@ -10974,9 +11041,9 @@ impl Store for PgStore {
             let rows = client
                 .query(
                     &format!(
-                        "{PUBLICATION_SELECT} WHERE p.repository = $1
+                        "{PUBLICATION_SELECT} WHERE p.repository_scope = $1
                          AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
-                             FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                             FROM hub_publications q WHERE q.repository_scope = $1 AND q.id = $2))
                          AND (p.created_at, p.id) >= ($6::bigint, $7::text)
                          AND (p.pr_number = $5::bigint
                              OR p.branch ILIKE $4 ESCAPE '\\' OR p.base ILIKE $4 ESCAPE '\\'
@@ -10988,13 +11055,7 @@ impl Store for PgStore {
                          ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
                     ),
                     &[
-                        &repository,
-                        &before,
-                        &limit,
-                        &pattern,
-                        &number,
-                        &oldest_at,
-                        &oldest_id,
+                        &scope, &before, &limit, &pattern, &number, &oldest_at, &oldest_id,
                     ],
                 )?
                 .iter()
@@ -11008,25 +11069,20 @@ impl Store for PgStore {
         })
     }
 
-    fn pull_publications(
-        &self,
-        repository: &str,
-        after: i64,
-        limit: usize,
-    ) -> Result<Vec<Publication>> {
+    fn pull_publications(&self, scope: &str, after: i64, limit: usize) -> Result<Vec<Publication>> {
         self.run(true, |client| {
             let limit = limit as i64;
             client
                 .query(
                     &format!(
-                        "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower($1) AND p.pr_number > $2
+                        "{PUBLICATION_SELECT} WHERE p.repository_scope = $1 AND p.pr_number > $2
                          AND p.merge_commit IS NULL
                          AND p.id = (SELECT q.id FROM hub_publications q
-                             WHERE lower(q.repository) = lower($1) AND q.pr_number = p.pr_number
+                             WHERE q.repository_scope = $1 AND q.pr_number = p.pr_number
                              ORDER BY q.created_at DESC, q.id DESC LIMIT 1)
                          ORDER BY p.pr_number LIMIT $3"
                     ),
-                    &[&repository, &after, &limit],
+                    &[&scope, &after, &limit],
                 )?
                 .iter()
                 .map(publication_row)
@@ -11043,8 +11099,8 @@ impl Store for PgStore {
                 let current = publication_by_id(&mut tx, id, false)?
                     .ok_or_else(|| HubError::Invalid("unknown publication".into()))?;
                 if current.event_seq.is_none() {
-                    tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", current.repository, current.branch)])?;
-                    let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository=$1 AND branch=$2", &[&current.repository, &current.branch])?.map(|r| r.get(0));
+                    tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", current.repository_scope, current.branch)])?;
+                    let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository_scope=$1 AND branch=$2", &[&current.repository_scope, &current.branch])?.map(|r| r.get(0));
                     if head.as_deref() != Some(id) {
                         return Err(HubError::Invalid("candidate was superseded before PR attempt".into()));
                     }
@@ -13337,17 +13393,18 @@ impl Store for PgStore {
             tx.execute("UPDATE hub_change_actions SET finish_request=$3,finished_at=$4,updated_at=$5 WHERE work=$1 AND action_id=$2",&[&finish.work_id,&finish.action_id,&request,&finish.finished_at,&now])?;let receipt=ActionMutationReceiptV1{work_id:finish.work_id.clone(),operation_id:finish.operation_id.clone(),action_id:finish.action_id.clone(),replayed:false};tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'action_finish',$4,$5,$6)",&[&finish.work_id,&finish.operation_id,&token,&request,&json_string(&receipt)?,&now])?;tx.commit()?;Ok(receipt)})
     }
 
-    fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>> {
+    fn skill_adoption(&self, scope: &str) -> Result<Option<SkillAdoption>> {
         self.run(true, |client| {
             Ok(client
                 .query_opt(
                     "SELECT repository, source, lock_json, default_branch, observed_at, reported_by,
-                            local_skills
-                     FROM hub_skill_adoptions WHERE repository = $1",
-                    &[&repo],
+                            local_skills, repository_scope
+                     FROM hub_skill_adoptions WHERE repository_scope = $1",
+                    &[&scope],
                 )?
                 .map(|row| SkillAdoption {
                     repository: row.get(0),
+                    repository_scope: row.get(7),
                     source: row.get(1),
                     lock_json: row.get(2),
                     default_branch: row.get(3),
@@ -13363,9 +13420,10 @@ impl Store for PgStore {
             client.execute(
                 "INSERT INTO hub_skill_adoptions
                      (repository, source, lock_json, default_branch, observed_at, reported_by,
-                      local_skills)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (repository) DO UPDATE SET source = excluded.source,
+                      local_skills, repository_scope)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (repository_scope) DO UPDATE SET repository = excluded.repository,
+                     source = excluded.source,
                      lock_json = excluded.lock_json, default_branch = excluded.default_branch,
                      observed_at = excluded.observed_at, reported_by = excluded.reported_by,
                      local_skills = excluded.local_skills
@@ -13379,20 +13437,21 @@ impl Store for PgStore {
                     &a.observed_at,
                     &a.reported_by,
                     &a.local_skills,
+                    &a.repository_scope,
                 ],
             )?;
             Ok(())
         })?;
-        self.skill_adoption(&a.repository)?
+        self.skill_adoption(&a.repository_scope)?
             .ok_or_else(|| HubError::Unavailable("skill adoption vanished".into()))
     }
 
-    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()> {
+    fn skill_adoption_clear(&self, scope: &str, source: Option<&str>) -> Result<()> {
         self.run(false, |client| {
             client.execute(
                 "DELETE FROM hub_skill_adoptions
-                 WHERE repository = $1 AND ($2::TEXT IS NULL OR source = $2)",
-                &[&repo, &source],
+                 WHERE repository_scope = $1 AND ($2::TEXT IS NULL OR source = $2)",
+                &[&scope, &source],
             )?;
             Ok(())
         })
@@ -13403,8 +13462,9 @@ impl Store for PgStore {
             client.execute(
                 "INSERT INTO hub_skill_evidence (id, repository, branch, run_id, skill,
                      skill_sha256, gate, kind, head_sha, assurance, summary, url, pull_request,
-                     detail, token_id, session, agent, recorded_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+                     detail, token_id, session, agent, recorded_at, repository_scope)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                     $18, $19)",
                 &[
                     &r.id,
                     &r.repository,
@@ -13424,26 +13484,29 @@ impl Store for PgStore {
                     &r.session,
                     &r.agent,
                     &r.recorded_at,
+                    &r.repository_scope,
                 ],
             )?;
             Ok(())
         })
     }
 
-    fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>> {
+    fn skill_evidence(&self, scope: &str, run_id: &str) -> Result<Vec<EvidenceRow>> {
         self.run(true, |client| {
             Ok(client
                 .query(
                     "SELECT id, repository, branch, run_id, skill, skill_sha256, gate, kind,
                             head_sha, assurance, summary, url, pull_request, detail, token_id,
-                            session, agent, recorded_at
-                     FROM hub_skill_evidence WHERE repository = $1 AND run_id = $2 ORDER BY seq",
-                    &[&repo, &run_id],
+                            session, agent, recorded_at, repository_scope
+                     FROM hub_skill_evidence WHERE repository_scope = $1 AND run_id = $2
+                     ORDER BY seq",
+                    &[&scope, &run_id],
                 )?
                 .iter()
                 .map(|row| EvidenceRow {
                     id: row.get(0),
                     repository: row.get(1),
+                    repository_scope: row.get(18),
                     branch: row.get(2),
                     run_id: row.get(3),
                     skill: row.get(4),
@@ -13467,7 +13530,7 @@ impl Store for PgStore {
 
     fn skill_run_heads(
         &self,
-        repo: &str,
+        scope: &str,
         branch: Option<&str>,
         run_id: Option<&str>,
         limit: usize,
@@ -13477,11 +13540,11 @@ impl Store for PgStore {
             Ok(client
                 .query(
                     "SELECT run_id, branch, skill, skill_sha256 FROM hub_skill_evidence
-                     WHERE seq IN (SELECT MAX(seq) FROM hub_skill_evidence WHERE repository = $1
-                                   GROUP BY run_id)
+                     WHERE seq IN (SELECT MAX(seq) FROM hub_skill_evidence
+                                   WHERE repository_scope = $1 GROUP BY run_id)
                        AND ($2::text IS NULL OR branch = $2) AND ($3::text IS NULL OR run_id = $3)
                      ORDER BY seq DESC LIMIT $4",
-                    &[&repo, &branch, &run_id, &limit],
+                    &[&scope, &branch, &run_id, &limit],
                 )?
                 .iter()
                 .map(|row| RunHead {
@@ -13681,7 +13744,8 @@ impl Store for PgStore {
         let (since, until) = query.window(now)?;
         self.run(false,|client|{let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).start()?;
         if !who.token_id.is_empty(){let live=work_who(&mut tx,&who.token_id,now)?;if live.repository!=who.repository || live.repository_id!=who.repository_id || live.owner.id!=who.owner.id{return Err(HubError::Unauthorized);}}
-        let lock:Option<String>=tx.query_opt("SELECT lock_json FROM hub_skill_adoptions WHERE repository=$1",&[&who.repository])?.map(|r|r.get(0));
+        let adoption_scope=resolved_scope(&mut tx,&who.owner.identity.host,&who.repository,who.repository_id)?;
+        let lock:Option<String>=tx.query_opt("SELECT lock_json FROM hub_skill_adoptions WHERE repository_scope=$1",&[&adoption_scope])?.map(|r|r.get(0));
         let current_configuration=configuration(lock.as_deref());
         let scope=ValueScope{provider:who.owner.identity.provider.clone(),host:who.owner.identity.host.clone(),repository:who.repository.clone(),repository_id:who.repository_id};
         let provider=&scope.provider;let host=&scope.host;let repository=&scope.repository;let repository_id=&scope.repository_id;
@@ -13726,9 +13790,10 @@ impl Store for PgStore {
         let delivery_pruned_range=pruning_rows.into_iter().next();
         let capture_failures=capture_failed(&scope);
         let context_population=if token.is_some(){"calling repository token's structured catch-up deliveries"}else{"signed-in owner's own structured catch-up deliveries"}.into();
-        let (contested,contested_complete)=contested_facts(&mut tx,&scope.repository,since,until,now)?;
-        let (duplicate_starts,duplicate_starts_complete)=duplicate_start_facts(&mut tx,&scope.repository,since,until,now)?;
-        let (overhead,overhead_complete)=overhead_facts(&mut tx,&scope.repository,since,until,now)?;
+        let rows_scope=resolved_scope(&mut tx,&scope.host,&scope.repository,scope.repository_id)?;
+        let (contested,contested_complete)=contested_facts(&mut tx,&rows_scope,since,until,now)?;
+        let (duplicate_starts,duplicate_starts_complete)=duplicate_start_facts(&mut tx,&rows_scope,since,until,now)?;
+        let (overhead,overhead_complete)=overhead_facts(&mut tx,&rows_scope,since,until,now)?;
         tx.commit()?;
         Ok(ValueFacts{scope,current_configuration,works,usage,deliveries,observations,merges,capture_failures,delivery_retained_from:Some(now.saturating_sub(86400)),cap_rejections,complete,request_membership,request_membership_complete,delivery_pruned_range,context_population,contested,contested_complete,duplicate_starts,duplicate_starts_complete,overhead,overhead_complete})
         })
@@ -13775,15 +13840,18 @@ impl Store for PgStore {
         ];
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let scope = token_scope(&mut tx, token)?;
             let new: bool = tx
                 .query_one(
                     "INSERT INTO hub_hook_overhead AS o (repository, token, session, agent,
                          hub_calls, injected_start, injected_refusal, injected_other,
                          client_calls, client_ms_total, client_ms_max, client_timeouts,
-                         client_failed_open, first_at, updated_at)
-                     VALUES ($1, $2, $3, $4, $14, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+                         client_failed_open, first_at, updated_at, repository_scope)
+                     VALUES ($1, $2, $3, $4, $14, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13,
+                         $15)
                      ON CONFLICT (token, session, agent) DO UPDATE SET
                          repository = excluded.repository,
+                         repository_scope = excluded.repository_scope,
                          hub_calls = o.hub_calls + excluded.hub_calls,
                          injected_start = o.injected_start + excluded.injected_start,
                          injected_refusal = o.injected_refusal + excluded.injected_refusal,
@@ -13810,14 +13878,15 @@ impl Store for PgStore {
                         &values[7],
                         &now,
                         &values[8],
+                        &scope,
                     ],
                 )?
                 .get(0);
             // A new row is the only write that can grow the table, so only it prunes.
             if new {
                 tx.execute(
-                    "DELETE FROM hub_hook_overhead WHERE repository = $1 AND updated_at < $2",
-                    &[&repository, &(now - RETAIN_SECONDS)],
+                    "DELETE FROM hub_hook_overhead WHERE repository_scope = $1 AND updated_at < $2",
+                    &[&scope, &(now - RETAIN_SECONDS)],
                 )?;
                 tx.execute(
                     "DELETE FROM hub_hook_overhead WHERE (token, session, agent) IN (
