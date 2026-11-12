@@ -460,6 +460,14 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
         "repository_path"
     );
     assert_eq!(summary["intent"]["title"], "prepare a concise handoff");
+    assert_eq!(summary["intent"]["repository"], REPOSITORY);
+    assert_eq!(summary["review"]["actual_scope"], "unknown");
+    assert_eq!(summary["review"]["establishes_approval"], false);
+    assert_eq!(summary["review"]["diff"]["head"], "1".repeat(40));
+    assert_ne!(
+        summary["review"]["captured_by"]["session_id"],
+        "http-change-record"
+    );
     assert!(summary["intent"]["scope"].as_array().unwrap().len() <= 16);
     assert!(summary["intent"]["scope_omitted"].as_u64().unwrap() >= 240);
     assert!(summary["decision"]["source_refs"].as_array().unwrap().len() <= 16);

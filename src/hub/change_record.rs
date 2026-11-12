@@ -2,11 +2,12 @@
 
 use crate::change_record::{
     ActionFinishV1, ActionOutcomeV1, ActionStartV1, ActionSummaryV1, ApplicabilityV1,
-    AssuranceBasisV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1,
-    ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
-    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DriftV1, IntentSummaryV1,
-    MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1, SessionCoverageV1,
-    SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
+    AssuranceBasisV1, CapturedAttributionV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1,
+    CompletenessV1, ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
+    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DiffReferenceV1, DriftV1,
+    IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
+    ReviewProjectionV1, SessionCoverageV1, SessionSetupV1, SourceBindingV1, SubjectSummaryV1,
+    UnknownFactV1,
 };
 
 use super::viewer::Viewer;
@@ -215,6 +216,57 @@ pub fn project(
         source: stored.start.source.clone(),
     });
     let latest_action = action.as_ref().map(|stored| action_summary(item, stored));
+    let captured_by = action.as_ref().map(|stored| {
+        let mut session_id = stored.start.session_id.clone();
+        let (owner, token) = Viewer::capturer(
+            &item.participants,
+            &session_id,
+            (Some(item.owner.as_str()), item.lead_token.as_str()),
+        );
+        viewer.session(owner, token, &mut session_id);
+        let mut agent = item
+            .participants
+            .iter()
+            .find(|participant| participant.session == stored.start.session_id)
+            .map_or_else(
+                || item.lead_agent.clone(),
+                |participant| participant.agent.clone(),
+            );
+        viewer.label(owner, &mut agent);
+        CapturedAttributionV1 { agent, session_id }
+    });
+    let diff = action.as_ref().map(|stored| match &stored.start.source {
+        SourceBindingV1::Native {
+            repository,
+            revision,
+            change_id,
+            ..
+        } => DiffReferenceV1::Native {
+            repository: repository.clone(),
+            revision: revision.clone(),
+            change_id: change_id.clone(),
+        },
+        SourceBindingV1::Git {
+            repository,
+            worktree_id,
+            base,
+            head,
+            dirty,
+            untracked_count,
+            omissions,
+            snapshot_coverage,
+            ..
+        } => DiffReferenceV1::Git {
+            repository: repository.clone(),
+            worktree_id: worktree_id.clone(),
+            base: base.clone(),
+            head: head.clone(),
+            dirty: *dirty,
+            untracked_count: *untracked_count,
+            omissions: omissions.clone(),
+            snapshot_coverage: *snapshot_coverage,
+        },
+    });
     let result_coverage = latest_action
         .as_ref()
         .map_or(CoverageV1::Unknown, |action| {
@@ -276,6 +328,10 @@ pub fn project(
             viewer.session(owner, token, session);
         }
     }
+    let review_concerns =
+        review_concerns(session_coverage, latest_action.as_ref(), action.as_ref());
+    let mut next_actor = item.lead_agent.clone();
+    viewer.label(Some(&item.owner), &mut next_actor);
     ChangeRecordSummaryV1 {
         schema_version: crate::change_record::SCHEMA_VERSION_V1,
         work_id: item.id.clone(),
@@ -283,6 +339,14 @@ pub fn project(
         as_of,
         intent: IntentSummaryV1 {
             title: item.title.clone(),
+            description: item.description.clone(),
+            repository: item.repository.clone(),
+            branch: item.branch.clone(),
+            provenance: match item.source {
+                super::work::WorkSource::Native { .. } => "native",
+                super::work::WorkSource::Forge { .. } => "forge",
+            }
+            .into(),
             scope: item
                 .scope
                 .iter()
@@ -320,7 +384,63 @@ pub fn project(
             usage: usage_coverage,
         },
         unknowns,
+        review: Some(ReviewProjectionV1 {
+            captured_by,
+            diff,
+            actual_scope: CoverageV1::Unknown,
+            concerns: review_concerns,
+            detail_links: vec![
+                format!("work:{}:change-record", item.id),
+                format!("work:{}:conversation", item.id),
+                format!("work:{}:actionable-status", item.id),
+            ],
+            next_actor: Some(next_actor),
+            supported_action: None,
+            establishes_approval: false,
+        }),
     }
+}
+
+fn review_concerns(
+    sessions: CoverageV1,
+    latest: Option<&ActionSummaryV1>,
+    stored: Option<&StoredActionV1>,
+) -> Vec<String> {
+    let mut concerns = Vec::new();
+    if sessions != CoverageV1::Complete {
+        concerns.push("capture_history_incomplete_or_unknown".into());
+    }
+    if latest.is_none() {
+        concerns.push("no_captured_action".into());
+    }
+    if latest.is_some_and(|action| action.outcome != ActionOutcomeV1::Succeeded) {
+        concerns.push("latest_execution_not_successful".into());
+    }
+    if latest.is_some_and(|action| action.result != CheckResultV1::Passed) {
+        concerns.push("latest_check_not_passing".into());
+    }
+    if latest.is_some_and(|action| action.applicability != ApplicabilityV1::Current) {
+        concerns.push("current_source_applicability_not_established".into());
+    }
+    if let Some(stored) = stored
+        && let SourceBindingV1::Git {
+            dirty,
+            untracked_count,
+            omissions,
+            ..
+        } = &stored.start.source
+    {
+        if *dirty || *untracked_count > 0 {
+            concerns.push("captured_source_dirty_or_untracked".into());
+        }
+        if !omissions.is_empty() {
+            concerns.push("captured_source_has_omissions".into());
+        }
+    }
+    concerns.push("actual_changed_scope_requires_source_diff".into());
+    concerns.push("supported_next_action_requires_actionable_status".into());
+    concerns.push("approval_and_readiness_not_established".into());
+    concerns
 }
 
 fn decision_summary(

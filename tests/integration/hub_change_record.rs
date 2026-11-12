@@ -277,7 +277,19 @@ fn action_capture_receipt(db: &Db) {
     );
     assert_eq!(summary.decision.source_refs.len(), 1);
     assert_eq!(summary.intent.title, "capture a source-bound check");
+    assert_eq!(summary.intent.repository, REPO);
+    assert_eq!(
+        summary.intent.branch.as_deref(),
+        Some("feature/change-record")
+    );
     assert!(summary.subject.is_some());
+    let review = summary.review.as_ref().unwrap();
+    assert!(!review.establishes_approval);
+    assert_eq!(review.actual_scope, CoverageV1::Unknown);
+    assert_eq!(review.captured_by.as_ref().unwrap().session_id, "session-1");
+    assert!(
+        matches!(review.diff, Some(agentscm::change_record::DiffReferenceV1::Git { ref base, ref head, .. }) if base == &"3".repeat(40) && head == &"1".repeat(40))
+    );
 
     let mut elevated = action_finish(&work_id, generation);
     elevated.operation_id = "finish-elevated".into();
@@ -408,6 +420,150 @@ fn action_capture_receipt(db: &Db) {
         reason: agentscm::change_record::GapReasonV1::CaptureInterrupted,
     });
     assert!(store.change_ingest(&token, &stale_new, 315).is_err());
+}
+
+fn review_projection_acceptance_cases(db: &Db) {
+    // Missing capture events and actions remain explicit rather than looking clear.
+    let (store, token, work_id, generation) = setup(db);
+    let missing = store.change_record(&token, &work_id, 700).unwrap().unwrap();
+    let concerns = &missing.review.as_ref().unwrap().concerns;
+    assert!(concerns.contains(&"capture_history_incomplete_or_unknown".into()));
+    assert!(concerns.contains(&"no_captured_action".into()));
+
+    // An interrupted session is partial even when its first event arrived.
+    store
+        .change_ingest(
+            &token,
+            &event_batch(&work_id, generation, "interrupted", 1),
+            701,
+        )
+        .unwrap();
+    let interrupted = store.change_record(&token, &work_id, 702).unwrap().unwrap();
+    assert_eq!(interrupted.sessions.coverage, CoverageV1::Partial);
+
+    // A successful check followed by observed source change is stale, not current evidence.
+    let drift_start = action_start(&work_id, generation);
+    store
+        .change_action_start(&token, &drift_start, 703)
+        .unwrap();
+    let mut drift_finish = action_finish(&work_id, generation);
+    drift_finish.drift = DriftV1::SourceChanged;
+    store
+        .change_action_finish(&token, &drift_finish, 704)
+        .unwrap();
+    let drifted = store.change_record(&token, &work_id, 705).unwrap().unwrap();
+    assert_eq!(drifted.latest_action.unwrap().result, CheckResultV1::Passed);
+    assert!(
+        drifted
+            .review
+            .unwrap()
+            .concerns
+            .contains(&"current_source_applicability_not_established".into())
+    );
+
+    // One synthetic record covers dirty/untracked source and a failed check. These are separate
+    // typed facts and neither is promoted to approval/readiness.
+    let mut start = action_start(&work_id, generation);
+    start.operation_id = "start-dirty-failed".into();
+    start.action_id = "action-dirty-failed".into();
+    start.observed_order = 3;
+    if let SourceBindingV1::Git {
+        dirty,
+        untracked_count,
+        omissions,
+        captured_snapshot,
+        snapshot_coverage,
+        ..
+    } = &mut start.source
+    {
+        *dirty = true;
+        *untracked_count = 2;
+        omissions.push(agentscm::change_record::CaptureOmissionV1::UntrackedContent);
+        *captured_snapshot = Some(ArtifactRefV1 {
+            digest: "7".repeat(64),
+            size_bytes: 20,
+            media: ArtifactMediaV1::Binary,
+            retention: RetentionClassV1::WorkLocal,
+            availability: ContentAvailabilityV1::Local,
+        });
+        *snapshot_coverage = CoverageV1::Partial;
+    }
+    store.change_action_start(&token, &start, 703).unwrap();
+    let mut finish = action_finish(&work_id, generation);
+    finish.operation_id = "finish-dirty-failed".into();
+    finish.action_id = "action-dirty-failed".into();
+    finish.outcome = ActionOutcomeV1::Failed;
+    finish.result = CheckResultV1::Failed;
+    finish.drift = DriftV1::SourceChanged;
+    store.change_action_finish(&token, &finish, 704).unwrap();
+    let failed = store.change_record(&token, &work_id, 705).unwrap().unwrap();
+    let action = failed.latest_action.as_ref().unwrap();
+    assert_eq!(action.outcome, ActionOutcomeV1::Failed);
+    assert_eq!(action.result, CheckResultV1::Failed);
+    assert_eq!(action.applicability, ApplicabilityV1::Stale);
+    let review = failed.review.as_ref().unwrap();
+    for concern in [
+        "captured_source_dirty_or_untracked",
+        "captured_source_has_omissions",
+        "latest_execution_not_successful",
+        "latest_check_not_passing",
+        "current_source_applicability_not_established",
+    ] {
+        assert!(
+            review.concerns.iter().any(|value| value == concern),
+            "{concern}"
+        );
+    }
+
+    // A later declared branch/worktree does not rewrite the exact source captured for the action.
+    let updated_seq = store
+        .work_get(&token, &work_id, 706)
+        .unwrap()
+        .unwrap()
+        .updated_seq;
+    store
+        .work_checkpoint(
+            &token,
+            &WorkCheckpoint {
+                work_id: work_id.clone(),
+                operation_id: "switch-branch-worktree".into(),
+                generation,
+                session: "session-1".into(),
+                expected_updated_seq: Some(updated_seq),
+                kind: CheckpointKind::Progress,
+                summary: "Continue on a replacement checkout.".into(),
+                next_action: None,
+                scope: None,
+                branch: Some("feature/replacement".into()),
+                worktree: Some("replacement-worktree".into()),
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: vec![],
+                related_work: vec![],
+            },
+            706,
+        )
+        .unwrap();
+    let switched = store.change_record(&token, &work_id, 707).unwrap().unwrap();
+    assert_eq!(
+        switched.intent.branch.as_deref(),
+        Some("feature/replacement")
+    );
+    assert!(
+        matches!(switched.review.unwrap().diff, Some(agentscm::change_record::DiffReferenceV1::Git { ref worktree_id, .. }) if worktree_id == "worktree-1")
+    );
+}
+
+#[test]
+fn sqlite_review_projection_acceptance_cases() {
+    review_projection_acceptance_cases(&Db::sqlite());
+}
+
+#[test]
+fn postgres_review_projection_acceptance_cases() {
+    if let Some(db) = Db::postgres() {
+        review_projection_acceptance_cases(&db);
+    }
 }
 
 fn lifecycle_resume_and_replay(db: &Db) {

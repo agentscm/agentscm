@@ -805,6 +805,8 @@ Read the resulting shared projection without running a model or mutating Hub sta
 agentscm change-capture show --root /absolute/repository --work-id wrk_example
 ```
 
+The bounded response also joins the retained Work intent and latest relevant decision with the latest action's exact captured source. Its `review` field names masked captured agent/session attribution, a native revision or Git base/head/worktree reference, dirty and untracked facts, omissions, explicit concerns and stable detail-link identities. Declared scope remains separate from `review.actual_scope`: the Hub cannot inspect current checkout bytes, so actual changed paths stay `unknown` until a source-aware client follows the diff reference. Execution outcome, check result, assurance, coverage, applicability and evidence availability remain separate typed facts. A completed Work, proposed decision or passing check does not establish human approval or merge readiness, and missing capture remains an explicit gap rather than evidence that nothing happened.
+
 ## Codex adapter
 
 Codex command hooks use the same event names and fields as Claude Code's, so Codex is captured by
