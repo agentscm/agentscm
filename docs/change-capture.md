@@ -155,14 +155,14 @@ uploads it to the Hub's object store.
 
 ### The repository setting
 
-Whether a repository shares agent conversations is a Hub setting, **Share agent conversations**,
-not a per-checkout switch. It is on by default on a new Hub, and stays off on a Hub that already
-had people when the default became on. A repository admin (GitHub `admin`, GitLab maintainer
-or owner) or a Hub admin changes it for one repository; a Hub admin can also set a Hub-wide
-default that applies to every repository without its own setting. The routes are in
+Whether a repository permits agent conversation sharing is a Hub setting, **Share agent conversations**,
+not a per-checkout switch and not a person's consent. It is off by default. A repository admin
+(GitHub `admin`, GitLab maintainer or owner) or a Hub admin changes it for one repository; a Hub
+admin can also set a Hub-wide default that applies to every repository without its own setting.
+Neither setting opts any person in, and existing people without a recorded choice remain opted out. The routes are in
 [conversation sharing](hub.md#conversation-sharing).
 
-- **Checkouts follow it.** While it is on, every connected checkout of the repository, and every
+- **Checkouts follow both gates.** While the repository permits sharing and the person has explicitly opted in, every connected checkout of the repository, and every
   linked worktree of one, captures in `shared-conversation` mode without `configure`. The AgentSCM
   plugin hook asks the Hub at each session start; when the Hub shares and the checkout has no
   capture binding, it creates one with the one-step defaults below, marked `follows_hub`, and
@@ -171,13 +171,7 @@ default that applies to every repository without its own setting. The routes are
   `PreCompact`, `SubagentStart`, `SubagentStop`; for Codex see the
   [Codex adapter](#codex-adapter)). Capture starts with that session. A binding that follows the
   Hub is written as config version 7, which older binaries refuse.
-- **People are told and can opt out.** The first time a person's session shares in a
-  repository, its agent is told in the session-start context that conversations are shared,
-  who can read them, and how to stop. This is best effort: the notice is recorded as shown
-  before the hook's reply is printed, so a reply the host cuts off loses it, and a session
-  already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
-  that person's own sessions in the repository, on every computer, from uploading;
-  `change-capture opt-in` undoes it. The choice is per person and repository, stored on the Hub.
+- **People must opt in.** `agentscm change-capture opt-in` in a connected checkout records affirmative consent for that person and repository on the Hub. It applies to that person's sessions on every computer. A missing or unreadable choice, including one left by an older Hub, is not consent and is never migrated into consent. `change-capture opt-out` revokes consent. The first time a consented person's session shares in a repository, its agent is told in the session-start context that conversations are shared, who can read them, and how to stop. This notice is separate from consent: recording that the notice was shown cannot opt the person in. Notice delivery is best effort: it is recorded as shown before the hook's reply is printed, so a reply the host cuts off loses it, and a session already running when both gates become enabled is told at its next start. The choice is per person and repository, stored on the Hub.
   Opting out also hides what the person shared before: their entries leave other readers'
   listings and their bodies are no longer served to them, while the person and Hub admins still
   read them. The bodies stay stored until they expire or their author deletes them with
@@ -193,7 +187,7 @@ default that applies to every repository without its own setting. The routes are
   - capture is turned off in this checkout, or was set up for another repository or Hub, while the
     repository shares: `change-capture forget --root <checkout>` (after `unconfigure` if it is still
     on), and the next session follows the repository;
-  - the person keeps their own sessions out: `change-capture opt-in`, and also the `set-mode` fix
+  - the person has not opted in, or opted out: `change-capture opt-in`, and also the `set-mode` fix
     above when this checkout's own setting caps it;
   - the session keeps a lower mode it started under (it started before sharing was on, or its
     saved mode could not be read): the next session shares;
@@ -204,8 +198,8 @@ default that applies to every repository without its own setting. The routes are
     nothing in that session and asks again at the next one;
   - an older Hub without the sharing setting: the context says only that sharing is off.
 - **Off means off.** The client asks the Hub again on every hook call, and the Hub itself
-  refuses uploads (403 `sharing_off`) and lists nothing as missing while the setting is off or the
-  person opted out, so bodies not yet uploaded stay declared `local`; they are not uploaded later
+  refuses uploads (403 `sharing_off`) and lists nothing as missing while the repository setting is off or the
+  person lacks affirmative consent, so bodies not yet uploaded stay declared `local`; they are not uploaded later
   if sharing is turned back on. A followed binding keeps recording metadata (events and action
   receipts, no bodies) while sharing is off, until `unconfigure`. Turning it off recalls
   nothing already uploaded (see [retention and deletion](#retention-and-deletion)).
@@ -247,8 +241,7 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 `repository_shares` (null when the Hub did not answer or has no sharing setting),
 `effective_mode` (the mode a session starting now captures in; `off` when no hook captures for
 this binding, null when the Hub did not answer) and `session_start`, the sentence that session
-would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not
-`shared-conversation`, this checkout's local setting is what keeps sharing off. The
+would say. `repository_shares` reports repository enablement, not personal consent; `session_start` distinguishes missing consent from a disabled repository. When the repository permits sharing, you have opted in, and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps sharing off. The
 Hub page opened from this computer (**Settings → Conversation sharing**) has the same switch per
 checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
 `configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
@@ -259,7 +252,7 @@ unsupported: older binaries cannot read the new session association records.
 
 ### One-step setup from the local page
 
-Turning sharing on from the page calls one library function, `enable_capture`, for a
+Turning sharing on from the page configures only that checkout; it does not record the person's Hub consent. Run `agentscm change-capture opt-in` in the checkout as well. The page calls one library function, `enable_capture`, for a
 checkout that has a current client connection; turning it off calls `set_capture_mode`. The page
 and `client status` read the setting through one function, `capture_setting` (configured, enabled, mode, and
 `lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
@@ -381,10 +374,7 @@ What leaves the machine, and when:
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
-Who can read a shared body: while the repository shares agent conversations, anyone who can read
-the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages);
-otherwise only the human who shared it (any of that person's tokens for the repository) and Hub
-admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
+Who can read a shared body: while the repository permits sharing and its author remains opted in, anyone who can read the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages); otherwise only the human who shared it (any of that person's tokens for the repository) and Hub admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
 the Work has no extra access to a helper's or reviewer's shared bodies. Each human's declaration of
 a body is its own row, so two people sharing identical content each read and delete their own. A
 listing shows a caller every author's entries while the repository shares, else only their own
@@ -407,6 +397,8 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
 number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
+A program that embeds the Hub may set it per repository instead, from 0 to 3650; at 0 the Hub keeps no
+bodies for that repository, asks for no uploads and the page says nothing is uploaded.
 `client status --check` carries it in the connection's `hub_check` (when the check is valid), and the
 local page's `GET /v1/local/capture` lists it per
 checkout (looked up with the checkout's own agent token and reused for a minute). The page
@@ -812,6 +804,18 @@ Read the resulting shared projection without running a model or mutating Hub sta
 ```text
 agentscm change-capture show --root /absolute/repository --work-id wrk_example
 ```
+
+The bounded response also joins the retained Work intent and latest relevant decision with the latest action's exact captured source. Its `review` field names masked captured agent/session attribution, a native revision or Git base/head/worktree reference, dirty and untracked facts, omissions, explicit concerns and stable detail-link identities. Declared scope remains separate from `review.actual_scope`: the Hub cannot inspect current checkout bytes, so actual changed paths stay `unknown` until a source-aware client follows the diff reference. Execution outcome, check result, assurance, coverage, applicability and evidence availability remain separate typed facts. A completed Work, proposed decision or passing check does not establish human approval or merge readiness, and missing capture remains an explicit gap rather than evidence that nothing happened.
+
+The Hub UI presents that projection as a compact review summary before the detailed receipt fields. For a Git capture it can offer a local Explorer comparison only when the selected Hub repository matches and both base and head are full object IDs. The comparison is committed base-to-head source only: dirty files, untracked files, captured snapshots and omissions are labelled but are not folded into the diff. The local Explorer cannot prove that its selected checkout is the captured worktree, so that association remains explicit and unknown. Native revisions do not fabricate a Git link. The bounded `detail_links` values are existing authenticated Hub API paths for the change record, its explicitly opened conversation listing and shared actionable status; they do not claim a separate history route.
+
+HTTP, MCP and the CLI path through HTTP enrich the capture projection with shared actionable status only when the status row matches the Work id, generation and `updated_seq`. That non-atomic read supplies the deterministic supported action and its actual recipient while keeping the Work's reported `next_action` separate. A missing, failed or mismatched status read stays explicitly unknown and cannot make retained evidence fresh. Captured attribution is resolved by the action's retained author token together with its session; if that exact participant is unavailable, attribution is unknown rather than assigned to the Work lead.
+
+### Review-summary qualification
+
+This source branch is qualified with the source build and synthetic fixtures for the six backend projection cases: clean Git capture, dirty or untracked Git capture, native capture, missing capture, failed or interrupted action, and privacy-masked attribution. Frontend fixtures cover DTO compatibility and malformed references, stale applicability, dirty and untracked exclusions, branch or worktree mismatch, missing capture, failed or interrupted receipts, explicit conversation opening and refusal of a cross-repository diff. These tests use synthetic repositories, Work records and adapter payloads.
+
+Released-client with released-Hub combinations have not been qualified for the new `review` field. A source client against an older Hub remains compatible because the field is optional; an older strict client may reject a response from a newer Hub and must be upgraded. Real Claude Code and Codex host-adapter sessions producing the new summary have not been run, and no existing adapter qualification is evidence for this projection. Multi-machine, live forge, object-store deployment and captured working-file rendering remain unverified. Missing runtime evidence stays unknown.
 
 ## Codex adapter
 

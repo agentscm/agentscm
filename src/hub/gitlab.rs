@@ -14,7 +14,7 @@ use super::forge_http::{self, Full, send_capped};
 use super::github::{
     API_BODY_BYTES, Branch, ClosedPage, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES,
     MAX_FILE_PAGES, MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply,
-    RepoInfo, StatusState, answer, endpoint_kind, parse_rfc3339, valid_ref_name,
+    RepoInfo, StatusState, answer, endpoint_kind, parse_rfc3339, refusal, valid_ref_name,
 };
 use super::store::{unix_now, validate_repository};
 
@@ -27,6 +27,17 @@ const MAX_BRANCH_PAGES: u32 = 10;
 pub const MAX_TREE_PAGES: u32 = 5;
 /// Pages of one commit's statuses of a single name.
 pub const MAX_STATUS_PAGES: u32 = 2;
+/// Pages of a followed namespace's project listing (1,000 projects); more is reported.
+pub const MAX_NAMESPACE_PAGES: u32 = 10;
+
+/// A GitLab namespace whose projects a connection follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Namespace {
+    /// A group by id; its subgroups' projects are followed too.
+    Group(i64),
+    /// A user by id: the projects in their personal namespace.
+    User(i64),
+}
 
 /// The newest status of one name on a commit, as GitLab reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +165,29 @@ impl Api {
     pub async fn project_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
         let path = format!("/projects/{}", encode(full_name));
         answer(self.get(token, &path).await?, "projects")
+    }
+
+    /// The namespace's projects, archived ones left out, at most [`MAX_NAMESPACE_PAGES`]
+    /// pages, and the number of pages left unread past that cap.
+    pub async fn namespace_projects(
+        &self,
+        token: &str,
+        namespace: Namespace,
+    ) -> Gh<(Vec<RepoInfo>, u32)> {
+        let path = match namespace {
+            Namespace::Group(id) => {
+                format!("/groups/{id}/projects?include_subgroups=true&archived=false")
+            }
+            Namespace::User(id) => format!("/users/{id}/projects?archived=false"),
+        };
+        let paged = self.paged(token, &path, MAX_NAMESPACE_PAGES).await?;
+        let projects = paged
+            .items
+            .iter()
+            .filter(|item| item["archived"].as_bool() != Some(true))
+            .filter_map(project_info)
+            .collect();
+        Ok((projects, paged.unread))
     }
 
     /// The user id and username the token acts as.
@@ -529,6 +563,76 @@ impl Api {
         }))
     }
 
+    /// The newest deployment of exactly `sha` among the 100 newest to `environment`, with its
+    /// status (`running`, `success`, `failed`, ...); `None` when there is none.
+    pub async fn find_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        sha: &str,
+        environment: &str,
+    ) -> Gh<Option<(i64, String)>> {
+        let path = format!(
+            "/projects/{project}/deployments?environment={}&order_by=id&sort=desc&per_page=100",
+            encode(environment)
+        );
+        let list = self.get(token, &path).await?.ok("deployments")?;
+        let Some(list) = list.as_array() else {
+            return Err(GhError::Failed("unreadable reply from deployments".into()));
+        };
+        Ok(list
+            .iter()
+            .find(|item| item["sha"] == sha)
+            .and_then(|item| Some((item["id"].as_i64()?, item["status"].as_str()?.to_owned()))))
+    }
+
+    /// Records a deployment of `sha` from `ref_name` to `environment` in `status`, creating the
+    /// environment when it is new, and returns its id.
+    pub async fn create_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        sha: &str,
+        ref_name: &str,
+        environment: &str,
+        status: &str,
+    ) -> Gh<i64> {
+        let url = format!("{}/projects/{project}/deployments", self.base);
+        let body = json!({"environment": environment, "sha": sha, "ref": ref_name,
+            "tag": false, "status": status});
+        let reply = self.call(token, Method::POST, &url, Some(body)).await?;
+        match reply.body["id"].as_i64() {
+            Some(id) if reply.status == 201 && reply.body["sha"] == sha => Ok(id),
+            _ => Err(GhError::Failed(format!(
+                "{} from deployments: {}",
+                reply.status,
+                refusal(&reply.body)
+            ))),
+        }
+    }
+
+    /// Moves deployment `id` to `status`.
+    pub async fn update_deployment(
+        &self,
+        token: &str,
+        project: i64,
+        id: i64,
+        status: &str,
+    ) -> Gh<()> {
+        let url = format!("{}/projects/{project}/deployments/{id}", self.base);
+        let reply = self
+            .call(token, Method::PUT, &url, Some(json!({"status": status})))
+            .await?;
+        if reply.status != 200 || reply.body["status"] != status {
+            return Err(GhError::Failed(format!(
+                "{} from deployments: {}",
+                reply.status,
+                refusal(&reply.body)
+            )));
+        }
+        Ok(())
+    }
+
     /// Posts a commit status on the commit with `ref_name` (the merge request's source branch).
     /// `Ok(Err(status))`: 403 or 404 is a definite refusal. 400 is GitLab's "cannot transition",
     /// which it returns only for a state posted onto a status that is still pending or running
@@ -745,16 +849,28 @@ fn project_info(item: &Value) -> Option<RepoInfo> {
 fn pull_json(mr: &Value) -> Value {
     let merged = mr["state"] == "merged";
     let open = matches!(mr["state"].as_str(), Some("opened" | "locked"));
+    // GitLab lists label names; the sync reads pull request labels as `{name}` objects.
+    let labels: Vec<Value> = mr["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|label| match label {
+            Value::String(name) => json!({"name": name}),
+            other => other.clone(),
+        })
+        .collect();
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
         "merged": merged, "merged_at": mr["merged_at"], "updated_at": mr["updated_at"],
-        "body": mr["description"], "labels": mr["labels"],
+        "body": mr["description"], "labels": labels,
         "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
         "merge_commit_sha": if mr["merge_commit_sha"].is_null() { &mr["squash_commit_sha"] } else { &mr["merge_commit_sha"] },
-        "head": {"ref": mr["source_branch"], "sha": mr["sha"]},
-        "base": {"ref": mr["target_branch"]},
+        "head": {"ref": mr["source_branch"], "sha": mr["sha"], "repo": {"id": mr["source_project_id"]}},
+        // `start_sha` is the target branch's tip the diff was made against, as a pull request's base sha is.
+        // Only a single merge request read carries `diff_refs`; a listing leaves it null.
+        "base": {"ref": mr["target_branch"], "sha": mr["diff_refs"]["start_sha"], "repo": {"id": mr["target_project_id"]}},
         "user": {"login": mr["author"]["username"], "id": mr["author"]["id"]},
         "html_url": mr["web_url"]})
 }
@@ -962,9 +1078,32 @@ mod tests {
             (&json!("closed"), &json!(true))
         );
         assert_eq!(pull["merge_commit_sha"], "abc");
-        assert_eq!(pull["head"], json!({"ref": "feat/x", "sha": "head"}));
+        assert_eq!(
+            pull["head"],
+            json!({"ref": "feat/x", "sha": "head", "repo": {"id": null}})
+        );
         assert_eq!(pull["user"], json!({"login": "alice", "id": 5}));
         assert_eq!(pull_json(&json!({"state": "opened"}))["state"], "open");
+    }
+
+    #[test]
+    fn merge_requests_carry_labels_projects_and_base() {
+        let mr = json!({"iid": 4, "state": "merged", "sha": "ff", "merge_commit_sha": null,
+            "squash_commit_sha": null, "labels": ["bug", "needs review"],
+            "source_project_id": 7, "target_project_id": 7,
+            "diff_refs": {"base_sha": "mb", "start_sha": "tip", "head_sha": "ff"}});
+        let pull = pull_json(&mr);
+        assert_eq!(
+            pull["labels"],
+            json!([{"name": "bug"}, {"name": "needs review"}])
+        );
+        assert_eq!(
+            (&pull["head"]["repo"]["id"], &pull["base"]["repo"]["id"]),
+            (&json!(7), &json!(7))
+        );
+        assert_eq!(pull["base"]["sha"], "tip");
+        // A fast-forward merge has no merge commit; catch-up reads the head instead (catchup_sync).
+        assert!(pull["merge_commit_sha"].is_null());
     }
 
     #[test]

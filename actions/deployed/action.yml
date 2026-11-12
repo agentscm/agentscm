@@ -1,0 +1,51 @@
+name: Record a deployment
+description: Tell the AgentSCM Hub that a commit is live in an environment; the Hub records the deployment on GitHub with its own App.
+inputs:
+  environment:
+    description: Environment the commit now runs in, such as production.
+    required: true
+  hub-url:
+    description: The Hub's URL, such as https://hub.example.com.
+    required: true
+  hub-token:
+    description: An AgentSCM agent token for this repository; keep it in a secret.
+    required: true
+  status:
+    description: success, failure or in_progress.
+    default: success
+  url:
+    description: Where the deployed app is reached.
+    default: ""
+  commit:
+    description: The commit deployed. Default the checked-out HEAD.
+    default: HEAD
+  version:
+    description: npm version of agentscm to run when it is not already on PATH.
+    default: latest
+runs:
+  using: composite
+  steps:
+    - name: Record the deployment
+      shell: bash
+      env:
+        AGENTSCM_HUB_URL: ${{ inputs.hub-url }}
+        HUB_TOKEN: ${{ inputs.hub-token }}
+        DEPLOYED_ENV: ${{ inputs.environment }}
+        DEPLOYED_STATUS: ${{ inputs.status }}
+        DEPLOYED_URL: ${{ inputs.url }}
+        DEPLOYED_COMMIT: ${{ inputs.commit }}
+        AGENTSCM_NPM_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        AGENTSCM_HUB_TOKEN_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/agentscm-token.XXXXXX")"
+        export AGENTSCM_HUB_TOKEN_FILE
+        trap 'rm -f "$AGENTSCM_HUB_TOKEN_FILE"' EXIT
+        printf '%s' "$HUB_TOKEN" > "$AGENTSCM_HUB_TOKEN_FILE"
+        unset HUB_TOKEN
+        args=(--env "$DEPLOYED_ENV" --commit "$DEPLOYED_COMMIT" --status "$DEPLOYED_STATUS")
+        if [ -n "$DEPLOYED_URL" ]; then args+=(--url "$DEPLOYED_URL"); fi
+        if command -v agentscm >/dev/null; then
+          agentscm --no-telemetry deployed "${args[@]}"
+        else
+          npx --yes "agentscm@$AGENTSCM_NPM_VERSION" --no-telemetry deployed "${args[@]}"
+        fi

@@ -2,15 +2,17 @@
 
 use crate::change_record::{
     ActionFinishV1, ActionOutcomeV1, ActionStartV1, ActionSummaryV1, ApplicabilityV1,
-    AssuranceBasisV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1,
-    ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
-    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DriftV1, IntentSummaryV1,
-    MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1, SessionCoverageV1,
-    SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
+    AssuranceBasisV1, CapturedAttributionV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1,
+    CompletenessV1, ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
+    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DiffReferenceV1, DriftV1,
+    IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
+    ReviewProjectionV1, SessionCoverageV1, SessionSetupV1, SourceBindingV1, SubjectSummaryV1,
+    UnknownFactV1,
 };
 
 use super::viewer::Viewer;
 use super::work::{Checkpoint, SourceRef, WorkItem};
+use super::work_http::actionable_status;
 use super::{HubError, Result};
 
 /// Lifecycle of one shared-conversation body declaration, keyed by (work, digest, author).
@@ -173,6 +175,7 @@ pub struct StoredActionV1 {
     pub start: ActionStartV1,
     pub finish: Option<ActionFinishV1>,
     pub source_id: String,
+    pub author_token: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -215,6 +218,53 @@ pub fn project(
         source: stored.start.source.clone(),
     });
     let latest_action = action.as_ref().map(|stored| action_summary(item, stored));
+    let captured_by = action.as_ref().and_then(|stored| {
+        let participant = item.participants.iter().find(|participant| {
+            participant.token == stored.author_token
+                && participant.session == stored.start.session_id
+        })?;
+        let mut session_id = stored.start.session_id.clone();
+        viewer.session(
+            Some(&participant.owner),
+            &participant.token,
+            &mut session_id,
+        );
+        let mut agent = participant.agent.clone();
+        viewer.label(Some(&participant.owner), &mut agent);
+        Some(CapturedAttributionV1 { agent, session_id })
+    });
+    let diff = action.as_ref().map(|stored| match &stored.start.source {
+        SourceBindingV1::Native {
+            repository,
+            revision,
+            change_id,
+            ..
+        } => DiffReferenceV1::Native {
+            repository: repository.clone(),
+            revision: revision.clone(),
+            change_id: change_id.clone(),
+        },
+        SourceBindingV1::Git {
+            repository,
+            worktree_id,
+            base,
+            head,
+            dirty,
+            untracked_count,
+            omissions,
+            snapshot_coverage,
+            ..
+        } => DiffReferenceV1::Git {
+            repository: repository.clone(),
+            worktree_id: worktree_id.clone(),
+            base: base.clone(),
+            head: head.clone(),
+            dirty: *dirty,
+            untracked_count: *untracked_count,
+            omissions: omissions.clone(),
+            snapshot_coverage: *snapshot_coverage,
+        },
+    });
     let result_coverage = latest_action
         .as_ref()
         .map_or(CoverageV1::Unknown, |action| {
@@ -276,13 +326,25 @@ pub fn project(
             viewer.session(owner, token, session);
         }
     }
+    let review_concerns =
+        review_concerns(session_coverage, latest_action.as_ref(), action.as_ref());
+    let encoded_repository = item.repository.replace('/', "%2F");
     ChangeRecordSummaryV1 {
         schema_version: crate::change_record::SCHEMA_VERSION_V1,
         work_id: item.id.clone(),
         generation: item.generation,
+        updated_seq: item.updated_seq,
         as_of,
         intent: IntentSummaryV1 {
             title: item.title.clone(),
+            description: item.description.clone(),
+            repository: item.repository.clone(),
+            branch: item.branch.clone(),
+            provenance: match item.source {
+                super::work::WorkSource::Native { .. } => "native",
+                super::work::WorkSource::Forge { .. } => "forge",
+            }
+            .into(),
             scope: item
                 .scope
                 .iter()
@@ -320,7 +382,104 @@ pub fn project(
             usage: usage_coverage,
         },
         unknowns,
+        review: Some(ReviewProjectionV1 {
+            captured_by,
+            diff,
+            actual_scope: CoverageV1::Unknown,
+            concerns: review_concerns,
+            detail_links: vec![
+                format!(
+                    "/v1/hub/repos/{}/change-records/{}",
+                    encoded_repository, item.id
+                ),
+                format!(
+                    "/v1/hub/repos/{}/change-records/{}/conversation",
+                    encoded_repository, item.id
+                ),
+                "/v1/hub/standup/status".into(),
+            ],
+            next_actor: None,
+            supported_action: None,
+            establishes_approval: false,
+        }),
     }
+}
+
+/// Add operational guidance only when a non-atomic status read names the exact Work version.
+/// A missing, failed or stale status read leaves the bounded capture projection explicitly
+/// unknown; it never promotes older evidence to current.
+pub fn enrich_actionable_status(
+    summary: &mut ChangeRecordSummaryV1,
+    status: Option<&actionable_status::ActionableStatus>,
+) {
+    let Some(review) = summary.review.as_mut() else {
+        return;
+    };
+    let Some(row) = status.and_then(|status| {
+        status.work.iter().find(|row| {
+            row.work_id == summary.work_id
+                && row.generation == summary.generation
+                && row.updated_seq == summary.updated_seq
+        })
+    }) else {
+        if !review
+            .concerns
+            .iter()
+            .any(|value| value == "actionable_status_unavailable_or_stale")
+        {
+            review
+                .concerns
+                .push("actionable_status_unavailable_or_stale".into());
+        }
+        return;
+    };
+    review.next_actor = Some(actionable_status::recipient_label(&row.recipient));
+    review.supported_action = Some(row.action.clone());
+    review
+        .concerns
+        .retain(|value| value != "supported_next_action_requires_actionable_status");
+}
+
+fn review_concerns(
+    sessions: CoverageV1,
+    latest: Option<&ActionSummaryV1>,
+    stored: Option<&StoredActionV1>,
+) -> Vec<String> {
+    let mut concerns = Vec::new();
+    if sessions != CoverageV1::Complete {
+        concerns.push("capture_history_incomplete_or_unknown".into());
+    }
+    if latest.is_none() {
+        concerns.push("no_captured_action".into());
+    }
+    if latest.is_some_and(|action| action.outcome != ActionOutcomeV1::Succeeded) {
+        concerns.push("latest_execution_not_successful".into());
+    }
+    if latest.is_some_and(|action| action.result != CheckResultV1::Passed) {
+        concerns.push("latest_check_not_passing".into());
+    }
+    if latest.is_some_and(|action| action.applicability != ApplicabilityV1::Current) {
+        concerns.push("current_source_applicability_not_established".into());
+    }
+    if let Some(stored) = stored
+        && let SourceBindingV1::Git {
+            dirty,
+            untracked_count,
+            omissions,
+            ..
+        } = &stored.start.source
+    {
+        if *dirty || *untracked_count > 0 {
+            concerns.push("captured_source_dirty_or_untracked".into());
+        }
+        if !omissions.is_empty() {
+            concerns.push("captured_source_has_omissions".into());
+        }
+    }
+    concerns.push("actual_changed_scope_requires_source_diff".into());
+    concerns.push("supported_next_action_requires_actionable_status".into());
+    concerns.push("approval_and_readiness_not_established".into());
+    concerns
 }
 
 fn decision_summary(
@@ -490,6 +649,35 @@ fn aggregate_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn summary_for_status() -> ChangeRecordSummaryV1 {
+        serde_json::from_value(json!({
+            "schema_version":1,"work_id":format!("wrk_{}", "a".repeat(32)),"generation":2,
+            "updated_seq":17,"as_of":20,
+            "intent":{"title":"status fixture","repository":"acme/widgets","provenance":"forge","scope":[],"scope_omitted":0},
+            "subject":null,"sessions":{"count":0,"coverage":"unknown","gaps":0},
+            "latest_action":null,
+            "decision":{"status":"missing","reference":null,"summary":null,"source_refs":[],"source_refs_omitted":0,"author_kind":null,"author_agent":null,"at":null,"generation":null},
+            "next_action":"agent-reported follow-up",
+            "completeness":{"events":"unknown","source":"unknown","setup":"unknown","recipe":"unknown","result":"unknown","usage":"unknown"},
+            "unknowns":["human_decision"],
+            "review":{"captured_by":null,"diff":null,"actual_scope":"unknown","concerns":["supported_next_action_requires_actionable_status"],"detail_links":[],"next_actor":null,"supported_action":null,"establishes_approval":false}
+        })).unwrap()
+    }
+
+    fn status_for(summary: &ChangeRecordSummaryV1) -> actionable_status::ActionableStatus {
+        let mut status: actionable_status::ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let row = status.work.first_mut().unwrap();
+        row.work_id = summary.work_id.clone();
+        row.generation = summary.generation;
+        row.updated_seq = summary.updated_seq;
+        row.action = "Ask the owner for a decision.".into();
+        row.recipient.kind = actionable_status::RecipientKind::Person;
+        row.recipient.login = Some("builder".into());
+        status
+    }
 
     fn row(author: &str, state: SharedBodyState) -> SharedBodyRow {
         SharedBodyRow {
@@ -558,5 +746,42 @@ mod tests {
     #[test]
     fn availability_is_not_inferred_from_result() {
         assert_eq!(aggregate_availability(&[]), ContentAvailabilityV1::Missing);
+    }
+
+    #[test]
+    fn actionable_status_enrichment_requires_the_exact_work_version() {
+        let mut exact = summary_for_status();
+        let status = status_for(&exact);
+        enrich_actionable_status(&mut exact, Some(&status));
+        let review = exact.review.as_ref().unwrap();
+        assert_eq!(review.next_actor.as_deref(), Some("builder"));
+        assert_eq!(
+            review.supported_action.as_deref(),
+            Some("Ask the owner for a decision.")
+        );
+        assert!(exact.unknowns.contains(&UnknownFactV1::HumanDecision));
+
+        let mut stale = summary_for_status();
+        stale.updated_seq += 1;
+        enrich_actionable_status(&mut stale, Some(&status));
+        let review = stale.review.as_ref().unwrap();
+        assert!(review.supported_action.is_none());
+        assert!(
+            review
+                .concerns
+                .iter()
+                .any(|value| value == "actionable_status_unavailable_or_stale")
+        );
+
+        let mut unavailable = summary_for_status();
+        enrich_actionable_status(&mut unavailable, None);
+        assert!(
+            unavailable
+                .review
+                .unwrap()
+                .concerns
+                .iter()
+                .any(|value| value == "actionable_status_unavailable_or_stale")
+        );
     }
 }

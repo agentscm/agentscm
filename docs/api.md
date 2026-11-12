@@ -572,14 +572,20 @@ post, `uncertain`, `posted` or `refused`), `ruleset_requirement`, `status_source
 
 ## Hub publication external outcomes
 
-This is the Hub, not `serve`. When the repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`
-and the publication has a merge commit, `GET /v1/hub/repos/{repo}/publications/{id}` adds a
-read-only `external` object; otherwise the reply has no such field. It reads the Hub's store
-and calls no forge. Fields: `provider` (`github`), `note` (observed after landing, not
+This is the Hub, not `serve`. When the publication has a merge commit and either the
+repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS` or the Hub holds a deployment of that
+commit, `GET /v1/hub/repos/{repo}/publications/{id}` adds a read-only `external` object;
+otherwise the reply has no such field. It reads the Hub's store and calls no forge. Fields:
+`provider` (the connection's, `github` or `gitlab`), `watched` (whether the Hub reads this
+repository's runs and deployments from the forge), `note` (observed after landing, not
 evidence for the landing decision), `merge_commit`, `state`, `reconciled_at` (unix seconds of
 the last read, or null), `ci` (`run_id`, `attempt`, `branch`, `name`, `outcome`,
 `provider_updated_at`, `html_url`) and `deployments` (`run_id`, `environment`, `name`,
-`outcome`, `provider_updated_at`, `html_url`). `outcome` is `pending`, `running`,
+`outcome`, `source`, `provider_updated_at`, `html_url`). `source` is `forge` (read from the
+forge, not written by AgentSCM) or `recorded` (written through
+[`POST .../deployments`](#hub-recorded-deployments)); `workflow` and `agent` are reserved.
+`state` describes only the forge read: a repository that is not watched is always
+`unobserved`, and its `deployments` then hold only what was recorded, which still counts. `outcome` is `pending`, `running`,
 `succeeded`, `failed`, `cancelled`, `superseded` or `unknown`. `state` is `unobserved` (no
 read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind exist) or
 `observed`. Under `incomplete` the lists may be non-empty but are partial, and under
@@ -597,6 +603,24 @@ and that repository's current name: `connected` says the Hub has a connection fo
 `supported` is true only when that connection is GitHub, and `watched` only when it is also
 listed in `opt_in`, which is `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A listed repository the Hub is not
 connected to is not watched, and `provider` is then the token owner's.
+
+### Hub recorded deployments
+
+`POST /v1/hub/repos/{repo}/deployments` (agent bearer token for that repository; read-only
+tokens are refused) with `{"commit", "environment", "status", "url"?}` records on the forge
+that `commit` (40 lowercase hex) is in `environment` (1 to 200 characters, trimmed) with
+`status` `success`, `failure` or `in_progress`. `url` is an optional http(s) address of the
+deployed app, kept on GitHub only. The Hub writes with the credential it holds for the
+repository: GitHub's deployments API through its App installation (or token connection),
+GitLab's deployments API through its connection's token. It reuses the commit's newest
+deployment to that environment and adds a status only when that deployment's newest one
+differs, one request at a time per repository, then stores the row. The reply is
+`{"recorded", "provider", "repository", "commit", "environment", "outcome", "source",
+"deployment_id"}`; `recorded` is false when nothing needed writing. A credential that may not
+write deployments is `403` `forge_permission_missing` with a message naming the permission;
+nothing is recorded. A repository the Hub has not connected is `403` `not_connected`. A forge
+rate limit is `429` `rate_limited`; any other forge failure is `503` `unavailable`, and a
+timeout may still have been recorded, so retry. `agentscm deployed` calls this route.
 
 ## Hub: requests and replies across versions
 
@@ -766,6 +790,7 @@ Registered codes:
 | `owner_disabled` | 409 | no | `ask_owner` |
 | `owner_wrong_forge` | 409 | no | `provide_field` |
 | `repository_renamed` | 409 | no | `inspect_work` |
+| `forge_permission_missing` | 403 | no | `ask_owner` |
 
 ## HTTP boundaries
 
