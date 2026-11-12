@@ -998,6 +998,18 @@ fn setup_actions(
     )
 }
 
+/// Where unfinished Work sorts when a session is named by the Work it leads: active, then
+/// blocked, then paused, the one updated last first. Finished Work has no place.
+fn lead_order(i: &WorkItem) -> Option<(u8, std::cmp::Reverse<i64>, &str)> {
+    let rank = match i.state {
+        WorkState::Active => 0,
+        WorkState::Blocked => 1,
+        WorkState::Paused => 2,
+        WorkState::Finished | WorkState::Handover => return None,
+    };
+    Some((rank, std::cmp::Reverse(i.updated_at), i.id.as_str()))
+}
+
 /// The viewer's own sessions that stopped for them: a permission prompt or a question always
 /// needs them; the end of a turn only while that session leads unfinished Work, or a session that
 /// started it does, in any repository and through any number of sessions, since a finished chat
@@ -1032,15 +1044,9 @@ fn waiting_actions(
             store.owner_lead_sessions(owner)?,
         )
     };
-    let unfinished = |i: &WorkItem| {
-        matches!(
-            i.state,
-            WorkState::Active | WorkState::Blocked | WorkState::Paused
-        )
-    };
     let mut actions = Vec::new();
     for wait in waits {
-        let led = items
+        let mut led = items
             .values()
             .filter(|i| {
                 // A wait kept under its person is the session's whichever token leads its Work.
@@ -1049,9 +1055,10 @@ fn waiting_actions(
                 } else {
                     i.lead_token == wait.token
                 };
-                leads && i.lead_session == wait.session && unfinished(i)
+                leads && i.lead_session == wait.session && lead_order(i).is_some()
             })
             .collect::<Vec<_>>();
+        led.sort_by_key(|&i| lead_order(i));
         // The sessions that started this one, nearest first.
         let above = session_ancestors(&starts, &wait.session);
         let holds_up = above
@@ -1066,7 +1073,10 @@ fn waiting_actions(
             let task = above.iter().find_map(|session| {
                 items
                     .values()
-                    .find(|i| i.owner == owner && i.lead_session == *session && unfinished(i))
+                    .filter(|i| {
+                        i.owner == owner && i.lead_session == *session && lead_order(i).is_some()
+                    })
+                    .min_by_key(|&i| lead_order(i))
             });
             match task {
                 Some(i) => format!(
@@ -3424,6 +3434,134 @@ mod tests {
     #[test]
     fn a_started_sessions_wait_reaches_its_person_while_its_starter_leads_work_on_postgres() {
         on_postgres(started_wait_contract);
+    }
+
+    /// A session that leads more than one unfinished Work is named by its active one, not by
+    /// whichever id sorts first.
+    #[test]
+    fn a_wait_names_the_active_work_before_an_older_paused_one() {
+        use crate::hub::session_waiting::{GRACE_SECONDS, WaitReason};
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 621,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let viewer = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        const STARTER: &str = "66666666-6666-4666-8666-666666666666";
+        const KID: &str = "77777777-7777-4777-8777-777777777777";
+        let led = |session: &str, id: &str, title: &str, state, updated_at| {
+            let mut i = item(state);
+            i.id = id.into();
+            i.title = title.into();
+            i.updated_at = updated_at;
+            i.owner = viewer.owner.id.clone();
+            i.lead_token = viewer.token_id.clone();
+            i.lead_session = session.into();
+            (i.id.clone(), i)
+        };
+        let items = BTreeMap::from([
+            led(
+                "working",
+                "wrk_0000",
+                "Old paused task",
+                WorkState::Paused,
+                100,
+            ),
+            led(
+                "working",
+                "wrk_ffff",
+                "Current task",
+                WorkState::Active,
+                200,
+            ),
+            led(STARTER, "wrk_1000", "Old lead", WorkState::Paused, 100),
+            led(STARTER, "wrk_eeee", "Current lead", WorkState::Active, 200),
+        ]);
+        let observations = Observations::default();
+        observations
+            .waiting()
+            .record(
+                &viewer,
+                "working",
+                "working",
+                "claude",
+                WaitReason::Idle,
+                None,
+                None,
+                now - GRACE_SECONDS,
+            )
+            .unwrap();
+        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            actions[0].action.contains("on “Current task”"),
+            "{}",
+            actions[0].action
+        );
+        assert_eq!(actions[0].work_ids, vec!["wrk_ffff", "wrk_0000"]);
+        // A session its starter started names the starter's active task, not its older paused one.
+        let seen = crate::hub::session::SessionCall {
+            session: Some(STARTER.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: vec![],
+            deny: false,
+            report: false,
+        };
+        store.touch_session(&viewer.token_id, &seen, now).unwrap();
+        store
+            .session_started_by(&user.id, KID, STARTER, now)
+            .unwrap();
+        observations
+            .waiting()
+            .record(
+                &viewer,
+                KID,
+                KID,
+                "claude",
+                WaitReason::Question,
+                None,
+                Some("Shall I merge it?"),
+                now - GRACE_SECONDS,
+            )
+            .unwrap();
+        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        let started = actions
+            .iter()
+            .find(|a| a.action.contains("started under"))
+            .unwrap_or_else(|| panic!("{actions:?}"));
+        assert!(
+            started
+                .action
+                .contains("started under your session on “Current lead”"),
+            "{}",
+            started.action
+        );
     }
 
     #[test]
