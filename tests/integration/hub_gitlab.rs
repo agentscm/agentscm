@@ -3,14 +3,18 @@
 use crate::fake_gitlab;
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::connection::{ConnectedRepository, Observed};
+use agentscm::hub::HubError;
+use agentscm::hub::connection::{ConnectedRepository, Connection, NewConnection, Observed};
+use agentscm::hub::gitlab::Namespace;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
-use agentscm::hub::sync::{self, PollReport, Sync, SyncConfig};
+use agentscm::hub::sync::{self, ConnectionCredentials, PollReport, Sync, SyncConfig};
 use agentscm::hub::{HubState, router};
 use axum::extract::Form;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -1627,6 +1631,53 @@ async fn catchup_discovers_ordinary_gitlab_merges_and_keeps_rename_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_merge_requests_keep_their_labels_and_source_project() {
+    let env = Env::start().await;
+    add_mr(&env, 81, &["src/a.rs"]);
+    env.mr(81, |mr| {
+        mr.labels = vec!["bug".into(), "needs review".into()]
+    });
+    env.poll().await;
+    let data = env.pr_data(81);
+    assert_eq!(data["labels"], json!(["bug", "needs review"]));
+    assert_eq!(data["head_repository_id"], json!(REPO_ID));
+    assert_eq!(data["repository_id"], json!(REPO_ID));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_finds_a_fast_forward_gitlab_merge_by_its_head() {
+    use agentscm::hub::catchup::CatchupQuery;
+    use agentscm::hub::store::mint_bound_agent_token;
+    let env = Env::start().await;
+    add_mr(&env, 82, &["src/ff.rs"]);
+    // A fast-forward merge leaves no merge or squash commit: the merged head is the landed commit.
+    env.mr(82, |mr| mr.state = "merged".into());
+    let head = env.fake.with(|s| s.projects[&REPO_ID].mrs[&82].sha.clone());
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: env.host.clone(),
+                user_id: 82,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    env.poll().await;
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(page.merges.len(), 1);
+    assert_eq!(page.merges[0].pull_number, 82);
+    assert_eq!(page.merges[0].merge_commit, head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
     use agentscm::hub::catchup::{CatchupCoverageState, CatchupMergeSource, CatchupQuery};
     use agentscm::hub::store::mint_bound_agent_token;
@@ -1730,4 +1781,361 @@ async fn a_recorded_deployment_is_written_with_the_connections_token() {
             .contains("Developer role")
     );
     assert_eq!(env.fake.with(|s| s.projects[&REPO_ID].deployments.len()), 1);
+}
+
+// ---- connections whose credential an embedder supplies ----
+
+/// An embedder: a token per connection, repositories it does not bind, and followed namespaces.
+#[derive(Default)]
+struct Embedder {
+    tokens: HashMap<String, String>,
+    inactive: BTreeSet<i64>,
+    namespaces: HashMap<String, Namespace>,
+}
+
+impl ConnectionCredentials for Embedder {
+    fn token<'a>(
+        &'a self,
+        connection: &'a Connection,
+    ) -> Pin<Box<dyn Future<Output = agentscm::hub::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.tokens
+                .get(&connection.id)
+                .cloned()
+                .ok_or(HubError::Unauthorized)
+        })
+    }
+
+    fn active(&self, _: &Connection, repository: &ConnectedRepository) -> bool {
+        !self.inactive.contains(&repository.repository_id)
+    }
+
+    fn namespace(&self, connection: &Connection) -> Option<Namespace> {
+        self.namespaces.get(&connection.id).copied()
+    }
+}
+
+struct Embedded {
+    state: HubState,
+    store: Arc<dyn Store>,
+    url: String,
+    host: String,
+    _dir: TempDir,
+}
+
+const EMBEDDED_A: &str = "con_000000000000000000000000000000aa";
+const EMBEDDED_B: &str = "con_000000000000000000000000000000bb";
+
+/// A hub with only a GitLab URL (no token) and two `embedded` connections on the fake's host.
+async fn embedded_hub(fake: &FakeGitlab, embedder: Option<Embedder>) -> Embedded {
+    let dir = TempDir::new().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        dir.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let base = fake.base.clone();
+    let config = SyncConfig::from_lookup(&url, dir.path().join("secrets"), 14, |name| {
+        (name == "AGENTSCM_GITLAB_URL").then(|| base.clone())
+    })
+    .unwrap();
+    let mut sync = Sync::new(config).unwrap();
+    if let Some(embedder) = embedder {
+        sync = sync.with_connection_credentials(Arc::new(embedder));
+    }
+    let state = HubState::new(
+        store.clone(),
+        Arc::new(LocalBackend::open(dir.path().join("objects")).unwrap()),
+    )
+    .with_sync(sync);
+    sync::start(&state).await.unwrap();
+    let app = router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let host = base
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    for (id, login) in [(EMBEDDED_A, "robot-a"), (EMBEDDED_B, "robot-b")] {
+        store
+            .insert_connection(
+                &NewConnection {
+                    id: id.into(),
+                    provider: "gitlab".into(),
+                    host: host.clone(),
+                    kind: "embedded".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some(login.into()),
+                },
+                "test",
+            )
+            .unwrap();
+    }
+    Embedded {
+        state,
+        store,
+        url,
+        host,
+        _dir: dir,
+    }
+}
+
+fn add_token(fake: &FakeGitlab, token: &str, username: &str, projects: &[i64]) {
+    fake.with(|s| {
+        s.tokens.insert(
+            token.into(),
+            Token {
+                username: username.into(),
+                user_id: 70,
+                access: projects.iter().map(|id| (*id, 30)).collect(),
+            },
+        );
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_connections_poll_with_their_own_tokens_and_skip_inactive_repositories() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        for (id, name) in [
+            (101, "team-a/one"),
+            (102, "team-b/two"),
+            (103, "team-a/unbound"),
+        ] {
+            let mut project = Project::new(id, name, "private");
+            project
+                .mrs
+                .insert(1, Mr::new(1, &format!("feature-{id}"), &["src/lib.rs"]));
+            s.projects.insert(id, project);
+        }
+    });
+    add_token(&fake, "token-a", "robot-a", &[101, 103]);
+    add_token(&fake, "token-b", "robot-b", &[102]);
+    let embedder = Embedder {
+        tokens: [
+            (EMBEDDED_A.to_owned(), "token-a".to_owned()),
+            (EMBEDDED_B.to_owned(), "token-b".to_owned()),
+        ]
+        .into(),
+        inactive: [103].into(),
+        ..Embedder::default()
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+    for (connection, id, name) in [
+        (EMBEDDED_A, 101, "team-a/one"),
+        (EMBEDDED_A, 103, "team-a/unbound"),
+        (EMBEDDED_B, 102, "team-b/two"),
+    ] {
+        hub.store
+            .upsert_repository(connection, &hub.host, id, name, None, None)
+            .unwrap();
+    }
+
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    let polled: BTreeSet<(String, String)> = reports
+        .iter()
+        .map(|r| (r.connection.clone(), r.repository.clone()))
+        .collect();
+    assert_eq!(
+        polled,
+        [
+            (EMBEDDED_A.to_owned(), "team-a/one".to_owned()),
+            (EMBEDDED_B.to_owned(), "team-b/two".to_owned()),
+        ]
+        .into()
+    );
+    assert!(reports.iter().all(|r| r.pull_requests == 1), "{reports:?}");
+    let requests = fake.with(|s| s.requests.clone());
+    let carried = |project: &str| -> BTreeSet<Option<String>> {
+        requests
+            .iter()
+            .filter(|r| r.path_and_query.contains(&format!("/projects/{project}")))
+            .map(|r| r.auth.clone())
+            .collect()
+    };
+    assert_eq!(carried("101"), [Some("Bearer token-a".to_owned())].into());
+    assert_eq!(carried("102"), [Some("Bearer token-b".to_owned())].into());
+    assert!(
+        carried("103").is_empty(),
+        "an inactive repository is never read"
+    );
+    for id in [EMBEDDED_A, EMBEDDED_B] {
+        assert_eq!(hub.store.connection(id).unwrap().unwrap().status, "enabled");
+    }
+
+    // Polling only: a delivery to an embedded connection is refused before anything is recorded.
+    let status = fake_gitlab::deliver(
+        &hub.url,
+        EMBEDDED_A,
+        "Merge Request Hook",
+        "uuid-1",
+        &json!({"project": {"id": 101}, "object_attributes": {"iid": 1}}),
+        "any-token",
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_embedded_connection_without_an_embedder_fails_as_a_credential() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        s.projects
+            .insert(101, Project::new(101, "team-a/one", "private"));
+    });
+    let hub = embedded_hub(&fake, None).await;
+    hub.store
+        .upsert_repository(EMBEDDED_A, &hub.host, 101, "team-a/one", None, None)
+        .unwrap();
+    assert!(sync::poll_once(&hub.state).await.unwrap().is_empty());
+    let conn = hub.store.connection(EMBEDDED_A).unwrap().unwrap();
+    assert_eq!(conn.status, "auth_failed");
+    assert!(
+        conn.status_detail.unwrap_or_default().contains("embedder"),
+        "the detail names the missing credential"
+    );
+    assert!(
+        fake.with(|s| s.requests.is_empty()),
+        "GitLab is never called"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followed_namespace_connects_its_projects_across_pages_up_to_the_cap() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        let mut add = |id: i64, name: String, namespaces: Vec<i64>, archived: bool| {
+            let mut project = Project::new(id, &name, "internal");
+            project.namespaces = namespaces;
+            project.archived = archived;
+            s.projects.insert(id, project);
+        };
+        add(1, "acme/old".into(), vec![7], true);
+        add(2, "other/thing".into(), vec![9], false);
+        add(3, "acme/top".into(), vec![7], false);
+        // 1,050 more in a subgroup: eleven pages of 100, one past the cap.
+        for id in 10..1060 {
+            add(id, format!("acme/sub/p{id}"), vec![8, 7], false);
+        }
+        add(5000, "someone/own".into(), vec![55], false);
+    });
+    add_token(&fake, "token-a", "robot-a", &[]);
+    add_token(&fake, "token-b", "robot-b", &[]);
+    let embedder = Embedder {
+        tokens: [
+            (EMBEDDED_A.to_owned(), "token-a".to_owned()),
+            (EMBEDDED_B.to_owned(), "token-b".to_owned()),
+        ]
+        .into(),
+        // Only a few are bound, so the poll reads those and the listing alone covers the rest.
+        inactive: (10..1060).filter(|id| *id != 10 && *id != 150).collect(),
+        namespaces: [
+            (EMBEDDED_A.to_owned(), Namespace::Group(7)),
+            (EMBEDDED_B.to_owned(), Namespace::User(55)),
+        ]
+        .into(),
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    let capped: Vec<&PollReport> = reports.iter().filter(|r| r.repository.is_empty()).collect();
+    assert!(
+        capped.iter().all(|r| r.connection == EMBEDDED_A),
+        "{reports:?}"
+    );
+    // The listing passed its page cap, and the 1,000 connected repositories fill the stored list.
+    assert_eq!(
+        capped
+            .iter()
+            .map(|r| r.truncated.clone())
+            .collect::<Vec<_>>(),
+        [
+            json!({"namespace_projects": 1}),
+            json!({"repositories": 1000})
+        ]
+    );
+
+    let connected = |connection: &str| -> BTreeSet<i64> {
+        hub.store
+            .repositories(connection)
+            .unwrap()
+            .iter()
+            .map(|r| r.repository_id)
+            .collect()
+    };
+    let group = connected(EMBEDDED_A);
+    assert_eq!(group.len(), 1000, "ten pages of 100");
+    assert!(group.contains(&3) && group.contains(&10) && group.contains(&150));
+    assert!(!group.contains(&1), "an archived project is skipped");
+    assert!(
+        !group.contains(&2),
+        "another group's project is not followed"
+    );
+    assert_eq!(connected(EMBEDDED_B), [5000].into());
+
+    let polled: BTreeSet<String> = reports
+        .iter()
+        .filter(|r| !r.repository.is_empty())
+        .map(|r| r.repository.clone())
+        .collect();
+    assert_eq!(
+        polled,
+        ["acme/sub/p10", "acme/sub/p150", "acme/top", "someone/own"]
+            .map(String::from)
+            .into()
+    );
+    let listings: Vec<String> = fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.path_and_query.contains("/groups/7/projects"))
+            .map(|r| r.path_and_query.clone())
+            .collect()
+    });
+    assert_eq!(listings.len(), 10, "{listings:?}");
+    assert!(
+        listings
+            .iter()
+            .all(|q| q.contains("include_subgroups=true") && q.contains("archived=false"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_namespace_listing_that_fails_still_polls_the_connected_repositories() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        let mut project = Project::new(101, "team-a/one", "private");
+        project.mrs.insert(1, Mr::new(1, "feat/1", &["src/a.rs"]));
+        s.projects.insert(101, project);
+    });
+    add_token(&fake, "token-a", "robot-a", &[101]);
+    let embedder = Embedder {
+        tokens: [(EMBEDDED_A.to_owned(), "token-a".to_owned())].into(),
+        // A group the token cannot read: the listing answers 404.
+        namespaces: [(EMBEDDED_A.to_owned(), Namespace::Group(999))].into(),
+        ..Embedder::default()
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+    hub.store
+        .upsert_repository(EMBEDDED_A, &hub.host, 101, "team-a/one", None, None)
+        .unwrap();
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    assert!(
+        reports.iter().any(|r| r.repository == "team-a/one"),
+        "{reports:?}"
+    );
+    let conn = hub
+        .store
+        .connections()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == EMBEDDED_A)
+        .unwrap();
+    assert_eq!(
+        conn.status, "enabled",
+        "a listing answer is not a credential failure"
+    );
 }

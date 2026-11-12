@@ -89,9 +89,12 @@ pub(super) struct FrontDoor {
     retired: Arc<Mutex<Vec<CachedToken>>>,
     hub_reads: tokio::sync::Semaphore,
     client: reqwest::Client,
-    /// Days each Hub said it keeps a shared conversation (`None`: it did not say), by Hub URL.
-    retention: Mutex<HashMap<String, (Instant, Option<i64>)>>,
+    /// Days each Hub said a repository keeps a shared conversation (`None`: it did not say).
+    retention: Mutex<HashMap<HubRepository, (Instant, Option<i64>)>>,
 }
+
+/// A Hub URL and a repository on it.
+type HubRepository = (String, String);
 
 #[derive(Default)]
 struct Codes {
@@ -231,11 +234,11 @@ impl FrontDoor {
         })
     }
 
-    fn cached_retention(&self, hub: &str) -> Option<(Instant, Option<i64>)> {
+    fn cached_retention(&self, connection: &Connection) -> Option<(Instant, Option<i64>)> {
         self.retention
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(hub)
+            .get(&(connection.hub.clone(), connection.repo.clone()))
             .copied()
     }
 
@@ -243,7 +246,7 @@ impl FrontDoor {
     /// checkout's own agent token. `None` when the Hub is unreachable, slow, older or says
     /// nothing usable; the answer (or its absence) is reused for [`RETENTION_TTL`].
     async fn retention_days(&self, connection: &Connection) -> Option<i64> {
-        if let Some((at, days)) = self.cached_retention(&connection.hub)
+        if let Some((at, days)) = self.cached_retention(connection)
             && at.elapsed() < RETENTION_TTL
         {
             return days;
@@ -272,7 +275,10 @@ impl FrontDoor {
         self.retention
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(connection.hub.clone(), (Instant::now(), days));
+            .insert(
+                (connection.hub.clone(), connection.repo.clone()),
+                (Instant::now(), days),
+            );
         days
     }
 
@@ -897,27 +903,25 @@ async fn capture_settings(State(front_door): State<Arc<FrontDoor>>) -> Response 
     })
     .await
     .unwrap_or_default();
-    // One lookup per Hub, all at once, so a slow Hub delays the list by one timeout at most.
+    // One lookup per Hub and repository, all at once, so a slow Hub delays the list by one
+    // timeout at most.
+    let key = |connection: &Connection| (connection.hub.clone(), connection.repo.clone());
     let mut lookups = tokio::task::JoinSet::new();
-    let mut hubs = std::collections::BTreeSet::new();
+    let mut asked = std::collections::BTreeSet::new();
     for connection in &connections {
-        if hubs.insert(connection.hub.clone()) {
+        if asked.insert(key(connection)) {
             let (door, connection) = (front_door.clone(), connection.clone());
-            lookups.spawn(async move {
-                (
-                    connection.hub.clone(),
-                    door.retention_days(&connection).await,
-                )
-            });
+            lookups
+                .spawn(async move { (key(&connection), door.retention_days(&connection).await) });
         }
     }
-    let mut days: HashMap<String, Option<i64>> = HashMap::new();
-    while let Some(Ok((hub, found))) = lookups.join_next().await {
-        days.insert(hub, found);
+    let mut days: HashMap<HubRepository, Option<i64>> = HashMap::new();
+    while let Some(Ok((asked, found))) = lookups.join_next().await {
+        days.insert(asked, found);
     }
     for (row, connection) in rows.iter_mut().zip(&connections) {
         row["shared_conversation_retention_days"] =
-            json!(days.get(&connection.hub).copied().flatten());
+            json!(days.get(&key(connection)).copied().flatten());
     }
     Json(json!({"version": 1, "checkouts": rows})).into_response()
 }
@@ -993,7 +997,7 @@ async fn capture_change(
     match outcome {
         Ok(Some(Ok(connection))) => {
             let days = front_door
-                .cached_retention(&connection.hub)
+                .cached_retention(&connection)
                 .and_then(|(_, days)| days);
             let row = capture_row(&front_door.instance, &connection, days);
             Json(json!({"version": 1, "checkout": row})).into_response()

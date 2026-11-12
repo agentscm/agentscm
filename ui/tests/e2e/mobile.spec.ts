@@ -121,6 +121,8 @@ test('change record detail wraps long source, recipe and setup identities', asyn
   await signIn(page)
   await page.evaluate((workId) => { window.location.hash = `change-record/${workId}` }, CHANGE_RECORD_WORK_ID)
   await expect(page.getByRole('heading', { level: 1, name: 'Inspect a narrow change record' })).toBeVisible()
+  await page.getByText('Source, check and decision details', { exact: true }).click()
+  await page.getByText('Stable source identity', { exact: true }).click()
   await expect(page.locator('code:visible').filter({ hasText: SOURCE_ID }).first()).toHaveText(SOURCE_ID)
   const receiptIdentities = page.locator('details').filter({ hasText: 'Receipt identities' })
   await receiptIdentities.getByText('Receipt identities', { exact: true }).click()

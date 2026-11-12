@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildExplorerContextPacket,
+  exactComparisonFromHash,
   ExplorerPage,
 } from '../../src/pages/Explorer.tsx'
 import {
@@ -122,6 +123,48 @@ describe('repository explorer decoders', () => {
 })
 
 describe('repository explorer journey', () => {
+  it('accepts only repository-bound full object IDs for captured comparisons', () => {
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`)).toEqual({ repository: REPO, base: PARENT, head: COMMIT, worktree: 'worktree-1' })
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=main&head=${COMMIT}&worktree=worktree-1`)).toBeNull()
+    expect(exactComparisonFromHash(`#explorer?repo=${REPO}&base=${PARENT}&head=HEAD&worktree=worktree-1`)).toBeNull()
+    expect(exactComparisonFromHash(`#explorer?repo=../other&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`)).toBeNull()
+  })
+
+  it('refuses a captured comparison routed to another Hub repository without requesting its commits', async () => {
+    window.location.hash = `#explorer?repo=other/repository&base=${PARENT}&head=${COMMIT}&worktree=worktree-1`
+    const seen: URL[] = []
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      const url = new URL(String(input), 'http://localhost'); seen.push(url)
+      if (url.pathname.endsWith('/summary')) return json(summary())
+      if (url.pathname.endsWith('/tree')) return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path: '', entries: [], next: null, complete: true, limit_state: 'complete' })
+      throw new Error(`unexpected URL ${url}`)
+    })
+    render(<ExplorerPage hubRepository={REPO} />)
+    expect(await screen.findByText('Captured comparison not opened')).toBeTruthy()
+    expect(seen.some((url) => url.pathname.endsWith('/diff'))).toBe(false)
+    expect(seen.some((url) => url.pathname.endsWith('/summary'))).toBe(false)
+  })
+
+  it('replaces an exact comparison when the hash changes within the Explorer section', async () => {
+    const firstBase = '4'.repeat(40), firstHead = '5'.repeat(40)
+    const secondBase = '6'.repeat(40), secondHead = firstHead
+    const calls: URL[] = []
+    window.location.hash = `#explorer?repo=${REPO}&base=${firstBase}&head=${firstHead}&worktree=worktree-1`
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      const url = new URL(String(input), 'http://localhost'); calls.push(url)
+      if (url.pathname.endsWith('/summary')) return json({ ...summary(), commit: url.searchParams.get('ref'), repository_id: REPO })
+      if (url.pathname.endsWith('/tree')) return json({ version: 1, repository_id: REPO, commit: url.searchParams.get('commit'), tree: TREE, path: '', entries: [], next: null, complete: true, limit_state: 'complete' })
+      if (url.pathname.endsWith('/diff')) return json({ version: 1, repository_id: REPO, left: url.searchParams.get('left'), left_tree: TREE, right: url.searchParams.get('right'), right_tree: TREE, path: null, changes: [], patch: { state: 'text', content: '', truncated: false }, next: null, complete: true, limit_state: 'complete' })
+      throw new Error(`unexpected URL ${url}`)
+    })
+    render(<ExplorerPage hubRepository={REPO} />)
+    await screen.findByText('Captured commit comparison')
+    await waitFor(() => expect(calls.some((url) => url.pathname.endsWith('/diff') && url.searchParams.get('left') === firstBase && url.searchParams.get('right') === firstHead)).toBe(true))
+    act(() => { window.location.hash = `#explorer?repo=${REPO}&base=${secondBase}&head=${secondHead}&worktree=worktree-2`; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    await waitFor(() => expect(calls.some((url) => url.pathname.endsWith('/diff') && url.searchParams.get('left') === secondBase && url.searchParams.get('right') === secondHead)).toBe(true))
+    expect(screen.getByText(/worktree-2/)).toBeTruthy()
+  })
+
   it('renders and copies an unknown working-tree observation without claiming cleanliness', async () => {
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {
       const url = new URL(String(input), 'http://localhost')

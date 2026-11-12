@@ -375,10 +375,13 @@ fn hub_retention_is_reported_only_when_the_hub_says_a_valid_number() {
     let reported = hub_check_with(serde_json::json!({"shared_conversation_retention_days": 3650}));
     assert_eq!(reported["state"], "valid");
     assert_eq!(reported["shared_conversation_retention_days"], 3650);
+    // 0: the Hub keeps no bodies for this repository.
+    let none = hub_check_with(serde_json::json!({"shared_conversation_retention_days": 0}));
+    assert_eq!(none["shared_conversation_retention_days"], 0);
     // An older Hub, or a value no Hub would configure, is unknown rather than a guessed number.
     for extra in [
         serde_json::json!({}),
-        serde_json::json!({"shared_conversation_retention_days": 0}),
+        serde_json::json!({"shared_conversation_retention_days": -1}),
         serde_json::json!({"shared_conversation_retention_days": 3651}),
         serde_json::json!({"shared_conversation_retention_days": "30"}),
     ] {

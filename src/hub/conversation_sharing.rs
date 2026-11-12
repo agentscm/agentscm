@@ -1,12 +1,11 @@
 //! Whether agent conversations in a repository are shared with the Hub. A repository setting,
 //! changed by a repository admin (GitHub `admin`, GitLab maintainer or owner) or a Hub admin,
-//! falls back to a Hub-wide default that only Hub admins change. The default is on until a Hub
-//! admin sets it; a Hub that had people before the default became on keeps off (the
-//! `conversation_sharing_default` migration records it). Each person can
-//! opt their own sessions out, and is told once in their agent's session context that sharing is
-//! on. Connected checkouts follow the answer: the client reads it at session start and on hook
-//! calls, and the Hub refuses uploads while it says no. Values live in `hub_settings`, keyed by
-//! the forge's repository id so a rename keeps them.
+//! falls back to a Hub-wide default that only Hub admins change. The default is off. Repository
+//! enablement permits sharing, but each person must also affirmatively opt in before their sessions
+//! upload or repository readers see their retained bodies. The one-time session notice is separate
+//! from that consent. Connected checkouts follow the answer: the client reads it at session start
+//! and on hook calls, and the Hub refuses uploads while it says no. Values live in `hub_settings`,
+//! keyed by the forge's repository id so a rename keeps them.
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
@@ -24,9 +23,9 @@ fn repository_key(repository_id: i64) -> String {
     format!("conversation_sharing:repo:{repository_id}")
 }
 
-/// What a person's opt-out key starts with. The store query that lists shared bodies reads the
-/// setting itself: the key is this, the user id, `:` and the repository id, and any value but
-/// `0` opts out, as in [`person`].
+/// What a person's choice key starts with. The store query that lists shared bodies reads the
+/// setting itself: the key is this, the user id, `:` and the repository id. Only the exact value
+/// `0`, written by the existing explicit opt-in operation, is affirmative consent.
 pub(super) const OPT_OUT_KEY_PREFIX: &str = "conversation_sharing:opt_out:";
 
 /// A person's own choice for one repository, each under its own key so the session-start
@@ -39,7 +38,9 @@ fn person_key(choice: &str, user_id: &str, repository_id: i64) -> String {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Person {
     opted_out: bool,
-    /// Their agent has shown the one-time notice that sharing is on.
+    /// The existing explicit opt-in writes `opt_out=0`; absence or an invalid value is not consent.
+    consented: bool,
+    /// Their agent has shown the one-time notice about sharing.
     notified: bool,
 }
 
@@ -53,8 +54,10 @@ pub struct Sharing {
     pub source: &'static str,
     pub hub_default: bool,
     pub opted_out: bool,
+    /// Whether this person affirmatively opted in for this repository.
+    pub consented: bool,
     pub notified: bool,
-    /// `enabled` and not `opted_out`: this person's sessions upload conversation bodies.
+    /// `enabled` and `consented`: this person's sessions upload conversation bodies.
     pub sharing: bool,
     /// Web sign-in only: whether this person may change the repository setting.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,28 +75,20 @@ fn flag(store: &dyn Store, key: &str) -> Result<Option<bool>> {
     })
 }
 
-/// The Hub-wide default: on unless a Hub admin, or the migration for a Hub that already had
-/// people, set it off.
+/// The Hub-wide default is off unless a Hub admin explicitly turns it on.
 fn hub_default(store: &dyn Store) -> Result<bool> {
-    Ok(flag(store, HUB_DEFAULT_KEY)?.unwrap_or(true))
+    Ok(flag(store, HUB_DEFAULT_KEY)?.unwrap_or(false))
 }
 
-/// An unreadable value opts the person out rather than in.
+/// Only the existing explicit opt-in representation is consent. Absence and unreadable values
+/// deny sharing without being presented as an explicit opt-out.
 fn person(store: &dyn Store, user_id: &str, repository_id: i64) -> Result<Person> {
-    let choice = |name| -> Result<bool> {
-        Ok(
-            match store
-                .get_setting(&person_key(name, user_id, repository_id))?
-                .as_deref()
-            {
-                None | Some("0") => false,
-                Some(_) => true,
-            },
-        )
-    };
+    let opt_out = store.get_setting(&person_key("opt_out", user_id, repository_id))?;
+    let notified = store.get_setting(&person_key("notified", user_id, repository_id))?;
     Ok(Person {
-        opted_out: choice("opt_out")?,
-        notified: choice("notified")?,
+        opted_out: opt_out.as_deref().is_some_and(|value| value != "0"),
+        consented: opt_out.as_deref() == Some("0"),
+        notified: notified.as_deref().is_some_and(|value| value != "0"),
     })
 }
 
@@ -118,7 +113,7 @@ pub(super) fn person_shares(
     let Some(id) = repository_id else {
         return Ok(false);
     };
-    Ok(repository_shares(store, repository_id)? && !person(store, user_id, id)?.opted_out)
+    Ok(repository_shares(store, repository_id)? && person(store, user_id, id)?.consented)
 }
 
 fn view(
@@ -147,8 +142,9 @@ fn view(
         },
         hub_default,
         opted_out: mine.opted_out,
+        consented: mine.consented,
         notified: mine.notified,
-        sharing: enabled && !mine.opted_out,
+        sharing: enabled && mine.consented,
         can_change: None,
         can_change_hub_default: None,
     })
@@ -404,13 +400,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repository_setting_overrides_the_hub_default_and_people_opt_out() {
+    fn repository_enablement_and_affirmative_person_consent_are_both_required() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}", dir.path().join("hub.db").display());
         let store = crate::hub::store::open(&url).unwrap();
         let store = &*store;
-        assert!(repository_shares(store, Some(7)).unwrap(), "on by default");
-        assert!(view(store, "o/r", Some(7), "usr_a").unwrap().hub_default);
+        assert!(
+            !repository_shares(store, Some(7)).unwrap(),
+            "off by default"
+        );
+        assert!(!view(store, "o/r", Some(7), "usr_a").unwrap().hub_default);
+        store.set_setting(HUB_DEFAULT_KEY, "on", "admin").unwrap();
+        assert!(repository_shares(store, Some(7)).unwrap());
+        assert!(!person_shares(store, "usr_a", Some(7)).unwrap());
         store.set_setting(HUB_DEFAULT_KEY, "off", "admin").unwrap();
         assert!(!repository_shares(store, Some(7)).unwrap());
         assert!(!view(store, "o/r", Some(7), "usr_a").unwrap().sharing);
@@ -431,6 +433,12 @@ mod tests {
         store
             .set_setting(&repository_key(7), "default", "admin")
             .unwrap();
+        assert!(!person_shares(store, "usr_a", Some(7)).unwrap());
+        let consent = PersonChange {
+            opted_out: Some(false),
+            notified: None,
+        };
+        update_person(store, "usr_a", 7, &consent).unwrap();
         assert!(person_shares(store, "usr_a", Some(7)).unwrap());
         let out = PersonChange {
             opted_out: Some(true),
@@ -444,15 +452,21 @@ mod tests {
             format!("{OPT_OUT_KEY_PREFIX}usr_a:7")
         );
         assert!(
-            person_shares(store, "usr_b", Some(7)).unwrap(),
+            !person_shares(store, "usr_b", Some(7)).unwrap(),
             "per person"
         );
+        store
+            .set_setting(&person_key("opt_out", "usr_b", 7), "invalid", "usr_b")
+            .unwrap();
+        assert!(!person_shares(store, "usr_b", Some(7)).unwrap());
         let told = PersonChange {
             opted_out: None,
             notified: Some(true),
         };
         update_person(store, "usr_a", 7, &told).unwrap();
         let mine = view(store, "o/r", Some(7), "usr_a").unwrap();
-        assert!(mine.enabled && mine.opted_out && mine.notified && !mine.sharing);
+        assert!(
+            mine.enabled && mine.opted_out && !mine.consented && mine.notified && !mine.sharing
+        );
     }
 }

@@ -13073,10 +13073,10 @@ impl Store for PgStore {
                          WHERE work=$1 AND ($2::text IS NULL
                            OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
                               > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
-                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
+                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND EXISTS (
                                 SELECT 1 FROM hub_settings o
                                  WHERE o.key = $8::text || author || ':' || $9::bigint::text
-                                   AND o.value <> '0')))
+                                   AND o.value = '0')))
                          ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
                      SELECT page.*, e.event, e.observed_at FROM page
                      JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -13091,8 +13091,8 @@ impl Store for PgStore {
                     &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
                     &(audience == ConversationAudience::Everyone),
                     &who.owner.id,
-                    // Set only for readers of a sharing repository: an author who opted out is
-                    // left out, with what they shared before.
+                    // Set only for readers of a sharing repository: an author is included only
+                    // after their affirmative opt-in, including for bodies shared before it.
                     &opt_out_prefix,
                     &who.repository_id,
                 ],
@@ -13552,8 +13552,8 @@ impl Store for PgStore {
                             received_order DESC) AS scope_rank
                     FROM scope_state
                 )
-                SELECT start_request,finish_request,source_id FROM ranked
-                WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
+                SELECT start_request,finish_request,source_id,author_token FROM ranked
+                WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2),author_token:r.get(3)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
             let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now,super::viewer::Viewer(&who.owner.id));tx.commit()?;Ok(Some(summary))})
     }
