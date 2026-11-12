@@ -313,7 +313,7 @@ fn validate_note(note: &str) -> Result<()> {
     } else if text("note", note, MAX_NOTE_BYTES).is_err() {
         (
             FieldProblem::Invalid,
-            "Send a non-empty note of 1-500 bytes without control characters.",
+            "Send a non-empty note of 1-500 bytes without control or invisible characters.",
         )
     } else {
         return Ok(());

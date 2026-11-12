@@ -1381,10 +1381,15 @@ impl Call {
                     .as_deref()
                     .map(|id| format!(" {id}"))
                     .unwrap_or_default();
-                let tail = if applied {
-                    "Tell your parent, which holds the claim, so it can record them"
-                } else {
-                    "Finish without this edit and tell your parent it was refused, so it can record them"
+                let tail = match (applied, lead) {
+                    (true, true) => "Tell your parent, which holds the claim, so it can record them",
+                    (true, false) => "Tell your parent, so it can have them recorded",
+                    (false, true) => {
+                        "Finish without this edit and tell your parent it was refused, so it can record them"
+                    }
+                    (false, false) => {
+                        "Finish without this edit and tell your parent it was refused, so it can have them recorded"
+                    }
                 };
                 let (leader, ask) = if lead {
                     ("that session", "the parent should checkpoint")
@@ -2416,6 +2421,17 @@ mod tests {
             lead.contains("\"scope\":[\"src/a.rs\",\"src/shared.rs\"]"),
             "{lead}"
         );
+        // The CLI example decodes as a strict checkpoint, with or without a session ID.
+        for call in [edit(json!({})), edit(json!({"session_id": null}))] {
+            let text = call.unlinked_refusal(Some((&active, true)));
+            let body = text
+                .split_once("inside this file's checkout instead, with ")
+                .and_then(|(_, rest)| rest.split_once(" on standard input"))
+                .map(|(body, _)| body)
+                .unwrap_or_default();
+            serde_json::from_str::<crate::hub::work::WorkCheckpoint>(body)
+                .unwrap_or_else(|error| panic!("{error}: {body}"));
+        }
         let scoped = edit(json!({"agent_id":"sub"})).unlinked_refusal(Some((&active, true)));
         assert!(
             scoped.starts_with("AgentSCM: EDIT_UNLINKED: this edit was not applied"),
