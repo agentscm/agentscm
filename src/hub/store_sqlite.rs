@@ -64,7 +64,8 @@ use super::handoff::{
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
     MAX_OBSERVATIONS, MAX_PUBLICATIONS, PublicationEvidence, RecordedCheck, TokenGroup,
-    UsageReceipt, UsageRecord, UsageSummary, WorkInsight,
+    UsageReceipt, UsageRecord, UsageReport, UsageReportPage, UsageReportQuery, UsageSummary,
+    WorkInsight,
 };
 use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Overlap, Plan, Who, announced,
@@ -1574,68 +1575,76 @@ fn sqlite_usage_summary(
     work: &str,
     group_limit: usize,
 ) -> Result<UsageSummary> {
-    let (
-        observations,
-        input_tokens,
-        output_tokens,
-        input_known,
-        output_known,
-        missing_cost,
-        failed,
-    ): (i64, Option<i64>, Option<i64>, i64, i64, i64, i64) = tx.query_row(
+    // The cache counts have no column of their own: they are read from the stored report, where
+    // an absent count and a null are both unknown, so neither is summed or counted as known.
+    let mut summary = tx.query_row(
         "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
+                SUM(json_extract(request,'$.cache_read_input_tokens')),
+                SUM(json_extract(request,'$.cache_creation_input_tokens')),
                 COUNT(input_tokens), COUNT(output_tokens),
+                COUNT(json_extract(request,'$.cache_read_input_tokens')),
+                COUNT(json_extract(request,'$.cache_creation_input_tokens')),
                 COALESCE(SUM(CASE WHEN cost_amount_micros IS NULL THEN 1 ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN outcome='failed' THEN 1 ELSE 0 END),0)
            FROM hub_work_model_usage WHERE work=?1
              AND COALESCE(json_extract(request,'$.measurement_scope'),'request')<>'session_cumulative'",
         [work],
         |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
+            let observations: i64 = r.get(0)?;
+            Ok(UsageSummary {
+                observations: observations as usize,
+                coverage: if observations == 0 {
+                    "unknown"
+                } else {
+                    "partial"
+                }
+                .into(),
+                input_tokens: r.get(1)?,
+                output_tokens: r.get(2)?,
+                cache_read_input_tokens: r.get(3)?,
+                cache_creation_input_tokens: r.get(4)?,
+                input_known_observations: r.get::<_, i64>(5)? as usize,
+                output_known_observations: r.get::<_, i64>(6)? as usize,
+                cache_read_input_known_observations: r.get::<_, i64>(7)? as usize,
+                cache_creation_input_known_observations: r.get::<_, i64>(8)? as usize,
+                missing_cost_observations: r.get::<_, i64>(9)? as usize,
+                reported_failed_attempts: r.get::<_, i64>(10)? as usize,
+                groups_complete: true,
+                cost_groups: Vec::new(),
+                token_groups: Vec::new(),
+            })
         },
     )?;
     let mut statement = tx.prepare(
-        "SELECT agent,model_provider,model,usage_basis,COUNT(*),SUM(input_tokens),SUM(output_tokens),COUNT(input_tokens),COUNT(output_tokens)
+        "SELECT agent,model_provider,model,usage_basis,COUNT(*),SUM(input_tokens),SUM(output_tokens),
+                SUM(json_extract(request,'$.cache_read_input_tokens')),
+                SUM(json_extract(request,'$.cache_creation_input_tokens')),
+                COUNT(input_tokens),COUNT(output_tokens),
+                COUNT(json_extract(request,'$.cache_read_input_tokens')),
+                COUNT(json_extract(request,'$.cache_creation_input_tokens'))
            FROM hub_work_model_usage WHERE work=?1
              AND COALESCE(json_extract(request,'$.measurement_scope'),'request')<>'session_cumulative'
           GROUP BY agent,model_provider,model,usage_basis ORDER BY agent,model_provider,model,usage_basis LIMIT ?2")?;
     let mut token_groups = statement
         .query_map(params![work, (group_limit + 1) as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)?,
-            ))
-        })?
-        .map(|row| {
-            let (agent, provider, model, basis, n, input, output, ik, ok) = row?;
+            let basis: String = r.get(3)?;
             Ok(TokenGroup {
-                agent,
-                provider,
-                model,
+                agent: r.get(0)?,
+                provider: r.get(1)?,
+                model: r.get(2)?,
                 usage_basis: serde_json::from_str(&format!("\"{basis}\""))
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                observations: n as usize,
-                input_tokens: input,
-                output_tokens: output,
-                input_known_observations: ik as usize,
-                output_known_observations: ok as usize,
+                observations: r.get::<_, i64>(4)? as usize,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                cache_read_input_tokens: r.get(7)?,
+                cache_creation_input_tokens: r.get(8)?,
+                input_known_observations: r.get::<_, i64>(9)? as usize,
+                output_known_observations: r.get::<_, i64>(10)? as usize,
+                cache_read_input_known_observations: r.get::<_, i64>(11)? as usize,
+                cache_creation_input_known_observations: r.get::<_, i64>(12)? as usize,
             })
-        })
+        })?
         .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
     let mut statement = tx.prepare(
         "SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros),COUNT(*)
@@ -1674,27 +1683,13 @@ fn sqlite_usage_summary(
             })
         })
         .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-    let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
+    summary.groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
     token_groups.truncate(group_limit);
     cost_groups.truncate(group_limit);
-    Ok(UsageSummary {
-        observations: observations as usize,
-        coverage: if observations == 0 {
-            "unknown"
-        } else {
-            "partial"
-        }
-        .into(),
-        input_tokens,
-        output_tokens,
-        input_known_observations: input_known as usize,
-        output_known_observations: output_known as usize,
-        missing_cost_observations: missing_cost as usize,
-        reported_failed_attempts: failed as usize,
-        groups_complete,
-        cost_groups,
-        token_groups,
-    })
+    summary.token_groups = token_groups;
+    summary.cost_groups = cost_groups;
+    summary.mask_agents();
+    Ok(summary)
 }
 
 fn sqlite_insight_input(
@@ -14470,6 +14465,39 @@ impl Store for SqliteStore {
             received_at: now,
             replayed: false,
         })
+    }
+
+    fn work_usage_reports(
+        &self,
+        token: &str,
+        id: &str,
+        query: &UsageReportQuery,
+        now: i64,
+    ) -> Result<Option<UsageReportPage>> {
+        query.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let rows = tx
+            .prepare(
+                "SELECT request,received_at FROM hub_work_model_usage WHERE work=?1
+                  ORDER BY received_at,observation_id LIMIT ?2 OFFSET ?3",
+            )?
+            .query_map(
+                params![item.id, (query.limit + 1) as i64, query.after as i64],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        tx.commit()?;
+        let items = rows
+            .into_iter()
+            .map(|(request, at)| Ok(UsageReport::stored(json_value(&request)?, at)))
+            .collect::<Result<_>>()?;
+        Ok(Some(UsageReportPage::of(item.id, query, items, now)))
     }
 
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>> {

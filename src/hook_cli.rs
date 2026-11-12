@@ -189,9 +189,8 @@ async fn hook(
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
-    let wants_capture = client_connection
-        && agent == "claude"
-        && crate::change_capture_cli::captures_claude_event(&payload);
+    let wants_capture =
+        client_connection && crate::change_capture_cli::captured_harness(agent, &payload).is_some();
     // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
     #[cfg(not(unix))]
     let wants_capture = false;
@@ -205,6 +204,7 @@ async fn hook(
     #[cfg(unix)]
     let spawn_capture = || {
         tokio::spawn(capture(
+            agent.to_owned(),
             body.clone(),
             std::sync::Arc::clone(&payload),
             budget,
@@ -218,7 +218,7 @@ async fn hook(
     let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
     let reply = if client_connection
-        && CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+        && capture_only(agent, payload["hook_event_name"].as_str().unwrap_or(""))
         && !observes_shell(agent, &payload)
     {
         fail_open(agent, &payload, None)
@@ -264,9 +264,16 @@ async fn hook(
 /// Change capture for one call of the plugin's hook, run beside coordination: context for the
 /// session, when capture has some.
 #[cfg(unix)]
-async fn capture(body: Vec<u8>, payload: std::sync::Arc<Value>, budget: Instant) -> Option<String> {
-    let routed = route_client("claude", &payload).ok()?;
+async fn capture(
+    agent: String,
+    body: Vec<u8>,
+    payload: std::sync::Arc<Value>,
+    budget: Instant,
+) -> Option<String> {
+    let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
+    let routed = route_client(&agent, &payload).ok()?;
     crate::change_capture_cli::plugin_capture(
+        harness,
         &body,
         &payload,
         routed.checkout,
@@ -402,9 +409,24 @@ async fn observe_shell(
 const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
 const CAPTURE_SESSION_START_BUDGET: Duration = Duration::from_millis(4000);
 
-/// Claude Code events the plugin registers only so capture sees them. A subagent's start and
+/// Events the plugin registers only so capture sees them. A Claude Code subagent's start and
 /// stop are not among them: the Hub keeps each session's subagents from those.
-const CAPTURE_ONLY_EVENTS: [&str; 3] = ["PostToolUseFailure", "MessageDisplay", "PreCompact"];
+fn capture_only(agent: &str, event: &str) -> bool {
+    match agent {
+        "codex" => matches!(
+            event,
+            "UserPromptSubmit"
+                | "PostModelRequest"
+                | "PreCompact"
+                | "SubagentStart"
+                | "SubagentStop"
+        ),
+        _ => matches!(
+            event,
+            "PostToolUseFailure" | "MessageDisplay" | "PreCompact"
+        ),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn coordinate(
@@ -5412,6 +5434,25 @@ mod tests {
                 unknown_output(agent, &event("PreToolUse"), "no token"),
                 json!({})
             );
+        }
+    }
+
+    #[test]
+    fn events_only_capture_reads_stay_off_the_hub_per_agent() {
+        // Coordination uses Claude Code's prompt and subagent events; Codex's are capture's alone.
+        for event in ["UserPromptSubmit", "SubagentStart", "SubagentStop"] {
+            assert!(capture_only("codex", event), "{event}");
+            assert!(!capture_only("claude", event), "{event}");
+        }
+        assert!(capture_only("codex", "PostModelRequest"));
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            assert!(!capture_only("codex", event), "{event}");
+        }
+        #[cfg(unix)]
+        for event in agentscm::change_capture::codex::HOOK_EVENTS {
+            let payload = json!({"hook_event_name": event});
+            assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
+            assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
         }
     }
 }
