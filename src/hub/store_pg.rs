@@ -1926,6 +1926,8 @@ fn terminal_provenance(
     let latest = tx.query_opt(
         "SELECT kind, data FROM hub_events
          WHERE subject = $1 AND kind IN ('work_checkpoint', 'work_transition')
+           AND NOT (kind = 'work_transition'
+                    AND data::jsonb->>'transition' = 'prune_participants')
          ORDER BY seq DESC LIMIT 1",
         &[&id],
     )?;
@@ -7615,12 +7617,14 @@ impl PgStore {
                        AND e.at >= $5 AND e.at <= $6
                        AND ((e.kind = 'work_checkpoint'
                              AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish'))
-                            OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                            OR (e.kind = 'work_transition' AND v.state = 'finished'
+                                AND e.data::jsonb->>'transition' <> 'prune_participants'))
                        AND NOT (EXISTS (
                            SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
                            WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
                              AND e2.at <= $6
-                             AND (e2.kind = 'work_transition'
+                             AND ((e2.kind = 'work_transition'
+                                   AND e2.data::jsonb->>'transition' <> 'prune_participants')
                                   OR v2.snapshot::jsonb #>> '{current,kind}' = 'finish')))
                      ORDER BY v.event_seq DESC LIMIT $7",
                     &[
@@ -11746,6 +11750,7 @@ impl Store for PgStore {
             let basis_column: Option<String> = columns_row.get(1);
             let held = basis_column.is_some();
             let only_joins_since = item.updated_seq != request.expected_updated_seq
+                && request.transition != work_transition::WorkTransitionKind::PruneParticipants
                 && tx
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)

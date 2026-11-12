@@ -1943,6 +1943,8 @@ fn terminal_provenance(
         .query_row(
             "SELECT kind, data FROM hub_events
              WHERE subject = ?1 AND kind IN ('work_checkpoint', 'work_transition')
+               AND NOT (kind = 'work_transition'
+                        AND json_extract(data, '$.transition') = 'prune_participants')
              ORDER BY seq DESC LIMIT 1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -7753,12 +7755,14 @@ impl SqliteStore {
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
                    AND ((e.kind = 'work_checkpoint'
                          AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
-                        OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                        OR (e.kind = 'work_transition' AND v.state = 'finished'
+                            AND json_extract(e.data, '$.transition') <> 'prune_participants'))
                    AND NOT (EXISTS (
                        SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
                        WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
                          AND e2.at <= ?6
-                         AND (e2.kind = 'work_transition'
+                         AND ((e2.kind = 'work_transition'
+                               AND json_extract(e2.data, '$.transition') <> 'prune_participants')
                               OR json_extract(v2.snapshot, '$.current.kind') = 'finish')))
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
@@ -11748,6 +11752,7 @@ impl Store for SqliteStore {
         )?;
         let held = basis_column.is_some();
         let only_joins_since = item.updated_seq != request.expected_updated_seq
+            && request.transition != work_transition::WorkTransitionKind::PruneParticipants
             && tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = ?1 AND seq = ?2 AND seq < ?3)
                     AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = ?1

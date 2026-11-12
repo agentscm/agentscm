@@ -2068,19 +2068,161 @@ fn retention_gap_retry_refuses_not_replays(db: &Db) {
         .work_compact(&scope, later + 86_400, true, compact_at)
         .unwrap();
     assert!(pass.applied);
+    // A new token of the same owner, valid at the retry: the retry is judged on the fences.
+    let (fresh_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &alice.user.id,
+        "agent-retry",
+        REPO,
+        REPOSITORY_ID,
+        30 * 86_400,
+        false,
+    )
+    .unwrap();
+    let fresh = WorkTransitionActor::Agent {
+        token: &fresh_token,
+    };
     let events = db.scalar("SELECT COUNT(*) FROM hub_events");
-    let retry = apply_batch(&*store, &actor, &batch, compact_at + 1).unwrap();
+    let retry = apply_batch(&*store, &fresh, &batch, compact_at + 1).unwrap();
     for item in &retry.items {
         assert_eq!(item.outcome, BatchOutcome::Refused, "{item:?}");
-        // The fences moved when the repair applied, so the retry is refused, whichever check
-        // meets it first.
-        assert!(
-            matches!(item.code.as_deref(), Some("work_changed" | "unauthorized")),
-            "{item:?}"
-        );
+        assert_eq!(item.code.as_deref(), Some("work_changed"), "{item:?}");
     }
     assert_eq!(retry.applied, 0);
     assert_eq!(db.scalar("SELECT COUNT(*) FROM hub_events"), events);
+}
+
+/// An expected seq that is still a recorded event of the Work, with only joins after it, is
+/// refused once it lies below the repository's event floor.
+fn a_recorded_seq_below_the_event_floor_is_refused(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    // A synthetic snapshot: the floor sits above the recorded start event.
+    let floor = work.updated_seq + 1;
+    db.sql("DELETE FROM hub_work_retention");
+    db.sql(&format!(
+        "INSERT INTO hub_work_retention (provider, host, repository, repository_id, event_floor_seq, snapshot_floor_seq, updated_at) \
+         VALUES ('github', 'github.com', '{REPO}', {REPOSITORY_ID}, {floor}, 0, {now})"
+    ));
+    let refused = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-1",
+        work.updated_seq,
+        now + 2,
+    );
+    assert_eq!(refused.outcome, BatchOutcome::Refused, "{refused:?}");
+    assert_eq!(refused.code.as_deref(), Some("work_changed"));
+    // At or above the floor the same shape passes.
+    db.sql(&format!(
+        "UPDATE hub_work_retention SET event_floor_seq = {}",
+        work.updated_seq
+    ));
+    let applied = abandon_with(
+        &*store,
+        &alice,
+        &work,
+        "abandon-2",
+        work.updated_seq,
+        now + 3,
+    );
+    assert_eq!(applied.outcome, BatchOutcome::Applied, "{applied:?}");
+}
+
+/// Pruning finished Work changes neither who stated its outcome nor its recent outcome.
+fn pruning_finished_work_keeps_its_outcome_and_provenance(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let live = current(&*store, &alice, &work.id, now + 2);
+    let complete = WorkTransitionRequest {
+        transition: WorkTransitionKind::Complete,
+        ..prune_request(&live, "complete-1", Some("s-a"), &[])
+    };
+    let done = store
+        .work_transition(&as_agent(&alice), &complete, now + 3)
+        .unwrap()
+        .item;
+    assert_eq!(done.state, WorkState::Finished);
+    let overview = |at: i64| {
+        let query = agentscm::hub::work::WorkOverviewQuery {
+            recent_since: Some(now - 10),
+            ..Default::default()
+        };
+        store
+            .work_overview(&alice.token, &query, at)
+            .unwrap()
+            .recent
+    };
+    let provenance = |at: i64| {
+        one(&*store, &caller(&alice, "s-a"), &work.id, at).work[0]
+            .operational
+            .outcome
+            .provenance
+    };
+    let (before_recent, before) = (overview(now + 4), provenance(now + 4));
+    assert_eq!(before_recent.len(), 1, "{before_recent:?}");
+    assert_eq!(
+        before,
+        agentscm::hub::work_lifecycle::OutcomeProvenance::AgentReport
+    );
+    let pruned = store
+        .work_transition(
+            &as_agent(&alice),
+            &prune_request(&done, "prune-1", Some("s-owner"), &[(&bob.token, "s-b")]),
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(pruned.item.participants.len(), 1);
+    assert_eq!(provenance(now + 6), before);
+    assert_eq!(overview(now + 6), before_recent);
+}
+
+/// A participant that rejoined after the plan was read is not removed: prune needs the exact
+/// `expected_updated_seq`, with no allowance for joins.
+fn a_prune_refuses_after_a_rejoin_since_the_plan(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let work = store
+        .work_start(&alice.token, &start("a", "s-a", "src/a/**"), now)
+        .unwrap()
+        .item;
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Helper, now + 1);
+    let planned = current(&*store, &alice, &work.id, now + 2);
+    join(&*store, &bob, &work.id, "s-b", WorkRole::Reviewer, now + 3);
+    assert_invalid(
+        store.work_transition(
+            &as_agent(&alice),
+            &prune_request(&planned, "prune-1", Some("s-owner"), &[(&bob.token, "s-b")]),
+            now + 4,
+        ),
+        "work changed",
+    );
+    assert_eq!(
+        current(&*store, &alice, &work.id, now + 5)
+            .participants
+            .len(),
+        2
+    );
 }
 
 conformance!(
@@ -2108,4 +2250,7 @@ conformance!(
     other_owners_items_are_refused_not_taken,
     interrupted_repair_replays_applied_items,
     retention_gap_retry_refuses_not_replays,
+    a_recorded_seq_below_the_event_floor_is_refused,
+    pruning_finished_work_keeps_its_outcome_and_provenance,
+    a_prune_refuses_after_a_rejoin_since_the_plan,
 );

@@ -16,9 +16,9 @@ use super::work::{
     ClaimStatus, WorkItem, WorkParticipant, WorkPathOverlap, WorkRole, WorkState, validate_id,
 };
 use super::work_lifecycle::{
-    ActorVia, LEASE_LAPSED, MAX_OTHER_OWNER_PARTICIPANTS, OperationalRow, OutcomeValue,
-    ReservationStatus, WorkActorKind, WorkOperationalV1, WorkTransitionKind, decide_transition,
-    operational_page,
+    ActorVia, LEASE_LAPSED, MAX_OTHER_OWNER_PARTICIPANTS, MergeStatus, OperationalRow,
+    OutcomeValue, ReservationStatus, WorkActorKind, WorkOperationalV1, WorkTransitionKind,
+    decide_transition, operational_page,
 };
 use super::work_transition::{
     MAX_PARTICIPANTS, ParticipantRef, WorkLifecycleReader, WorkTransitionActor,
@@ -319,6 +319,8 @@ pub enum FindingKind {
     ContradictoryBlocker,
     /// The participant list is full, or too much of it belongs to other owners.
     ParticipantCap,
+    /// A held reservation that a merged pull request hides from the active views. Report only.
+    HiddenHold,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -458,7 +460,7 @@ pub struct BatchTransitionItem {
     pub reason: String,
     #[serde(default)]
     pub superseded_by: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<super::work_transition::ParticipantRef>,
 }
 
@@ -1136,6 +1138,17 @@ fn findings(
             proposed: permitted(RemedyKind::Release),
         });
     }
+    if !finished && subject.live() && operational.merge.hidden_by_merged_pr {
+        found.push(FindingV1 {
+            kind: FindingKind::HiddenHold,
+            evidence: format!(
+                "A merged pull request hides the {} Work, but the hold of {lead} is still live and blocks overlapping Work; the Hub does not name the pull request here.",
+                word(&item.state)
+            ),
+            complete: operational.merge.status == MergeStatus::Observed,
+            proposed: None,
+        });
+    }
     if !finished && item.claim_status == ClaimStatus::Stale && !subject.live() {
         found.push(FindingV1 {
             kind: FindingKind::AbandonedSession,
@@ -1217,13 +1230,7 @@ fn inspected(
     let (requests, requests_complete) = bounded(row.requests.clone());
     let (dependents, dependents_complete) = bounded(row.dependents.clone());
     RecoveryWorkV1 {
-        findings: findings(
-            &subject,
-            caller,
-            viewer,
-            &row.requests,
-            requests_complete && dependents_complete,
-        ),
+        findings: findings(&subject, caller, viewer, &row.requests, requests_complete),
         work_id: item.id.clone(),
         title: item.title.clone(),
         source: item.source.clone(),
@@ -1795,9 +1802,9 @@ fn repair_item(
     }
     let Some(remedy) = finding.proposed else {
         return Err(match finding.kind {
-            FindingKind::OrphanedRequests | FindingKind::ContradictoryBlocker => {
-                "report only: this finding proposes no remedy".to_owned()
-            }
+            FindingKind::OrphanedRequests
+            | FindingKind::ContradictoryBlocker
+            | FindingKind::HiddenHold => "report only: this finding proposes no remedy".to_owned(),
             _ => "no remedy is proposed: none is permitted to this caller".to_owned(),
         });
     };
@@ -1837,7 +1844,10 @@ fn repair_item(
         return Err(format!("needs input from the caller: {}", extra.join(", ")));
     }
     if !finding.complete {
-        return Err("its facts are incomplete; inspect it with agentscm work recovery".to_owned());
+        return Err(match finding.kind {
+            FindingKind::LapsedHold => "its facts are incomplete: lease renewal is not hook-covered, so the lapse may not mean the session stopped; inspect it with agentscm work recovery, and release it with agentscm work transitions if it is obsolete".to_owned(),
+            _ => "its facts are incomplete; inspect it with agentscm work recovery".to_owned(),
+        });
     }
     let args = &apply.arguments;
     let (Some(generation), Some(seq)) = (
@@ -2505,6 +2515,48 @@ mod tests {
         assert!(!findings(&subject, &caller, &owner, &[], true)[0].complete);
     }
 
+    #[test]
+    fn a_live_hold_hidden_by_a_merged_pr_is_a_report_only_finding() {
+        let owner = viewer(OWNER, "tok-owner-2", false);
+        let caller = agent("tok-owner-2", "s-new");
+        let item = item(WorkState::Active);
+        let mut hidden = view(&item, Some(ReservationBasis::Admitted), 200);
+        hidden.merge.hidden_by_merged_pr = true;
+        let subject = |operational| Subject {
+            item: &item,
+            operational,
+            standing: Standing::Owner,
+            prune: Vec::new(),
+        };
+        let mut observed = hidden.clone();
+        observed.merge.status = MergeStatus::Observed;
+        let found = findings(&subject(&hidden), &caller, &owner, &[], true);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, FindingKind::HiddenHold);
+        assert_eq!(found[0].proposed, None);
+        assert!(!found[0].complete, "the merge fact is unknown here");
+        let found = findings(&subject(&observed), &caller, &owner, &[], true);
+        assert!(found[0].complete);
+        let visible = view(&item, Some(ReservationBasis::Admitted), 200);
+        assert!(findings(&subject(&visible), &caller, &owner, &[], true).is_empty());
+    }
+
+    #[test]
+    fn a_batch_item_without_participants_omits_the_key() {
+        let plain = BatchTransitionItem {
+            work_id: "wrk_a".to_owned(),
+            operation_id: "op".to_owned(),
+            generation: 1,
+            expected_updated_seq: 2,
+            transition: WorkTransitionKind::Release,
+            reason: "synthetic".to_owned(),
+            superseded_by: None,
+            participants: Vec::new(),
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("participants").is_none(), "{json}");
+    }
+
     fn finding(kind: FindingKind, proposed: Option<RemedyKind>) -> FindingV1 {
         FindingV1 {
             kind,
@@ -2660,7 +2712,8 @@ mod tests {
         assert!(reason(b, FindingKind::ContradictoryBlocker).starts_with("report only"));
         assert!(reason(c, FindingKind::LapsedHold).starts_with("another owner's Work"));
         assert!(reason(d, FindingKind::LapsedHold).contains("hold_live"));
-        assert!(reason(e, FindingKind::LapsedHold).contains("incomplete"));
+        assert!(reason(e, FindingKind::LapsedHold).contains("not hook-covered"));
+        assert!(reason(e, FindingKind::LapsedHold).contains("agentscm work transitions"));
         assert!(reason(f, FindingKind::ParticipantCap).contains("planned first"));
         assert_eq!(plan.skipped.len(), 8);
     }

@@ -58,7 +58,7 @@ resolves before this check.
 
 A new store operation `work_transition` runs in one transaction. It is idempotent by `operation_id`
 and fenced by both `expected_updated_seq` and `generation`. An exact retry returns the stored
-receipt and the current item and acquires nothing. The sequence fence also passes when `expected_updated_seq` is a recorded event of the Work and every later event of it is `work_joined`, so a participant joining or changing role cannot expire an owner's cleanup. A different request with the same `operation_id`
+receipt and the current item and acquires nothing. The sequence fence also passes when `expected_updated_seq` is a recorded event of the Work and every later event of it is `work_joined`, so a participant joining or changing role cannot expire an owner's cleanup. This does not apply to `prune_participants`, which requires the exact `expected_updated_seq`: a participant that rejoined after the plan was read must not be removed. A different request with the same `operation_id`
 is refused. A bounded, sanitized reason is required.
 
 Actors:
@@ -110,7 +110,7 @@ which can hold more than 25 of them. Every listed pair must be a current non-lea
 nothing is removed. The rows are deleted in the transaction of the transition, the live intent of
 each removed session is released unless that session is eligible on other Work, and the
 `work_transition` event names each removed participant by owner, agent and session, never by
-token. It is not offered as a remedy and changes no recovery output.
+token. It is excluded from the operational projection's `remedies`, while recovery offers it as the `prune_participants` remedy and proposes it from the `participant_cap` finding. Its event is not a lifecycle or outcome change: outcome provenance and recent outcomes skip it.
 
 Reopen requires a session, generation, `expected_updated_seq`, `operation_id` and reason, and always
 runs the overlap check whether or not the client ran preflight. On overlap it returns a conflict and

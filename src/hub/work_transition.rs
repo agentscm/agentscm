@@ -433,16 +433,18 @@ pub(super) fn apply(
                         || super::store::session_key(&participant.token, &participant.session)
                             == wanted.session)
             };
+            let leads = |participant: &WorkParticipant| {
+                participant.role == WorkRole::Lead
+                    || (participant.token == item.lead_token
+                        && participant.session == item.lead_session)
+            };
             let listed = |participant: &WorkParticipant| {
-                request.participants.iter().any(|p| names(participant, p))
+                !leads(participant) && request.participants.iter().any(|p| names(participant, p))
             };
             let removable = request.participants.iter().all(|wanted| {
-                item.participants.iter().any(|participant| {
-                    names(participant, wanted)
-                        && participant.role != WorkRole::Lead
-                        && !(participant.token == item.lead_token
-                            && participant.session == item.lead_session)
-                })
+                item.participants
+                    .iter()
+                    .any(|participant| names(participant, wanted) && !leads(participant))
             });
             if !removable {
                 return Err(invalid(
