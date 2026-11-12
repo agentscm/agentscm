@@ -7,10 +7,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::connection::ConnectedRepository;
 use super::github::{Gh, GhError};
-use super::store::Store;
-use super::work::{WorkItem, WorkSource};
-use super::work_reconcile::{WorkStage, WorkStageV1};
+use super::store::{ForgeIdentity, Principal, Store, User};
+use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource};
+use super::work_lifecycle::OutcomeValue;
+use super::work_reconcile::{WorkStage, WorkStageV1, work_stages};
+use super::work_transition::WorkLifecycleReader;
 
 /// Observation kind and key prefix of one issue's closure fact.
 pub const OBSERVATION_KIND: &str = "issue_closure";
@@ -208,6 +211,131 @@ pub fn facts(
         closure,
         hold,
     }
+}
+
+/// The merged facts of the unfinished Work of one connected repository.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryFacts {
+    /// Ordered by Work id.
+    pub work: Vec<(WorkItem, MergedFacts)>,
+    /// False when the read listed fewer Work than the repository has, or a stage limit was hit.
+    pub complete: bool,
+}
+
+/// The repository's own scope as a `Principal`, for the stage logic that reads by repository
+/// name and id. It holds no token and cannot write; it is never handed to a caller.
+fn repository_principal(provider: &str, repo: &ConnectedRepository) -> Principal {
+    Principal {
+        token_id: String::new(),
+        name: String::new(),
+        repository: repo.full_name.clone(),
+        repository_id: Some(repo.repository_id),
+        expires_at: i64::MAX,
+        read_only: true,
+        owner: User {
+            id: String::new(),
+            identity: ForgeIdentity {
+                provider: provider.to_owned(),
+                host: repo.host.clone(),
+                user_id: 0,
+            },
+            login: String::new(),
+            name: None,
+            disabled: false,
+        },
+    }
+}
+
+/// Merged facts for every unfinished Work in `repo` that the repository overview lists: Work
+/// holding a reservation, and Work whose branch has not merged. `provider` is the connection's
+/// provider (`github`). Callers run this in the Hub, where the repository scope needs no token.
+// ponytail: one overview page (100 newest Work); upgrade: continue by `after` cursor.
+pub fn repository_facts(
+    store: &dyn Store,
+    provider: &str,
+    repo: &ConnectedRepository,
+    now: i64,
+) -> super::Result<RepositoryFacts> {
+    let principal = repository_principal(provider, repo);
+    let overview = store.repository_work_overview(
+        &principal.owner,
+        &repo.full_name,
+        repo.repository_id,
+        &WorkOverviewQuery {
+            recent_since: None,
+            limit: MAX_WORK_PAGE,
+            after: None,
+        },
+        now,
+    )?;
+    let items: Vec<_> = overview
+        .current
+        .iter()
+        .map(|item| (item, OutcomeValue::None))
+        .collect();
+    let reader = WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &repo.full_name,
+        repository_id: repo.repository_id,
+    };
+    let (stages, limits) = work_stages(store, &principal, &reader, &items, now);
+    let mut work: Vec<_> = overview
+        .current
+        .iter()
+        .map(|item| {
+            let facts = facts(
+                store,
+                &repo.id,
+                item,
+                stages.get(&item.id),
+                provider,
+                &repo.full_name,
+                repo.repository_id,
+            );
+            (item.clone(), facts)
+        })
+        .collect();
+    work.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    Ok(RepositoryFacts {
+        work,
+        complete: overview.current_complete && limits.is_empty(),
+    })
+}
+
+/// Merged facts of one Work for a caller holding a `Principal` (an MCP or hook request). The
+/// observation scope is the connected repository found by the principal's host, repository name
+/// and id (`sync::find_repository`), whose `rep_` id keys the closure observation. `None` when
+/// that repository is not connected.
+pub fn work_facts(
+    store: &dyn Store,
+    principal: &Principal,
+    item: &WorkItem,
+    now: i64,
+) -> Option<MergedFacts> {
+    let repo = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    )
+    .ok()??;
+    let reader = WorkLifecycleReader::Token(&principal.token_id);
+    let (stages, _) = work_stages(
+        store,
+        principal,
+        &reader,
+        &[(item, OutcomeValue::None)],
+        now,
+    );
+    Some(facts(
+        store,
+        &repo.id,
+        item,
+        stages.get(&item.id),
+        &principal.owner.identity.provider,
+        &repo.full_name,
+        repo.repository_id,
+    ))
 }
 
 #[cfg(test)]

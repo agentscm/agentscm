@@ -1199,7 +1199,74 @@ async fn read_repo(
     if sync.skill_read_due(&repo.id) {
         super::skills::sync_adoption(state, api, repo, token).await;
     }
+    poll_issue_closures(state, conn, repo, token).await;
     Ok(report)
+}
+
+/// Most source issues read per poll of one repository.
+// ponytail: a fixed 50 per poll, in Work id order; upgrade: page by a stored cursor so a
+// repository with more merged Work than this cannot starve its later issues.
+const ISSUE_CLOSURE_POLL_LIMIT: usize = 50;
+
+/// Store how the source issue of each merged unfinished Work stands, so a hold that outlived
+/// its work can be named. A closure already stored as closed by the Work's own pull request is
+/// stable and is not read again. A failed read keeps the previous observation and never fails
+/// the poll; a rate limit or credential failure ends this poll's reads.
+// ponytail: this polls; an `issues` webhook could refresh a closure sooner than the next poll.
+async fn poll_issue_closures(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+) {
+    use super::merged_holds::{CloseReason, IssueState, OBSERVATION_KIND, observation_key};
+    // GitLab closure facts stay unknown, so a GitLab Work is never settled.
+    if conn.provider != "github" {
+        return;
+    }
+    let Some(api) = state.sync.api.as_ref() else {
+        return;
+    };
+    let (store_repo, now) = (repo.clone(), super::store::unix_now());
+    let Ok(found) = db(state, move |store| {
+        super::merged_holds::repository_facts(store, "github", &store_repo, now)
+    })
+    .await
+    else {
+        return;
+    };
+    let mut issues = BTreeSet::new();
+    for (_, facts) in &found.work {
+        let stable = facts.closure.is_some_and(|c| {
+            c.state == IssueState::Closed
+                && c.reason == CloseReason::Completed
+                && c.closer_pull.is_some()
+        });
+        if let (Some(_), Some(issue), false) = (facts.merged_pull, facts.issue, stable) {
+            issues.insert(issue);
+        }
+    }
+    for issue in issues.into_iter().take(ISSUE_CLOSURE_POLL_LIMIT) {
+        let closure = match api.issue_closure(token, &repo.full_name, issue).await {
+            Ok(closure) => closure,
+            Err(GhError::Limited(_) | GhError::Auth(_)) => return,
+            Err(_) => continue,
+        };
+        let (Ok(data), Ok(stamp)) = (
+            serde_json::to_string(&closure),
+            observation_stamp(state, &repo.id).await,
+        ) else {
+            continue;
+        };
+        let id = repo.id.clone();
+        let stored = db(state, move |store| {
+            store.observe(&id, OBSERVATION_KIND, &observation_key(issue), &data, stamp)
+        })
+        .await;
+        if let Err(error) = stored {
+            crate::hub::error_envelope::log_internal(&error);
+        }
+    }
 }
 
 /// Invalidate current planning coverage before a read while retaining its earlier fact time.

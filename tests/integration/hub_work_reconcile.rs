@@ -832,6 +832,124 @@ fn work_reconcile_branch_merged() {
     run_both(branch_merged);
 }
 
+fn merged_issue_facts(fixture: &StoreFixture) {
+    use agentscm::hub::merged_holds::{
+        CloseReason, IssueClosure, IssueState, MergedHold, OBSERVATION_KIND, observation_key,
+        repository_facts, work_facts,
+    };
+    use agentscm::hub::planned_issues::IssueIdentity;
+    use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    let mut ctx = setup(fixture);
+    let after = unix_now() + 5;
+    let work = branch_work(&ctx, "m", "src/m", "feature/m");
+    let open = branch_work(&ctx, "o", "src/o", "feature/o");
+    let update = |item: &WorkItem, key: &str, number: i64| WorkIssueLinkUpdate {
+        work_id: item.id.clone(),
+        operation_id: key.into(),
+        generation: item.generation,
+        session: format!("session-{key}"),
+        expected_updated_seq: item.updated_seq,
+        link: Some(IssueIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository_id: REPOSITORY_ID,
+            number,
+        }),
+    };
+    ctx.store
+        .work_issue_link_set(ctx.token(), &update(&work, "m", 7), unix_now())
+        .unwrap();
+    branch_merge(&ctx, 41, "feature/m", after, true);
+    let hold = |ctx: &Ctx, id: &str| {
+        let found = repository_facts(&*ctx.store, "github", &ctx.repo, unix_now()).unwrap();
+        assert!(found.complete);
+        let ids: Vec<_> = found.work.iter().map(|(w, _)| w.id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "ordered by Work id");
+        let (item, facts) = found.work.into_iter().find(|(w, _)| w.id == id).unwrap();
+        let by_principal = work_facts(&*ctx.store, &ctx.principal, &item, unix_now()).unwrap();
+        assert_eq!(by_principal, facts);
+        facts
+    };
+
+    // A merge alone, with no closure observed, is never settled.
+    let facts = hold(&ctx, &work.id);
+    assert_eq!((facts.merged_pull, facts.issue), (Some(41), Some(7)));
+    assert_eq!(facts.hold, MergedHold::MergedOnly { pull: 41 });
+    // A Work with no merged pull request is not merged.
+    assert_eq!(hold(&ctx, &open.id).hold, MergedHold::NotMerged);
+
+    let observe = |ctx: &mut Ctx, closure: IssueClosure| {
+        ctx.clock += 1;
+        ctx.store
+            .observe(
+                &ctx.repo.id,
+                OBSERVATION_KIND,
+                &observation_key(7),
+                &serde_json::to_string(&closure).unwrap(),
+                ctx.clock,
+            )
+            .unwrap();
+    };
+    // "Part of" merged and the issue is still open: keep the hold.
+    observe(
+        &mut ctx,
+        IssueClosure {
+            state: IssueState::Open,
+            reason: CloseReason::Other,
+            closer_pull: None,
+        },
+    );
+    assert_eq!(
+        hold(&ctx, &work.id).hold,
+        MergedHold::MergedIssueOpen { pull: 41, issue: 7 }
+    );
+    // Closed as completed by a different pull request is not settled.
+    observe(
+        &mut ctx,
+        IssueClosure {
+            state: IssueState::Closed,
+            reason: CloseReason::Completed,
+            closer_pull: Some(99),
+        },
+    );
+    assert_eq!(
+        hold(&ctx, &work.id).hold,
+        MergedHold::MergedOnly { pull: 41 }
+    );
+    // Closed as completed by the merged pull request.
+    observe(
+        &mut ctx,
+        IssueClosure {
+            state: IssueState::Closed,
+            reason: CloseReason::Completed,
+            closer_pull: Some(41),
+        },
+    );
+    assert_eq!(
+        hold(&ctx, &work.id).hold,
+        MergedHold::Settled { pull: 41, issue: 7 }
+    );
+    // The closure is never stored undecodable.
+    assert!(
+        ctx.store
+            .observe(
+                &ctx.repo.id,
+                OBSERVATION_KIND,
+                "issue:7",
+                "{}",
+                ctx.clock + 1
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn work_reconcile_merged_issue_facts() {
+    run_both(merged_issue_facts);
+}
+
 fn status_stage(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let setup_observations = agentscm::hub::onboarding::Observations::default();
