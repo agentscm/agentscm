@@ -750,7 +750,23 @@ mod tests {
         assert_eq!(metrics.hub_calls, u64::MAX);
     }
 
-    fn hub() -> (tempfile::TempDir, super::super::HubState) {
+    /// Keeps the Hub's directory and the right to use the process-wide `PENDING` table, and
+    /// empties the table again at the end so no other test reads what this one left.
+    #[allow(dead_code)]
+    struct Isolated(tempfile::TempDir, std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Isolated {
+        fn drop(&mut self) {
+            *pending() = None;
+        }
+    }
+
+    /// A Hub with an empty `PENDING` table. `all_written` reads every store's totals, so the
+    /// tests that share the table run one at a time and each starts from nothing.
+    fn hub() -> (Isolated, super::super::HubState) {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let lock = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *pending() = None;
         let dir = tempfile::tempdir().unwrap();
         let store = super::super::store::open(&format!(
             "sqlite://{}",
@@ -759,7 +775,7 @@ mod tests {
         .unwrap();
         let objects = crate::backend::LocalBackend::open(dir.path().join("objects")).unwrap();
         let state = super::super::HubState::new(store, std::sync::Arc::new(objects));
-        (dir, state)
+        (Isolated(dir, lock), state)
     }
 
     fn one(session: &str, client: Option<ClientReport>) -> Sample {

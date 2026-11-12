@@ -1193,6 +1193,11 @@ impl Call {
                         let requests = state.onboarding.permissions();
                         requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
+                    // A turn that ended asking nothing is done with the Work it leads whose pull
+                    // request merged. A turn that asks its person something leaves it open.
+                    if reason == WaitReason::Finished {
+                        complete_led_merged(state, &principal, &native).await;
+                    }
                 }
                 Ok(Outcome::clean())
             }
@@ -1556,6 +1561,8 @@ impl Call {
                     Some(session) => {
                         let roster = state.onboarding.subagents();
                         roster.forget(&principal.token_id, &session);
+                        // Before the end pauses it: merged Work the session leads is complete.
+                        complete_led_merged(state, &principal, &session).await;
                         done_pausing_for(
                             state,
                             &principal,
@@ -2106,6 +2113,24 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             call
         }
         _ => call(Kind::Ignore, Shape::Silent),
+    }
+}
+
+/// Completes the Work that the session `native` leads whose pull request merged, at its turn's
+/// end or its end. Best effort and silent: the hook waits for it at most `MERGED_NOTICE_BUDGET`
+/// (the store call runs on after that) and never fails by it. One that ran past the budget may
+/// meet the end's pause, whose fence then refuses it, and the poll completes the Work later.
+async fn complete_led_merged(state: &HubState, principal: &Principal, native: &str) {
+    let (store, principal, native) = (state.store.clone(), principal.clone(), native.to_owned());
+    let done = blocking(state, move || {
+        let now = unix_now();
+        let name = store.session_name_for(&principal.token_id, Some(&native), now)?;
+        Ok(super::merged_holds::complete_led_merged(
+            &*store, &principal, &name, now,
+        ))
+    });
+    if let Ok(Err(error)) = tokio::time::timeout(MERGED_NOTICE_BUDGET, done).await {
+        eprintln!("hub: merged Work not completed at the turn's end: {error}");
     }
 }
 

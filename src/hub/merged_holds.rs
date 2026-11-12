@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::connection::ConnectedRepository;
 use super::github::{Gh, GhError};
 use super::store::{ForgeIdentity, Principal, Store, User};
-use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource};
+use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource, WorkState};
 use super::work_lifecycle::OutcomeValue;
 use super::work_reconcile::{WorkStage, WorkStageV1, work_stages_detailed};
 use super::work_transition::{OperationalSelect, WorkLifecycleReader};
@@ -631,9 +631,6 @@ pub fn complete_merged(
     repo: &ConnectedRepository,
     now: i64,
 ) -> super::Result<Vec<String>> {
-    use super::work::WorkState;
-    use super::work_lifecycle::ActivityStatus;
-    use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
     let found = repository_facts_where(store, provider, repo, now, |item| {
         matches!(item.state, WorkState::Active | WorkState::Paused)
     })?;
@@ -642,79 +639,143 @@ pub fn complete_merged(
         let Some(pull) = completes_on_merge(facts) else {
             continue;
         };
-        let attempt = || -> super::Result<bool> {
-            let Some(owner) = store.user_by_id(&item.owner)?.filter(|u| !u.disabled) else {
-                return Ok(false);
-            };
-            let reader = WorkLifecycleReader::Person {
-                owner: &owner,
-                repository: &repo.full_name,
-                repository_id: repo.repository_id,
-            };
-            let overview =
-                store.work_operational(&reader, &OperationalSelect::One(&item.id), now)?;
-            let open = |w: &super::work_lifecycle::WorkOperationalV1| {
-                matches!(w.state, WorkState::Active | WorkState::Paused)
-            };
-            let Some(current) = overview
-                .work
-                .first()
-                .filter(|w| open(w) && w.activity.status != ActivityStatus::Live)
-            else {
-                return Ok(false);
-            };
-            // A Work its lead resumed after the policy released it holds again on purpose.
-            if current.reservation.basis.is_some()
-                && store.merge_prompt_claimed(&item.id, POLICY_RELEASE)?
-            {
-                return Ok(false);
-            }
-            // Once ever, claimed before the transition so two pollers cannot both complete, and so
-            // Work reopened after the Hub completed it is left to its lead.
-            if !store.claim_merge_prompt(&item.id, HUB_COMPLETE, now)? {
-                return Ok(false);
-            }
-            let request = WorkTransitionRequest {
-                work_id: item.id.clone(),
-                operation_id: format!(
-                    "hub-observed-merge:{}:{}:{}",
-                    item.id, current.generation, current.updated_seq
-                ),
-                generation: current.generation,
-                expected_updated_seq: current.updated_seq,
-                session: None,
-                transition: WorkTransitionKind::Complete,
-                reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
-                superseded_by: None,
-                participants: Vec::new(),
-            };
-            let actor = WorkTransitionActor::Policy {
-                owner: &owner,
-                repository: &repo.full_name,
-                repository_id: repo.repository_id,
-            };
-            let done = store.work_transition(&actor, &request, now);
-            if done.is_err() {
-                // The claim stays only when a re-read shows the Work is no longer open (someone
-                // finished it); otherwise it is given back so a later poll can complete it.
-                let still_open = store
-                    .work_operational(&reader, &OperationalSelect::One(&item.id), now)
-                    .map_or(true, |o| o.work.first().is_some_and(open));
-                if still_open {
-                    let _ = store.unclaim_merge_prompt(&item.id, HUB_COMPLETE);
-                }
-            }
-            done.map(|_| true)
-        };
-        match attempt() {
-            Ok(true) => completed.push(item.id.clone()),
-            Ok(false) => {}
-            // The fence moved or the Work finished meanwhile: a later poll reads it again.
-            Err(super::HubError::Invalid(_)) => {}
-            Err(error) => super::error_envelope::log_internal(&error),
+        if complete_one(store, repo, item, pull, true, now) {
+            completed.push(item.id.clone());
         }
     }
     Ok(completed)
+}
+
+/// Completes the Work that `session` of `principal` leads whose pull request merged, as
+/// `complete_merged` does but without waiting for the lease: the session is ending its turn
+/// having asked nothing, or ending, so the live lease is its own. Returns the ids completed.
+pub fn complete_led_merged(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Vec<String> {
+    if principal.read_only {
+        return Vec::new();
+    }
+    let Ok(led) = store.session_led_work(&principal.token_id, session) else {
+        return Vec::new();
+    };
+    // Cheapest first: Work the Hub already completed once is its lead's.
+    let led: Vec<_> = led
+        .into_iter()
+        .filter(|item| matches!(item.state, WorkState::Active | WorkState::Paused))
+        .filter(|item| {
+            !store
+                .merge_prompt_claimed(&item.id, HUB_COMPLETE)
+                .unwrap_or(true)
+        })
+        .collect();
+    if led.is_empty() {
+        return Vec::new();
+    }
+    let Ok(Some(repo)) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return Vec::new();
+    };
+    led.into_iter()
+        .filter(|item| {
+            work_facts_in(store, principal, &repo, item, now)
+                .and_then(|facts| completes_on_merge(&facts))
+                .is_some_and(|pull| complete_one(store, &repo, item, pull, false, now))
+        })
+        .map(|item| item.id)
+        .collect()
+}
+
+/// Completes one Work whose pull request `pull` merged, once ever, as the policy actor for its
+/// owner. With `quiet_only` a Work whose lease is live is left to its lead. True when it completed.
+fn complete_one(
+    store: &dyn Store,
+    repo: &ConnectedRepository,
+    item: &WorkItem,
+    pull: u64,
+    quiet_only: bool,
+    now: i64,
+) -> bool {
+    use super::work_lifecycle::ActivityStatus;
+    use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
+    let attempt = || -> super::Result<bool> {
+        let Some(owner) = store.user_by_id(&item.owner)?.filter(|u| !u.disabled) else {
+            return Ok(false);
+        };
+        let reader = WorkLifecycleReader::Person {
+            owner: &owner,
+            repository: &repo.full_name,
+            repository_id: repo.repository_id,
+        };
+        let overview = store.work_operational(&reader, &OperationalSelect::One(&item.id), now)?;
+        let open = |w: &super::work_lifecycle::WorkOperationalV1| {
+            matches!(w.state, WorkState::Active | WorkState::Paused)
+        };
+        let Some(current) = overview
+            .work
+            .first()
+            .filter(|w| open(w) && !(quiet_only && w.activity.status == ActivityStatus::Live))
+        else {
+            return Ok(false);
+        };
+        // A Work its lead resumed after the policy released it holds again on purpose.
+        if current.reservation.basis.is_some()
+            && store.merge_prompt_claimed(&item.id, POLICY_RELEASE)?
+        {
+            return Ok(false);
+        }
+        // Once ever, claimed before the transition so two callers cannot both complete, and so
+        // Work reopened after the Hub completed it is left to its lead.
+        if !store.claim_merge_prompt(&item.id, HUB_COMPLETE, now)? {
+            return Ok(false);
+        }
+        let request = WorkTransitionRequest {
+            work_id: item.id.clone(),
+            operation_id: format!(
+                "hub-observed-merge:{}:{}:{}",
+                item.id, current.generation, current.updated_seq
+            ),
+            generation: current.generation,
+            expected_updated_seq: current.updated_seq,
+            session: None,
+            transition: WorkTransitionKind::Complete,
+            reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
+            superseded_by: None,
+            participants: Vec::new(),
+        };
+        let actor = WorkTransitionActor::Policy {
+            owner: &owner,
+            repository: &repo.full_name,
+            repository_id: repo.repository_id,
+        };
+        let done = store.work_transition(&actor, &request, now);
+        if done.is_err() {
+            // The claim stays only when a re-read shows the Work is no longer open (someone
+            // finished it); otherwise it is given back so a later call can complete it.
+            let still_open = store
+                .work_operational(&reader, &OperationalSelect::One(&item.id), now)
+                .map_or(true, |o| o.work.first().is_some_and(open));
+            if still_open {
+                let _ = store.unclaim_merge_prompt(&item.id, HUB_COMPLETE);
+            }
+        }
+        done.map(|_| true)
+    };
+    match attempt() {
+        Ok(done) => done,
+        // The fence moved or the Work finished meanwhile: a later call reads it again.
+        Err(super::HubError::Invalid(_)) => false,
+        Err(error) => {
+            super::error_envelope::log_internal(&error);
+            false
+        }
+    }
 }
 
 /// The most owner start lines one session start carries.
