@@ -807,7 +807,7 @@ static TOOLS_CHANGED: std::sync::LazyLock<Value> = std::sync::LazyLock::new(
 );
 
 const NOT_CONNECTED: &str = "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run.";
-const HUB_UNAVAILABLE: &str = "The AgentSCM Hub did not answer when this session started. The tools are listed, and each call tries the Hub again; until it answers, a call says why it cannot run.";
+const HUB_UNAVAILABLE: &str = "The AgentSCM Hub gave no usable answer when this session started. The tools are listed, and each call tries the Hub again; until it answers, a call says why it cannot run.";
 
 /// The server's own answer to `initialize` or `tools/list`, for when no Hub can give one; `None`
 /// for any other request. `why` opens the instructions, which a host reads only at `initialize`.

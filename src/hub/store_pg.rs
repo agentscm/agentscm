@@ -2304,15 +2304,14 @@ fn lapse_notice(
         Err(HubError::Unauthorized) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if let Some(refusal) = lapsed_hold_refusal(tx, &who, session, None)? {
-        return Ok(Some(refusal));
+    // Current Work first: a lapse whose scope was taken leaves that Work paused, and a lead
+    // that has since moved on is told only of the Work it leads now.
+    if let Some(item) = unfinished_for_session(tx, &who, session, now)? {
+        return Ok(lapsed_at(tx, &item.id, now)?.map(|(renewed, expired)| {
+            lapsed_unheld_text(&item.id, item.generation, renewed, expired, Unheld::Edit)
+        }));
     }
-    let Some(item) = unfinished_for_session(tx, &who, session, now)? else {
-        return Ok(None);
-    };
-    Ok(lapsed_at(tx, &item.id, now)?.map(|(renewed, expired)| {
-        lapsed_unheld_text(&item.id, item.generation, renewed, expired, Unheld::Edit)
-    }))
+    lapsed_hold_refusal(tx, &who, session, None)
 }
 
 /// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
@@ -8913,7 +8912,12 @@ impl Store for PgStore {
             let mut lapsed = None;
             if call.session.is_some() {
                 session_tool_call(&mut tx, token, &touched.session, phase, now)?;
-                lapsed = lapse_notice(&mut tx, token, &touched.session, now)?;
+                lapsed =
+                    lapse_notice(&mut tx, token, &touched.session, now).unwrap_or_else(|error| {
+                        // Advice only: the touch's renewal must not depend on it.
+                        eprintln!("hub: lapse notice not read: {error}");
+                        None
+                    });
             }
             tx.commit()?;
             Ok(lapsed)

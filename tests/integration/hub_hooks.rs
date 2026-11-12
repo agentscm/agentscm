@@ -1865,10 +1865,12 @@ async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
         hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
         json!({})
     );
+    // Only Claude Code's tool events are known to take added context.
+    assert_eq!(hub.hook_raw("codex", &lead, &read(None)), json!({}));
     let answer = hub.hook_raw("claude", &lead, &read(None));
     assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     let text = text_at(&answer, CLAUDE_CONTEXT);
-    assert!(text.contains("nothing was refused yet"), "{answer}");
+    assert!(text.contains("its next edit is refused"), "{answer}");
     assert!(text.contains("LEASE_LAPSED"), "{answer}");
     assert!(
         text.contains(&format!(

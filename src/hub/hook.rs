@@ -679,9 +679,6 @@ impl Call {
         }
     }
 
-    /// The shell call this call ends changed these files (observed by the hook client): already
-    /// applied, so the check of them runs after the fact like Cursor's, with the host's context
-    /// channel for `event`. A call that observed nothing is unchanged.
     /// Claude Code's tool events take added context, so a lapse notice can ride on them.
     fn noticed(mut self, agent: Agent, event: &str) -> Self {
         let event = match event {
@@ -695,6 +692,9 @@ impl Call {
         self
     }
 
+    /// The shell call this call ends changed these files (observed by the hook client): already
+    /// applied, so the check of them runs after the fact like Cursor's, with the host's context
+    /// channel for `event`. A call that observed nothing is unchanged.
     fn observed_shell(mut self, event: &'static str, field: Option<&Value>) -> Self {
         let Some(field) = field.filter(|field| !field.is_null()) else {
             return self;
@@ -985,7 +985,7 @@ impl Call {
                 if let Some(text) = lapsed {
                     let text = text.replace("when this was refused", "at this tool call");
                     outcome.text = format!(
-                        "{}AgentSCM: nothing was refused yet, but this session's next edit is: {text}",
+                        "{}AgentSCM: this session's hold lapsed, so its next edit is refused until it holds the Work again. {text}",
                         if outcome.text.is_empty() {
                             String::new()
                         } else {
