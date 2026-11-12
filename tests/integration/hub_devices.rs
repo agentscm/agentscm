@@ -1324,9 +1324,10 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert!(ok, "{stderr}");
 
     // The next session connects the checkout and says so in one line, writing no file in it.
+    // That line is not always first: a Hub that shares agent conversations says so before it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+        context(&reply).contains(&format!("AgentSCM: coordinating on {REPO} at "))
             && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
@@ -1403,7 +1404,7 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     );
     let reply = machine.session_start("s2");
     assert!(
-        context(&reply).starts_with("AgentSCM: alice has no access on private repository"),
+        context(&reply).contains("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
 
