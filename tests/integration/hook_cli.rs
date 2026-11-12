@@ -1174,6 +1174,62 @@ fn a_shell_call_that_writes_a_file_reports_the_path() {
 
 #[cfg(unix)]
 #[test]
+fn an_observation_the_hub_never_received_still_reaches_the_agent_every_time() {
+    let dir = home();
+    let (hub, _seen) = serve(|seen| {
+        let body: Value = serde_json::from_slice(&seen.body).unwrap_or_default();
+        if body["hook_event_name"] == "PostToolUse" {
+            (500, json!({"error": "boom"}))
+        } else {
+            (200, json!({}))
+        }
+    });
+    let root = connected_checkout(&dir, &hub);
+    let path = real_path();
+    let end = |id: &str| {
+        let payload = json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": root,
+            "tool_name": "Bash", "tool_use_id": id, "tool_input": {"command": "true"}});
+        let run = run_with(
+            CLAUDE,
+            &[("PATH", &path)],
+            &dir,
+            payload.to_string().as_bytes(),
+        );
+        assert_eq!(run.code, Some(0));
+        run.json()["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let start = |id: &str| {
+        let payload = json!({"hook_event_name": "PreToolUse", "session_id": "s1", "cwd": root,
+            "tool_name": "Bash", "tool_use_id": id, "tool_input": {"command": "true"}});
+        run_with(
+            CLAUDE,
+            &[("PATH", &path)],
+            &dir,
+            payload.to_string().as_bytes(),
+        );
+    };
+    for (id, file) in [("t1", "one.txt"), ("t2", "two.txt")] {
+        start(id);
+        std::fs::write(root.join(file), "x").unwrap();
+        let text = end(id);
+        assert!(
+            text.contains(&format!("could not report them to the Hub: {file}")),
+            "{id}: {text}"
+        );
+    }
+    // A call whose start was never seen: the file set is unknown, and that is said too.
+    let text = end("t3");
+    assert!(
+        text.contains("could not observe which files this shell call changed (missing snapshot)"),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_commit_made_inside_the_call_reports_its_paths() {
     let dir = home();
     let (hub, seen) = empty_hub();

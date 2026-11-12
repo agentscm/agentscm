@@ -197,12 +197,22 @@ struct Call {
     observed: Option<Observed>,
 }
 
-/// The most paths one observation may name, as the hook client bounds them.
-const MAX_OBSERVED_PATHS: usize = crate::git_collisions::OBSERVED_PATHS;
+/// At most this many paths in one observation; more set `truncated`. Defined here, not in the
+/// Unix-only `git_collisions`, because the Hub compiles everywhere; the client shares it.
+pub const OBSERVED_PATHS: usize = 200;
+const MAX_OBSERVED_PATHS: usize = OBSERVED_PATHS;
 /// How many observed paths a reply names.
 const SHOWN_OBSERVED: usize = 20;
-/// Why the hook client could not observe a shell call, shared with the client.
-const OBSERVED_UNKNOWN: [&str; 7] = crate::git_collisions::OBSERVED_UNKNOWN;
+/// Why a shell call could not be observed: the reasons the hook client sends and the Hub accepts.
+pub const OBSERVED_UNKNOWN: [&str; 7] = [
+    "missing_snapshot",
+    "pre_snapshot_failed",
+    "invalid_snapshot",
+    "git_failed",
+    "no_tool_use_id",
+    "background",
+    "local_error",
+];
 
 /// The `observed` field of a shell call's end, decoded strictly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1071,7 +1081,8 @@ impl Call {
                                     .replace(
                                         "request fresh admission before editing",
                                         "request fresh admission before the next change",
-                                    );
+                                    )
+                                    .replace("when this was refused", "when this change was made");
                                 format!(
                                     "{observed}\nAgentSCM: {detail}{child} No new file intent was announced."
                                 )
@@ -1784,8 +1795,6 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, input), scope)
         }
-        // The call that started a subagent says which one and what for; nothing else of a tool
-        // call's input or result is read.
         // A shell call's end also reports the files the hook client saw it change, or that it
         // could not tell. A failed call ends too, and may have changed files before it failed.
         Some(event @ ("PostToolUse" | "PostToolUseFailure")) if is_shell_tool(tool) => {
@@ -1798,6 +1807,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .launched(&v["subagent"])
                 .observed_shell(event, v.get("observed"))
         }
+        // The call that started a subagent says which one and what for; nothing else of a tool
+        // call's input or result is read.
         Some(event @ ("PreToolUse" | "PostToolUse")) => call(
             Kind::Activity(phase(tool, event == "PreToolUse")),
             Shape::Silent,
@@ -2237,8 +2248,6 @@ mod tests {
                 truncated: true
             }
         );
-        // The Hub and the client agree on the bounds and the reasons.
-        assert_eq!(MAX_OBSERVED_PATHS, crate::git_collisions::OBSERVED_PATHS);
         assert!(decode(json!({"outcome":"unknown","reason":"background"})) != invalid);
         assert!(decode(json!({"outcome":"unknown","reason":"local_error"})) != invalid);
         // A malformed field still ends the call and says it could not tell.

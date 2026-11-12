@@ -1241,8 +1241,9 @@ mod worktree_observation {
     use std::time::{Duration, Instant};
 
     use agentscm::git_collisions::{
-        OBSERVED_PATHS, Observed, WORKTREE_ENTRIES, WorktreeState, changed_during, worktree_state,
+        Observed, WORKTREE_ENTRIES, WorktreeState, changed_during, worktree_state,
     };
+    use agentscm::hub::hook::OBSERVED_PATHS;
 
     use super::*;
 

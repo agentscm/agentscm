@@ -1581,6 +1581,68 @@ async fn observed_shell_changes_name_a_holder_and_a_failed_call_still_ends() {
     assert!(expiry(&hub) <= unix_now() + LEASE_SECONDS, "call not ended");
 }
 
+/// Files a shell call changed on Work whose hold lapsed are already changed: the reply says to
+/// hold the scope again before the next change, never that anything was refused or not applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_shell_changes_on_lapsed_work_are_reported_as_applied() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    let begun = unix_now() - 2 * LEASE_SECONDS;
+    hub.store.observe_lease_clock(begun).unwrap();
+    hub.store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("lapsed".into()),
+                title: "lapsed".into(),
+                description: None,
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            begun,
+        )
+        .unwrap();
+    for step in 1..=4 {
+        hub.store
+            .observe_lease_clock(begun + step * LEASE_SECONDS / 2)
+            .unwrap();
+    }
+    let mut end = fixture("claude-PostToolUse-Bash");
+    end["session_id"] = json!(session);
+    end["observed"] = json!({"outcome": "changed", "paths": ["src/widget.rs"], "truncated": false});
+    let answer = hub.hook_raw("claude", &lead, &end);
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    // The wording depends on the Hub's lapsed-hold messages; this fails if they drift.
+    assert!(text.contains("LEASE_LAPSED"), "{answer}");
+    assert!(text.contains("before the next change"), "{answer}");
+    for refused in ["before editing", "not applied", "was refused"] {
+        assert!(!text.contains(refused), "{refused}: {answer}");
+    }
+    assert!(
+        !answer.to_string().contains("permissionDecision"),
+        "{answer}"
+    );
+}
+
 /// The hook's side of answering a permission prompt from the Hub. A request needs its session's
 /// permission wait, is offered only once the host's own notification confirms a prompt is on
 /// screen, and ends when the session moves on.

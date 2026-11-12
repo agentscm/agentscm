@@ -6,7 +6,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use agentscm::git_collisions::{self, OBSERVED_PATHS, WorktreeState};
+use agentscm::git_collisions::{self, WorktreeState};
+use agentscm::hub::hook::OBSERVED_PATHS;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -239,16 +240,29 @@ pub(super) fn pre(
     if !prepare(&dir) {
         return;
     }
-    // Resolution trouble only means ignored-by-the-user files may show; it is not an error.
-    let excludes = git_collisions::global_excludes_file(git, root, deadline);
-    let state = git_collisions::worktree_state(git, root, deadline, excludes.as_deref()).ok();
-    let stored = Stored {
+    // Without the user's excludes setting the snapshot could list files they keep out of Git on
+    // purpose, so a setting that cannot be resolved fails the snapshot like any other failure.
+    let snapshot = git_collisions::global_excludes_file(git, root, deadline).and_then(|excludes| {
+        git_collisions::worktree_state(git, root, deadline, excludes.as_deref())
+            .map(|state| (state, excludes))
+    });
+    let (state, excludes) = match snapshot {
+        Ok((state, excludes)) => (Some(state), excludes),
+        Err(_) => (None, None),
+    };
+    let mut stored = Stored {
         root: root.to_string_lossy().into_owned(),
         created: now(),
         state,
         excludes: excludes.map(|path| path.to_string_lossy().into_owned()),
     };
-    write(&dir, &key(agent, session, id, root), &stored);
+    let name = key(agent, session, id, root);
+    // A snapshot too large to store becomes the failed marker, so the post-call hook says so.
+    if !write(&dir, &name, &stored) && stored.state.is_some() {
+        stored.state = None;
+        stored.excludes = None;
+        write(&dir, &name, &stored);
+    }
 }
 
 /// Consumes the pre-call snapshot, snapshots `root` again and compares them.
@@ -266,7 +280,13 @@ pub(super) fn post(
     };
     let dir = store(config);
     let Some(read) = take(&dir, &key(agent, session, id, root)) else {
-        return Outcome::Unknown("missing_snapshot");
+        // A store that cannot be opened or made is a local error; an open one with no entry
+        // means the pre-call hook never stored a snapshot for this call.
+        return if prepare(&dir) {
+            Outcome::Unknown("missing_snapshot")
+        } else {
+            Outcome::Unknown("local_error")
+        };
     };
     let stored = read
         .ok()
@@ -328,7 +348,7 @@ mod tests {
             "local_error",
         ] {
             assert!(
-                git_collisions::OBSERVED_UNKNOWN.contains(&reason),
+                agentscm::hub::hook::OBSERVED_UNKNOWN.contains(&reason),
                 "{reason}"
             );
         }
@@ -356,6 +376,38 @@ mod tests {
         assert!(bounded(POST_DIFF, far) < Instant::now() + POST_DIFF + Duration::from_millis(50));
         // No time at all is a deadline already passed.
         assert!(bounded(POST_DIFF, Instant::now()) <= Instant::now());
+    }
+
+    #[test]
+    fn an_unresolvable_excludes_setting_fails_the_pre_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // A `git` that fails every call, the excludes lookup included.
+        let git = dir.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\nexit 2\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let config = dir.path().join("config");
+        pre(&config, "claude", "s", Some("t"), root.path(), &git, soon());
+        assert_eq!(
+            post(&config, "claude", "s", Some("t"), root.path(), &git, soon()),
+            Outcome::Unknown("pre_snapshot_failed")
+        );
+    }
+
+    #[test]
+    fn an_unavailable_store_is_a_local_error_and_a_missing_entry_is_a_missing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new("/synthetic/root");
+        let git = Path::new("/usr/bin/git");
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let run = |config: &Path| post(config, "claude", "s", Some("t"), root, git, soon());
+        assert_eq!(run(dir.path()), Outcome::Unknown("missing_snapshot"));
+        // A config directory that is a file cannot hold the store.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "x").unwrap();
+        assert_eq!(run(&blocked), Outcome::Unknown("local_error"));
     }
 
     #[test]

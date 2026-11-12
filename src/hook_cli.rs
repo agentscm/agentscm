@@ -441,6 +441,7 @@ async fn coordinate(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let activity = std::sync::Arc::new(ActivityTracker::new(agent));
     let local_note = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
     let measured = Instant::now();
     let report = crate::hook_report::Pending::load(
         config_dir().ok().as_deref(),
@@ -458,6 +459,7 @@ async fn coordinate(
             original_body: body,
             activity_tracker: activity.clone(),
             local_note: local_note.clone(),
+            observed: observed.clone(),
             deadline,
             report: report.header(),
         },
@@ -473,7 +475,8 @@ async fn coordinate(
     if let Some(sent) = sent {
         report.settle(measured.elapsed(), sent);
     }
-    let reply = match result {
+    let hub_failed = !matches!(&result, Ok(Ok(Ok(_))));
+    let mut reply = match result {
         Ok(Ok(Ok(reply))) => reply,
         Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
@@ -483,6 +486,14 @@ async fn coordinate(
             unknown_output(agent, &payload, "hub unreachable")
         }
     };
+    // The one-time "coordination unknown" note must not hide what this call was seen to do, so a
+    // failed Hub call says it every time.
+    if hub_failed
+        && let Some(line) = observed.lock().ok().and_then(|slot| slot.clone())
+        && let Some(line) = unreported_observation(&line)
+    {
+        reply = with_post_context(reply, agent, &payload, &line);
+    }
     finish_local_observation(reply, agent, &payload, &local_note, deadline).await
 }
 
@@ -547,10 +558,14 @@ fn read_stdin() -> Option<Vec<u8>> {
 type LocalObservation =
     std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Option<String>>>>>;
 
+/// What `observe_shell` found, kept where a failed Hub call can still reach it.
+type ObservedSlot = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
+
 struct HubCallContext {
     original_body: Vec<u8>,
     activity_tracker: std::sync::Arc<ActivityTracker>,
     local_note: LocalObservation,
+    observed: ObservedSlot,
     deadline: Instant,
     report: Option<String>,
 }
@@ -568,6 +583,7 @@ async fn call_hub(
         original_body,
         activity_tracker,
         local_note,
+        observed: observed_slot,
         deadline,
         report,
     } = context;
@@ -628,7 +644,7 @@ async fn call_hub(
                 }
             }
             #[cfg(not(unix))]
-            let _ = (&local_note, deadline);
+            let _ = (&local_note, &observed_slot, deadline);
             let session_start = is_session_start(&agent, &payload);
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
@@ -645,6 +661,9 @@ async fn call_hub(
                 && let Some(observation) =
                     observe_shell(&agent, &payload, &routed.checkout, deadline).await
             {
+                if let Ok(mut slot) = observed_slot.lock() {
+                    *slot = Some(observation.clone());
+                }
                 routed.payload["observed"] = observation;
             }
             if session_start {
@@ -2864,6 +2883,60 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
         ),
         None => context_reply_with(agent, payload, None),
     }
+}
+
+/// The line for the agent when a shell call's observation could not reach the Hub, so it is not
+/// lost with the one-time "coordination unknown" note. `None` for a shape this client never sends.
+fn unreported_observation(observed: &Value) -> Option<String> {
+    const SHOWN: usize = 20;
+    match observed["outcome"].as_str()? {
+        "changed" => {
+            let paths: Vec<&str> = observed["paths"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if paths.is_empty() {
+                return None;
+            }
+            let more = paths.len() > SHOWN || observed["truncated"] == true;
+            let listed = paths[..paths.len().min(SHOWN)].join(", ");
+            Some(format!(
+                "AgentSCM observed these files change during this shell call, but could not report them to the Hub: {listed}{}. Call `agentscm_check` with them when the Hub is reachable.",
+                if more { ", and more" } else { "" }
+            ))
+        }
+        "unknown" => Some(format!(
+            "AgentSCM could not observe which files this shell call changed ({}) and could not reach the Hub.",
+            observed["reason"].as_str()?.replace('_', " ")
+        )),
+        _ => None,
+    }
+}
+
+/// `reply` with `text` added to the context of a shell call's end event (Claude Code and Codex
+/// accept it there), after anything the reply already says.
+fn with_post_context(mut reply: Value, agent: &str, payload: &Value, text: &str) -> Value {
+    let Some(event) = payload["hook_event_name"].as_str() else {
+        return reply;
+    };
+    if !matches!(agent, "claude" | "codex") || !event.starts_with("PostToolUse") {
+        return reply;
+    }
+    if let Some(Value::String(existing)) =
+        reply.pointer_mut("/hookSpecificOutput/additionalContext")
+    {
+        existing.push_str("\n\n");
+        existing.push_str(text);
+        return reply;
+    }
+    if let Value::Object(top) = &mut reply {
+        top.insert(
+            "hookSpecificOutput".into(),
+            json!({"hookEventName": event, "additionalContext": text}),
+        );
+    }
+    reply
 }
 
 /// The agent's reply that adds `text` to its context, where the event allows it.

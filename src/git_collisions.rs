@@ -1179,20 +1179,9 @@ pub fn unmerged_paths(
 /// error: a truncated list could hide a change, and a checkout this dirty is not one a shell
 /// call's edits can be attributed in anyway.
 pub const WORKTREE_ENTRIES: usize = 2_000;
-/// At most this many paths in one [`Observed`]; more set `truncated`.
-pub const OBSERVED_PATHS: usize = 200;
+use crate::hub::hook::OBSERVED_PATHS;
 /// Output budget for `git status` and the commit diffs: room for every entry at the path limit.
 const WORKTREE_BYTES: u64 = 4 * 1024 * 1024;
-/// Why a shell call could not be observed: the reasons the hook client sends and the Hub accepts.
-pub const OBSERVED_UNKNOWN: [&str; 7] = [
-    "missing_snapshot",
-    "pre_snapshot_failed",
-    "invalid_snapshot",
-    "git_failed",
-    "no_tool_use_id",
-    "background",
-    "local_error",
-];
 
 /// One path that `git status` reported: its two-letter porcelain status, and the file's size and
 /// modification time (nanoseconds since the Unix epoch) when it exists on disk, so that a second
@@ -1299,13 +1288,17 @@ fn entry_metadata(path: &Path) -> (Option<u64>, Option<i64>) {
 /// The excludes file Git would use in `repository`, for [`worktree_state`]: the effective
 /// `core.excludesFile` read in `repository` with the user's own environment, inside `deadline`,
 /// so a repository's own setting wins over the user's global one, as it does for Git. Without a
-/// setting, the default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore`. `None` when
-/// there is none or it cannot be read in time; the caller then proceeds without it.
+/// setting, the default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore`. `Ok(None)` is a confirmed absence: Git reported no setting and there is no
+/// default file, or the configured file does not exist (Git ignores a missing excludes file).
+/// Anything that leaves the setting unknown (a timeout, Git not starting, an exit status other
+/// than "not set", output that is unreadable, too long, not UTF-8 or not an absolute path) is an
+/// error: the caller must not snapshot without the user's excludes then, as that could list
+/// files the user keeps out of Git on purpose.
 pub fn global_excludes_file(
     git_path: &Path,
     repository: &Path,
     deadline: Instant,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(git_path)
@@ -1317,31 +1310,62 @@ pub fn global_excludes_file(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+        .map_err(|_| Error::Invalid("git config did not start".into()))?;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                return Err(Error::Invalid("git config timed out".into()));
             }
         }
-    }?;
-    if status.success() {
-        let mut out = Vec::new();
-        child.stdout.take()?.take(4096).read_to_end(&mut out).ok()?;
-        let text = std::str::from_utf8(&out).ok()?.trim_end_matches('\n');
-        let path = PathBuf::from(text);
-        return (!text.is_empty() && path.is_absolute() && path.is_file()).then_some(path);
+    };
+    let mut out = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(EXCLUDES_VALUE_BYTES + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| Error::Invalid("git config output was unreadable".into()))?;
     }
-    default_excludes(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
+    match classify_excludes(status.code(), &out)? {
+        Some(path) => Ok(path),
+        None => Ok(default_excludes(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )),
+    }
+}
+
+const EXCLUDES_VALUE_BYTES: u64 = 4096;
+
+/// What `git config --get core.excludesFile` said: `None` when nothing is set (exit status 1, so
+/// the default applies), `Some(None)` for a configured file that is empty or missing, `Some(file)`
+/// for a usable one, and an error for anything else.
+fn classify_excludes(code: Option<i32>, out: &[u8]) -> Result<Option<Option<PathBuf>>> {
+    match code {
+        Some(1) => Ok(None),
+        Some(0) => {
+            if out.len() as u64 > EXCLUDES_VALUE_BYTES {
+                return Err(Error::Invalid("core.excludesFile is too long".into()));
+            }
+            let text = std::str::from_utf8(out)
+                .map_err(|_| Error::Invalid("core.excludesFile is not UTF-8".into()))?
+                .trim_end_matches('\n');
+            if text.is_empty() {
+                return Ok(Some(None));
+            }
+            let path = PathBuf::from(text);
+            if !path.is_absolute() {
+                return Err(Error::Invalid("core.excludesFile is not absolute".into()));
+            }
+            Ok(Some(path.is_file().then_some(path)))
+        }
+        _ => Err(Error::Invalid("git config failed".into())),
+    }
 }
 
 /// Git's default global excludes file, when it exists.
@@ -1392,9 +1416,15 @@ pub fn worktree_state(
     let top = git.run(&["rev-parse", "--show-toplevel"], None, WORKTREE_BYTES)?;
     let top = top.strip_suffix(b"\n").unwrap_or(&top);
     let top = PathBuf::from(std::ffi::OsStr::from_bytes(top));
+    // A path that cannot be handed to Git is an error, not a reason to list what it would hide.
     let excludes = excludes
-        .and_then(Path::to_str)
-        .map(|path| format!("core.excludesFile={path}"));
+        .map(|path| match path.to_str() {
+            Some(path) if Path::new(path).is_absolute() => Ok(format!("core.excludesFile={path}")),
+            _ => Err(Error::Invalid(
+                "the excludes file is not an absolute UTF-8 path".into(),
+            )),
+        })
+        .transpose()?;
     let mut args = Vec::new();
     if let Some(setting) = &excludes {
         args.extend(["-c", setting]);
@@ -1584,6 +1614,84 @@ mod tests {
         );
         assert_eq!(default_excludes(Some(xdg), Some(home)), None);
         assert_eq!(default_excludes(None, None), None);
+    }
+
+    #[test]
+    fn the_excludes_setting_is_classified_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ignore");
+        std::fs::write(&file, "x\n").unwrap();
+        let text = format!("{}\n", file.display());
+        // Not set: the default applies.
+        assert_eq!(classify_excludes(Some(1), b"").unwrap(), None);
+        // Set to an existing file, a missing one, or nothing.
+        assert_eq!(
+            classify_excludes(Some(0), text.as_bytes()).unwrap(),
+            Some(Some(file))
+        );
+        let missing = dir.path().join("missing");
+        let missing = format!("{}\n", missing.display());
+        assert_eq!(
+            classify_excludes(Some(0), missing.as_bytes()).unwrap(),
+            Some(None)
+        );
+        assert_eq!(classify_excludes(Some(0), b"\n").unwrap(), Some(None));
+        // Unknown: other statuses, a signal, unreadable or unusable values.
+        assert!(classify_excludes(Some(2), b"").is_err());
+        assert!(classify_excludes(Some(128), b"/x\n").is_err());
+        assert!(classify_excludes(None, b"").is_err());
+        assert!(classify_excludes(Some(0), b"relative/path\n").is_err());
+        assert!(classify_excludes(Some(0), b"/bad\xff\n").is_err());
+        assert!(classify_excludes(Some(0), &vec![b'a'; 4097]).is_err());
+    }
+
+    #[test]
+    fn an_unusable_excludes_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let soon = Instant::now() + std::time::Duration::from_secs(5);
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/odd\xff"));
+        for path in [odd, Path::new("relative")] {
+            assert!(worktree_state(Path::new("git"), dir.path(), soon, Some(path)).is_err());
+        }
+    }
+
+    /// A stand-in `git` that runs `body`, to exercise how the excludes lookup reads its result.
+    fn fake_git(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("git");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_excludes_lookup_fails_closed_when_git_cannot_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ignore");
+        std::fs::write(&file, "x\n").unwrap();
+        let ask = |body: &str, wait: u64| {
+            let git = fake_git(dir.path(), body);
+            global_excludes_file(
+                &git,
+                repo.path(),
+                Instant::now() + std::time::Duration::from_millis(wait),
+            )
+        };
+        assert_eq!(
+            ask(&format!("echo '{}'", file.display()), 5000).unwrap(),
+            Some(file.clone())
+        );
+        assert!(ask("exit 2", 5000).is_err());
+        assert!(ask("exec sleep 5", 300).is_err());
+        let missing = global_excludes_file(
+            &dir.path().join("no-such-git"),
+            repo.path(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(missing.is_err());
+        // Exit status 1 is Git saying nothing is set: not an error.
+        assert!(ask("exit 1", 5000).is_ok());
     }
 
     #[test]
