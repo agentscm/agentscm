@@ -679,14 +679,11 @@ pub(super) async fn sync_adoption(
         }
     };
     let lock = file.and_then(|bytes| SkillLock::parse(&bytes).ok());
-    // Repository skills are GitHub only: GitLab's file read returns JSON re-encoded, so a
-    // manifest's bytes, and its digest, never match the pin there.
     let mut bundles = Vec::new();
     let paths = lock
         .iter()
         .flat_map(|l| &l.skills)
         .filter_map(|p| p.source.repo_local_path())
-        .filter(|_| matches!(api, ForgeApi::Github(_)))
         .take(supported::MAX_LOCAL_SKILLS);
     for path in paths {
         match read_bundle(api, token, repo, &at, path).await {
