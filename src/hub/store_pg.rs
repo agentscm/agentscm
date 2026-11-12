@@ -56,7 +56,8 @@ use super::device::{
     REFUSAL_SECONDS, Refusal, RepositoryUsage, validate_device_name,
 };
 use super::external_runs::{
-    EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
+    EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun,
+    ExternalSource, supersedes,
 };
 use super::handoff::{
     Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request,
@@ -5260,9 +5261,10 @@ fn active_token(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Re
 }
 
 fn external_run_row(row: &postgres::Row) -> Result<ExternalRun> {
-    let (Some(kind), Some(outcome)) = (
+    let (Some(kind), Some(outcome), Some(source)) = (
         ExternalKind::parse(row.get(1)),
         ExternalOutcome::parse(row.get(8)),
+        ExternalSource::parse(row.get(11)),
     ) else {
         return Err(HubError::Unavailable(
             "stored external run is invalid".into(),
@@ -5271,6 +5273,7 @@ fn external_run_row(row: &postgres::Row) -> Result<ExternalRun> {
     Ok(ExternalRun {
         provider: row.get(0),
         kind,
+        source,
         run_id: row.get(2),
         attempt: row.get(3),
         commit_sha: row.get(4),
@@ -10678,6 +10681,7 @@ impl Store for PgStore {
         run.validate()?;
         let kind = run.kind.as_str();
         let outcome = run.outcome.as_str();
+        let source = run.source.as_str();
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             // The repository row lock serializes its observations.
@@ -10687,9 +10691,16 @@ impl Store for PgStore {
                     &format!(
                         "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
                          WHERE repository = $1 AND provider = $2 AND kind = $3 AND run_id = $4
-                             AND attempt = $5"
+                             AND attempt = $5 AND source = $6"
                     ),
-                    &[&repo, &run.provider, &kind, &run.run_id, &run.attempt],
+                    &[
+                        &repo,
+                        &run.provider,
+                        &kind,
+                        &run.run_id,
+                        &run.attempt,
+                        &source,
+                    ],
                 )?
                 .map(|row| external_run_row(&row))
                 .transpose()?;
@@ -10701,9 +10712,9 @@ impl Store for PgStore {
             tx.execute(
                 "INSERT INTO hub_external_runs (repository, provider, kind, run_id, attempt,
                      commit_sha, branch, environment, name, outcome, provider_updated_at,
-                     html_url)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                 ON CONFLICT (repository, provider, kind, run_id, attempt) DO UPDATE SET
+                     html_url, source)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 ON CONFLICT (repository, provider, kind, source, run_id, attempt) DO UPDATE SET
                      commit_sha = excluded.commit_sha, branch = excluded.branch,
                      environment = excluded.environment, name = excluded.name,
                      outcome = excluded.outcome,
@@ -10722,6 +10733,7 @@ impl Store for PgStore {
                     &outcome,
                     &run.provider_updated_at,
                     &run.html_url,
+                    &source,
                 ],
             )?;
             append(&mut tx, &Event::external_run_observed(repo, run)?)?;
@@ -13061,10 +13073,10 @@ impl Store for PgStore {
                          WHERE work=$1 AND ($2::text IS NULL
                            OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
                               > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
-                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
+                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND EXISTS (
                                 SELECT 1 FROM hub_settings o
                                  WHERE o.key = $8::text || author || ':' || $9::bigint::text
-                                   AND o.value <> '0')))
+                                   AND o.value = '0')))
                          ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
                      SELECT page.*, e.event, e.observed_at FROM page
                      JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -13079,8 +13091,8 @@ impl Store for PgStore {
                     &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
                     &(audience == ConversationAudience::Everyone),
                     &who.owner.id,
-                    // Set only for readers of a sharing repository: an author who opted out is
-                    // left out, with what they shared before.
+                    // Set only for readers of a sharing repository: an author is included only
+                    // after their affirmative opt-in, including for bodies shared before it.
                     &opt_out_prefix,
                     &who.repository_id,
                 ],
@@ -13540,8 +13552,8 @@ impl Store for PgStore {
                             received_order DESC) AS scope_rank
                     FROM scope_state
                 )
-                SELECT start_request,finish_request,source_id FROM ranked
-                WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
+                SELECT start_request,finish_request,source_id,author_token FROM ranked
+                WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2),author_token:r.get(3)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
             let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now,super::viewer::Viewer(&who.owner.id));tx.commit()?;Ok(Some(summary))})
     }

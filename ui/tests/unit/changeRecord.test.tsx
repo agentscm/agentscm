@@ -23,6 +23,7 @@ const fixture = () => ({
     schema_version: 1,
     work_id: WORK_ID,
     generation: 3,
+    updated_seq: 91,
     as_of: 1_798_000_300,
     intent: {
       title: 'Capture a bounded change-record handoff',
@@ -127,10 +128,20 @@ afterEach(() => {
 })
 
 describe('change record response', () => {
+  it.each(['builder’s Codex', 'No action assigned', 'Recipient unknown'])('accepts the actionable-status recipient label %s', (label) => {
+    const response = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    response.summary['review'] = { captured_by: null, diff: null, actual_scope: 'unknown', concerns: [], detail_links: [], next_actor: label, supported_action: null, establishes_approval: false }
+    expect(decodeChangeRecordResponse(response).summary.review?.next_actor).toBe(label)
+  })
+
   it('decodes the bounded projection with inspectable source, intent, decision and independent action dimensions', () => {
     const value = decodeChangeRecordResponse(fixture(), WORK_ID)
     expect(value.summary.intent).toEqual({
       title: 'Capture a bounded change-record handoff',
+      description: null,
+      repository: null,
+      branch: null,
+      provenance: null,
       scope: ['ui/src/**', 'src/hub/mcp.rs'],
       scope_omitted: 0,
     })
@@ -163,6 +174,21 @@ describe('change record response', () => {
     const mixed = fixture()
     mixed.summary.latest_action.evidence_availability = 'mixed'
     expect(decodeChangeRecordResponse(mixed).summary.latest_action?.evidence_availability).toBe('mixed')
+  })
+
+  it('decodes the optional review projection and rejects malformed or cross-repository diff references', () => {
+    const value = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    value.summary['review'] = { captured_by: { agent: 'review-agent', session_id: 'session-7' }, diff: { kind: 'git', repository: 'counterbranch/agentscm', worktree_id: 'worktree-1', base: BASE, head: HEAD, dirty: true, untracked_count: 2, omissions: ['untracked_content'], snapshot_coverage: 'partial' }, actual_scope: 'unknown', concerns: ['current_source_applicability_not_established'], detail_links: [`/v1/hub/repos/counterbranch/agentscm/change-records/${WORK_ID}`], next_actor: 'lead-agent', supported_action: 'Ask a person to review the blocked Work.', establishes_approval: false }
+    const decoded = decodeChangeRecordResponse(value, WORK_ID, 'counterbranch/agentscm')
+    expect(decoded.summary.review?.diff).toMatchObject({ kind: 'git', base: BASE, head: HEAD, dirty: true })
+    expect(decoded.summary.review?.establishes_approval).toBe(false)
+    expect(decoded.summary.review?.supported_action).toBe('Ask a person to review the blocked Work.')
+    const malformed = structuredClone(value)
+    ;(malformed.summary['review'] as Record<string, unknown>)['establishes_approval'] = true
+    expect(() => decodeChangeRecordResponse(malformed)).toThrow(/summary.review/)
+    const crossRepo = structuredClone(value)
+    ;((crossRepo.summary['review'] as Record<string, unknown>)['diff'] as Record<string, unknown>)['repository'] = 'other/repository'
+    expect(() => decodeChangeRecordResponse(crossRepo, WORK_ID, 'counterbranch/agentscm')).toThrow(/repository_mismatch/)
   })
 
   it('decodes native source facts without accepting host paths', () => {
@@ -362,6 +388,16 @@ describe('change record route and page', () => {
     const response = fixture()
     response.summary.intent.scope_omitted = 240
     response.summary.decision.source_refs_omitted = 84
+    ;(response.summary as Record<string, unknown>)['review'] = {
+      captured_by: { agent: 'capture-agent', session_id: 'capture-session' },
+      diff: { kind: 'git', repository: 'counterbranch/agentscm', worktree_id: 'worktree-1', base: BASE, head: HEAD, dirty: true, untracked_count: 2, omissions: ['ignored_content'], snapshot_coverage: 'partial' },
+      actual_scope: 'unknown',
+      concerns: ['capture_history_incomplete_or_unknown', 'latest_execution_not_successful', 'current_source_applicability_not_established'],
+      detail_links: [`/v1/hub/repos/counterbranch%2Fagentscm/change-records/${WORK_ID}`, '/v1/hub/standup/status'],
+      next_actor: 'builder’s Codex',
+      supported_action: 'Ask builder to decide whether the blocked Work should continue.',
+      establishes_approval: false,
+    }
     const sent: { method: string; url: string }[] = []
     vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
       sent.push({ method: (init.method ?? 'GET').toUpperCase(), url: input })
@@ -370,30 +406,31 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest verification' })
     expect(screen.getAllByText('Capture a bounded change-record handoff').length).toBeGreaterThan(0)
-    expect(screen.getByText('ui/src/**')).toBeTruthy()
+    expect(screen.getAllByText('ui/src/**').length).toBeGreaterThan(0)
     expect(screen.getByText('240 additional scope entries omitted from this bounded projection.')).toBeTruthy()
     expect(screen.getByText('Git working source')).toBeTruthy()
-    expect(screen.getByText(HEAD)).toBeTruthy()
+    expect(screen.getAllByText(HEAD).length).toBeGreaterThan(0)
     expect(screen.getByText(TREE)).toBeTruthy()
     expect(screen.getByText(BASE)).toBeTruthy()
     expect(screen.getByText(SNAPSHOT_DIGEST)).toBeTruthy()
     expect(screen.getByText('Ignored content')).toBeTruthy()
-    expect(screen.getByText('Passed')).toBeTruthy()
+    expect(screen.getAllByText('Passed').length).toBeGreaterThan(0)
     expect(screen.getByText('Verification')).toBeTruthy()
     expect(screen.getByText('Configured recipe match')).toBeTruthy()
-    expect(screen.getByText('Stale')).toBeTruthy()
-    expect(screen.getByText('Caller asserted')).toBeTruthy()
+    expect(screen.getAllByText('Stale').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Caller asserted').length).toBeGreaterThan(0)
     expect(screen.getByText('Evidence local')).toBeTruthy()
     expect(screen.getByText('Agent says')).toBeTruthy()
     expect(screen.getByRole('link', { name: 'Capture a bounded change-record handoff' }).getAttribute('href')).toBe(`#work/${WORK_ID}`)
     expect(screen.getByText('Technical details', { selector: 'summary' }).closest('details')?.textContent).toContain(WORK_ID)
     expect(screen.getAllByText('Partial').length).toBeGreaterThan(0)
-    expect(screen.getByText('Decision proposed')).toBeTruthy()
+    expect(screen.getAllByText('Decision proposed').length).toBeGreaterThan(0)
     expect(screen.getByText('Agent proposal')).toBeTruthy()
     expect(screen.getByText(/This is not human approval/)).toBeTruthy()
-    expect(screen.getByText('Keep the read surface bounded and expose source coverage.')).toBeTruthy()
+    expect(screen.getAllByText('Keep the read surface bounded and expose source coverage.').length).toBeGreaterThan(0)
     expect(screen.getByText(/Declared captured event/)).toBeTruthy()
     expect(screen.getByText(/session-7 \/ event:42/)).toBeTruthy()
     expect(screen.getByText(/Supersedes version/)).toBeTruthy()
@@ -401,11 +438,17 @@ describe('change record route and page', () => {
     expect(screen.getByText('84 additional source references omitted from this bounded projection.')).toBeTruthy()
     expect(screen.getByText('Human decision is unknown')).toBeTruthy()
     expect(screen.getAllByText('Run the focused UI check against the current source.').length).toBeGreaterThan(0)
+    expect(screen.getByText('capture-agent')).toBeTruthy()
+    expect(screen.getByText(/proposed by review-agent/)).toBeTruthy()
+    expect(screen.getByText(/Ask builder to decide whether the blocked Work should continue/)).toBeTruthy()
+    expect(screen.getByText('builder’s Codex')).toBeTruthy()
+    expect(screen.getByText('Capture history is partial or unavailable')).toBeTruthy()
+    expect(screen.getByText('The latest execution did not succeed')).toBeTruthy()
+    expect(screen.getByText('Applicability to the current source is not established')).toBeTruthy()
     expect(screen.queryByText(/private transcript/)).toBeNull()
     const record = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}`
-    // The list is the only conversation request: no body is fetched until one is opened.
-    await screen.findByText('No shared conversation you can read for this work item')
-    expect(sent).toEqual([{ method: 'GET', url: record }, { method: 'GET', url: `${record}/conversation` }])
+    expect(screen.getByRole('button', { name: 'Show shared conversation entries' })).toBeTruthy()
+    expect(sent).toEqual([{ method: 'GET', url: record }])
   })
 
   it('lists model, effort and permission mode per session with unknown where absent', async () => {
@@ -419,6 +462,7 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest verification' })
     expect(screen.getByText('Session session-1')).toBeTruthy()
     expect(screen.getByText('Model model-a · effort high · permission mode plan')).toBeTruthy()
@@ -439,9 +483,10 @@ describe('change record route and page', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
 
+    fireEvent.click(await screen.findByText('Source, check and decision details', { selector: 'summary' }))
     await screen.findByRole('heading', { name: 'Latest execution' })
     expect(screen.getByText('Execution')).toBeTruthy()
-    expect(screen.getByText('Succeeded')).toBeTruthy()
+    expect(screen.getAllByText('Succeeded').length).toBeGreaterThan(0)
     expect(screen.getByText('Verification not established')).toBeTruthy()
     expect(screen.getByText('Observed command')).toBeTruthy()
     expect(screen.getByText(/no verification result was established/i)).toBeTruthy()
@@ -532,6 +577,7 @@ describe('shared conversation', () => {
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo={REPO} token="read-token" />)
     await screen.findByRole('heading', { name: 'Conversation' })
+    fireEvent.click(screen.getByRole('button', { name: 'Show shared conversation entries' }))
   }
 
   it('lists entries with kind, time, availability and expiry, and offers a body only for shared ones', async () => {
@@ -561,7 +607,8 @@ describe('shared conversation', () => {
           ]))
         : undefined,
     )
-    const items = (await screen.findAllByRole('listitem')).filter((item) => item.closest('ul')?.getAttribute('aria-label') === 'Shared conversation entries')
+    await screen.findByRole('list', { name: 'Shared conversation entries' })
+    const items = screen.getAllByRole('listitem').filter((item) => item.closest('ul')?.getAttribute('aria-label') === 'Shared conversation entries')
     expect(items[0]?.textContent).toContain('expired ')
     expect(items[1]?.textContent).toContain('Deleted')
     expect(items[1]?.textContent).not.toContain('expired')
@@ -620,7 +667,7 @@ describe('shared conversation', () => {
 
   it('says plainly when the viewer is not the author or an admin, and offers no retry', async () => {
     await open((url) => (url.endsWith('/conversation') ? json(403, { error: 'forbidden' }) : undefined))
-    expect(await screen.findByText('Only the person who shared this conversation and Hub admins can read it')).toBeTruthy()
+    expect(await screen.findByText('This conversation is available only to its author or a Hub admin while repository sharing is off')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
   })
 
@@ -635,7 +682,7 @@ describe('shared conversation', () => {
       [410, 'This conversation body has expired or been deleted'],
       [424, 'Integrity failed: the stored body is missing or did not verify, so nothing is shown'],
       [404, 'This conversation body is not on the Hub'],
-      [403, 'Only the person who shared this conversation and Hub admins can read it'],
+      [403, 'This conversation is available only to its author or a Hub admin while repository sharing is off'],
     ] as const) {
       status.set('body', code)
       fireEvent.click(await screen.findByRole('button', { name: 'View' }))

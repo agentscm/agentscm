@@ -211,6 +211,8 @@ pub struct Project {
     pub git: Option<std::path::PathBuf>,
     /// File bytes by (ref, path), for `repository/files/:path?ref=`.
     pub files: BTreeMap<(String, String), Vec<u8>>,
+    /// Deployments as GitLab lists them, in creation order.
+    pub deployments: Vec<Value>,
     /// Namespace ids from the project's own outward: its group then each parent group, or its
     /// owner's user id.
     pub namespaces: Vec<i64>,
@@ -231,6 +233,7 @@ impl Project {
             default_branch: Some("main".into()),
             git: None,
             files: BTreeMap::new(),
+            deployments: Vec::new(),
             namespaces: Vec::new(),
             archived: false,
         }
@@ -819,6 +822,48 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         200,
                         json!({"id": n.id, "body": n.body, "author": {"username": n.author_username}}),
                     )
+                }
+                None => not_found(),
+            }
+        }
+        (&Method::GET, ["deployments"]) => {
+            let environment = query.iter().find(|(k, _)| k == "environment");
+            let mut found: Vec<Value> = project
+                .deployments
+                .iter()
+                .filter(|d| {
+                    environment.is_none_or(|(_, e)| d["environment"]["name"].as_str() == Some(e))
+                })
+                .cloned()
+                .collect();
+            if query.iter().any(|(k, v)| k == "sort" && v == "desc") {
+                found.reverse();
+            }
+            json_reply(200, Value::Array(found))
+        }
+        (&Method::POST | &Method::PUT, ["deployments", ..])
+            if token.access.get(&id).is_none_or(|level| *level < 30) =>
+        {
+            json_reply(403, json!({"message": "403 Forbidden"}))
+        }
+        (&Method::POST, ["deployments"]) => {
+            let b = json_body();
+            let deployment = json!({"id": project.deployments.len() + 1, "sha": b["sha"],
+                "ref": b["ref"], "status": b["status"],
+                "environment": {"name": b["environment"]}});
+            project.deployments.push(deployment.clone());
+            json_reply(201, deployment)
+        }
+        (&Method::PUT, ["deployments", number]) => {
+            let status = json_body()["status"].clone();
+            match project
+                .deployments
+                .iter_mut()
+                .find(|d| d["id"].as_i64().is_some_and(|id| number.parse() == Ok(id)))
+            {
+                Some(deployment) => {
+                    deployment["status"] = status;
+                    json_reply(200, deployment.clone())
                 }
                 None => not_found(),
             }

@@ -1369,7 +1369,25 @@ async fn read_repo(
     }
     let read = poll_issue_closures(state, conn, repo, token).await;
     release_settled_holds(state, conn, repo, read).await;
+    complete_merged_work(state, conn, repo).await;
     Ok(report)
+}
+
+/// Completes Work whose pull request this Hub observed merge and that no live session holds.
+/// A failure never fails the poll.
+async fn complete_merged_work(state: &HubState, conn: &Connection, repo: &ConnectedRepository) {
+    let (provider, repo, now) = (
+        conn.provider.clone(),
+        repo.clone(),
+        super::store::unix_now(),
+    );
+    let done = db(state, move |store| {
+        super::merged_holds::complete_merged(store, &provider, &repo, now)
+    })
+    .await;
+    if let Err(error) = done {
+        crate::hub::error_envelope::log_internal(&error);
+    }
 }
 
 /// Most source issues read per poll of one repository.
@@ -2927,7 +2945,8 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
         "callback_urls": [format!("{public}/v1/hub/login/github/callback")],
         "public": false,
         "default_permissions": {"contents": "read", "metadata": "read",
-            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read"}});
+            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read",
+            "deployments": "write"}});
     if webhook_reachable(public) {
         manifest["hook_attributes"] =
             json!({"url": format!("{public}/v1/hub/webhooks/github/{connection}")});

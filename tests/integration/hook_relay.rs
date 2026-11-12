@@ -532,47 +532,64 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_relay_pool() {
     );
     let _host = fixture.host();
     let mcp = fixture.received().peer;
-    let mut owner = None;
-    for event in ["SessionStart", "SessionEnd"] {
+    // Sends one hook and returns the connection its Hub request came on. Capture also asks,
+    // once, whether the repository shares agent conversations.
+    let send = |event: &str| {
         let output = fixture
             .hook(event, true, |_| {})
             .child
             .wait_with_output()
             .unwrap();
         assert!(output.status.success());
-        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
-        if event == "SessionStart" {
-            assert!(
-                reply["hookSpecificOutput"]["additionalContext"]
-                    .as_str()
-                    .unwrap()
-                    .contains("native session ID")
-            );
-        } else {
-            assert_eq!(reply, json!({}));
+        let mut seen = vec![fixture.received()];
+        while let Ok(more) = fixture.seen.recv_timeout(Duration::from_millis(200)) {
+            seen.push(more);
         }
-        let peer = if event == "SessionStart" {
-            // Capture also asks, once, whether the repository shares agent conversations.
-            let first = fixture.received();
-            let mut seen = vec![first];
-            while let Ok(more) = fixture.seen.recv_timeout(Duration::from_millis(200)) {
-                seen.push(more);
-            }
-            let (hooks, rest): (Vec<_>, Vec<_>) = seen
-                .into_iter()
-                .partition(|s| s.uri == "/v1/hub/hook/claude?repo=acme%2Fwidgets");
-            assert_eq!(hooks.len(), 1);
-            assert!(
-                rest.iter()
-                    .all(|s| s.uri == "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"),
-                "{:?}",
-                rest.iter().map(|s| &s.uri).collect::<Vec<_>>()
-            );
-            hooks[0].peer
-        } else {
-            fixture.only_hook().peer
-        };
-        assert_ne!(peer, mcp);
-        assert_eq!(*owner.get_or_insert(peer), peer);
-    }
+        let (hooks, rest): (Vec<_>, Vec<_>) = seen
+            .into_iter()
+            .partition(|s| s.uri == "/v1/hub/hook/claude?repo=acme%2Fwidgets");
+        assert_eq!(hooks.len(), 1);
+        assert!(
+            rest.iter()
+                .all(|s| s.uri == "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"),
+            "{:?}",
+            rest.iter().map(|s| &s.uri).collect::<Vec<_>>()
+        );
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (hooks[0].peer, reply)
+    };
+    // The host answers MCP before its relay has bound, and a hook that finds no relay sends
+    // directly on a connection of its own: wait for two hooks in a row on one connection.
+    let started = Instant::now();
+    let mut previous = None;
+    let owner = loop {
+        let (peer, _) = send("PreToolUse");
+        if previous == Some(peer) {
+            break peer;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the relay must start pooling hooks"
+        );
+        previous = Some(peer);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_ne!(owner, mcp);
+    let (peer, reply) = send("SessionStart");
+    assert!(
+        reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("native session ID")
+    );
+    assert_eq!(
+        peer, owner,
+        "SessionStart must reuse the relay's pooled connection"
+    );
+    let (peer, reply) = send("SessionEnd");
+    assert_eq!(reply, json!({}));
+    assert_eq!(
+        peer, owner,
+        "SessionEnd must reuse the relay's pooled connection"
+    );
 }

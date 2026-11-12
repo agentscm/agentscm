@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
 use agentscm::hub::HubState;
-use agentscm::hub::external_runs::{ExternalKind, ExternalOutcome, ExternalRun};
+use agentscm::hub::external_runs::{ExternalKind, ExternalOutcome, ExternalRun, ExternalSource};
 use agentscm::hub::publish::{NewPublication, Update, derive_id};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
@@ -177,6 +177,27 @@ impl Env {
             .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         serde_json::from_str(&response.text().await.unwrap()).unwrap()
+    }
+
+    /// `POST /v1/hub/repos/{repo}/deployments` with this agent's token: status and body.
+    async fn record(&self, body: Value) -> (u16, Value) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = agentscm::hub::router(self.state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/hub/repos/acme%2Fwidgets/deployments"))
+            .bearer_auth(&self.secret)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (
+            status,
+            serde_json::from_str(&response.text().await.unwrap()).unwrap(),
+        )
     }
 
     fn runs(&self, sha: &str) -> Vec<ExternalRun> {
@@ -870,4 +891,289 @@ async fn many_ci_runs_do_not_hide_deployments_in_the_view() {
     assert_eq!(external["state"], "incomplete");
     assert_eq!(external["ci"].as_array().unwrap().len(), 200);
     assert_eq!(external["deployments"].as_array().unwrap().len(), 1);
+}
+
+fn live(status: &str) -> Value {
+    json!({"commit": MERGED, "environment": "production", "status": status,
+        "url": "https://widgets.example.test"})
+}
+
+#[tokio::test]
+async fn a_recorded_deployment_is_written_with_the_hubs_credential_and_shown() {
+    // Not watched: the Hub reads nothing from the forge, but shows what it recorded.
+    let env = Env::start(false).await;
+    env.fake
+        .with(|s| s.pushers.insert(PAT.into(), [REPO_ID].into()));
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+
+    let (status, first) = env.record(live("success")).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["recorded"], true);
+    assert_eq!(
+        (&first["source"], &first["outcome"], &first["provider"]),
+        (&json!("recorded"), &json!("succeeded"), &json!("github"))
+    );
+    let (_, again) = env.record(live("success")).await;
+    assert_eq!(again["recorded"], false, "a repeat writes nothing");
+    let deployments = || env.fake.with(|s| s.repos[&REPO_ID].deployments.clone());
+    let made = deployments();
+    assert_eq!(made.len(), 1);
+    assert_eq!(made[0].0["sha"], MERGED);
+    assert_eq!(made[0].0["payload"], json!({"agentscm": "recorded"}));
+    assert_eq!(made[0].1.len(), 1);
+    assert_eq!(
+        made[0].1[0]["environment_url"],
+        "https://widgets.example.test"
+    );
+
+    let (_, failed) = env.record(live("failure")).await;
+    assert_eq!(failed["recorded"], true);
+    assert_eq!(
+        deployments()[0].1.len(),
+        2,
+        "a new status on the same deployment"
+    );
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["watched"], false);
+    assert_eq!(external["state"], "unobserved");
+    assert_eq!(external["deployments"].as_array().unwrap().len(), 1);
+    let shown = &external["deployments"][0];
+    assert_eq!(
+        (&shown["environment"], &shown["outcome"], &shown["source"]),
+        (&json!("production"), &json!("failed"), &json!("recorded"))
+    );
+}
+
+#[tokio::test]
+async fn a_watched_read_keeps_a_recorded_deployment_recorded() {
+    let env = Env::start(true).await;
+    env.fake
+        .with(|s| s.pushers.insert(PAT.into(), [REPO_ID].into()));
+    env.publish(1, OTHER, Some(MERGED)).await;
+    assert_eq!(env.record(live("success")).await.0, 200);
+    env.pass().await;
+    let deployed: Vec<_> = env
+        .runs(MERGED)
+        .into_iter()
+        .filter(|run| run.kind == ExternalKind::Deployment)
+        .collect();
+    assert_eq!(deployed.len(), 1, "{deployed:?}");
+    assert_eq!(deployed[0].source, ExternalSource::Recorded);
+    assert_eq!(deployed[0].outcome, ExternalOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn a_credential_without_deployment_access_records_nothing_and_says_so() {
+    let env = Env::start(false).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    let (status, refused) = env.record(live("success")).await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["error"], "forge_permission_missing");
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains("Deployments: Read and write"), "{message}");
+    assert!(message.contains("Nothing was recorded"), "{message}");
+    assert!(env.runs(MERGED).is_empty());
+    assert!(env.fake.with(|s| s.repos[&REPO_ID].deployments.is_empty()));
+
+    for bad in [
+        json!({"commit": "abc", "environment": "production", "status": "success"}),
+        json!({"commit": MERGED, "environment": "", "status": "success"}),
+        json!({"commit": MERGED, "environment": "production", "status": "done"}),
+        json!({"commit": MERGED, "environment": "production", "status": "success",
+            "url": "ftp://x"}),
+    ] {
+        assert_eq!(env.record(bad.clone()).await.0, 400, "{bad}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_records_through_the_hub_with_no_forge_token() {
+    use std::process::Command;
+    let env = Env::start(false).await;
+    env.fake
+        .with(|s| s.pushers.insert(PAT.into(), [REPO_ID].into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub = format!("http://{}", listener.local_addr().unwrap());
+    let app = agentscm::hub::router(env.state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("agent.token");
+    std::fs::write(&token_file, &env.secret).unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&checkout)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "deploy me"]);
+    git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+    let sha = git(&["rev-parse", "HEAD"]);
+    let deployed = |args: &[&str]| {
+        let checkout = checkout.clone();
+        let (hub, token_file) = (hub.clone(), token_file.clone());
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_agentscm"))
+                .current_dir(checkout)
+                .env("AGENTSCM_HUB_URL", hub)
+                .env("AGENTSCM_HUB_TOKEN_FILE", token_file)
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .args(["--no-telemetry", "deployed"])
+                .args(args)
+                .output()
+                .unwrap()
+        })
+    };
+    let out = deployed(&["--env", "production"]).await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "Recorded {} live in production for acme/widgets on GitHub.\n",
+            &sha[..12]
+        )
+    );
+    let again = deployed(&["--env", "production"]).await.unwrap();
+    assert!(String::from_utf8_lossy(&again.stdout).starts_with("Already recorded"));
+    env.fake.with(|s| {
+        let made = &s.repos[&REPO_ID].deployments;
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].0["sha"], sha.as_str());
+    });
+
+    // A checkout of another repository is refused before anything is sent.
+    git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:acme/other.git",
+    ]);
+    let other = deployed(&["--env", "staging"]).await.unwrap();
+    assert!(!other.status.success());
+    assert!(String::from_utf8_lossy(&other.stderr).contains("acme/other"));
+    assert_eq!(env.fake.with(|s| s.repos[&REPO_ID].deployments.len()), 1);
+}
+
+#[tokio::test]
+async fn a_deploy_workflow_run_is_a_workflow_deployment_without_the_opt_in() {
+    let env = Env::start(false).await;
+    // What `PUT .../deploy-workflow` stores once a repository admin names the workflow.
+    env.store
+        .set_setting(
+            &format!("deploy_workflow:repo:{REPO_ID}"),
+            ".github/workflows/deploy.yml",
+            "usr_admin",
+        )
+        .unwrap();
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        let mut deploy = run_json(REPO_ID, 5, MERGED, "main", "completed", Some("success"));
+        deploy["path"] = ".github/workflows/deploy.yml".into();
+        deploy["name"] = "Deploy to production".into();
+        r.runs.push(deploy);
+        r.runs.push(run_json(
+            REPO_ID,
+            6,
+            MERGED,
+            "main",
+            "completed",
+            Some("success"),
+        ));
+    });
+    env.pass().await;
+    let deployed: Vec<_> = env
+        .runs(MERGED)
+        .into_iter()
+        .filter(|run| run.kind == ExternalKind::Deployment)
+        .collect();
+    assert_eq!(
+        deployed.len(),
+        1,
+        "only the deploy workflow's run: {deployed:?}"
+    );
+    assert_eq!(deployed[0].source, ExternalSource::Workflow);
+    assert_eq!(deployed[0].run_id, 5);
+    assert_eq!(
+        deployed[0].environment.as_deref(),
+        Some("Deploy to production")
+    );
+    assert_eq!(deployed[0].outcome, ExternalOutcome::Succeeded);
+
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["watched"], true);
+    assert_eq!(external["state"], "observed");
+    assert_eq!(external["ci"].as_array().unwrap().len(), 2);
+    assert_eq!(external["deployments"][0]["source"], "workflow");
+}
+
+#[tokio::test]
+async fn the_deploy_workflow_setting_reads_validates_and_needs_an_admin() {
+    let env = Env::start(false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/hub/repos/acme%2Fwidgets/deploy-workflow",
+        listener.local_addr().unwrap()
+    );
+    let app = agentscm::hub::router(env.state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let read = client
+        .get(&url)
+        .bearer_auth(&env.secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status().as_u16(), 200);
+    let read: Value = serde_json::from_str(&read.text().await.unwrap()).unwrap();
+    assert_eq!(read["workflow"], Value::Null);
+    let put = |body: Value| {
+        client
+            .put(&url)
+            .bearer_auth(&env.secret)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+    };
+    for bad in [
+        "deploy.yml",
+        ".github/workflows/../x.yml",
+        ".github/workflows/a/b.yml",
+    ] {
+        let status = put(json!({"workflow": bad}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 400, "{bad}");
+    }
+    // The fake GitHub gives this agent's owner no admin role, and the Hub has no admins.
+    let refused = put(json!({"workflow": ".github/workflows/deploy.yml"}))
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 403);
+    assert!(
+        env.store
+            .get_setting(&format!("deploy_workflow:repo:{REPO_ID}"))
+            .unwrap()
+            .is_none()
+    );
 }

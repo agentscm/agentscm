@@ -1179,6 +1179,8 @@ exact omission counts identify trailing entries removed deterministically to fit
 MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
 explicitly untrusted structured data and are not interpolated into that narration.
 
+HTTP and MCP use the same non-atomic enrichment step. Shared actionable status supplies `review.supported_action` and the actual status recipient only when its Work id, generation and `updated_seq` exactly match the change record; otherwise both remain unknown and the review concerns name unavailable or stale status. The Work's reported `next_action` remains a separate field. Captured attribution uses the retained action author token together with the session id; an absent exact participant is unknown and is never replaced with the Work lead. `review.detail_links` are bounded authenticated API paths that already exist, not symbolic claims of a history route.
+
 ### Shared conversation reads
 
 Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares
@@ -1226,7 +1228,7 @@ the person who shared it (older clients, which refuse unknown fields, need upgra
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.
 - `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
-  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries and shows a
+  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries only after the reader explicitly opens the conversation section, and shows a
   shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
   on an older record; it has no delete control because the status page only holds read-only
   tokens.
@@ -1238,9 +1240,7 @@ in the Hub's settings table, keyed by the forge's repository id so a rename keep
 checkouts follow it as described in
 [the repository setting](change-capture.md#the-repository-setting).
 
-The Hub-wide default is on until a Hub admin sets it, so on a new Hub a connected repository shares
-its agents' conversations with the people who can read it there. Four switches turn that off, and
-each still wins over the default:
+The Hub-wide default is off. Repository permission and the author's affirmative per-repository opt-in are separate gates; neither a notice nor an existing capture binding records consent. A Hub admin may change the Hub-wide default, but that still does not opt any person in. A repository setting and checkout mode can narrow sharing further:
 
 - a Hub admin sets the Hub-wide default off (`PUT .../conversation-sharing/default` below);
 - a repository admin sets the repository off;
@@ -1248,11 +1248,7 @@ each still wins over the default:
 - a checkout's own capture mode is lower than `shared-conversation`, or its capture is off
   ([capture modes](change-capture.md)).
 
-A Hub that already had people when it first ran a build with this default keeps sharing off: the
-`conversation_sharing_default` migration records the default as off there, unless a Hub admin had
-already set it. Nothing a person had not agreed to share starts uploading because of an upgrade. A
-Hub admin turns the default on for such a Hub with the same `PUT`. Each person's agent is told once
-at session start that sharing is on.
+Existing Hubs also keep sharing off unless an administrator deliberately changes the setting. Nothing a person had not affirmatively agreed to share starts uploading because of an install or upgrade. After both gates are enabled, each person's agent is told at session start that sharing is on; that notice is informational and cannot substitute for consent.
 
 - `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
   `{repository, enabled, source, hub_default, opted_out, notified, sharing}` for the token's
@@ -1326,6 +1322,10 @@ A separate per-repository setting, `GET` or `PUT /v1/hub/standup/merged-release/
 sync poll release the hold of Work whose merged pull request closed its source issue as completed
 ([automatic release](standup.md#automatic-release-of-a-merged-works-hold)). It is off by default,
 and only a Hub admin or a repository admin can switch it on with `PUT`.
+
+Without any setting, the sync poll also completes Work whose pull request it observed merge once no
+live session holds it, with the outcome provenance `hub_observed_merge`
+([completion of merged Work](standup.md#completion-of-merged-work)).
 
 **Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
 digest once a week as a private direct message to each person who has a Slack binding for the
@@ -1979,6 +1979,12 @@ paged, so old merges never occupy a page:
 - Deployments for that commit (`deployments?sha=`), each with its newest deployment status.
   Deployments carry no repository id, so they are matched by the repository name in the
   request and the exact sha, the same exposure as the `pulls/{n}` merge read.
+
+A deploy run from a script records no deployment by itself; `agentscm deployed` asks the Hub
+to record one with the connection's own credential, which on GitHub needs the App permission
+Deployments: Read and write (see [record a deployment from a script](record-deployments.md)).
+A deployment the Hub wrote carries `payload` `{"agentscm": "recorded"}` and is read back as
+source `recorded`; every other deployment read is source `forge`.
 
 Outcomes are `pending`, `running`, `succeeded`, `failed`, `cancelled`, `superseded` (a
 deployment that went `inactive`) or `unknown`; anything the Hub does not recognise is

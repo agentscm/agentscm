@@ -18,6 +18,7 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hub publish` and `hub slack` print a multi-line JSON value; `hub publish` on an incomplete or rejected publication also exits nonzero.
 - `intent` prints plain text (or nothing) by default and a hook JSON object with `--hook`; it deliberately exits 0 on coordination errors so that it never blocks an agent. `intent watch` runs until stopped.
 - `setup` reports its errors as a structured JSON object.
+- `deployed` prints one plain line saying what it recorded.
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
@@ -141,6 +142,16 @@ only about commits; its answer lists Work whose declared scope covers it. An ans
 `known: false` means the Hub has no Work recorded for that commit or path: a commit merged
 without a linked Work, or history the Hub never saw, stays unknown. A line that is not
 committed yet names no commit.
+
+### `deployed`
+
+`agentscm deployed --env NAME [--commit REV] [--status success|failure|in_progress] [--url URL]`
+tells the Hub that a commit (default `HEAD`) is live in an environment. The Hub records the
+deployment on GitHub or GitLab with the credential it holds for the repository, so the command
+needs no forge token; it signs in to the Hub like the other client commands
+(`AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN_FILE` on a machine with no client setup). The token's
+repository must match the checkout's `origin`. A repeat for the same commit, environment and
+status writes nothing. See [record a deployment from a script](../record-deployments.md).
 
 ### `change-capture` (experimental, Unix)
 
