@@ -682,6 +682,7 @@ async fn protocol_basics() {
             "agentscm_work_intent",
             "agentscm_work_insight",
             "agentscm_work_insights",
+            "agentscm_work_usage_reports",
             "agentscm_value_metrics",
             "agentscm_contribution_receipt",
             "agentscm_receipt_settings",
@@ -729,6 +730,7 @@ async fn protocol_basics() {
         .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect();
     let opt_in = [
+        "agentscm_work_usage_reports",
         "agentscm_skill_list",
         "agentscm_skill_status",
         "agentscm_skill_evidence",

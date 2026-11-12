@@ -7,7 +7,7 @@ use agentscm::hub::HubError;
 use agentscm::hub::connection::{ForgeCheckReserve, NewConnection, NewForgeCheck};
 use agentscm::hub::insights::{
     AttemptOutcome, AttemptPhase, CostKind, InsightQuery, MAX_MEASUREMENT, MAX_OBSERVATIONS,
-    ReportedCost, UsageBasis, UsageRecord,
+    MAX_USAGE_PAGE, ReportedCost, UsageBasis, UsageMeasurementScope, UsageRecord, UsageReportQuery,
 };
 use agentscm::hub::publish::{Change, Manifest, NewPublication, Person, Update, derive_id};
 use agentscm::hub::store;
@@ -471,6 +471,8 @@ fn observation_and_group_limits(db: &Db) {
         report.usage_basis = UsageBasis::ProviderResult;
         report.input_tokens = Some(MAX_MEASUREMENT);
         report.output_tokens = Some(MAX_MEASUREMENT);
+        report.cache_read_input_tokens = Some(MAX_MEASUREMENT);
+        report.cache_creation_input_tokens = Some(MAX_MEASUREMENT);
         report.cost = Some(ReportedCost {
             kind: CostKind::ReportedCharge,
             currency: "USD".into(),
@@ -519,6 +521,72 @@ fn observation_and_group_limits(db: &Db) {
         detail.usage.output_tokens,
         Some(MAX_MEASUREMENT * MAX_OBSERVATIONS as i64)
     );
+    assert_eq!(
+        detail.usage.cache_read_input_tokens,
+        detail.usage.input_tokens
+    );
+    assert_eq!(
+        detail.usage.cache_creation_input_tokens,
+        detail.usage.input_tokens
+    );
+    assert_eq!(
+        detail.usage.cache_read_input_known_observations,
+        MAX_OBSERVATIONS
+    );
+    assert_eq!(
+        detail.usage.token_groups[0].cache_creation_input_tokens,
+        Some(MAX_MEASUREMENT)
+    );
+    let mut over = usage(&item.id, "over-bound", 1, "lead");
+    over.cache_read_input_tokens = Some(MAX_MEASUREMENT + 1);
+    invalid(
+        store.work_usage(&lead.token, &over, now),
+        "token count is out of bounds",
+    );
+
+    // Every stored report can be read back, a bounded page at a time, oldest first.
+    let mut after = 0;
+    let mut models = Vec::new();
+    loop {
+        let query = UsageReportQuery {
+            after,
+            limit: MAX_USAGE_PAGE,
+        };
+        let page = store
+            .work_usage_reports(&lead.token, &item.id, &query, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.items.len(), MAX_USAGE_PAGE);
+        models.extend(page.items.into_iter().map(|report| report.model));
+        match page.next_after {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    let expected: Vec<_> = (0..MAX_OBSERVATIONS)
+        .map(|index| format!("model-{index:03}"))
+        .collect();
+    assert_eq!(models, expected);
+    let past_the_end = UsageReportQuery {
+        after: MAX_OBSERVATIONS,
+        limit: 1,
+    };
+    let empty = store
+        .work_usage_reports(&lead.token, &item.id, &past_the_end, now)
+        .unwrap()
+        .unwrap();
+    assert!(empty.items.is_empty() && empty.next_after.is_none());
+    for (after, limit) in [(0, 0), (0, MAX_USAGE_PAGE + 1), (MAX_OBSERVATIONS + 1, 1)] {
+        invalid(
+            store.work_usage_reports(
+                &lead.token,
+                &item.id,
+                &UsageReportQuery { after, limit },
+                now,
+            ),
+            "usage report page is out of bounds",
+        );
+    }
     let page = store
         .work_insights(
             &lead.token,
@@ -536,6 +604,10 @@ fn observation_and_group_limits(db: &Db) {
     assert_eq!(summary.observations, detail.usage.observations);
     assert_eq!(summary.input_tokens, detail.usage.input_tokens);
     assert_eq!(summary.output_tokens, detail.usage.output_tokens);
+    assert_eq!(
+        summary.cache_read_input_tokens,
+        detail.usage.cache_read_input_tokens
+    );
     assert_eq!(summary.token_groups.len(), 20);
     assert_eq!(summary.cost_groups.len(), 20);
     assert!(!summary.groups_complete);
@@ -557,13 +629,223 @@ fn zero_usage_is_explicitly_unknown(db: &Db) {
     assert_eq!(insight.usage.coverage, "unknown");
     assert_eq!(insight.usage.input_tokens, None);
     assert_eq!(insight.usage.output_tokens, None);
+    assert_eq!(insight.usage.cache_read_input_tokens, None);
+    assert_eq!(insight.usage.cache_creation_input_tokens, None);
     assert_eq!(insight.usage.input_known_observations, 0);
     assert_eq!(insight.usage.output_known_observations, 0);
+    assert_eq!(insight.usage.cache_read_input_known_observations, 0);
+    assert_eq!(insight.usage.cache_creation_input_known_observations, 0);
     assert_eq!(insight.usage.missing_cost_observations, 0);
     assert_eq!(insight.usage.reported_failed_attempts, 0);
     assert!(insight.usage.token_groups.is_empty());
     assert!(insight.usage.cost_groups.is_empty());
     assert!(insight.usage.groups_complete);
+    let reports = store
+        .work_usage_reports(&lead.token, &item.id, &Default::default(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reports.work_id, item.id);
+    assert!(reports.items.is_empty() && reports.next_after.is_none());
+}
+
+fn cached_input_is_totalled_and_stored_reports_read_back(db: &Db) {
+    let store = db.open();
+    let lead = ordinary_agent(&*store, 13);
+    let now = unix_now();
+    let item = store
+        .work_start(&lead.token, &start("cached", "Cached input", "lead"), now)
+        .unwrap()
+        .item;
+
+    // Reports that name no cache count leave both sums unknown, not zero.
+    let plain = usage(&item.id, "b-plain", 1, "lead");
+    store.work_usage(&lead.token, &plain, now + 1).unwrap();
+    let before = store
+        .work_insight(&lead.token, &item.id, now + 1)
+        .unwrap()
+        .unwrap()
+        .usage;
+    assert_eq!(before.input_tokens, Some(7));
+    assert_eq!(before.cache_read_input_tokens, None);
+    assert_eq!(before.cache_creation_input_tokens, None);
+    assert_eq!(before.cache_read_input_known_observations, 0);
+    assert_eq!(before.token_groups[0].cache_read_input_tokens, None);
+
+    let mut cached = usage(&item.id, "a-cached", 1, "lead");
+    cached.agent = "other-client".into();
+    cached.cache_read_input_tokens = Some(40);
+    cached.cache_creation_input_tokens = Some(0);
+    cached.action_id = Some("private-action".into());
+    cached.attempt_id = Some("private-attempt".into());
+    cached.provider_request_id = Some("private-request".into());
+    cached.provider_event_id = Some("private-event".into());
+    cached.measurement_scope = Some(UsageMeasurementScope::Request);
+    cached.cost = Some(ReportedCost {
+        kind: CostKind::ListPriceEstimate,
+        currency: "USD".into(),
+        amount_micros: 12,
+        basis: "rates-v1".into(),
+    });
+    // Same second as the plain report: the observation ID orders them.
+    store.work_usage(&lead.token, &cached, now + 1).unwrap();
+    let mut other_model = usage(&item.id, "c-other-model", 1, "lead");
+    other_model.model = "model-z".into();
+    other_model.input_tokens = None;
+    other_model.cache_creation_input_tokens = Some(3);
+    store
+        .work_usage(&lead.token, &other_model, now + 2)
+        .unwrap();
+    let mut cumulative = usage(&item.id, "d-session-total", 1, "lead");
+    cumulative.agent = "client-buildhost-0a1b2c3d".into();
+    cumulative.cache_read_input_tokens = Some(4_000);
+    cumulative.cache_creation_input_tokens = Some(4_000);
+    cumulative.measurement_scope = Some(UsageMeasurementScope::SessionCumulative);
+    store.work_usage(&lead.token, &cumulative, now + 3).unwrap();
+
+    let detail = store
+        .work_insight(&lead.token, &item.id, now + 4)
+        .unwrap()
+        .unwrap()
+        .usage;
+    // The session total stays out of every sum and count, as it does for input and output.
+    assert_eq!(detail.observations, 3);
+    assert_eq!(detail.input_tokens, Some(14));
+    assert_eq!(detail.cache_read_input_tokens, Some(40));
+    assert_eq!(detail.cache_creation_input_tokens, Some(3));
+    assert_eq!(detail.input_known_observations, 2);
+    assert_eq!(detail.cache_read_input_known_observations, 1);
+    // A reported zero is known.
+    assert_eq!(detail.cache_creation_input_known_observations, 2);
+    let group = |model: &str, agent: &str| {
+        detail
+            .token_groups
+            .iter()
+            .find(|group| group.model == model && group.agent == agent)
+            .unwrap()
+    };
+    let cached_group = group("model-y", "other-client");
+    assert_eq!(cached_group.cache_read_input_tokens, Some(40));
+    assert_eq!(cached_group.cache_creation_input_tokens, Some(0));
+    assert_eq!(cached_group.cache_creation_input_known_observations, 1);
+    let plain_group = group("model-y", "custom-mcp");
+    assert_eq!(plain_group.cache_read_input_tokens, None);
+    assert_eq!(plain_group.cache_read_input_known_observations, 0);
+    let other_group = group("model-z", "custom-mcp");
+    assert_eq!(other_group.input_tokens, None);
+    assert_eq!(other_group.cache_read_input_tokens, None);
+    assert_eq!(other_group.cache_creation_input_tokens, Some(3));
+    let listed = store
+        .work_insights(&lead.token, &InsightQuery::default(), now + 4)
+        .unwrap();
+    assert_eq!(listed.items[0].usage, detail);
+
+    // The stored reports read back oldest first, the session total included.
+    let reader = agent(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 14,
+            repository: REPOSITORY,
+            repository_id: REPOSITORY_ID,
+            read_only: true,
+        },
+    );
+    let first = store
+        .work_usage_reports(
+            &reader.token,
+            &item.id,
+            &UsageReportQuery { after: 0, limit: 3 },
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!((first.version, first.as_of), (1, now + 4));
+    assert_eq!(first.next_after, Some(3));
+    let cached_report = &first.items[0];
+    assert_eq!(cached_report.received_at, now + 1);
+    assert_eq!(cached_report.agent, "other-client");
+    assert_eq!(cached_report.input_tokens, Some(7));
+    assert_eq!(cached_report.cache_read_input_tokens, Some(40));
+    assert_eq!(cached_report.cache_creation_input_tokens, Some(0));
+    assert_eq!(cached_report.cost, cached.cost);
+    assert_eq!(
+        cached_report.measurement_scope,
+        Some(UsageMeasurementScope::Request)
+    );
+    assert_eq!(first.items[1].cache_read_input_tokens, None);
+    assert_eq!(first.items[1].measurement_scope, None);
+    assert_eq!(first.items[2].model, "model-z");
+    assert_eq!(first.items[2].input_tokens, None);
+    let rest = store
+        .work_usage_reports(
+            &reader.token,
+            &item.id,
+            &UsageReportQuery { after: 3, limit: 3 },
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rest.next_after, None);
+    assert_eq!(rest.items.len(), 1);
+    assert_eq!(rest.items[0].cache_read_input_tokens, Some(4_000));
+    // A generated label that names a host is read back without the host name.
+    assert_eq!(rest.items[0].agent, "client-host-0a1b2c3d");
+    assert_eq!(
+        rest.items[0].measurement_scope,
+        Some(UsageMeasurementScope::SessionCumulative)
+    );
+    let ids: std::collections::BTreeSet<_> = first
+        .items
+        .iter()
+        .chain(&rest.items)
+        .map(|report| report.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 4);
+
+    // Nothing that names the session, the author or a caller's identifier leaves the store.
+    let text = serde_json::to_string(&(&first, &rest)).unwrap();
+    for hidden in [
+        "lead\"",
+        "private-",
+        "a-cached",
+        "d-session-total",
+        "buildhost",
+        "tok_",
+    ] {
+        assert!(!text.contains(hidden), "{hidden} in {text}");
+    }
+
+    // The same scope rules as the insight read.
+    let unknown = "wrk_00000000000000000000000000000000";
+    assert!(
+        store
+            .work_usage_reports(&lead.token, unknown, &Default::default(), now + 4)
+            .unwrap()
+            .is_none()
+    );
+    let outside = agent(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 15,
+            repository: "acme/other",
+            repository_id: REPOSITORY_ID + 1,
+            read_only: false,
+        },
+    );
+    assert!(
+        store
+            .work_usage_reports(&outside.token, &item.id, &Default::default(), now + 4)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.revoke_agent_token(&reader.token).unwrap());
+    assert!(matches!(
+        store.work_usage_reports(&reader.token, &item.id, &Default::default(), now + 4),
+        Err(HubError::Unauthorized)
+    ));
 }
 
 fn keyset_windows_and_cursor_bindings(db: &Db) {
@@ -2343,6 +2625,7 @@ conformance!(
     replay_and_authorization,
     observation_and_group_limits,
     zero_usage_is_explicitly_unknown,
+    cached_input_is_totalled_and_stored_reports_read_back,
     keyset_windows_and_cursor_bindings,
     compaction_retains_usage_and_marks_history_incomplete,
     publication_provenance_is_exact_scope_and_checkpoint_first,

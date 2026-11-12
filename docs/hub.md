@@ -652,7 +652,7 @@ on no others:
   stand-up bytes it holds now; see the [API](api.md#hub-retention))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
-  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,
+  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_work_usage_reports`, `agentscm_change_record`, `agentscm_pr_context`,
   `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
   `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_why`, `agentscm_work_repositories`,
   `agentscm_publications_list`, `agentscm_workflow_runs_list`,
@@ -1037,7 +1037,8 @@ also lists the rarely needed tools, and its instructions describe them: `agentsc
 `agentscm_workflow_status`, `agentscm_shared_conversation`, `agentscm_publications_list`,
 `agentscm_workflow_runs_list`, the five promise tools, `agentscm_contribution_receipt`,
 `agentscm_receipt_settings`, `agentscm_work_declarations(_set)`, `agentscm_work_pr_link(_set)`,
-`agentscm_work_reconciliation(_apply)` and `agentscm_work_transitions`. `agentscm client mcp`
+`agentscm_work_reconciliation(_apply)`, `agentscm_work_transitions` and
+`agentscm_work_usage_reports`. `agentscm client mcp`
 asks for the full set when `AGENTSCM_MCP_TOOLS=all` is in its environment. Every tool stays
 callable by name either way. A read-only token's list is unchanged: it always lists every read
 tool it may call.
@@ -1055,6 +1056,7 @@ Tools:
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
 | `agentscm_work_insights` | bounded window and continuation | Reads one page of repository work insights. A continuation repeats the exact returned window and watermark. |
 | `agentscm_work_insight` | `work_id` | Reads one bounded work insight projection. |
+| `agentscm_work_usage_reports` | `work_id`, `after?`, `limit?` (at most 100) | Reads one page of a work item's [stored usage reports](work-insights.md#reading-stored-usage-reports), oldest first, without the session, author or reporter-supplied identifiers. |
 | `agentscm_work_usage` | strict usage record | Idempotently reports partial token, attempt and optional cost evidence for the caller's current repository work. It does not prove complete capture or a verified bill. |
 
 Three read-only search tools are offered to read-only and writer tokens, with the bounds and reply
