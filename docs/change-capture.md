@@ -819,10 +819,10 @@ no `configure` step for Codex. Live capture reads only what a hook payload carri
 
 | Fact | Hook event | Notes |
 |---|---|---|
-| Session start and end | `SessionStart`, `SessionEnd` | A `fork` start, like a resume, does not prove earlier history was observed. Codex gives every end the reason `other`. |
+| Session start and end | `SessionStart`, `SessionEnd` | A `fork` start, like a resume, does not prove earlier history was observed. Codex gives every end the reason `other`, and ends and starts the session again around each non-interactive `resume`. |
 | Prompt | `UserPromptSubmit` | The `prompt` field. A prompt before the session has Work is held as for Claude Code. |
-| Tool start | `PreToolUse` | Tool name, call identity and input. |
-| Tool finish with its result | `PostToolUse` | The `tool_response` field. Recorded as `returned`. |
+| Tool start | `PreToolUse` | Tool name, call identity and input. A shell command is `Bash`, an MCP tool `mcp__server__tool`. |
+| Tool finish with its result | `PostToolUse` | The `tool_response` field: for a shell command, its output as text. Recorded as `returned`. |
 | Assistant message | `Stop` | The `last_assistant_message` field: the last message of the turn, recorded just before the turn's end. |
 | Token usage of one model request | `PostModelRequest` | See [token usage](#codex-token-usage). |
 | Compaction, subagent start and stop | `PreCompact`, `SubagentStart`, `SubagentStop` | Markers, as for Claude Code. |
@@ -836,9 +836,11 @@ What Codex does not expose to a hook is not recorded, and is not guessed:
 
 - **An assistant message before a turn's last one.** No hook carries it. `import-codex` reads it
   from the session file.
-- **Whether a tool call failed.** There is no failure hook and `tool_response` has no documented
-  shape. A finished call is `returned`, and an action's outcome is `unknown` unless the response is
-  an object with an integer `exit_code`.
+- **Whether a tool call failed.** There is no failure hook. A shell command runs `PostToolUse`
+  whatever its exit code, and its response is its output with no exit code, so it is `returned`
+  and an action's outcome is `unknown`. An MCP call that failed, and a call that a `PreToolUse`
+  hook refused, run no `PostToolUse`: each is recorded as started and never finished.
+  `import-codex` reads the exit code and the failure from the session file.
 - **Hosted tool calls**, such as web search. They run no hook.
 - **Reasoning.** Codex stores it encrypted; the adapter never reads it.
 - **An identity for a prompt or a session boundary.** `UserPromptSubmit` names the turn, not the
@@ -848,7 +850,7 @@ What Codex does not expose to a hook is not recorded, and is not guessed:
 - **A model request's identity** (see below), and **a reason for a session's end**.
 - **A subagent's own prompts and replies.** Its tool calls and model requests are recorded when
   Codex runs the session's hooks for them; that was read from the hook schemas, which give those
-  events an `agent_id`, and was not observed in a run.
+  events an `agent_id`. The session that was run had no subagent.
 
 ### Codex token usage
 
@@ -867,8 +869,8 @@ because Codex writes 0 when a provider reports none; it is not subtracted from i
 `reasoning_output_tokens` is part of `output_tokens` and is not kept separately.
 
 The payload does not name the request, so an observation is identified by its turn and its six
-counts. The session file's record of the same request has the same identity, so a session that
-was recorded live and is imported later is not counted twice. Two requests of one turn with
+counts. The session file's record of the same request has the same turn and counts, so a session
+that was recorded live and is imported later is not counted twice. Two requests of one turn with
 identical counts are recorded once.
 
 ### Importing a Codex session file
@@ -892,13 +894,18 @@ file that starts with another session's record, or with no session record, is re
 has the bounds and gaps of `import-claude` and selects:
 
 - the person's prompts and every assistant message, interim ones included;
-- each tool call with its input and the text of its result, recorded as `returned`. Codex can
-  write several outputs for one call; each is a finish of that call;
+- each command, file change, MCP call and web search, from the typed record Codex writes when it
+  ends: a start at the time the record says it began and a finish with its input, the text of its
+  result, a command's exit code, and `failed` when the record says so. A record's id is the call
+  id Codex's hooks give the same call. A command or a file change has no tool name in the file,
+  only its kind;
 - each model request's token usage, as above. The command prints how many observations were new
   as `usage_observations`.
 
-It does not select reasoning (counted as `private_blocks_ignored`), images, or the instructions and
-environment notes Codex adds around a prompt. A subagent's file opens with a copy of its parent's
+It does not select reasoning (counted as `private_blocks_ignored`), images, the instructions and
+environment notes Codex adds around a prompt, or the model-level call records, which in recent
+versions are scripts that wrap the calls above; plan updates and calls between agents, which the
+file has only at that level, are therefore not imported. A subagent's file opens with a copy of its parent's
 history; those records are skipped, and the subagent's file is imported as a session of its own,
 with `--parent-session-id` when the parent is known. Importing a file again adds nothing. A
 session that was recorded live gets its events a second time under the import's identities, as
@@ -906,17 +913,24 @@ with `import-claude`; its usage is not repeated.
 
 ### Codex qualification
 
-Checked on 2026-11-12 against Codex CLI 0.167.1: the hook input schemas in its source
-(`codex-rs/hooks/schema/generated`) and its hooks documentation for the events and fields above,
-and 176 session files written by versions 0.154.0 to 0.167.1 on one macOS machine for the import.
-Each of those files imports with as many events and usage observations as it has records of its
-own. In all of their roughly 8,300 model requests `total_tokens` was `input_tokens` plus
-`output_tokens`, cached input was no larger than input, and none reported a cache write. One real
-session file was imported and delivered to a local Hub, whose usage totals matched the file.
+Checked on 2026-11-12 against Codex CLI 0.167.1:
 
-The hook path was run with the plugin's hook client against a local Hub, using payloads written
-from the schemas: hook fixtures are not copied from a session, and no Codex session was run with
-these hooks. That a subagent's events carry its parent's session, and that the hook and the
-session file name a request's turn alike, are therefore read from the schemas and the files, not
-observed together. The source code states the capabilities as
-`change_capture::codex::CAPABILITIES`.
+- **Its hook input schemas** (`codex-rs/hooks/schema/generated`) and hooks documentation, for the
+  events and fields above.
+- **One session run with these hooks** (`codex exec`, then `codex exec resume`, with a hook that
+  logged each payload and handed it to the plugin's hook client) against a local Hub. The Hub
+  recorded the session start, the prompt, three shell commands with their results, eight other
+  tool starts, the last reply, the turn's end and the session's end, and one usage observation
+  for each of the nine model requests made after the session had Work. The session's ten requests
+  had the same turn and counts in the hook payloads and in the session file, and importing that
+  file afterwards added only the one request made before the session had Work. This run is where
+  the notes on shell responses, failed MCP calls and refused calls come from. It had no subagent,
+  no compaction and no hosted tool call.
+- **180 session files** written by versions 0.154.0 to 0.167.1 on one macOS machine, for the
+  import. Each imports with as many events and usage observations as it has records of its own;
+  together they hold about 7,700 typed tool records, 600 of them failed. In all of their roughly
+  8,600 model requests `total_tokens` was `input_tokens` plus `output_tokens`, cached input was no
+  larger than input, and none reported a cache write.
+
+Hook fixtures have the schemas' fields and that session's value shapes, with every value made up.
+The source code states the capabilities as `change_capture::codex::CAPABILITIES`.

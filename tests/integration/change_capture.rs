@@ -6246,7 +6246,7 @@ fn codex_hooks_record_prompt_tool_result_and_last_reply_as_codex() {
         .find(|(_, event)| event.kind == CapturedEventKindV1::ToolFinished)
         .and_then(|(_, event)| event.tool.clone())
         .unwrap();
-    assert_eq!(finished.request_id.as_deref(), Some("call_1"));
+    assert_eq!(finished.request_id.as_deref(), Some("exec-1"));
     assert_eq!(finished.completion, Some(ToolCompletionV1::Returned));
 
     // Bodies stay in the private spool, as for Claude Code.
@@ -6344,6 +6344,8 @@ fn codex_import_selects_visible_history_and_usage_and_leaves_the_rest() {
             .iter()
             .all(|(session, _)| session.harness == AgentHarnessV1::Codex)
     );
+    // Tool calls come from the typed records, with the ids Codex's hooks use and whether each
+    // failed; the model-level script that wraps them is not a tool call of its own.
     let tools: Vec<_> = events
         .iter()
         .filter(|(_, event)| event.kind != CapturedEventKindV1::Gap)
@@ -6351,32 +6353,72 @@ fn codex_import_selects_visible_history_and_usage_and_leaves_the_rest() {
             let tool = event.tool.as_ref();
             (
                 event.kind,
+                tool.map(|tool| tool.kind),
                 tool.and_then(|tool| tool.name.as_deref()),
                 tool.and_then(|tool| tool.request_id.as_deref()),
+                tool.and_then(|tool| tool.completion),
             )
         })
         .collect();
+    use CapturedEventKindV1::{AssistantMessage, ToolFinished, ToolStarted, UserPrompt};
+    use ToolCompletionV1::{Failed, Returned};
+    use agentscm::change_record::ToolKindV1::{Edit, Other, Search, Shell};
+    let mcp = Some("mcp__tracker__lookup");
     assert_eq!(
         tools,
         [
-            (CapturedEventKindV1::UserPrompt, None, None),
-            (CapturedEventKindV1::AssistantMessage, None, None),
+            (UserPrompt, None, None, None, None),
+            (AssistantMessage, None, None, None, None),
+            (ToolStarted, Some(Shell), None, Some("exec-1"), None),
             (
-                CapturedEventKindV1::ToolStarted,
-                Some("exec_command"),
-                Some("call_1")
+                ToolFinished,
+                Some(Shell),
+                None,
+                Some("exec-1"),
+                Some(Returned)
             ),
-            (CapturedEventKindV1::ToolFinished, None, Some("call_1")),
+            (ToolStarted, Some(Edit), None, Some("exec-2"), None),
             (
-                CapturedEventKindV1::ToolStarted,
-                Some("apply_patch"),
-                Some("call_2")
+                ToolFinished,
+                Some(Edit),
+                None,
+                Some("exec-2"),
+                Some(Returned)
             ),
-            (CapturedEventKindV1::ToolFinished, None, Some("call_2")),
-            (CapturedEventKindV1::AssistantMessage, None, None),
+            (ToolStarted, Some(Other), mcp, Some("exec-3"), None),
+            (ToolFinished, Some(Other), mcp, Some("exec-3"), Some(Failed)),
+            (ToolStarted, Some(Shell), None, Some("exec-4"), None),
+            (
+                ToolFinished,
+                Some(Shell),
+                None,
+                Some("exec-4"),
+                Some(Failed)
+            ),
+            (ToolStarted, Some(Search), None, Some("ws_1"), None),
+            (
+                ToolFinished,
+                Some(Search),
+                None,
+                Some("ws_1"),
+                Some(Returned)
+            ),
+            (AssistantMessage, None, None, None, None),
         ]
     );
-    // The file's own times, not the import's.
+    // The file's own times: the first command began two seconds before its record was written.
+    let command: Vec<_> = events
+        .iter()
+        .filter(|(_, event)| {
+            event
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.request_id.as_deref())
+                == Some("exec-1")
+        })
+        .map(|(_, event)| event.observed_at)
+        .collect();
+    assert_eq!(command[1] - command[0], 2);
     assert!(events.iter().all(|(_, event)| event.observed_at > 0));
 
     let shared = serde_json::to_string(&spool.pending(100).unwrap()).unwrap();
@@ -6384,21 +6426,28 @@ fn codex_import_selects_visible_history_and_usage_and_leaves_the_rest() {
     for visible in [
         "VISIBLE_PROMPT_902",
         "VISIBLE_COMMENTARY_904",
+        "VISIBLE_COMMAND_916",
         "VISIBLE_RESULT_905",
         "VISIBLE_PATCH_906",
         "VISIBLE_PATCH_RESULT_907",
+        "VISIBLE_QUERY_912",
+        "VISIBLE_MCP_ERROR_913",
+        "VISIBLE_FAILURE_914",
+        "VISIBLE_SEARCH_915",
         "VISIBLE_ANSWER_908",
     ] {
         assert!(!shared.contains(visible), "{visible} left the spool");
         assert!(contains_bytes(&retained, visible.as_bytes()), "{visible}");
     }
-    // Instructions, the environment note, reasoning and images are never selected.
+    // Instructions, the environment note, reasoning, images and wrapper scripts are not selected.
     for private in [
         "BASE_INSTRUCTIONS_899",
         "DEVELOPER_INSTRUCTIONS_900",
         "ENV_901",
         "PRIVATE_REASONING_903",
         "IMAGE_BYTES_909",
+        "WRAPPER_SCRIPT_910",
+        "WRAPPER_OUTPUT_911",
     ] {
         assert!(!contains_bytes(&retained, private.as_bytes()), "{private}");
     }
@@ -6468,36 +6517,4 @@ fn codex_import_refuses_another_session_and_skips_a_parent_copy() {
     let retained = retained_bytes(spool.root());
     assert!(contains_bytes(&retained, b"OWN_REPLY_911"));
     assert!(!contains_bytes(&retained, b"PARENT_REPLY_910"));
-}
-
-#[test]
-fn codex_import_keeps_every_output_of_one_call() {
-    // Codex writes a long-running call's output as several records under one call id.
-    let temp = TempDir::new().unwrap();
-    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
-    let request = codex_request(CaptureModeV1::MetadataOnly);
-    let output = |ordinal: u64| {
-        serde_json::json!({
-            "timestamp": "2026-11-01T10:00:01Z", "ordinal": ordinal, "type": "response_item",
-            "payload": {"type": "custom_tool_call_output", "call_id": "call_1", "output": "more"},
-        })
-        .to_string()
-    };
-    let file = [
-        serde_json::json!({
-            "timestamp": "2026-11-01T10:00:00Z", "ordinal": 0, "type": "session_meta",
-            "payload": {"id": CODEX_SESSION},
-        })
-        .to_string(),
-        output(1),
-        output(2),
-    ]
-    .join("\n");
-    let (report, _) = codex::import_rollout(Cursor::new(file), &request, &spool).unwrap();
-    assert_eq!(report.events, 3);
-    let finished = captured_events(&spool)
-        .into_iter()
-        .filter(|(_, event)| event.kind == CapturedEventKindV1::ToolFinished)
-        .count();
-    assert_eq!(finished, 2);
 }

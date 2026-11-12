@@ -14,10 +14,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::claude_code::{
-    CaptureReport, CaptureRequest, SelectedEvent, check_kind, identifier, import_history, tool_fact,
+    CaptureReport, CaptureRequest, SelectedEvent, identifier, import_history,
 };
 use super::{AppendOutcome, CaptureError, LocalSpool, Result};
-use crate::change_record::{CaptureEnvelopeV1, CapturedEventKindV1, ToolCompletionV1};
+use crate::change_record::{
+    CaptureEnvelopeV1, CapturedEventKindV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
+};
 use crate::checks::sha256;
 use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
@@ -25,7 +27,7 @@ use crate::hub::insights::{
 };
 
 /// What capture can record for Codex. Checked against Codex CLI 0.167.1: its hook input schemas,
-/// and the session files it and four earlier versions wrote.
+/// a session run with these hooks, and the session files it and four earlier versions wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
     /// `UserPromptSubmit` carries the prompt.
@@ -35,9 +37,12 @@ pub struct Capabilities {
     /// No hook carries an assistant message written before the turn's last one.
     pub interim_assistant_messages: bool,
     pub tool_starts: bool,
-    /// `PostToolUse` carries the tool's response.
+    /// `PostToolUse` carries the tool's response. Codex runs it for a shell command whatever its
+    /// exit code, and not for an MCP call that failed or a call a hook refused: those are recorded
+    /// as started only.
     pub tool_finishes: bool,
-    /// No hook says that a tool call failed; a finished call is recorded as returned.
+    /// No hook says that a tool call failed: a shell command's response is its output, with no
+    /// exit code, so a finished call is recorded as returned.
     pub tool_failures: bool,
     /// Hosted tools, such as web search, run no hook.
     pub hosted_tool_calls: bool,
@@ -47,8 +52,9 @@ pub struct Capabilities {
     pub session_end: bool,
     /// Reasoning is stored encrypted and is never read.
     pub reasoning: bool,
-    /// `import-codex` reads prompts, every assistant message, tool calls with their results and
-    /// token usage from a session file.
+    /// `import-codex` reads a session file: prompts, every assistant message, commands, file
+    /// changes, MCP calls and web searches with their results and whether each failed, and token
+    /// usage.
     pub retrospective_visible_history: bool,
 }
 
@@ -192,10 +198,11 @@ struct RolloutLine {
 }
 
 /// Imports the visible portion of one Codex session file (`rollout-*.jsonl`): the person's
-/// prompts, assistant messages, tool calls with their results, and each model request's token
-/// usage. Reasoning, images and the instructions Codex adds around a prompt are not selected. A
-/// subagent's file starts with a copy of its parent's history, which is left to the parent's own
-/// file. Returns the report and the number of usage observations newly recorded.
+/// prompts, assistant messages, commands, file changes, MCP calls and web searches with their
+/// results, and each model request's token usage. Reasoning, images and the instructions Codex
+/// adds around a prompt are not selected. A subagent's file starts with a copy of its parent's
+/// history, which is left to the parent's own file. Returns the report and the number of usage
+/// observations newly recorded.
 pub fn import_rollout(
     input: impl BufRead,
     request: &CaptureRequest,
@@ -240,8 +247,7 @@ pub fn import_rollout(
         let Some(observed_at) = line.timestamp.as_deref().and_then(parse_rfc3339) else {
             return Ok(Some((Vec::new(), 0)));
         };
-        // A record's place in the file names its events. Its own ids can repeat: Codex writes
-        // several outputs for one call under one call id.
+        // A record's place in the file names its events.
         let place = line
             .ordinal
             .map_or_else(|| format!("line{number}"), |ordinal| ordinal.to_string());
@@ -260,12 +266,23 @@ pub fn import_rollout(
 }
 
 /// The events of one of the session's own records, and how many private blocks it left out.
+/// Messages and tool calls come from Codex's typed records (`item_completed`): each names a
+/// command, file change, MCP call or web search with the id its hooks use, and says whether it
+/// failed. The model-level records beside them are not selected; in recent versions they are
+/// scripts that wrap those calls.
 fn select(
     kind: &str,
     payload: &Value,
     observed_at: i64,
     place: &str,
 ) -> (Vec<SelectedEvent>, usize) {
+    if kind == "response_item" && payload["type"] == "reasoning" {
+        return (Vec::new(), 1);
+    }
+    if kind != "event_msg" || payload["type"] != "item_completed" {
+        return (Vec::new(), 0);
+    }
+    let item = &payload["item"];
     let event_id = |index: usize| format!("evt:rollout:{place}:{index}");
     let texts = |content: &Value| -> Vec<Value> {
         content
@@ -276,7 +293,7 @@ fn select(
             .map(|block| block["text"].clone())
             .collect()
     };
-    let messages = |item: &Value, kind| {
+    let messages = |kind| {
         texts(&item["content"])
             .into_iter()
             .enumerate()
@@ -291,56 +308,76 @@ fn select(
             })
             .collect()
     };
-    let record = payload["type"].as_str().unwrap_or("");
-    match (kind, record) {
-        ("event_msg", "item_completed") => {
-            let item = &payload["item"];
-            match item["type"].as_str() {
-                Some("UserMessage") => (messages(item, CapturedEventKindV1::UserPrompt), 0),
-                Some("AgentMessage") => (messages(item, CapturedEventKindV1::AssistantMessage), 0),
-                _ => (Vec::new(), 0),
-            }
-        }
-        ("response_item", "function_call" | "custom_tool_call") => {
-            let name = payload["name"].as_str();
-            // A function call's arguments are JSON in a string; a custom tool's input is text.
-            let input = payload["arguments"]
+    // A tool record's kind, its name where the record gives one, its input and its result.
+    let (tool, name, input, result) = match item["type"].as_str() {
+        Some("UserMessage") => return (messages(CapturedEventKindV1::UserPrompt), 0),
+        Some("AgentMessage") => return (messages(CapturedEventKindV1::AssistantMessage), 0),
+        Some("CommandExecution") => (
+            ToolKindV1::Shell,
+            None,
+            json!({"command": item["command"], "parsed_cmd": item["parsed_cmd"]}),
+            json!({"output": item["aggregated_output"], "exit_code": item["exit_code"]}),
+        ),
+        Some("FileChange") => (
+            ToolKindV1::Edit,
+            None,
+            json!({"changes": item["changes"]}),
+            json!({"stdout": item["stdout"], "stderr": item["stderr"]}),
+        ),
+        Some("McpToolCall") => (
+            ToolKindV1::Other,
+            // As Codex's hooks name an MCP tool.
+            item["server"]
                 .as_str()
-                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-                .unwrap_or_else(|| payload["input"].clone());
-            let call = SelectedEvent::history(
-                event_id(0),
-                observed_at,
-                check_kind(CapturedEventKindV1::ToolStarted, name),
-                Some(tool_fact(name, payload["call_id"].as_str(), None)),
-                json!({
-                    "tool_name": name,
-                    "namespace": payload["namespace"],
-                    "tool_input": input,
-                }),
-            );
-            (vec![call], 0)
-        }
-        ("response_item", "function_call_output" | "custom_tool_call_output") => {
-            // Text only: an output's images are not selected.
-            let output = match &payload["output"] {
-                Value::String(text) => json!(text),
-                blocks => json!(texts(blocks)),
-            };
-            let finish = SelectedEvent::history(
-                event_id(0),
-                observed_at,
-                CapturedEventKindV1::ToolFinished,
-                Some(tool_fact(
-                    None,
-                    payload["call_id"].as_str(),
-                    Some(ToolCompletionV1::Returned),
-                )),
-                json!({"tool_result": output}),
-            );
-            (vec![finish], 0)
-        }
-        ("response_item", "reasoning") => (Vec::new(), 1),
-        _ => (Vec::new(), 0),
-    }
+                .zip(item["tool"].as_str())
+                .map(|(server, tool)| format!("mcp__{server}__{tool}")),
+            item["arguments"].clone(),
+            // Text only: a result's images are not selected.
+            json!(texts(&item["result"]["content"])),
+        ),
+        Some("WebSearch") => (
+            ToolKindV1::Search,
+            None,
+            json!({"query": item["query"]}),
+            Value::Null,
+        ),
+        _ => return (Vec::new(), 0),
+    };
+    let failed = item["status"] == "failed" || item["result"]["isError"] == true;
+    let fact = |completion| ToolFactV1 {
+        kind: tool,
+        request_id: item["id"]
+            .as_str()
+            .filter(|id| identifier(id, 255))
+            .map(str::to_owned),
+        name: name.clone().filter(|name| identifier(name, 128)),
+        completion,
+    };
+    // The record is written when the call ends and says when it began.
+    let started_at = payload["started_at_ms"]
+        .as_i64()
+        .map(|milliseconds| milliseconds / 1000)
+        .filter(|started| (1..=observed_at).contains(started))
+        .unwrap_or(observed_at);
+    let events = vec![
+        SelectedEvent::history(
+            event_id(0),
+            started_at,
+            CapturedEventKindV1::ToolStarted,
+            Some(fact(None)),
+            json!({"tool_name": name, "tool_input": input}),
+        ),
+        SelectedEvent::history(
+            event_id(1),
+            observed_at,
+            CapturedEventKindV1::ToolFinished,
+            Some(fact(Some(if failed {
+                ToolCompletionV1::Failed
+            } else {
+                ToolCompletionV1::Returned
+            }))),
+            json!({"tool_result": result, "is_error": failed}),
+        ),
+    ];
+    (events, 0)
 }

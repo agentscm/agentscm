@@ -7,7 +7,7 @@
   "turn_id": "aaaaaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee",
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
-  "tool_use_id": "call_1",
+  "tool_use_id": "exec-1",
   "tool_input": {
     "command": "printf hi"
   }

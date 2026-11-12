@@ -2816,7 +2816,7 @@ fn batch(
     }
 }
 
-pub(super) fn tool_fact(
+fn tool_fact(
     name: Option<&str>,
     request_id: Option<&str>,
     completion: Option<ToolCompletionV1>,
@@ -2868,10 +2868,7 @@ fn hook_subagent(
     })
 }
 
-pub(super) fn check_kind(
-    default: CapturedEventKindV1,
-    tool_name: Option<&str>,
-) -> CapturedEventKindV1 {
+fn check_kind(default: CapturedEventKindV1, tool_name: Option<&str>) -> CapturedEventKindV1 {
     match tool_name {
         Some(name) if is_check(name) && default == CapturedEventKindV1::ToolStarted => {
             CapturedEventKindV1::CheckStarted
