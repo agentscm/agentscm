@@ -1488,6 +1488,8 @@ async fn observe_pull(
         "labels": labels(&item["labels"]),
         "author": {"login": item["user"]["login"], "id": item["user"]["id"]},
         "html_url": item["html_url"],
+        // The forge's last push, review or comment: whether its owner is idle (held merges).
+        "updated_at": item["updated_at"],
         "files": files, "files_truncated": truncated});
     let (id, text) = (repo.id.clone(), data.to_string());
     let observed = db(state, move |store| {
