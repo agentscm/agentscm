@@ -424,6 +424,55 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observed_shell_change_does_not_verify_the_native_edit_hook() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "member-agent");
+    let binding = "a".repeat(64);
+    let session = "setup-shell-observed";
+    let post = |body: Value| {
+        hub.onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            "/v1/hub/hook/claude",
+            body,
+        )
+    };
+    post(json!({"hook_event_name":"SessionStart","session_id":session})).await;
+    let status = || async {
+        let (_, reply) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"agentscm_setup_status",
+                    "arguments":{"agent":"claude","session":session}}}),
+            )
+            .await;
+        serde_json::from_str::<Value>(reply["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(status().await["native_verified"], false);
+    post(json!({
+        "hook_event_name":"PostToolUse","session_id":session,"tool_name":"Bash",
+        "tool_use_id":"toolu_shell","tool_input":{"command":"true"},
+        "observed":{"outcome":"changed","paths":["src/a.rs"],"truncated":false}
+    }))
+    .await;
+    let after_shell = status().await;
+    assert_eq!(after_shell["mcp_verified"], true, "{after_shell}");
+    assert_eq!(after_shell["native_verified"], false, "{after_shell}");
+    post(json!({
+        "hook_event_name":"PreToolUse","session_id":session,"tool_name":"Write",
+        "tool_input":{"file_path":"src/b.rs"}
+    }))
+    .await;
+    assert_eq!(status().await["native_verified"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_is_authenticated_revalidates_revocation_and_rejects_fabricated_fields() {
     let hub = Hub::start().await;
     let secret = hub.secret(1, "agent");
