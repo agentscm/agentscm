@@ -13979,8 +13979,8 @@ impl Store for SqliteStore {
                         received_order DESC) AS scope_rank
                 FROM scope_state
             )
-            SELECT start_request,finish_request,source_id FROM ranked
-            WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",params![work_id,item.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?))).optional()?.map(|(start,finish,source_id)| -> Result<StoredActionV1> {Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id})}).transpose()?;
+            SELECT start_request,finish_request,source_id,author_token FROM ranked
+            WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",params![work_id,item.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?.map(|(start,finish,source_id,author_token)| -> Result<StoredActionV1> {Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id,author_token})}).transpose()?;
         let decision = tx
             .query_row(
                 "SELECT event_seq,snapshot FROM hub_work_versions

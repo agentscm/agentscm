@@ -23,6 +23,7 @@ const fixture = () => ({
     schema_version: 1,
     work_id: WORK_ID,
     generation: 3,
+    updated_seq: 91,
     as_of: 1_798_000_300,
     intent: {
       title: 'Capture a bounded change-record handoff',
@@ -171,10 +172,11 @@ describe('change record response', () => {
 
   it('decodes the optional review projection and rejects malformed or cross-repository diff references', () => {
     const value = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
-    value.summary['review'] = { captured_by: { agent: 'review-agent', session_id: 'session-7' }, diff: { kind: 'git', repository: 'counterbranch/agentscm', worktree_id: 'worktree-1', base: BASE, head: HEAD, dirty: true, untracked_count: 2, omissions: ['untracked_content'], snapshot_coverage: 'partial' }, actual_scope: 'unknown', concerns: ['current_source_applicability_not_established'], detail_links: [`work:${WORK_ID}:change-record`], next_actor: 'lead-agent', supported_action: null, establishes_approval: false }
+    value.summary['review'] = { captured_by: { agent: 'review-agent', session_id: 'session-7' }, diff: { kind: 'git', repository: 'counterbranch/agentscm', worktree_id: 'worktree-1', base: BASE, head: HEAD, dirty: true, untracked_count: 2, omissions: ['untracked_content'], snapshot_coverage: 'partial' }, actual_scope: 'unknown', concerns: ['current_source_applicability_not_established'], detail_links: [`/v1/hub/repos/counterbranch/agentscm/change-records/${WORK_ID}`], next_actor: 'lead-agent', supported_action: 'Ask a person to review the blocked Work.', establishes_approval: false }
     const decoded = decodeChangeRecordResponse(value, WORK_ID, 'counterbranch/agentscm')
     expect(decoded.summary.review?.diff).toMatchObject({ kind: 'git', base: BASE, head: HEAD, dirty: true })
     expect(decoded.summary.review?.establishes_approval).toBe(false)
+    expect(decoded.summary.review?.supported_action).toBe('Ask a person to review the blocked Work.')
     const malformed = structuredClone(value)
     ;(malformed.summary['review'] as Record<string, unknown>)['establishes_approval'] = true
     expect(() => decodeChangeRecordResponse(malformed)).toThrow(/summary.review/)
@@ -380,6 +382,16 @@ describe('change record route and page', () => {
     const response = fixture()
     response.summary.intent.scope_omitted = 240
     response.summary.decision.source_refs_omitted = 84
+    ;(response.summary as Record<string, unknown>)['review'] = {
+      captured_by: { agent: 'capture-agent', session_id: 'capture-session' },
+      diff: { kind: 'git', repository: 'counterbranch/agentscm', worktree_id: 'worktree-1', base: BASE, head: HEAD, dirty: true, untracked_count: 2, omissions: ['ignored_content'], snapshot_coverage: 'partial' },
+      actual_scope: 'unknown',
+      concerns: ['capture_history_incomplete_or_unknown', 'latest_execution_not_successful', 'current_source_applicability_not_established'],
+      detail_links: [`/v1/hub/repos/counterbranch%2Fagentscm/change-records/${WORK_ID}`, '/v1/hub/standup/status'],
+      next_actor: 'builder',
+      supported_action: 'Ask builder to decide whether the blocked Work should continue.',
+      establishes_approval: false,
+    }
     const sent: { method: string; url: string }[] = []
     vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
       sent.push({ method: (init.method ?? 'GET').toUpperCase(), url: input })
@@ -419,6 +431,13 @@ describe('change record route and page', () => {
     expect(screen.getByText('84 additional source references omitted from this bounded projection.')).toBeTruthy()
     expect(screen.getByText('Human decision is unknown')).toBeTruthy()
     expect(screen.getAllByText('Run the focused UI check against the current source.').length).toBeGreaterThan(0)
+    expect(screen.getByText('capture-agent')).toBeTruthy()
+    expect(screen.getByText(/proposed by review-agent/)).toBeTruthy()
+    expect(screen.getByText(/Ask builder to decide whether the blocked Work should continue/)).toBeTruthy()
+    fireEvent.click(screen.getByText('Review concerns (3)', { selector: 'summary' }))
+    expect(screen.getByText('Capture history is partial or unavailable')).toBeTruthy()
+    expect(screen.getByText('The latest execution did not succeed')).toBeTruthy()
+    expect(screen.getByText('Applicability to the current source is not established')).toBeTruthy()
     expect(screen.queryByText(/private transcript/)).toBeNull()
     const record = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}`
     expect(screen.getByRole('button', { name: 'Show shared conversation entries' })).toBeTruthy()

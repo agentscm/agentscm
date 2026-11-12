@@ -1179,6 +1179,8 @@ exact omission counts identify trailing entries removed deterministically to fit
 MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
 explicitly untrusted structured data and are not interpolated into that narration.
 
+HTTP and MCP use the same non-atomic enrichment step. Shared actionable status supplies `review.supported_action` and the actual status recipient only when its Work id, generation and `updated_seq` exactly match the change record; otherwise both remain unknown and the review concerns name unavailable or stale status. The Work's reported `next_action` remains a separate field. Captured attribution uses the retained action author token together with the session id; an absent exact participant is unknown and is never replaced with the Work lead. `review.detail_links` are bounded authenticated API paths that already exist, not symbolic claims of a history route.
+
 ### Shared conversation reads
 
 Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares

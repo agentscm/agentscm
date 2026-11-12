@@ -554,6 +554,80 @@ fn review_projection_acceptance_cases(db: &Db) {
     );
 }
 
+fn attribution_uses_author_token_and_session(db: &Db) {
+    let (store, lead_token, work_id, generation) = setup(db);
+    let helper_owner = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 43,
+            },
+            "helper-owner",
+        )
+        .unwrap();
+    let (helper_token, _) =
+        mint_agent_token(&*store, &helper_owner.id, "helper-agent", REPO, 3600).unwrap();
+    store
+        .work_start(
+            &helper_token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: Some(work_id.clone()),
+                source: None,
+                request_key: None,
+                title: "join with a colliding session name".into(),
+                description: None,
+                session: "session-1".into(),
+                role: WorkRole::Helper,
+                scope: vec![],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+                preflight: None,
+            },
+            800,
+        )
+        .unwrap();
+    let mut start = action_start(&work_id, generation);
+    start.operation_id = "helper-colliding-session-start".into();
+    start.action_id = "helper-colliding-session-action".into();
+    store
+        .change_action_start(&helper_token, &start, 801)
+        .unwrap();
+
+    let helper_view = store
+        .change_record(&helper_token, &work_id, 802)
+        .unwrap()
+        .unwrap();
+    let helper_capture = helper_view.review.unwrap().captured_by.unwrap();
+    assert_eq!(helper_capture.agent, "helper-agent");
+    assert_eq!(helper_capture.session_id, "session-1");
+
+    let lead_view = store
+        .change_record(&lead_token, &work_id, 803)
+        .unwrap()
+        .unwrap();
+    let lead_capture = lead_view.review.unwrap().captured_by.unwrap();
+    assert_ne!(lead_capture.agent, "codex");
+    assert_ne!(lead_capture.session_id, "session-1");
+}
+
+#[test]
+fn sqlite_attribution_uses_author_token_and_session() {
+    attribution_uses_author_token_and_session(&Db::sqlite());
+}
+
+#[test]
+fn postgres_attribution_uses_author_token_and_session() {
+    if let Some(db) = Db::postgres() {
+        attribution_uses_author_token_and_session(&db);
+    }
+}
+
 #[test]
 fn sqlite_review_projection_acceptance_cases() {
     review_projection_acceptance_cases(&Db::sqlite());

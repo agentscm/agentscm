@@ -82,6 +82,7 @@ export interface ChangeRecordSummaryV1 {
   schema_version: 1
   work_id: string
   generation: number
+  updated_seq: number
   as_of: number
   intent: { title: string; description: string | null; repository: string | null; branch: string | null; provenance: 'native' | 'forge' | null; scope: string[]; scope_omitted: number }
   subject: { source_id: string; source_kind: 'native' | 'git'; source: ChangeRecordSource } | null
@@ -183,6 +184,11 @@ const boundedText = (value: unknown, field: string, maxBytes = 500): string => {
 }
 const nullableText = (value: unknown, field: string, maxBytes = 500): string | null => (value === null ? null : boundedText(value, field, maxBytes))
 const nullableIdentifier = (value: unknown, field: string): string | null => (value === null ? null : identifier(value, field))
+const apiPath = (value: unknown, field: string): string => {
+  const result = boundedText(value, field, 2048)
+  if (!result.startsWith('/v1/hub/') || result.includes('\\') || result.includes('..') || /[?#]/.test(result)) fail(field)
+  return result
+}
 const digest = (value: unknown, field: string): string =>
   typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : fail(field)
 const oid = (value: unknown, field: string): string =>
@@ -430,7 +436,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       return fail('summary.review.diff.kind')
     })()
     const concerns = Array.isArray(item['concerns']) ? item['concerns'].map((entry, index) => identifier(entry, `summary.review.concerns[${index}]`)) : fail('summary.review.concerns')
-    const detailLinks = Array.isArray(item['detail_links']) ? item['detail_links'].map((entry, index) => identifier(entry, `summary.review.detail_links[${index}]`)) : fail('summary.review.detail_links')
+    const detailLinks = Array.isArray(item['detail_links']) ? item['detail_links'].map((entry, index) => apiPath(entry, `summary.review.detail_links[${index}]`)) : fail('summary.review.detail_links')
     if (concerns.length > 16 || detailLinks.length > 16 || item['establishes_approval'] !== false) fail('summary.review')
     return {
       captured_by: captured ? { agent: identifier(captured['agent'], 'summary.review.captured_by.agent'), session_id: identifier(captured['session_id'], 'summary.review.captured_by.session_id') } : null,
@@ -451,6 +457,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       schema_version: 1,
       work_id: workId,
       generation: integer(raw['generation'], 'summary.generation', 1),
+      updated_seq: raw['updated_seq'] === undefined ? 0 : integer(raw['updated_seq'], 'summary.updated_seq'),
       as_of: timestamp(raw['as_of'], 'summary.as_of'),
       intent,
       subject,

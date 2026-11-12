@@ -594,6 +594,10 @@ pub struct ChangeRecordSummaryV1 {
     pub schema_version: u16,
     pub work_id: String,
     pub generation: i64,
+    /// Work event sequence used to join non-atomic actionable-status reads without treating a
+    /// different version of the same generation as current.
+    #[serde(default)]
+    pub updated_seq: i64,
     pub as_of: i64,
     pub intent: IntentSummaryV1,
     pub subject: Option<SubjectSummaryV1>,

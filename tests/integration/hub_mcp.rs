@@ -1184,6 +1184,9 @@ async fn change_record_is_a_read_only_bounded_projection() {
     assert_eq!(summary["decision"]["status"], "missing");
     assert_eq!(summary["review"]["actual_scope"], "unknown");
     assert_eq!(summary["review"]["establishes_approval"], false);
+    assert_eq!(summary["updated_seq"], item["updated_seq"]);
+    assert!(summary["review"]["next_actor"].is_string());
+    assert!(summary["review"]["supported_action"].is_string());
     assert_eq!(summary["review"]["diff"]["base"], "3".repeat(40));
     assert_ne!(
         summary["review"]["captured_by"]["session_id"],

@@ -12,6 +12,7 @@ use crate::change_record::{
 
 use super::viewer::Viewer;
 use super::work::{Checkpoint, SourceRef, WorkItem};
+use super::work_http::actionable_status;
 use super::{HubError, Result};
 
 /// Lifecycle of one shared-conversation body declaration, keyed by (work, digest, author).
@@ -174,6 +175,7 @@ pub struct StoredActionV1 {
     pub start: ActionStartV1,
     pub finish: Option<ActionFinishV1>,
     pub source_id: String,
+    pub author_token: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -216,24 +218,20 @@ pub fn project(
         source: stored.start.source.clone(),
     });
     let latest_action = action.as_ref().map(|stored| action_summary(item, stored));
-    let captured_by = action.as_ref().map(|stored| {
+    let captured_by = action.as_ref().and_then(|stored| {
+        let participant = item.participants.iter().find(|participant| {
+            participant.token == stored.author_token
+                && participant.session == stored.start.session_id
+        })?;
         let mut session_id = stored.start.session_id.clone();
-        let (owner, token) = Viewer::capturer(
-            &item.participants,
-            &session_id,
-            (Some(item.owner.as_str()), item.lead_token.as_str()),
+        viewer.session(
+            Some(&participant.owner),
+            &participant.token,
+            &mut session_id,
         );
-        viewer.session(owner, token, &mut session_id);
-        let mut agent = item
-            .participants
-            .iter()
-            .find(|participant| participant.session == stored.start.session_id)
-            .map_or_else(
-                || item.lead_agent.clone(),
-                |participant| participant.agent.clone(),
-            );
-        viewer.label(owner, &mut agent);
-        CapturedAttributionV1 { agent, session_id }
+        let mut agent = participant.agent.clone();
+        viewer.label(Some(&participant.owner), &mut agent);
+        Some(CapturedAttributionV1 { agent, session_id })
     });
     let diff = action.as_ref().map(|stored| match &stored.start.source {
         SourceBindingV1::Native {
@@ -330,12 +328,12 @@ pub fn project(
     }
     let review_concerns =
         review_concerns(session_coverage, latest_action.as_ref(), action.as_ref());
-    let mut next_actor = item.lead_agent.clone();
-    viewer.label(Some(&item.owner), &mut next_actor);
+    let encoded_repository = item.repository.replace('/', "%2F");
     ChangeRecordSummaryV1 {
         schema_version: crate::change_record::SCHEMA_VERSION_V1,
         work_id: item.id.clone(),
         generation: item.generation,
+        updated_seq: item.updated_seq,
         as_of,
         intent: IntentSummaryV1 {
             title: item.title.clone(),
@@ -390,15 +388,56 @@ pub fn project(
             actual_scope: CoverageV1::Unknown,
             concerns: review_concerns,
             detail_links: vec![
-                format!("work:{}:change-record", item.id),
-                format!("work:{}:conversation", item.id),
-                format!("work:{}:actionable-status", item.id),
+                format!(
+                    "/v1/hub/repos/{}/change-records/{}",
+                    encoded_repository, item.id
+                ),
+                format!(
+                    "/v1/hub/repos/{}/change-records/{}/conversation",
+                    encoded_repository, item.id
+                ),
+                "/v1/hub/standup/status".into(),
             ],
-            next_actor: Some(next_actor),
+            next_actor: None,
             supported_action: None,
             establishes_approval: false,
         }),
     }
+}
+
+/// Add operational guidance only when a non-atomic status read names the exact Work version.
+/// A missing, failed or stale status read leaves the bounded capture projection explicitly
+/// unknown; it never promotes older evidence to current.
+pub fn enrich_actionable_status(
+    summary: &mut ChangeRecordSummaryV1,
+    status: Option<&actionable_status::ActionableStatus>,
+) {
+    let Some(review) = summary.review.as_mut() else {
+        return;
+    };
+    let Some(row) = status.and_then(|status| {
+        status.work.iter().find(|row| {
+            row.work_id == summary.work_id
+                && row.generation == summary.generation
+                && row.updated_seq == summary.updated_seq
+        })
+    }) else {
+        if !review
+            .concerns
+            .iter()
+            .any(|value| value == "actionable_status_unavailable_or_stale")
+        {
+            review
+                .concerns
+                .push("actionable_status_unavailable_or_stale".into());
+        }
+        return;
+    };
+    review.next_actor = Some(actionable_status::recipient_label(&row.recipient));
+    review.supported_action = Some(row.action.clone());
+    review
+        .concerns
+        .retain(|value| value != "supported_next_action_requires_actionable_status");
 }
 
 fn review_concerns(
@@ -610,6 +649,35 @@ fn aggregate_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn summary_for_status() -> ChangeRecordSummaryV1 {
+        serde_json::from_value(json!({
+            "schema_version":1,"work_id":format!("wrk_{}", "a".repeat(32)),"generation":2,
+            "updated_seq":17,"as_of":20,
+            "intent":{"title":"status fixture","repository":"acme/widgets","provenance":"forge","scope":[],"scope_omitted":0},
+            "subject":null,"sessions":{"count":0,"coverage":"unknown","gaps":0},
+            "latest_action":null,
+            "decision":{"status":"missing","reference":null,"summary":null,"source_refs":[],"source_refs_omitted":0,"author_kind":null,"author_agent":null,"at":null,"generation":null},
+            "next_action":"agent-reported follow-up",
+            "completeness":{"events":"unknown","source":"unknown","setup":"unknown","recipe":"unknown","result":"unknown","usage":"unknown"},
+            "unknowns":["human_decision"],
+            "review":{"captured_by":null,"diff":null,"actual_scope":"unknown","concerns":["supported_next_action_requires_actionable_status"],"detail_links":[],"next_actor":null,"supported_action":null,"establishes_approval":false}
+        })).unwrap()
+    }
+
+    fn status_for(summary: &ChangeRecordSummaryV1) -> actionable_status::ActionableStatus {
+        let mut status: actionable_status::ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let row = status.work.first_mut().unwrap();
+        row.work_id = summary.work_id.clone();
+        row.generation = summary.generation;
+        row.updated_seq = summary.updated_seq;
+        row.action = "Ask the owner for a decision.".into();
+        row.recipient.kind = actionable_status::RecipientKind::Person;
+        row.recipient.login = Some("builder".into());
+        status
+    }
 
     fn row(author: &str, state: SharedBodyState) -> SharedBodyRow {
         SharedBodyRow {
@@ -678,5 +746,42 @@ mod tests {
     #[test]
     fn availability_is_not_inferred_from_result() {
         assert_eq!(aggregate_availability(&[]), ContentAvailabilityV1::Missing);
+    }
+
+    #[test]
+    fn actionable_status_enrichment_requires_the_exact_work_version() {
+        let mut exact = summary_for_status();
+        let status = status_for(&exact);
+        enrich_actionable_status(&mut exact, Some(&status));
+        let review = exact.review.as_ref().unwrap();
+        assert_eq!(review.next_actor.as_deref(), Some("builder"));
+        assert_eq!(
+            review.supported_action.as_deref(),
+            Some("Ask the owner for a decision.")
+        );
+        assert!(exact.unknowns.contains(&UnknownFactV1::HumanDecision));
+
+        let mut stale = summary_for_status();
+        stale.updated_seq += 1;
+        enrich_actionable_status(&mut stale, Some(&status));
+        let review = stale.review.as_ref().unwrap();
+        assert!(review.supported_action.is_none());
+        assert!(
+            review
+                .concerns
+                .iter()
+                .any(|value| value == "actionable_status_unavailable_or_stale")
+        );
+
+        let mut unavailable = summary_for_status();
+        enrich_actionable_status(&mut unavailable, None);
+        assert!(
+            unavailable
+                .review
+                .unwrap()
+                .concerns
+                .iter()
+                .any(|value| value == "actionable_status_unavailable_or_stale")
+        );
     }
 }

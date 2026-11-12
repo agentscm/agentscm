@@ -463,6 +463,16 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     assert_eq!(summary["intent"]["repository"], REPOSITORY);
     assert_eq!(summary["review"]["actual_scope"], "unknown");
     assert_eq!(summary["review"]["establishes_approval"], false);
+    assert_eq!(
+        summary["updated_seq"],
+        hub.store
+            .work_get(&writer_token, &work.id, unix_now())
+            .unwrap()
+            .unwrap()
+            .updated_seq
+    );
+    assert!(summary["review"]["next_actor"].is_string());
+    assert!(summary["review"]["supported_action"].is_string());
     assert_eq!(summary["review"]["diff"]["head"], "1".repeat(40));
     assert_ne!(
         summary["review"]["captured_by"]["session_id"],

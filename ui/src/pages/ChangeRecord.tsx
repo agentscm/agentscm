@@ -496,6 +496,19 @@ function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; rep
   const review = summary.review
   const diff = review?.diff ?? (summary.subject ? summary.subject.source.kind === 'git' ? { kind: 'git' as const, repository: summary.subject.source.repository, worktree_id: summary.subject.source.worktree_id, base: summary.subject.source.base, head: summary.subject.source.head, dirty: summary.subject.source.dirty, untracked_count: summary.subject.source.untracked_count, omissions: summary.subject.source.omissions, snapshot_coverage: summary.subject.source.snapshot_coverage } : { kind: 'native' as const, repository: summary.subject.source.repository, revision: summary.subject.source.revision, change_id: summary.subject.source.change_id } : null)
   const diffHref = diff?.kind === 'git' && diff.repository === repo ? `#explorer?repo=${encodeURIComponent(repo)}&base=${diff.base}&head=${diff.head}&worktree=${encodeURIComponent(diff.worktree_id)}` : null
+  const concernLabel: Record<string, string> = {
+    capture_history_incomplete_or_unknown: 'Capture history is partial or unavailable',
+    no_captured_action: 'No action receipt was captured',
+    latest_execution_not_successful: 'The latest execution did not succeed',
+    latest_check_not_passing: 'The latest check is not passing',
+    current_source_applicability_not_established: 'Applicability to the current source is not established',
+    captured_source_dirty_or_untracked: 'Dirty or untracked files are outside the committed comparison',
+    captured_source_has_omissions: 'The captured source reports omissions',
+    actual_changed_scope_requires_source_diff: 'Actual changed scope requires opening the source diff',
+    supported_next_action_requires_actionable_status: 'Current supported action is unavailable',
+    actionable_status_unavailable_or_stale: 'Actionable status was unavailable or did not match this Work version',
+    approval_and_readiness_not_established: 'Approval and readiness are not established',
+  }
   return <Box icon="clipboard2-check" title="Review summary" explain="A compact view of retained intent, captured source, the latest observed receipt and what remains unknown.">
     {summary.intent.description ? <p>{summary.intent.description}</p> : null}
     <dl className="tech mb-0">
@@ -503,10 +516,14 @@ function ReviewOverview({ summary, repo }: { summary: ChangeRecordSummaryV1; rep
       <Fact label="Captured source">{diff?.kind === 'git' ? <><code>{diff.worktree_id}</code> · <code>{diff.head}</code>{diffHref ? <> · <a href={diffHref}>Compare exact commits</a></> : <> · <span className="muted">Local comparison unavailable for this repository</span></>}</> : diff?.kind === 'native' ? <>Native revision <code>{diff.revision}</code> · diff unavailable in the local Git explorer</> : <span className="muted">No captured source</span>}</Fact>
       {diff?.kind === 'git' && (diff.dirty || diff.untracked_count > 0 || diff.omissions.length > 0) ? <Fact label="Excluded from commit comparison"><span className="warn-text">Working-tree changes{diff.untracked_count ? `, ${diff.untracked_count} untracked item${diff.untracked_count === 1 ? '' : 's'}` : ''}{diff.omissions.length ? `, ${diff.omissions.map((item) => OMISSION_LABEL[item].toLowerCase()).join(', ')}` : ''}</span></Fact> : null}
       <Fact label="Latest observed receipt">{summary.latest_action ? <><StatusPill status={OUTCOME[summary.latest_action.outcome]} /> <StatusPill status={RESULT[summary.latest_action.result]} /> <StatusPill status={ASSURANCE[summary.latest_action.assurance]} /> <StatusPill status={COVERAGE[summary.latest_action.coverage]} /> <StatusPill status={APPLICABILITY[summary.latest_action.applicability]} /></> : <span className="muted">No action receipt captured; check history is unavailable.</span>}</Fact>
-      <Fact label="Retained decision"><StatusPill status={DECISION[summary.decision.status]} /> {summary.decision.summary ?? 'No decision summary retained.'}</Fact>
-      <Fact label="Next actor and supported action"><strong>{review?.next_actor ?? 'Unknown'}</strong> · supported action unknown. <a href={workHref(summary.work_id)}>Open Work for current recovery and actions</a>.</Fact>
+      <Fact label="Captured by">{review?.captured_by ? <><strong>{review.captured_by.agent}</strong> · session <code>{review.captured_by.session_id}</code></> : <span className="muted">Capture participant unknown</span>}</Fact>
+      <Fact label="Retained decision"><StatusPill status={DECISION[summary.decision.status]} /> {summary.decision.summary ?? 'No decision summary retained.'}{summary.decision.author_kind ? <> · proposed by {summary.decision.author_kind === 'agent' ? summary.decision.author_agent ?? 'an unknown agent' : 'a person'}</> : null}</Fact>
+      <Fact label="Next actor and supported action"><strong>{review?.next_actor ?? 'Recipient unknown'}</strong> · {review?.supported_action ?? 'Supported action unknown.'} <a href={workHref(summary.work_id)}>Open Work</a>.</Fact>
+      <Fact label="Reported next action">{summary.next_action ?? <span className="muted">No next action was reported.</span>}</Fact>
     </dl>
     <Notice tone="warn" title="Approval and readiness are not established">This summary is historical and non-atomic. A passing latest receipt is not a current approval, and findings or check history not shown here remain unavailable.</Notice>
+    {review?.concerns.length ? <details className="disclosure mt-3"><summary>Review concerns ({review.concerns.length})</summary><ul className="mt-3 mb-0">{review.concerns.map((concern) => <li key={concern}>{concernLabel[concern] ?? concern.replaceAll('_', ' ')}</li>)}</ul></details> : null}
+    <details className="disclosure mt-3"><summary>Review references and provenance</summary><dl className="tech mt-3 mb-0"><Fact label="Work version">generation {summary.generation}, event {summary.updated_seq || 'unavailable'}</Fact><Fact label="Assurance">{summary.latest_action ? ASSURANCE[summary.latest_action.assurance].label : 'Unavailable'}; this is separate from the reported result.</Fact><Fact label="Detail destinations">{review?.detail_links.length ? review.detail_links.map((link) => <div key={link}><a href={link}>{link}</a></div>) : <span className="muted">No detail destinations retained.</span>}</Fact></dl></details>
   </Box>
 }
 

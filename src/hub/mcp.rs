@@ -2926,14 +2926,8 @@ async fn call_inner(
         if super::work::validate_id("work", &work_id, "wrk").is_err() {
             return Ok(invalid_args(name, "malformed work id"));
         }
-        let store = state.store.clone();
-        let token = principal.token_id.clone();
         return Ok(
-            match blocking(state, move || {
-                store.change_record(&token, &work_id, unix_now())
-            })
-            .await
-            {
+            match super::change_record_http::read_summary(state, principal, &work_id).await {
                 Ok(Some(summary)) => match ChangeRecordResponseV1::bounded(summary) {
                     Ok(response) => change_record_result(response),
                     Err(error) => work_failure(&error),

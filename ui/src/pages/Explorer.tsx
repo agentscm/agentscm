@@ -533,14 +533,17 @@ function ExplorerBody({ summary, hubRepository, onOpenRevision, exactComparison 
   )
 }
 
-export function ExplorerPage({ hubRepository }: { hubRepository?: string | null }) {
-  const comparisonQueryPresent = ['repo', 'base', 'head', 'worktree'].some((key) => hashQuery().has(key))
-  const requested = exactComparisonFromHash()
+function ExplorerRoute({ hubRepository, routeHash }: { hubRepository?: string | null; routeHash: string }) {
+  const query = hashQuery(routeHash)
+  const comparisonQueryPresent = ['repo', 'base', 'head', 'worktree'].some((key) => query.has(key))
+  const requested = exactComparisonFromHash(routeHash)
   const exactComparison = requested && hubRepository === requested.repository ? requested : undefined
   const [selectedRef, setSelectedRef] = useState(exactComparison?.head ?? 'HEAD')
   const [refresh, setRefresh] = useState(0)
   const reachable = localReachable()
-  const summary = useResource(reachable ? `summary|${selectedRef}|${refresh}` : null, (signal) => fetchExplorerSummary(selectedRef, signal))
+  const requestCanOpen = !comparisonQueryPresent || requested !== null && hubRepository === requested.repository
+  const summary = useResource(reachable && requestCanOpen ? `summary|${selectedRef}|${refresh}` : null, (signal) => fetchExplorerSummary(selectedRef, signal))
+  const routeIdentity = exactComparison ? `${exactComparison.repository}|${exactComparison.base}|${exactComparison.head}|${exactComparison.worktree}` : 'browse'
   return (
     <div className="page explorer-page">
       <PageHead question="What happened around this code?" answer="Files, history and the evidence behind them." fact={<><Icon name="laptop" /> Read from your local checkout; reading never changes it.</>} />
@@ -550,7 +553,17 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
       {summary.kind === 'loading' && <Skeleton rows={6} />}
       {summary.kind === 'error' && (onFrontDoor() ? <Notice tone="bad" icon="plug" title="Could not open this repository">{summary.message}</Notice> : <Notice tone="brand" icon="laptop" title="Your files and conversations open from your computer">Run <code>agentscm open</code> in your repository. This page then opens on your computer, already connected.<details className="mt-2 small"><summary>Details</summary>{summary.message}</details></Notice>)}
       {summary.kind === 'ready' && exactComparison && summary.value.repository_id !== exactComparison.repository ? <Notice tone="warn" title="Captured comparison belongs to another local repository">The selected local repository is <code>{summary.value.repository_id}</code>, not <code>{exactComparison.repository}</code>. No diff was requested.</Notice> : null}
-      {summary.kind === 'ready' && !(exactComparison && summary.value.repository_id !== exactComparison.repository) && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} exactComparison={exactComparison} /></>}
+      {summary.kind === 'ready' && !(exactComparison && summary.value.repository_id !== exactComparison.repository) && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}|${routeIdentity}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} exactComparison={exactComparison} /></>}
     </div>
   )
+}
+
+export function ExplorerPage({ hubRepository }: { hubRepository?: string | null }) {
+  const [routeHash, setRouteHash] = useState(() => window.location.hash)
+  useEffect(() => {
+    const onHash = () => setRouteHash(window.location.hash)
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  return <ExplorerRoute key={routeHash} hubRepository={hubRepository} routeHash={routeHash} />
 }
