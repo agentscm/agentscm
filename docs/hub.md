@@ -561,7 +561,8 @@ start; until then they stop working (401 `sign_in_required`).
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
   token's id, name, repository and expiry, and its owner, plus
   `shared_conversation_retention_days`, the days this Hub keeps an uploaded shared conversation
-  (`hub serve --shared-conversation-retention-days`, 1 to 3650). The field is additive: a Hub
+  for the token's repository (`hub serve --shared-conversation-retention-days`, 1 to 3650, unless
+  a program that embeds the Hub sets it per repository, where 0 means it keeps none). The field is additive: a Hub
   that predates it omits it, and clients then say the retention is not known instead of naming a
   number. Every authentication failure returns the same 401 body.
 - `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes
@@ -1178,6 +1179,8 @@ exact omission counts identify trailing entries removed deterministically to fit
 MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
 explicitly untrusted structured data and are not interpolated into that narration.
 
+HTTP and MCP use the same non-atomic enrichment step. Shared actionable status supplies `review.supported_action` and the actual status recipient only when its Work id, generation and `updated_seq` exactly match the change record; otherwise both remain unknown and the review concerns name unavailable or stale status. The Work's reported `next_action` remains a separate field. Captured attribution uses the retained action author token together with the session id; an absent exact participant is unknown and is never replaced with the Work lead. `review.detail_links` are bounded authenticated API paths that already exist, not symbolic claims of a history route.
+
 ### Shared conversation reads
 
 Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares
@@ -1225,7 +1228,7 @@ the person who shared it (older clients, which refuse unknown fields, need upgra
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.
 - `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
-  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries and shows a
+  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries only after the reader explicitly opens the conversation section, and shows a
   shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
   on an older record; it has no delete control because the status page only holds read-only
   tokens.
@@ -1237,9 +1240,7 @@ in the Hub's settings table, keyed by the forge's repository id so a rename keep
 checkouts follow it as described in
 [the repository setting](change-capture.md#the-repository-setting).
 
-The Hub-wide default is on until a Hub admin sets it, so on a new Hub a connected repository shares
-its agents' conversations with the people who can read it there. Four switches turn that off, and
-each still wins over the default:
+The Hub-wide default is off. Repository permission and the author's affirmative per-repository opt-in are separate gates; neither a notice nor an existing capture binding records consent. A Hub admin may change the Hub-wide default, but that still does not opt any person in. A repository setting and checkout mode can narrow sharing further:
 
 - a Hub admin sets the Hub-wide default off (`PUT .../conversation-sharing/default` below);
 - a repository admin sets the repository off;
@@ -1247,11 +1248,7 @@ each still wins over the default:
 - a checkout's own capture mode is lower than `shared-conversation`, or its capture is off
   ([capture modes](change-capture.md)).
 
-A Hub that already had people when it first ran a build with this default keeps sharing off: the
-`conversation_sharing_default` migration records the default as off there, unless a Hub admin had
-already set it. Nothing a person had not agreed to share starts uploading because of an upgrade. A
-Hub admin turns the default on for such a Hub with the same `PUT`. Each person's agent is told once
-at session start that sharing is on.
+Existing Hubs also keep sharing off unless an administrator deliberately changes the setting. Nothing a person had not affirmatively agreed to share starts uploading because of an install or upgrade. After both gates are enabled, each person's agent is told at session start that sharing is on; that notice is informational and cannot substitute for consent.
 
 - `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
   `{repository, enabled, source, hub_default, opted_out, notified, sharing}` for the token's
@@ -1325,6 +1322,10 @@ A separate per-repository setting, `GET` or `PUT /v1/hub/standup/merged-release/
 sync poll release the hold of Work whose merged pull request closed its source issue as completed
 ([automatic release](standup.md#automatic-release-of-a-merged-works-hold)). It is off by default,
 and only a Hub admin or a repository admin can switch it on with `PUT`.
+
+Without any setting, the sync poll also completes Work whose pull request it observed merge once no
+live session holds it, with the outcome provenance `hub_observed_merge`
+([completion of merged Work](standup.md#completion-of-merged-work)).
 
 **Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
 digest once a week as a private direct message to each person who has a Slack binding for the
@@ -1429,6 +1430,32 @@ Repositories are added one at a time with
 them (409 when another connection already holds the repository). A PAT acts as one
 person: its comments appear as theirs.
 `AGENTSCM_GITHUB_URL` and `AGENTSCM_GITHUB_API_URL` are the ones sign-in uses.
+
+Embedded connections. A program that embeds the hub as a library can supply a
+connection's credential itself. It implements `sync::ConnectionCredentials`
+(`token`, `active` and, optionally, `namespace`) and passes it to
+`Sync::with_connection_credentials`, then records connections of kind `embedded`
+(GitHub or GitLab; no app id or slug; `acts_as` is required, so the hub recognises
+its own comments and statuses). For an embedded connection the hub asks `token`
+for a current credential on every use and caches nothing. An unauthorized answer
+marks the connection `auth_failed` and starts the usual backoff; any other error
+skips that repository for the round. Without an embedder, an embedded connection
+fails as a credential problem and nothing is called. Embedded connections are
+polled only: their webhook route answers 401. Repositories are added as for a
+PAT (`POST /v1/hub/connections/{id}/repositories`). `active` applies to every
+connection kind, apps included: a repository it answers false for is skipped by
+polling, the catch-up status pass and webhook jobs, though discovery still
+attaches it. With only `AGENTSCM_GITLAB_URL` set (no token), the GitLab client
+serves embedded connections alone.
+
+Following a GitLab namespace. When `namespace` names a group or a user for a
+GitLab connection that is not an app, each poll lists its projects
+(`/groups/:id/projects?include_subgroups=true&archived=false`, or
+`/users/:id/projects?archived=false`), 100 a page and at most 10 pages, and
+connects new ones as discovery does. Nothing is detached; a project another
+connection holds stays with it. A listing cut short at the page cap adds a poll
+report with an empty `repository` and `truncated: {"namespace_projects": <pages
+unread>}`. At most 1,000 connected repositories per connection are polled.
 
 _Experimental: tested only against in-process fake servers, not live GitHub or GitLab._
 
@@ -1952,6 +1979,12 @@ paged, so old merges never occupy a page:
 - Deployments for that commit (`deployments?sha=`), each with its newest deployment status.
   Deployments carry no repository id, so they are matched by the repository name in the
   request and the exact sha, the same exposure as the `pulls/{n}` merge read.
+
+A deploy run from a script records no deployment by itself; `agentscm deployed` asks the Hub
+to record one with the connection's own credential, which on GitHub needs the App permission
+Deployments: Read and write (see [record a deployment from a script](record-deployments.md)).
+A deployment the Hub wrote carries `payload` `{"agentscm": "recorded"}` and is read back as
+source `recorded`; every other deployment read is source `forge`.
 
 Outcomes are `pending`, `running`, `succeeded`, `failed`, `cancelled`, `superseded` (a
 deployment that went `inactive`) or `unknown`; anything the Hub does not recognise is

@@ -1088,8 +1088,9 @@ async fn show(
 /// External runs shown per publication; one more is read to tell a full list from a cut one.
 const EXTERNAL_SHOWN: usize = 200;
 
-/// External CI and deployment outcomes stored for a merged publication's merge commit, only
-/// where the repository is opted in. Read-only: it reads the store and calls no forge.
+/// External CI and deployment outcomes stored for a merged publication's merge commit: what
+/// the Hub read where the repository is watched, and any deployment recorded through the Hub
+/// on any forge. Read-only: it reads the store and calls no forge.
 async fn external_view(
     state: &HubState,
     principal: &Principal,
@@ -1098,9 +1099,6 @@ async fn external_view(
     let Some(sha) = publication.merge_commit.clone() else {
         return Ok(None);
     };
-    if !state.sync.external_runs_enabled(&principal.repository) {
-        return Ok(None);
-    }
     let (host, name, repository_id) = (
         principal.owner.identity.host.clone(),
         principal.repository.clone(),
@@ -1117,12 +1115,10 @@ async fn external_view(
     let Some((conn, repo)) = found else {
         return Ok(None);
     };
-    if conn.provider != "github"
-        || !state.sync.external_runs_enabled(&repo.full_name)
-        || !publication_on_forge(state, publication, &repo).await
-    {
+    if !publication_on_forge(state, publication, &repo).await {
         return Ok(None);
     }
+    let watched = super::external_runs::watched(state, &conn, &repo).await?;
     let (store, id, commit) = (state.store.clone(), repo.id.clone(), sha.clone());
     // Each kind has its own cap, so many CI runs cannot hide the deployments.
     let (mut ci_runs, mut deployed, marker) = blocking(state, move || {
@@ -1133,6 +1129,9 @@ async fn external_view(
         ))
     })
     .await?;
+    if !watched && deployed.is_empty() {
+        return Ok(None);
+    }
     let cut = ci_runs.len() > EXTERNAL_SHOWN || deployed.len() > EXTERNAL_SHOWN;
     ci_runs.truncate(EXTERNAL_SHOWN);
     deployed.truncate(EXTERNAL_SHOWN);
@@ -1153,11 +1152,13 @@ async fn external_view(
         .into_iter()
         .map(|run| {
             json!({"run_id": run.run_id, "environment": run.environment, "name": run.name,
-                "outcome": run.outcome.as_str(),
+                "outcome": run.outcome.as_str(), "source": run.source.as_str(),
                 "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})
         })
         .collect();
-    Ok(Some(json!({"provider": "github",
+    // `state` is the forge read's; a repository the Hub does not watch was never read.
+    let status = if watched { status } else { "unobserved" };
+    Ok(Some(json!({"provider": conn.provider, "watched": watched,
         "note": "Observed after landing; not evidence for the landing decision.",
         "merge_commit": sha, "state": status,
         "reconciled_at": marker.map(|(at, _)| at),

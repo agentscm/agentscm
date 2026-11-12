@@ -271,7 +271,7 @@ async fn candidate(
     }
     let scope = scope(conn, repo);
     let store = state.store.clone();
-    let merge_commit = hint["merge_commit_sha"].as_str().map(str::to_owned);
+    let merge_commit = landed_commit(conn, hint).map(str::to_owned);
     let known = blocking(state, move || {
         store.catchup_merge_known(&scope, number, merge_commit.as_deref())
     })
@@ -312,8 +312,7 @@ pub(super) async fn observe(
     if number != expected_number {
         return Err(GhError::Failed("merged proposal identity changed".into()));
     }
-    let merge_commit = pull["merge_commit_sha"]
-        .as_str()
+    let merge_commit = landed_commit(conn, pull)
         .ok_or_else(|| GhError::Failed("missing merged proposal commit".into()))?
         .to_owned();
     let scope = scope(conn, repo);
@@ -405,7 +404,9 @@ fn projection(
         branch: text(&pull["head"]["ref"])?,
         base: text(&pull["base"]["ref"])?,
         head_commit: text(&pull["head"]["sha"])?,
-        merge_commit: text(&pull["merge_commit_sha"])?,
+        merge_commit: landed_commit(conn, pull)
+            .map(str::to_owned)
+            .ok_or_else(invalid)?,
         pull_number: number,
         paths,
         paths_complete,
@@ -413,6 +414,16 @@ fn projection(
     };
     merge.validate(observed_at).map_err(failure)?;
     Ok(merge)
+}
+
+/// The commit a merged proposal landed as. A GitLab fast-forward merge makes neither a merge nor a
+/// squash commit, so its merged head is what landed on the target.
+fn landed_commit<'a>(conn: &Connection, pull: &'a Value) -> Option<&'a str> {
+    pull["merge_commit_sha"].as_str().or_else(|| {
+        (conn.provider == "gitlab" && pull["merged"] == true)
+            .then(|| pull["head"]["sha"].as_str())
+            .flatten()
+    })
 }
 
 fn same_id(head: &Value, base: &Value) -> bool {

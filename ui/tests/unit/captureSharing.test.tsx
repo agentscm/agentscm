@@ -25,7 +25,8 @@ describe('conversation sharing decoding', () => {
     const days = (value: unknown) => decodeCheckouts({ version: 1, checkouts: [row({ shared_conversation_retention_days: value })] })[0]!.shared_conversation_retention_days
     expect(days(14)).toBe(14)
     expect(days(3650)).toBe(3650)
-    for (const bad of [null, undefined, 0, 3651, 1.5, '30', {}]) expect(days(bad)).toBeNull()
+    expect(days(0)).toBe(0)
+    for (const bad of [null, undefined, -1, 3651, 1.5, '30', {}]) expect(days(bad)).toBeNull()
   })
 
   it('requires an opaque id, so a path or a missing id is never accepted as a name', () => {
@@ -70,6 +71,9 @@ describe('Conversation sharing in Settings', () => {
     expect(screen.getByText(/as long as the Hub operator sets \(30 days unless changed\)/)).toBeTruthy()
     expect(screen.queryByText(/days on/)).toBeNull()
     expect(screen.getByText(/redacted for secrets on this computer/)).toBeTruthy()
+    expect(screen.getByText(/anyone who can read the repository on the Hub/)).toBeTruthy()
+    expect(screen.getByText(/does not opt you in on the Hub/)).toBeTruthy()
+    expect(screen.getByText(/agentscm change-capture opt-in/)).toBeTruthy()
     expect(screen.getByText(HUB)).toBeTruthy()
     await userEvent.click(screen.getByRole('button', { name: 'Share conversations' }))
     await waitFor(() => expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(true))
@@ -86,6 +90,14 @@ describe('Conversation sharing in Settings', () => {
     expect(screen.queryByText(/30 days/)).toBeNull()
     await userEvent.click(switches[1]!)
     expect(screen.getByText(/It is kept 1 day on/)).toBeTruthy()
+  })
+
+  it('says nothing is uploaded when the Hub keeps no conversations for the repository', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reply(200, { version: 1, checkouts: [row({ shared_conversation_retention_days: 0 })] })))
+    render(<CaptureSharingBox token={TOKEN} />)
+    await userEvent.click((await screen.findAllByRole('switch'))[0]!)
+    expect(screen.getByText(/keeps no conversations for this repository/).textContent).toContain(HUB)
+    expect(screen.queryByText(/It is kept/)).toBeNull()
   })
 
   it('moves focus into the confirmation, announces the result and gives focus back to the switch', async () => {

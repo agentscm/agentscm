@@ -643,6 +643,13 @@ fn who(state: &FakeState, auth: Option<&str>) -> Option<Who> {
     Some(Who::Reader(login.clone(), *id, repos.clone(), push))
 }
 
+fn can_push(who: &Who, repo: i64) -> bool {
+    match who {
+        Who::Installation(_) => true,
+        Who::Reader(_, _, _, pushable) => pushable.contains(&repo),
+    }
+}
+
 fn can_read(state: &FakeState, who: &Who, repo: &Repo) -> bool {
     !repo.private
         || match who {
@@ -1286,10 +1293,14 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 }
                 (&Method::GET, ["deployments"]) => {
                     let wanted = query.iter().find(|(k, _)| k == "sha").map(|(_, v)| v);
+                    let environment = query.iter().find(|(k, _)| k == "environment");
                     let found: Vec<Value> = state.repos[&id]
                         .deployments
                         .iter()
                         .filter(|(d, _)| wanted.is_none_or(|w| d["sha"].as_str() == Some(w)))
+                        .filter(|(d, _)| {
+                            environment.is_none_or(|(_, e)| d["environment"].as_str() == Some(e))
+                        })
                         .map(|(d, _)| d.clone())
                         .collect();
                     let (page, link) = paginate(ctx, uri, &query, found);
@@ -1524,6 +1535,49 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     200,
                     state.repos[&id].rules.clone().unwrap_or_else(|| json!([])),
                 ),
+                (&Method::POST, ["deployments", ..]) if !can_push(&who, id) => json_reply(
+                    403,
+                    json!({"message": "Resource not accessible by personal access token"}),
+                ),
+                (&Method::POST, ["deployments"]) => {
+                    let b = json_body();
+                    let repo = state.repos.get_mut(&id).unwrap();
+                    let next = repo
+                        .deployments
+                        .iter()
+                        .filter_map(|(d, _)| d["id"].as_i64())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    let deployment = json!({"id": next, "sha": b["ref"], "ref": b["ref"],
+                        "environment": b["environment"], "description": "",
+                        "payload": b["payload"],
+                        "updated_at": rfc3339(1_700_000_000)});
+                    repo.deployments.insert(0, (deployment.clone(), Vec::new()));
+                    json_reply(201, deployment)
+                }
+                (&Method::POST, ["deployments", deployment, "statuses"]) => {
+                    let b = json_body();
+                    let found = deployment.parse::<i64>().ok().and_then(|n| {
+                        state
+                            .repos
+                            .get_mut(&id)
+                            .unwrap()
+                            .deployments
+                            .iter_mut()
+                            .find(|(d, _)| d["id"].as_i64() == Some(n))
+                    });
+                    match found {
+                        Some((_, statuses)) => {
+                            let status = json!({"id": statuses.len() + 1, "state": b["state"],
+                                "environment_url": b["environment_url"], "log_url": null,
+                                "target_url": null, "updated_at": rfc3339(1_700_000_100)});
+                            statuses.insert(0, status.clone());
+                            json_reply(201, status)
+                        }
+                        None => not_found(),
+                    }
+                }
                 (&Method::POST, ["statuses", sha]) => {
                     let b = json_body();
                     let valid_state = matches!(

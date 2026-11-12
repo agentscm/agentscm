@@ -253,7 +253,7 @@ once. MCP exposes the same read as `agentscm_work_repositories`, which every age
 
 Each `work[]` row of `GET /v1/hub/standup/status` carries `stage` (`working`, `pull_request_open`, `pull_request_merged`, `complete`, `ended` or `unknown`) with `pull_request` and `basis`. A pull request link inferred from the Work's branch has `basis: "branch_observed"`; an explicit `pr-link` is `caller_reported`, always wins and is never overwritten by inference.
 
-The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, an `idle` wait is listed only while that session, or a session that started it, leads unfinished Work, and its `session` is `{"name", "started_by"}`, the waiting session's name and the name of the first session of the chain that started it or null; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
+The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `merge_held` (a non-draft open pull request of unfinished Work, with every check on its head passed, changes files another owner's open pull request changes; its id is `held:<repository>:<number>`, one per waiting pull request. It needs the waiting pull request's person only when every such owner is idle: no live hold on the shared files and no push, review or comment, as the forge's `updated_at` reports, for 4 hours, the window of the interim merge rule. Its text then asks them to merge first and leave one comment on each other pull request, or to wait. While an owner is active, an activity time is unknown, or the read was cut short, it names the waiting Work's lead agents and asks no person) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, an `idle` wait is listed only while that session, or a session that started it, leads unfinished Work, and its `session` is `{"name", "started_by"}`, the waiting session's name and the name of the first session of the chain that started it or null; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
 
 ## Hub repository setup reads
 
@@ -572,14 +572,20 @@ post, `uncertain`, `posted` or `refused`), `ruleset_requirement`, `status_source
 
 ## Hub publication external outcomes
 
-This is the Hub, not `serve`. When the repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`
-and the publication has a merge commit, `GET /v1/hub/repos/{repo}/publications/{id}` adds a
-read-only `external` object; otherwise the reply has no such field. It reads the Hub's store
-and calls no forge. Fields: `provider` (`github`), `note` (observed after landing, not
+This is the Hub, not `serve`. When the publication has a merge commit and either the
+repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS` or the Hub holds a deployment of that
+commit, `GET /v1/hub/repos/{repo}/publications/{id}` adds a read-only `external` object;
+otherwise the reply has no such field. It reads the Hub's store and calls no forge. Fields:
+`provider` (the connection's, `github` or `gitlab`), `watched` (whether the Hub reads this
+repository's runs and deployments from the forge), `note` (observed after landing, not
 evidence for the landing decision), `merge_commit`, `state`, `reconciled_at` (unix seconds of
 the last read, or null), `ci` (`run_id`, `attempt`, `branch`, `name`, `outcome`,
 `provider_updated_at`, `html_url`) and `deployments` (`run_id`, `environment`, `name`,
-`outcome`, `provider_updated_at`, `html_url`). `outcome` is `pending`, `running`,
+`outcome`, `source`, `provider_updated_at`, `html_url`). `source` is `forge` (read from the
+forge, not written by AgentSCM) or `recorded` (written through
+[`POST .../deployments`](#hub-recorded-deployments)); `workflow` and `agent` are reserved.
+`state` describes only the forge read: a repository that is not watched is always
+`unobserved`, and its `deployments` then hold only what was recorded, which still counts. `outcome` is `pending`, `running`,
 `succeeded`, `failed`, `cancelled`, `superseded` or `unknown`. `state` is `unobserved` (no
 read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind exist) or
 `observed`. Under `incomplete` the lists may be non-empty but are partial, and under
@@ -597,6 +603,24 @@ and that repository's current name: `connected` says the Hub has a connection fo
 `supported` is true only when that connection is GitHub, and `watched` only when it is also
 listed in `opt_in`, which is `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A listed repository the Hub is not
 connected to is not watched, and `provider` is then the token owner's.
+
+### Hub recorded deployments
+
+`POST /v1/hub/repos/{repo}/deployments` (agent bearer token for that repository; read-only
+tokens are refused) with `{"commit", "environment", "status", "url"?}` records on the forge
+that `commit` (40 lowercase hex) is in `environment` (1 to 200 characters, trimmed) with
+`status` `success`, `failure` or `in_progress`. `url` is an optional http(s) address of the
+deployed app, kept on GitHub only. The Hub writes with the credential it holds for the
+repository: GitHub's deployments API through its App installation (or token connection),
+GitLab's deployments API through its connection's token. It reuses the commit's newest
+deployment to that environment and adds a status only when that deployment's newest one
+differs, one request at a time per repository, then stores the row. The reply is
+`{"recorded", "provider", "repository", "commit", "environment", "outcome", "source",
+"deployment_id"}`; `recorded` is false when nothing needed writing. A credential that may not
+write deployments is `403` `forge_permission_missing` with a message naming the permission;
+nothing is recorded. A repository the Hub has not connected is `403` `not_connected`. A forge
+rate limit is `429` `rate_limited`; any other forge failure is `503` `unavailable`, and a
+timeout may still have been recorded, so retry. `agentscm deployed` calls this route.
 
 ## Hub: requests and replies across versions
 
@@ -766,6 +790,7 @@ Registered codes:
 | `owner_disabled` | 409 | no | `ask_owner` |
 | `owner_wrong_forge` | 409 | no | `provide_field` |
 | `repository_renamed` | 409 | no | `inspect_work` |
+| `forge_permission_missing` | 403 | no | `ask_owner` |
 
 ## HTTP boundaries
 

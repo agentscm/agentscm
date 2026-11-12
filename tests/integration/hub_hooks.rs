@@ -1893,17 +1893,37 @@ async fn scope_refusals_follow_the_declared_scope_not_the_tool_or_file() {
         None,
         unix_now(),
     );
-    for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
-        let answer = hub.hook_raw("claude", &lead, &edit_of(tool, session, file));
-        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
-        assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
-        assert!(
-            reason.contains("outside the declared scope"),
-            "{tool} {file}: {answer}"
-        );
-    }
-    for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
-        hub.hook("claude", &lead, &edit_of(tool, session, file));
+    for child in [false, true] {
+        for (tool, file) in [("Write", "src/new_file.rs"), ("Edit", "src/lib.rs")] {
+            let mut payload = edit_of(tool, session, file);
+            if child {
+                payload["agent_id"] = json!("scope-child");
+                payload["agent_type"] = json!("general-purpose");
+            }
+            let answer = hub.hook_raw("claude", &lead, &payload);
+            assert_eq!(
+                answer["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{answer}"
+            );
+            let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+            assert!(reason.contains("EDIT_UNLINKED"), "{tool} {file}: {answer}");
+            assert!(
+                reason.contains("outside the declared scope"),
+                "{tool} {file}: {answer}"
+            );
+            if child {
+                assert!(reason.contains("You are a subagent"), "{answer}");
+                assert!(reason.contains(session), "{answer}");
+            }
+        }
+        for (tool, file) in [("Write", "docs/new/page.md"), ("Edit", "src/widget.rs")] {
+            let mut payload = edit_of(tool, session, file);
+            if child {
+                payload["agent_id"] = json!("scope-child");
+                payload["agent_type"] = json!("general-purpose");
+            }
+            hub.hook("claude", &lead, &payload);
+        }
     }
 }
 
@@ -1938,15 +1958,35 @@ async fn a_scope_refusal_after_a_resume_quotes_the_current_fences() {
         unix_now(),
     );
     assert!(resumed.generation > lapsed.generation);
-    let answer = hub.hook_raw("claude", &lead, &edit_of("Edit", session, "src/lib.rs"));
-    let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
-    assert!(
-        reason.contains(&format!(
-            "generation {}, expected_updated_seq {}",
-            resumed.generation, resumed.updated_seq
-        )),
-        "{answer}"
-    );
+    for child in [false, true] {
+        let mut payload = edit_of("Edit", session, "src/lib.rs");
+        if child {
+            payload["agent_id"] = json!("resumed-child");
+            payload["agent_type"] = json!("general-purpose");
+        }
+        let answer = hub.hook_raw("claude", &lead, &payload);
+        assert_eq!(
+            answer["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{answer}"
+        );
+        let reason = text_at(&answer, "/hookSpecificOutput/permissionDecisionReason");
+        if child {
+            // Children hand recovery to the parent; they receive no mutation fences.
+            assert!(reason.contains("You are a subagent"), "{answer}");
+            assert!(reason.contains(session), "{answer}");
+            assert!(reason.contains(&resumed.id), "{answer}");
+            assert!(reason.contains("the parent should checkpoint"), "{answer}");
+            assert!(!reason.contains("expected_updated_seq"), "{answer}");
+        } else {
+            assert!(
+                reason.contains(&format!(
+                    "generation {}, expected_updated_seq {}",
+                    resumed.generation, resumed.updated_seq
+                )),
+                "{answer}"
+            );
+        }
+    }
 }
 
 /// #542 item 9: the lead's next tool call after its hold lapsed says so once, before any edit
@@ -2161,8 +2201,11 @@ mod merged_prompts {
     use agentscm::hub::planned_issues::IssueIdentity;
     use agentscm::hub::store::new_connection_id;
     use agentscm::hub::work_issues::WorkIssueLinkUpdate;
+    use agentscm::hub::work_lifecycle::OutcomeProvenance;
     use agentscm::hub::work_recovery::{RecoveryCaller, RemedyKind, RemedyPreviewRequest, preview};
-    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    use agentscm::hub::work_transition::{
+        OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
+    };
 
     const ID: i64 = 101;
     const LEAD: &str = "lead-session";
@@ -2493,5 +2536,95 @@ mod merged_prompts {
             .unwrap()
             .unwrap();
         assert_eq!(item.state, WorkState::Active);
+    }
+
+    impl World {
+        fn turn_end(&self, session: &str, extra: Value) -> Value {
+            let mut payload = json!({"hook_event_name": "Stop", "session_id": session,
+                "cwd": "/work/acme-widgets"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            self.hub.hook("claude", &self.secret, &payload)
+        }
+
+        fn session_end(&self, session: &str) {
+            let payload = json!({"hook_event_name": "SessionEnd", "session_id": session,
+                "cwd": "/work/acme-widgets"});
+            self.hub.hook("claude", &self.secret, &payload);
+        }
+
+        /// The Work's state and its outcome's provenance, as the operational read shows them.
+        fn outcome(&self, id: &str) -> (WorkState, OutcomeProvenance) {
+            let operational = self
+                .hub
+                .store
+                .work_operational(
+                    &WorkLifecycleReader::Token(&self.token),
+                    &OperationalSelect::One(id),
+                    unix_now(),
+                )
+                .unwrap();
+            let work = &operational.work[0];
+            (work.state, work.outcome.provenance)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_asks_nothing_completes_merged_work_it_leads() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
+        // A turn that asks its person something leaves the Work open.
+        w.turn_end(
+            LEAD,
+            json!({"asked_nothing": false, "asks": "Shall I merge it?"}),
+        );
+        assert_eq!(w.outcome(&id).0, WorkState::Active);
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_end_completes_merged_work_instead_of_pausing_it() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
+        w.session_end(LEAD);
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_end_leaves_part_of_work_and_another_sessions_work_open() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(IssueClosure {
+            state: IssueState::Open,
+            reason: CloseReason::Other,
+            closer_pull: None,
+            closer_repository_id: None,
+        });
+        w.prompt(LEAD);
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id).0,
+            WorkState::Active,
+            "the issue is still open"
+        );
+        // Another session's end never completes Work it does not lead.
+        w.close_issue(completed());
+        w.prompt(OTHER);
+        w.turn_end(OTHER, json!({"asked_nothing": true}));
+        w.session_end(OTHER);
+        assert_eq!(w.outcome(&id).0, WorkState::Active);
     }
 }

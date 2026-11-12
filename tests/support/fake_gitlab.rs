@@ -118,6 +118,10 @@ pub struct Mr {
     pub source_project_id: Option<i64>,
     /// RFC 3339 time the listing orders by; creation time unless a test sets it.
     pub updated_at: String,
+    /// Label names, as GitLab lists them.
+    pub labels: Vec<String>,
+    /// The target branch tip the diff was made against (`diff_refs.start_sha` on a single read).
+    pub base_sha: String,
 }
 
 impl Mr {
@@ -140,6 +144,8 @@ impl Mr {
             description: String::new(),
             source_project_id: None,
             updated_at: rfc3339_now(),
+            labels: Vec::new(),
+            base_sha: fake_sha(&format!("main#{iid}")),
         }
     }
 }
@@ -203,6 +209,12 @@ pub struct Project {
     pub default_branch: Option<String>,
     /// A bare Git repository behind the branch reads and MR creation, if any.
     pub git: Option<std::path::PathBuf>,
+    /// Deployments as GitLab lists them, in creation order.
+    pub deployments: Vec<Value>,
+    /// Namespace ids from the project's own outward: its group then each parent group, or its
+    /// owner's user id.
+    pub namespaces: Vec<i64>,
+    pub archived: bool,
 }
 
 impl Project {
@@ -218,6 +230,9 @@ impl Project {
             commits: BTreeMap::new(),
             default_branch: Some("main".into()),
             git: None,
+            deployments: Vec::new(),
+            namespaces: Vec::new(),
+            archived: false,
         }
     }
 }
@@ -488,7 +503,7 @@ fn mr_json(ctx: &Ctx, p: &Project, m: &Mr) -> Value {
         "id": m.id, "iid": m.iid, "title": m.title, "state": m.state, "draft": m.draft,
         "source_branch": m.source_branch, "target_branch": m.target_branch, "sha": m.sha,
         "merge_commit_sha": m.merge_commit_sha, "squash_commit_sha": null,
-        "description": m.description, "updated_at": m.updated_at,
+        "description": m.description, "updated_at": m.updated_at, "labels": m.labels,
         "source_project_id": m.source_project_id.unwrap_or(p.id), "target_project_id": p.id,
         "author": {"id": m.author_id, "username": m.author_username},
         "web_url": format!("{}/{}/-/merge_requests/{}", ctx.base, p.path_with_namespace, m.iid),
@@ -566,6 +581,36 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             200,
             json!({"id": token.user_id, "username": token.username}),
         );
+    }
+    // A group's projects (its subgroups' too when asked) or a user's, honouring `archived`.
+    if let (&Method::GET, [owner @ ("groups" | "users"), id, "projects"]) = (method, &segs[..]) {
+        let q = |name: &str| {
+            query
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let (id, deep) = (
+            id.parse::<i64>().unwrap_or(0),
+            q("include_subgroups") == Some("true"),
+        );
+        let listed: Vec<Value> = state
+            .projects
+            .values()
+            .filter(|p| can_read(p, &token))
+            .filter(|p| match *owner {
+                "groups" if deep => p.namespaces.contains(&id),
+                _ => p.namespaces.first() == Some(&id),
+            })
+            .filter(|p| q("archived") != Some("false") || !p.archived)
+            .map(|p| {
+                let mut json = project_json(ctx, p, &token);
+                json["archived"] = json!(p.archived);
+                json
+            })
+            .collect();
+        let (page, link) = paginate(ctx, uri, &query, listed);
+        return reply(200, &link, Some(Value::Array(page)));
     }
     let ["projects", key, tail @ ..] = &segs[..] else {
         return not_found();
@@ -662,7 +707,13 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
         }
         (&Method::GET, ["merge_requests", iid]) => {
             match iid.parse::<i64>().ok().and_then(|n| project.mrs.get(&n)) {
-                Some(m) => json_reply(200, mr_json(ctx, project, m)),
+                Some(m) => {
+                    // Only a single merge request read carries `diff_refs`, as on GitLab.
+                    let mut body = mr_json(ctx, project, m);
+                    body["diff_refs"] =
+                        json!({"base_sha": m.base_sha, "start_sha": m.base_sha, "head_sha": m.sha});
+                    json_reply(200, body)
+                }
                 None => not_found(),
             }
         }
@@ -768,6 +819,48 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         200,
                         json!({"id": n.id, "body": n.body, "author": {"username": n.author_username}}),
                     )
+                }
+                None => not_found(),
+            }
+        }
+        (&Method::GET, ["deployments"]) => {
+            let environment = query.iter().find(|(k, _)| k == "environment");
+            let mut found: Vec<Value> = project
+                .deployments
+                .iter()
+                .filter(|d| {
+                    environment.is_none_or(|(_, e)| d["environment"]["name"].as_str() == Some(e))
+                })
+                .cloned()
+                .collect();
+            if query.iter().any(|(k, v)| k == "sort" && v == "desc") {
+                found.reverse();
+            }
+            json_reply(200, Value::Array(found))
+        }
+        (&Method::POST | &Method::PUT, ["deployments", ..])
+            if token.access.get(&id).is_none_or(|level| *level < 30) =>
+        {
+            json_reply(403, json!({"message": "403 Forbidden"}))
+        }
+        (&Method::POST, ["deployments"]) => {
+            let b = json_body();
+            let deployment = json!({"id": project.deployments.len() + 1, "sha": b["sha"],
+                "ref": b["ref"], "status": b["status"],
+                "environment": {"name": b["environment"]}});
+            project.deployments.push(deployment.clone());
+            json_reply(201, deployment)
+        }
+        (&Method::PUT, ["deployments", number]) => {
+            let status = json_body()["status"].clone();
+            match project
+                .deployments
+                .iter_mut()
+                .find(|d| d["id"].as_i64().is_some_and(|id| number.parse() == Ok(id)))
+            {
+                Some(deployment) => {
+                    deployment["status"] = status;
+                    json_reply(200, deployment.clone())
                 }
                 None => not_found(),
             }

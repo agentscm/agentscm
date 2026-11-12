@@ -577,6 +577,7 @@ const ACTION_LINK: Record<string, [string, string, string]> = {
   pr_overlap: ['#now', 'Open current work', 'envelope-exclamation'],
   file_conflict: ['#now', 'Open current work', 'envelope-exclamation'],
   failed_check: ['#landed', 'Open changes', 'x-circle'],
+  merge_held: ['#landed', 'Open changes', 'sign-stop'],
   skill_gate: ['#skills', 'Open Skills', 'sign-stop'],
   agent_setup: ['#setup', 'Open Agents', 'plug'],
 }
