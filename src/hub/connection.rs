@@ -11,11 +11,13 @@ pub struct NewConnection {
     pub id: String,
     pub provider: String,
     pub host: String,
-    /// `app` or `pat`.
+    /// `app`, `pat`, or `embedded` (the program that embeds the Hub supplies its credential;
+    /// see [`super::sync::ConnectionCredentials`]).
     pub kind: String,
     pub app_id: Option<i64>,
     pub app_slug: Option<String>,
-    /// The login a `pat` connection acts as.
+    /// The login a `pat` or `embedded` connection acts as. Required: the Hub finds its own
+    /// comments by this author.
     pub acts_as: Option<String>,
 }
 
@@ -224,10 +226,10 @@ impl NewConnection {
             return Err(invalid("connection id must be con_ and 32 lowercase hex"));
         }
         if !matches!(self.provider.as_str(), "github" | "gitlab")
-            || (self.provider == "gitlab" && self.kind != "pat")
+            || (self.provider == "gitlab" && !matches!(self.kind.as_str(), "pat" | "embedded"))
         {
             return Err(invalid(
-                "connection provider must be github, or gitlab with kind pat",
+                "connection provider must be github, or gitlab with kind pat or embedded",
             ));
         }
         // Reuses the host rules of a forge identity.
@@ -243,7 +245,7 @@ impl NewConnection {
                     && self.app_slug.as_deref().is_some_and(plain)
                     && self.acts_as.is_none()
             }
-            "pat" => {
+            "pat" | "embedded" => {
                 self.app_id.is_none()
                     && self.app_slug.is_none()
                     && self.acts_as.as_deref().is_some_and(plain)
@@ -252,7 +254,7 @@ impl NewConnection {
         };
         if !shape_ok {
             return Err(invalid(
-                "connection kind app needs app_id and app_slug; pat needs acts_as",
+                "connection kind app needs app_id and app_slug; pat and embedded need acts_as",
             ));
         }
         Ok(())

@@ -3,8 +3,10 @@
 //! intents, and (when a connection opts in) write one comment and one status.
 //! Everything read from GitHub is stored as an observation with exact ids.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,11 +74,12 @@ pub struct SyncConfig {
     gitlab: Option<GitlabConfig>,
 }
 
-/// A GitLab token connection: the forge's URLs and the credential.
+/// GitLab's URLs and the token of its `pat` connection. Without a token only `embedded`
+/// connections use it, and only once an embedder supplies their credentials.
 struct GitlabConfig {
     api: String,
     host: String,
-    token: Pat,
+    token: Option<Pat>,
 }
 
 struct Pat {
@@ -120,36 +123,36 @@ impl SyncConfig {
             "AGENTSCM_GITLAB_WEBHOOK_SECRET_FILE",
             "AGENTSCM_GITLAB_WEBHOOK_SECRET",
         )?;
-        let gitlab = match gitlab_token {
-            Some(token) => {
-                let gl = forge_urls("gitlab", "GITLAB", "https://gitlab.com", &lookup)?;
-                // Stores key repositories and PAT connections by host alone.
-                if gl.host == urls.host {
-                    return Err(HubError::Invalid(
-                        "GitHub and GitLab must be on different hosts".into(),
-                    ));
-                }
-                if gitlab_hook.is_none() {
-                    eprintln!(
-                        "hub: no AGENTSCM_GITLAB_WEBHOOK_SECRET; GitLab webhooks are refused and only polling runs"
-                    );
-                }
-                Some(GitlabConfig {
-                    api: gl.api,
-                    host: gl.host,
-                    token: Pat {
-                        token,
-                        webhook_secret: gitlab_hook,
-                    },
-                })
-            }
-            None if gitlab_hook.is_some() => {
+        if gitlab_token.is_none() && gitlab_hook.is_some() {
+            return Err(HubError::Invalid(
+                "a GitLab webhook secret needs AGENTSCM_GITLAB_TOKEN or AGENTSCM_GITLAB_TOKEN_FILE"
+                    .into(),
+            ));
+        }
+        // A URL without a token is kept for connections an embedder supplies credentials for.
+        let gitlab = if gitlab_token.is_some() || lookup("AGENTSCM_GITLAB_URL").is_some() {
+            let gl = forge_urls("gitlab", "GITLAB", "https://gitlab.com", &lookup)?;
+            // Stores key repositories and PAT connections by host alone.
+            if gl.host == urls.host {
                 return Err(HubError::Invalid(
-                    "a GitLab webhook secret needs AGENTSCM_GITLAB_TOKEN or AGENTSCM_GITLAB_TOKEN_FILE"
-                        .into(),
+                    "GitHub and GitLab must be on different hosts".into(),
                 ));
             }
-            None => None,
+            if gitlab_token.is_some() && gitlab_hook.is_none() {
+                eprintln!(
+                    "hub: no AGENTSCM_GITLAB_WEBHOOK_SECRET; GitLab webhooks are refused and only polling runs"
+                );
+            }
+            Some(GitlabConfig {
+                api: gl.api,
+                host: gl.host,
+                token: gitlab_token.map(|token| Pat {
+                    token,
+                    webhook_secret: gitlab_hook,
+                }),
+            })
+        } else {
+            None
         };
         if !(1..=365).contains(&activity_days) {
             return Err(HubError::Invalid("--activity-days must be 1 to 365".into()));
@@ -239,10 +242,31 @@ struct Setup {
     admin: String,
 }
 
+/// Supplies the credential of every `embedded` connection and says which connected
+/// repositories the Hub reads, for a program that embeds the Hub. Set one with
+/// [`Sync::with_connection_credentials`]; without one every repository is read and an
+/// `embedded` connection fails as an unusable credential.
+pub trait ConnectionCredentials: Send + std::marker::Sync + 'static {
+    /// A current access token for the `embedded` `connection`. Asked before each repository
+    /// read and each write, and kept by the Hub only for that call, so the embedder caches and
+    /// refreshes it. `Err(HubError::Unauthorized)` marks the connection `auth_failed` and backs
+    /// it off; any other error skips that repository for the round.
+    fn token<'a>(
+        &'a self,
+        connection: &'a Connection,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+    /// Whether the Hub reads `repository` through `connection`, of any kind. Polls and webhook
+    /// deliveries skip an inactive repository, which stays connected. Runs on a blocking
+    /// thread, once per repository per poll and per delivery.
+    fn active(&self, connection: &Connection, repository: &ConnectedRepository) -> bool;
+}
+
 pub struct Sync {
     config: Option<SyncConfig>,
     api: Option<Api>,
     gitlab: Option<gitlab::Api>,
+    credentials: Option<Arc<dyn ConnectionCredentials>>,
     apps: Mutex<HashMap<String, Arc<AppCred>>>,
     /// Installation id to (token, unix expiry).
     installs: Mutex<HashMap<i64, (String, i64)>>,
@@ -430,6 +454,7 @@ impl Sync {
             config,
             api,
             gitlab,
+            credentials: None,
             apps: Mutex::default(),
             installs: Mutex::default(),
             setups: Mutex::default(),
@@ -447,6 +472,21 @@ impl Sync {
             noticed: Mutex::default(),
             pulls: Mutex::default(),
         }
+    }
+
+    /// Lets `credentials` supply `embedded` connections' tokens and choose the repositories read.
+    pub fn with_connection_credentials(
+        mut self,
+        credentials: Arc<dyn ConnectionCredentials>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// The GitLab configuration in use: it serves only a token, or an embedder's connections.
+    fn gitlab_config(&self) -> Option<&GitlabConfig> {
+        let gitlab = self.config.as_ref()?.gitlab.as_ref()?;
+        (gitlab.token.is_some() || self.credentials.is_some()).then_some(gitlab)
     }
 
     /// Last successful sync's PR gaps; absent after restart or before a completed sync.
@@ -491,8 +531,11 @@ impl Sync {
     }
 
     fn webhook_secret(&self, conn: &Connection) -> Option<String> {
-        if conn.kind == "pat" {
-            return self.pat(conn)?.webhook_secret.clone();
+        match conn.kind.as_str() {
+            "pat" => return self.pat(conn)?.webhook_secret.clone(),
+            // Polling only: no webhook secret is ever stored for it.
+            "embedded" => return None,
+            _ => {}
         }
         // An app made without a webhook has no secret; an empty key would accept forgeries.
         Some(lock(&self.apps).get(&conn.id)?.webhook_secret.clone()).filter(|s| !s.is_empty())
@@ -518,6 +561,20 @@ impl Sync {
                 .map(|pat| pat.token.clone())
                 .ok_or_else(|| GhError::Failed("no PAT configured".into()));
         }
+        if conn.kind == "embedded" {
+            let credentials = self.credentials.as_ref().ok_or_else(|| {
+                GhError::Auth("no embedder supplies this connection's credential".into())
+            })?;
+            return match credentials.token(conn).await {
+                Ok(token) => Ok(token),
+                Err(HubError::Unauthorized) => Err(GhError::Auth(
+                    "the embedder has no credential for the connection".into(),
+                )),
+                Err(error) => Err(GhError::Failed(format!(
+                    "embedder credential unavailable: {error}"
+                ))),
+            };
+        }
         let installation =
             installation.ok_or_else(|| GhError::Failed("repository has no installation".into()))?;
         if let Some((token, expires)) = lock(&self.installs).get(&installation)
@@ -539,7 +596,7 @@ impl Sync {
     fn pat(&self, conn: &Connection) -> Option<&Pat> {
         let config = self.config.as_ref()?;
         match conn.provider.as_str() {
-            "gitlab" => config.gitlab.as_ref().map(|gitlab| &gitlab.token),
+            "gitlab" => self.gitlab_config()?.token.as_ref(),
             _ => config.pat.as_ref(),
         }
     }
@@ -547,7 +604,10 @@ impl Sync {
     /// The client for the connection's provider.
     pub(super) fn forge(&self, conn: &Connection) -> Gh<ForgeApi<'_>> {
         let api = match conn.provider.as_str() {
-            "gitlab" => self.gitlab.as_ref().map(ForgeApi::Gitlab),
+            "gitlab" => self
+                .gitlab_config()
+                .and(self.gitlab.as_ref())
+                .map(ForgeApi::Gitlab),
             _ => self.api.as_ref().map(ForgeApi::Github),
         };
         api.ok_or_else(|| GhError::Failed("sync is not configured".into()))
@@ -560,9 +620,8 @@ impl Sync {
             .as_ref()
             .is_some_and(|config| match connection.provider.as_str() {
                 "github" => connection.host == config.host,
-                "gitlab" => config
-                    .gitlab
-                    .as_ref()
+                "gitlab" => self
+                    .gitlab_config()
                     .is_some_and(|gitlab| connection.host == gitlab.host),
                 _ => false,
             })
@@ -574,7 +633,7 @@ impl Sync {
             .iter()
             .flat_map(|config| {
                 std::iter::once(config.host.clone())
-                    .chain(config.gitlab.iter().map(|g| g.host.clone()))
+                    .chain(self.gitlab_config().map(|g| g.host.clone()))
             })
             .collect()
     }
@@ -698,8 +757,10 @@ pub async fn start(state: &HubState) -> Result<()> {
         let user = sync.api().map_err(gh_to_hub)?.user(&pat.token).await;
         ensure_pat(state, "github", &config.host, "GitHub", "PAT", user).await?;
     }
-    if let (Some(gitlab), Some(api)) = (&config.gitlab, &sync.gitlab) {
-        let user = api.user(&gitlab.token.token).await;
+    if let (Some(gitlab), Some(api)) = (&config.gitlab, &sync.gitlab)
+        && let Some(token) = &gitlab.token
+    {
+        let user = api.user(&token.token).await;
         ensure_pat(state, "gitlab", &gitlab.host, "GitLab", "token", user).await?;
     }
     Ok(())
@@ -886,6 +947,26 @@ async fn mark_enabled(state: &HubState, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The repositories of `conn` the embedder has the Hub read; all of them without one.
+async fn active_repositories(
+    state: &HubState,
+    conn: &Connection,
+) -> Result<Vec<ConnectedRepository>> {
+    let id = conn.id.clone();
+    let repos = db(state, move |store| store.repositories(&id)).await?;
+    let Some(credentials) = state.sync.credentials.clone() else {
+        return Ok(repos);
+    };
+    let conn = conn.clone();
+    blocking(state, move || {
+        Ok(repos
+            .into_iter()
+            .filter(|repo| credentials.active(&conn, repo))
+            .collect())
+    })
+    .await
+}
+
 // Discovery can fail before a repository token/read is attempted. Its last successful
 // observation must not continue to advertise a healthy forge source after that failure.
 async fn catchup_connection_status(
@@ -893,8 +974,7 @@ async fn catchup_connection_status(
     conn: &Connection,
     coverage: super::catchup::CatchupCoverageState,
 ) -> Result<()> {
-    let id = conn.id.clone();
-    for repo in db(state, move |store| store.repositories(&id)).await? {
+    for repo in active_repositories(state, conn).await? {
         let _guard = state.sync.lock_repo(&repo.id).await;
         if coverage == super::catchup::CatchupCoverageState::Unavailable {
             provider_health(state, conn, &repo, "unavailable", None).await?;
@@ -939,8 +1019,7 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
             }
         }
     }
-    let id = conn.id.clone();
-    let mut repos = db(state, move |store| store.repositories(&id)).await?;
+    let mut repos = active_repositories(state, conn).await?;
     // Start somewhere else each round, so a limit or a slow repository does not starve the rest.
     if !repos.is_empty() {
         let start = state.sync.round.fetch_add(1, Ordering::Relaxed) % repos.len();
@@ -2304,6 +2383,12 @@ async fn webhook_work(
     let Some(repo) = repo.filter(|repo| repo.connection == conn.id) else {
         return Ok(());
     };
+    if let Some(credentials) = sync.credentials.clone() {
+        let (conn, repo) = (conn.clone(), repo.clone());
+        if !blocking(state, move || Ok(credentials.active(&conn, &repo))).await? {
+            return Ok(());
+        }
+    }
     let _guard = sync.lock_repo(&repo.id).await;
     if event == "pull_request" {
         super::catchup_sync::begin(state, conn, &repo)
@@ -2812,6 +2897,11 @@ async fn setup_callback(
 fn label(conn: &Connection) -> String {
     match conn.kind.as_str() {
         "app" => format!("GitHub App {}", conn.app_slug.as_deref().unwrap_or("?")),
+        "embedded" => format!(
+            "{} credential from the embedder, acts as {}",
+            who(conn),
+            conn.acts_as.as_deref().unwrap_or("?")
+        ),
         _ if conn.provider == "gitlab" => {
             format!(
                 "GitLab token, acts as {}",
@@ -2907,7 +2997,7 @@ async fn add_repository(
     let conn = known(&state, id).await?;
     // GitLab projects can sit in nested groups; GitHub's are owner/name.
     let depth_ok = conn.provider == "gitlab" || body.full_name.split('/').count() == 2;
-    if conn.kind != "pat" || !depth_ok {
+    if !matches!(conn.kind.as_str(), "pat" | "embedded") || !depth_ok {
         return Err(ApiError::invalid());
     }
     let token = state

@@ -3,14 +3,17 @@
 use crate::fake_gitlab;
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::connection::{ConnectedRepository, Observed};
+use agentscm::hub::HubError;
+use agentscm::hub::connection::{ConnectedRepository, Connection, NewConnection, Observed};
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
-use agentscm::hub::sync::{self, PollReport, Sync, SyncConfig};
+use agentscm::hub::sync::{self, ConnectionCredentials, PollReport, Sync, SyncConfig};
 use agentscm::hub::{HubState, router};
 use axum::extract::Form;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -1663,4 +1666,219 @@ async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
         .find(|source| source.source == CatchupMergeSource::ForgePull)
         .unwrap();
     assert_eq!(forge.state, CatchupCoverageState::ObservedOnly);
+}
+
+// ---- connections whose credential an embedder supplies ----
+
+/// An embedder: a token per connection and repositories it does not bind.
+#[derive(Default)]
+struct Embedder {
+    tokens: HashMap<String, String>,
+    inactive: BTreeSet<i64>,
+}
+
+impl ConnectionCredentials for Embedder {
+    fn token<'a>(
+        &'a self,
+        connection: &'a Connection,
+    ) -> Pin<Box<dyn Future<Output = agentscm::hub::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.tokens
+                .get(&connection.id)
+                .cloned()
+                .ok_or(HubError::Unauthorized)
+        })
+    }
+
+    fn active(&self, _: &Connection, repository: &ConnectedRepository) -> bool {
+        !self.inactive.contains(&repository.repository_id)
+    }
+}
+
+struct Embedded {
+    state: HubState,
+    store: Arc<dyn Store>,
+    url: String,
+    host: String,
+    _dir: TempDir,
+}
+
+const EMBEDDED_A: &str = "con_000000000000000000000000000000aa";
+const EMBEDDED_B: &str = "con_000000000000000000000000000000bb";
+
+/// A hub with only a GitLab URL (no token) and two `embedded` connections on the fake's host.
+async fn embedded_hub(fake: &FakeGitlab, embedder: Option<Embedder>) -> Embedded {
+    let dir = TempDir::new().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        dir.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let base = fake.base.clone();
+    let config = SyncConfig::from_lookup(&url, dir.path().join("secrets"), 14, |name| {
+        (name == "AGENTSCM_GITLAB_URL").then(|| base.clone())
+    })
+    .unwrap();
+    let mut sync = Sync::new(config).unwrap();
+    if let Some(embedder) = embedder {
+        sync = sync.with_connection_credentials(Arc::new(embedder));
+    }
+    let state = HubState::new(
+        store.clone(),
+        Arc::new(LocalBackend::open(dir.path().join("objects")).unwrap()),
+    )
+    .with_sync(sync);
+    sync::start(&state).await.unwrap();
+    let app = router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let host = base
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    for (id, login) in [(EMBEDDED_A, "robot-a"), (EMBEDDED_B, "robot-b")] {
+        store
+            .insert_connection(
+                &NewConnection {
+                    id: id.into(),
+                    provider: "gitlab".into(),
+                    host: host.clone(),
+                    kind: "embedded".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some(login.into()),
+                },
+                "test",
+            )
+            .unwrap();
+    }
+    Embedded {
+        state,
+        store,
+        url,
+        host,
+        _dir: dir,
+    }
+}
+
+fn add_token(fake: &FakeGitlab, token: &str, username: &str, projects: &[i64]) {
+    fake.with(|s| {
+        s.tokens.insert(
+            token.into(),
+            Token {
+                username: username.into(),
+                user_id: 70,
+                access: projects.iter().map(|id| (*id, 30)).collect(),
+            },
+        );
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_connections_poll_with_their_own_tokens_and_skip_inactive_repositories() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        for (id, name) in [
+            (101, "team-a/one"),
+            (102, "team-b/two"),
+            (103, "team-a/unbound"),
+        ] {
+            let mut project = Project::new(id, name, "private");
+            project
+                .mrs
+                .insert(1, Mr::new(1, &format!("feature-{id}"), &["src/lib.rs"]));
+            s.projects.insert(id, project);
+        }
+    });
+    add_token(&fake, "token-a", "robot-a", &[101, 103]);
+    add_token(&fake, "token-b", "robot-b", &[102]);
+    let embedder = Embedder {
+        tokens: [
+            (EMBEDDED_A.to_owned(), "token-a".to_owned()),
+            (EMBEDDED_B.to_owned(), "token-b".to_owned()),
+        ]
+        .into(),
+        inactive: [103].into(),
+    };
+    let hub = embedded_hub(&fake, Some(embedder)).await;
+    for (connection, id, name) in [
+        (EMBEDDED_A, 101, "team-a/one"),
+        (EMBEDDED_A, 103, "team-a/unbound"),
+        (EMBEDDED_B, 102, "team-b/two"),
+    ] {
+        hub.store
+            .upsert_repository(connection, &hub.host, id, name, None, None)
+            .unwrap();
+    }
+
+    let reports = sync::poll_once(&hub.state).await.unwrap();
+    let polled: BTreeSet<(String, String)> = reports
+        .iter()
+        .map(|r| (r.connection.clone(), r.repository.clone()))
+        .collect();
+    assert_eq!(
+        polled,
+        [
+            (EMBEDDED_A.to_owned(), "team-a/one".to_owned()),
+            (EMBEDDED_B.to_owned(), "team-b/two".to_owned()),
+        ]
+        .into()
+    );
+    assert!(reports.iter().all(|r| r.pull_requests == 1), "{reports:?}");
+    let requests = fake.with(|s| s.requests.clone());
+    let carried = |project: &str| -> BTreeSet<Option<String>> {
+        requests
+            .iter()
+            .filter(|r| r.path_and_query.contains(&format!("/projects/{project}")))
+            .map(|r| r.auth.clone())
+            .collect()
+    };
+    assert_eq!(carried("101"), [Some("Bearer token-a".to_owned())].into());
+    assert_eq!(carried("102"), [Some("Bearer token-b".to_owned())].into());
+    assert!(
+        carried("103").is_empty(),
+        "an inactive repository is never read"
+    );
+    for id in [EMBEDDED_A, EMBEDDED_B] {
+        assert_eq!(hub.store.connection(id).unwrap().unwrap().status, "enabled");
+    }
+
+    // Polling only: a delivery to an embedded connection is refused before anything is recorded.
+    let status = fake_gitlab::deliver(
+        &hub.url,
+        EMBEDDED_A,
+        "Merge Request Hook",
+        "uuid-1",
+        &json!({"project": {"id": 101}, "object_attributes": {"iid": 1}}),
+        "any-token",
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_embedded_connection_without_an_embedder_fails_as_a_credential() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        s.projects
+            .insert(101, Project::new(101, "team-a/one", "private"));
+    });
+    let hub = embedded_hub(&fake, None).await;
+    hub.store
+        .upsert_repository(EMBEDDED_A, &hub.host, 101, "team-a/one", None, None)
+        .unwrap();
+    assert!(sync::poll_once(&hub.state).await.unwrap().is_empty());
+    let conn = hub.store.connection(EMBEDDED_A).unwrap().unwrap();
+    assert_eq!(conn.status, "auth_failed");
+    assert!(
+        conn.status_detail.unwrap_or_default().contains("embedder"),
+        "the detail names the missing credential"
+    );
+    assert!(
+        fake.with(|s| s.requests.is_empty()),
+        "GitLab is never called"
+    );
 }
