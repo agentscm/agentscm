@@ -1840,9 +1840,10 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         && !resumes_itself(payload)
         && let Some(message) = payload["last_assistant_message"]
             .as_str()
-            .and_then(redacted_line)
+            .filter(|message| !message.trim().is_empty())
     {
-        let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&message);
+        // Judged as written: its last paragraph is where an ask sits.
+        let nothing = agentscm::hub::session_waiting::turn_asked_nothing(message);
         out.insert("asked_nothing".into(), json!(nothing));
     }
     if let Some(subagent) = started_subagent(payload) {
@@ -1956,7 +1957,7 @@ fn line_start(text: &str) -> Option<String> {
 /// nothing. Judged here, where the whole message is; only the excerpt and the answer leave.
 fn turn_end(message: &str) -> Option<(String, bool)> {
     let line = redacted_line(message)?;
-    let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&line);
+    let nothing = agentscm::hub::session_waiting::turn_asked_nothing(message);
     Some((end_of(&line), nothing))
 }
 
@@ -3039,6 +3040,11 @@ mod tests {
             false
         );
         assert_eq!(judged("  ".into()), Value::Null);
+        // Judged as written, so a question in an earlier paragraph is not the turn's ask.
+        assert_eq!(
+            judged(format!("Why did it fail? A stale cache.\n\n{report}")),
+            true
+        );
 
         let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
             "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});
