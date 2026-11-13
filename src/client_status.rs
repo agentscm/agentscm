@@ -20,6 +20,7 @@ use crate::hub_cli::map_hub_error;
 
 const REPLY_BYTES: usize = 64 * 1024;
 const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const HUB_BUILD_TIMEOUT: Duration = Duration::from_secs(2);
 const SNAPSHOT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECK_CONCURRENCY: usize = 4;
 const ONBOARDING_FRESH_SECONDS: i64 = 15 * 60;
@@ -189,7 +190,7 @@ impl Health {
             Self::RenewalFailed { message } => format!("authenticated but renewal failed: {message}"),
             Self::Expired => "expired; the next hook call tries to renew it, or run client renew".into(),
             Self::Revoked => "the Hub rejected the token (revoked or no longer valid); run client setup again".into(),
-            Self::Unreachable => "the Hub did not answer; hooks fail open and coordination is unknown until it does".into(),
+            Self::Unreachable => "the Hub did not answer or answered with an error; hooks fail open and coordination is unknown until it does".into(),
         }
     }
 }
@@ -589,7 +590,11 @@ pub(crate) async fn check_hub(
         }
     };
     // The Hub answered, so its health route is worth one more request, whatever the verdict.
-    let build = hub_build(&client, &connection.hub).await;
+    // It is bounded on its own, so a slow health route cannot turn this answer into a timeout.
+    let build = tokio::time::timeout(HUB_BUILD_TIMEOUT, hub_build(&client, &connection.hub))
+        .await
+        .ok()
+        .flatten();
     if status == 401 || status == 403 {
         return (
             HubCheck::Rejected {

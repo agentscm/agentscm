@@ -307,11 +307,7 @@ async fn status(args: StatusArgs) -> Result<()> {
             hub_check_text(&connection.hub_check, now),
         );
         println!("  connection: {}", connection.health.summary());
-        if let crate::client_status::HubCheck::Valid {
-            hub_build: Some(build),
-            ..
-        } = &connection.hub_check
-        {
+        if let Some(build) = connection.hub_check.build() {
             println!("  Hub build: {}", build.label());
         }
         println!(

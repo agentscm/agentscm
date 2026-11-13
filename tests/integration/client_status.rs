@@ -430,6 +430,47 @@ fn slow_hub_is_bounded_and_reported_unavailable() {
     );
 }
 
+#[test]
+fn unanswered_health_route_keeps_a_fast_rejection() {
+    use std::io::{Read, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let root = repo(temp.path(), "nohealth");
+    let token = temp.path().join("token");
+    std::fs::write(&token, "synthetic-token").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        // whoami and health arrive on separate connections; answer whoami, hold health open.
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            if String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/hub/health ") {
+                held.push(stream);
+            } else {
+                let body = "{}";
+                write!(stream, "HTTP/1.1 401 Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(4));
+    });
+    save(
+        temp.path(),
+        serde_json::json!([{
+            "root":root,"origin_host":"github.com","hub":format!("http://{address}"),
+            "repo":"acme/nohealth","token_file":token
+        }]),
+    );
+    let output = run(temp.path(), Some(&root), true);
+    server.join().unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["connections"][0]["health"]["state"], "revoked");
+    assert!(value["connections"][0]["hub_check"]["hub_build"].is_null());
+}
+
 /// A fake Hub that answers `/v1/hub/whoami` with `whoami_status` and `/v1/hub/health` with a
 /// version and commit, until `stop` is set.
 fn fake_hub(
@@ -490,10 +531,6 @@ fn eight_saved_connections_with_mixed_validity_each_report_their_own_health() {
         .unwrap()
         .as_secs() as i64;
     let stop = Arc::new(AtomicBool::new(false));
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
     // (name, whoami status or None for a closed port, owned token expiry, token file present,
     //  expected health, whether the Hub build is expected)
     #[allow(clippy::type_complexity)]
@@ -515,6 +552,21 @@ fn eight_saved_connections_with_mixed_validity_each_report_their_own_health() {
         ("notoken", None, None, false, "no_usable_token", false),
     ];
     let mut servers = Vec::new();
+    let mut addresses = Vec::new();
+    for (name, status, ..) in &cases {
+        if let Some(status) = status {
+            let (address, handle) = fake_hub(&format!("acme/{name}"), *status, Arc::clone(&stop));
+            servers.push(handle);
+            addresses.push(address);
+        }
+    }
+    // Chosen after every fake Hub is bound, so no Hub can hold or later take this port.
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    assert!(!addresses.contains(&closed));
+    let mut addresses = addresses.into_iter();
     let mut tokens = Vec::new();
     let mut saved = Vec::new();
     for (index, (name, status, owned, has_token, _, _)) in cases.iter().enumerate() {
@@ -522,12 +574,7 @@ fn eight_saved_connections_with_mixed_validity_each_report_their_own_health() {
         let secret = format!("synthetic-secret-{index}-{name}");
         tokens.push(secret.clone());
         let address = match status {
-            Some(status) => {
-                let (address, handle) =
-                    fake_hub(&format!("acme/{name}"), *status, Arc::clone(&stop));
-                servers.push(handle);
-                address
-            }
+            Some(_) => addresses.next().unwrap(),
             None => closed,
         };
         let hub = format!("http://{address}");

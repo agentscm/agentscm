@@ -1465,8 +1465,10 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert_eq!(machine.renew()["result"], "refused");
 }
 
-/// Two renewals that fall due together (two hooks, or a hook and a person) leave one live token:
-/// neither reports a failure, and the token the losing process minted is revoked.
+/// Two renewals that fall due together (two hooks, or a hook and a person) leave one live token
+/// and neither reports a failure. The two processes may or may not overlap on a given run. If both
+/// minted a token, both report `renewed` and the losing process's token is revoked, so exactly one
+/// is live. If they did not overlap, one renews and the other reports `not_due`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_renewals_leave_one_live_token() {
     let env = Env::start("github").await;
@@ -1524,6 +1526,7 @@ async fn concurrent_renewals_leave_one_live_token() {
     };
     // Both processes are running before either is waited on.
     let children = [spawn(), spawn()];
+    let mut results = Vec::new();
     for child in children {
         let output = child.wait_with_output().unwrap();
         assert!(
@@ -1538,6 +1541,7 @@ async fn concurrent_renewals_leave_one_live_token() {
             ["renewed", "not_due"].contains(&reply["result"].as_str().unwrap()),
             "{reply}"
         );
+        results.push(reply["result"].as_str().unwrap().to_owned());
     }
 
     let saved = machine.token();
@@ -1548,8 +1552,16 @@ async fn concurrent_renewals_leave_one_live_token() {
     assert_ne!(saved_id, first_id);
     assert_eq!(env.whoami(&first).await, 401);
     assert_eq!(env.whoami(&saved).await, 200);
-    // A token minted by the losing process was revoked: only the saved one is live.
     assert_eq!(live(&env), [saved_id]);
+    // Every token issued for the user, live or revoked, including the first.
+    let issued = env.store.list_agent_tokens(&alice.id).unwrap().len();
+    if issued == 3 {
+        // The runs overlapped: both minted a token and the loser's was revoked.
+        assert_eq!(results, ["renewed", "renewed"]);
+    } else {
+        assert_eq!(issued, 2, "{results:?}");
+        assert!(results.contains(&"not_due".to_owned()), "{results:?}");
+    }
 }
 
 /// Signing in again replaces this computer's credential, which revokes the agent tokens it

@@ -445,7 +445,7 @@ A saved token is configuration, not proof of coordination. Each connection repor
 | `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
 | `expired` | The token ended and nothing renewed it, whatever the Hub answers. |
 | `revoked` | The Hub rejected a token that has not ended. |
-| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+| `unreachable` | The Hub did not answer or answered with an error; hooks fail open, so coordination is unknown. |
 
 `coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
 for the checkout; `partial`, `unverified` and `unknown` otherwise. Whenever the Hub answered a check,
