@@ -532,6 +532,12 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   leaves its waits for the process that starts next, which then knows them as before. What
   sessions reported while no Hub ran is still missing, so Work whose lead session called in the
   hour before the stop, has no wait in that list and has not called since reads unknown too.
+- **Waiting on an open pull request.** Quiet or paused Work whose Hub-observed stage is
+  `pull_request_open` reads `active`, names its lead agent and asks nobody. Its action says that
+  the pull request is open and waits on its checks and review, and that the Hub observed only
+  that it is open. Freshness and the `lead_wait_unknown` limit are unchanged. A blocker, a
+  handover, an observed merge and a live wait are shown instead; a closed or unreadable pull
+  request and Work with no pull request read as before.
 - **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews may lapse, or be retained. A directed request to a quiet lead says its lead is not running only when its session is not live. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
   rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:
