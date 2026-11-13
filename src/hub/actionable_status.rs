@@ -271,7 +271,7 @@ pub fn project_work(
 
 /// [`project_work`] with the Hub-observed stage. Quiet Work whose pull request the provider
 /// observed open waits on that pull request; the stage is also set on the row.
-pub fn project_work_staged(
+fn project_work_staged(
     item: &WorkItem,
     operational: WorkOperationalV1,
     reconciliation: Option<ReconciliationView>,
@@ -478,7 +478,7 @@ pub fn project_work_staged(
         needs_you,
         action: if consistent && item.state == WorkState::Handover {
             item.blocker.as_ref().map_or_else(
-                || action.clone().into_owned(),
+                || action.into_owned(),
                 |blocker| {
                     format!(
                         "Resolve the handover's reported blocker: {}",
@@ -2249,7 +2249,17 @@ mod tests {
         assert_eq!(row.state, StatusState::AwaitingParty);
         assert!(row.action.contains("handover"));
         assert!(!row.action.contains("Pull request #"));
-        // A reported blocker and a live wait still win; live Work keeps its own text.
+        // A merged pull request and a reported blocker still win; live Work keeps its own text.
+        let merged = project_work_staged(
+            &paused,
+            op(&paused, false, true),
+            None,
+            NotWaiting,
+            "usr_owner",
+            open(12, WorkStage::PullRequestOpen),
+        );
+        assert_eq!(merged.state, StatusState::ReassessmentNeeded);
+        assert!(merged.action.starts_with("Its pull request merged"));
         let blocked = item(WorkState::Blocked);
         let row = read(&blocked, NotWaiting, open(12, WorkStage::PullRequestOpen));
         assert_eq!(row.state, StatusState::Blocked);

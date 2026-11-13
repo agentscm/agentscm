@@ -527,8 +527,8 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Unknown, never stale.** After a Hub restart that left no list of waits (the Hub died, or was
   down for 10 minutes or more), or when the Hub dropped a wait for room, a quiet
   Work whose lead session has not called since reads `freshness: unknown` with the limit
-  `lead_wait_unknown`. It names nobody (unless the Hub observed its pull request open) and needs nobody until that session calls again, or until
-  24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
+  `lead_wait_unknown`. It names nobody (unless the Hub observed its pull request open) and needs
+  nobody until that session calls again, or until 24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
   leaves its waits for the process that starts next, which then knows them as before. What
   sessions reported while no Hub ran is still missing, so Work whose lead session called in the
   hour before the stop, has no wait in that list and has not called since reads unknown too.
