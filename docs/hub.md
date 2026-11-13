@@ -1244,16 +1244,17 @@ The Hub-wide default is off. Repository permission and the author's affirmative 
 
 - a Hub admin sets the Hub-wide default off (`PUT .../conversation-sharing/default` below);
 - a repository admin sets the repository off;
-- a person opts their own sessions out for a repository;
+- a person has not opted in for a repository (`agentscm change-capture opt-in`), or has opted out;
 - a checkout's own capture mode is lower than `shared-conversation`, or its capture is off
   ([capture modes](change-capture.md)).
 
 Existing Hubs also keep sharing off unless an administrator deliberately changes the setting. Nothing a person had not affirmatively agreed to share starts uploading because of an install or upgrade. After both gates are enabled, each person's agent is told at session start that sharing is on; that notice is informational and cannot substitute for consent.
 
 - `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
-  `{repository, enabled, source, hub_default, opted_out, notified, sharing}` for the token's
-  person: `enabled` is the repository's effective setting, `source` is `repository` or
-  `hub_default`, and `sharing` is `enabled` and not `opted_out`. A token minted without a forge
+  `{repository, enabled, source, hub_default, opted_out, consented, notified, sharing}` for the
+  token's person: `enabled` is the repository's effective setting, `source` is `repository` or
+  `hub_default`, `consented` is true only after the person's explicit opt-in, and `sharing` is
+  `enabled` and `consented`. A token minted without a forge
   repository id never shares.
 - `PUT /v1/hub/repos/{repo}/conversation-sharing/me` with `{opted_out?, notified?}` (a token that
   is not read-only) records the person's own choice; the client sets `notified` once it has shown
@@ -2024,11 +2025,13 @@ any other sync read; that stage re-reads its page next pass, and merge-detection
 before a stop in the run reads is kept. Any other 403
 (including one that carries rate-limit headers) skips the repository for this pass without
 blaming the connection or marking anything read. The token needs `actions: read` and `deployments: read` (a fine-grained
-PAT, or an App installation); the GitHub App manifest does not request them yet, so an App
-installation gets 403 and the repository is skipped.
+PAT, or an App installation); the GitHub App manifest requests `deployments: write` but not
+`actions: read`, so an App installation reads deployments, gets 403 on workflow runs, and the
+repository is skipped for those. Naming a deploy workflow turns on the same reads; see
+[record a deployment](record-deployments.md).
 
-Observation only. The Hub never fetches logs, dispatches or reruns workflows, creates
-deployments or posts to either; the outcomes never feed a forge check, native admission or
+Observation only. The Hub never fetches logs or dispatches or reruns workflows, and creates a
+deployment only when asked through `agentscm deployed` ([record a deployment](record-deployments.md)); the outcomes never feed a forge check, native admission or
 a publication's state. Rows (`hub_external_runs`) and the per-commit read marker
 (`hub_external_reconciles`) are kept with the repository, and each new or changed row appends
 an `external_run_observed` event with identifiers and the outcome only; events are
@@ -2126,10 +2129,11 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   keeps at most 8 live sessions. Sessions are not rechecked per request: a user
   disabled by other means keeps an existing session until it expires and can
   still list and revoke their tokens, though not mint.
-- External CI and deployment outcomes are GitHub only, polled (no webhook hints), tested only
-  against an in-process fake and not live-verified; the GitHub App manifest does not request
-  `actions: read` or `deployments: read`, so only a PAT that has them is read. GitLab
-  pipelines and Jenkins are not supported.
+- Polled external CI and deployment outcomes are GitHub only (no webhook hints), tested only
+  against an in-process fake and not live-verified; the GitHub App manifest requests
+  `deployments: write` but not `actions: read`, so workflow runs are read only with a PAT that
+  has it. `agentscm deployed` records deployments on GitHub and GitLab. GitLab pipelines and
+  Jenkins are not polled.
 - GitLab: a merge without a merge commit (fast-forward or merged by push) records `merge_commit_sha` null. After a project is
   renamed, the stored name refreshes only when it is added again (`add-repo`), and
   tokens must then be re-minted. Note adoption scans the first 300 notes, system

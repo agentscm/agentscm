@@ -19,7 +19,7 @@ Install the version required by `.config/nextest.toml` so local and CI behavior 
 cargo install cargo-nextest --version 0.9.148 --locked
 ```
 
-On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and checks the library, the binary and `--test integration`; the Windows test set is the modules in `tests/integration/main.rs` declared without `#[cfg(unix)]`. It needs the target and a MinGW C compiler once:
+On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and checks the library, the binary and `--test integration`; the Windows test set is the modules in `tests/integration/main.rs` declared without `#[cfg(unix)]`. It needs the target and a MinGW C compiler once:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
