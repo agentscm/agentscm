@@ -1,9 +1,10 @@
 //! The key a connected repository's Hub rows are stored under, for tests that read the store.
 
-use agentscm::hub::store::{self, Store};
+use agentscm::hub::store;
 
 /// The scope of the repository connected as `full_name`; panics when none is connected.
-pub(crate) fn connected(store: &dyn Store, full_name: &str) -> String {
+#[cfg(unix)] // its callers are the Unix-only forge test modules
+pub(crate) fn connected(store: &dyn store::Store, full_name: &str) -> String {
     store
         .connections()
         .unwrap()
