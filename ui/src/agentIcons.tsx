@@ -23,8 +23,11 @@ const NAME_OF: Record<string, string> = { claudecode: 'Claude Code', codex: 'Cod
 // Agent names come from Hub records; a record missing one falls back to the plain label instead of throwing.
 export const brandOf = (agent: string): BrandName | null => (typeof agent === 'string' ? BRAND_OF[agent.toLowerCase()] ?? null : null)
 
+// Agents `client setup` wires that have no brand mark here, by their product name.
+const PLAIN_NAME_OF: Record<string, string> = { droid: 'Factory Droid', qwen: 'Qwen Code', junie: 'Junie CLI', crush: 'Crush' }
+
 /** How people say a known agent ("Claude Code"); null for one that is not. */
 export const brandName = (agent: string): string | null => {
   const b = brandOf(agent)
-  return b ? NAME_OF[b]! : null
+  return b ? NAME_OF[b]! : typeof agent === 'string' ? PLAIN_NAME_OF[agent.toLowerCase()] ?? null : null
 }

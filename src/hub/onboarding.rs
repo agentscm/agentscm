@@ -34,10 +34,27 @@ pub enum Agent {
     Cursor,
     Copilot,
     Gemini,
+    Droid,
+    Qwen,
+    Junie,
+    Crush,
 }
 
 impl Agent {
-    /// The name `from_name` reads.
+    /// Every agent, in the order of [`crate::clients::CLIENTS`].
+    pub const ALL: [Self; 9] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Cursor,
+        Self::Copilot,
+        Self::Gemini,
+        Self::Droid,
+        Self::Qwen,
+        Self::Junie,
+        Self::Crush,
+    ];
+
+    /// The name `from_name` reads, which is also its wire name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -45,18 +62,15 @@ impl Agent {
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
             Self::Gemini => "gemini",
+            Self::Droid => "droid",
+            Self::Qwen => "qwen",
+            Self::Junie => "junie",
+            Self::Crush => "crush",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
-            "copilot" => Some(Self::Copilot),
-            "gemini" => Some(Self::Gemini),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|agent| agent.name() == name)
     }
 }
 
@@ -762,6 +776,19 @@ impl Observations {
 mod tests {
     use super::*;
     use crate::hub::store::{ForgeIdentity, User};
+
+    #[test]
+    fn onboarding_names_every_native_client_by_its_wire_name() {
+        let names: Vec<&str> = Agent::ALL.iter().map(|agent| agent.name()).collect();
+        assert_eq!(names, crate::clients::names().collect::<Vec<_>>());
+        for agent in Agent::ALL {
+            assert_eq!(Agent::from_name(agent.name()), Some(agent));
+            assert_eq!(
+                serde_json::to_value(agent).unwrap(),
+                serde_json::json!(agent.name())
+            );
+        }
+    }
 
     #[test]
     fn a_session_is_told_to_declare_its_work_once_a_day() {

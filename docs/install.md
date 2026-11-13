@@ -48,7 +48,8 @@ To join a Hub that already runs, give its URL. The command signs you in through 
 npx agentscm --hub-url https://hub.example.com
 ```
 
-Either way it finds Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI and sets each one
+Either way it finds Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI, Factory Droid, Qwen
+Code, Junie CLI and Crush and sets each one
 up for all your projects, so a fresh clone works with no further setup. Nothing is written to
 your repositories. It asks no question while it sets up the agents.
 
@@ -67,7 +68,7 @@ These options are shown in `agentscm quickstart --help`:
 | --- | --- |
 | `--hub-url URL` | Join the Hub at URL instead of running one here. |
 | `--yes` | Take the recommended answers; never ask. |
-| `--only AGENT` | Set up only this agent: `claude`, `codex`, `cursor`, `copilot` or `gemini` (repeatable). |
+| `--only AGENT` | Set up only this agent: `claude`, `codex`, `cursor`, `copilot`, `gemini`, `droid`, `qwen`, `junie` or `crush` (repeatable). |
 | `--dry-run` | Print what it would do and write nothing. |
 | `--json` | Print one JSON result on stdout and progress on stderr (not on Windows). |
 
@@ -109,7 +110,7 @@ Flags shown by `npx agentscm --help`:
 |---|---|
 | `--hub-url URL` | Connect to the hub that already runs at URL. |
 | `--yes` | Answer every question with the recommended choice (needed without a terminal). |
-| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`); repeat for more. Default: every detected agent on supported Unix hosts. |
+| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot`, `gemini`, `droid`, `qwen`, `junie` or `crush`); repeat for more. Default: every detected agent on supported Unix hosts. |
 | `--dry-run` | Print what would be written and stop without writing. |
 | `--json` | Print one JSON object on stdout when done (`agents.installed`, `agents.skipped`, `agents.needs_user`, `hub`, `hub_up`, `signed_in`); the progress text goes to stderr. Not on Windows. |
 
@@ -229,6 +230,16 @@ does not stop to ask before each call.
 | Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
 | GitHub Copilot | `$COPILOT_HOME/hooks/agentscm-client.json` (`~/.copilot`) | `$COPILOT_HOME/mcp-config.json` | `$COPILOT_HOME/skills/coordinate-edits/` |
+| Factory Droid | `~/.factory/hooks.json` | `~/.factory/mcp.json` | `~/.factory/skills/coordinate-edits/` |
+| Qwen Code | `$QWEN_HOME/settings.json` (`~/.qwen`) | `$QWEN_HOME/settings.json` | `$QWEN_HOME/skills/coordinate-edits/` |
+| Junie CLI | `~/.junie/config.json` | `~/.junie/mcp/mcp.json` | `~/.junie/skills/coordinate-edits/` |
+| Crush | `crush.json` in `$CRUSH_GLOBAL_CONFIG`, else `$XDG_CONFIG_HOME/crush` (`~/.config/crush`) | the same `crush.json`, under `mcp` | `skills/coordinate-edits/` in that folder |
+
+Factory Droid, Qwen Code, Junie CLI and Crush are set up for all your projects only:
+`client setup --checkout-only` refuses them. Droid stops reading the hooks in
+`~/.factory/settings.json` once `~/.factory/hooks.json` exists, so setup refuses to create that
+file while `settings.json` has hooks; move them into `hooks.json` first. Junie CLI runs hooks
+only in its Early Access build. Crush also reads a `crushrc` file; setup writes only `crush.json`.
 
 In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
 that run `agentscm hook AGENT --client-connection`, and the block between
@@ -259,8 +270,10 @@ install afterwards has no AgentSCM hooks until you set it up. Two things find it
   ```
 
 An agent counts as installed when its program is on `PATH` (`claude`, `codex`, `cursor` or
-`cursor-agent`, `copilot`, `gemini`) or, for Cursor, GitHub Copilot and Gemini CLI, when its
-configuration directory exists (`~/.cursor`, `$COPILOT_HOME` or `~/.copilot`, `~/.gemini`). No
+`cursor-agent`, `copilot`, `gemini`, `droid`, `qwen`, `junie`, `crush`) or, for every agent but
+Claude Code and Codex, when its configuration directory exists (`~/.cursor`, `$COPILOT_HOME` or
+`~/.copilot`, `~/.gemini`, `~/.factory`, `$QWEN_HOME` or `~/.qwen`, `~/.junie`, the Crush folder
+above). No
 hook reports it at session start, so nothing tells you until you run one of those commands.
 
 For GitHub Copilot, the two user files above are the ones both Copilot CLI and VS Code's Copilot

@@ -8,7 +8,7 @@ title: "Coding agents: what is supported"
 
 AgentSCM warns an agent when another agent already holds a file it is about to edit. How well that works depends on how the agent connects to the [hub](hub.md). There are two ways, and most agents can use both:
 
-- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot, Gemini CLI), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
+- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot, Gemini CLI, Factory Droid, Qwen Code, Junie CLI, Crush), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
 - **Advisory (MCP).** The hub serves coordination [MCP](https://modelcontextprotocol.io) tools at `POST /mcp`: `agentscm_start`, `agentscm_check`, `agentscm_status` and `agentscm_done` for advice, and `agentscm_ask` and `agentscm_handoff` for the experimental handoff. The agent calls them because its instructions (`AGENTS.md`) tell it to. A model can forget or skip them, so treat this as a best effort. A session lists only the core coordination tools by default; rarely needed ones (promises, receipts, declarations, pull-request link setters, reconciliation, transition history) stay callable by name and appear in the list only with the full set, turned on by `AGENTSCM_MCP_TOOLS=all` in the `agentscm client mcp` server's environment or `?tools=all` on a direct Hub URL (see [the Hub's MCP tools](hub.md)).
 
 The read-only `agentscm_workflow_status` MCP tool inspects a retained native skill workflow when the operator has configured a repository mapping. It preserves recorded outcomes, current source applicability and unavailable capabilities as separate facts. See [skill workflows in the hub](advanced/skill-workflow-hub.md).
@@ -28,7 +28,7 @@ An edit that resolves a Git conflict is not checked. When a merge, rebase, cherr
 ## What each agent gets
 
 What one session of each agent gets once `agentscm client setup` has wired it, the host has
-loaded the hooks and the Hub answers. The first five rows are the agents `client setup` wires;
+loaded the hooks and the Hub answers. The first nine rows are the agents `client setup` wires;
 the last is any client that has only the Hub's MCP server.
 
 | Agent | Rules at session start | Edit check | An edit can be refused | Session end reported | Waiting for you reported | Subagents under the parent's session | Messages from the Hub |
@@ -38,6 +38,10 @@ the last is any client that has only the Hub's MCP server.
 | Cursor | Yes, with the session ID | Just after the write | No | Yes | End of turn only | No | At session start and just after an edit |
 | GitHub Copilot | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Not checked: a call that names a subagent is not held for a request addressed to its parent, but whether Copilot sends the parent's session for it was not verified | At session start; before an edit only as the refusal that holds it |
 | Gemini CLI | Yes, with the session ID | Before the write (`write_file`, `replace`) | Yes | Yes | Tool permission prompt, end of turn | No | At session start; before an edit as Gemini CLI's `systemMessage`, which does not hold the edit |
+| Factory Droid | Yes, with the session ID | Before the write (`Create`, `Edit`); `ApplyPatch` is not checked | Yes | Yes | Permission prompt, end of turn | No | At session start; before an edit only as the refusal, since its `PreToolUse` documents no note |
+| Qwen Code | Yes, with the session ID | Before the write (`write_file`, `edit`) | Yes | Yes | Permission prompt, end of turn | No | At session start, and before an edit as a note, which does not hold the edit |
+| Junie CLI | No: Junie shows a session start hook's text to the person only | Before the write (`Edit`, `Write`, `apply_patch`) | Yes | Yes | End of turn | No | Before an edit as `additionalContext`, which does not hold the edit |
+| Crush | No: its session start hook only observes | Before the write (`edit`, `write`, `multiedit`) | Yes | Yes | End of turn (`TurnEnd`) | No | Before an edit as `context`, which does not hold the edit |
 | A client with no hooks (MCP only) | In the MCP server's instructions, when the client shows them; no session ID | Only when the agent calls `agentscm_check` | No | Only when the agent calls `agentscm_done` | No | No | Only in the replies to its own AgentSCM tool calls |
 
 What the columns mean:
@@ -52,7 +56,7 @@ What the columns mean:
   (`WORK_UNDECLARED`, once per session), `LEASE_LAPSED`, `EDIT_UNLINKED` or, in Claude Code, Codex
   and Copilot, a coordination request the session has not answered. Where it cannot, the same
   text arrives as a note.
-- **Session end reported.** Setup installs a session-end hook for all five wired agents
+- **Session end reported.** Setup installs a session-end hook for all nine wired agents
   (`SessionEnd`; `sessionEnd` for Cursor and Copilot). When it runs, the Hub releases the
   session's file intents. It records the session's Work as finished only when that Work's pull
   request merged (below). Other Work whose hold is still live stays active: some clients end the
@@ -84,12 +88,38 @@ what AgentSCM does with what each host is documented to send (see [Support tiers
 A recorded wait is shown only after 60 seconds, so the tests check that a wait is accepted and
 never answered; what the Hub records for it is covered by the Hub's own hook tests.
 
+Factory Droid, Qwen Code, Junie CLI and Crush are wired from one table in `src/clients.rs`. Their
+hooks run `agentscm hook AGENT --client-connection`, which turns each payload into the
+[generic hook](#recipes-for-other-agents) shape and the Hub's answer into the agent's own output.
+Their payloads were written from each vendor's hook documentation (Qwen Code and Crush also from
+their source), read in November 2026; none was run against a live session. What each documents
+less than fully:
+
+- **Factory Droid.** Its docs show `tool_input.file_path` only for `Create`; `Edit` is read the
+  same way, and an `Edit` call without that field is not checked. `ApplyPatch` input is not
+  documented, so it renews the session but is not checked.
+- **Junie CLI.** Its hooks need the Early Access build. Only `SessionStart` and
+  `UserPromptSubmit` carry `session_id` and `cwd`, so later hooks take the session the start hook
+  recorded for the Junie process (on macOS and Linux; none when that process has several open) and
+  the folder Junie runs the hook in. Its session start shows a hook's text to the person only, so
+  the rules and session ID reach the model through the MCP server instead. Its `PermissionRequest`
+  hook approves a call it answers nothing to, so it is not installed and a permission prompt is not
+  reported. An `apply_patch` call is checked by the files its patch headers name; another patch
+  format is reported as coordination unknown.
+- **Crush.** Setup writes the JSON `crush.json`. Crush also reads a `crushrc` file, which setup
+  does not touch. Its session start hook only observes, so the rules and session ID reach the model
+  through the MCP server. A permission prompt is not reported: setup does not install its
+  `PermissionRequest` hook, since what that hook does with an empty answer is not documented.
+- **Qwen Code.** Its MCP client names itself after the server entry, `agentscm`, which the MCP
+  server reads as a hooked agent.
+
 ## Support tiers
 
 | Tier | Agents | How |
 | --- | --- | --- |
 | **Instructions by `agentscm init-repo`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code, Gemini CLI | Shared instruction files committed to the repository. No MCP config or hooks; those come from `client setup`. |
 | **Wired by `agentscm client setup --agent claude\|codex\|cursor\|copilot\|gemini`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code, Gemini CLI | Binds one checkout to an existing hub and installs that agent's native hooks and MCP config locally, without committing files. Candidate behavior: not yet qualified end to end across all five clients or against a hosted hub ([onboarding](team-member-onboarding.md)). |
+| **Wired by `agentscm client setup --agent droid\|qwen\|junie\|crush`, not qualified** | Factory Droid, Qwen Code, Junie CLI, Crush | The same setup, for all your projects only. Payloads and replies are written from vendor documentation and source; no live session was run ([what each documents less than fully](#what-each-agent-gets)). |
 | **Recipe** (hand configuration; not tested here) | Copilot coding agent and Copilot CLI, Gemini CLI and Antigravity, Windsurf, Devin, Amp, OpenCode, Cline | Point the agent's MCP client at the hub and give it the `AGENTS.md` snippet. |
 | **Advisory MCP only** | Roo | No hook; relies on the model following the instructions. |
 | **Not supported** | Aider | No hook or MCP client to attach to. |
@@ -234,6 +264,7 @@ A reservation on shared files is a lease. It blocks other Work only while the le
 | Copilot | `preToolUse` and `postToolUse` for all tools; shell calls while they run | a non-shell tool call longer than 20 minutes |
 | Cursor | `postToolUse` for all tools | time inside a tool call: Cursor reports no tool start the Hub can use |
 | Gemini CLI | `BeforeTool` and `AfterTool` for all tools; `run_shell_command` while it runs | a non-shell tool call longer than 20 minutes |
+| Factory Droid, Qwen Code, Junie CLI, Crush | `PreToolUse` and `PostToolUse` for all tools; their shell tool (`Execute`, `run_shell_command`, `Bash`, `bash`) while it runs | a non-shell tool call longer than 20 minutes |
 | An agent with MCP only | named MCP session calls and checkpoints | everything between them |
 
 The Work projection shows which case applies to a lead session as `activity.coverage`: `tool_calls` once a hook reported one of its tool calls, `tool_ends` for Cursor, whose hook reports only each call's end, `edits` for hooks that report only edits, `mcp_only`, or `unknown` when the Hub keeps no record of the session. Anything but `tool_calls` is listed as unknown coverage, with a reason that says what to run.
@@ -282,9 +313,11 @@ When an agent stops to wait for its person, it makes no tool calls, which otherw
 | Copilot CLI | `notification` `permission_prompt` | `notification` `elicitation_dialog` | `agentStop`, `notification` `agent_idle` | The notification's own `message` for a prompt or a question. None for the end of a turn: `agentStop` names only a transcript file, which the hook does not read | a turn that ends with a question from one that finished |
 | Cursor | none | none | `stop` | The end of the turn's last reply, judged, where Cursor runs `afterAgentResponse`: the hook keeps it on the machine until `stop` and sends nothing before. None where Cursor does not run that hook | permission waits: Cursor reports none; a turn's end where `afterAgentResponse` does not run |
 | Gemini CLI | `Notification` `ToolPermission` | none | `AfterAgent` | The command, the file (its path inside the session's folder, else its name) or the MCP tool of the prompt, from the notification's `details`, else its `message`; the end of `prompt_response`, judged | a question asked through `ask_user`: its details name only the tool |
+| Factory Droid, Qwen Code | `Notification` `permission_prompt` | `Notification` `elicitation_dialog` (Droid) | `Stop`, `Notification` `idle_prompt` | The notification's own `message`; the end of `last_assistant_message`, judged, where the payload has one | a turn's end where `Stop` names no last message |
+| Junie CLI, Crush | none (setup does not install their permission hooks) | none | `Stop`; `TurnEnd` for Crush | The end of `last_assistant_message`, judged | permission waits |
 | Others | `agentscm hook generic` with `{"event": "waiting", "reason": "permission"\|"question"\|"idle", "agent", "session", "asks"?, "asked_nothing"?}` | | | `asks`, as the caller cut it; `asked_nothing: true` with `idle` says the turn asked nothing | |
 
-The Cursor, Copilot CLI and Gemini CLI rows follow the fields their vendors document (read November 2026); none was run against a live session of that tool. Cursor's command-line agent was reported not to run `afterAgentResponse`, so there the end of a turn is shown without an excerpt.
+The Cursor, Copilot CLI, Gemini CLI, Factory Droid, Qwen Code, Junie CLI and Crush rows follow the fields their vendors document (read November 2026); none was run against a live session of that tool. Cursor's command-line agent was reported not to run `afterAgentResponse`, so there the end of a turn is shown without an excerpt.
 
 While a session waits for its person, the Work it leads reads as waiting for that person in [shared status](standup.md#shared-actionable-status), not as stale. Everyone who can read the repository sees that it waits and on whom; only that person sees what it asks. A Claude Code session that stops while its own background tasks run waits for nobody, and the Hub notes that stop too, so its Work stays active for up to 60 minutes instead of going quiet. Neither keeps the session's hold on its files, which lapses 20 minutes after its last call as before. So that the task also says what it waits on, an agent records a pause or blocker checkpoint whose `next_action` names it before it stops.
 
@@ -376,8 +409,8 @@ An agent token belongs to one repository, and every other coordination read is a
 
 ## Limits
 
-- A warning appears before an edit only for edits the agent makes through its file-edit tools. A shell command's file changes are never announced or refused beforehand; for Claude Code and Codex they are [observed afterwards](#shell-call-observation), and for Cursor, Copilot and Gemini CLI they are not observed at all.
-- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Gemini CLI's `BeforeTool` hook refuses the same way (`decision: deny`), and any other note before an edit goes to its `systemMessage`. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
+- A warning appears before an edit only for edits the agent makes through its file-edit tools. A shell command's file changes are never announced or refused beforehand; for Claude Code and Codex they are [observed afterwards](#shell-call-observation), and for the other wired agents they are not observed at all.
+- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Gemini CLI's `BeforeTool` hook refuses the same way (`decision: deny`), and any other note before an edit goes to its `systemMessage`. Factory Droid and Qwen Code refuse with `permissionDecision: deny`, Junie CLI and Crush with `decision: deny`; a note goes to Qwen Code's `additionalContext`, Junie's `additionalContext` and Crush's `context`, and Droid gets none. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
 - Claude Code's HTTP hook cannot tell the hub where the repository root is (the project directory is not available to HTTP-hook headers), so the hub makes paths relative to the directory the agent was started in. Start Claude Code at the repository root; from a subdirectory its edits are announced under shorter paths and may not match other agents' paths. The command hooks (`agentscm hook`) send the Git root and do not have this limit.
 - Codex hooks run only when the project is trusted, and Codex asks the developer to review new or changed hooks in `/hooks` once; changed hooks ask again.
 - Claude Code asks each developer to approve the project's MCP server and trust the folder before project hooks run.
@@ -491,4 +524,4 @@ A Stop trigger only prompts the agent to run the check. Omitting, misconfiguring
 
 ## Verified against
 
-The file formats were checked against the vendors' public documentation in October 2026: [Claude Code hooks](https://code.claude.com/docs/en/hooks) and [MCP](https://code.claude.com/docs/en/mcp), the Codex documentation for hooks and MCP servers, [Cursor hooks](https://cursor.com/docs/hooks) and [MCP](https://cursor.com/docs/mcp), and the GitHub Copilot and VS Code documentation for hooks and `mcp.json`. Matrix version 2 adds live CLI runs of Claude Code 2.1.304 and Codex CLI 0.163.0 (2026-10-20) and the vendor pages checked the same day: [Cursor agent hooks](https://cursor.com/docs/agent/hooks), [Copilot hooks configuration](https://docs.github.com/en/copilot/reference/hooks-configuration) and [VS Code agent hooks](https://code.visualstudio.com/docs/copilot/customization/hooks). Vendors change these formats; if a generated file stops working, please open an issue.
+The file formats were checked against the vendors' public documentation in October 2026: [Claude Code hooks](https://code.claude.com/docs/en/hooks) and [MCP](https://code.claude.com/docs/en/mcp), the Codex documentation for hooks and MCP servers, [Cursor hooks](https://cursor.com/docs/hooks) and [MCP](https://cursor.com/docs/mcp), and the GitHub Copilot and VS Code documentation for hooks and `mcp.json`. In November 2026: [Factory Droid hooks](https://docs.factory.com/reference/hooks-reference), [its hooks guide](https://docs.factory.com/cli/configuration/hooks-guide), [MCP](https://docs.factory.com/cli/configuration/mcp) and [skills](https://docs.factory.com/cli/configuration/skills); Qwen Code's hooks and settings documentation and source ([QwenLM/qwen-code](https://github.com/QwenLM/qwen-code)); [Junie CLI hooks](https://junie.jetbrains.com/docs/junie-cli-hooks.html), [MCP](https://junie.jetbrains.com/docs/junie-cli-mcp-configuration.html) and [skills](https://junie.jetbrains.com/docs/agent-skills.html); Crush's hooks documentation and source ([charmbracelet/crush](https://github.com/charmbracelet/crush)). Matrix version 2 adds live CLI runs of Claude Code 2.1.304 and Codex CLI 0.163.0 (2026-10-20) and the vendor pages checked the same day: [Cursor agent hooks](https://cursor.com/docs/agent/hooks), [Copilot hooks configuration](https://docs.github.com/en/copilot/reference/hooks-configuration) and [VS Code agent hooks](https://code.visualstudio.com/docs/copilot/customization/hooks). Vendors change these formats; if a generated file stops working, please open an issue.

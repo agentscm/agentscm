@@ -1846,8 +1846,12 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             )));
         }
     };
-    let agent = Agent::from_name(name)
-        .ok_or_else(|| invalid("agent must be claude, codex, cursor, copilot or gemini"))?;
+    let agent = Agent::from_name(name).ok_or_else(|| {
+        invalid(&format!(
+            "agent must be one of {}",
+            agentscm::clients::names_joined(", ")
+        ))
+    })?;
     if !is_current(&connection) {
         return Err(invalid(
             "checkout root or origin changed; review client setup before reconnecting",

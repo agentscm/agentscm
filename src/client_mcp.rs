@@ -16,7 +16,7 @@ use agentscm::{Error, Result};
 
 use crate::client_cli::read_token;
 use crate::client_config::{
-    AGENTS, Connection, canonical_root, connection_for_checkout, is_current_in, load, relative,
+    Connection, canonical_root, connection_for_checkout, is_current_in, load, relative,
 };
 use crate::client_session::{self, Process, Recorded};
 use crate::hub_cli::map_hub_error;
@@ -444,10 +444,12 @@ fn open(connection: &Connection, checkout: &Path) -> std::result::Result<String,
 
 /// Whether an MCP client's name is one of the agents that run AgentSCM hooks. A client that
 /// never said its name counts too: only a client known to have no hooks gets a made-up session.
+/// Qwen Code names itself after the server entry, which setup calls `agentscm`.
 fn hooked(client: Option<&str>) -> bool {
     client.is_none_or(|name| {
         let name = name.to_ascii_lowercase();
-        AGENTS.iter().any(|agent| name.contains(agent))
+        agentscm::clients::names().any(|agent| name.contains(agent))
+            || name == "agentscm"
             || name.contains("visual studio code")
             || name.contains("vscode")
     })
@@ -1644,6 +1646,16 @@ mod tests {
             unnamed.ancestors = Some(Vec::new());
             assert_eq!(session(&mut unnamed, json!({"task": "t"})), Value::Null);
         });
+    }
+
+    #[test]
+    fn every_natively_wired_agent_counts_as_hooked() {
+        for name in agentscm::clients::names() {
+            assert!(hooked(Some(name)), "{name}");
+        }
+        // Qwen Code names its MCP client after the server entry.
+        assert!(hooked(Some("agentscm")) && hooked(Some("Crush")) && hooked(None));
+        assert!(!hooked(Some("plain-editor")) && !hooked(Some("agentscm-proxy")));
     }
 
     #[test]
