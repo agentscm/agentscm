@@ -3234,12 +3234,14 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         }
     }
 
-    // Losing access shows on the next fresh read: the role is asked, not cached.
-    {
+    // Within the 90-second role cache a lost access is not asked again: the forge is not called
+    // and the repository still lists; it drops out once the answer expires or alice signs out.
+    let reads = {
         let mut fake = env.fake.lock().unwrap();
         fake.roles.remove(&("acme/docs".into(), ALICE));
         fake.levels.remove(&(4343, ALICE));
-    }
+        fake.role_reads
+    };
     let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
     let names: Vec<_> = body["repositories"]
         .as_array()
@@ -3247,7 +3249,8 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         .iter()
         .map(|row| row["repository"].as_str().unwrap())
         .collect();
-    assert_eq!(names, [REPO], "{body}");
+    assert_eq!(names, ["acme/docs", REPO], "{body}");
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
     // The token that asked within the last 30 seconds gets its earlier answer back.
     let (_, again) = env.get(path, &alice).await;
     assert_eq!(again, first);
@@ -3662,7 +3665,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
-    // The detailed device list checks the forge again even while the web list's answer is cached.
+    // The detailed device list reuses the same cached answers, so the lost role still lists.
     let (status, device_after_role_loss) = env
         .call(
             &env.hub,
@@ -3678,12 +3681,9 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
-    assert_eq!(
-        device_after_role_loss["repositories"][0]["repository"],
-        "acme/docs"
-    );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
     // Signing out forgets them: losing the role leaves the repository out, with no refused
     // sign-in recorded.
@@ -3997,6 +3997,19 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
         .unwrap()
         .roles
         .remove(&("acme/docs".into(), ALICE));
+    // The role answer is kept for 90 seconds; signing out forgets it, so the next sign-in asks.
+    let (_, session) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let csrf = session["csrf_token"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &cookie,
+        Some(csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let cookie = web_sign_in(&env, ALICE).await;
     let (revoked_status, revoked) = with_cookie(&env.hub, Method::GET, &path, &cookie, None).await;
     assert_eq!(revoked_status, 404);
     assert_eq!(revoked, unknown);
@@ -4484,12 +4497,22 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     assert_eq!(page["dismissals"].as_array().unwrap().len(), 1);
     assert_eq!(page["dismissals"][0]["key"], "stale:wrk_1");
 
+    // A lost role reads from the 90-second role answer, without asking the forge, until it
+    // expires or bob signs out (and signing in again checks the role).
+    let reads = env.fake.lock().unwrap().role_reads;
     env.drop_role(BOB);
-    let (status, refused) = read(&bob).await;
-    assert_eq!(
-        (status, refused["error"].as_str()),
-        (403, Some("insufficient_role"))
-    );
+    assert_eq!(read(&bob).await.0, 200);
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &bob.cookie,
+        Some(&bob.csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(read(&bob).await.0, 401);
 }
 
 const PERMISSIONS: &str = "/v1/hub/session/permissions";

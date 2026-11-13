@@ -552,6 +552,38 @@ pub(in crate::hub) async fn mint_access(
         .map(|(repo, level)| (repo, level == Level::Administer))
 }
 
+/// [`mint_check`] at [`Level::Read`] for a page's poll: a role answer kept within
+/// [`ROLE_CHECK_TTL_SECONDS`] that `owner` may contribute stands in for asking the forge again.
+/// The allow list is still checked on every call.
+pub(in crate::hub) async fn read_check(
+    state: &HubState,
+    owner: &User,
+    repository: &str,
+    via: &'static str,
+) -> ApiResult<ConnectedRepository> {
+    let decision = access::decide(state, owner).await?;
+    let rules = matches!(decision, Decision::HubRules);
+    if rules {
+        let (store, host, named) = (
+            state.store.clone(),
+            owner.identity.host.clone(),
+            repository.to_owned(),
+        );
+        if let Some(repo) = blocking(state, move || store.repository_named(&host, &named)).await?
+            && cached_role(&state.login, &owner.id, &repo, unix_now()) == Some(true)
+        {
+            admitted(state, owner, &decision, via).await?;
+            return Ok(repo);
+        }
+    }
+    let (repo, level) = mint_level(state, owner, repository, via).await?;
+    // The cache's `true` means "may contribute" (see [`readable`]), so a read-only answer is not kept.
+    if rules && level >= Level::Contribute {
+        remember_role(&state.login, &owner.id, &repo, true, unix_now());
+    }
+    Ok(repo)
+}
+
 /// The connected repository `repository` and what `owner` may do on it now (see
 /// [`repository_access`]).
 async fn mint_level(
@@ -703,12 +735,7 @@ struct Listed {
 
 /// [`Listed`] for `owner`: every repository on their Git host that passes [`readable`], or,
 /// with an embedder, the ones it grants there.
-async fn listed(
-    state: &HubState,
-    owner: &User,
-    decision: &Decision,
-    use_role_cache: bool,
-) -> ApiResult<Listed> {
+async fn listed(state: &HubState, owner: &User, decision: &Decision) -> ApiResult<Listed> {
     let host = owner.identity.host.clone();
     let mut read_only = HashSet::new();
     let mut candidates = match decision {
@@ -734,7 +761,7 @@ async fn listed(
     let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
     let (repositories, unchecked) = match decision {
-        Decision::HubRules => readable(state, owner, candidates, use_role_cache).await,
+        Decision::HubRules => readable(state, owner, candidates).await,
         Decision::Refused | Decision::Granted(_) => (candidates, 0),
     };
     Ok(Listed {
@@ -764,13 +791,12 @@ async fn session_value_metrics(
     query.window(unix_now()).map_err(ApiError::from)?;
     let owner = human.user;
     let decision = access::decide(&state, &owner).await?;
-    // A fresh role check applies to every aggregate and every detail page.
     let Listed {
         repositories: mut readable,
         unchecked,
         complete: repositories_complete,
         ..
-    } = listed(&state, &owner, &decision, false).await?;
+    } = listed(&state, &owner, &decision).await?;
     if let Some(name) = &query.repository {
         readable.retain(|r| &r.full_name == name);
         if readable.is_empty() {
@@ -839,7 +865,7 @@ async fn repositories_for_owner(
         unchecked,
         complete,
         read_only,
-    } = listed(&state, &owner, &decision, !include_work).await?;
+    } = listed(&state, &owner, &decision).await?;
     // Every listed repository is on the person's own forge host; the summary already names the provider.
     let host = owner.identity.host.clone();
     let store = state.store.clone();
@@ -1070,8 +1096,7 @@ async fn agent_repositories_route(
 
 /// The repositories on the person's forge host the token's owner can read now, each with its current unfinished
 /// Work in brief, as the owner may see it. Every repository is checked with the forge as the All
-/// repositories page checks it, but without its role cache, because this read returns Work
-/// details. Repositories the forge could not answer for are counted in `unchecked`, never named,
+/// repositories page checks it, with the same role cache. Repositories the forge could not answer for are counted in `unchecked`, never named,
 /// because a name could reveal that a private repository exists. A token asking again within
 /// [`AGENT_READ_REUSE_SECONDS`] gets its previous answer back, `checked_at` unchanged.
 pub(in crate::hub) async fn agent_repositories(
@@ -1097,7 +1122,7 @@ pub(in crate::hub) async fn agent_repositories(
         unchecked,
         complete: all_candidates,
         ..
-    } = listed(state, &owner, &decision, false).await?;
+    } = listed(state, &owner, &decision).await?;
     readable.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     let store = state.store.clone();
     let (rows, work_complete) = blocking(state, move || {
@@ -1195,7 +1220,6 @@ pub(in crate::hub) async fn readable(
     state: &HubState,
     owner: &User,
     candidates: Vec<ConnectedRepository>,
-    use_role_cache: bool,
 ) -> (Vec<ConnectedRepository>, usize) {
     // An embedder answers for every repository at once, and its answer is never cached.
     match access::decide(state, owner).await {
@@ -1218,10 +1242,7 @@ pub(in crate::hub) async fn readable(
         while checks.len() < LIST_CONCURRENCY
             && let Some(repo) = pending.next()
         {
-            let cached = use_role_cache
-                .then(|| cached_role(&state.login, &owner.id, &repo, now))
-                .flatten();
-            match cached {
+            match cached_role(&state.login, &owner.id, &repo, now) {
                 Some(true) => allowed.push(repo),
                 Some(false) => {}
                 None => {
@@ -1236,15 +1257,11 @@ pub(in crate::hub) async fn readable(
         match tokio::time::timeout_at(deadline, checks.join_next()).await {
             Ok(None) => break,
             Ok(Some(Ok((repo, Ok(()))))) => {
-                if use_role_cache {
-                    remember_role(&state.login, &owner.id, &repo, true, unix_now());
-                }
+                remember_role(&state.login, &owner.id, &repo, true, unix_now());
                 allowed.push(repo);
             }
             Ok(Some(Ok((repo, Err(Denial::Role(_)))))) => {
-                if use_role_cache {
-                    remember_role(&state.login, &owner.id, &repo, false, unix_now());
-                }
+                remember_role(&state.login, &owner.id, &repo, false, unix_now());
             }
             Ok(Some(Ok((_, Err(Denial::Kind("not_connected")))))) => {}
             Ok(Some(_)) => unchecked += 1,
@@ -1258,8 +1275,10 @@ pub(in crate::hub) async fn readable(
     (allowed, unchecked)
 }
 
-/// How long the All repositories list reuses a person's role answer for one repository, so a
-/// granted or lost access shows there within this long. Mints and read tokens always ask.
+/// How long the repository lists and the web pages' read polls ([`read_check`]) reuse a person's
+/// role answer for one repository, so a granted or lost access shows there within this long;
+/// asking on every call used up a busy Hub's hourly forge API limit. Mints, read tokens and
+/// changes always ask.
 const ROLE_CHECK_TTL_SECONDS: i64 = 90;
 
 /// Starts with the person, so [`forget_role_checks`] finds all of theirs.

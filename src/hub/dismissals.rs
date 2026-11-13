@@ -137,14 +137,7 @@ async fn scoped(
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
     // A person's own dismissals change nothing anyone else sees, so reading is enough.
-    let repo = super::login::devices::mint_check(
-        state,
-        &user,
-        repository,
-        "dismissals",
-        super::access::Level::Read,
-    )
-    .await?;
+    let repo = super::login::devices::read_check(state, &user, repository, "dismissals").await?;
     let key = setting_key(&user.id, repo.repository_id);
     Ok((user.id, key))
 }

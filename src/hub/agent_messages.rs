@@ -1277,8 +1277,12 @@ async fn scoped(
 ) -> std::result::Result<(super::store::User, i64, Vec<(String, String)>), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
-    let repo =
-        super::login::devices::mint_check(state, &user, repository, "agent_messages", need).await?;
+    // A page polls the list; changes ask the forge every time.
+    let repo = if need == Level::Read {
+        super::login::devices::read_check(state, &user, repository, "agent_messages").await?
+    } else {
+        super::login::devices::mint_check(state, &user, repository, "agent_messages", need).await?
+    };
     let (store, owner, repository_id) = (state.store.clone(), user.id.clone(), repo.repository_id);
     let tokens = blocking(state, move || {
         let now = unix_now();
