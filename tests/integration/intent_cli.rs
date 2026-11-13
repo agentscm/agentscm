@@ -85,7 +85,14 @@ impl Hub {
     }
 
     fn live(&self) -> Vec<Vec<String>> {
-        let live = self.store.live_intents(REPO, unix_now(), 100).unwrap();
+        let live = self
+            .store
+            .live_intents(
+                &crate::repository_scope::github(REPO, None),
+                unix_now(),
+                100,
+            )
+            .unwrap();
         live.into_iter().map(|i| i.paths).collect()
     }
 }
@@ -493,7 +500,10 @@ fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
 
     // The Hub releases the stored id (as when its Work finishes). The next edit must mint a new
     // id, keep the earlier path and not stay stuck.
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     let first_id = live[0].id.clone();
     assert!(
         hub.store
@@ -502,7 +512,10 @@ fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
     );
     assert!(hub.live().is_empty());
     silent(&client.edit("s", "Edit", work.path(), &path("src/b.rs")));
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_ne!(live[0].id, first_id);
     let mut paths = live[0].paths.clone();
@@ -595,7 +608,7 @@ fn a_fenced_path_is_dropped_and_the_other_paths_are_still_announced() {
     assert!(text.contains("lib/x.rs"), "{text}");
     let mine: Vec<Vec<String>> = hub
         .store
-        .live_intents(REPO, unix_now(), 10)
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
         .unwrap()
         .into_iter()
         .filter(|i| {

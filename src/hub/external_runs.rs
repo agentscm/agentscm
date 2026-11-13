@@ -873,9 +873,9 @@ async fn pass(
 ) -> Gh<()> {
     let oldest = unix_now() - state.sync.config()?.activity_days * 86_400;
     let (after_number, after_id) = state.sync.external_cursor(&repo.id);
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let unmerged = blocking(state, move || {
-        store.pull_publications(&name, after_number, MAX_PER_PASS)
+        store.pull_publications(&scope, after_number, MAX_PER_PASS)
     })
     .await?;
     let full = unmerged.len() >= MAX_PER_PASS;
@@ -914,9 +914,9 @@ async fn pass(
         .sync
         .set_external_cursor(&repo.id, (if full { last } else { 0 }, after_id.clone()));
 
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let merged = blocking(state, move || {
-        store.merged_publications(&name, &after_id, oldest, MAX_PER_PASS)
+        store.merged_publications(&scope, &after_id, oldest, MAX_PER_PASS)
     })
     .await?;
     let next = match merged.last() {

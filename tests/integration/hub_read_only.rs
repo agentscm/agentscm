@@ -335,7 +335,11 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
         );
         assert!(
             hub.store
-                .live_intents("acme/widgets", unix_now(), 10)
+                .live_intents(
+                    &crate::repository_scope::github("acme/widgets", None),
+                    unix_now(),
+                    10
+                )
                 .unwrap()
                 .is_empty(),
             "{label}"

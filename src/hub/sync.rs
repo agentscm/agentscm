@@ -2019,9 +2019,9 @@ async fn repo_intents(
     conn: &Connection,
     repo: &ConnectedRepository,
 ) -> Gh<Vec<Intent>> {
-    let name = repo.full_name.clone();
+    let scope = repo.repository_scope();
     let (intents, truncated) = db(state, move |store| {
-        live_intents_capped(store, &name, unix_now())
+        live_intents_capped(store, &scope, unix_now())
     })
     .await?;
     if truncated {
@@ -3317,11 +3317,11 @@ async fn work(
 ) -> ApiResult<Json<Value>> {
     scope(&principal, &repo)?;
     let host = principal.owner.identity.host.clone();
-    let (name, name_for_intents) = (repo.clone(), repo);
+    let (name, scope) = (repo, super::store::scope_of(&state, &principal).await?);
     let repository_id = principal.repository_id;
     let (intents, prs, branches, connected) = db(&state, move |store| {
         // By the forge's id when the token has one: a renamed or re-created name never serves another repository.
-        let intents = store.live_intents(&name_for_intents, unix_now(), MAX_LIVE_INTENTS + 1)?;
+        let intents = store.live_intents(&scope, unix_now(), MAX_LIVE_INTENTS + 1)?;
         Ok(match find_repository(store, &host, &name, repository_id)? {
             Some(found) => (
                 intents,

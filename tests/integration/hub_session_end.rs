@@ -247,7 +247,11 @@ fn work(store: &dyn Store, who: &Agent, id: &str, now: i64) -> WorkItem {
 
 fn live(store: &dyn Store, now: i64) -> Vec<String> {
     store
-        .live_intents(REPO, now, 10)
+        .live_intents(
+            &crate::repository_scope::github(REPO, Some(REPOSITORY_ID)),
+            now,
+            10,
+        )
         .unwrap()
         .into_iter()
         .map(|intent| intent.id)

@@ -362,7 +362,12 @@ mod conflict {
         // holds a file.
         let unchanged = store.work_get(&token_id(&*store, &holder), &held.id, unix_now());
         assert_eq!(unchanged.unwrap(), Some(held));
-        assert!(store.live_intents(REPO, unix_now(), 10).unwrap().is_empty());
+        assert!(
+            store
+                .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+                .unwrap()
+                .is_empty()
+        );
 
         // A held file with no conflict is refused as ever in the same merge, alone or in one
         // patch with the conflicted file.

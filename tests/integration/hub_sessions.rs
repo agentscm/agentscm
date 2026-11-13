@@ -143,7 +143,9 @@ fn paths_accumulate_in_one_intent(db: &Db) {
     let intent = second.intent.unwrap();
     assert_eq!(intent.paths, ["docs/a.md", "src/a.rs", "src/b.rs"]);
     assert_eq!(intent.task, "task unknown");
-    let live = store.live_intents(REPO, T0 + 10, 10).unwrap();
+    let live = store
+        .live_intents(&crate::repository_scope::github(REPO, None), T0 + 10, 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].id, intent.id);
     // A task replaces the old one and is kept by later calls.
@@ -246,11 +248,23 @@ fn heartbeat_renews_the_expiry(db: &Db) {
         T0 + 600 + SESSION_TTL_SECONDS
     );
     let later = T0 + 600 + SESSION_TTL_SECONDS - 1;
-    assert_eq!(store.live_intents(REPO, later, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), later, 10)
+            .unwrap()
+            .len(),
+        1
+    );
     // A session without paths has no intent and does not list.
     let bob = agent(&*store, 2, "b");
     assert!(touch(&*store, &bob, &[], T0).intent.is_none());
-    assert_eq!(store.live_intents(REPO, T0, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn expired_intent_is_not_revived(db: &Db) {
@@ -270,19 +284,37 @@ fn expired_intent_is_not_revived(db: &Db) {
     let first = touch(&*store, &alice, &["old.rs"], T0);
     assert_eq!(first.overlaps.len(), 1);
     let late = T0 + SESSION_TTL_SECONDS + 5;
-    assert!(store.live_intents(REPO, late, 10).unwrap().len() == 1);
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), late, 10)
+            .unwrap()
+            .len()
+            == 1
+    );
     // The old paths are not carried over: the call starts a fresh intent and is warned again.
     let fresh = touch(&*store, &alice, &["old.rs", "new.rs"], late);
     assert_ne!(intent_id(&first), intent_id(&fresh));
     assert_eq!(fresh.intent.as_ref().unwrap().paths, ["new.rs", "old.rs"]);
     assert_eq!(fresh.added, ["new.rs", "old.rs"]);
     assert_eq!(fresh.overlaps.len(), 1);
-    assert_eq!(store.live_intents(REPO, late, 10).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), late, 10)
+            .unwrap()
+            .len(),
+        2
+    );
     // A heartbeat on an expired session creates nothing.
     let much_later = late + SESSION_TTL_SECONDS + 5;
     let beat = touch(&*store, &alice, &[], much_later);
     assert!(beat.intent.is_none() && beat.added.is_empty());
-    assert_eq!(store.live_intents(REPO, much_later, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), much_later, 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn done_releases_and_a_later_touch_starts_afresh(db: &Db) {
@@ -290,7 +322,12 @@ fn done_releases_and_a_later_touch_starts_afresh(db: &Db) {
     let alice = agent(&*store, 1, "a");
     let first = touch(&*store, &alice, &["a.rs"], T0);
     assert!(store.end_session(&alice.token, None, T0 + 1).unwrap());
-    assert!(store.live_intents(REPO, T0 + 1, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 1, 10)
+            .unwrap()
+            .is_empty()
+    );
     assert!(!store.end_session(&alice.token, None, T0 + 2).unwrap());
     let second = touch(&*store, &alice, &["a.rs"], T0 + 3);
     assert_ne!(intent_id(&first), intent_id(&second));
@@ -446,7 +483,9 @@ fn via_accumulates_and_is_listed(db: &Db) {
         .touch_session(&alice.token, &call("mcp", Some("s"), &[]), T0 + 1)
         .unwrap();
     assert_eq!(both.via, ["hook:codex", "mcp"]);
-    let live = store.live_intents(REPO, T0 + 2, 10).unwrap();
+    let live = store
+        .live_intents(&crate::repository_scope::github(REPO, None), T0 + 2, 10)
+        .unwrap();
     let via = |id: &str| live.iter().find(|i| i.id == id).unwrap().via.clone();
     assert_eq!(via(&intent_id(&both)), ["hook:codex", "mcp"]);
     assert!(via(&rest.id).is_empty());
@@ -543,7 +582,13 @@ fn the_first_contested_edit_is_refused_and_a_repeat_passes(db: &Db) {
     assert_eq!(refused.denied[0].intent.token, alice.token);
     // Nothing is held for a refused call, not even the file nobody else holds.
     assert!(refused.added.is_empty() && refused.intent.is_none() && refused.overlaps.is_empty());
-    assert_eq!(store.live_intents(REPO, T0 + 1, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 1, 10)
+            .unwrap()
+            .len(),
+        1
+    );
     // The holder is not told: bob never started on the file.
     assert!(touch(&*store, &alice, &[], T0 + 2).notices.is_empty());
     let denied = event_data(&*store, "edit_denied");
@@ -638,7 +683,9 @@ fn every_touch_keeps_last_active_fresh(db: &Db) {
     for minute in 1..=5 {
         touch(&*store, &alice, &[], T0 + minute * 300);
     }
-    let live = store.live_intents(REPO, T0 + 1500, 10).unwrap();
+    let live = store
+        .live_intents(&crate::repository_scope::github(REPO, None), T0 + 1500, 10)
+        .unwrap();
     assert_eq!(live[0].updated_at, T0 + 1500);
 }
 
@@ -790,10 +837,23 @@ fn other_repositories_stay_apart(db: &Db) {
     let theirs = touch(&*store, &carol, &["src/a.rs"], T0 + 1);
     assert!(theirs.overlaps.is_empty());
     assert_eq!(
-        store.live_intents("acme/other", T0 + 1, 10).unwrap().len(),
+        store
+            .live_intents(
+                &crate::repository_scope::github("acme/other", None),
+                T0 + 1,
+                10
+            )
+            .unwrap()
+            .len(),
         1
     );
-    assert_eq!(store.live_intents(REPO, T0 + 1, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0 + 1, 10)
+            .unwrap()
+            .len(),
+        1
+    );
     // Sessions are per token: the same name does not collide.
     let same = |who: &Agent| {
         let named = call("mcp", Some("same"), &["x.rs"]);
@@ -1042,7 +1102,12 @@ fn invalid_calls_are_rejected_without_events(db: &Db) {
             .iter()
             .all(|e| !e.kind.starts_with("session_"))
     );
-    assert!(store.live_intents(REPO, T0, 10).unwrap().is_empty());
+    assert!(
+        store
+            .live_intents(&crate::repository_scope::github(REPO, None), T0, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn a_file_held_through_mcp_is_still_refused_on_the_first_hook_edit(db: &Db) {

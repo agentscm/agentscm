@@ -1020,7 +1020,10 @@ async fn a_forge_merged_pull_request_in_the_window_is_recorded_and_not_read_agai
     env.poll().await;
     let merged = env
         .store
-        .publication(REPO, &env.publication)
+        .publication(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            &env.publication,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1052,7 +1055,10 @@ async fn a_publication_to_another_host_is_never_reconciled_against_a_same_named_
     assert_eq!(env.status_posts(), 1);
     assert!(env.statuses().iter().all(|(sha, _, _)| sha == COMMIT));
     // The listing omits merged publications: still listed means no merge was recorded.
-    let foreign = env.store.pull_publications(REPO, 1, 1).unwrap();
+    let foreign = env
+        .store
+        .pull_publications(&crate::repository_scope::connected(&*env.store, REPO), 1, 1)
+        .unwrap();
     assert_eq!(
         foreign.len(),
         1,

@@ -2712,6 +2712,7 @@ mod tests {
                 .skill_evidence_add(&EvidenceRow {
                     id: format!("evd_{n}"),
                     repository: "acme/widgets".into(),
+                    repository_scope: crate::hub::store::principal_scope(store, who).unwrap(),
                     branch: branch.into(),
                     run_id: run_id_of("acme/widgets", branch, "pr-gate"),
                     skill: "pr-gate".into(),

@@ -197,7 +197,7 @@ struct Pending {
     totals: BTreeMap<Key, Waiting>,
     /// Totals of sessions whose token is not verified yet; the next write checks them.
     unverified: BTreeMap<Key, Waiting>,
-    /// When the store last accepted each token, and the repository the token belongs to.
+    /// When the store last accepted each token, and the scope of the repository it belongs to.
     verified: BTreeMap<Token, (Instant, String)>,
     /// Report ids already counted, per session, apart for verified and unverified tokens so
     /// made-up tokens cannot push out real sessions' ids.
@@ -214,13 +214,12 @@ struct Pending {
 }
 
 impl Pending {
-    /// The repository a waiting total counts for: the token's own once verified, else the one
-    /// the call named; None when neither is known.
+    /// The scope of the repository a waiting total counts for, once its token is verified; None
+    /// before then, as the name the call sent is not a scope, so it counts for every repository.
     fn repository<'a>(&'a self, key: &'a Key) -> Option<&'a str> {
         self.verified
             .get(&(key.0, key.1.clone(), key.2.clone()))
-            .map(|(_, repository)| repository.as_str())
-            .or(key.2.as_deref())
+            .map(|(_, scope)| scope.as_str())
     }
 
     /// Adds `sample` to the total at `key` in the verified or unverified table, or counts it as
@@ -297,18 +296,19 @@ fn store_key(state: &super::HubState) -> usize {
     std::sync::Arc::as_ptr(&state.store).cast::<()>() as usize
 }
 
-/// Whether the store holds every hook call this process saw for `repository` in the window from
-/// `since` to `until`: none dropped in it, and none waiting longer than a write takes. Calls of
-/// the last [`FLUSH_EVERY`] or two are on their way and do not make a read partial.
+/// Whether the store holds every hook call this process saw for the repository with `scope` (see
+/// [`super::store::repository_scope`]) in the window from `since` to `until`: none dropped in it,
+/// and none waiting longer than a write takes. Calls of the last [`FLUSH_EVERY`] or two are on
+/// their way and do not make a read partial.
 // shortcut: scans every waiting total under the lock hook calls take (microseconds at 10,000);
 // keep an index by repository if it shows in hook latency.
-pub fn all_written(repository: &str, since: i64, until: i64) -> bool {
+pub fn all_written(scope: &str, since: i64, until: i64) -> bool {
     let overdue = super::store::unix_now() - 2 * FLUSH_EVERY.as_secs() as i64;
     let guard = pending();
     let Some(pending) = guard.as_ref() else {
         return true;
     };
-    let dropped = [repository, ""]
+    let dropped = [scope, ""]
         .iter()
         .filter_map(|name| pending.dropped.get(*name))
         .any(|at| *at >= since);
@@ -317,14 +317,15 @@ pub fn all_written(repository: &str, since: i64, until: i64) -> bool {
         .iter()
         .chain(&pending.unverified)
         .any(|(key, waiting)| {
-            pending.repository(key).is_none_or(|r| r == repository)
+            pending.repository(key).is_none_or(|r| r == scope)
                 && waiting.first_at <= until
                 && waiting.first_at < overdue
         });
-    let writing =
-        pending.writing.values().flatten().any(|(r, first_at)| {
-            r.as_deref().is_none_or(|r| r == repository) && *first_at <= until
-        });
+    let writing = pending
+        .writing
+        .values()
+        .flatten()
+        .any(|(r, first_at)| r.as_deref().is_none_or(|r| r == scope) && *first_at <= until);
     !dropped && !waiting && !writing
 }
 
@@ -437,10 +438,16 @@ pub async fn flush(state: &super::HubState) {
         .map(|(key, waiting)| (key.clone(), waiting.sample.clone()))
         .collect();
     type Checked = BTreeMap<(String, Option<String>), Option<super::store::Principal>>;
-    fn accepted(checked: Checked) -> BTreeMap<(String, Option<String>), String> {
+    fn accepted(
+        store: &dyn super::store::Store,
+        checked: Checked,
+    ) -> BTreeMap<(String, Option<String>), String> {
         checked
             .into_iter()
-            .filter_map(|(token, principal)| principal.map(|p| (token, p.repository)))
+            .filter_map(|(token, principal)| {
+                let scope = super::store::principal_scope(store, &principal?).ok()?;
+                Some((token, scope))
+            })
             .collect()
     }
     // (tokens the store accepted with their repository, indexes of the totals not written)
@@ -483,7 +490,7 @@ pub async fn flush(state: &super::HubState) {
                 in_a_row = 0;
             }
         }
-        Ok((accepted(checked), failed))
+        Ok((accepted(&*store, checked), failed))
     })
     .await;
     // None: the write task failed part-way, so which totals it stored is not known.

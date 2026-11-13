@@ -99,6 +99,7 @@ impl Hub {
         self.store
             .skill_adoption_put(&SkillAdoption {
                 repository: REPO.into(),
+                repository_scope: store::repository_scope("github.com", REPO, Some(1)),
                 source: "default_branch".into(),
                 lock_json: serde_json::to_string(&lock).unwrap(),
                 default_branch: Some("main".into()),
@@ -603,7 +604,10 @@ async fn a_forge_connected_repository_refuses_checkout_adoption_reports() {
         (StatusCode::OK, json!(true)),
         "{put}"
     );
-    let before = hub.store.skill_adoption(REPO).unwrap();
+    let before = hub
+        .store
+        .skill_adoption(&store::repository_scope("github.com", REPO, Some(1)))
+        .unwrap();
 
     let connection = hub
         .store
@@ -644,7 +648,12 @@ async fn a_forge_connected_repository_refuses_checkout_adoption_reports() {
             .contains("agentscm-skills.lock.json on the default branch"),
         "{refused}"
     );
-    assert_eq!(hub.store.skill_adoption(REPO).unwrap(), before);
+    assert_eq!(
+        hub.store
+            .skill_adoption(&store::repository_scope("github.com", REPO, Some(1)))
+            .unwrap(),
+        before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

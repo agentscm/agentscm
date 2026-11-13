@@ -129,7 +129,9 @@ fn full_key(who: &Agent, session: &str) -> String {
 }
 
 fn live(store: &dyn Store, now: i64) -> Vec<Intent> {
-    store.live_intents(REPO, now, 10).unwrap()
+    store
+        .live_intents(&crate::repository_scope::github(REPO, None), now, 10)
+        .unwrap()
 }
 
 /// The live paths of the token's intent.
@@ -871,7 +873,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     // Each person reads their own side, with a third person seeing nothing.
     let (alice_owner, bob_owner) = (owner_of(&*store, 1), owner_of(&*store, 2));
     let bobs = store
-        .handoffs_of_owner(&bob_owner, REPO, T0 + 4, 10)
+        .handoffs_of_owner(
+            &bob_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 4,
+            10,
+        )
         .unwrap();
     assert_eq!(bobs.len(), 1);
     assert_eq!(mine(&bobs), ("pending", true, false));
@@ -886,13 +893,23 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     let carol = owner_of(&*store, 3);
     assert!(
         store
-            .handoffs_of_owner(&carol, REPO, T0 + 4, 10)
+            .handoffs_of_owner(
+                &carol,
+                &crate::repository_scope::github(REPO, None),
+                T0 + 4,
+                10
+            )
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .handoffs_of_owner(&bob_owner, "acme/other", T0 + 4, 10)
+            .handoffs_of_owner(
+                &bob_owner,
+                &crate::repository_scope::github("acme/other", None),
+                T0 + 4,
+                10
+            )
             .unwrap()
             .is_empty()
     );
@@ -907,7 +924,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     assert_eq!(heard.handoffs.len(), 1);
     assert!(heard.handoffs[0].via == Via::Hub && heard.handoffs[0].kind == "grant");
     let alices = store
-        .handoffs_of_owner(&alice_owner, REPO, T0 + 7, 10)
+        .handoffs_of_owner(
+            &alice_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 7,
+            10,
+        )
         .unwrap();
     assert_eq!(mine(&alices), ("granted", true, true));
     assert!(alices[0].requester_told);
@@ -918,7 +940,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
         .unwrap();
     assert!(matches!(again, Asked::Requested { .. }), "{again:?}");
     let late = store
-        .handoffs_of_owner(&bob_owner, REPO, T0 + 9 + HOLD_CAP_SECONDS + 1, 10)
+        .handoffs_of_owner(
+            &bob_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 9 + HOLD_CAP_SECONDS + 1,
+            10,
+        )
         .unwrap();
     assert_eq!(late[0].state, "lapsed");
 
@@ -962,7 +989,12 @@ fn a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told(db: 
     assert_eq!(heard.handoffs.len(), 1);
     assert!(heard.handoffs[0].via == Via::Slack && heard.handoffs[0].kind == "decline");
     let alices = store
-        .handoffs_of_owner(&owner_of(&*store, 1), REPO, T0 + 5, 10)
+        .handoffs_of_owner(
+            &owner_of(&*store, 1),
+            &crate::repository_scope::github(REPO, None),
+            T0 + 5,
+            10,
+        )
         .unwrap();
     assert_eq!(
         (
@@ -1228,7 +1260,12 @@ fn hand_offs_between_two_tokens_name_each_session(db: &Db) {
     );
     // The owner's page: either side's key and kind, whoever reads.
     let views = store
-        .handoffs_of_owner(&owner_of(&*store, 2), REPO, T0 + 3, 10)
+        .handoffs_of_owner(
+            &owner_of(&*store, 2),
+            &crate::repository_scope::github(REPO, None),
+            T0 + 3,
+            10,
+        )
         .unwrap();
     assert_eq!(views[0].requester.key, full_key(&bob, "hb"));
     assert_eq!(views[0].holder.key, full_key(&alice, "ha"));

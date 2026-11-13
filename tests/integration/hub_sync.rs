@@ -3373,6 +3373,7 @@ async fn a_repository_skill_needs_the_forge_and_survives_a_failed_read() {
     env.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&lock).unwrap(),
             default_branch: Some("main".into()),
@@ -3804,7 +3805,9 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
     set_skill_status(&env, "on");
     env.poll().await;
     assert_eq!(last(&env)["state"], "success");
-    env.store.skill_adoption_clear(REPO, None).unwrap();
+    env.store
+        .skill_adoption_clear(&crate::repository_scope::connected(&*env.store, REPO), None)
+        .unwrap();
     env.poll().await;
     assert_eq!(last(&env)["state"], "error");
 
@@ -3819,6 +3822,7 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
         }
         SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&SkillLock {
                 version: 1,
@@ -4170,6 +4174,7 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
     env.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&lock).unwrap(),
             default_branch: Some("main".into()),

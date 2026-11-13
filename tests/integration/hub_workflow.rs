@@ -281,7 +281,14 @@ async fn concurrent_http_claims_and_mcp_participation_fence_overlapping_work() {
         &rejected["structuredContent"]["work"]["conflict"],
         &winner_id,
     );
-    let live = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         live.iter()
             .all(|intent| !intent.paths.contains(&"src/rejected-only.rs".to_owned())),
@@ -374,7 +381,14 @@ async fn concurrent_http_claims_and_mcp_participation_fence_overlapping_work() {
         )
         .await;
     assert_eq!(no_goal["isError"], true, "{no_goal}");
-    let live = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     for refused_path in ["src/outside-declared-scope.rs", "src/no-goal.rs"] {
         assert!(
             live.iter()
@@ -1378,7 +1392,11 @@ async fn takeover_long_poll_and_fixed_pages_follow_current_recipients() {
     let finishing_id = finishing_work["id"].as_str().unwrap().to_owned();
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .any(|intent| intent.paths.contains(&"src/finished-live.rs".to_owned()))
@@ -1401,7 +1419,11 @@ async fn takeover_long_poll_and_fixed_pages_follow_current_recipients() {
     assert_eq!(finished["structuredContent"]["item"]["state"], "finished");
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/finished-live.rs".to_owned()))
@@ -1574,7 +1596,11 @@ fn postgres_finish_and_live_heartbeat_share_one_lock_order() {
     assert!(
         store::open(&database)
             .unwrap()
-            .live_intents(REPOSITORY, now + 2, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 2,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| intent.id != intent_id)
@@ -1694,7 +1720,14 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
         second_repeat["hookSpecificOutput"]["permissionDecision"], "deny",
         "{second_repeat}"
     );
-    let intents = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let intents = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         intents
             .iter()
@@ -1718,7 +1751,11 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
     assert!(!denied(&allowed), "{allowed}");
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .any(|intent| intent.session.as_deref() == Some("default")
@@ -2000,7 +2037,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     ));
     assert!(
         setup
-            .live_intents(REPOSITORY, now + 2, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 2,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-takeover.rs".to_owned()))
@@ -2106,7 +2147,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     let after_takeover = store::open(database).unwrap();
     assert!(
         after_takeover
-            .live_intents(REPOSITORY, takeover_at + 1, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 1,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-takeover.rs".to_owned()))
@@ -2232,7 +2277,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     ));
     assert!(
         after_takeover
-            .live_intents(REPOSITORY, takeover_at + 4, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 4,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-finish.rs".to_owned()))
@@ -2326,7 +2375,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     let finished_store = store::open(database).unwrap();
     assert!(
         finished_store
-            .live_intents(REPOSITORY, takeover_at + 7, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 7,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-finish.rs".to_owned()))

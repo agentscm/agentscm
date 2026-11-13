@@ -374,7 +374,14 @@ async fn a_persistent_run_read_403_does_not_stall_merge_detection() {
         env.publish(n, &format!("{n:040x}"), None).await;
     }
     env.publish(100, OTHER, Some(MERGED)).await;
-    let late = env.store.pull_publications(REPO, 20, 1).unwrap()[0]
+    let late = env
+        .store
+        .pull_publications(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            20,
+            1,
+        )
+        .unwrap()[0]
         .id
         .clone();
     env.seed(|r| {
@@ -390,7 +397,14 @@ async fn a_persistent_run_read_403_does_not_stall_merge_detection() {
     }
     env.pass().await;
     env.pass().await;
-    let publication = env.store.publication(REPO, &late).unwrap().unwrap();
+    let publication = env
+        .store
+        .publication(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            &late,
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(publication.merge_commit, Some("9".repeat(40)));
 }
 
@@ -414,7 +428,11 @@ async fn a_forge_reported_merge_is_recorded_then_its_runs_are_read() {
         ));
     });
     env.pass().await;
-    let publication = env.store.publication(REPO, &id).unwrap().unwrap();
+    let publication = env
+        .store
+        .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+        .unwrap()
+        .unwrap();
     assert_eq!(publication.merge_commit.as_deref(), Some(MERGED));
     assert_eq!(env.runs(MERGED).len(), 1);
 }
@@ -695,7 +713,11 @@ async fn a_list_cut_short_by_the_page_cap_is_marked_incomplete() {
 async fn external_outcomes_change_no_check_or_publication_state() {
     let env = Env::start(true).await;
     let id = env.publish(1, OTHER, Some(MERGED)).await;
-    let before = env.store.publication(REPO, &id).unwrap().unwrap();
+    let before = env
+        .store
+        .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+        .unwrap()
+        .unwrap();
     env.seed(|r| {
         r.runs.push(run_json(
             REPO_ID,
@@ -712,7 +734,13 @@ async fn external_outcomes_change_no_check_or_publication_state() {
     });
     env.pass().await;
     assert_eq!(env.runs(MERGED).len(), 2);
-    assert_eq!(env.store.publication(REPO, &id).unwrap().unwrap(), before);
+    assert_eq!(
+        env.store
+            .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
     assert_eq!(
         env.store
             .forge_check(&env.repo, 1, "agentscm/workflow/main")

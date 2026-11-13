@@ -48,6 +48,8 @@ const MAX_LOCK_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillAdoption {
     pub repository: String,
+    /// What the row is keyed by; see [`super::store::repository_scope`].
+    pub repository_scope: String,
     /// `default_branch` or `reported_by_checkout`.
     pub source: String,
     /// The lock file in canonical JSON.
@@ -64,6 +66,8 @@ pub struct SkillAdoption {
 pub struct EvidenceRow {
     pub id: String,
     pub repository: String,
+    /// What the row is keyed by; see [`super::store::repository_scope`].
+    pub repository_scope: String,
     pub branch: String,
     pub run_id: String,
     pub skill: String,
@@ -81,6 +85,14 @@ pub struct EvidenceRow {
     pub session: String,
     pub agent: String,
     pub recorded_at: i64,
+}
+
+/// A repository as people read it (`name`, which run ids are made of) and as the skill tables
+/// key it (`scope`, see [`super::store::repository_scope`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Repo<'a> {
+    pub name: &'a str,
+    pub scope: &'a str,
 }
 
 /// Which run: the latest row of each (repository, run).
@@ -105,7 +117,7 @@ fn unword<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
 
 impl EvidenceRow {
     fn from_stored(
-        repository: &str,
+        repo: Repo<'_>,
         run_id: &str,
         branch: &str,
         skill: &str,
@@ -115,7 +127,8 @@ impl EvidenceRow {
         let e = &s.evidence;
         Self {
             id: s.id.clone(),
-            repository: repository.to_owned(),
+            repository: repo.name.to_owned(),
+            repository_scope: repo.scope.to_owned(),
             branch: branch.to_owned(),
             run_id: run_id.to_owned(),
             skill: skill.to_owned(),
@@ -270,7 +283,7 @@ fn adopted_pin<'a>(pins: &'a [PinStatus], name: &str) -> Option<&'a PinStatus> {
 /// The run as it stands, or None when its skill is no longer in this binary's catalog.
 fn run_view(
     store: &dyn Store,
-    repo: &str,
+    repo: Repo<'_>,
     head: &RunHead,
     pins: &Adopted,
 ) -> Result<Option<RunView>> {
@@ -278,7 +291,7 @@ fn run_view(
         return Ok(None);
     };
     let stored: Vec<StoredEvidence> = store
-        .skill_evidence(repo, &head.run_id)?
+        .skill_evidence(repo.scope, &head.run_id)?
         .iter()
         .filter_map(EvidenceRow::to_stored)
         .collect();
@@ -292,7 +305,7 @@ fn run_view(
         .unwrap_or_default();
     let identity = RunIdentity {
         run_id: head.run_id.clone(),
-        repo: repo.to_owned(),
+        repo: repo.name.to_owned(),
         branch: head.branch.clone(),
         pull_request: None,
         skill_sha256: head.skill_sha256.clone(),
@@ -308,14 +321,14 @@ fn run_view(
 
 pub(super) fn views(
     store: &dyn Store,
-    repo: &str,
+    repo: Repo<'_>,
     branch: Option<&str>,
     run_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<RunView>> {
-    let pins = pins_of(store.skill_adoption(repo)?.as_ref());
+    let pins = pins_of(store.skill_adoption(repo.scope)?.as_ref());
     let mut out = Vec::new();
-    for head in store.skill_run_heads(repo, branch, run_id, limit)? {
+    for head in store.skill_run_heads(repo.scope, branch, run_id, limit)? {
         out.extend(run_view(store, repo, &head, &pins)?);
     }
     Ok(out)
@@ -350,13 +363,13 @@ fn enforce_stop(view: &RunView) -> bool {
     })
 }
 
-fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
+fn library(store: &dyn Store, repo: Option<Repo<'_>>) -> Result<Value> {
     let mut catalog = json!(supported::catalog());
-    let mut adoption = json!({"repo": repo.unwrap_or(""), "source": "none", "observed_at": null,
+    let mut adoption = json!({"repo": repo.map_or("", |r| r.name), "source": "none", "observed_at": null,
         "default_branch": null, "pins": []});
     let mut counts = BTreeMap::new();
     if let Some(repo) = repo {
-        let stored = store.skill_adoption(repo)?;
+        let stored = store.skill_adoption(repo.scope)?;
         if let Some(a) = &stored {
             adoption["source"] = json!(a.source);
             adoption["observed_at"] = json!(a.observed_at);
@@ -443,7 +456,7 @@ fn stored_local(lock: &SkillLock, bundles: Vec<supported::LocalBundle>) -> Optio
 }
 
 /// Stores a lock a checkout reported; the forge's own reading, when there is one, still wins.
-fn report_adoption(store: &dyn Store, repo: &str, token: &str, body: &[u8]) -> Out<Value> {
+fn report_adoption(store: &dyn Store, repo: Repo<'_>, token: &str, body: &[u8]) -> Out<Value> {
     let lock =
         SkillLock::parse(body).map_err(|e| bad_request(format!("invalid lock file: {e}")))?;
     // A checkout's files are whatever its branch says: a repository skill's definition and
@@ -459,7 +472,8 @@ fn report_adoption(store: &dyn Store, repo: &str, token: &str, body: &[u8]) -> O
     }
     let lock_json = serde_json::to_string(&lock).map_err(|_| bad_request("unserializable lock"))?;
     let applied = store.skill_adoption_put(&SkillAdoption {
-        repository: repo.to_owned(),
+        repository: repo.name.to_owned(),
+        repository_scope: repo.scope.to_owned(),
         source: "reported_by_checkout".into(),
         lock_json: lock_json.clone(),
         default_branch: None,
@@ -477,7 +491,7 @@ fn report_adoption(store: &dyn Store, repo: &str, token: &str, body: &[u8]) -> O
 }
 
 struct Recorder<'a> {
-    repo: &'a str,
+    repo: Repo<'a>,
     token: &'a str,
     agent: &'a str,
     session: Option<&'a str>,
@@ -493,7 +507,7 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
         .clone()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| bad_request("branch is required"))?;
-    let pins = pins_of(store.skill_adoption(who.repo)?.as_ref());
+    let pins = pins_of(store.skill_adoption(who.repo.scope)?.as_ref());
     let pin = adopted_pin(&pins.pins, &skill).ok_or_else(|| {
         conflict(
             "not_adopted",
@@ -505,9 +519,9 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
         .ok_or_else(|| conflict("not_adopted", format!("skill {skill} is not available")))?;
     let now = unix_now();
     let session = store.session_name_for(who.token, who.session, now)?;
-    let run_id = run_id_of(who.repo, &branch, &skill);
+    let run_id = run_id_of(who.repo.name, &branch, &skill);
     let existing: Vec<StoredEvidence> = store
-        .skill_evidence(who.repo, &run_id)?
+        .skill_evidence(who.repo.scope, &run_id)?
         .iter()
         .filter_map(EvidenceRow::to_stored)
         .collect();
@@ -667,9 +681,9 @@ pub(super) async fn sync_adoption(
         Ok(read) => read,
         Err(error) => {
             crate::hub::error_envelope::log_internal(&error);
-            let (store, name) = (state.store.clone(), repo.full_name.clone());
+            let (store, scope) = (state.store.clone(), repo.repository_scope());
             let cleared = blocking(state, move || {
-                store.skill_adoption_clear(&name, Some("reported_by_checkout"))
+                store.skill_adoption_clear(&scope, Some("reported_by_checkout"))
             })
             .await;
             if let Err(error) = cleared {
@@ -695,11 +709,16 @@ pub(super) async fn sync_adoption(
             Err(error) => return crate::hub::error_envelope::log_internal(&error),
         }
     }
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, name, scope) = (
+        state.store.clone(),
+        repo.full_name.clone(),
+        repo.repository_scope(),
+    );
     let done = blocking(state, move || match lock {
         Some(lock) => store
             .skill_adoption_put(&SkillAdoption {
                 repository: name,
+                repository_scope: scope.clone(),
                 source: "default_branch".into(),
                 lock_json: serde_json::to_string(&lock)
                     .map_err(|_| HubError::Invalid("lock".into()))?,
@@ -709,7 +728,7 @@ pub(super) async fn sync_adoption(
                 local_skills: stored_local(&lock, bundles),
             })
             .map(|_| ()),
-        None => store.skill_adoption_clear(&name, None),
+        None => store.skill_adoption_clear(&scope, None),
     })
     .await;
     if let Err(error) = done {
@@ -1014,11 +1033,11 @@ async fn forge_facts(
 /// skills' entries with their runs on the branch after recording.
 fn record_observed(
     store: &dyn Store,
-    repo: &str,
+    repo: Repo<'_>,
     pull: &ForgePull,
     facts: &[Fact],
 ) -> Result<Vec<(supported::CatalogEntry, Option<RunView>)>> {
-    let pins = pins_of(store.skill_adoption(repo)?.as_ref());
+    let pins = pins_of(store.skill_adoption(repo.scope)?.as_ref());
     let mut out = Vec::new();
     for pin in pins
         .pins
@@ -1032,9 +1051,9 @@ fn record_observed(
             .manifest
             .effective_params(pin.pin.params.as_ref())
             .unwrap_or_default();
-        let run_id = run_id_of(repo, &pull.branch, &pin.pin.name);
+        let run_id = run_id_of(repo.name, &pull.branch, &pin.pin.name);
         let mut existing: Vec<StoredEvidence> = store
-            .skill_evidence(repo, &run_id)?
+            .skill_evidence(repo.scope, &run_id)?
             .iter()
             .filter_map(EvidenceRow::to_stored)
             .collect();
@@ -1230,8 +1249,8 @@ const RETIRED: &str = "No longer published by the Hub for this repository.";
 /// the pass moves on; a slow forge never stalls the provider-context pass.
 const FORGE_SECONDS: u64 = 10;
 
-fn adopted_names(store: &dyn Store, repo: &str) -> Result<Vec<String>> {
-    Ok(pins_of(store.skill_adoption(repo)?.as_ref())
+fn adopted_names(store: &dyn Store, scope: &str) -> Result<Vec<String>> {
+    Ok(pins_of(store.skill_adoption(scope)?.as_ref())
         .pins
         .iter()
         .filter(|p| p.status == AdoptionStatus::Adopted)
@@ -1239,8 +1258,8 @@ fn adopted_names(store: &dyn Store, repo: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn adopted(store: &dyn Store, repo: &str) -> Result<bool> {
-    Ok(!adopted_names(store, repo)?.is_empty())
+fn adopted(store: &dyn Store, scope: &str) -> Result<bool> {
+    Ok(!adopted_names(store, scope)?.is_empty())
 }
 
 /// Skill names whose status the combined status shows as `success`.
@@ -1282,13 +1301,16 @@ pub(super) async fn observe_open_pull(
     let Some(pull) = ForgePull::read(repo, fields) else {
         return;
     };
-    let (store, name, id) = (
+    let (store, scope, id) = (
         state.store.clone(),
-        repo.full_name.clone(),
+        repo.repository_scope(),
         repo.repository_id,
     );
     let read = blocking(state, move || {
-        Ok((adopted_names(&*store, &name)?, status_setting(&*store, id)?))
+        Ok((
+            adopted_names(&*store, &scope)?,
+            status_setting(&*store, id)?,
+        ))
     })
     .await;
     let (names, setting) = match read {
@@ -1327,9 +1349,18 @@ async fn open_pull_work(
     if !names.is_empty() {
         let facts = forge_facts(state, repo, token, &read, &pull.head, None).await?;
         now = facts.iter().map(|f| f.kind).collect();
-        let (store, name, observed) = (state.store.clone(), repo.full_name.clone(), pull.clone());
+        let (store, name, scope, observed) = (
+            state.store.clone(),
+            repo.full_name.clone(),
+            repo.repository_scope(),
+            pull.clone(),
+        );
         runs = blocking(state, move || {
-            record_observed(&*store, &name, &observed, &facts)
+            let repo = Repo {
+                name: &name,
+                scope: &scope,
+            };
+            record_observed(&*store, repo, &observed, &facts)
         })
         .await
         .map_err(|error| GhError::Failed(error.to_string()))?;
@@ -1386,8 +1417,8 @@ pub(super) async fn observe_merge(
     let Some(pull) = ForgePull::read(repo, fields) else {
         return;
     };
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
-    if !blocking(state, move || adopted(&*store, &name))
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
+    if !blocking(state, move || adopted(&*store, &scope))
         .await
         .unwrap_or(false)
     {
@@ -1417,9 +1448,17 @@ pub(super) async fn observe_merge(
             short(&pull.head)
         ),
     });
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, name, scope) = (
+        state.store.clone(),
+        repo.full_name.clone(),
+        repo.repository_scope(),
+    );
     if let Err(error) = blocking(state, move || {
-        record_observed(&*store, &name, &pull, &facts).map(|_| ())
+        let repo = Repo {
+            name: &name,
+            scope: &scope,
+        };
+        record_observed(&*store, repo, &pull, &facts).map(|_| ())
     })
     .await
     {
@@ -1577,7 +1616,15 @@ async fn library_route(
         scope(&principal, repo)?;
     }
     let store = state.store.clone();
-    let value = blocking(&state, move || library(&*store, query.repo.as_deref())).await?;
+    let rows = super::store::scope_of(&state, &principal).await?;
+    let value = blocking(&state, move || {
+        let repo = query
+            .repo
+            .as_deref()
+            .map(|name| Repo { name, scope: &rows });
+        library(&*store, repo)
+    })
+    .await?;
     Ok(Json(value))
 }
 
@@ -1589,6 +1636,7 @@ async fn adoption_route(
 ) -> Out<Json<Value>> {
     scope(&principal, &repo)?;
     let store = state.store.clone();
+    let rows = super::store::scope_of(&state, &principal).await?;
     let token = principal.token_id;
     let (host, repository_id) = (principal.owner.identity.host, principal.repository_id);
     blocking(&state, move || {
@@ -1603,7 +1651,11 @@ async fn adoption_route(
                 ),
             )));
         }
-        Ok(report_adoption(&*store, &repo, &token, &body))
+        let repo_rows = Repo {
+            name: &repo,
+            scope: &rows,
+        };
+        Ok(report_adoption(&*store, repo_rows, &token, &body))
     })
     .await?
     .map(Json)
@@ -1632,8 +1684,13 @@ async fn runs_route(
     let store = state.store.clone();
     // Filtering happens after evaluation, so scan the newest MAX_RUNS runs.
     let viewer = principal.owner.id.clone();
+    let rows = super::store::scope_of(&state, &principal).await?;
     let all = blocking(&state, move || {
-        let mut all = views(&*store, &repo, None, None, MAX_RUNS)?;
+        let repo = Repo {
+            name: &repo,
+            scope: &rows,
+        };
+        let mut all = views(&*store, repo, None, None, MAX_RUNS)?;
         shown_runs(&*store, &viewer, &mut all)?;
         Ok(all)
     })
@@ -1661,7 +1718,12 @@ async fn by_branch_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let mut found = blocking(&state, move || {
-        let mut found = views(&*store, &repo, Some(&query.branch), None, 1)?;
+        let rows = super::store::principal_scope(&*store, &principal)?;
+        let repo = Repo {
+            name: &repo,
+            scope: &rows,
+        };
+        let mut found = views(&*store, repo, Some(&query.branch), None, 1)?;
         shown_runs(&*store, &principal.owner.id, &mut found)?;
         Ok(found)
     })
@@ -1677,7 +1739,12 @@ async fn run_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let mut found = blocking(&state, move || {
-        let mut found = views(&*store, &repo, None, Some(&run_id), 1)?;
+        let rows = super::store::principal_scope(&*store, &principal)?;
+        let repo = Repo {
+            name: &repo,
+            scope: &rows,
+        };
+        let mut found = views(&*store, repo, None, Some(&run_id), 1)?;
         shown_runs(&*store, &principal.owner.id, &mut found)?;
         Ok(found)
     })
@@ -1702,10 +1769,14 @@ async fn evidence_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let view = blocking(&state, move || {
+        let rows = super::store::principal_scope(&*store, &principal)?;
         let mut out = record(
             &*store,
             Recorder {
-                repo: &repo,
+                repo: Repo {
+                    name: &repo,
+                    scope: &rows,
+                },
                 token: &principal.token_id,
                 agent: &principal.name,
                 session: request.session.as_deref(),
@@ -1934,9 +2005,17 @@ pub(super) async fn mcp_call(
             if repo != principal.repository {
                 return other_repository();
             }
+            let rows = match super::store::scope_of(state, principal).await {
+                Ok(rows) => rows,
+                Err(e) => return hub_failure(&e),
+            };
             let read = blocking(state, move || {
-                let pins = pins_of(store.skill_adoption(&repo)?.as_ref());
-                Ok((library(&*store, Some(&repo))?, pins))
+                let pins = pins_of(store.skill_adoption(&rows)?.as_ref());
+                let repo = Repo {
+                    name: &repo,
+                    scope: &rows,
+                };
+                Ok((library(&*store, Some(repo))?, pins))
             })
             .await;
             match read {
@@ -1953,8 +2032,16 @@ pub(super) async fn mcp_call(
                 return other_repository();
             }
             let viewer = principal.owner.id.clone();
+            let rows = match super::store::scope_of(state, principal).await {
+                Ok(rows) => rows,
+                Err(e) => return hub_failure(&e),
+            };
             let found = blocking(state, move || {
-                let mut found = views(&*store, &repo, Some(&branch), None, MAX_RUNS)?;
+                let repo = Repo {
+                    name: &repo,
+                    scope: &rows,
+                };
+                let mut found = views(&*store, repo, Some(&branch), None, MAX_RUNS)?;
                 shown_runs(&*store, &viewer, &mut found)?;
                 Ok(found)
             })
@@ -2003,11 +2090,18 @@ pub(super) async fn mcp_call(
                 a.session,
             );
             let viewer = principal.owner.id.clone();
+            let rows = match super::store::scope_of(state, principal).await {
+                Ok(rows) => rows,
+                Err(e) => return hub_failure(&e),
+            };
             let out = blocking(state, move || {
                 let mut out = record(
                     &*store,
                     Recorder {
-                        repo: &repo,
+                        repo: Repo {
+                            name: &repo,
+                            scope: &rows,
+                        },
                         token: &token,
                         agent: &agent,
                         session: session.as_deref(),

@@ -1808,7 +1808,7 @@ async fn candidate_attempt_survives_unreadable_success_store_failure_and_list_la
         }
         assert_eq!(
             env.store
-                .publication(REPO, &id)
+                .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
                 .unwrap()
                 .unwrap()
                 .branch_state,
@@ -1922,7 +1922,10 @@ async fn stale_candidate_handler(env: Env) {
     let retained_id = bid.clone();
     assert!(
         tokio::task::spawn_blocking(move || store
-            .publication(REPO, &retained_id)
+            .publication(
+                &crate::repository_scope::connected(&*store, REPO),
+                &retained_id
+            )
             .unwrap()
             .unwrap()
             .pr_number
@@ -1988,7 +1991,7 @@ async fn refused_candidate_allows_manual_adoption_after_target_moves() {
     );
     assert_eq!(
         env.store
-            .publication(REPO, &id)
+            .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
             .unwrap()
             .unwrap()
             .branch_state,
@@ -2102,9 +2105,16 @@ async fn publications_list_newest_first_and_read_only_reads_call_no_forge() {
         assert_eq!(status, 200, "{reply}");
         created.push(reply["id"].as_str().unwrap().to_owned());
     }
-    let (_, reader, _) =
-        store::mint_bound_agent_token(&*env.store, &env.owner, "status-page", REPO, 1, 3600, true)
-            .unwrap();
+    let (_, reader, _) = store::mint_bound_agent_token(
+        &*env.store,
+        &env.owner,
+        "status-page",
+        REPO,
+        REPO_ID,
+        3600,
+        true,
+    )
+    .unwrap();
     let reader = reader.expose().to_owned();
 
     let mut listed = Vec::new();

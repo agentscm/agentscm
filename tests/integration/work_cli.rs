@@ -420,7 +420,10 @@ fn repair_merge_previews_and_applies_only_the_guarded_retained_failure() {
     );
     assert_eq!(
         hub.store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(991)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -484,7 +487,10 @@ fn repair_merge_previews_and_applies_only_the_guarded_retained_failure() {
     );
     assert_eq!(
         hub.store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(991)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -539,7 +545,10 @@ fn repair_merge_previews_and_applies_only_the_guarded_retained_failure() {
     );
     assert_eq!(
         hub.store
-            .publication(REPOSITORY, &valid_publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(991)),
+                &valid_publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit

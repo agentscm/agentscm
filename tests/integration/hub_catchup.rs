@@ -1419,7 +1419,10 @@ fn failed_publication_projection_can_be_repaired(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(252)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1458,7 +1461,10 @@ fn failed_publication_projection_can_be_repaired(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(252)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1662,7 +1668,10 @@ fn publication_repair_accepts_canonical_forge_observation(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(257)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1687,7 +1696,10 @@ fn publication_repair_accepts_canonical_forge_observation(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(257)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1760,7 +1772,10 @@ fn strict_publication_repair_rolls_back_projection_failure(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(256)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1792,7 +1807,10 @@ fn strict_publication_repair_rolls_back_projection_failure(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(256)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -2008,7 +2026,10 @@ fn postgres_projection_sql_failure_isolated_by_savepoint_and_retryable() {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(254)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -2099,8 +2120,8 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
         .execute(
             "INSERT INTO hub_publications
                 (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,
-                 branch_state,pr_number,merge_commit,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,'merged',?9,?10,?11,?11)",
+                 branch_state,pr_number,merge_commit,created_at,updated_at,repository_scope)
+             VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,'merged',?9,?10,?11,?11,?12)",
             rusqlite::params![
                 "pub_00000000000000000000000000000001",
                 REPOSITORY,
@@ -2113,6 +2134,7 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
                 301,
                 format!("{:040x}", 3),
                 now - 100,
+                crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
             ],
         )
         .unwrap();
