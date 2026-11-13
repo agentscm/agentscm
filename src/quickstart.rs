@@ -1471,7 +1471,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         );
         #[cfg(target_os = "macos")]
-        println!("  - remove the Start at Login entry an earlier version's menu bar app left, if there is one");
+        println!(
+            "  - remove the Start at Login entry an earlier version's menu bar app left, if there is one"
+        );
     }
     if let Some(l) = &m.local_hub {
         println!(
