@@ -586,14 +586,26 @@ impl Slack {
             if !first {
                 continue;
             }
+            // One binding's failure is that binding's: the others still get their messages, and
+            // this one is read again at its next scan.
             let status = {
-                let _slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
-                let principal = match self.principal(state, binding) {
-                    Ok(p) => p,
-                    Err(HubError::Unauthorized) => continue,
-                    Err(e) => return Err(e),
+                let Ok(_slot) = state.permits.try_acquire() else {
+                    continue;
                 };
-                actionable_status::read(&*state.store, &state.onboarding, &principal, now)?
+                let read = self.principal(state, binding).and_then(|principal| {
+                    actionable_status::read(&*state.store, &state.onboarding, &principal, now)
+                });
+                match read {
+                    Ok(status) => status,
+                    Err(HubError::Unauthorized) => continue,
+                    Err(error) => {
+                        eprintln!(
+                            "Slack wait collection skipped {}: {error}",
+                            binding.config.repository
+                        );
+                        continue;
+                    }
+                }
             };
             let link = self.link("box-needs");
             let mut db = self.database()?;
