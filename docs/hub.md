@@ -319,14 +319,17 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each
-  person's forge answer (readable or not) for a repository for 90 seconds and reuses it for this
-  list only, so a granted or lost access shows here within 90 seconds; minting a token always asks
-  the forge. Answers are never shared between people, a forge that could not answer is never kept,
+  person's forge answer (readable or not) for a repository for 90 seconds and reuses it for every
+  repository list (this one, the device list, the agent list and value metrics) and for the web
+  pages' polls of dismissals and agent messages, so a granted or lost access shows there within 90
+  seconds (about two minutes for the agent list, which also reuses its whole answer for 30 seconds
+  per token); minting a token, a read token and every change always ask the forge, except a
+  person's own dismissals, which change nothing anyone else sees. Answers are never shared between people, a forge that could not answer is never kept,
   at most 1,024 answers are held, and signing out forgets that person's. A call past those 90
   seconds makes one forge request per repository, so the page asks every two minutes.
-- `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list and
-  fresh forge-role checks on every call for the macOS work panel; it does not use the web list's
-  90-second role cache. It returns the same bounded repository
+- `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list check
+  on every call, and the same forge-role check with the web list's 90-second role cache, for the
+  macOS work panel. It returns the same bounded repository
   summaries plus each repository's current Work title, lead agent, reported state, claim status
   and next action, plus bounded live session or intent agent/task labels. Unreadable repositories
   are omitted; failed access checks are counted in `unchecked` without naming the repository.
