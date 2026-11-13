@@ -154,6 +154,12 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+// #295 root cause: a SessionStart from a later session, after another hook session had
+// adopted the durable `default` Work, got `Invalid("durable default work is already bound to
+// another hook session")`, which the hook route reported as "invalid hook payload". #344 removed
+// that error. The later-new-session case reproduced locally (in-process Hub on SQLite) at
+// aaaaaa9a, the reported build, and at v0.2.1; first start, replay and resume did not. The
+// hosted Hub that reported it was not re-checked.
 async fn i295_startup_scenario(scenario: &str) {
     let mut hub = Hub::start().await;
     let secret = hub.agent();

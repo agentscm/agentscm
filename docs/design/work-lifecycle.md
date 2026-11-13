@@ -469,7 +469,7 @@ a reopen's or resume's overlap; the apply does, inside its own transaction, with
 the same actor, and returns one outcome per item. A refused item never stops the rest; an exact
 retry of the batch replays applied items through their `operation_id` and retries the others.
 Refusals carry a fixed code and sentence, never the store's internal text, except a `LEASE_LAPSED`
-refusal, which every surface already passes through. The shared error envelope (#314) will carry
+refusal, which every surface already passes through. The shared error envelope (#314) carries
 the same codes for single calls.
 
 ### Resolving before a duplicate

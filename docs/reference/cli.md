@@ -443,14 +443,16 @@ A saved token is configuration, not proof of coordination. Each connection repor
 | `authenticated` | The Hub accepted the token during this check. |
 | `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
 | `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
-| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `expired` | The token ended and nothing renewed it, whatever the Hub answers. |
 | `revoked` | The Hub rejected a token that has not ended. |
-| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+| `unreachable` | The Hub did not answer, or gave an error or an unreadable answer; hooks fail open, so coordination is unknown. |
 
 `coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
-for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
-Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
-same state and build, and stops with the reason when the Hub does not accept the token.
+for the checkout; `partial`, `unverified` and `unknown` otherwise. Whenever the Hub answered a check,
+including with a refusal or an error status, `hub_build` (version and commit) is reported when the
+Hub states one; it is absent when the Hub did not answer. `client doctor` prints the same state
+and build, and stops with the reason, naming the build when known, when the Hub does not accept
+the token.
 
 ## Shared actionable status
 

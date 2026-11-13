@@ -307,11 +307,7 @@ async fn status(args: StatusArgs) -> Result<()> {
             hub_check_text(&connection.hub_check, now),
         );
         println!("  connection: {}", connection.health.summary());
-        if let crate::client_status::HubCheck::Valid {
-            hub_build: Some(build),
-            ..
-        } = &connection.hub_check
-        {
+        if let Some(build) = connection.hub_check.build() {
             println!("  Hub build: {}", build.label());
         }
         println!(
@@ -365,7 +361,7 @@ fn hub_check_text(check: &crate::client_status::HubCheck, now: i64) -> String {
             crate::hub_cli::when(*expires_at, now)
         ),
         HubCheck::Rejected { .. } => "rejected the saved sign-in or token".to_owned(),
-        HubCheck::Unavailable { .. } => "did not answer".to_owned(),
+        HubCheck::Unavailable { .. } => "did not answer or answered with an error".to_owned(),
         HubCheck::InvalidResponse { .. } => "gave an answer AgentSCM could not read".to_owned(),
     }
 }
@@ -1862,7 +1858,11 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
         .find(|status| status.root == root)
         .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub."))?;
     let crate::client_status::HubCheck::Valid { hub_build, .. } = &status.hub_check else {
-        return Err(invalid(&status.health.summary()));
+        let summary = status.health.summary();
+        return Err(invalid(&match status.hub_check.build() {
+            Some(build) => format!("{summary} (Hub build: {})", build.label()),
+            None => summary,
+        }));
     };
     // --json stays one JSON document; the connection lines are for a person.
     if !args.json {
