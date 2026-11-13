@@ -103,7 +103,8 @@ The Hub is only as available as your computer.
 Deploying a Hub on a server is your job, and it is not supported in the alpha. Ask your coding
 agent to follow [hosted setup](hosted.md) with you. Then everyone joins with `--hub-url`.
 
-Flags shown by `npx agentscm --help`:
+Flags shown by `npx agentscm quickstart --help` (`npx agentscm --help` prints the program's own
+command list instead; `install.sh --help` shows these flags):
 
 | Flag | What it does |
 |---|---|

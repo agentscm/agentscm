@@ -555,8 +555,7 @@ start; until then they stop working (401 `sign_in_required`).
 
 ## Routes
 
-- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"capacity":{"recent_limits":0,"last_refused_at":null},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `capacity` counts the repository limits that refused an agent write in the last day and gives the newest refusal time, without naming a repository; it is `null` when the refusal record could not be read. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
-  (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
+- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"capacity":{"recent_limits":0,"last_refused_at":null},"version":"<version>","commit":"<40 hex>"|null}`. `version` is the Hub binary's own version. `coordination` holds the warn-once counters (see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)). `capacity` counts the repository limits that refused an agent write in the last day and gives the newest refusal time, without naming a repository; it is `null` when the refusal record could not be read. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older. The reply adds
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
   token's id, name, repository and expiry, and its owner, plus
@@ -654,13 +653,23 @@ on no others:
 - `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
 - `GET /v1/hub/repos/{repo}/retention` (the Hub's retention limits for the repository and the
   stand-up bytes it holds now; see the [API](api.md#hub-retention))
+- `GET /v1/hub/standup/operational`, and for one Work `GET /v1/hub/standup/work/{id}/usage`,
+  `/operational`, `/reconciliation` and `/pr-link`
+- `GET /v1/hub/standup/dependency-notices` and `GET /v1/hub/standup/overlap/consents`
+- `GET /v1/hub/repos/{repo}/deploy-workflow`
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
-  `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
-  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_work_usage_reports`, `agentscm_change_record`, `agentscm_pr_context`,
-  `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
-  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_why`, `agentscm_work_repositories`,
-  `agentscm_publications_list`, `agentscm_workflow_runs_list`,
-  `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
+  `agentscm_work_status`, `agentscm_work_briefing`, `agentscm_work_overview`, `agentscm_show_overview`,
+  `agentscm_work_catchup`, `agentscm_work_catchup_ack`, `agentscm_briefing_read`, `agentscm_briefing_pending`,
+  `agentscm_work_preflight`, `agentscm_work_intent`, `agentscm_work_recovery`, `agentscm_work_recovery_preview`,
+  `agentscm_work_dependency_notices`, `agentscm_work_overlap_consents`, `agentscm_work_declarations`,
+  `agentscm_work_reconciliation`, `agentscm_work_insight`, `agentscm_work_insights`,
+  `agentscm_work_usage_reports`, `agentscm_value_metrics`, `agentscm_contribution_receipt`,
+  `agentscm_change_record`, `agentscm_pr_context`, `agentscm_work_pr_link`,
+  `agentscm_shared_conversation`, `agentscm_workflow_status`, `agentscm_work_search`, `agentscm_why`,
+  `agentscm_work_repositories`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_coordination_inbox`, `agentscm_skill_list`, `agentscm_skill_status`,
+  `agentscm_promises_list`, `agentscm_promise_show` and `agentscm_promise_history`. Setting a pull-request
+  link (`agentscm_work_pr_link_set`, `POST /v1/hub/standup/pr-link`) needs an ordinary agent token
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
 creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
@@ -1075,7 +1084,7 @@ decision checkpoint.
 command line) answers why a commit or a path exists: the Work recorded for it, newest first, with
 its description, latest checkpoint and decision checkpoints. A commit resolves only through a pull
 request and its linked Work; a path resolves through declared Work scope. `known: false` means the
-Hub recorded no Work for it. The opt-in tool `agentscm_work_repositories` (as
+Hub recorded no Work for it. The tool `agentscm_work_repositories`, listed by default (as
 `GET /v1/hub/standup/repositories`) lists current Work in every connected repository on the person's
 forge host that the token's person can read now, redacted as other Work reads are; see
 [agents](agents.md#work-in-your-persons-other-repositories) and [API](api.md).
@@ -1351,7 +1360,7 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer, and a Claude Code lead's background waiter wakes it once for one it has not acknowledged (see [Waking an idle Claude Code session](agent-messages.md#waking-an-idle-claude-code-session)). It shows in the Dashboard's Needs you only when that lead is live but has not acknowledged it 10 minutes after it was made: then it is one action for the lead's person (and for the Work's owner, if someone else), naming the request, the files, the requester and the time since which the lead has not responded; that person answers it for their agent from the Inbox, or the owner releases that Work's hold so the asker's next start takes the files. Only the acknowledgement counts as responding: a renewed lease, a checkpoint or a connection that looks live does not. The row every reader sees, the asker's included, says so; before that it says when it will be raised, or that the lead acknowledged it and has not replied. When that lead is paused or quiet it is not raised there (the [Slack adapter](slack.md), where set up, tells that lead's person): the refused agent's `agentscm_start` reply says its lead is not running only when that lead's session is also not live; a quiet or paused Work whose session is live can still reply, and a session that could not be checked is reported as unknown. The reply promises no lapse, since a hold can be retained: `agentscm_work_status` says whether it lapses, and the asker reads `agentscm_coordination_inbox` for a reply. Once the target's hold has lapsed the asker's next start takes the files. Between two agents of one person it is never raised: the asking agent asks that person in its session, History (Finished, Changes, Change records, and Files from this
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer, and a Claude Code lead's background waiter wakes it once for one it has not acknowledged (see [Waking an idle Claude Code session](agent-messages.md#waking-an-idle-claude-code-session)). It shows in the Dashboard's Needs you only when that lead is live but has not acknowledged it 10 minutes after it was made: then it is one action for the lead's person (and for the Work's owner, if someone else), naming the request, the files, the requester and the time since which the lead has not responded; that person answers it for their agent from the Inbox, or the owner releases that Work's hold so the asker's next start takes the files. Only the acknowledgement counts as responding: a renewed lease, a checkpoint or a connection that looks live does not. The row every reader sees, the asker's included, says so; before that it says when it will be raised, or that the lead acknowledged it and has not replied. When that lead is paused or quiet it is not raised there, and the [Slack adapter](slack.md) does not send it either (by default Slack sends only `session_waiting`): the refused agent's `agentscm_start` reply says its lead is not running only when that lead's session is also not live; a quiet or paused Work whose session is live can still reply, and a session that could not be checked is reported as unknown. The reply promises no lapse, since a hold can be retained: `agentscm_work_status` says whether it lapses, and the asker reads `agentscm_coordination_inbox` for a reply. Once the target's hold has lapsed the asker's next start takes the files. Between two agents of one person it is never raised: the asking agent asks that person in its session, History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in
