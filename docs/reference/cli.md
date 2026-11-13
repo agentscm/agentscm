@@ -443,7 +443,7 @@ A saved token is configuration, not proof of coordination. Each connection repor
 | `authenticated` | The Hub accepted the token during this check. |
 | `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
 | `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
-| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `expired` | The token ended and nothing renewed it, whatever the Hub answers. |
 | `revoked` | The Hub rejected a token that has not ended. |
 | `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
 
