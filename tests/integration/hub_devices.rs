@@ -1415,6 +1415,28 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
         context(&reply).contains("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
+    // The refusal is visible without opening the Hub: the token still works, so status says the
+    // renewal failed, and says what to do.
+    let root = machine.root();
+    let (ok, status, stderr) = machine.run(&[
+        "client",
+        "status",
+        "--json",
+        "--check",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let status: Value = serde_json::from_str(&status).unwrap();
+    let health = &status["connections"][0]["health"];
+    assert_eq!(health["state"], "renewal_failed", "{status}");
+    assert!(
+        health["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask a repository owner for"),
+        "{health}"
+    );
 
     // Revoking the computer signs it out: renewal says so, and nothing re-enrolls it.
     env.role(ALICE, "write", "write", 30);
@@ -1441,6 +1463,93 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// Two renewals that fall due together (two hooks, or a hook and a person) leave one live token:
+/// neither reports a failure, and the token the losing process minted is revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renewals_leave_one_live_token() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let (ok, _, stderr) = machine.run(&["hub", "login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    let first_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(env.whoami(&first).await, 200);
+    let alice = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let live = |env: &Env| -> Vec<String> {
+        let now = unix_now();
+        let mut ids: Vec<String> = env
+            .store
+            .list_agent_tokens(&alice.id)
+            .unwrap()
+            .into_iter()
+            .filter(|token| !token.revoked && token.expires_at > now)
+            .map(|token| token.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(live(&env), std::slice::from_ref(&first_id));
+
+    machine.age_token();
+    let root = machine.root();
+    let spawn = || {
+        machine
+            .command(&[
+                "--no-telemetry",
+                "client",
+                "renew",
+                "--root",
+                root.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // Both processes are running before either is waited on.
+    let children = [spawn(), spawn()];
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reply: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        // Which process wins is not fixed; neither may report the renewal as failed.
+        assert!(
+            ["renewed", "not_due"].contains(&reply["result"].as_str().unwrap()),
+            "{reply}"
+        );
+    }
+
+    let saved = machine.token();
+    let saved_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(saved_id, first_id);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&saved).await, 200);
+    // A token minted by the losing process was revoked: only the saved one is live.
+    assert_eq!(live(&env), [saved_id]);
 }
 
 /// Signing in again replaces this computer's credential, which revokes the agent tokens it
