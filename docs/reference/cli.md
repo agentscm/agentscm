@@ -6,7 +6,7 @@ title: "Native CLI reference"
 
 > **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [connected local page](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
 
-`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
+`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `hub whoami`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
 
 ## Commands
 
@@ -421,7 +421,7 @@ agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--dry-run` (print every file and setting it would write, then stop), `--json` (one JSON object on stdout; progress on stderr). `--no-collisions` and `--tray` are accepted for older scripts and do nothing.
 
 ### Client status
 
@@ -454,7 +454,7 @@ same state and build, and stops with the reason when the Hub does not accept the
 
 ## Shared actionable status
 
-`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. Row evidence includes claim freshness, agent report kind/time and provider source coverage/check times; the overall read time is separate. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion.
+`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. Row evidence includes claim freshness, agent report kind/time and provider source coverage/check times; the overall read time is separate. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion on its own (the Hub's own [completion of merged Work](../standup.md#completion-of-merged-work) is a recorded transition, not an inference).
 
 ## Usage telemetry
 
@@ -483,7 +483,7 @@ agentscm demo [--no-open]
 
 ```sh
 agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--yes]
-agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called by agents, not by people
+agentscm hook <claude|codex|cursor|copilot|gemini|generic> [--hub-url URL]   # called by agents, not by people
 ```
 
 `init-repo` writes only the committed agent instruction files for the chosen agents (all five by default) into the Git repository you are in: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursor/rules/agentscm.mdc` and `.github/copilot-instructions.md`. It writes no MCP config, hooks or token. It needs no data directory and is idempotent. `--hub-url` (default: `AGENTSCM_HUB_URL`, then `hub.json`) fills in the setup command in those files and in the next steps it prints; without one they keep a `<HUB_URL>` placeholder. Each developer then runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout. (`init` is the unrelated command that prepares a data directory.) `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`; the hooks `client setup` writes instead pass `--client-connection` (also accepted for `gemini`), which uses only the checkout's saved connection and cannot be combined with `--hub-url` or `--repo`. Details, the file list and limits: [supported agents](../agents.md).

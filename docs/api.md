@@ -350,8 +350,8 @@ the UI and the MCP text.
 keeps at most 256 evidence records. Refusals are 409 with `{error, message}`: `not_adopted` (the
 skill is not an `adopted` pin), `stale_head`, `not_independent`, `unknown_gate` and `run_full`;
 malformed evidence is 400. Adoption is read from `agentscm-skills.lock.json` on the default branch of
-a connected repository about every five minutes (GitHub only reads are exercised by tests; GitLab
-reads the file through its raw-file API and accepts JSON files only). A missing or invalid file there
+a connected repository about every five minutes (GitHub and GitLab both read the file as its exact bytes; GitLab
+through its repository files API). A missing or invalid file there
 clears the forge adoption.
 
 MCP tools: `agentscm_skill_list {repo}` (catalog with when to follow each skill, prerequisites,

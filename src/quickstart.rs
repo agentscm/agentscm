@@ -179,7 +179,7 @@ To run it without one, pass --yes and choose with flags: --local (recommended) o
 --hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --init, --tray";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -546,9 +546,6 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
-    }
-    if args.tray && !cfg!(target_os = "macos") {
-        return Err(invalid("--tray is currently supported only on macOS"));
     }
     // Validate the complete private input before acquiring the lease or performing any install
     // write. Supplying this flag is the only way quickstart enables the optional Slack adapter.
@@ -1474,7 +1471,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         );
         #[cfg(target_os = "macos")]
-        println!("  - remove the owned AgentSCM tray login setting when removing its program");
+        println!("  - remove the Start at Login entry an earlier version's menu bar app left, if there is one");
     }
     if let Some(l) = &m.local_hub {
         println!(
@@ -1677,7 +1674,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             println!("Removed the program files in {}.", shown(&dir, &home));
             #[cfg(target_os = "macos")]
             println!(
-                "Tray login is disabled. If its menu is still open, choose Quit AgentSCM Tray."
+                "If an earlier version's AgentSCM menu bar icon is still showing, choose Quit AgentSCM Tray from it."
             );
         }
     }
@@ -1830,7 +1827,6 @@ mod tests {
             "--no-agents",
             "--slack-config-file",
             "--init",
-            "--tray",
         ] {
             assert!(NEEDS_TERMINAL.contains(flag), "{flag}");
         }

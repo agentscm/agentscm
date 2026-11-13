@@ -292,7 +292,7 @@ satisfy a gate only when the gate says `min_assurance: self_reported`; the Hub n
 A pin's `source` says where the manifest bytes come from. `first_party` (embedded in the binary)
 and `repo_local` resolve; `third_party` and `private` parse and resolve to `unsupported_source`:
 
-- `repo_local {path}`: a skill defined in the repository itself (Experimental, GitHub only).
+- `repo_local {path}`: a skill defined in the repository itself (Experimental; GitHub and GitLab, both read as exact bytes).
   `path` is the repository path of its manifest (`skill.json`, manifest version 2); the procedure
   is the file its `skill.entrypoint` names, and it may name no other resources. The pin's `sha256`
   is the same bundle digest a first-party pin uses, over those two files. Each file is at most

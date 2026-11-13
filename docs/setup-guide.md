@@ -15,7 +15,7 @@ npx agentscm --hub-url https://hub.example.com # join a Hub that already runs
 
 ## Usage telemetry choice
 
-When telemetry is configured and eligible, quickstart shows the disclosure and offers an opt-out before the first event can be sent. Provisioning the endpoint and profile alone does not record that notice or enable sending. A `consent-required` profile stays inactive until you affirmatively run `agentscm telemetry on` or make the equivalent interactive choice; `--yes` never supplies that consent. A `permitted-default` profile may enable collection after quickstart shows the notice and completes its default-on flow, subject to the operator's legal determination. An `unknown` profile stays inactive.
+Quickstart does not show a telemetry notice, ask a telemetry question or change telemetry state. Nothing is sent or recorded by default: no endpoint is built in, so telemetry stays inactive until an operator configures an endpoint and profile (`agentscm telemetry configure`) and you run `agentscm telemetry on`, which prints the disclosure. Provisioning the endpoint and profile alone does not record that notice or enable sending, under any profile; an `unknown` profile stays inactive.
 
 Your choice is stored in the per-user telemetry configuration. `agentscm telemetry off` persists the opt-out and deletes queued events and telemetry identifiers without sending an opt-out event. `DO_NOT_TRACK=1`, `AGENTSCM_TELEMETRY=off` and the global `--no-telemetry` flag provide stronger overrides. See [usage telemetry](telemetry.md) for the fields, status and inspection commands.
 
@@ -80,14 +80,14 @@ The flags `--hub-url`, `--yes`, `--only`, `--dry-run` and `--json` are the ones 
 | `--provider github\|gitlab` | Forge to sign in with (inferred from `github.com` or `gitlab.com`; select explicitly for a self-managed forge, including nested GitLab groups). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |
 | `--init` | Also run `agentscm init-repo` for this repository. Without it, quickstart writes nothing to the repository. |
-| `--no-collisions` | Skip the collision check. |
+| `--no-collisions` | Accepted and ignored: quickstart no longer runs a collision check. |
 
 Quickstart's origin detection ignores URLs containing passwords, HTTPS userinfo, queries or fragments.
 Use SSH or an HTTPS credential helper instead of embedding credentials in the origin URL.
 
 With `--yes` or without a terminal quickstart never starts a browser or device sign-in. If there is no saved sign-in, or the hub no longer accepts it (it expired, or the hub restarted), quickstart says so at once and sets up no agent: run it at a terminal, or pass `--agent-token-file`. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns exit status **3** without waiting. Finish that step, then resume with the printed command, which includes the runtime, port and project. Exit status **0** means the requested setup completed; other failures exit non-zero.
 
-Non-interactive `--yes` leaves a fresh telemetry notice and choice pending under every profile. It does not enable telemetry; use an earlier eligible choice or explicit `agentscm telemetry on`.
+Quickstart, with or without `--yes`, never changes telemetry state; only `agentscm telemetry on` enables it.
 
 Example: `agentscm quickstart --yes --hub existing --hub-url https://hub.example.com --agent-token-file ~/hub.token --agent claude`.
 
