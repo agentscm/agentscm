@@ -399,12 +399,22 @@ struct CompactedEnvelopeV1 {
     envelope: Option<CaptureEnvelopeV1>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentityV1 {
     pub device: u64,
     pub inode: u64,
 }
+
+/// The same file is the same inode. The device is recorded but not compared: macOS can give the
+/// same volume a new device number at boot, and a replaced file or directory gets a new inode.
+impl PartialEq for FileIdentityV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.inode == other.inode
+    }
+}
+
+impl Eq for FileIdentityV1 {}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3857,7 +3867,6 @@ impl LocalSpool {
         }
         if let Some(previous) = expected
             && (previous.path_digest != next.path_digest
-                || previous.file_device != next.file_device
                 || previous.file_inode != next.file_inode
                 || previous.work_id != next.work_id
                 || previous.generation != next.generation
@@ -3890,7 +3899,6 @@ impl LocalSpool {
             ));
         }
         if expected.path_digest != next.path_digest
-            || expected.file_device != next.file_device
             || expected.file_inode != next.file_inode
             || next.offset < expected.offset
             || (expected.work_id == next.work_id && expected.generation == next.generation)
@@ -8099,6 +8107,39 @@ fn appended_root_record(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_renumbered_at_boot_still_opens_its_spool_and_a_replaced_one_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("spool");
+        let identity = LocalSpool::open(&root).unwrap().identity();
+        // What a restart that renumbers the volume leaves behind: the same inodes, recorded
+        // under another device number.
+        let mut renumbered = identity;
+        for file in [
+            &mut renumbered.root,
+            &mut renumbered.spool_lock,
+            &mut renumbered.managed_lock,
+        ] {
+            file.device ^= 1;
+        }
+        fs::write(
+            root.join("capture-spool-v4.json"),
+            serde_json::to_vec(&renumbered).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_spool(&root).unwrap().classification,
+            SpoolClassificationV1::V4IdentityMatch
+        );
+        LocalSpool::open_with_limits_expected(&root, SpoolLimits::default(), identity).unwrap();
+        let mut replaced = identity;
+        replaced.root.inode ^= 1;
+        assert!(matches!(
+            LocalSpool::open_with_limits_expected(&root, SpoolLimits::default(), replaced),
+            Err(CaptureError::Conflict(_))
+        ));
+    }
 
     #[test]
     fn a_snapshot_of_new_files_checks_the_quota_once_and_retained_files_not_at_all() {

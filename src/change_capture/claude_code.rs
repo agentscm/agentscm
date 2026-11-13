@@ -2045,8 +2045,8 @@ pub fn capture_provider_usage(
         offset,
     };
     if let Some(cursor) = previous.as_ref() {
+        // Not the device: macOS can renumber a volume at boot (see `FileIdentityV1`).
         if cursor.path_digest != path_digest
-            || cursor.file_device != opened.dev()
             || cursor.file_inode != opened.ino()
             || cursor.canonical_session_id != request.canonical_session_id
         {
