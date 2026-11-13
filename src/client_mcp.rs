@@ -835,6 +835,23 @@ enum Waited<T> {
     Elsewhere(Vec<u8>),
 }
 
+/// Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused start's
+/// conflict, coordination and recovery payload, reach the agent unchanged.
+fn upgrade_reply(mut reply: Value) -> Value {
+    let bare_error = &reply["result"]["structuredContent"]["error"];
+    if reply["result"]["isError"] == true
+        && bare_error.is_object()
+        && bare_error["recovery"].is_null()
+    {
+        reply["result"] = agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
+    } else if reply["error"].is_object() {
+        let error = agentscm::hub::error_envelope::decode(400, &reply);
+        let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
+        reply["error"] = json!({"code":code,"message":error.render(),"data":error});
+    }
+    reply
+}
+
 /// Forwards one request. A well-formed reply is returned for the caller to finish and write;
 /// every other outcome is reported to the client here.
 async fn exchange(
@@ -859,21 +876,7 @@ async fn exchange(
         (None, Ok((202 | 204, _, _))) => {}
         (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
         (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
-            let mut reply = reply;
-            // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
-            // start's conflict, coordination and recovery payload, reach the agent unchanged.
-            let bare_error = &reply["result"]["structuredContent"]["error"];
-            if reply["result"]["isError"] == true
-                && bare_error.is_object()
-                && bare_error["recovery"].is_null()
-            {
-                reply["result"] =
-                    agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
-            } else if reply["error"].is_object() {
-                let error = agentscm::hub::error_envelope::decode(400, &reply);
-                let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
-                reply["error"] = json!({"code":code,"message":error.render(),"data":error});
-            }
+            let reply = upgrade_reply(reply);
             return Ok(Some(reply));
         }
         (Some(id), Ok((status @ (401 | 403), _, reply))) => {
@@ -1015,6 +1018,66 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn older_hub_bare_errors_are_upgraded_to_a_full_envelope() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/hub_errors/mcp-baseline.json"
+        ))
+        .unwrap();
+        for bare in [
+            json!({"kind":"busy"}),
+            json!({"code":"busy","message":"hub busy"}),
+            fixture["structuredContent"]["error"].clone(),
+        ] {
+            let reply = json!({"jsonrpc":"2.0","id":1,"result":{"isError":true,"structuredContent":{"error":bare}}});
+            let upgraded = upgrade_reply(reply);
+            let error = &upgraded["result"]["structuredContent"]["error"];
+            assert_eq!(error["code"], "busy");
+            assert!(error["recovery"]["action"].is_string());
+            let message = error["message"].as_str().unwrap();
+            assert!(!message.is_empty());
+            assert_eq!(upgraded["result"]["isError"], true);
+            assert_eq!(upgraded["id"], 1);
+        }
+    }
+
+    #[test]
+    fn current_envelopes_and_successes_pass_unchanged() {
+        let current = agentscm::hub::error_envelope::ErrorEnvelope::local(
+            agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+        )
+        .mcp();
+        let conflict = json!({"isError":true,"structuredContent":{"error":{
+            "code":"work_conflict","recovery":null,"overlaps":[{"path":"a.rs"}]}}});
+        let refused = json!({"isError":true,"structuredContent":{"error":{
+            "code":"work_conflict","recovery":{"action":"ask_owner"},"coordination_request":{"id":"x"}}}});
+        let success =
+            json!({"content":[{"type":"text","text":"ok"}],"structuredContent":{"work_id":"w"}});
+        for result in [current, refused, success] {
+            let reply = json!({"jsonrpc":"2.0","id":2,"result":result});
+            assert_eq!(upgrade_reply(reply.clone()), reply);
+        }
+        // A bare payload with no `recovery` is the older shape and is upgraded, not preserved.
+        let reply = json!({"jsonrpc":"2.0","id":2,"result":conflict});
+        assert_ne!(upgrade_reply(reply.clone()), reply);
+    }
+
+    #[test]
+    fn json_rpc_errors_keep_their_numeric_code_and_gain_an_envelope() {
+        let reply = json!({"jsonrpc":"2.0","id":3,"error":{"code":-32001,"message":"refused","data":{"error":"read_only"}}});
+        let upgraded = upgrade_reply(reply);
+        let error = &upgraded["error"];
+        assert_eq!(error["code"], -32001);
+        assert_eq!(error["data"]["error"], "read_only");
+        let message = error["message"].as_str().unwrap();
+        assert_ne!(message, "refused");
+        assert_eq!(
+            message,
+            agentscm::hub::error_envelope::decode(400, &upgraded).render()
+        );
+        assert!(error["data"]["recovery"]["action"].is_string());
+    }
 
     fn saved(hub: String, root: &str, repo: &str) -> Connection {
         Connection {
