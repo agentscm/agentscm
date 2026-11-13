@@ -527,11 +527,19 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Unknown, never stale.** After a Hub restart that left no list of waits (the Hub died, or was
   down for 10 minutes or more), or when the Hub dropped a wait for room, a quiet
   Work whose lead session has not called since reads `freshness: unknown` with the limit
-  `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
-  24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
+  `lead_wait_unknown`. It names nobody (unless the Hub observed its pull request open) and needs
+  nobody until that session calls again, or until 24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
   leaves its waits for the process that starts next, which then knows them as before. What
   sessions reported while no Hub ran is still missing, so Work whose lead session called in the
   hour before the stop, has no wait in that list and has not called since reads unknown too.
+- **Waiting on an open pull request.** Quiet or paused Work whose Hub-observed stage is
+  `pull_request_open` reads `active`, names its lead agent and asks nobody. Its action says that
+  the pull request is open and that the Hub observed only that, not whether its checks pass or
+  anyone reviews it. Freshness and the `lead_wait_unknown` limit are unchanged. A handover, a
+  reported blocker or its reassessment, a Work version change during the read, an observed merge
+  and a live wait are shown instead; unavailable provider coverage (`provider_coverage_unavailable`)
+  keeps the reassessment, because the stored observation may be stale. A closed or unreadable
+  pull request and Work with no pull request read as before.
 - **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews may lapse, or be retained. A directed request to a quiet lead says its lead is not running only when its session is not live. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
   rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:

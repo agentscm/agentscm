@@ -2,6 +2,7 @@
 //!
 //! This bounded read is advisory, never completion or edit authority. Its digest identifies the
 //! captured facts, not a transactional snapshot or current provider evidence omitted by V2.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use crate::hub::store::{Principal, Store, owner_session, session_ancestors, sess
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
-use crate::hub::work_reconcile::WorkStage;
+use crate::hub::work_reconcile::{WorkStage, WorkStageV1};
 use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
@@ -116,7 +117,7 @@ pub struct StatusWork {
     pub reconciliation: Option<StatusReconciliation>,
     /// Working, pull request open or merged, or complete, with the pull request number.
     #[serde(default)]
-    pub stage: Option<crate::hub::work_reconcile::WorkStageV1>,
+    pub stage: Option<WorkStageV1>,
     pub limits: Vec<String>,
 }
 
@@ -265,6 +266,19 @@ pub fn project_work(
     wait: LeadWait,
     viewer: &str,
 ) -> StatusWork {
+    project_work_staged(item, operational, reconciliation, wait, viewer, None)
+}
+
+/// [`project_work`] with the Hub-observed stage. Quiet Work whose pull request the provider
+/// observed open waits on that pull request; the stage is also set on the row.
+fn project_work_staged(
+    item: &WorkItem,
+    operational: WorkOperationalV1,
+    reconciliation: Option<ReconciliationView>,
+    wait: LeadWait,
+    viewer: &str,
+    stage: Option<WorkStageV1>,
+) -> StatusWork {
     let mut limits = BTreeSet::new();
     // A session that reported a wait is there, however long ago its Work checked in. One whose
     // wait this Hub may have lost is not known to be quiet.
@@ -337,17 +351,21 @@ pub fn project_work(
             }
         }
     }
-    let (state, recipient, action) = if !consistent {
+    let open_pull_request = stage
+        .as_ref()
+        .filter(|s| s.stage == WorkStage::PullRequestOpen)
+        .and_then(|s| s.pull_request);
+    let (state, recipient, action): (_, _, Cow<str>) = if !consistent {
         (
             StatusState::ReassessmentNeeded,
             StatusRecipient::none(),
-            "Refresh changed Work before acting.",
+            "Refresh changed Work before acting.".into(),
         )
     } else if item.state == WorkState::Finished {
         (
             StatusState::Retired,
             StatusRecipient::none(),
-            "Inspect the recorded outcome and its provenance.",
+            "Inspect the recorded outcome and its provenance.".into(),
         )
     } else if item.state == WorkState::Handover {
         // Handover is an agent follow-up, regardless of merge coverage or reservation state.
@@ -360,13 +378,13 @@ pub fn project_work(
             } else {
                 lead(item)
             },
-            "Its lead reviews the handover and completes or resumes the remaining Work.",
+            "Its lead reviews the handover and completes or resumes the remaining Work.".into(),
         )
     } else if current.is_some_and(|r| !r.reassessments.is_empty()) {
         (
             StatusState::ReassessmentNeeded,
             lead(item),
-            "Reassess the reported blocker against current prerequisite evidence.",
+            "Reassess the reported blocker against current prerequisite evidence.".into(),
         )
     } else if operational.merge.hidden_by_merged_pr {
         // Only the close is left, and it is the lead's: a hold still held lapses by itself. The
@@ -376,13 +394,13 @@ pub fn project_work(
         (
             StatusState::ReassessmentNeeded,
             lead(item),
-            "Its pull request merged: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.",
+            "Its pull request merged: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.".into(),
         )
     } else if item.state == WorkState::Blocked {
         (
             StatusState::Blocked,
             lead(item),
-            "Review the reported blocker and identify its next action.",
+            "Review the reported blocker and identify its next action.".into(),
         )
     } else if let LeadWait::Waiting(reason) = wait {
         match reason {
@@ -391,11 +409,11 @@ pub fn project_work(
             WaitReason::Finished if pause_asks_person(item) => (
                 StatusState::AwaitingParty,
                 lead_person(item),
-                "Its lead session ended its turn, and its pause report says what it needs from its person.",
+                "Its lead session ended its turn, and its pause report says what it needs from its person.".into(),
             ),
             // Neither asks anybody, and neither is stuck: the text says which it is.
             WaitReason::Finished | WaitReason::Background => {
-                (StatusState::Active, lead(item), waiting_text(reason))
+                (StatusState::Active, lead(item), waiting_text(reason).into())
             }
             WaitReason::Permission | WaitReason::Question | WaitReason::Idle => {
                 // Its `session_waiting` action asks the person, so one wait counts once.
@@ -403,30 +421,43 @@ pub fn project_work(
                 (
                     StatusState::AwaitingParty,
                     lead_person(item),
-                    waiting_text(reason),
+                    waiting_text(reason).into(),
                 )
             }
         }
     } else if quiet {
-        if wait == LeadWait::Unknown {
+        // A provider known unavailable leaves the stored observation possibly stale.
+        if let Some(n) =
+            open_pull_request.filter(|_| !limits.contains("provider_coverage_unavailable"))
+        {
+            // The Hub saw only that the pull request is open, so the row claims no more.
+            (
+                StatusState::Active,
+                lead(item),
+                Cow::Owned(format!(
+                    "Pull request #{n} is open. The Hub observed only that it is open, not whether its checks pass or anyone reviews it."
+                )),
+            )
+        } else if wait == LeadWait::Unknown {
             (
                 StatusState::ReassessmentNeeded,
                 StatusRecipient::none(),
-                "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.",
+                "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.".into(),
             )
         } else {
             // Nobody is asked, held or not: a hold its lead no longer renews lapses by itself.
             (
                 StatusState::ReassessmentNeeded,
                 StatusRecipient::none(),
-                "Review the unfinished Work; a quiet claim does not prove failure or completion.",
+                "Review the unfinished Work; a quiet claim does not prove failure or completion."
+                    .into(),
             )
         }
     } else {
         (
             StatusState::Active,
             lead(item),
-            "Continue the reported work; activity is not independently observed.",
+            "Continue the reported work; activity is not independently observed.".into(),
         )
     };
     if recipient.kind == RecipientKind::Unknown {
@@ -447,7 +478,7 @@ pub fn project_work(
         needs_you,
         action: if consistent && item.state == WorkState::Handover {
             item.blocker.as_ref().map_or_else(
-                || action.to_owned(),
+                || action.into_owned(),
                 |blocker| {
                     format!(
                         "Resolve the handover's reported blocker: {}",
@@ -456,7 +487,7 @@ pub fn project_work(
                 },
             )
         } else {
-            action.into()
+            action.into_owned()
         },
         reported_next_action: item.next_action.clone(),
         freshness,
@@ -482,7 +513,7 @@ pub fn project_work(
             current_source_coverage: r.current_source_coverage,
             stale_reasons: r.stale_reasons,
         }),
-        stage: None,
+        stage,
         limits: limits.into_iter().collect(),
     }
 }
@@ -631,6 +662,7 @@ fn read_scoped(
     });
     let mut work = Vec::new();
     let mut staged = Vec::new();
+    let mut gathered = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
         let item = match item {
@@ -669,12 +701,21 @@ fn read_scoped(
         if called_at.is_some() && shown.claim_status == ClaimStatus::Stale {
             shown.claim_status = ClaimStatus::Active;
         }
-        let mut row = project_work(
+        staged.push((item.clone(), op.outcome.value));
+        gathered.push((id, item, op.clone(), reconciliation, wait, shown));
+    }
+    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
+    let (mut stages, stage_limits) =
+        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
+    limits.extend(stage_limits);
+    for (id, item, op, reconciliation, wait, shown) in gathered {
+        let mut row = project_work_staged(
             &shown,
-            op.clone(),
+            op,
             reconciliation,
             wait,
             &principal.owner.id,
+            stages.remove(&id),
         );
         // Fence the row with the final Work version. This does not claim an atomic snapshot.
         if store
@@ -687,20 +728,12 @@ fn read_scoped(
             row.recipient = StatusRecipient::none();
             row.action = "Refresh changed Work before acting.".into();
         }
-        staged.push((item.clone(), op.outcome.value));
         if !row.limits.iter().any(|limit| {
             limit == "work_changed_during_read" || limit == "reconciliation_work_changed"
         }) {
             items.insert(id, item);
         }
         work.push(row);
-    }
-    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
-    let (mut stages, stage_limits) =
-        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
-    limits.extend(stage_limits);
-    for row in &mut work {
-        row.stage = stages.remove(&row.work_id);
     }
     for request in &requests.requests {
         if !request.responses_complete {
@@ -2144,6 +2177,144 @@ mod tests {
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         assert!(!row.needs_you);
         assert_eq!(row.recipient.kind, RecipientKind::None);
+    }
+
+    #[test]
+    fn an_open_pull_request_reads_as_waiting_not_as_a_quiet_claim() {
+        let open = |number, stage| {
+            Some(WorkStageV1 {
+                stage,
+                pull_request: Some(number),
+                basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+            })
+        };
+        let read = |item: &WorkItem, wait, stage| {
+            project_work_staged(item, op(item, false, false), None, wait, "usr_owner", stage)
+        };
+        let mut paused = item(WorkState::Paused);
+        let mut stale = item(WorkState::Active);
+        stale.claim_status = ClaimStatus::Stale;
+        paused.claim_status = ClaimStatus::Active;
+        let waits = |row: &StatusWork| {
+            assert_eq!(row.state, StatusState::Active);
+            assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+            assert!(!row.needs_you);
+            assert!(row.action.contains("Pull request #12 is open"));
+            assert!(row.action.contains("not whether its checks pass"));
+            assert_eq!(
+                row.stage.as_ref().map(|s| (s.stage, s.pull_request)),
+                Some((WorkStage::PullRequestOpen, Some(12)))
+            );
+        };
+        for (item, wait) in [(&paused, NotWaiting), (&stale, NotWaiting)] {
+            let row = read(item, wait, open(12, WorkStage::PullRequestOpen));
+            waits(&row);
+            assert_eq!(row.freshness, item.claim_status);
+        }
+        let unknown = read(
+            &stale,
+            LeadWait::Unknown,
+            open(12, WorkStage::PullRequestOpen),
+        );
+        waits(&unknown);
+        assert_eq!(unknown.freshness, ClaimStatus::Unknown);
+        assert!(unknown.limits.contains(&"lead_wait_unknown".into()));
+        // Anything but an observed open pull request keeps the reassessment.
+        for stage in [
+            open(12, WorkStage::Unknown),
+            Some(WorkStageV1 {
+                stage: WorkStage::Working,
+                pull_request: None,
+                basis: None,
+            }),
+            open(12, WorkStage::PullRequestMerged),
+            None,
+        ] {
+            for wait in [NotWaiting, LeadWait::Unknown] {
+                let row = read(&paused, wait, stage.clone());
+                assert_eq!(row.state, StatusState::ReassessmentNeeded, "{stage:?}");
+                assert!(!row.action.contains("Pull request #"));
+            }
+        }
+        // A live wait and a handover still win over the observed pull request.
+        let row = read(
+            &paused,
+            LeadWait::Waiting(WaitReason::Question),
+            open(12, WorkStage::PullRequestOpen),
+        );
+        assert_eq!(row.state, StatusState::AwaitingParty);
+        assert!(!row.action.contains("Pull request #"));
+        let handover = item(WorkState::Handover);
+        let row = read(&handover, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert_eq!(row.state, StatusState::AwaitingParty);
+        assert!(row.action.contains("handover"));
+        assert!(!row.action.contains("Pull request #"));
+        // A merged pull request and a reported blocker still win; live Work keeps its own text.
+        let merged = project_work_staged(
+            &paused,
+            op(&paused, false, true),
+            None,
+            NotWaiting,
+            "usr_owner",
+            open(12, WorkStage::PullRequestOpen),
+        );
+        assert_eq!(merged.state, StatusState::ReassessmentNeeded);
+        assert!(merged.action.starts_with("Its pull request merged"));
+        let blocked = item(WorkState::Blocked);
+        let row = read(&blocked, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert_eq!(row.state, StatusState::Blocked);
+        let live = item(WorkState::Active);
+        let row = read(&live, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert!(row.action.starts_with("Continue the reported work"));
+    }
+
+    #[test]
+    fn unavailable_provider_coverage_keeps_the_reassessment_over_an_open_pull_request() {
+        use crate::hub::work_reconciliation::{
+            SourceEvidence, WorkDeclarations, WorkDeclarationsView, reconciliation_view,
+        };
+        let mut paused = item(WorkState::Paused);
+        paused.claim_status = ClaimStatus::Active;
+        let declarations = WorkDeclarationsView {
+            schema_version: 2,
+            work_id: paused.id.clone(),
+            generation: paused.generation,
+            updated_seq: paused.updated_seq,
+            declaration_seq: 1,
+            compatibility_link: None,
+            declarations: WorkDeclarations::default(),
+        };
+        let mut evidence: ReconciliationEvidence = serde_json::from_value(json!({
+            "provider":"github", "host":"github.com", "repository_id":1,
+            "merge_through":0,"merge_floor":0,"sources":[],"pulls":[],"prerequisites":[]
+        }))
+        .unwrap();
+        evidence.sources = ["forge_pull", "tracked_publication"]
+            .into_iter()
+            .map(|source| SourceEvidence {
+                source: source.into(),
+                state: "unavailable".into(),
+                checked_at_seconds: 1,
+                unread_pages: 0,
+                deferred: 0,
+            })
+            .collect();
+        let view = reconciliation_view(&paused, &declarations, &evidence, None);
+        let row = project_work_staged(
+            &paused,
+            op(&paused, false, false),
+            Some(view),
+            NotWaiting,
+            "usr_owner",
+            Some(WorkStageV1 {
+                stage: WorkStage::PullRequestOpen,
+                pull_request: Some(12),
+                basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+            }),
+        );
+        assert!(row.limits.contains(&"provider_coverage_unavailable".into()));
+        assert_eq!(row.state, StatusState::ReassessmentNeeded);
+        assert!(!row.action.contains("Pull request #"));
     }
 
     #[test]
@@ -3728,6 +3899,119 @@ mod tests {
     #[test]
     fn a_waiting_lead_session_is_not_a_quiet_claim_on_postgres() {
         on_postgres(lead_wait_contract);
+    }
+
+    /// Quiet Work whose branch has an open pull request reads as waiting on it, and as
+    /// reassessment again once that pull request closes unmerged.
+    fn open_pull_request_contract(store: &dyn Store) {
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 612,
+                },
+                "shipper",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            store,
+            &user.id,
+            "shipper-laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let who = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "ship-it", "title": "Ship it", "session": "shipping",
+            "scope": ["src/ship.rs"], "branch": "feat/ship"
+        }))
+        .unwrap();
+        let work = store.work_start(&who.token_id, &request, now).unwrap().item;
+        let connection = store
+            .insert_connection(
+                &crate::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                &user.id,
+            )
+            .unwrap();
+        let repository = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let later = now + crate::hub::work::CLAIM_STALE_SECONDS + 60;
+        let observations = Observations::default();
+        let read = || {
+            let status = super::read(store, &observations, &who, later).unwrap();
+            status
+                .work
+                .into_iter()
+                .find(|w| w.work_id == work.id)
+                .unwrap()
+        };
+        let observe = |state: &str| {
+            let data = json!({"number": 12, "state": state, "repository_id": 101,
+                "head_ref": "feat/ship", "head_sha": "a".repeat(40), "base_ref": "main",
+                "head_repository_id": 101})
+            .to_string();
+            store
+                .observe(&repository.id, "pull_request", "12", &data, now + 1)
+                .unwrap();
+        };
+        assert_eq!(read().state, StatusState::ReassessmentNeeded);
+        observe("open");
+        let open = read();
+        assert_eq!(open.state, StatusState::Active);
+        assert_eq!(open.recipient.kind, RecipientKind::LeadAgent);
+        assert!(!open.needs_you);
+        assert!(open.action.contains("Pull request #12 is open"));
+        let person = read_person(store, &user, "acme/widgets", 101, later).unwrap();
+        let through_person = person.work.iter().find(|w| w.work_id == work.id).unwrap();
+        assert_eq!(through_person.state, StatusState::Active);
+        assert!(through_person.action.contains("Pull request #12 is open"));
+        let stage = open.stage.unwrap();
+        assert_eq!(stage.stage, WorkStage::PullRequestOpen);
+        assert_eq!(stage.pull_request, Some(12));
+        observe("closed");
+        let closed = read();
+        assert_eq!(closed.state, StatusState::ReassessmentNeeded);
+        assert!(!closed.action.contains("Pull request #"));
+    }
+
+    #[test]
+    fn sqlite_an_open_pull_request_reads_as_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        open_pull_request_contract(&*store);
+    }
+
+    #[test]
+    fn an_open_pull_request_reads_as_waiting_on_postgres() {
+        on_postgres(open_pull_request_contract);
     }
 
     #[test]
