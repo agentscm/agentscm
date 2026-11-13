@@ -1193,9 +1193,10 @@ impl Call {
                         let requests = state.onboarding.permissions();
                         requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
-                    // A turn that ended asking nothing is done with the Work it leads whose pull
-                    // request merged. A turn that asks its person something leaves it open.
-                    if reason == WaitReason::Finished {
+                    // A merge settles the Work the session leads, whether or not its turn asks
+                    // its person something; the ask stays a wait. A dialog shown mid-turn is not
+                    // held up for it.
+                    if !matches!(reason, WaitReason::Permission | WaitReason::Question) {
                         complete_led_merged(state, &principal, &native).await;
                     }
                 }

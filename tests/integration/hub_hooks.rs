@@ -2601,13 +2601,24 @@ mod merged_prompts {
         let id = w.merged_work();
         w.close_issue(completed());
         w.prompt(LEAD);
-        // A turn that asks its person something leaves the Work open.
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_asks_still_completes_merged_work_it_leads() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
         w.turn_end(
             LEAD,
-            json!({"asked_nothing": false, "asks": "Shall I merge it?"}),
+            json!({"asked_nothing": false, "asks": "Shall I start the next one?"}),
         );
-        assert_eq!(w.outcome(&id).0, WorkState::Active);
-        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        // The merge settled the task; the ask is still recorded as the session's wait.
         assert_eq!(
             w.outcome(&id),
             (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
