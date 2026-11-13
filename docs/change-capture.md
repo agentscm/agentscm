@@ -155,14 +155,14 @@ uploads it to the Hub's object store.
 
 ### The repository setting
 
-Whether a repository permits agent conversation sharing is a Hub setting, **Share agent conversations**,
-not a per-checkout switch and not a person's consent. It is off by default. A repository admin
-(GitHub `admin`, GitLab maintainer or owner) or a Hub admin changes it for one repository; a Hub
-admin can also set a Hub-wide default that applies to every repository without its own setting.
-Neither setting opts any person in, and existing people without a recorded choice remain opted out. The routes are in
+Whether a repository shares agent conversations is a Hub setting, **Share agent conversations**,
+not a per-checkout switch. It is on by default on a new Hub, and stays off on a Hub that already
+had people when the default became on. A repository admin (GitHub `admin`, GitLab maintainer
+or owner) or a Hub admin changes it for one repository; a Hub admin can also set a Hub-wide
+default that applies to every repository without its own setting. The routes are in
 [conversation sharing](hub.md#conversation-sharing).
 
-- **Checkouts follow both gates.** While the repository permits sharing and the person has explicitly opted in, every connected checkout of the repository, and every
+- **Checkouts follow it.** While it is on and the person has not opted out, every connected checkout of the repository, and every
   linked worktree of one, captures in `shared-conversation` mode without `configure`. The AgentSCM
   plugin hook asks the Hub at each session start; when the Hub shares and the checkout has no
   capture binding, it creates one with the one-step defaults below, marked `follows_hub`, and
@@ -171,7 +171,14 @@ Neither setting opts any person in, and existing people without a recorded choic
   `PreCompact`, `SubagentStart`, `SubagentStop`; for Codex see the
   [Codex adapter](#codex-adapter)). Capture starts with that session. A binding that follows the
   Hub is written as config version 7, which older binaries refuse.
-- **People must opt in.** `agentscm change-capture opt-in` in a connected checkout records affirmative consent for that person and repository on the Hub. It applies to that person's sessions on every computer. A missing or unreadable choice, including one left by an older Hub, is not consent and is never migrated into consent. `change-capture opt-out` revokes consent. The first time a consented person's session shares in a repository, its agent is told in the session-start context that conversations are shared, who can read them, and how to stop. This notice is separate from consent: recording that the notice was shown cannot opt the person in. Notice delivery is best effort: it is recorded as shown before the hook's reply is printed, so a reply the host cuts off loses it, and a session already running when both gates become enabled is told at its next start. The choice is per person and repository, stored on the Hub.
+- **People are told and can opt out.** The first time a person's session shares in a
+  repository, its agent is told in the session-start context that conversations are shared,
+  who can read them, and how to stop. This is best effort: the notice is recorded as shown
+  before the hook's reply is printed, so a reply the host cuts off loses it, and a session
+  already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
+  that person's own sessions in the repository, on every computer, from uploading;
+  `change-capture opt-in` undoes it. An unreadable choice counts as opted out. The choice is per
+  person and repository, stored on the Hub.
   Opting out also hides what the person shared before: their entries leave other readers'
   listings and their bodies are no longer served to them, while the person and Hub admins still
   read them. The bodies stay stored until they expire or their author deletes them with
@@ -187,7 +194,7 @@ Neither setting opts any person in, and existing people without a recorded choic
   - capture is turned off in this checkout, or was set up for another repository or Hub, while the
     repository shares: `change-capture forget --root <checkout>` (after `unconfigure` if it is still
     on), and the next session follows the repository;
-  - the person has not opted in, or opted out: `change-capture opt-in`, and also the `set-mode` fix
+  - the person keeps their own sessions out: `change-capture opt-in`, and also the `set-mode` fix
     above when this checkout's own setting caps it;
   - the session keeps a lower mode it started under (it started before sharing was on, or its
     saved mode could not be read): the next session shares;
@@ -198,8 +205,8 @@ Neither setting opts any person in, and existing people without a recorded choic
     nothing in that session and asks again at the next one;
   - an older Hub without the sharing setting: the context says only that sharing is off.
 - **Off means off.** The client asks the Hub again on every hook call, and the Hub itself
-  refuses uploads (403 `sharing_off`) and lists nothing as missing while the repository setting is off or the
-  person lacks affirmative consent, so bodies not yet uploaded stay declared `local`; they are not uploaded later
+  refuses uploads (403 `sharing_off`) and lists nothing as missing while the setting is off or the
+  person opted out, so bodies not yet uploaded stay declared `local`; they are not uploaded later
   if sharing is turned back on. A followed binding keeps recording metadata (events and action
   receipts, no bodies) while sharing is off, until `unconfigure`. Turning it off recalls
   nothing already uploaded (see [retention and deletion](#retention-and-deletion)).
@@ -241,7 +248,7 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 `repository_shares` (null when the Hub did not answer or has no sharing setting),
 `effective_mode` (the mode a session starting now captures in; `off` when no hook captures for
 this binding, null when the Hub did not answer) and `session_start`, the sentence that session
-would say. `repository_shares` reports repository enablement, not personal consent; `session_start` distinguishes missing consent from a disabled repository. When the repository permits sharing, you have opted in, and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps sharing off. The
+would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps sharing off. The
 Hub page opened from this computer (**Settings → Conversation sharing**) has the same switch per
 checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
 `configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
@@ -252,7 +259,7 @@ unsupported: older binaries cannot read the new session association records.
 
 ### One-step setup from the local page
 
-Turning sharing on from the page configures only that checkout; it does not record the person's Hub consent. Run `agentscm change-capture opt-in` in the checkout as well. The page calls one library function, `enable_capture`, for a
+Turning sharing on from the page calls one library function, `enable_capture`, for a
 checkout that has a current client connection; turning it off calls `set_capture_mode`. The page
 and `client status` read the setting through one function, `capture_setting` (configured, enabled, mode, and
 `lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
@@ -374,7 +381,7 @@ What leaves the machine, and when:
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
-Who can read a shared body: while the repository permits sharing and its author remains opted in, anyone who can read the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages); otherwise only the human who shared it (any of that person's tokens for the repository) and Hub admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
+Who can read a shared body: while the repository shares agent conversations and its author has not opted out, anyone who can read the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages); otherwise only the human who shared it (any of that person's tokens for the repository) and Hub admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
 the Work has no extra access to a helper's or reviewer's shared bodies. Each human's declaration of
 a body is its own row, so two people sharing identical content each read and delete their own. A
 listing shows a caller every author's entries while the repository shares, else only their own

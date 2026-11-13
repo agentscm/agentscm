@@ -1793,9 +1793,9 @@ fn audience(admin: bool) -> ConversationAudience {
     }
 }
 
-/// While a repository permits sharing, another reader lists an author's entries only after the
-/// author affirmatively opts in. Notice-only, absent and invalid choices grant no access.
-fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
+/// While a repository shares, a reader lists every author's entries except those of an author
+/// who opted out (or whose choice is unreadable), whose earlier entries leave the listing too.
+fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
     use ConversationAudience::{Everyone, Own, Sharing};
     const REPOSITORY_ID: i64 = 77;
     let store = db.open();
@@ -1856,19 +1856,27 @@ fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
         format!("conversation_sharing:notified:{user}:{repository_id}")
     };
     assert_eq!(listed(&reader_token, Own), 0);
-    assert_eq!(listed(&reader_token, Sharing), 0, "absent consent");
+    assert_eq!(listed(&reader_token, Sharing), 1, "shared by default");
     store
         .set_setting(&notified(&author.id, REPOSITORY_ID), "1", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 0, "notice is not consent");
+    assert_eq!(
+        listed(&reader_token, Sharing),
+        1,
+        "the notice changes nothing"
+    );
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "invalid", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 0, "invalid choice");
+    assert_eq!(
+        listed(&reader_token, Sharing),
+        0,
+        "an unreadable choice opts out"
+    );
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "0", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 1, "explicit opt-in");
+    assert_eq!(listed(&reader_token, Sharing), 1, "opted back in");
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "1", &author.id)
         .unwrap();
@@ -1892,14 +1900,14 @@ fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
 }
 
 #[test]
-fn sqlite_affirmative_consent_controls_the_listing_other_readers_get() {
-    affirmative_consent_controls_the_listing_other_readers_get(&Db::sqlite());
+fn sqlite_opting_out_leaves_the_listing_other_readers_get() {
+    opting_out_leaves_the_listing_other_readers_get(&Db::sqlite());
 }
 
 #[test]
-fn postgres_affirmative_consent_controls_the_listing_other_readers_get() {
+fn postgres_opting_out_leaves_the_listing_other_readers_get() {
     if let Some(db) = Db::postgres() {
-        affirmative_consent_controls_the_listing_other_readers_get(&db);
+        opting_out_leaves_the_listing_other_readers_get(&db);
     }
 }
 
