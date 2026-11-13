@@ -121,15 +121,37 @@ pub(crate) enum HubCheck {
         #[serde(skip_serializing_if = "Option::is_none")]
         hub_build: Option<HubBuild>,
     },
+    /// A refusal, with the Hub's build when its health route answered.
     Rejected {
         checked_at: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub_build: Option<HubBuild>,
     },
+    /// No usable answer. The build is present only when the Hub answered with an error status,
+    /// never when it could not be reached.
     Unavailable {
         checked_at: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub_build: Option<HubBuild>,
     },
     InvalidResponse {
         checked_at: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub_build: Option<HubBuild>,
     },
+}
+
+impl HubCheck {
+    /// The Hub's build, when it answered and its health route said so.
+    pub(crate) fn build(&self) -> Option<&HubBuild> {
+        match self {
+            Self::Valid { hub_build, .. }
+            | Self::Rejected { hub_build, .. }
+            | Self::Unavailable { hub_build, .. }
+            | Self::InvalidResponse { hub_build, .. } => hub_build.as_ref(),
+            Self::Skipped => None,
+        }
+    }
 }
 
 /// How far a connection can be trusted, from the strongest evidence available. Order of
@@ -256,7 +278,7 @@ impl HubBuild {
 }
 
 /// The Hub's build from its public health route; None when it does not say. Both fields are
-/// bounded and restricted to version and hex characters, because the Hub is not trusted to
+/// bounded and restricted to ASCII letters, digits and `._+-`, because the Hub is not trusted to
 /// send terminal text.
 pub(crate) async fn hub_build(client: &reqwest::Client, hub: &str) -> Option<HubBuild> {
     let (status, reply) = send(
@@ -438,6 +460,7 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
         coverage: Coverage::Unknown,
         hub_check: HubCheck::Unavailable {
             checked_at: unix_now(),
+            hub_build: None,
         },
         recent_participation: Vec::new(),
         capture_mode,
@@ -463,6 +486,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         } else {
             hub_check = HubCheck::Unavailable {
                 checked_at: unix_now(),
+                hub_build: None,
             };
         }
     }
@@ -544,6 +568,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::Unavailable {
                 checked_at: unix_now(),
+                hub_build: None,
             },
             Vec::new(),
         );
@@ -557,15 +582,19 @@ pub(crate) async fn check_hub(
             return (
                 HubCheck::Unavailable {
                     checked_at: unix_now(),
+                    hub_build: None,
                 },
                 Vec::new(),
             );
         }
     };
+    // The Hub answered, so its health route is worth one more request, whatever the verdict.
+    let build = hub_build(&client, &connection.hub).await;
     if status == 401 || status == 403 {
         return (
             HubCheck::Rejected {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -574,6 +603,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::Unavailable {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -582,6 +612,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::InvalidResponse {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -590,6 +621,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::InvalidResponse {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -598,6 +630,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::InvalidResponse {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -606,6 +639,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::InvalidResponse {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -614,6 +648,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::InvalidResponse {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -634,6 +669,7 @@ pub(crate) async fn check_hub(
         return (
             HubCheck::Rejected {
                 checked_at: unix_now(),
+                hub_build: build.clone(),
             },
             Vec::new(),
         );
@@ -658,7 +694,7 @@ pub(crate) async fn check_hub(
         hub_build: slot, ..
     } = &mut check
     {
-        *slot = hub_build(&client, &connection.hub).await;
+        *slot = build;
     }
     (check, participation)
 }
@@ -673,7 +709,13 @@ fn finalize_hub_check(
     mut participation: Vec<Participation>,
 ) -> (HubCheck, Vec<Participation>) {
     if expires_at <= checked_at {
-        return (HubCheck::Rejected { checked_at }, Vec::new());
+        return (
+            HubCheck::Rejected {
+                checked_at,
+                hub_build: None,
+            },
+            Vec::new(),
+        );
     }
     participation.retain(|row| row.expires_at > checked_at);
     (
@@ -860,7 +902,7 @@ mod tests {
             None,
             vec![participation(11)],
         );
-        assert!(matches!(expired, HubCheck::Rejected { checked_at: 10 }));
+        assert!(matches!(expired, HubCheck::Rejected { checked_at: 10, .. }));
         assert!(rows.is_empty());
 
         let (valid, rows) = finalize_hub_check(
@@ -909,8 +951,14 @@ mod tests {
     fn eight_saved_connections_with_mixed_validity_are_each_described_honestly() {
         let now = 1_000_000;
         let day = 24 * 60 * 60;
-        let down = HubCheck::Unavailable { checked_at: now };
-        let refused = HubCheck::Rejected { checked_at: now };
+        let down = HubCheck::Unavailable {
+            checked_at: now,
+            hub_build: None,
+        };
+        let refused = HubCheck::Rejected {
+            checked_at: now,
+            hub_build: None,
+        };
         let failed = || Some("the Hub refused to renew".to_owned());
         let rows = [
             // Stored token, never asked: configured, not authenticated.
@@ -944,7 +992,10 @@ mod tests {
             (
                 managed(CredentialState::Expired, Some(now - 1)),
                 None,
-                HubCheck::Unavailable { checked_at: now },
+                HubCheck::Unavailable {
+                    checked_at: now,
+                    hub_build: None,
+                },
                 Health::Expired,
             ),
             (
