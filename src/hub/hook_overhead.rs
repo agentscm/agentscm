@@ -214,13 +214,12 @@ struct Pending {
 }
 
 impl Pending {
-    /// The repository a waiting total counts for: the token's own once verified, else the one
-    /// the call named; None when neither is known.
+    /// The scope of the repository a waiting total counts for, once its token is verified; None
+    /// before then, as the name the call sent is not a scope, so it counts for every repository.
     fn repository<'a>(&'a self, key: &'a Key) -> Option<&'a str> {
         self.verified
             .get(&(key.0, key.1.clone(), key.2.clone()))
-            .map(|(_, repository)| repository.as_str())
-            .or(key.2.as_deref())
+            .map(|(_, scope)| scope.as_str())
     }
 
     /// Adds `sample` to the total at `key` in the verified or unverified table, or counts it as

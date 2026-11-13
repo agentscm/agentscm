@@ -576,7 +576,12 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     let alice = f.owner(0);
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert_eq!(handoffs.len(), 1);
@@ -819,7 +824,12 @@ async fn keeping_a_file_from_slack_tells_the_requesting_agent_and_messages_nobod
     let alice = f.owner(0);
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert!(handoffs[0].answered_via_slack && !handoffs[0].answered_via_hub);
@@ -873,7 +883,12 @@ async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
     );
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert_eq!(handoffs[0].state, "pending");

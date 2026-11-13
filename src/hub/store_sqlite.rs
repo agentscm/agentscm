@@ -5783,7 +5783,8 @@ fn announce_in(
                  ON CONFLICT (id) DO UPDATE SET task = excluded.task,
                      branch = excluded.branch, base = excluded.base,
                      machine = excluded.machine, paths = excluded.paths,
-                     expires_at = excluded.expires_at, updated_at = excluded.updated_at",
+                     expires_at = excluded.expires_at, updated_at = excluded.updated_at,
+                     repository_scope = excluded.repository_scope",
                 params![
                     intent.id,
                     who.repository,
@@ -9645,7 +9646,7 @@ impl Store for SqliteStore {
     fn handoffs_of_owner(
         &self,
         owner: &str,
-        repository: &str,
+        scope: &str,
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>> {
@@ -9665,12 +9666,12 @@ impl Store for SqliteStore {
                ON rs.token = h.requester_token AND rs.session = h.requester_session
              LEFT JOIN hub_sessions hs
                ON hs.token = h.holder_token AND hs.session = h.holder_session
-             WHERE h.repository = ?1 AND (rt.owner = ?2 OR ht.owner = ?2)
+             WHERE h.repository_scope = ?1 AND (rt.owner = ?2 OR ht.owner = ?2)
              ORDER BY h.created_at DESC, h.id LIMIT ?3",
         )?;
         let rows = statement
             .query_map(
-                params![repository, owner, i64::try_from(limit).unwrap_or(i64::MAX)],
+                params![scope, owner, i64::try_from(limit).unwrap_or(i64::MAX)],
                 |row| {
                     let (created_at, state) = (row.get::<_, i64>(5)?, row.get::<_, String>(2)?);
                     Ok(HandoffView {
@@ -10886,21 +10887,18 @@ impl Store for SqliteStore {
 
     fn merged_publications(
         &self,
-        repository: &str,
+        scope: &str,
         after: &str,
         oldest: i64,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
-            "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower(?1) AND p.id > ?2
+            "{PUBLICATION_SELECT} WHERE p.repository_scope = ?1 AND p.id > ?2
              AND p.merge_commit IS NOT NULL AND p.updated_at >= ?3 ORDER BY p.id LIMIT ?4"
         ))?;
         let rows = statement
-            .query_map(
-                params![repository, after, oldest, limit as i64],
-                publication_row,
-            )?
+            .query_map(params![scope, after, oldest, limit as i64], publication_row)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(publication_error)?;
         Ok(rows)

@@ -5536,11 +5536,12 @@ fn probe(
     Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
-/// Announces in one repository serialize, so two racing overlapping ones see each other.
-fn lock_repository(tx: &mut postgres::Transaction<'_>, repository: &str) -> Result<()> {
+/// Announces in one repository serialize, so two racing overlapping ones see each other. Keyed
+/// by repository scope, as the rows are: two names of one repository take one lock.
+fn lock_repository(tx: &mut postgres::Transaction<'_>, scope: &str) -> Result<()> {
     tx.execute(
         "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-        &[&INTENT_LOCK_CLASS, &repository],
+        &[&INTENT_LOCK_CLASS, &scope],
     )?;
     Ok(())
 }
@@ -5650,7 +5651,7 @@ fn announce_in(
     let paths = display_all(keys);
     let paths_json = serde_json::json!(paths).to_string();
     let expires_at = now + intent.ttl_seconds;
-    lock_repository(tx, &who.repository)?;
+    lock_repository(tx, &who.scope)?;
     tx.execute(
         "DELETE FROM hub_intent_paths WHERE repository_scope = $1 AND expires_at <= $2",
         &[&who.scope, &now],
@@ -5702,7 +5703,8 @@ fn announce_in(
                  ON CONFLICT (id) DO UPDATE SET task = excluded.task,
                      branch = excluded.branch, base = excluded.base,
                      machine = excluded.machine, paths = excluded.paths,
-                     expires_at = excluded.expires_at, updated_at = excluded.updated_at
+                     expires_at = excluded.expires_at, updated_at = excluded.updated_at,
+                     repository_scope = excluded.repository_scope
                  WHERE hub_intents.token = excluded.token AND hub_intents.released_at IS NULL",
                 &[
                     &intent.id,
@@ -6270,7 +6272,7 @@ fn touch_in(
         )?;
     }
     // Two calls of one session must not each start an intent.
-    lock_repository(tx, &who.repository)?;
+    lock_repository(tx, &who.scope)?;
     tx.execute(
         "DELETE FROM hub_sessions WHERE token = $1 AND updated_at < $2",
         &[&token, &(now - STALE_SESSION_SECONDS)],
@@ -7780,7 +7782,13 @@ fn checkpoint_overlap_in(
     }
     lock_work_capacity(tx, &who)?;
     if checkpoint.kind == super::work::CheckpointKind::Finish {
-        lock_repository(tx, &who.repository)?;
+        let scope = resolved_scope(
+            tx,
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        )?;
+        lock_repository(tx, &scope)?;
     }
     let mut item = scoped_work(tx, &who, &checkpoint.work_id, now, true)?
         .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
@@ -9267,7 +9275,7 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
-            lock_repository(&mut tx, &who.repository)?;
+            lock_repository(&mut tx, &who.scope)?;
             let name = session_name(&mut tx, token, session, now)?;
             let Some(row) = session_row(&mut tx, token, &name)? else {
                 return Err(HubError::Invalid("unknown session".into()));
@@ -9362,7 +9370,7 @@ impl Store for PgStore {
             } else {
                 true
             };
-            lock_repository(&mut tx, &who.repository)?;
+            lock_repository(&mut tx, &who.scope)?;
             // The pending request was read before waiting for the locks. Another
             // answer or expiry may have committed while we waited.
             if tx
@@ -9593,7 +9601,7 @@ impl Store for PgStore {
     fn handoffs_of_owner(
         &self,
         owner: &str,
-        repository: &str,
+        scope: &str,
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>> {
@@ -9613,9 +9621,9 @@ impl Store for PgStore {
                    ON rs.token = h.requester_token AND rs.session = h.requester_session
                  LEFT JOIN hub_sessions hs
                    ON hs.token = h.holder_token AND hs.session = h.holder_session
-                 WHERE h.repository = $1 AND (rt.owner = $2 OR ht.owner = $2)
+                 WHERE h.repository_scope = $1 AND (rt.owner = $2 OR ht.owner = $2)
                  ORDER BY h.created_at DESC, h.id LIMIT $3",
-                &[&repository, &owner, &(limit as i64)],
+                &[&scope, &owner, &(limit as i64)],
             )?;
             Ok(rows
                 .iter()
@@ -10866,7 +10874,7 @@ impl Store for PgStore {
 
     fn merged_publications(
         &self,
-        repository: &str,
+        scope: &str,
         after: &str,
         oldest: i64,
         limit: usize,
@@ -10876,11 +10884,11 @@ impl Store for PgStore {
             client
                 .query(
                     &format!(
-                        "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower($1) AND p.id > $2
+                        "{PUBLICATION_SELECT} WHERE p.repository_scope = $1 AND p.id > $2
                          AND p.merge_commit IS NOT NULL AND p.updated_at >= $3
                          ORDER BY p.id LIMIT $4"
                     ),
-                    &[&repository, &after, &oldest, &limit],
+                    &[&scope, &after, &oldest, &limit],
                 )?
                 .iter()
                 .map(publication_row)
@@ -11540,7 +11548,13 @@ impl Store for PgStore {
                 "SELECT pg_advisory_xact_lock($1, hashtext($2))",
                 &[&0x6167_6577_i32, &lock],
             )?;
-            lock_repository(&mut tx, &who.repository)?;
+            let scope = resolved_scope(
+                &mut tx,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            lock_repository(&mut tx, &scope)?;
             let scope = start.validate(&who)?;
             let preflight = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
             let seen = super::duplicate_starts::seen(&who, start, preflight.subject_match.as_ref());
@@ -11623,7 +11637,13 @@ impl Store for PgStore {
                 "SELECT pg_advisory_xact_lock($1, hashtext($2))",
                 &[&0x6167_6577_i32, &lock],
             )?;
-            lock_repository(&mut tx, &who.repository)?;
+            let scope = resolved_scope(
+                &mut tx,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            lock_repository(&mut tx, &scope)?;
             // A task-only start's identity is its session, so it finds a paused goal too.
             let current = match unfinished_for_session(&mut tx, &who, &start.session, now)? {
                 Some(item) => Some(item),
@@ -11739,7 +11759,9 @@ impl Store for PgStore {
                 WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
             };
             lock_work_capacity(&mut tx, &who)?;
-            lock_repository(&mut tx, &who.repository)?;
+            let scope =
+                resolved_scope(&mut tx, &who.owner.identity.host, &who.repository, who.repository_id)?;
+            lock_repository(&mut tx, &scope)?;
             let mut item = scoped_work(&mut tx, &who, &request.work_id, now, true)?
                 .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
             let envelope = request.envelope(via, &who.owner.id)?;

@@ -2639,15 +2639,16 @@ fn merged_publications_skip_unmerged_ones(db: &Db) {
                 branch,base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at,
                 repository_scope)
              VALUES ('{id}','{repository}','tok_mp','{}',1,'{}','b-{id}','main','{{}}','created',
-                1,{merged},1,{updated},'scope:{repository}');",
+                1,{merged},1,{updated},'scope:{}');",
             "a".repeat(64),
-            "b".repeat(40)
+            "b".repeat(40),
+            repository.to_ascii_lowercase()
         ));
     }
     db.exec(&sql).unwrap();
     let ids = |after: &str, limit: usize| {
         store
-            .merged_publications("acme/widgets", after, 1, limit)
+            .merged_publications("scope:acme/widgets", after, 1, limit)
             .unwrap()
             .into_iter()
             .map(|p| p.id)
@@ -2657,7 +2658,7 @@ fn merged_publications_skip_unmerged_ones(db: &Db) {
     assert_eq!(ids("", 50), ["m1", "m2"]);
     assert_eq!(
         store
-            .merged_publications("acme/widgets", "", 0, 50)
+            .merged_publications("scope:acme/widgets", "", 0, 50)
             .unwrap()
             .len(),
         3
@@ -3656,6 +3657,30 @@ fn repository_scope_backfill(db: &Db) {
         client: None,
     };
     store.hook_overhead(&bound, REPO, &sample, now).unwrap();
+    // Evidence the Hub observed on the forge is recorded under no token.
+    store
+        .skill_evidence_add(&EvidenceRow {
+            id: "evd_forge".into(),
+            repository: "acme/gadgets".into(),
+            repository_scope: "unused".into(),
+            branch: "feat/x".into(),
+            run_id: "run_forge".into(),
+            skill: "pr-gate".into(),
+            skill_sha256: "0".repeat(64),
+            gate: "ci".into(),
+            kind: "hosted_ci".into(),
+            head_sha: "a".repeat(40),
+            assurance: "observed".into(),
+            summary: "ok".into(),
+            url: None,
+            pull_request: None,
+            detail: None,
+            token_id: "forge".into(),
+            session: "forge".into(),
+            agent: "GitHub".into(),
+            recorded_at: 1,
+        })
+        .unwrap();
     let adoption = |repository: &str, source: &str, reported_by: Option<&str>| SkillAdoption {
         repository: repository.into(),
         repository_scope: format!("unused/{repository}"),
@@ -3754,6 +3779,7 @@ fn repository_scope_backfill(db: &Db) {
         // No token accounts for it: it keeps its bare name, which no caller's scope equals.
         ("hub_contested_edits", &"acme/gone".to_owned(), 1),
         ("hub_skill_adoptions", &connected_scope, 1),
+        ("hub_skill_evidence", &connected_scope, 1),
         ("hub_skill_adoptions", &bound_scope, 1),
         ("hub_skill_adoptions", &"acme/unknown".to_owned(), 1),
     ] {

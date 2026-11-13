@@ -914,9 +914,9 @@ async fn pass(
         .sync
         .set_external_cursor(&repo.id, (if full { last } else { 0 }, after_id.clone()));
 
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let merged = blocking(state, move || {
-        store.merged_publications(&name, &after_id, oldest, MAX_PER_PASS)
+        store.merged_publications(&scope, &after_id, oldest, MAX_PER_PASS)
     })
     .await?;
     let next = match merged.last() {

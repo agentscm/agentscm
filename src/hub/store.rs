@@ -154,10 +154,15 @@ pub(super) const ADOPT_NAME_SCOPE: [&str; 10] = [
     "UPDATE hub_hook_overhead SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_publications SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_skill_evidence SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
-    "UPDATE hub_candidate_heads SET repository_scope = $1 WHERE repository_scope = $2
+    // One row per key moves: names that differ only in case would otherwise collide.
+    "UPDATE hub_candidate_heads SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)
+     AND repository_scope = (SELECT MIN(h.repository_scope) FROM hub_candidate_heads h
+         WHERE lower(h.repository_scope) = lower($2) AND h.branch = hub_candidate_heads.branch)
      AND NOT EXISTS (SELECT 1 FROM hub_candidate_heads h
          WHERE h.repository_scope = $1 AND h.branch = hub_candidate_heads.branch)",
-    "UPDATE hub_skill_adoptions SET repository_scope = $1 WHERE repository_scope = $2
+    "UPDATE hub_skill_adoptions SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)
+     AND repository_scope = (SELECT MIN(a.repository_scope) FROM hub_skill_adoptions a
+         WHERE lower(a.repository_scope) = lower($2))
      AND NOT EXISTS (SELECT 1 FROM hub_skill_adoptions a WHERE a.repository_scope = $1)",
 ];
 
@@ -577,12 +582,13 @@ pub trait Store: Send + Sync {
         via: Via,
         now: i64,
     ) -> Result<Answered>;
-    /// The newest handoffs in `repository` (most recent first, at most `limit`) in which a
-    /// token owned by `owner` is the requester or the holder, in any state.
+    /// The newest handoffs in the repository with `scope` (see [`repository_scope`]; most recent
+    /// first, at most `limit`) in which a token owned by `owner` is the requester or the holder,
+    /// in any state.
     fn handoffs_of_owner(
         &self,
         owner: &str,
-        repository: &str,
+        scope: &str,
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
@@ -869,12 +875,12 @@ pub trait Store: Send + Sync {
         complete: bool,
     ) -> Result<()>;
     fn external_reconciled(&self, repo: &str, commit_sha: &str) -> Result<Option<(i64, bool)>>;
-    /// Publications of `repository` (a full name, matched case-insensitively) with a merge
+    /// Publications of the repository with `scope` (see [`repository_scope`]) with a merge
     /// commit, last updated at or after `oldest` (unix seconds), by id, ids above `after`, at
     /// most `limit`.
     fn merged_publications(
         &self,
-        repository: &str,
+        scope: &str,
         after: &str,
         oldest: i64,
         limit: usize,

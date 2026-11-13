@@ -91,8 +91,13 @@ ALTER TABLE hub_candidate_heads RENAME CONSTRAINT hub_candidate_heads_scoped_pke
     TO hub_candidate_heads_pkey;
 
 ALTER TABLE hub_skill_evidence ADD COLUMN repository_scope TEXT NOT NULL DEFAULT '';
+-- Evidence the Hub observed on the forge has no token: it is the connected repository's, when
+-- exactly one connected repository has the name.
 UPDATE hub_skill_evidence SET repository_scope = COALESCE((
-    SELECT s.scope FROM hub_token_scopes s WHERE s.token = hub_skill_evidence.token_id), repository);
+    SELECT s.scope FROM hub_token_scopes s WHERE s.token = hub_skill_evidence.token_id), (
+    SELECT MIN(r.host) || '/@repo-id:' || MIN(r.repository_id)
+    FROM hub_repositories r WHERE lower(r.full_name) = lower(hub_skill_evidence.repository)
+    HAVING COUNT(*) = 1), repository);
 ALTER TABLE hub_skill_evidence ALTER COLUMN repository_scope DROP DEFAULT;
 DROP INDEX hub_skill_evidence_branch;
 CREATE INDEX hub_skill_evidence_branch ON hub_skill_evidence (repository_scope, branch);
