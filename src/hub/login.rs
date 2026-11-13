@@ -508,8 +508,8 @@ struct Pending {
     device: Table<DeviceLogin>,
     handoffs: Table<Handoff>,
     sessions: Table<Human>,
-    /// Recent role checks of the All repositories list, keyed by person, connection and
-    /// repository: true when readable. Only forge answers are kept, never a failure.
+    /// Recent role checks of the repository lists and the web pages' read polls, keyed by
+    /// person, connection and repository: true when readable. Only forge answers are kept, never a failure.
     role_checks: Table<bool>,
     /// Providers whose forge app refused device sign-in when last asked.
     no_device: std::collections::BTreeSet<String>,

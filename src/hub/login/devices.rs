@@ -552,9 +552,9 @@ pub(in crate::hub) async fn mint_access(
         .map(|(repo, level)| (repo, level == Level::Administer))
 }
 
-/// [`mint_check`] at [`Level::Read`] for a page's poll: a role answer kept within
-/// [`ROLE_CHECK_TTL_SECONDS`] that `owner` may contribute stands in for asking the forge again.
-/// The allow list is still checked on every call.
+/// [`mint_check`] at [`Level::Read`] for a page's poll, and for a person's own dismissals: a role
+/// answer kept within [`ROLE_CHECK_TTL_SECONDS`] that `owner` may contribute stands in for asking
+/// the forge again. The allow list is still checked on every call.
 pub(in crate::hub) async fn read_check(
     state: &HubState,
     owner: &User,
@@ -576,7 +576,7 @@ pub(in crate::hub) async fn read_check(
             return Ok(repo);
         }
     }
-    let (repo, level) = mint_level(state, owner, repository, via).await?;
+    let (repo, level) = decided_level(state, owner, &decision, repository, via).await?;
     // The cache's `true` means "may contribute" (see [`readable`]), so a read-only answer is not kept.
     if rules && level >= Level::Contribute {
         remember_role(&state.login, &owner.id, &repo, true, unix_now());
@@ -593,7 +593,18 @@ async fn mint_level(
     via: &'static str,
 ) -> ApiResult<(ConnectedRepository, Level)> {
     let decision = access::decide(state, owner).await?;
-    admitted(state, owner, &decision, via).await?;
+    decided_level(state, owner, &decision, repository, via).await
+}
+
+/// [`mint_level`] with the embedder's answer already read.
+async fn decided_level(
+    state: &HubState,
+    owner: &User,
+    decision: &Decision,
+    repository: &str,
+    via: &'static str,
+) -> ApiResult<(ConnectedRepository, Level)> {
+    admitted(state, owner, decision, via).await?;
     let identity = &owner.identity;
     let (store, host, named) = (
         state.store.clone(),
@@ -611,7 +622,7 @@ async fn mint_level(
             None => refused_about("not_connected", repository, forge),
         });
     };
-    let level = match repository_level(state, owner, &repo, &decision).await {
+    let level = match repository_level(state, owner, &repo, decision).await {
         Ok(level) => level,
         Err(Denial::Role(role)) => {
             record_refusal(state, owner, "insufficient_role", via).await;
@@ -1278,7 +1289,7 @@ pub(in crate::hub) async fn readable(
 /// How long the repository lists and the web pages' read polls ([`read_check`]) reuse a person's
 /// role answer for one repository, so a granted or lost access shows there within this long;
 /// asking on every call used up a busy Hub's hourly forge API limit. Mints, read tokens and
-/// changes always ask.
+/// changes always ask, except a person's own dismissals, which change nothing anyone else sees.
 const ROLE_CHECK_TTL_SECONDS: i64 = 90;
 
 /// Starts with the person, so [`forget_role_checks`] finds all of theirs.

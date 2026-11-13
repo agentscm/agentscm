@@ -4513,6 +4513,17 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     .await;
     assert_eq!(status, 204);
     assert_eq!(read(&bob).await.0, 401);
+    // With nothing kept, a person without the role is refused and the forge was asked.
+    env.role(BOB, "read", "read", 20);
+    let bob = self::page(&env, BOB).await;
+    env.drop_role(BOB);
+    let reads = env.fake.lock().unwrap().role_reads;
+    let (status, refused) = read(&bob).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 1);
 }
 
 const PERMISSIONS: &str = "/v1/hub/session/permissions";

@@ -322,7 +322,9 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   person's forge answer (readable or not) for a repository for 90 seconds and reuses it for every
   repository list (this one, the device list, the agent list and value metrics) and for the web
   pages' polls of dismissals and agent messages, so a granted or lost access shows there within 90
-  seconds; minting a token, a read token and every change always ask the forge. Answers are never shared between people, a forge that could not answer is never kept,
+  seconds (about two minutes for the agent list, which also reuses its whole answer for 30 seconds
+  per token); minting a token, a read token and every change always ask the forge, except a
+  person's own dismissals, which change nothing anyone else sees. Answers are never shared between people, a forge that could not answer is never kept,
   at most 1,024 answers are held, and signing out forgets that person's. A call past those 90
   seconds makes one forge request per repository, so the page asks every two minutes.
 - `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list check
