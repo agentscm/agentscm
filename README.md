@@ -33,8 +33,8 @@ npx agentscm demo
 
 This starts a temporary local Hub, simulates three agents through its real hook endpoint and
 opens the status page. No account, Docker or forge is required; nothing is written to your
-repository. The agents and decisions are scripted. Press Ctrl-C to stop. See
-[See it in action](docs/scripted-demo.md) for prerequisites and limits.
+repository. The agents and decisions are scripted. Press Ctrl-C to stop. The
+[demo guide](docs/scripted-demo.md) covers prerequisites and limits.
 
 ### Connect your agents
 
