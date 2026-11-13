@@ -440,6 +440,7 @@ fn unanswered_health_route_keeps_a_fast_rejection() {
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
         let mut held = Vec::new();
         // whoami and health arrive on separate connections; answer whoami, hold health open.
@@ -454,7 +455,9 @@ fn unanswered_health_route_keeps_a_fast_rejection() {
                 write!(stream, "HTTP/1.1 401 Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(4));
+        // Hold health open until the check returns: without its own bound the check would
+        // hit the 5 s connection cap and report unreachable.
+        let _ = released.recv();
     });
     save(
         temp.path(),
@@ -464,6 +467,7 @@ fn unanswered_health_route_keeps_a_fast_rejection() {
         }]),
     );
     let output = run(temp.path(), Some(&root), true);
+    release.send(()).unwrap();
     server.join().unwrap();
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -361,7 +361,7 @@ fn hub_check_text(check: &crate::client_status::HubCheck, now: i64) -> String {
             crate::hub_cli::when(*expires_at, now)
         ),
         HubCheck::Rejected { .. } => "rejected the saved sign-in or token".to_owned(),
-        HubCheck::Unavailable { .. } => "did not answer".to_owned(),
+        HubCheck::Unavailable { .. } => "did not answer or answered with an error".to_owned(),
         HubCheck::InvalidResponse { .. } => "gave an answer AgentSCM could not read".to_owned(),
     }
 }

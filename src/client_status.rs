@@ -190,7 +190,7 @@ impl Health {
             Self::RenewalFailed { message } => format!("authenticated but renewal failed: {message}"),
             Self::Expired => "expired; the next hook call tries to renew it, or run client renew".into(),
             Self::Revoked => "the Hub rejected the token (revoked or no longer valid); run client setup again".into(),
-            Self::Unreachable => "the Hub did not answer or answered with an error; hooks fail open and coordination is unknown until it does".into(),
+            Self::Unreachable => "the Hub did not answer, or gave an error or an unreadable answer; hooks fail open and coordination is unknown until it does".into(),
         }
     }
 }
