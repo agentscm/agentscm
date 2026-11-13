@@ -77,78 +77,86 @@ pub(super) fn addresses_person(text: &str) -> bool {
         .any(|word| matches!(word.as_str(), "you" | "your" | "yours" | "yourself"))
 }
 
-/// Whether the end of an agent's last message may ask its person for something. A wrong yes
-/// only shows a session its person need not answer; a wrong no hides a request. So a question
-/// mark, any word to the person, any offer or choice ("shall I", a sentence that opens with
-/// "which") and any word for waiting, needing or being stuck counts. "Blocked" counts as a
-/// party's state or a request ("blocked on", "still blocked:", "unblock", "blocking"), not as a
-/// record's ("blocker checkpoint recorded", "state blocked,").
+/// Whether the end of an agent's last message asks its person for something. Only its last
+/// paragraph is read, and only a real ask counts: a sentence that closes with a question mark,
+/// an offer or a request in so many words ("shall I", "do you want", "let me know", "I need
+/// your"), a sentence that opens with "which", or one that opens with a request to the person
+/// ("Approve…", "Reply with…", "Tell me…"). Words that only report a state ("waiting on CI",
+/// "the owner merged it", "blocked by the review", "I need to rerun it") ask nothing, since
+/// nearly every report has some and each one put a finished turn in front of its person.
 fn asks_person(text: &str) -> bool {
-    const WAITING: &[&str] = &[
-        "wait",
-        "until",
-        "need",
-        "require",
-        "approv",
-        "confirm",
-        "choose",
-        "choice",
-        "pick",
-        "decision",
-        "decide",
-        "permission",
-        "sign in",
-        "sign-in",
-        "log in",
-        "login",
-        "credential",
-        "expired",
-        "blocked on",
-        "blocked by",
-        "am blocked",
-        "i'm blocked",
-        "is blocked",
-        "are blocked",
-        "was blocked",
-        "were blocked",
-        "got blocked",
-        "still blocked",
-        "blocked:",
-        "blocker:",
-        "blocking",
-        "unblock",
-        "stuck",
-        "unable",
-        "cannot",
-        "can't",
-        "proceed",
-        "go ahead",
-        "go-ahead",
-        "say go",
-        "reply",
-        "respond",
-        "provide",
+    // Phrases, matched as whole words; a typographic apostrophe spells the same word.
+    const ASKS: &[&str] = &[
         "let me know",
         "tell me",
         "send me",
-        "please",
         "should i",
         "shall i",
+        "do you want",
+        "would you like",
+        "if you want",
+        "if you'd like",
+        "want me to",
         "which one",
         "which of",
-        "want me to",
-        "owner",
+        "need your",
+        "needs your",
+        "need you to",
+        "require your",
+        "requires your",
+        "waiting for your",
+        "waiting on your",
+        "your call",
+        "say go",
     ];
-    // A typographic apostrophe spells the same word.
+    // Words that open a request to the person, as a sentence's first words.
+    const OPENS: &[&str] = &[
+        "approve", "confirm", "choose", "pick", "decide", "reply", "respond", "tell", "send",
+        "say", "provide", "give", "grant", "paste", "share", "please", "unblock", "sign in",
+        "log in", "which",
+    ];
     let lower = text.to_lowercase().replace('’', "'");
-    // "Which" asks where it opens a sentence; inside one it is a relative clause.
-    let opens_with_which = lower
-        .split(['.', '!', ':', ';', '\n'])
-        .any(|sentence| sentence.trim_start().starts_with("which"));
-    text.contains(['?', '？'])
-        || addresses_person(text)
-        || opens_with_which
-        || WAITING.iter().any(|phrase| lower.contains(phrase))
+    // The last paragraph, with the prose before it when it is only a list, a table or code, as
+    // in "Which one should I merge?" followed by the choices.
+    let mut paragraphs = lower.split('\n').fold(vec![Vec::new()], |mut all, line| {
+        match line.trim() {
+            "" if all.last().is_some_and(Vec::is_empty) => {}
+            "" => all.push(Vec::new()),
+            line => all.last_mut().unwrap().push(line),
+        }
+        all
+    });
+    paragraphs.retain(|paragraph| !paragraph.is_empty());
+    let listed = |paragraph: &Vec<&str>| {
+        let fenced = |line: Option<&&str>| line.is_some_and(|line| line.starts_with("```"));
+        fenced(paragraph.first())
+            || fenced(paragraph.last())
+            || paragraph.iter().all(|line| {
+                line.starts_with(['-', '*', '+', '|', '`', '>'])
+                    || line.split_once(['.', ')']).is_some_and(|(n, _)| {
+                        !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                    })
+            })
+    };
+    let start = paragraphs
+        .iter()
+        .rposition(|paragraph| !listed(paragraph))
+        .unwrap_or(0);
+    let last = paragraphs[start..].concat().join("\n");
+    // A question mark closes a sentence where no letter or digit follows it, unlike "?id=1".
+    let questions = last.match_indices(['?', '？']).any(|(at, mark)| {
+        !last[at + mark.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+    });
+    let spoken = |phrase: &str| format!(" {} ", words(phrase).join(" "));
+    let said = spoken(&last);
+    let opens = last
+        .split(['.', '!', '?', ':', ';', '\n'])
+        .map(spoken)
+        .any(|sentence| OPENS.iter().any(|open| sentence.starts_with(&spoken(open))));
+    questions || opens || ASKS.iter().any(|phrase| said.contains(&spoken(phrase)))
 }
 
 /// Whether a whitespace-separated token names something instead of saying it: an id, a path or a
@@ -185,8 +193,8 @@ fn reads_as_english(text: &str) -> bool {
 
 /// Whether an agent's whole last message asked its person nothing, so its turn's end is read
 /// and not answered. It asked nothing when it is only identifiers (an id, a path, a number) or
-/// English prose, a report of what was done, and shows no sign of an ask: no question mark, no
-/// word to the person, no offer or choice and no word for waiting or needing. Anything the rule
+/// English prose, a report of what was done, whose last paragraph asks nothing: no question, no
+/// offer and no request to the person. Anything the rule
 /// cannot read (an empty message, another language, a word or two) is not known to ask nothing.
 /// The hook client judges the message on the person's machine and sends only this answer; the
 /// Hub judges nothing it has not all of.
@@ -1271,21 +1279,14 @@ mod tests {
     #[test]
     fn a_turn_that_ended_asking_nothing_is_nobodys_wait() {
         // Endings modelled on real last messages. These ask, or are not known to ask nothing:
-        // a question, words to the person, words for waiting or needing, an ask that sits
-        // before a long report, another language, and too little to read.
+        // a question or a request to the person in the last paragraph, another language, and
+        // too little to read.
         for asks in [
             "Which of the two should I merge?",
             "Both are ready. Let me know which one to merge.",
             "The next step requires your AWS sign-in.",
-            "I stopped here until the migration is approved.",
-            "The branch is pushed and the checks are running; you can merge it when they pass.",
             "Two options: A (rebase) or B (merge). Pick one and I will go on. The tests pass for both.",
             "Say go and I will merge it. The checks are green and the diff is small.",
-            "I am stuck: the build fails with a linker error and the cause is not clear.",
-            "I can’t continue. The token has expired and the deploy stopped for that reason.",
-            "Decision for the reviewer: the unused volumes take about 31 GiB, and deleting them \
-             is not reversible. Status of the open pull requests: 12 conflicts with main, and 13 \
-             and 14 have had no pushes since this morning. Nothing has merged since noon.",
             "Die Migration ist fertig und die Tests laufen durch.",
             "どちらにしますか？",
             "Done.",
@@ -1294,16 +1295,29 @@ mod tests {
             "Checkpoint recorded for wrk_1a2b. Shall I merge it?",
             "Checkpoint recorded. Shall I merge the branch now.",
             "Merged and pushed. Which branch next.",
-            "I am blocked on the review of the migration.",
             "Unblock the deploy and I will continue.",
-            "Still blocked: the release workflow has no access to the signing key.",
-            "This is blocking the release.",
-            "The deploy has stopped and I need the API key for the region.",
             "Sag mir, was ich als Nächstes tun soll, dann will ich weitermachen.",
+            "Should I open the pull request? The branch is pushed and the tests pass.",
+            "The branch is pushed and the tests pass.\n\nDo you want me to open the pull request \
+             now, or wait until the review of the migration is done?",
+            "Both fixes are written and tested on both stores.\n\nApprove the push and I will \
+             open the pull request.",
+            "The deploy stopped at the health check.\n\nReply with the region and I will \
+             retry it there.",
+            "The unused volumes take about 31 GiB and deleting them is not reversible.\n\nTell \
+             me which ones to keep.",
+            "The release is ready.\n\n**Shall I tag it?**",
+            "Here is the plan:\n\n- one\n- two\n\nWould you like the second step first?",
+            "Both are rebased on main.\n\nWhich one should I merge first?\n\n- #12, the \
+             schema fix\n- #13, the docs",
+            "The cache is stale.\n\nShould I clear it with this?\n\n```\nagentscm cache \
+             clear\n```",
+            "Two ways to fix it:\n\n1. Retry the call\n2. Drop the cache\n\nPick one.",
         ] {
             assert!(!turn_asked_nothing(asks), "{asks}");
         }
-        // These report and ask nothing.
+        // These report and ask nothing, though they mention the owner, waiting, needing or being
+        // blocked, or asked something in an earlier paragraph.
         for done in [
             "The Work is completed and its claim is released. The first call failed because it \
              passed a field that the schema does not have; the retry with only the outcome and \
@@ -1327,6 +1341,29 @@ mod tests {
             "The fix, which adds a test, is merged and the checks passed.",
             "src/hub/hook.rs",
             "64493",
+            // Status words that only report.
+            "Pull request 412 is queued. I am waiting for CI and will merge it once the checks \
+             pass.",
+            "The owner approved the plan and the first pull request merged. The second one is \
+             waiting on the merge queue until the first lands.",
+            "Reported to the owner in the lead session. Nothing else is needed from this session \
+             until the review comes back.",
+            "I stopped here until the migration is approved.",
+            "The branch is pushed and the checks are running; you can merge it when they pass.",
+            "I am blocked on the review of the migration, so the second pull request waits.",
+            "Still blocked: the release workflow has no access to the signing key. Recorded as a \
+             blocker on the Work.",
+            "I can’t continue on the deploy: the token has expired. The rest of the batch merged \
+             and is recorded.",
+            "The deploy has stopped and I need to rerun the tests before I can proceed.",
+            "Unable to reproduce the failure on main; the flaky test passed ten times in a row.",
+            "Decision for the reviewer is recorded: the unused volumes take about 31 GiB and \
+             were left in place. Nothing has merged since noon.",
+            "The fetch with ?page=2 returned the rest of the list, and all of it is recorded.",
+            "Why did the first run fail? The cache held an old schema.\n\nThe cache is cleared, \
+             the rerun passed and the fix is merged.",
+            "Should the cache be cleared? It was, and the rerun passed.\n\nThe fix is merged \
+             and recorded:\n\n- src/cache.rs\n- src/cache_test.rs",
         ] {
             assert!(turn_asked_nothing(done), "{done}");
         }
