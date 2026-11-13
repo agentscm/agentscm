@@ -629,11 +629,11 @@ impl Slack {
             "DELETE FROM messages WHERE state IN ('done','failed') AND created < ?1",
             [now - 86400],
         )?;
-        if self.collect_status(state, now).is_err() {
-            eprintln!("Slack status collection unavailable");
+        if let Err(error) = self.collect_status(state, now) {
+            eprintln!("Slack status collection unavailable: {error}");
         }
-        if self.collect_waits(state, now).is_err() {
-            eprintln!("Slack wait collection unavailable");
+        if let Err(error) = self.collect_waits(state, now) {
+            eprintln!("Slack wait collection unavailable: {error}");
         }
         Ok(())
     }
