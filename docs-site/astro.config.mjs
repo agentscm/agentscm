@@ -11,14 +11,15 @@ export default defineConfig({
       title: 'AgentSCM Documentation',
       favicon: '/favicon.png',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/agentscm/agentscm' }],
+      components: { SocialIcons: './src/components/SocialIcons.astro' },
       sidebar: [
         { label: 'Start', items: [
-          { label: 'Scripted demo', link: '/scripted-demo/' },
           { label: 'Documentation', link: '/' },
+          { label: 'See it in action', link: '/scripted-demo/' },
           { label: 'Install', link: '/install/' },
+          { label: 'How it works', link: '/concepts/' },
           { label: 'Guided setup', link: '/setup-guide/' },
           { label: 'Two-container Hub walkthrough', link: '/two-agent-demo/' },
-          { label: 'Concepts', link: '/concepts/' },
         ] },
         { label: 'Coordinate', items: [
           { label: 'Supported agents', link: '/agents/' },
