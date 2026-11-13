@@ -1240,21 +1240,27 @@ in the Hub's settings table, keyed by the forge's repository id so a rename keep
 checkouts follow it as described in
 [the repository setting](change-capture.md#the-repository-setting).
 
-The Hub-wide default is off. Repository permission and the author's affirmative per-repository opt-in are separate gates; neither a notice nor an existing capture binding records consent. A Hub admin may change the Hub-wide default, but that still does not opt any person in. A repository setting and checkout mode can narrow sharing further:
+The Hub-wide default is on until a Hub admin sets it, so on a new Hub a connected repository shares
+its agents' conversations with the people who can read it there. Four switches turn that off, and
+each still wins over the default:
 
 - a Hub admin sets the Hub-wide default off (`PUT .../conversation-sharing/default` below);
 - a repository admin sets the repository off;
-- a person has not opted in for a repository (`agentscm change-capture opt-in`), or has opted out;
+- a person opts their own sessions out for a repository (`agentscm change-capture opt-out`);
 - a checkout's own capture mode is lower than `shared-conversation`, or its capture is off
   ([capture modes](change-capture.md)).
 
-Existing Hubs also keep sharing off unless an administrator deliberately changes the setting. Nothing a person had not affirmatively agreed to share starts uploading because of an install or upgrade. After both gates are enabled, each person's agent is told at session start that sharing is on; that notice is informational and cannot substitute for consent.
+A Hub that already had people when it first ran a build with this default keeps sharing off: the
+`conversation_sharing_default` migration records the default as off there, unless a Hub admin had
+already set it. Nothing a person had not agreed to share starts uploading because of an upgrade. A
+Hub admin turns the default on for such a Hub with the same `PUT`. Each person's agent is told once
+at session start that sharing is on.
 
 - `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
   `{repository, enabled, source, hub_default, opted_out, consented, notified, sharing}` for the
   token's person: `enabled` is the repository's effective setting, `source` is `repository` or
-  `hub_default`, `consented` is true only after the person's explicit opt-in, and `sharing` is
-  `enabled` and `consented`. A token minted without a forge
+  `hub_default`, `consented` is not `opted_out` (kept for clients that read it), and `sharing` is
+  `enabled` and not `opted_out`. A token minted without a forge
   repository id never shares.
 - `PUT /v1/hub/repos/{repo}/conversation-sharing/me` with `{opted_out?, notified?}` (a token that
   is not read-only) records the person's own choice; the client sets `notified` once it has shown

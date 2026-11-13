@@ -1763,17 +1763,6 @@ mod shared_bodies {
             let helper = user(&*store, 12, "helper");
             let (helper_token, helper_secret) = token(&*store, &helper, "helper", false);
             let (_, helper_read_only_secret) = token(&*store, &helper, "helper-reader", true);
-            // Positive-path fixtures opt each author in explicitly. Repository enablement alone
-            // is intentionally insufficient.
-            for author in [&owner, &helper] {
-                store
-                    .set_setting(
-                        &format!("conversation_sharing:opt_out:{author}:77"),
-                        "0",
-                        author,
-                    )
-                    .unwrap();
-            }
             let work = store
                 .work_start(
                     &owner_token,
@@ -2225,10 +2214,9 @@ mod shared_bodies {
                 .await,
             StatusCode::FORBIDDEN
         );
-        // Hub administration does not substitute for the uploader's own consent.
         assert_eq!(
             f.put(&f.admin_secret, &undeclared_sha, undeclared).await,
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
             assert_eq!(
@@ -2528,7 +2516,7 @@ mod shared_bodies {
         );
         assert_eq!(f.row().state, SharedBodyState::Declared);
         f.share(true);
-        // Notice-only and invalid legacy choices do not become consent after re-enablement.
+        // An unreadable choice opts the person out, also after re-enablement.
         f.store
             .set_setting(
                 &format!("conversation_sharing:opt_out:{}:77", f.owner),
@@ -2605,7 +2593,7 @@ mod shared_bodies {
             .unwrap()
             .parse::<Value>()
             .unwrap();
-        assert_eq!(other["sharing"], false, "another person has not opted in");
+        assert_eq!(other["sharing"], true, "another person still shares");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
