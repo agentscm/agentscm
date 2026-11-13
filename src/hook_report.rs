@@ -272,10 +272,20 @@ mod tests {
         let old = root.join("old-session");
         std::fs::create_dir_all(&old).unwrap();
         let long_ago = SystemTime::now() - Duration::from_secs(8 * 86_400);
-        std::fs::File::open(&old)
-            .unwrap()
-            .set_modified(long_ago)
-            .unwrap();
+        // Windows opens a directory only with backup semantics, and needs write access to date it.
+        #[cfg(windows)]
+        let dir_file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+                .open(&old)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let dir_file = std::fs::File::open(&old).unwrap();
+        dir_file.set_modified(long_ago).unwrap();
+        drop(dir_file);
         Pending::load(Some(dir.path()), "claude", Some("new"))
             .settle(Duration::ZERO, Sent::Answered);
         assert!(!old.exists());

@@ -315,6 +315,15 @@ pub(crate) fn recorded(config: &Path, ancestors: &[Process]) -> Recorded {
 mod tests {
     use super::*;
 
+    /// An absolute root on this platform: a route only keeps absolute roots.
+    fn root(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\work\{name}"))
+        } else {
+            PathBuf::from(format!("/work/{name}"))
+        }
+    }
+
     // An application that hosts two agents; the first runs its hook through a shell and its
     // MCP server through a launcher.
     const TABLE: &str = "    1     0 Fri Nov  6 10:22:18 2026     /sbin/launchd
@@ -369,7 +378,7 @@ mod tests {
     #[test]
     fn a_session_route_is_written_once_read_back_and_forgotten() {
         let config = tempfile::tempdir().unwrap();
-        let (one, two) = (Path::new("/work/one"), Path::new("/work/two"));
+        let (one, two) = (&*root("one"), &*root("two"));
         let get = |session: &str| route_of(config.path(), session, "https://hub", "o/r");
         assert_eq!(get("native-1"), None);
         record_route(config.path(), "native-1", "https://hub", "o/r", one).unwrap();
@@ -408,7 +417,7 @@ mod tests {
     #[test]
     fn a_session_keeps_one_route_per_repository_and_forgets_them_all() {
         let config = tempfile::tempdir().unwrap();
-        let (one, two) = (Path::new("/work/one"), Path::new("/work/two"));
+        let (one, two) = (&*root("one"), &*root("two"));
         record_route(config.path(), "s", "https://hub", "o/a", one).unwrap();
         record_route(config.path(), "s", "https://hub", "o/b", two).unwrap();
         record_route(config.path(), "t", "https://hub", "o/a", two).unwrap();
@@ -424,7 +433,7 @@ mod tests {
     #[test]
     fn session_routes_are_bounded_by_dropping_the_oldest() {
         let config = tempfile::tempdir().unwrap();
-        let root = Path::new("/work/one");
+        let root = &*root("one");
         for index in 0..=MAX_RECORDS {
             record_route(
                 config.path(),
