@@ -193,9 +193,14 @@ hooks written by `init-repo` or quickstart. On Unix, after a checkout has a save
 add marked project-local Claude hooks while preserving unrelated entries. Each hook resolves the
 session's current authorized Work and generation before it associates an event or action.
 
-The default `metadata-only` mode sends bounded typed facts and artifact identities to the Hub.
-Optional selected conversation/tool bodies, captured source bytes and command output remain in the
-operator's private local spool. Ordinary shell success is an execution outcome, not a passing
+Whether conversation bodies leave the machine is a Hub setting, **Share agent conversations**, not a
+per-checkout switch. It is on by default on a new Hub (a Hub that already had people when the
+default became on keeps it off). While it is on and the person has not opted out, every connected
+checkout follows it without `configure`: the plugin hook creates a binding that follows the Hub and
+captures in `shared-conversation` mode, uploading best-effort-redacted conversation bodies. While it
+is off, capture sends only bounded typed facts and artifact identities (`metadata-only`), and
+conversation/tool bodies, captured source bytes and command output stay in the operator's private
+local spool. See [sharing conversations with the Hub](change-capture.md#sharing-conversations-with-the-hub). Ordinary shell success is an execution outcome, not a passing
 verification. The local client reports pass/fail only for an exact configured verification recipe
 match; the Hub stores that as caller asserted and does not validate it against an independent recipe
 registry. See the [implementation status](implementation/agentscm-build-status.md) for

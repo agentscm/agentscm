@@ -33,9 +33,11 @@ authority. Durable Work records retain ownership, reported progress and handover
 [change capture](change-capture.md) adds bounded visible agent events, source bindings and action
 receipts. An action's outcome, verification result, source applicability, assurance, availability
 and coverage are separate; a captured command is not independent verification or human approval.
-Private bodies and source snapshots stay in an operator-chosen local spool by default. Explicit
-per-checkout conversation sharing adds best-effort redaction, author/admin reads and bounded Hub
-retention; it does not complete the wider privacy and recovery lifecycle.
+Source snapshots stay in an operator-chosen local spool. Conversation sharing is a repository
+setting on the Hub, on by default on a new Hub, which connected checkouts follow: while it is on,
+conversation bodies are uploaded with best-effort redaction, readable by anyone who can read the
+repository, and kept for a bounded retention period; while it is off, they stay in the local spool.
+It does not complete the wider privacy and recovery lifecycle.
 
 `agentscm open` starts a loopback [front door](connect-this-computer.md) that joins selected local
 checkouts to their Hub views. The [repository explorer](repository-explorer.md) reads committed

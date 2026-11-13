@@ -1,0 +1,80 @@
+---
+// Starlight's social links, preceded by the latest released version. The version is read at
+// build time from the npm package manifest (release automation keeps it in step with the
+// release tag) and refreshed in the browser from the npm registry, so a release shows here
+// without waiting for the next docs deploy.
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+import npmPackage from '../../../packages/npm/package.json';
+
+const repository = 'https://github.com/agentscm/agentscm';
+const version: string = npmPackage.version;
+---
+
+<a
+	class="release-version"
+	href={`${repository}/releases/tag/v${version}`}
+	data-release-version
+	data-repository={repository}
+	aria-label={`Latest release v${version}: release notes`}
+>
+	<span data-release-label>v{version}</span>
+</a>
+<Default />
+
+<script>
+	const PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+	async function refresh() {
+		const links = document.querySelectorAll<HTMLAnchorElement>('[data-release-version]');
+		if (links.length === 0) return;
+		try {
+			const response = await fetch('https://registry.npmjs.org/agentscm/latest', {
+				headers: { accept: 'application/json' },
+			});
+			if (!response.ok) return;
+			const { version } = (await response.json()) as { version?: unknown };
+			if (typeof version !== 'string' || !PATTERN.test(version)) return;
+			for (const link of links) {
+				const label = link.querySelector('[data-release-label]');
+				if (!label || label.textContent === `v${version}`) continue;
+				label.textContent = `v${version}`;
+				link.href = `${link.dataset.repository}/releases/tag/v${version}`;
+				link.setAttribute('aria-label', `Latest release v${version}: release notes`);
+			}
+		} catch {
+			// Offline or blocked: keep the version this page was built with.
+		}
+	}
+
+	refresh();
+</script>
+
+<style>
+	@layer starlight.core {
+		.release-version {
+			display: inline-flex;
+			align-items: center;
+			padding: 0.125rem 0.5rem;
+			margin-inline-end: 0.25rem;
+			border: 1px solid var(--sl-color-gray-5);
+			border-radius: 999px;
+			color: var(--sl-color-gray-2);
+			font-size: var(--sl-text-xs);
+			font-variant-numeric: tabular-nums;
+			line-height: 1.5;
+			text-decoration: none;
+			white-space: nowrap;
+			transition:
+				color 150ms ease-out,
+				border-color 150ms ease-out;
+		}
+		.release-version:hover {
+			color: var(--sl-color-white);
+			border-color: var(--sl-color-text-accent);
+		}
+		.release-version:focus-visible {
+			outline: 2px solid var(--sl-color-text-accent);
+			outline-offset: 2px;
+		}
+	}
+</style>

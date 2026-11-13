@@ -167,8 +167,9 @@ default that applies to every repository without its own setting. The routes are
   plugin hook asks the Hub at each session start; when the Hub shares and the checkout has no
   capture binding, it creates one with the one-step defaults below, marked `follows_hub`, and
   installs no hooks of its own: the plugin hook captures for it, including the events it
-  registers only for capture (for Claude Code `PostToolUseFailure`, `MessageDisplay`,
-  `PreCompact`, `SubagentStart`, `SubagentStop`; for Codex see the
+  registers only for capture (for Claude Code `PostToolUseFailure`, `MessageDisplay` and
+  `PreCompact`; its `SubagentStart` and `SubagentStop` are captured too but also reach the Hub,
+  which keeps each session's subagents from them; for Codex see the
   [Codex adapter](#codex-adapter)). Capture starts with that session. A binding that follows the
   Hub is written as config version 7, which older binaries refuse.
 - **People are told and can opt out.** The first time a person's session shares in a

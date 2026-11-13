@@ -64,9 +64,9 @@ and `AGENTSCM_TASK` sets the task text (default: `work on <branch>`).
 ## Without installing anything: MCP and hook endpoints
 
 The hub also serves the same coordination to agents directly: an MCP client
-calls `POST /mcp` (six tools: `agentscm_start`, `agentscm_check`, `agentscm_status`,
-`agentscm_done`, and `agentscm_ask` and `agentscm_handoff` for the experimental
-handoff), and an agent's hooks can post their hook JSON to
+calls `POST /mcp` (the coordination tools `agentscm_start`, `agentscm_check`, `agentscm_status`
+and `agentscm_done`, `agentscm_ask` and `agentscm_handoff` for the experimental handoff, and
+the Hub's Work and read tools; see [the Hub's MCP tools](hub.md#agent-sessions-mcp-and-hook-endpoints)), and an agent's hooks can post their hook JSON to
 `POST /v1/hub/hook/{claude,codex,cursor,copilot,generic}`, which always answers
 in that agent's own format. Sessions there expire 20 minutes after their last
 call (30 minutes at most per hold). The first time in a session an agent is about
