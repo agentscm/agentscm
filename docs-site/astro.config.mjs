@@ -1,7 +1,9 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import { unified } from '@astrojs/markdown-remark';
+import rehypeCodeBreaks from './src/rehype-code-breaks.js';
 import removePageHeading from './src/remark-remove-page-heading.js';
+import remarkMermaid from './src/remark-mermaid.js';
 import starlightDocLinks from './src/remark-starlight-doc-links.js';
 
 export default defineConfig({
@@ -11,7 +13,10 @@ export default defineConfig({
       title: 'AgentSCM Documentation',
       favicon: '/favicon.png',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/agentscm/agentscm' }],
-      components: { SocialIcons: './src/components/SocialIcons.astro' },
+      components: {
+        MarkdownContent: './src/components/MarkdownContent.astro',
+        SocialIcons: './src/components/SocialIcons.astro',
+      },
       sidebar: [
         { label: 'Start', items: [
           { label: 'Documentation', link: '/' },
@@ -47,5 +52,7 @@ export default defineConfig({
       ],
     }),
   ],
-  markdown: { processor: unified({ remarkPlugins: [removePageHeading, starlightDocLinks] }) },
+  markdown: { processor: unified({ remarkPlugins: [removePageHeading, starlightDocLinks, remarkMermaid],
+    rehypePlugins: [rehypeCodeBreaks],
+  }) },
 });
