@@ -504,10 +504,12 @@ async fn every_fixture_gets_its_agents_output_shape() {
             Expect::Empty => assert_eq!(answer, json!({}), "{name}"),
             Expect::Context(pointer) => {
                 let text = text_at(&answer, pointer);
-                // The session ID and required rules lead a start context.
+                // The session ID and required rules lead a start context; Claude Code reads the
+                // rules in the MCP server's instructions instead.
                 assert!(text.starts_with("AgentSCM"), "{name}: {answer}");
-                assert!(
+                assert_eq!(
                     agentscm::hub::agent_rules::carries_all(text),
+                    agent != "claude",
                     "{name}: {answer}"
                 );
                 assert!(
@@ -605,12 +607,12 @@ async fn session_end_leaves_held_work_active_without_claiming_completion() {
     let session = "11111111-2222-3333-4444-555555555555";
     let start_answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
     assert!(start_answer.to_string().contains("actions need you"));
-    assert!(start_answer.to_string().contains("Coverage incomplete"));
     assert!(
         start_answer
             .to_string()
-            .contains("provider times shown separately")
+            .contains("AgentSCM coverage is partial")
     );
+    assert!(!start_answer.to_string().contains("Evidence revision"));
     let start_context = text_at(&start_answer, CLAUDE_CONTEXT);
     assert!(
         start_context.contains("AgentSCM shared work"),
@@ -792,15 +794,71 @@ async fn session_start_flags_records_omitted_from_a_complete_preview() {
         context.contains("AgentSCM shared work: 6 unfinished item(s)"),
         "{answer}"
     );
-    assert!(
-        context.contains("This bounded hook preview omits shared-work records"),
-        "{answer}"
-    );
-    assert!(
-        context.contains("agentscm_work_briefing to begin durable pagination"),
-        "{answer}"
-    );
+    assert!(context.contains("agentscm_work_briefing"), "{answer}");
     assert!(!context.contains("Briefing delivery"), "{answer}");
+}
+
+/// A start in a repository with six unfinished Works stays small: the hook text is re-read on
+/// every turn, so its size is a cost to every session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_start_context_stays_small() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    for index in 0..6 {
+        hub.store
+            .work_start_auto(
+                &principal.token_id,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: None,
+                    title: format!("unfinished goal {index}"),
+                    description: None,
+                    session: format!("preview-session-{index}"),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/preview-{index}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
+    let context = text_at(&answer, CLAUDE_CONTEXT);
+    eprintln!("START_CONTEXT_CHARS {}\n{context}", context.chars().count());
+    // Each unfinished Work is named once, with no field dumps or record ids.
+    assert_eq!(context.matches("unfinished goal 3").count(), 1, "{context}");
+    for dump in [
+        "Provider source",
+        "Evidence revision",
+        "wrk_",
+        "merge-base",
+        "Claim Active",
+    ] {
+        assert!(!context.contains(dump), "{dump}: {context}");
+    }
+    assert!(
+        context.contains("AgentSCM coverage is partial"),
+        "{context}"
+    );
+    // It was 7,557 characters before the start context was trimmed.
+    assert!(
+        context.chars().count() < 2_500,
+        "{}",
+        context.chars().count()
+    );
 }
 
 /// The warn-once part of a refusal. A session's first edit while it has declared no Work carries

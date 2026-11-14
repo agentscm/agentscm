@@ -266,7 +266,8 @@ async fn session_start_carries_the_block_between_the_status_and_the_shared_work(
     // After the actionable status, and never first.
     let status = before.trim_end().lines().next_back().unwrap_or_default();
     assert!(
-        status.starts_with("Evidence revision ")
+        status.starts_with("- ")
+            || status.ends_with("actions need you.")
             || status.starts_with("Current actionable status unavailable"),
         "{text}"
     );
