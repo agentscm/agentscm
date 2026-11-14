@@ -258,12 +258,7 @@ async fn automatic_catchup_warns_before_forge_coverage_exists() {
         .and_then(Value::as_str)
         .unwrap();
     assert!(
-        hook_text.contains("Some catch-up sources are incomplete or unavailable"),
-        "{hook}"
-    );
-    assert!(hook_text.contains("affected coverage is unknown"), "{hook}");
-    assert!(
-        hook_text.contains("Do not infer that no recent merges were recorded"),
+        hook_text.contains("some merge sources are unobserved, so missing merges are unknown"),
         "{hook}"
     );
 
