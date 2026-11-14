@@ -1256,14 +1256,20 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
             status.work.len() - 6
         ));
     }
-    lines.extend(
-        status
-            .actions
-            .iter()
-            .filter(|a| a.needs_you)
-            .take(6)
-            .map(|a| a.action.clone()),
-    );
+    let needs_you: Vec<_> = status.actions.iter().filter(|a| a.needs_you).collect();
+    lines.extend(needs_you.iter().take(6).map(|a| a.action.clone()));
+    if needs_you.len() > 6 {
+        lines.push(format!(
+            "And {} more actions need you; see agentscm_work_status.",
+            needs_you.len() - 6
+        ));
+    }
+    if !status.complete {
+        lines.push(
+            "Coverage incomplete: these counts can miss Work, so missing signals remain unknown."
+                .into(),
+        );
+    }
     lines.join("\n")
 }
 
@@ -4955,6 +4961,21 @@ mod tests {
                 .limits
                 .contains(&"reservation_holders_truncated".into())
         );
+        // The start form names six Works, counts the rest and keeps the incomplete note.
+        let start = render_start_text(&status);
+        assert_eq!(
+            start
+                .lines()
+                .filter(|l| l.starts_with("- Synthetic"))
+                .count(),
+            6
+        );
+        assert!(
+            start.contains(&format!("- and {} more", MAX_STATUS_WORK - 6)),
+            "{start}"
+        );
+        assert!(start.contains("Coverage incomplete"), "{start}");
+        assert!(!start.contains("Evidence revision"), "{start}");
         assert!(
             status
                 .work

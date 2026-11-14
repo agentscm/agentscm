@@ -612,6 +612,7 @@ async fn session_end_leaves_held_work_active_without_claiming_completion() {
             .to_string()
             .contains("AgentSCM coverage is partial")
     );
+    assert!(start_answer.to_string().contains("Coverage incomplete"));
     assert!(!start_answer.to_string().contains("Evidence revision"));
     let start_context = text_at(&start_answer, CLAUDE_CONTEXT);
     assert!(
@@ -837,7 +838,6 @@ async fn session_start_context_stays_small() {
     }
     let answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
     let context = text_at(&answer, CLAUDE_CONTEXT);
-    eprintln!("START_CONTEXT_CHARS {}\n{context}", context.chars().count());
     // Each unfinished Work is named once, with no field dumps or record ids.
     assert_eq!(context.matches("unfinished goal 3").count(), 1, "{context}");
     for dump in [

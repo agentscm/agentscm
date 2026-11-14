@@ -279,6 +279,10 @@ fn names_session_only(reply: &Value, pointer: &str) {
     let context = text(reply, pointer);
     assert!(context.contains(SESSION), "{reply}");
     assert!(!context.contains("Required AgentSCM rules"), "{reply}");
+    assert!(
+        context.contains("agentscm MCP server's instructions"),
+        "{reply}"
+    );
 }
 
 /// A subagent's edit under its parent's session: it is not refused, and the note it gets points

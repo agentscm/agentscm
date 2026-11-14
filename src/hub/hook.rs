@@ -1531,6 +1531,12 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
+                // A read-only token's MCP instructions name no write tool, so they carry no rules;
+                // the one rule a reader needs comes here for Claude Code, which gets no others.
+                if principal.read_only && self.agent == Agent::Claude {
+                    text.push('\n');
+                    text.push_str(super::agent_rules::REQUIRED_RULES[5]);
+                }
                 // Only while a requested briefing waits for an agent.
                 if !principal.read_only
                     && super::narrative::pending(state, &principal)
@@ -1722,7 +1728,9 @@ impl Call {
             }
             // Claude Code reads the same rules first in the MCP server's instructions; this text
             // is re-read on every turn, so it carries them only for hosts not known to show those.
-            if self.agent != Agent::Claude {
+            if self.agent == Agent::Claude {
+                head.push_str(RULES_POINTER);
+            } else {
                 head.push_str(&super::agent_rules::prose());
             }
             let head = head.trim_end().to_owned();
@@ -1798,6 +1806,9 @@ pub fn fit_context(text: &str, limit: usize) -> String {
     format!("{kept}{SHORTENED}")
 }
 
+/// Stands in for the rules in Claude Code's start context, for a session whose MCP server is off.
+const RULES_POINTER: &str = "The required AgentSCM rules open the agentscm MCP server's instructions for an agent token; if that server is not connected, say coordination is unknown.";
+
 /// Ends the start context: what an agent cannot see from it, and where to read the rest.
 const COVERAGE: &str = "AgentSCM coverage is partial: only declared Work is visible, and a reported finish does not prove tests, review or merge. agentscm_work_status, agentscm_work_briefing, agentscm_work_overview and agentscm_work_catchup have the full records.";
 
@@ -1818,15 +1829,20 @@ fn render_briefing(briefing: &Briefing) -> String {
 /// Only overlaps between live tasks need coordination; paused or quiet pairs, and recent
 /// completions, stay in the overview tool.
 fn render_overview(overview: &WorkOverview) -> Vec<String> {
-    overview
+    let mut lines = overview
         .overlaps
         .iter()
         .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
-        .take(5)
         .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
             bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
             bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)))
-        .collect()
+        .collect::<Vec<_>>();
+    let partial = lines.len() > 5 || !overview.current_complete || !overview.overlaps_complete;
+    lines.truncate(5);
+    if partial {
+        lines.push("- The overlap list is partial; agentscm_work_overview has the rest.".into());
+    }
+    lines
 }
 
 /// Counts only, with the arguments that read them: the tool's default reader is the MCP
@@ -1843,7 +1859,7 @@ fn render_catchup(page: Option<&CatchupPreview>) -> String {
         .iter()
         .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly);
     format!(
-        "AgentSCM catch-up: {} unread Work event(s) and {} merged pull request(s){}{}{}; read them with agentscm_work_catchup {}",
+        "AgentSCM catch-up: {} unread event(s) and {} merged pull request(s){}{}{}; read them with agentscm_work_catchup {}",
         page.work_events.len() + page.coordination_events.len(),
         page.merges.len(),
         if page.complete {
