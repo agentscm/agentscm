@@ -273,6 +273,18 @@ fn carries_rules(reply: &Value, pointer: &str) {
     assert!(agentscm::hub::agent_rules::carries_all(context), "{reply}");
 }
 
+/// Claude Code reads the rules in the MCP server's instructions, so its start context names the
+/// session and leaves them out.
+fn names_session_only(reply: &Value, pointer: &str) {
+    let context = text(reply, pointer);
+    assert!(context.contains(SESSION), "{reply}");
+    assert!(!context.contains("Required AgentSCM rules"), "{reply}");
+    assert!(
+        context.contains("agentscm MCP server's instructions"),
+        "{reply}"
+    );
+}
+
 /// A subagent's edit under its parent's session: it is not refused, and the note it gets points
 /// at the lead session without handing it the request addressed to that session.
 fn under_parent(reply: &Value, request: &str) -> bool {
@@ -329,7 +341,7 @@ fn claude_code_gets_what_its_row_says() {
             json!({"file_path": bench.file(file), "old_string": "a", "new_string": "b"});
         edit
     };
-    carries_rules(
+    names_session_only(
         &bench.hook("claude", &pascal(&bench.root, "SessionStart")),
         HOOK_CONTEXT,
     );
