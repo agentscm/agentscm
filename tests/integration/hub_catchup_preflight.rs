@@ -842,17 +842,12 @@ async fn native_partial_delivery_can_be_continued_through_mcp() {
         !text.contains(forged_title),
         "forge titles must not enter automatic hook instructions"
     );
-    assert!(text.contains("AgentSCM catch-up preview"), "{text}");
-    assert!(text.contains("pull:7"), "{text}");
-    assert!(text.contains(&"a".repeat(40)), "{text}");
-    assert!(text.contains(&"b".repeat(40)), "{text}");
-    assert!(
-        text.contains("automatic preview creates no delivery or acknowledgement"),
-        "{text}"
-    );
+    // Counts only: commit hashes are the catch-up tool's to deliver.
+    assert!(text.contains("merged pull request(s)"), "{text}");
+    assert!(!text.contains(&"a".repeat(40)), "{text}");
     let instruction = text
         .lines()
-        .find(|line| line.contains("this exact JSON"))
+        .find(|line| line.contains("read them with agentscm_work_catchup {"))
         .expect(text);
     let arguments: Value =
         serde_json::from_str(&instruction[instruction.find('{').unwrap()..]).unwrap();

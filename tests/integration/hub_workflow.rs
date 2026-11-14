@@ -2492,10 +2492,8 @@ async fn following_the_start_context_and_each_refusal_links_the_edits() {
         context.contains("as `session` to agentscm_start"),
         "{context}"
     );
-    assert!(
-        agentscm::hub::agent_rules::carries_all(context),
-        "{context}"
-    );
+    // The rules come once, in the MCP server's instructions below.
+    assert!(!context.contains("Required AgentSCM rules"), "{context}");
     let (status, initialized) = hub
         .call(
             Method::POST,

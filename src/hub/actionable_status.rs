@@ -1211,6 +1211,68 @@ pub fn render_compact_text(status: &ActionableStatus) -> String {
     text
 }
 
+/// The session-start form: one line per Work and the actions that need the person. Claims,
+/// provider coverage and the evidence revision stay in `render_text` for the status tool.
+pub fn render_start_text(status: &ActionableStatus) -> String {
+    let c = &status.counts;
+    let mut lines = vec![format!(
+        "{}: {} active, {} awaiting a named party, {} blocked, {} reassessment needed; {} actions need you.",
+        status.repository,
+        c.active,
+        c.awaiting_party,
+        c.blocked,
+        c.reassessment_needed,
+        c.needs_you
+    )];
+    let mut work: Vec<_> = status.work.iter().collect();
+    work.sort_by_key(|w| !w.needs_you);
+    for row in work.iter().take(6) {
+        let state = match row.state {
+            StatusState::Active => "active",
+            StatusState::AwaitingParty => "awaiting a named party",
+            StatusState::Blocked => "blocked",
+            StatusState::ReassessmentNeeded => "reassessment needed",
+            StatusState::Retired => "retired",
+        };
+        let claim = match row.freshness {
+            ClaimStatus::Active => String::new(),
+            other => format!("; claim {other:?}"),
+        };
+        let stage = match row.stage.as_ref().map(|s| (s.stage, s.pull_request)) {
+            Some((WorkStage::PullRequestMerged, Some(n))) => format!("; pull request #{n} merged"),
+            Some((WorkStage::PullRequestOpen, Some(n))) => format!("; pull request #{n} open"),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "- {} [{state}; {}{claim}{stage}]: {}",
+            row.title,
+            recipient_label(&row.recipient),
+            row.action
+        ));
+    }
+    if status.work.len() > 6 {
+        lines.push(format!(
+            "- and {} more in agentscm_work_status.",
+            status.work.len() - 6
+        ));
+    }
+    let needs_you: Vec<_> = status.actions.iter().filter(|a| a.needs_you).collect();
+    lines.extend(needs_you.iter().take(6).map(|a| a.action.clone()));
+    if needs_you.len() > 6 {
+        lines.push(format!(
+            "And {} more actions need you; see agentscm_work_status.",
+            needs_you.len() - 6
+        ));
+    }
+    if !status.complete {
+        lines.push(
+            "Coverage incomplete: these counts can miss Work, so missing signals remain unknown."
+                .into(),
+        );
+    }
+    lines.join("\n")
+}
+
 pub fn render_text(status: &ActionableStatus) -> String {
     let c = &status.counts;
     let mut lines = vec![format!(
@@ -4899,6 +4961,21 @@ mod tests {
                 .limits
                 .contains(&"reservation_holders_truncated".into())
         );
+        // The start form names six Works, counts the rest and keeps the incomplete note.
+        let start = render_start_text(&status);
+        assert_eq!(
+            start
+                .lines()
+                .filter(|l| l.starts_with("- Synthetic"))
+                .count(),
+            6
+        );
+        assert!(
+            start.contains(&format!("- and {} more", MAX_STATUS_WORK - 6)),
+            "{start}"
+        );
+        assert!(start.contains("Coverage incomplete"), "{start}");
+        assert!(!start.contains("Evidence revision"), "{start}");
         assert!(
             status
                 .work

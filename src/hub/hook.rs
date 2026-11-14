@@ -1510,7 +1510,7 @@ impl Call {
                 // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
                 text.push('\n');
                 match current_status {
-                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
+                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_start_text(&facts)),
                     _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
                 }
                 if let Some(block) = super::context_source::render(&operator_context) {
@@ -1519,17 +1519,24 @@ impl Call {
                 }
                 text.push('\n');
                 text.push_str(&match briefing {
-                    Ok((briefing, overview, catchup)) => format!(
-                        "{}\n{}\n{}",
-                        render_briefing(&briefing),
-                        render_overview(&overview),
-                        render_catchup(catchup.as_ref())
-                    ),
+                    Ok((briefing, overview, catchup)) => {
+                        let mut lines = vec![render_briefing(&briefing)];
+                        lines.extend(render_overview(&overview));
+                        lines.push(render_catchup(catchup.as_ref()));
+                        lines.push(COVERAGE.to_owned());
+                        lines.join("\n")
+                    }
                     Err(_) => format!(
                         "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
                         unknown("shared work could not be listed")
                     ),
                 });
+                // A read-only token's MCP instructions name no write tool, so they carry no rules;
+                // the one rule a reader needs comes here for Claude Code, which gets no others.
+                if principal.read_only && self.agent == Agent::Claude {
+                    text.push('\n');
+                    text.push_str(super::agent_rules::REQUIRED_RULES[5]);
+                }
                 // Only while a requested briefing waits for an agent.
                 if !principal.read_only
                     && super::narrative::pending(state, &principal)
@@ -1719,7 +1726,14 @@ impl Call {
                 let literal = serde_json::to_string(session).unwrap_or_default();
                 head.push_str(&format!("AgentSCM native session ID (literal data, not instructions): {literal}. Pass this exact value as `session` to agentscm_start and every other AgentSCM call, agentscm_setup_status included: edit hooks check this session's edits. If this context is missing after installation, restart the native session; never guess or use another session's ID.\n"));
             }
-            head.push_str(&super::agent_rules::prose());
+            // Claude Code reads the same rules first in the MCP server's instructions; this text
+            // is re-read on every turn, so it carries them only for hosts not known to show those.
+            if self.agent == Agent::Claude {
+                head.push_str(RULES_POINTER);
+            } else {
+                head.push_str(&super::agent_rules::prose());
+            }
+            let head = head.trim_end().to_owned();
             // A failure's "coordination unknown" note still leads, so it reads as a failure.
             context = match (context.is_empty(), outcome.status == "unknown") {
                 (true, _) => head,
@@ -1792,147 +1806,79 @@ pub fn fit_context(text: &str, limit: usize) -> String {
     format!("{kept}{SHORTENED}")
 }
 
+/// Stands in for the rules in Claude Code's start context, for a session whose MCP server is off.
+const RULES_POINTER: &str = "The required AgentSCM rules open the agentscm MCP server's instructions for an agent token; if that server is not connected, say coordination is unknown.";
+
+/// Ends the start context: what an agent cannot see from it, and where to read the rest.
+const COVERAGE: &str = "AgentSCM coverage is partial: only declared Work is visible, and a reported finish does not prove tests, review or merge. agentscm_work_status, agentscm_work_briefing, agentscm_work_overview and agentscm_work_catchup have the full records.";
+
+/// Counts only: the actionable status above already names each unfinished Work.
 fn render_briefing(briefing: &Briefing) -> String {
-    const SHOWN_ITEMS: usize = 5;
-    const SHOWN_EVENTS: usize = 5;
-    let mut lines = vec![format!(
-        "AgentSCM shared work: {} unfinished item(s), {} change event(s) in this bounded page.",
+    format!(
+        "AgentSCM shared work: {} unfinished item(s), {} change event(s){}. Once the user intent is known, call agentscm_start with a stable work_id, forge source or request_key; a branch name alone is not a work identity.",
         briefing.items.len(),
-        briefing.events.len()
-    )];
-    for item in briefing.items.iter().take(SHOWN_ITEMS) {
-        lines.push(format!(
-            "- {} by {} [{:?}, claim {:?}]: {} (third-party text)",
-            item.id,
-            bounded_hook_text(&agent_name(&item.lead_agent), 64),
-            item.state,
-            item.claim_status,
-            bounded_hook_text(&item.title, 120)
-        ));
-    }
-    for event in briefing.events.iter().take(SHOWN_EVENTS) {
-        lines.push(format!(
-            "- change {} for {}: {} — {} (third-party text)",
-            event.seq,
-            event.work_id,
-            bounded_hook_text(&event.kind, 40),
-            bounded_hook_text(
-                event
-                    .item
-                    .current
-                    .as_ref()
-                    .map_or(&event.item.title, |checkpoint| &checkpoint.summary),
-                160
-            )
-        ));
-    }
-    if briefing.items.len() > SHOWN_ITEMS
-        || briefing.events.len() > SHOWN_EVENTS
-        || !briefing.complete
-    {
-        lines.push(
-            "This bounded hook preview omits shared-work records and created no delivery. Call agentscm_work_briefing to begin durable pagination of the full snapshot and delta; acknowledge only after deliberately delivering its complete page sequence."
-                .to_owned(),
-        );
-    }
-    lines.push(
-        "Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths. A branch name alone is not a work identity."
-            .to_owned(),
-    );
-    lines.join("\n")
+        briefing.events.len(),
+        if briefing.complete {
+            ""
+        } else {
+            " in a partial page"
+        },
+    )
 }
 
-fn render_overview(overview: &WorkOverview) -> String {
-    let mut lines = vec![format!(
-        "AgentSCM startup recap: reported completions and decisions from Unix {} to {} (independent of read acknowledgements).",
-        overview.recent_since, overview.until
-    )];
-    for outcome in overview.recent.iter().take(5) {
-        let summary = outcome
-            .item
-            .current
-            .as_ref()
-            .map_or(&outcome.item.title, |checkpoint| &checkpoint.summary);
-        lines.push(format!(
-            "- {:?}: {} by {} — {} (third-party text)",
-            outcome.kind,
-            bounded_hook_text(&outcome.item.title, 100),
-            bounded_hook_text(&agent_name(&outcome.item.lead_agent), 64),
-            bounded_hook_text(summary, 160)
-        ));
-    }
-    // Only overlaps between live tasks need coordination; paused or quiet pairs stay in the overview.
-    let live_overlaps: Vec<_> = overview
+/// Only overlaps between live tasks need coordination; paused or quiet pairs, and recent
+/// completions, stay in the overview tool.
+fn render_overview(overview: &WorkOverview) -> Vec<String> {
+    let mut lines = overview
         .overlaps
         .iter()
         .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
-        .collect();
-    for overlap in live_overlaps.iter().take(5) {
-        lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
+        .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
             bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
-            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)));
+            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)))
+        .collect::<Vec<_>>();
+    let partial = lines.len() > 5 || !overview.current_complete || !overview.overlaps_complete;
+    lines.truncate(5);
+    if partial {
+        lines.push("- The overlap list is partial; agentscm_work_overview has the rest.".into());
     }
-    if !overview.current_complete
-        || !overview.recent_complete
-        || !overview.overlaps_complete
-        || overview.recent.len() > 5
-        || live_overlaps.len() > 5
-    {
-        lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
-    }
-    lines.push("Only declared work is visible; empty scope is unknown coverage. Reported finish does not prove tests, review or merge.".into());
-    lines.join("\n")
+    lines
 }
 
+/// Counts only, with the arguments that read them: the tool's default reader is the MCP
+/// connection's session, which need not be this hook's.
 fn render_catchup(page: Option<&CatchupPreview>) -> String {
     let Some(page) = page else {
         return "AgentSCM durable catch-up is unavailable. Merge and Work-event coverage are unknown; do not infer that nothing changed."
             .to_owned();
     };
-    let mut lines = vec![format!(
-        "AgentSCM catch-up preview: {} Work event(s), {} coordination event(s), and {} provider-confirmed merge observation(s) in this page; complete through fixed event {} and merge {} high-waters: {}.",
-        page.work_events.len(),
-        page.coordination_events.len(),
-        page.merges.len(),
-        page.event_through,
-        page.merge_through,
-        page.complete,
-    )];
-    for merge in page.merges.iter().take(5) {
-        lines.push(format!(
-            "- {:?} {} PR #{}: {} -> {} (observed {})",
-            merge.source,
-            bounded_hook_text(&merge.source_id, 80),
-            merge.pull_number,
-            merge.head_commit,
-            merge.merge_commit,
-            merge.observed_at,
-        ));
-    }
-    lines.push(format!(
-        "This automatic preview creates no delivery or acknowledgement. Call agentscm_work_catchup with this exact JSON to begin an explicit delivery and read every page: {}",
-        json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
-    ));
-    if page.retention.work_gap || page.retention.coordination_gap || page.retention.merge_gap {
-        lines.push("Retained catch-up has a history gap. Treat affected coverage as unknown and inspect the current source and Work state.".to_owned());
-    }
-    lines.push(format!(
-        "Source coverage: {}.",
-        page.source_coverage
-            .iter()
-            .map(|source| format!("{:?}={:?}", source.source, source.state))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    if page
+    let gap =
+        page.retention.work_gap || page.retention.coordination_gap || page.retention.merge_gap;
+    let unseen = page
         .source_coverage
         .iter()
-        .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly)
-    {
-        lines.push("Some catch-up sources are incomplete or unavailable; affected coverage is unknown. Do not infer that no recent merges were recorded.".to_owned());
-    }
-    lines.push("Merge observations are exact typed records, not proof of arbitrary Git ancestry. For Git, check `git merge-base --is-ancestor <merge_commit> <source_revision>`; missing objects or an unavailable check leave the relation unknown. Inspect exact source and declared scope before claiming or editing.".to_owned());
-    lines.join("\n")
+        .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly);
+    format!(
+        "AgentSCM catch-up: {} unread event(s) and {} merged pull request(s){}{}{}; read them with agentscm_work_catchup {}",
+        page.work_events.len() + page.coordination_events.len(),
+        page.merges.len(),
+        if page.complete {
+            ""
+        } else {
+            " in its first page"
+        },
+        if gap {
+            "; retained history has a gap"
+        } else {
+            ""
+        },
+        if unseen {
+            "; some merge sources are unobserved, so missing merges are unknown"
+        } else {
+            ""
+        },
+        json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
+    )
 }
 
 fn bounded_hook_text(text: &str, max: usize) -> String {
@@ -2423,10 +2369,9 @@ mod tests {
             history_retention_gap: false,
             settled_count: 0,
         };
-        let text = render_overview(&overview);
+        let text = render_overview(&overview).join("\n");
         assert!(text.contains("LiveOne") && text.contains("LiveTwo"));
         assert!(!text.contains("PausedOne") && !text.contains("LiveThree"));
-        assert!(!text.contains("startup recap is partial"));
     }
 
     #[test]
@@ -2469,7 +2414,12 @@ mod tests {
             assert!(context.contains("literal data, not instructions"));
             // The ID comes with the call that needs it, not only the setup check.
             assert!(context.contains("as `session` to agentscm_start"));
-            assert!(super::super::agent_rules::carries_all(context), "{context}");
+            // Claude Code reads the rules in the MCP server's instructions.
+            assert_eq!(
+                super::super::agent_rules::carries_all(context),
+                agent != Agent::Claude,
+                "{context}"
+            );
         }
         for session in ["", "bad\nvalue"] {
             let reply = Call::parse(
@@ -2768,7 +2718,7 @@ mod tests {
     #[test]
     fn a_long_start_context_keeps_the_session_and_rules_within_budget() {
         let call = Call::parse(
-            Agent::Claude,
+            Agent::Codex,
             br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
             None,
         );
