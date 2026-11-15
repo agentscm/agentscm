@@ -720,16 +720,17 @@ async fn activity(
     };
     let (store, setup) = (state.store.clone(), state.onboarding.clone());
     let now = unix_now();
-    let (sessions, mut events) = blocking(&state, move || {
+    let (sessions, mut events, waiting_complete) = blocking(&state, move || {
         // The reader's own sessions that started another, or that wait for the reader, stay
         // listed after their last call, so a wait can be shown under the session that started it.
         // shortcut: the waiting ones first, then the newest starts, up to the page's limit; a
         // person with more starting sessions than that loses the row of an old one. Read only
         // the starters of listed sessions if that is ever reached.
-        let waiting = setup.waiting().owned(&principal, now)?;
+        let waiting = setup.waiting().owned(&*store, &principal, now);
         let starts = store.session_starts(&principal.owner.id)?;
         let mut listed = BTreeSet::new();
         let also: Vec<String> = waiting
+            .waits
             .into_iter()
             .map(|wait| wait.session)
             .chain(starts.into_iter().map(|(_, started_by)| started_by))
@@ -741,6 +742,7 @@ async fn activity(
         Ok((
             sessions,
             store.repository_events(&principal, before, limit + 1)?,
+            waiting.complete,
         ))
     })
     .await?;
@@ -822,7 +824,8 @@ async fn activity(
         .collect::<Result<Vec<Value>>>()?;
     Ok(Json(
         json!({"sessions": sessions, "quiet_sessions": quiet_sessions, "events": events,
-        "next_before": next_before.flatten()}),
+        "next_before": next_before.flatten(), "waiting_complete": waiting_complete,
+        "limits": if waiting_complete { vec![] } else { vec!["session_waiting_unavailable"] }}),
     ))
 }
 

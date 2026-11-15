@@ -767,6 +767,20 @@ fn declare_shared_body(
             &now,
         ],
     )?;
+    tx.execute(
+        "INSERT INTO hub_change_conversation_occurrences
+         (work,generation,session_id,event_id,sequence,digest,author)
+         VALUES ($1,$2,$3,$4,$5,$6,(SELECT owner FROM hub_agent_tokens WHERE id=$7))",
+        &[
+            &batch.work_id,
+            &batch.generation,
+            &batch.session.session_id,
+            &event.event_id,
+            &(event.sequence as i64),
+            &artifact.digest,
+            &token,
+        ],
+    )?;
     Ok(())
 }
 
@@ -3398,6 +3412,7 @@ fn current_capture_work_for_session(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     session: &str,
+    work_id: Option<&str>,
     now: i64,
 ) -> Result<Option<WorkItem>> {
     let rows = tx.query(
@@ -3408,6 +3423,7 @@ fn current_capture_work_for_session(
            AND item.repository_id IS NOT DISTINCT FROM $4 AND item.state IN ('active','paused','blocked')
            AND participant.token=$5 AND participant.session=$6
            AND participant.generation=item.generation
+           AND ($7::text IS NULL OR item.id=$7)
          ORDER BY item.state='active' DESC, participant.role='lead' DESC, item.id LIMIT 2",
         &[
             &who.owner.identity.provider,
@@ -3416,6 +3432,7 @@ fn current_capture_work_for_session(
             &who.repository_id,
             &who.token,
             &session,
+            &work_id,
         ],
     )?;
     // An active Work outranks paused or blocked ones, and the session's lead role breaks ties.
@@ -10028,6 +10045,99 @@ impl Store for PgStore {
         })
     }
 
+    fn native_question_coverage_mark(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+        rejected_offset: u64,
+    ) -> Result<()> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope, native])?;
+        let rejected_offset = format!("{rejected_offset:020}");
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_native_question_coverage(owner_hash, scope_hash, native_hash, rejected_offset)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT(owner_hash, scope_hash, native_hash)
+                 DO UPDATE SET rejected_offset = GREATEST(hub_native_question_coverage.rejected_offset, excluded.rejected_offset)",
+                &[&owner, &scope, &native, &rejected_offset],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn native_question_coverage_floor(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+    ) -> Result<Option<u64>> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope, native])?;
+        self.run(true, |client| {
+            client.query_opt(
+                "SELECT rejected_offset FROM hub_native_question_coverage WHERE owner_hash = $1 AND scope_hash = $2 AND native_hash = $3",
+                &[&owner, &scope, &native],
+            )?.map(|row| row.get::<_, String>(0).parse().map_err(|_| HubError::Unavailable("invalid native question retry offset".into()))).transpose()
+        })
+    }
+
+    fn native_question_coverage_unavailable(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: Option<&str>,
+    ) -> Result<bool> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope])?;
+        if let Some(native) = native {
+            super::store::validate_native_question_coverage_keys(&[native])?;
+        }
+        self.run(true, |client| {
+            let row = if let Some(native) = native {
+                client.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = $1 AND scope_hash = $2 AND native_hash = $3)",
+                    &[&owner, &scope, &native],
+                )?
+            } else {
+                client.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = $1 AND scope_hash = $2)",
+                    &[&owner, &scope],
+                )?
+            };
+            Ok(row.get(0))
+        })
+    }
+
+    fn native_question_coverage_resolve(
+        &self,
+        owner: &str,
+        scope: Option<&str>,
+        native: &str,
+        through_offset: Option<u64>,
+    ) -> Result<bool> {
+        super::store::validate_native_question_coverage_keys(&[owner, native])?;
+        if let Some(scope) = scope {
+            super::store::validate_native_question_coverage_keys(&[scope])?;
+        }
+        self.run(false, |client| {
+            if let Some(scope) = scope {
+                let through_offset = through_offset.map(|offset| format!("{offset:020}"));
+                client.execute(
+                    "DELETE FROM hub_native_question_coverage WHERE owner_hash = $1 AND scope_hash = $2 AND native_hash = $3 AND ($4::text IS NULL OR rejected_offset <= $4)",
+                    &[&owner, &scope, &native, &through_offset],
+                )?;
+                Ok(!client.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = $1 AND scope_hash = $2 AND native_hash = $3)",
+                    &[&owner, &scope, &native],
+                )?.get::<_, bool>(0))
+            } else {
+                client.execute(
+                    "DELETE FROM hub_native_question_coverage WHERE owner_hash = $1 AND native_hash = $2",
+                    &[&owner, &native],
+                )?;
+                Ok(true)
+            }
+        })
+    }
+
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {
         self.run(false, |client| {
             client.execute(
@@ -13198,27 +13308,35 @@ impl Store for PgStore {
                 && who.repository_id.is_some())
             .then_some(super::conversation_sharing::OPT_OUT_KEY_PREFIX);
             let rows = tx.query(
-                &format!(
-                    "WITH page AS (
-                         SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
-                         WHERE work=$1 AND ($2::text IS NULL
-                           OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
-                              > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
-                           AND ($6::boolean OR author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
+                "WITH page AS (
+                         SELECT o.work,b.digest,b.size_bytes,o.session_id,o.generation,o.event_id,o.sequence,
+                    b.declared_token,b.declared_at,b.state,b.uploaded_at,b.expires_at,b.deleted_at,
+                    b.deleted_by,b.physical_deleted_at,b.author,b.delete_attempts FROM hub_change_conversation_occurrences o
+                 JOIN hub_change_shared_bodies b ON b.work=o.work AND b.digest=o.digest AND b.author=o.author
+                         WHERE o.work=$1 AND ($2::text IS NULL
+                           OR (o.session_id COLLATE \"C\",o.generation,o.sequence,o.digest COLLATE \"C\")
+                              > ($2::text COLLATE \"C\",$10::bigint,$3::bigint,$4::text COLLATE \"C\"))
+                   AND (o.event_id NOT LIKE 'evt:history:%' OR NOT EXISTS (
+                       SELECT 1 FROM hub_change_conversation_occurrences earlier
+                       WHERE earlier.work=o.work AND earlier.session_id=o.session_id
+                         AND earlier.event_id=o.event_id AND earlier.author=o.author
+                         AND earlier.digest=o.digest AND earlier.generation<o.generation))
+                           AND ($6::boolean OR b.author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
                                 SELECT 1 FROM hub_settings o
-                                 WHERE o.key = $8::text || author || ':' || $9::bigint::text
+                                 WHERE o.key = $8::text || b.author || ':' || $9::bigint::text
                                    AND o.value <> '0')))
-                         ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
-                     SELECT page.*, e.event, e.observed_at FROM page
+                         ORDER BY o.session_id COLLATE \"C\",o.generation,o.sequence,o.digest COLLATE \"C\" LIMIT $5)
+                     SELECT page.*, e.event, e.observed_at, s.identity FROM page
                      JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
                        AND e.session_id=page.session_id AND e.event_id=page.event_id
-                     ORDER BY page.session_id COLLATE \"C\",page.sequence,page.digest COLLATE \"C\""
-                ),
+             JOIN hub_change_sessions s ON s.work=page.work AND s.generation=page.generation
+               AND s.session_id=page.session_id
+                     ORDER BY page.session_id COLLATE \"C\",page.generation,page.sequence,page.digest COLLATE \"C\"",
                 &[
                     &work_id,
                     &after.as_ref().map(|after| after.0.as_str()),
-                    &after.as_ref().map(|after| after.1 as i64),
-                    &after.as_ref().map(|after| after.2.as_str()),
+                    &after.as_ref().map(|after| after.2 as i64),
+                    &after.as_ref().map(|after| after.3.as_str()),
                     &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
                     &(audience == ConversationAudience::Everyone),
                     &who.owner.id,
@@ -13226,6 +13344,7 @@ impl Store for PgStore {
                     // left out, with what they shared before.
                     &opt_out_prefix,
                     &who.repository_id,
+                    &after.as_ref().map(|after| after.1),
                 ],
             )?;
             let entries = rows
@@ -13233,6 +13352,7 @@ impl Store for PgStore {
                 .map(|row| {
                     shared_body_row(row)?.conversation_entry(
                         &row.get::<_, String>(SHARED_BODY_COLUMN_COUNT),
+                        &row.get::<_, String>(SHARED_BODY_COLUMN_COUNT + 2),
                         row.get::<_, i64>(SHARED_BODY_COLUMN_COUNT + 1),
                         now,
                     )
@@ -14091,17 +14211,18 @@ impl Store for PgStore {
         })
     }
 
-    fn capture_work_for_session(
+    fn capture_work_for_session_at(
         &self,
         token: &str,
         session: &str,
+        work_id: Option<&str>,
         now: i64,
     ) -> Result<Option<WorkItem>> {
         super::intent::text("session", session, 255)?;
         self.run(true, |client| {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
-            let item = current_capture_work_for_session(&mut tx, &who, session, now)?;
+            let item = current_capture_work_for_session(&mut tx, &who, session, work_id, now)?;
             tx.commit()?;
             Ok(item)
         })

@@ -354,6 +354,15 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     assert_eq!(target["work_id"], work.id);
     assert_eq!(target["generation"], work.generation);
     assert_eq!(target["session_id"], "http-change-record");
+    let exact = format!("{current_path}&work_id={}", work.id);
+    let (status, same) = hub.get(&exact, Some(&writer_secret)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same, target);
+    let other = exact.replace("session_id=http-change-record", "session_id=unrelated");
+    assert_eq!(
+        hub.get(&other, Some(&writer_secret)).await.0,
+        StatusCode::NOT_FOUND
+    );
 
     let start = ActionStartV1 {
         schema_version: 1,
@@ -2662,7 +2671,7 @@ mod shared_bodies {
                 "session_id": SESSION, "sequence": 1, "event_id": "http-setup-event",
                 "kind": "session_started", "observed_at": 100, "digest": f.sha,
                 "size_bytes": f.body.len(), "availability": "local", "expires_at": null,
-                "author": "owner"
+                "author": "owner", "generation": f.generation, "harness": "claude_code"
             })
         );
         // Declared but never uploaded: nothing to read.
@@ -2788,6 +2797,103 @@ mod shared_bodies {
             f.read(&f.member_secret, &f.sha).await.status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_body_occurrences_keep_identity_and_survive_migration() {
+        let f = Fixture::start().await;
+        let mut batch = f.batch("repeated-message");
+        batch.events[0].sequence = 2;
+        batch.events[0].event_id = "second-occurrence".into();
+        batch.events[0].kind = CapturedEventKindV1::ToolFinished;
+        batch.events[0].tool = Some(agentscm::change_record::ToolFactV1 {
+            kind: agentscm::change_record::ToolKindV1::Other,
+            request_id: Some("native-call-2".into()),
+            name: Some("lookup".into()),
+            completion: Some(agentscm::change_record::ToolCompletionV1::Returned),
+        });
+        f.store
+            .change_ingest(&f.owner_token(), &batch, unix_now())
+            .unwrap();
+        let (_, page) = f.list(&f.owner_secret, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["digest"], entries[1]["digest"]);
+        assert_ne!(entries[0]["event_id"], entries[1]["event_id"]);
+        assert_eq!(entries[1]["generation"], f.generation);
+        assert_eq!(entries[1]["harness"], "claude_code");
+        assert_eq!(entries[1]["tool"]["request_id"], "native-call-2");
+        // Exercise the migration on retained pre-migration events and accepted batches.
+        let db = rusqlite::Connection::open(f._directory.path().join("hub.sqlite")).unwrap();
+        db.execute_batch("DROP TABLE hub_change_conversation_occurrences")
+            .unwrap();
+        db.execute_batch(include_str!(
+            "../../src/hub/migrations/named/conversation_occurrences.sqlite.sql"
+        ))
+        .unwrap();
+        let (_, restored) = f.list(&f.owner_secret, "").await;
+        assert_eq!(restored, page);
+        f.share(false);
+        assert_eq!(f.list(&f.member_secret, "").await.1["entries"], json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_does_not_guess_an_ambiguous_occurrence_author() {
+        let f = Fixture::start().await;
+        let mut repeated = f.batch("repeat-before-migration");
+        repeated.events[0].sequence = 2;
+        repeated.events[0].event_id = "repeated-event".into();
+        f.store
+            .change_ingest(&f.owner_token(), &repeated, unix_now())
+            .unwrap();
+        let helper = f.token_of(&f.helper_secret);
+        f.declare_as(&helper, HELPER_SESSION, 1, &[&f.body]);
+        f.store
+            .work_start(
+                &helper,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: Some(f.work_id.clone()),
+                    source: None,
+                    request_key: None,
+                    title: "join the named session".into(),
+                    description: None,
+                    session: SESSION.into(),
+                    role: WorkRole::Helper,
+                    scope: vec![],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        repeated.operation_id = "duplicate-by-another-author".into();
+        f.store
+            .change_ingest(&helper, &repeated, unix_now())
+            .unwrap();
+        let db = rusqlite::Connection::open(f._directory.path().join("hub.sqlite")).unwrap();
+        for reverse in [false, true] {
+            db.execute_batch(&format!("PRAGMA reverse_unordered_selects={}; DROP TABLE hub_change_conversation_occurrences", i32::from(reverse))).unwrap();
+            db.execute_batch(include_str!(
+                "../../src/hub/migrations/named/conversation_occurrences.sqlite.sql"
+            ))
+            .unwrap();
+            let (_, restored) = f.list(&f.admin_secret, "").await;
+            let entries = restored["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 2, "retain exact original declarations only");
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["event_id"] != "repeated-event")
+            );
+            assert!(entries.iter().any(|entry| entry["author"] == "owner"));
+            assert!(entries.iter().any(|entry| entry["author"] == "helper"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1619,6 +1619,16 @@ pub async fn resolve_target_with(
     hub: &CaptureHub,
     session_id: &str,
 ) -> Result<Option<CaptureTargetV1>> {
+    resolve_work_target_with(binding, hub, session_id, None).await
+}
+
+/// Revalidates the native session's participation in one explicitly started Work.
+pub(crate) async fn resolve_work_target_with(
+    binding: &CaptureBinding,
+    hub: &CaptureHub,
+    session_id: &str,
+    work_id: Option<&str>,
+) -> Result<Option<CaptureTargetV1>> {
     let CaptureHub {
         connection,
         token,
@@ -1638,6 +1648,10 @@ pub async fn resolve_target_with(
         .query(&[("session_id", session_id)])
         .bearer_auth(token)
         .timeout(Duration::from_secs(2));
+    let request = match work_id {
+        Some(work_id) => request.query(&[("work_id", work_id)]),
+        None => request,
+    };
     let (status, body) = send(request, REPLY_BYTES)
         .await
         .map_err(|_| invalid("capture target lookup unavailable"))?;

@@ -374,13 +374,267 @@ async fn hook_claude() -> Result<i32> {
         &binding,
         &spool,
         hub.as_ref(),
-        None,
+        NativeCapture::default(),
     )
     .await
     {
         println!("{}", session_start_output(context)?);
     }
     Ok(0)
+}
+
+fn codex_history_root() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|home| home.join("sessions"))
+}
+
+fn history_root(harness: AgentHarnessV1, checkout: &std::path::Path) -> Option<PathBuf> {
+    match harness {
+        AgentHarnessV1::Codex => codex_history_root(),
+        AgentHarnessV1::ClaudeCode => crate::client_plugin::claude_config_dir(checkout)
+            .ok()
+            .map(|root| root.join("projects")),
+    }
+}
+
+fn find_history(root: &std::path::Path, session: &str, harness: AgentHarnessV1) -> Option<PathBuf> {
+    match harness {
+        AgentHarnessV1::Codex => codex::find_rollout(root, session).ok().flatten(),
+        AgentHarnessV1::ClaudeCode => claude_code::find_transcript(root, session).ok().flatten(),
+    }
+}
+
+fn contained_history(path: &std::path::Path, root: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        && root
+            .canonicalize()
+            .ok()
+            .zip(path.canonicalize().ok())
+            .is_some_and(|(root, path)| path.starts_with(root))
+}
+
+/// A caller-supplied session is only a candidate; its own native tool receipt proves the start.
+/// Callers select a non-symlink source under the harness's configured history root first.
+async fn native_start_proven(
+    config: &std::path::Path,
+    association: &crate::client_session::CaptureAssociation,
+    path: &std::path::Path,
+    deadline: tokio::time::Instant,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let scope = format!("{:?}\0{}", association.harness, association.session);
+    let proofs = config.join("agentscm").join("native-start-proofs");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    if builder.create(&proofs).is_err()
+        || !fs::symlink_metadata(&proofs)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    let directory = proofs.join(format!("{:x}", Sha256::digest(scope.as_bytes())));
+    let Ok(spool) = LocalSpool::open(directory) else {
+        return false;
+    };
+    let request = CaptureRequest {
+        operation_prefix: "native-start-proof".into(),
+        work_id: association.work_id.clone(),
+        generation: association.generation,
+        observed_session_id: association.session.clone(),
+        canonical_session_id: association.session.clone(),
+        parent_session_id: None,
+        capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
+        harness: association.harness,
+    };
+    loop {
+        let read = tokio::task::spawn_blocking({
+            let (path, request, repo, spool) = (
+                path.to_path_buf(),
+                request.clone(),
+                association.repo.clone(),
+                spool.clone(),
+            );
+            move || match request.harness {
+                AgentHarnessV1::Codex => {
+                    codex::verify_history_start(&path, &request, &repo, &spool)
+                }
+                AgentHarnessV1::ClaudeCode => {
+                    claude_code::verify_history_start(&path, &request, &repo, &spool)
+                }
+            }
+        });
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(Ok(Ok(report))) if report.authorized => {
+                if !association.native_start_verified {
+                    let mut verified = association.clone();
+                    verified.native_start_verified = true;
+                    if crate::client_session::record_capture(config, &verified).is_err() {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            Ok(Ok(Ok(report)))
+                if !report.complete
+                    && report.records > 0
+                    && tokio::time::Instant::now() < deadline => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The MCP lifetime observes visible history even when the host emits no tool hook.
+pub(crate) async fn watch_session(config: PathBuf, session: String) {
+    let mut source = None;
+    let mut questions = None;
+    let mut warned = false;
+    let mut observed = None;
+    let mut retry_at = tokio::time::Instant::now();
+    loop {
+        let associations = crate::client_session::capture_associations(&config, &session);
+        let Some(first) = associations.first() else {
+            return;
+        };
+        let harness = first.harness;
+        let Some(root) = history_root(harness, &first.checkout) else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        if source.is_none() && now >= retry_at {
+            let native = session.clone();
+            source = tokio::task::spawn_blocking(move || find_history(&root, &native, harness))
+                .await
+                .ok()
+                .flatten();
+        }
+        let stamp = source
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+        let state = (stamp, associations.clone());
+        // Unchanged history still retries delivery and permission changes, without polling every Hub each tick.
+        if now >= retry_at || observed.as_ref() != Some(&state) {
+            observed = Some(state);
+            retry_at = now + Duration::from_secs(30);
+            if let Ok(connections) = crate::client_config::load() {
+                let mut proven = Vec::new();
+                for association in associations
+                    .iter()
+                    .filter(|association| association.harness == harness)
+                {
+                    let verified = match &source {
+                        Some(path) => {
+                            native_start_proven(
+                                &config,
+                                association,
+                                path,
+                                tokio::time::Instant::now() + Duration::from_secs(2),
+                            )
+                            .await
+                        }
+                        None => false,
+                    };
+                    if verified || association.native_start_verified {
+                        proven.push((association, verified));
+                    }
+                }
+                let question_report = if harness == AgentHarnessV1::Codex
+                    && proven.iter().any(|(_, verified)| *verified)
+                {
+                    if let Some(path) = source.clone() {
+                        let (native, mut cursor) = (session.clone(), questions.take());
+                        let (report, cursor) = tokio::task::spawn_blocking(move || {
+                            let started = std::time::Instant::now();
+                            let report = loop {
+                                let report =
+                                    codex::poll_questions(&path, &native, &mut cursor).ok();
+                                if report
+                                    .as_ref()
+                                    .is_none_or(|report| report.complete || report.records == 0)
+                                    || started.elapsed() >= Duration::from_secs(2)
+                                {
+                                    break report;
+                                }
+                            };
+                            (report, cursor)
+                        })
+                        .await
+                        .unwrap_or((None, None));
+                        questions = cursor;
+                        if report.as_ref().is_some_and(|report| !report.complete) {
+                            retry_at = now;
+                        }
+                        report
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut sent_questions = std::collections::HashSet::new();
+                for (association, source_verified) in proven {
+                    let Some((connection, _)) = crate::client_config::connection_for_checkout(
+                        &connections,
+                        &association.checkout,
+                    )
+                    .filter(|(connection, _)| {
+                        connection.hub == association.hub
+                            && connection.repo.eq_ignore_ascii_case(&association.repo)
+                            && crate::client_config::is_current_in(
+                                connection,
+                                &association.checkout,
+                            )
+                    }) else {
+                        continue;
+                    };
+                    if harness == AgentHarnessV1::Codex
+                        && sent_questions.insert((connection.hub.clone(), connection.repo.clone()))
+                        && crate::hook_cli::forward_questions(
+                            connection,
+                            &session,
+                            question_report
+                                .as_ref()
+                                .filter(|report| {
+                                    source_verified && report.complete && report.reliable
+                                })
+                                .map(|report| &report.snapshot),
+                        )
+                        .await
+                        .is_err()
+                        && !warned
+                    {
+                        eprintln!(
+                            "AgentSCM: pending native questions could not be delivered; retrying"
+                        );
+                        warned = true;
+                    }
+                    if !source_verified {
+                        continue;
+                    }
+                    let payload = json!({"hook_event_name":"NativeHistory", "session_id": session,
+                        "transcript_path":source});
+                    let input = payload.to_string().into_bytes();
+                    plugin_capture_for_work(
+                        harness,
+                        &input,
+                        &payload,
+                        association.checkout.clone(),
+                        connection.clone(),
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        Some(association),
+                    )
+                    .await;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// The harness whose hook events capture records for the hook client's `agent`, when `payload`
@@ -404,15 +658,69 @@ pub(crate) async fn plugin_capture(
     harness: AgentHarnessV1,
     input: &[u8],
     payload: &Value,
-    checkout: std::path::PathBuf,
+    checkout: PathBuf,
     connection: crate::client_config::Connection,
     deadline: tokio::time::Instant,
+) -> (
+    Option<String>,
+    Option<agentscm::change_record::CaptureTargetV1>,
+) {
+    let mut target = None;
+    let context = plugin_capture_inner(
+        harness,
+        input,
+        payload,
+        checkout,
+        connection,
+        NativeCapture {
+            deadline: Some(deadline),
+            association: None,
+            resolved_target: Some(&mut target),
+        },
+    )
+    .await;
+    (context, target)
+}
+
+pub(crate) async fn plugin_capture_for_work(
+    harness: AgentHarnessV1,
+    input: &[u8],
+    payload: &Value,
+    checkout: PathBuf,
+    connection: crate::client_config::Connection,
+    deadline: tokio::time::Instant,
+    association: Option<&crate::client_session::CaptureAssociation>,
 ) -> Option<String> {
+    plugin_capture_inner(
+        harness,
+        input,
+        payload,
+        checkout,
+        connection,
+        NativeCapture {
+            deadline: Some(deadline),
+            association,
+            resolved_target: None,
+        },
+    )
+    .await
+}
+
+async fn plugin_capture_inner(
+    harness: AgentHarnessV1,
+    input: &[u8],
+    payload: &Value,
+    checkout: PathBuf,
+    connection: crate::client_config::Connection,
+    options: NativeCapture<'_>,
+) -> Option<String> {
+    let deadline = options.deadline?;
+    let association = options.association;
     let hub = change_capture_client::CaptureHub::new(connection.clone()).ok()?;
     let session_start =
         payload.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart");
     // Only a session start creates a binding, so a session keeps the mode it started under.
-    let answer = if session_start {
+    let answer = if session_start || association.is_some() {
         tokio::time::timeout_at(deadline, change_capture_client::hub_sharing(&hub))
             .await
             .unwrap_or(SharingAnswer::NoAnswer)
@@ -420,13 +728,14 @@ pub(crate) async fn plugin_capture(
         SharingAnswer::NoAnswer
     };
     let create = answer.sharing().is_some_and(|answer| answer.sharing);
+    let explicit = association.is_some();
     let found = tokio::task::spawn_blocking({
         let (checkout, connection) = (checkout.clone(), connection.clone());
         move || {
             let followed = change_capture_client::followed_binding(&checkout, &connection, create);
             // A binding with hooks of its own has them for Claude Code only, so this hook is the
             // one that captures Codex for it.
-            if harness == AgentHarnessV1::Codex && matches!(followed, Ok(None)) {
+            if (harness == AgentHarnessV1::Codex || explicit) && matches!(followed, Ok(None)) {
                 let own = change_capture_client::binding_for_payload(&json!({"cwd": checkout}))
                     .ok()
                     .flatten()
@@ -467,7 +776,7 @@ pub(crate) async fn plugin_capture(
         &binding,
         &spool,
         Some(&hub),
-        Some(deadline),
+        options,
     )
     .await
 }
@@ -476,6 +785,13 @@ pub(crate) async fn plugin_capture(
 /// problem is a warning. Returns the session-start context, if any. Past `deadline` a Hub call is
 /// given up: an unresolved target leaves a sanitized deferred fact, and pending records wait for
 /// the next hook.
+#[derive(Default)]
+struct NativeCapture<'a> {
+    deadline: Option<tokio::time::Instant>,
+    association: Option<&'a crate::client_session::CaptureAssociation>,
+    resolved_target: Option<&'a mut Option<agentscm::change_record::CaptureTargetV1>>,
+}
+
 async fn capture_native(
     harness: AgentHarnessV1,
     input: &[u8],
@@ -483,11 +799,12 @@ async fn capture_native(
     binding: &change_capture_client::CaptureBinding,
     spool: &LocalSpool,
     hub: Option<&change_capture_client::CaptureHub>,
-    deadline: Option<tokio::time::Instant>,
+    options: NativeCapture<'_>,
 ) -> Option<String> {
     // A hook without its own deadline keeps the host's (20 seconds for the capture hook).
-    let deadline =
-        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(18));
+    let deadline = options
+        .deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(18));
     let session_id = match payload
         .get("session_id")
         .and_then(serde_json::Value::as_str)
@@ -546,7 +863,14 @@ async fn capture_native(
     let (target, sharing) = match hub {
         Some(hub) => tokio::time::timeout_at(deadline, async {
             tokio::join!(
-                change_capture_client::resolve_target_with(binding, hub, &session_id),
+                change_capture_client::resolve_work_target_with(
+                    binding,
+                    hub,
+                    &session_id,
+                    options
+                        .association
+                        .map(|association| association.work_id.as_str())
+                ),
                 change_capture_client::hub_sharing(hub)
             )
         })
@@ -579,11 +903,17 @@ async fn capture_native(
     let start_lines = |mode: CaptureModeV1| {
         change_capture_client::session_start_lines(mode, binding, sharing, full)
     };
-    let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
-        Ok(Some(target)) => target,
+        Ok(Some(target))
+            if options.association.is_none_or(|association| {
+                association.work_id == target.work_id && association.generation == target.generation
+            }) =>
+        {
+            target
+        }
+        Ok(Some(_)) => return None,
         // Usage belongs to Work: without a target it is not kept and leaves no deferred fact.
-        _ if model_request => {
+        _ if model_request || event == Some("NativeHistory") => {
             let _ = deliver().await;
             return None;
         }
@@ -595,10 +925,6 @@ async fn capture_native(
                     == Some("UserPromptSubmit")
             {
                 hold_prompt(&session_file(binding, &session_id), input);
-            }
-            // Replies before the claim are not the Work's: recovery starts after them.
-            if claude {
-                skip_transcript(&replies, payload, false);
             }
             let retained = claude_code::deferred_native_hook(
                 input,
@@ -638,11 +964,14 @@ async fn capture_native(
             return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
     };
+    if let Some(resolved) = options.resolved_target {
+        *resolved = Some(target.clone());
+    }
     let live_parent = payload
         .get("parent_session_id")
         .and_then(serde_json::Value::as_str);
-    let (parent_session_id, capture_mode) = spool
-        .pin_session_identity(
+    let pin = if options.association.is_some() {
+        spool.pin_associated_session_identity(
             &session_id,
             &target.session_id,
             &target.work_id,
@@ -650,6 +979,17 @@ async fn capture_native(
             live_parent,
             live_mode,
         )
+    } else {
+        spool.pin_session_identity(
+            &session_id,
+            &target.session_id,
+            &target.work_id,
+            target.generation,
+            live_parent,
+            live_mode,
+        )
+    };
+    let (parent_session_id, capture_mode) = pin
         .unwrap_or_else(|_| {
             eprintln!(
                 "AgentSCM local capture warning: pinned session identity is unavailable; using the live binding"
@@ -672,6 +1012,100 @@ async fn capture_native(
         live_capture_mode: live_mode,
         harness,
     };
+    let source_root = binding
+        .claude_history_root
+        .clone()
+        .filter(|_| claude)
+        .or_else(|| history_root(harness, &binding.root));
+    let failed_before = match claude_code::history_failed(&request, spool) {
+        Ok(failed) => failed,
+        Err(_) => return None,
+    };
+    let mut proof_available = false;
+    let rollout = if let Some(root) = source_root {
+        let path = match payload.get("transcript_path").and_then(Value::as_str) {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                contained_history(&path, &root).then_some(path)
+            }
+            None => find_history(&root, &session_id, harness),
+        };
+        let association = options.association.cloned().unwrap_or_else(|| {
+            crate::client_session::CaptureAssociation {
+                session: session_id.clone(),
+                harness,
+                hub: binding.hub.clone(),
+                repo: binding.repository.clone(),
+                checkout: binding.root.clone(),
+                work_id: request.work_id.clone(),
+                generation: request.generation,
+                native_start_verified: false,
+            }
+        });
+        let path = match (path, crate::hub_cli::config_dir()) {
+            (Some(path), Ok(config))
+                if native_start_proven(&config, &association, &path, deadline).await =>
+            {
+                Some(path)
+            }
+            _ => None,
+        };
+        proof_available = path.is_some();
+        match path {
+            Some(path) if !failed_before => {
+                let mut captured = false;
+                loop {
+                    let read = tokio::task::spawn_blocking({
+                        let (path, request, spool) = (path.clone(), request.clone(), spool.clone());
+                        move || match harness {
+                            AgentHarnessV1::ClaudeCode => {
+                                claude_code::capture_transcript(&path, &request, &spool)
+                            }
+                            _ => codex::capture_rollout(&path, &request, &spool),
+                        }
+                    });
+                    match tokio::time::timeout_at(deadline, read).await {
+                        Ok(Ok(Ok(report))) => {
+                            captured = true;
+                            if report.complete
+                                || report.records == 0
+                                || tokio::time::Instant::now() >= deadline
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Ok(Err(_))) => {
+                            eprintln!(
+                                "AgentSCM local capture warning: native visible history could not be retained"
+                            );
+                            break;
+                        }
+                        _ => {
+                            // The bounded reader may still finish; do not duplicate its messages through hooks.
+                            captured = true;
+                            break;
+                        }
+                    }
+                }
+                captured
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if options.association.is_some_and(|association| {
+        !(proof_available || failed_before && association.native_start_verified)
+    }) {
+        // Missing or timed-out proof is temporary uncertainty, not a terminal source error.
+        return None;
+    }
+    // A failing page may already have captured this prompt; only later hooks use fallback.
+    let failed_now = !failed_before && claude_code::history_failed(&request, spool).unwrap_or(true);
+    if event == Some("NativeHistory") {
+        let _ = deliver().await;
+        return None;
+    }
     if model_request {
         let usage = payload
             .as_object()
@@ -684,9 +1118,28 @@ async fn capture_native(
         let _ = deliver().await;
         return None;
     }
+    if options.association.is_some() {
+        let lifecycle = matches!(event, Some("SessionStart" | "SessionEnd"));
+        if !failed_now && (failed_before || lifecycle) {
+            if !claude
+                && event == Some("Stop")
+                && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
+                && claude_code::capture_associated_hook(&reply, &request, spool).is_err()
+            {
+                eprintln!("AgentSCM local capture warning: associated turn reply was not retained");
+            }
+            if claude_code::capture_associated_hook(input, &request, spool).is_err() {
+                eprintln!(
+                    "AgentSCM local capture warning: associated native context was not retained"
+                );
+            }
+        }
+        let _ = deliver().await;
+        return None;
+    }
     // Prompts held before the claim come first, and only into a shared conversation.
     let held = take_held_prompts(&session_file(binding, &session_id));
-    if capture_mode == CaptureModeV1::SharedConversation {
+    if capture_mode == CaptureModeV1::SharedConversation && !rollout && !failed_now {
         for prompt in held {
             if claude_code::capture_native_hook(&prompt, &request, &actions, spool).is_err() {
                 eprintln!(
@@ -695,20 +1148,28 @@ async fn capture_native(
             }
         }
     }
-    if claude {
-        // A session first seen with Work (or on an older build) recovers only replies from now on.
-        skip_transcript(&replies, payload, true);
-        if event == Some("MessageDisplay") {
-            note_fragment(&replies, payload);
-        }
-    } else if event == Some("Stop")
+    if !claude
+        && !rollout
+        && !failed_now
+        && event == Some("Stop")
         && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
         && claude_code::capture_native_hook(&reply, &request, &actions, spool).is_err()
     {
         // Codex names a turn's last reply only when the turn ends; it comes before that end.
         eprintln!("AgentSCM local capture warning: the turn's last reply was not retained");
     }
-    match claude_code::capture_native_hook(input, &request, &actions, spool) {
+    let native = if (rollout || failed_now)
+        && matches!(event, Some("UserPromptSubmit" | "MessageDisplay"))
+    {
+        Ok(claude_code::NativeHookReport {
+            event: claude_code::HookCaptureOutcome::Ignored,
+            action: claude_code::NativeActionOutcome::NotApplicable,
+            warnings: Vec::new(),
+        })
+    } else {
+        claude_code::capture_native_hook(input, &request, &actions, spool)
+    };
+    match native {
         Ok(report) => {
             for warning in report.warnings {
                 eprintln!("AgentSCM local capture warning: {warning}");
@@ -726,23 +1187,6 @@ async fn capture_native(
                 CaptureError::Json(_) => "JSON could not be parsed",
             }
         ),
-    }
-    if claude
-        && event == Some("Stop")
-        && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
-    {
-        for (hash, reply) in missed_replies(&replies, std::path::Path::new(transcript), &session_id)
-        {
-            if claude_code::capture_native_hook(&reply, &request, &actions, spool).is_ok() {
-                note_replies(&replies, |seen| {
-                    seen.hashes.insert(hash);
-                });
-            } else {
-                eprintln!(
-                    "AgentSCM local capture warning: a reply recovered from the transcript was not retained"
-                );
-            }
-        }
     }
     // A captured Claude Code session reports its token counts and model names by default: a
     // binding with no history root of its own uses Claude Code's projects folder. Either way the
@@ -829,7 +1273,7 @@ const HELD_PROMPTS: usize = 8;
 const HELD_PROMPT_BYTES: usize = 64 * 1024;
 const HELD_PROMPT_SECONDS: u64 = 24 * 60 * 60;
 
-/// A private file per checkout and session (held prompts, seen replies); its name reveals neither.
+/// A private held-prompt file per checkout and session; its name reveals neither.
 fn session_file(
     binding: &change_capture_client::CaptureBinding,
     session_id: &str,
@@ -937,179 +1381,6 @@ fn take_held_prompts(path: &Option<PathBuf>) -> Vec<Vec<u8>> {
         let _ = fs::remove_file(path);
         held.into_iter().map(String::into_bytes).collect()
     })
-}
-
-/// Replies already captured in a session, by text, and how far its transcript has been read.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SeenReplies {
-    offset: u64,
-    hashes: std::collections::BTreeSet<String>,
-    /// Fragments of replies still being displayed, by message id, joined until the final one.
-    #[serde(default)]
-    partial: std::collections::BTreeMap<String, String>,
-}
-
-/// Replies being assembled at once, and the size of each.
-const PARTIAL_REPLIES: usize = 64;
-const PARTIAL_REPLY_BYTES: usize = 1 << 20;
-
-/// Transcript bytes read per Stop, and replies remembered per session.
-const TRANSCRIPT_READ_BYTES: u64 = 8 << 20;
-const SEEN_REPLIES: usize = 4096;
-
-/// Ignores whitespace: the transcript joins a reply's text blocks differently from the hooks.
-fn text_hash(text: &str) -> String {
-    use sha2::Digest;
-    let text: String = text.split_whitespace().collect();
-    sha2::Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Updates the session's seen replies; `change` gets the saved state, or None for a new session.
-fn update_replies(
-    path: &Option<PathBuf>,
-    change: impl FnOnce(Option<SeenReplies>) -> Option<SeenReplies>,
-) {
-    let Some(path) = path else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    locked(path, || {
-        let saved = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let Some(mut seen) = change(saved) else {
-            return;
-        };
-        while seen.hashes.len() > SEEN_REPLIES {
-            let first = seen.hashes.iter().next().cloned();
-            first.map(|first| seen.hashes.remove(&first));
-        }
-        while seen.partial.len() > PARTIAL_REPLIES {
-            let first = seen.partial.keys().next().cloned();
-            first.map(|first| seen.partial.remove(&first));
-        }
-        if let Ok(text) = serde_json::to_string(&seen) {
-            let _ = crate::hub_cli::write_private(path, &text);
-        }
-    });
-}
-
-fn note_replies(path: &Option<PathBuf>, change: impl FnOnce(&mut SeenReplies)) {
-    update_replies(path, |seen| {
-        let mut seen = seen.unwrap_or_default();
-        change(&mut seen);
-        Some(seen)
-    });
-}
-
-/// Records a displayed reply fragment; the final one marks the whole reply as seen.
-fn note_fragment(path: &Option<PathBuf>, payload: &Value) {
-    let (Some(id), Some(delta)) = (
-        payload.get("message_id").and_then(Value::as_str),
-        payload.get("delta").and_then(Value::as_str),
-    ) else {
-        return;
-    };
-    let last = payload.get("final") == Some(&Value::Bool(true));
-    note_replies(path, |seen| {
-        let mut text = seen.partial.remove(id).unwrap_or_default();
-        if text.len() + delta.len() <= PARTIAL_REPLY_BYTES {
-            text.push_str(delta);
-        }
-        if last {
-            seen.hashes.insert(text_hash(&text));
-        } else {
-            seen.partial.insert(id.to_owned(), text);
-        }
-    });
-}
-
-/// Moves transcript recovery to the transcript's end: always (`only_new` false), or only for a
-/// session with no saved state yet.
-fn skip_transcript(path: &Option<PathBuf>, payload: &Value, only_new: bool) {
-    let Some(length) = payload
-        .get("transcript_path")
-        .and_then(Value::as_str)
-        .and_then(|transcript| fs::metadata(transcript).ok())
-        .map(|metadata| metadata.len())
-    else {
-        return;
-    };
-    update_replies(path, |saved| match saved {
-        Some(_) if only_new => None,
-        saved => {
-            let mut seen = saved.unwrap_or_default();
-            seen.offset = length;
-            Some(seen)
-        }
-    });
-}
-
-/// The session's assistant replies in its transcript that no MessageDisplay hook delivered (a
-/// hook the host stopped loses its reply), as MessageDisplay inputs keyed by transcript entry, so
-/// a repeat is a duplicate. Reads on from where the last Stop stopped.
-fn missed_replies(
-    seen_path: &Option<PathBuf>,
-    transcript: &std::path::Path,
-    session_id: &str,
-) -> Vec<(String, Vec<u8>)> {
-    use std::io::{BufRead, Seek};
-    let mut found = Vec::new();
-    note_replies(seen_path, |seen| {
-        let Ok(mut file) = File::open(transcript) else {
-            return;
-        };
-        let length = file.metadata().map_or(0, |metadata| metadata.len());
-        // A shorter transcript is another file: read it from the start.
-        if seen.offset > length {
-            seen.offset = 0;
-        }
-        if file.seek(std::io::SeekFrom::Start(seen.offset)).is_err() {
-            return;
-        }
-        let mut reader = BufReader::new(file.take(TRANSCRIPT_READ_BYTES));
-        let mut line = Vec::new();
-        while let Ok(read) = reader.read_until(b'\n', &mut line) {
-            // Only whole lines count; a line still being written is read next time.
-            if read == 0 || line.last() != Some(&b'\n') {
-                break;
-            }
-            seen.offset += read as u64;
-            if let Ok(entry) = serde_json::from_slice::<Value>(&line) {
-                let text = (entry["type"] == "assistant" && entry["isSidechain"] != true)
-                    .then(|| entry["message"]["content"].as_array())
-                    .flatten()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|block| block["type"] == "text")
-                            .filter_map(|block| block["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n\n")
-                    })
-                    .filter(|text| !text.trim().is_empty());
-                if let (Some(text), Some(uuid)) = (text, entry["uuid"].as_str())
-                    && !seen.hashes.contains(&text_hash(&text))
-                {
-                    let reply = json!({
-                        "hook_event_name": "MessageDisplay",
-                        "session_id": session_id,
-                        "message_id": format!("transcript:{uuid}"),
-                        "timestamp": entry["timestamp"],
-                        "delta": text,
-                        "index": 0,
-                        "final": true,
-                    });
-                    found.extend(serde_json::to_vec(&reply).map(|reply| (text_hash(&text), reply)));
-                }
-            }
-            line.clear();
-        }
-    });
-    found
 }
 
 /// Upkeep (`LocalSpool::upkeep`) that fails open. Answers whether the spool is still full, where
@@ -1550,51 +1821,352 @@ fn capture_error(error: agentscm::change_capture::CaptureError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_start_proof_does_not_trust_a_candidates_claimed_chat() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        let association = crate::client_session::CaptureAssociation {
+            session: "11111111-1111-4111-8111-111111111111".into(),
+            harness: AgentHarnessV1::Codex,
+            hub: "https://hub.example".into(),
+            repo: "acme/widgets".into(),
+            checkout: temp.path().to_path_buf(),
+            work_id: format!("wrk_{}", "1".repeat(32)),
+            generation: 1,
+            native_start_verified: false,
+        };
+        crate::client_session::record_capture(temp.path(), &association).unwrap();
+        let header = json!({"type":"session_meta", "ordinal":0,
+            "payload":{"id":association.session,"subagent_history_start_ordinal":0}});
+        fs::write(&source, format!("{header}\n")).unwrap();
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+        let proofs = temp.path().join("agentscm").join("native-start-proofs");
+        assert!(!proofs.exists());
+        assert!(!native_start_proven(temp.path(), &association, &source, deadline()).await);
+        let proof = fs::read_dir(&proofs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let state = fs::read_dir(proof.join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let state: Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+        assert!(
+            state["history_starts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|cursor| cursor["authorized"] == false)
+        );
+        assert!(
+            !crate::client_session::capture_associations(temp.path(), &association.session)[0]
+                .native_start_verified
+        );
+        let start = json!({"type":"event_msg", "ordinal":1,
+            "payload":{"type":"item_completed", "thread_id":association.session,
+                "item":{"type":"McpToolCall","id":"start-1","server":"agentscm","tool":"agentscm_start",
+                    "status":"completed","arguments":{"session":association.session},
+                    "result":{"isError":false,"structuredContent":{"claim_acquired":true,
+                        "work":{"item":{"id":association.work_id,"generation":1,"repository":association.repo}}}}}}});
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{start}"
+        )
+        .unwrap();
+        assert!(native_start_proven(temp.path(), &association, &source, deadline()).await);
+        assert!(
+            crate::client_session::capture_associations(temp.path(), &association.session)[0]
+                .native_start_verified
+        );
+        let other = crate::client_session::CaptureAssociation {
+            generation: 2,
+            ..association
+        };
+        assert!(!native_start_proven(temp.path(), &other, &source, deadline()).await);
+    }
+
     use super::{recipe_exit_status, session_start_output};
 
     #[test]
-    fn stop_recovers_only_replies_no_hook_delivered_and_reads_each_line_once() {
+    fn history_paths_stay_in_the_configured_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let seen = Some(dir.path().join("seen"));
-        let transcript = dir.path().join("t.jsonl");
-        let line = |uuid: &str, texts: &[&str]| {
-            let blocks: Vec<_> = texts
-                .iter()
-                .map(|text| serde_json::json!({"type": "text", "text": text}))
-                .collect();
-            format!(
-                "{}\n",
-                serde_json::json!({"type": "assistant", "uuid": uuid, "timestamp": "2026-11-09T10:00:00Z",
-                    "message": {"content": blocks}})
+        let root = dir.path().join("history");
+        std::fs::create_dir(&root).unwrap();
+        let good = root.join("session.jsonl");
+        let outside = dir.path().join("outside.jsonl");
+        std::fs::write(&good, "{}\n").unwrap();
+        std::fs::write(&outside, "{}\n").unwrap();
+        assert!(super::contained_history(&good, &root));
+        assert!(!super::contained_history(&outside, &root));
+        assert!(!super::contained_history(&root, &root));
+        let link = root.join("link.jsonl");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(!super::contained_history(&link, &root));
+    }
+
+    #[test]
+    fn associated_proof_uncertainty_retries_and_new_failure_does_not_replay_current_reply() {
+        use super::{CaptureRequest, claude_code};
+        crate::client_config::in_isolated_config_home(|config| {
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, true);
+            let history = config.join("history");
+            std::fs::create_dir(&history).unwrap();
+            let transcript = history.join("session_fixture.jsonl");
+            let bound = CaptureBinding {
+                hub: url.clone(),
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(history),
+                ..binding(config)
+            };
+            let association = crate::client_session::CaptureAssociation {
+                session: "session_fixture".into(),
+                harness: AgentHarnessV1::ClaudeCode,
+                hub: url,
+                repo: "acme/widgets".into(),
+                checkout: config.to_path_buf(),
+                work_id: "wrk_11111111111111111111111111111111".into(),
+                generation: 1,
+                native_start_verified: true,
+            };
+            let request = CaptureRequest {
+                operation_prefix: "fixture".into(),
+                work_id: association.work_id.clone(),
+                generation: 1,
+                observed_session_id: association.session.clone(),
+                canonical_session_id: association.session.clone(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::LocalConversation,
+                live_capture_mode: CaptureModeV1::LocalConversation,
+                harness: AgentHarnessV1::ClaudeCode,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let send = |event: &str, extra: Value, expired: bool| {
+                let mut payload = json!({"hook_event_name":event,"session_id":"session_fixture",
+                    "transcript_path":transcript});
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let input = payload.to_string();
+                runtime.block_on(super::capture_native(
+                    AgentHarnessV1::ClaudeCode,
+                    input.as_bytes(),
+                    &payload,
+                    &bound,
+                    &spool,
+                    Some(&hub),
+                    super::NativeCapture {
+                        deadline: Some(
+                            tokio::time::Instant::now()
+                                + if expired {
+                                    std::time::Duration::ZERO
+                                } else {
+                                    std::time::Duration::from_secs(5)
+                                },
+                        ),
+                        association: Some(&association),
+                        resolved_target: None,
+                    },
+                ));
+            };
+            // A temporarily missing source is not evidence of permanent failure.
+            send("NativeHistory", json!({}), false);
+            assert!(!claude_code::history_failed(&request, &spool).unwrap());
+            let line = |kind: &str, session: &str, id: &str, content: Value| {
+                json!({"type":kind,"sessionId":session,"uuid":id,
+                    "timestamp":"2026-11-01T10:00:01Z","message":{"content":content}})
+                .to_string()
+                    + "\n"
+            };
+            let result = json!({"isError":false,"structuredContent":{"claim_acquired":true,
+                "work":{"item":{"id":association.work_id,"generation":1,"repository":association.repo}}}});
+            let valid = line(
+                "assistant",
+                "session_fixture",
+                "start",
+                json!([{"type":"tool_use",
+                "id":"start-call","name":"mcp__plugin_agentscm_agentscm__agentscm_start",
+                "input":{"session":"session_fixture"}}]),
+            ) + &line(
+                "user",
+                "session_fixture",
+                "result",
+                json!([{"type":"tool_result",
+                    "tool_use_id":"start-call","content":[{"type":"text","text":result.to_string()}]}]),
+            ) + &line(
+                "assistant",
+                "session_fixture",
+                "known",
+                json!([{"type":"text","text":"known reply"}]),
+            );
+            std::fs::write(&transcript, &valid).unwrap();
+            send("NativeHistory", json!({}), true);
+            assert!(!claude_code::history_failed(&request, &spool).unwrap());
+            assert!(runtime.block_on(super::native_start_proven(
+                config,
+                &association,
+                &transcript,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+            )));
+            std::fs::write(
+                &transcript,
+                valid
+                    + &line(
+                        "assistant",
+                        "foreign-native",
+                        "foreign",
+                        json!([{"type":"text","text":"foreign reply"}]),
+                    ),
             )
-        };
-        let shown = |delta: &str, last: bool| {
-            super::note_fragment(
-                &seen,
-                &serde_json::json!({"message_id": "m1", "delta": delta, "final": last}),
+            .unwrap();
+            send(
+                "MessageDisplay",
+                json!({"message_id":"triggering-reply","delta":"known reply","index":0,"final":true}),
+                false,
+            );
+            assert!(claude_code::history_failed(&request, &spool).unwrap());
+            let count = || {
+                spool
+                    .pending(100)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|envelope| match envelope {
+                        CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                        _ => vec![],
+                    })
+                    .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                    .count()
+            };
+            assert_eq!(count(), 1);
+            send(
+                "MessageDisplay",
+                json!({"message_id":"future-reply","delta":"later live reply","index":0,"final":true}),
+                false,
+            );
+            assert_eq!(count(), 2);
+            assert!(
+                std::fs::read_dir(spool.root().join("associations"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn failed_claude_history_stop_never_replays_source_and_live_replies_continue() {
+        crate::client_config::in_isolated_config_home(|config| {
+            use std::io::Write;
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, true);
+            let history = config.join("history");
+            std::fs::create_dir(&history).unwrap();
+            let transcript = history.join("session_fixture.jsonl");
+            let bound = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(history),
+                ..binding(config)
+            };
+            let line = |kind: &str, session: &str, id: &str, content: Value| {
+                json!({"type":kind,"sessionId":session,"uuid":id,
+                    "timestamp":"2026-11-01T10:00:01Z","message":{"content":content}})
+                .to_string()
+                    + "\n"
+            };
+            let result = json!({"isError":false,"structuredContent":{"claim_acquired":true,
+                "work":{"item":{"id":"wrk_11111111111111111111111111111111",
+                    "generation":1,"repository":"acme/widgets"}}}});
+            std::fs::write(&transcript,
+                line("assistant", "session_fixture", "start", json!([{"type":"tool_use",
+                    "id":"start-call","name":"mcp__plugin_agentscm_agentscm__agentscm_start",
+                    "input":{"session":"session_fixture"}}]))
+                + &line("user", "session_fixture", "result", json!([{"type":"tool_result",
+                    "tool_use_id":"start-call","content":[{"type":"text","text":result.to_string()}]}]))
+                + &line("assistant", "session_fixture", "known", json!([{"type":"text",
+                    "text":"KNOWN_VISIBLE_REPLY_261"}]))
+            ).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let send = |event: &str, extra: Value| {
+                let mut payload = json!({"hook_event_name":event,"session_id":"session_fixture",
+                    "transcript_path":transcript});
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let input = payload.to_string();
+                runtime.block_on(super::capture_native(
+                    AgentHarnessV1::ClaudeCode,
+                    input.as_bytes(),
+                    &payload,
+                    &bound,
+                    &spool,
+                    Some(&hub),
+                    super::NativeCapture::default(),
+                ));
+            };
+            send("NativeHistory", json!({}));
+            let assistant_count = || {
+                spool
+                    .pending(100)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|envelope| match envelope {
+                        CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                        _ => vec![],
+                    })
+                    .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                    .count()
+            };
+            assert_eq!(assistant_count(), 1);
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap(),
+                "{}",
+                line(
+                    "assistant",
+                    "foreign-native",
+                    "foreign",
+                    json!([{"type":"text",
+                    "text":"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262"}])
+                )
+                .trim_end()
             )
-        };
-        // "delivered" arrived through MessageDisplay in two fragments; "lost" did not.
-        std::fs::write(&transcript, line("old", &["before this build"])).unwrap();
-        let payload = serde_json::json!({"transcript_path": transcript});
-        super::skip_transcript(&seen, &payload, true);
-        shown("Deliv", false);
-        shown("ered.", true);
-        let mut text = std::fs::read_to_string(&transcript).unwrap();
-        text += &(line("a", &["Deliv", "ered."])
-            + &line("b", &["lost"])
-            + "{\"type\":\"user\"}\n"
-            + "{\"partial");
-        std::fs::write(&transcript, text).unwrap();
-        // State saved already: skipping only for a new session leaves it alone.
-        super::skip_transcript(&seen, &payload, true);
-        let replies = super::missed_replies(&seen, &transcript, "s");
-        assert_eq!(replies.len(), 1);
-        let reply: serde_json::Value = serde_json::from_slice(&replies[0].1).unwrap();
-        assert_eq!(reply["hook_event_name"], "MessageDisplay");
-        assert_eq!(reply["delta"], "lost");
-        assert_eq!(reply["message_id"], "transcript:b");
-        assert!(super::missed_replies(&seen, &transcript, "s").is_empty());
+            .unwrap();
+            send("Stop", json!({}));
+            send("Stop", json!({}));
+            assert_eq!(assistant_count(), 1);
+            send(
+                "MessageDisplay",
+                json!({"message_id":"live-after-failure","delta":"LIVE_REPLY_263",
+                "index":0,"final":true}),
+            );
+            assert_eq!(assistant_count(), 2);
+            for entry in std::fs::read_dir(spool.root().join("artifacts")).unwrap() {
+                let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(b"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262".len())
+                        .any(|window| window == b"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262")
+                );
+            }
+        });
     }
 
     #[test]
@@ -1755,7 +2327,7 @@ mod tests {
                 binding,
                 spool,
                 hub,
-                None,
+                super::NativeCapture::default(),
             ))
     }
 
@@ -1985,7 +2557,7 @@ mod tests {
                 binding,
                 spool,
                 Some(hub),
-                None,
+                super::NativeCapture::default(),
             ));
         assert_eq!(context, None);
     }
@@ -2112,7 +2684,7 @@ mod tests {
                 binding,
                 &spool,
                 Some(hub),
-                None,
+                super::NativeCapture::default(),
             ));
         let pending = spool.pending(100).unwrap();
         pending

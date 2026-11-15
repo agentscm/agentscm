@@ -747,6 +747,12 @@ impl ChangeRecordResponseV1 {
 #[serde(deny_unknown_fields)]
 pub struct ConversationEntryV1 {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<AgentHarnessV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolFactV1>,
     pub sequence: u64,
     pub event_id: String,
     pub kind: CapturedEventKindV1,
@@ -761,14 +767,36 @@ pub struct ConversationEntryV1 {
 }
 
 impl ConversationEntryV1 {
-    /// Position after this entry: `<sequence>:<digest>:<session_id>`.
+    /// Generation is part of occurrence identity even when a resumed session reuses a sequence.
     pub fn cursor(&self) -> String {
-        format!("{}:{}:{}", self.sequence, self.digest, self.session_id)
+        match self.generation {
+            Some(generation) => format!(
+                "v2:{generation}:{}:{}:{}",
+                self.sequence, self.digest, self.session_id
+            ),
+            None => format!("{}:{}:{}", self.sequence, self.digest, self.session_id),
+        }
     }
 }
 
-/// Reads a conversation cursor as (session_id, sequence, digest) to continue after.
-pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, u64, String)> {
+/// Reads (session_id, generation, sequence, digest). A legacy cursor revisits its session
+/// from generation zero rather than skipping occurrences it could not identify.
+pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, i64, u64, String)> {
+    let (generation, cursor) = match cursor.strip_prefix("v2:") {
+        Some(rest) => {
+            let (generation, cursor) = rest
+                .split_once(':')
+                .ok_or_else(|| invalid("malformed cursor"))?;
+            let generation = (!generation.is_empty()
+                && generation.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| generation.parse::<i64>().ok())
+            .flatten()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| invalid("malformed cursor"))?;
+            (generation, cursor)
+        }
+        None => (0, cursor),
+    };
     let mut parts = cursor.splitn(3, ':');
     let (Some(sequence), Some(digest), Some(session)) = (parts.next(), parts.next(), parts.next())
     else {
@@ -786,7 +814,7 @@ pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, u64, String)> 
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     match sequence {
         Some(sequence) if digest_ok && identifier("cursor", session, 255).is_ok() => {
-            Ok((session.to_owned(), sequence, digest.to_owned()))
+            Ok((session.to_owned(), generation, sequence, digest.to_owned()))
         }
         _ => Err(invalid("malformed cursor")),
     }
@@ -1706,6 +1734,9 @@ mod tests {
     fn conversation_entry(index: u64, session_id: &str) -> ConversationEntryV1 {
         ConversationEntryV1 {
             session_id: session_id.into(),
+            generation: Some(1),
+            harness: Some(AgentHarnessV1::Codex),
+            tool: None,
             sequence: index + 1,
             event_id: "e".repeat(255),
             kind: CapturedEventKindV1::AssistantMessage,
@@ -1721,7 +1752,11 @@ mod tests {
     #[test]
     fn conversation_pages_stop_at_the_entry_limit_and_continue_after_the_last_entry() {
         let entries: Vec<_> = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
-            .map(|index| conversation_entry(index, "s"))
+            .map(|index| {
+                let mut entry = conversation_entry(index, "s");
+                entry.event_id = format!("event-{index}");
+                entry
+            })
             .collect();
         let page = ConversationPageV1::bounded(entries.clone()).unwrap();
         assert_eq!(page.entries.len(), MAX_CONVERSATION_PAGE_ENTRIES);
@@ -1729,7 +1764,7 @@ mod tests {
         assert_eq!(cursor, entries[MAX_CONVERSATION_PAGE_ENTRIES - 1].cursor());
         assert_eq!(
             parse_conversation_cursor(&cursor).unwrap(),
-            ("s".to_owned(), 100, format!("{:064x}", 99))
+            ("s".to_owned(), 1, 100, format!("{:064x}", 99))
         );
         let last = ConversationPageV1::bounded(entries[..3].to_vec()).unwrap();
         assert_eq!((last.entries.len(), last.next_cursor), (3, None));
@@ -1763,9 +1798,13 @@ mod tests {
         let digest = "a".repeat(64);
         assert_eq!(
             parse_conversation_cursor(&format!("7:{digest}:codex:session@1")).unwrap(),
-            ("codex:session@1".to_owned(), 7, digest.clone())
+            ("codex:session@1".to_owned(), 0, 7, digest.clone())
         );
         for bad in [
+            format!("v2:+1:7:{digest}:s"),
+            format!("v2:0:7:{digest}:s"),
+            format!("v2:-1:7:{digest}:s"),
+            format!("v2:9223372036854775808:7:{digest}:s"),
             String::new(),
             "7".into(),
             format!("7:{digest}"),

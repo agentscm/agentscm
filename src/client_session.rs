@@ -264,13 +264,127 @@ pub(crate) fn record_route(
     Ok(())
 }
 
-/// Drops `session` from every host, and every repository's route, when its conversation ends.
+/// A successful explicit Work start, separate from whichever repository a tool last touched.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaptureAssociation {
+    pub session: String,
+    pub harness: agentscm::change_record::AgentHarnessV1,
+    pub hub: String,
+    pub repo: String,
+    pub checkout: PathBuf,
+    pub work_id: String,
+    pub generation: i64,
+    #[serde(default)]
+    pub native_start_verified: bool,
+}
+
+impl CaptureAssociation {
+    fn valid(&self) -> bool {
+        [&self.session, &self.work_id].iter().all(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        }) && self.generation > 0
+            && self.checkout.is_absolute()
+            && !self.hub.is_empty()
+            && !self.repo.is_empty()
+    }
+}
+
+fn capture_directory(config: &Path, session: &str) -> PathBuf {
+    config
+        .join("agentscm")
+        .join("session-work")
+        .join(tag(session))
+}
+
+pub(crate) fn capture_associations(config: &Path, session: &str) -> Vec<CaptureAssociation> {
+    let mut associations: Vec<CaptureAssociation> =
+        std::fs::read_dir(capture_directory(config, session))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(MAX_RECORDS)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                serde_json::from_value::<CaptureAssociation>(route_record(&entry.path())?).ok()
+            })
+            .filter(|record| record.session == session && record.valid())
+            .collect();
+    associations.sort_by(|a, b| {
+        (&a.hub, &a.repo, &a.work_id, a.generation, &a.checkout).cmp(&(
+            &b.hub,
+            &b.repo,
+            &b.work_id,
+            b.generation,
+            &b.checkout,
+        ))
+    });
+    associations
+}
+
+pub(crate) fn record_capture(
+    config: &Path,
+    association: &CaptureAssociation,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if !association.valid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid capture association",
+        ));
+    }
+    let directory = capture_directory(config, &association.session);
+    let name = tag(&format!(
+        "{}\0{}\0{}\0{}",
+        association.session,
+        association.hub,
+        association.repo.to_ascii_lowercase(),
+        association.work_id
+    ));
+    let path = directory.join(name);
+    let mut association = association.clone();
+    if let Some(mut previous) = route_record(&path)
+        .and_then(|value| serde_json::from_value::<CaptureAssociation>(value).ok())
+        .filter(|previous| previous.native_start_verified)
+    {
+        previous.native_start_verified = association.native_start_verified;
+        if previous == association {
+            association.native_start_verified = true;
+        }
+    }
+    if route_record(&path)
+        .and_then(|value| serde_json::from_value::<CaptureAssociation>(value).ok())
+        .as_ref()
+        == Some(&association)
+    {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&directory)?;
+    // Never evict another live association to admit a new one.
+    if !path.exists() && std::fs::read_dir(&directory)?.take(MAX_RECORDS).count() >= MAX_RECORDS {
+        return Err(std::io::Error::other("capture association limit reached"));
+    }
+    let bytes = serde_json::to_vec(&association)?;
+    if bytes.len() > RECORD_BYTES as usize {
+        return Err(std::io::Error::other("capture association is too large"));
+    }
+    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+    file.write_all(&bytes)?;
+    file.persist(path)?;
+    Ok(())
+}
+
+/// Drops live host routes at session end. Explicit Work associations survive native resume.
 pub(crate) fn forget(config: &Path, session: &str) {
     for entry in std::fs::read_dir(routes(config))
         .into_iter()
         .flatten()
-        .flatten()
         .take(MAX_RECORDS)
+        .flatten()
     {
         let file = entry.path();
         if route_record(&file).is_some_and(|record| record["session"].as_str() == Some(session)) {
@@ -455,6 +569,65 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn explicit_capture_associations_fan_out_by_work_and_survive_resume() {
+        let config = tempfile::tempdir().unwrap();
+        let one = CaptureAssociation {
+            session: "native".into(),
+            harness: agentscm::change_record::AgentHarnessV1::Codex,
+            hub: "https://hub".into(),
+            repo: "org/one".into(),
+            checkout: root("one"),
+            work_id: "wrk_one".into(),
+            generation: 1,
+            native_start_verified: false,
+        };
+        let two = CaptureAssociation {
+            repo: "org/two".into(),
+            checkout: root("two"),
+            work_id: "wrk_two".into(),
+            ..one.clone()
+        };
+        let newer = CaptureAssociation {
+            generation: 2,
+            ..one.clone()
+        };
+        for record in [&one, &two, &one, &newer] {
+            record_capture(config.path(), record).unwrap();
+        }
+        let records = capture_associations(config.path(), "native");
+        assert_eq!(records.len(), 2);
+        assert!(!records.contains(&one) && records.contains(&two) && records.contains(&newer));
+        assert!(capture_associations(config.path(), "other").is_empty());
+        record_route(
+            config.path(),
+            "native",
+            "https://hub",
+            "org/three",
+            &root("three"),
+        )
+        .unwrap();
+        assert_eq!(capture_associations(config.path(), "native").len(), 2);
+        let bad = CaptureAssociation {
+            checkout: PathBuf::from("relative"),
+            ..one.clone()
+        };
+        assert!(record_capture(config.path(), &bad).is_err());
+        let mut verified = newer.clone();
+        verified.native_start_verified = true;
+        record_capture(config.path(), &verified).unwrap();
+        record_capture(config.path(), &newer).unwrap();
+        assert!(capture_associations(config.path(), "native").contains(&verified));
+        let resumed = CaptureAssociation {
+            generation: 3,
+            ..newer.clone()
+        };
+        record_capture(config.path(), &resumed).unwrap();
+        assert!(capture_associations(config.path(), "native").contains(&resumed));
+        forget(config.path(), "native");
+        assert_eq!(capture_associations(config.path(), "native").len(), 2);
     }
 
     #[cfg(unix)]

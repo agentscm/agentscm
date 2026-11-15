@@ -133,6 +133,7 @@ async fn action_finish(
 #[serde(deny_unknown_fields)]
 struct CurrentTargetQuery {
     session_id: String,
+    work_id: Option<String>,
 }
 
 async fn current_target(
@@ -150,14 +151,18 @@ async fn current_target(
     let target = blocking(&state, move || {
         let now = unix_now();
         let session_id = store.session_name_for(&token, Some(&query.session_id), now)?;
-        Ok(store
-            .capture_work_for_session(&token, &session_id, now)?
-            .map(|item| CaptureTargetV1 {
-                version: 1,
-                work_id: item.id,
-                generation: item.generation,
-                session_id,
-            }))
+        let item = store.capture_work_for_session_at(
+            &token,
+            &session_id,
+            query.work_id.as_deref(),
+            now,
+        )?;
+        Ok(item.map(|item| CaptureTargetV1 {
+            version: 1,
+            work_id: item.id,
+            generation: item.generation,
+            session_id,
+        }))
     })
     .await?
     .ok_or_else(ApiError::not_found)?;

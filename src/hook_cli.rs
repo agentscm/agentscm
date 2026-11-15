@@ -253,6 +253,13 @@ async fn hook(
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
     }
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        crate::client_session::forget(&config, session);
+    }
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
     if permission::applies(agent, client_connection, &payload) {
@@ -271,16 +278,80 @@ async fn capture(
     budget: Instant,
 ) -> Option<String> {
     let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
-    let routed = route_client(&agent, &payload).ok()?;
-    crate::change_capture_cli::plugin_capture(
-        harness,
-        &body,
-        &payload,
-        routed.checkout,
-        routed.connection,
-        budget.into(),
-    )
-    .await
+    let routed = route_client(&agent, &payload).ok();
+    let mut default = None;
+    let mut context = None;
+    if let Some(routed) = routed {
+        let namespace = (
+            routed.connection.hub.clone(),
+            routed.connection.repo.clone(),
+        );
+        let (captured, target) = crate::change_capture_cli::plugin_capture(
+            harness,
+            &body,
+            &payload,
+            routed.checkout,
+            routed.connection,
+            budget.into(),
+        )
+        .await;
+        context = captured;
+        default = target.map(|target| (namespace, target));
+    }
+    if matches!(agent.as_str(), "codex" | "claude")
+        && let (Some(session), Ok(config), Ok(connections)) =
+            (session_of(&payload), config_dir(), client_config::load())
+    {
+        let tool = matches!(
+            payload["hook_event_name"].as_str(),
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        );
+        for association in crate::client_session::capture_associations(&config, session)
+            .iter()
+            .filter(|association| association.harness == harness)
+        {
+            // The default route already handled this literal event. Tool claims can retain an
+            // older Work route, so those use each association's exact phase dedup instead.
+            if !needs_associated_capture(association, default.as_ref(), tool) {
+                continue;
+            }
+            let Some((connection, _)) =
+                client_config::connection_for_checkout(&connections, &association.checkout).filter(
+                    |(connection, _)| {
+                        connection.hub == association.hub
+                            && connection.repo.eq_ignore_ascii_case(&association.repo)
+                            && client_config::is_current_in(connection, &association.checkout)
+                    },
+                )
+            else {
+                continue;
+            };
+            crate::change_capture_cli::plugin_capture_for_work(
+                harness,
+                &body,
+                &payload,
+                association.checkout.clone(),
+                connection.clone(),
+                budget.into(),
+                Some(association),
+            )
+            .await;
+        }
+    }
+    context
+}
+
+fn needs_associated_capture(
+    association: &crate::client_session::CaptureAssociation,
+    default: Option<&((String, String), agentscm::change_record::CaptureTargetV1)>,
+    tool: bool,
+) -> bool {
+    tool || !default.is_some_and(|((hub, repo), target)| {
+        association.hub == *hub
+            && association.repo.eq_ignore_ascii_case(repo)
+            && association.work_id == target.work_id
+            && association.generation == target.generation
+    })
 }
 
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
@@ -295,12 +366,6 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
         return Some(tokio::task::spawn_blocking(move || {
             crate::client_session::record(&config, &session);
         }));
-    }
-    if matches!(
-        payload["hook_event_name"].as_str(),
-        Some("SessionEnd" | "sessionEnd")
-    ) {
-        crate::client_session::forget(&config, &session);
     }
     None
 }
@@ -1800,6 +1865,48 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
     route_client_with("codex", payload, connections)
 }
 
+/// Sends only a completely read native question snapshot, independently of conversation
+/// sharing. The caller has already bound the native file to this session and checkout.
+pub(crate) async fn forward_questions(
+    connection: &Connection,
+    session: &str,
+    snapshot: Option<&agentscm::hub::session_waiting::QuestionSnapshot>,
+) -> Result<(), String> {
+    if session.is_empty() || session.len() > 1024 || session.chars().any(char::is_control) {
+        return Err("invalid native question session".into());
+    }
+    let payload = match snapshot {
+        Some(snapshot) => {
+            json!({"hook_event_name": "QuestionsSnapshot", "session_id": session, "questions": snapshot})
+        }
+        None => json!({"hook_event_name": "QuestionsUnavailable", "session_id": session}),
+    };
+    let payload = sanitized_codex(&payload, Some(&[]))?;
+    let token = crate::client_cli::read_token(&connection.token_file).map_err(|_| "no token")?;
+    let request = HookRequest {
+        agent: "codex".into(),
+        repo: Some(connection.repo.clone()),
+        client: Some(client_config::onboarding_client(&connection.root, &token)),
+        token,
+        root: None,
+        report_completion: false,
+        report: None,
+        body: serde_json::to_vec(&payload).map_err(|_| "invalid native question snapshot")?,
+    };
+    let client = forge_http::client().map_err(|_| "hub unreachable")?;
+    let request = request
+        .request(&client, &connection.hub)
+        .map_err(|_| "hub unreachable")?;
+    let (status, reply) = tokio::time::timeout(LIMIT, send(request, REPLY_BYTES))
+        .await
+        .map_err(|_| "hub unreachable")?
+        .map_err(|_| "hub unreachable")?;
+    if status != 200 || reply["questions_accepted"] != true {
+        return Err("native question snapshot not accepted".into());
+    }
+    Ok(())
+}
+
 /// Codex may include source, patch bodies and prompts outside the tool input. Only fields needed
 /// for coordination leave the machine. For patches, only recognized operation headers survive.
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
@@ -1821,6 +1928,18 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         {
             out.insert(key.into(), json!(value));
         }
+    }
+    if payload["hook_event_name"] == "QuestionsSnapshot" {
+        let mut snapshot: agentscm::hub::session_waiting::QuestionSnapshot =
+            serde_json::from_value(payload["questions"].clone())
+                .map_err(|_| "invalid native question snapshot")?;
+        for question in &mut snapshot.pending {
+            question.asks = question.asks.as_deref().and_then(line_end);
+        }
+        if !snapshot.valid() {
+            return Err("invalid native question snapshot".into());
+        }
+        out.insert("questions".into(), json!(snapshot));
     }
     // A session its person cleared (`/clear`) waits for nobody; no other end reason leaves.
     if payload["hook_event_name"] == "SessionEnd" && payload["reason"] == "clear" {
@@ -1914,14 +2033,21 @@ const ASKS_CHARS: usize = 400;
 fn wait_asks(payload: &Value) -> Option<String> {
     match payload["hook_event_name"].as_str()? {
         "Stop" if !resumes_itself(payload) => line_end(payload["last_assistant_message"].as_str()?),
-        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => line_end(
-            &payload["tool_input"]["questions"]
-                .as_array()?
-                .iter()
-                .filter_map(|q| q["question"].as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
+        "PreToolUse"
+            if matches!(
+                payload["tool_name"].as_str(),
+                Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+            ) =>
+        {
+            line_end(
+                &payload["tool_input"]["questions"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|q| q["question"].as_str().or_else(|| q["title"].as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
         _ => None,
     }
 }
@@ -2411,7 +2537,11 @@ fn waits(agent: &str, payload: &Value) -> bool {
     match payload["hook_event_name"].as_str() {
         Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
         Some("stop") => agent == "cursor",
-        Some("PreToolUse") => payload["tool_name"] == "AskUserQuestion",
+        Some("QuestionsSnapshot" | "QuestionsUnavailable") => true,
+        Some("PreToolUse") => matches!(
+            payload["tool_name"].as_str(),
+            Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+        ),
         Some(_) => false,
         None => {
             agent == "copilot"
@@ -2848,6 +2978,61 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literal_fanout_skips_only_the_exact_default_work_and_preserves_tool_context() {
+        let association = crate::client_session::CaptureAssociation {
+            session: "native".into(),
+            harness: agentscm::change_record::AgentHarnessV1::ClaudeCode,
+            hub: "https://hub.example".into(),
+            repo: "acme/one".into(),
+            checkout: std::path::PathBuf::from("/synthetic/checkout"),
+            work_id: "wrk_one".into(),
+            generation: 1,
+            native_start_verified: true,
+        };
+        let default = (
+            (association.hub.clone(), association.repo.clone()),
+            agentscm::change_record::CaptureTargetV1 {
+                version: 1,
+                work_id: association.work_id.clone(),
+                generation: 1,
+                session_id: "native".into(),
+            },
+        );
+        assert!(!super::needs_associated_capture(
+            &association,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(
+            &association,
+            Some(&default),
+            true
+        ));
+        let mut other = association.clone();
+        other.work_id = "wrk_two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.repo = "acme/two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.generation += 1;
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(&association, None, false));
+    }
+
     use super::*;
 
     fn changed(paths: &[&str], truncated: bool) -> Value {
@@ -3008,6 +3193,186 @@ mod tests {
         assert_eq!(edit(&real, &nested.join("src/a.rs")), unplaced);
         // A `cwd` outside every checkout, editing inside one.
         assert_eq!(edit(temp.path(), &real.join("src/a.rs")), unplaced);
+    }
+
+    #[test]
+    fn native_question_snapshots_send_only_validated_redacted_wait_metadata() {
+        let raw = json!({"hook_event_name":"QuestionsSnapshot","session_id":"s",
+            "prompt":"private reply", "transcript_path":"private path",
+            "questions":{"offset":123,"pending":[{"id":"[\"request_user_input_async\",\"call_example\",0]",
+                "since":1000,"asks":"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nChoose a format"}]}});
+        let sent = sanitized_codex(&raw, Some(&[])).unwrap();
+        let text = sent.to_string();
+        assert!(!text.contains("private") && !text.contains("ghp_abc"));
+        assert!(text.contains("Choose a format"));
+        assert_eq!(sent["questions"]["offset"], 123);
+        assert!(waits("codex", &raw));
+        let mut malformed = raw;
+        malformed["questions"]["pending"][0]["id"] = json!("not a question id");
+        assert!(sanitized_codex(&malformed, Some(&[])).is_err());
+        let synchronous = json!({"hook_event_name":"PreToolUse","tool_name":"request_user_input",
+            "tool_input":{"questions":[{"question":"Choose a format"}]}});
+        assert_eq!(wait_asks(&synchronous).as_deref(), Some("Choose a format"));
+        assert!(waits("codex", &synchronous));
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":"s",
+            "prompt":"private", "transcript_path":"private", "questions":{"pending":["private"]}});
+        let sent = sanitized_codex(&unavailable, Some(&[])).unwrap();
+        assert!(waits("codex", &sent));
+        assert_eq!(sent["hook_event_name"], "QuestionsUnavailable");
+        assert!(!sent.to_string().contains("private"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_question_poll_forward_and_status_preserve_the_wait_until_a_matched_reply() {
+        use agentscm::backend::LocalBackend;
+        use agentscm::change_capture::codex::poll_questions;
+        use agentscm::hub::store::{self, ForgeIdentity, mint_bound_agent_token, unix_now};
+        use agentscm::hub::{HubState, router};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        const SESSION: &str = "55555555-5555-4555-8555-555555555555";
+        let temp = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            temp.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 913,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(&*store, &user.id, "codex", "acme/widgets", 101, 3600, false)
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connection = connection(temp.path(), "acme/widgets");
+        connection.hub = format!("http://{}", listener.local_addr().unwrap());
+        connection.token_file = temp.path().join("token");
+        std::fs::write(&connection.token_file, secret.expose()).unwrap();
+        std::fs::set_permissions(
+            &connection.token_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let app = router(HubState::new(
+            store,
+            Arc::new(LocalBackend::open(temp.path().join("objects")).unwrap()),
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = temp.path().join("rollout.jsonl");
+        let append = |value: Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{value}").unwrap();
+        };
+        append(json!({"type":"session_meta","payload":{"id":SESSION}}));
+        let item = |value: Value| {
+            json!({"type":"event_msg","timestamp":"2026-11-15T12:00:00Z",
+            "payload":{"type":"item_completed","thread_id":SESSION,"item":value}})
+        };
+        append(item(
+            json!({"type":"AgentMessage","id":"call_question","delivery":"async",
+            "content":[],"questions":[{"title":"Choose a format","options":["JSON","CSV"]}]}),
+        ));
+        let mut cursor = None;
+        let read = |cursor: &mut Option<_>| {
+            let mut report = poll_questions(&path, SESSION, cursor).unwrap();
+            assert!(report.complete && report.reliable);
+            // Simulate an elapsed grace interval without making a local test wait a minute.
+            for question in &mut report.snapshot.pending {
+                question.since = unix_now() - 70;
+            }
+            report.snapshot
+        };
+        let first = read(&mut cursor);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let status = || async {
+            let body = client
+                .get(format!("{}/v1/hub/standup/status", connection.hub))
+                .bearer_auth(secret.expose())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        };
+        let waiting_count = |value: &Value| {
+            value["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["kind"] == "session_waiting")
+                .count()
+        };
+        assert_eq!(waiting_count(&status().await), 1);
+        append(
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_question","output":"{\"accepted\":true}"}}),
+        );
+        append(item(
+            json!({"type":"UserMessage","id":"unrelated","content":[{"type":"Text","text":"Here is a screenshot"}]}),
+        ));
+        // Continued native work and a normal user prompt also flow through the real hooks.
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"] {
+            client
+                .post(format!(
+                    "{}/v1/hub/hook/codex?repo=acme/widgets",
+                    connection.hub
+                ))
+                .bearer_auth(secret.expose())
+                .header("content-type", "application/json")
+                .body(
+                    json!({"hook_event_name":event,"session_id":SESSION,"tool_name":"exec"})
+                        .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        forward_questions(&connection, SESSION, Some(&read(&mut cursor)))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 1);
+        let reply = json!([{"questionItemId":first.pending[0].id,"question":"Choose a format","answer":"JSON"}]);
+        append(item(
+            json!({"type":"UserMessage","id":"reply","content":[{"type":"Text",
+            "text":format!("<send_user_message_question_reply>{reply}</send_user_message_question_reply>")}]}),
+        ));
+        let answered = read(&mut cursor);
+        assert!(answered.pending.is_empty());
+        forward_questions(&connection, SESSION, Some(&answered))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        std::fs::write(&connection.token_file, "invalid-token").unwrap();
+        assert!(
+            forward_questions(&connection, SESSION, Some(&answered))
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[test]

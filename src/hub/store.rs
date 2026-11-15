@@ -686,6 +686,38 @@ pub trait Store: Send + Sync {
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()>;
     /// Insert a hub-wide setting once across replicas and return its retained value.
     fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String>;
+    /// Persist unknown coverage and its largest reliably observed rejected offset. Zero means
+    /// unavailable coverage without a reliable snapshot; upserts never lower the retry floor.
+    fn native_question_coverage_mark(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+        rejected_offset: u64,
+    ) -> Result<()>;
+    /// The retry floor for one unresolved source; zero is unknown coverage without an offset.
+    fn native_question_coverage_floor(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+    ) -> Result<Option<u64>>;
+    /// Indexed existence check for unresolved coverage in one owner's repository.
+    fn native_question_coverage_unavailable(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: Option<&str>,
+    ) -> Result<bool>;
+    /// Resolve through an accepted offset in one repository, or across repositories after a
+    /// verified native clear (`through_offset: None`). False means a newer barrier remains.
+    fn native_question_coverage_resolve(
+        &self,
+        owner: &str,
+        scope: Option<&str>,
+        native: &str,
+        through_offset: Option<u64>,
+    ) -> Result<bool>;
     /// Unix seconds; no event.
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()>;
     /// Keyed by (host, repository_id): a rename updates the row. A repository already held by
@@ -1361,6 +1393,16 @@ pub trait Store: Send + Sync {
         &self,
         token: &str,
         session: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        self.capture_work_for_session_at(token, session, None, now)
+    }
+    /// The same authorization fence, optionally restricted to an explicitly associated Work.
+    fn capture_work_for_session_at(
+        &self,
+        token: &str,
+        session: &str,
+        work_id: Option<&str>,
         now: i64,
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
@@ -2382,6 +2424,18 @@ pub fn validate_repository(repository: &str) -> Result<()> {
 
 fn name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+pub(super) fn validate_native_question_coverage_keys(keys: &[&str]) -> Result<()> {
+    if keys.iter().any(|key| {
+        key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(invalid("invalid native question coverage key"));
+    }
+    Ok(())
 }
 
 fn invalid(message: &str) -> HubError {

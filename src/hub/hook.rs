@@ -35,7 +35,7 @@ use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
     done_pausing_for, others_for, record_hook_ms,
 };
-use super::session_waiting::{WaitReason, Waiting, holder};
+use super::session_waiting::{QuestionSnapshot, WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
@@ -133,6 +133,10 @@ enum Kind {
     /// The session stopped to wait for its person, or on its own background work; its next call
     /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
+    /// A complete, ordered snapshot of the native session's outstanding async questions.
+    Questions,
+    /// The native source cannot currently establish its outstanding questions.
+    QuestionsUnavailable,
     /// A subagent started or stopped: only its session's roster follows it. It renews nothing
     /// and ends no wait, because a host also reports the agents it runs for itself, such as
     /// one that suggests the next prompt after a turn has ended.
@@ -165,7 +169,7 @@ enum Shape {
     Unreadable,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Call {
     agent: Agent,
     kind: Kind,
@@ -183,6 +187,7 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    questions: Option<QuestionSnapshot>,
     /// This client's hook can carry added context at a prompt or checked tool call (Claude
     /// Code, Codex, Cursor, Copilot's PascalCase hooks); Copilot CLI's and generic hooks cannot.
     context_hook: bool,
@@ -289,7 +294,7 @@ impl Observed {
 /// A subagent a session started, from the hook client's `subagent` object on the call that
 /// started it: its id and type, a short excerpt of what it was started to do, and whether the
 /// call returned while it still runs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Launched {
     id: String,
     agent_type: Option<String>,
@@ -417,26 +422,41 @@ async fn hook(
             )
         }
     };
-    // The session is moving again, so its person no longer holds it up. Only a session that
-    // waits costs the authentication. Any token of the same person ends the wait of a session
-    // its host named (the session's token may have been renewed meanwhile); another person's
-    // call cannot.
+    // Ordinary activity authenticates only when there is a known wait. An explicit clear
+    // must persist even before the first native snapshot arrives, so it always authenticates.
     if let Some((native, all)) = call.ends_wait()
-        && state.onboarding.waiting().has_session(native)
-        && let Ok(Ok(principal)) =
-            timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
+        && (call.cleared || state.onboarding.waiting().has_session(native))
     {
-        call.end_wait(
-            state.onboarding.waiting(),
-            holder(&principal, native),
-            native,
-            all,
-        );
-        if all {
-            state
-                .onboarding
-                .subagents()
-                .answered(&principal.token_id, native);
+        let end = async {
+            let principal = authenticate(&state, token.clone(), repo.clone()).await?;
+            let store = state.store.clone();
+            let onboarding = state.onboarding.clone();
+            let call = call.clone();
+            let native = native.to_owned();
+            blocking(&state, move || {
+                call.end_wait(onboarding.waiting(), &*store, &principal, &native, all)?;
+                if all {
+                    onboarding
+                        .subagents()
+                        .answered(&principal.token_id, &native);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(reason)
+        };
+        match timeout_at(deadline, end).await {
+            Ok(Ok(())) => {}
+            failed if call.cleared => {
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    _ => error_envelope::from_code(ErrorCode::Unavailable),
+                };
+                outcome.text = error.hook_note();
+                outcome.status = "unknown";
+                failure = Some(error);
+            }
+            _ => {}
         }
     }
     if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
@@ -819,6 +839,7 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            questions: None,
             context_hook: false,
             prompt_shown: false,
             agent_type: None,
@@ -993,19 +1014,37 @@ impl Call {
         let all = match self.kind {
             Kind::Start | Kind::Prompt | Kind::Done => true,
             Kind::Check | Kind::Activity(_) => false,
-            Kind::Ignore | Kind::Waiting(_) | Kind::Subagent | Kind::Fail(_) => return None,
+            Kind::Ignore
+            | Kind::Waiting(_)
+            | Kind::Questions
+            | Kind::QuestionsUnavailable
+            | Kind::Subagent
+            | Kind::Fail(_) => {
+                return None;
+            }
         };
         Some((self.session.as_deref()?, all))
     }
 
     /// Ends the wait of `native` that [`Self::ends_wait`] names. A session's end keeps a turn's
     /// end that asks its person something, unless the person cleared that session and moved on.
-    fn end_wait(&self, waiting: &Waiting, holder: &str, native: &str, all: bool) {
-        if self.kind == Kind::Done && !self.cleared {
+    fn end_wait(
+        &self,
+        waiting: &Waiting,
+        store: &dyn Store,
+        principal: &Principal,
+        native: &str,
+        all: bool,
+    ) -> super::Result<()> {
+        let holder = holder(principal, native);
+        if self.cleared {
+            waiting.cleared(store, principal, native, unix_now())?;
+        } else if self.kind == Kind::Done {
             waiting.ended(holder, native);
         } else {
             waiting.clear(holder, native, self.asker.as_deref(), all);
         }
+        Ok(())
     }
 
     fn task(mut self, task: Option<&str>) -> Self {
@@ -1146,6 +1185,38 @@ impl Call {
                     outcome.status = "fyi";
                 }
                 Ok(outcome)
+            }
+            Kind::Questions | Kind::QuestionsUnavailable => {
+                let principal = authenticate(state, token, repo).await?;
+                let native = self.session.as_deref().ok_or_else(|| {
+                    reason(HubError::Invalid("missing native question session".into()))
+                })?;
+                let snapshot = if self.kind == Kind::Questions {
+                    Some(self.questions.clone().ok_or_else(|| {
+                        reason(HubError::Invalid("invalid native question snapshot".into()))
+                    })?)
+                } else {
+                    None
+                };
+                let store = state.store.clone();
+                let onboarding = state.onboarding.clone();
+                let native = native.to_owned();
+                blocking(state, move || {
+                    let now = unix_now();
+                    let session =
+                        store.session_name_for(&principal.token_id, Some(&native), now)?;
+                    match snapshot {
+                        Some(snapshot) => onboarding
+                            .waiting()
+                            .questions(&*store, &principal, &native, &session, &snapshot, now),
+                        None => onboarding
+                            .waiting()
+                            .questions_unavailable(&*store, &principal, &native, &session, now),
+                    }
+                })
+                .await
+                .map_err(reason)?;
+                Ok(Outcome::clean())
             }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
@@ -1716,6 +1787,9 @@ impl Call {
     }
 
     fn render(&self, outcome: &Outcome) -> Value {
+        if matches!(self.kind, Kind::Questions | Kind::QuestionsUnavailable) {
+            return json!({"questions_accepted": outcome.status == "clean"});
+        }
         let mut context = outcome.text.clone();
         if self.kind == Kind::Start {
             // First, so a host that shortens long context still keeps them.
@@ -1982,6 +2056,16 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
     let tool = str_at(v, "tool_name").unwrap_or_default();
     let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks"));
     match str_at(v, "hook_event_name") {
+        Some("QuestionsSnapshot") if agent == Agent::Codex => {
+            let mut decoded = call(Kind::Questions, Shape::Silent);
+            decoded.questions = serde_json::from_value(v["questions"].clone())
+                .ok()
+                .filter(QuestionSnapshot::valid);
+            decoded
+        }
+        Some("QuestionsUnavailable") if agent == Agent::Codex => {
+            call(Kind::QuestionsUnavailable, Shape::Silent)
+        }
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
         // Fires only where a person types, so it reaches the session they are talking to. The
@@ -1990,7 +2074,11 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         // Only the facts of the wait are read: never the message, tool input or question. A
         // question raises its own permission request, which must not turn its wait into a
         // permission wait. Answering a permission prompt from the Hub is in `permission_answer`.
-        Some("PreToolUse" | "PermissionRequest") if tool == ASK_USER_QUESTION => {
+        Some("PreToolUse" | "PermissionRequest")
+            if tool == ASK_USER_QUESTION
+                || (agent == Agent::Codex
+                    && matches!(tool, "request_user_input" | "functions.request_user_input")) =>
+        {
             waiting(WaitReason::Question)
         }
         Some("PermissionRequest") => waiting(WaitReason::Permission),
@@ -3173,6 +3261,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_native_question_snapshots_are_explicit_and_do_not_end_waits() {
+        let event = json!({"hook_event_name":"QuestionsSnapshot","session_id":"s",
+            "questions":{"offset":123,"pending":[{"id":"[\"request_user_input_async\",\"call_example\",0]","asks":"Choose a format","since":1000}]}});
+        let call = parse(Agent::Codex, &event);
+        assert_eq!(call.kind, Kind::Questions);
+        assert_eq!(call.questions.as_ref().unwrap().pending.len(), 1);
+        assert_eq!(call.ends_wait(), None);
+        assert_eq!(
+            call.render(&Outcome::clean()),
+            json!({"questions_accepted":true})
+        );
+        let mut failed = Outcome::clean();
+        failed.status = "unknown";
+        assert_eq!(call.render(&failed), json!({"questions_accepted":false}));
+        assert_eq!(parse(Agent::Claude, &event).kind, Kind::Ignore);
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":"s"});
+        let unknown = parse(Agent::Codex, &unavailable);
+        assert_eq!(unknown.kind, Kind::QuestionsUnavailable);
+        assert!(unknown.questions.is_none());
+        assert_eq!(unknown.ends_wait(), None);
+        assert_eq!(
+            unknown.render(&Outcome::clean()),
+            json!({"questions_accepted":true})
+        );
+        assert_eq!(parse(Agent::Claude, &unavailable).kind, Kind::Ignore);
+        let mut malformed = event;
+        malformed["questions"]["pending"][0]["id"] = json!("not a native question");
+        assert!(parse(Agent::Codex, &malformed).questions.is_none());
+        for tool in ["request_user_input", "functions.request_user_input"] {
+            assert_eq!(
+                parse(
+                    Agent::Codex,
+                    &json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":tool})
+                )
+                .kind,
+                Kind::Waiting(WaitReason::Question)
+            );
+        }
+    }
+
+    #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
         use WaitReason::{Background, Finished, Idle, Permission, Question};
         let wait = |agent, v: Value| {
@@ -3484,8 +3613,339 @@ mod tests {
         );
     }
 
+    struct QuestionHub {
+        _directory: tempfile::TempDir,
+        client: reqwest::Client,
+        url: String,
+        token: String,
+        store: std::sync::Arc<dyn Store>,
+        owner: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for QuestionHub {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl QuestionHub {
+        async fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = crate::hub::store::open(&format!(
+                "sqlite://{}",
+                directory.path().join("hub.sqlite").display()
+            ))
+            .unwrap();
+            let user = store
+                .upsert_user(
+                    &crate::hub::store::ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id: 913,
+                    },
+                    "synthetic-viewer",
+                )
+                .unwrap();
+            let (_, token, _) = crate::hub::store::mint_bound_agent_token(
+                &*store,
+                &user.id,
+                "codex",
+                "acme/widgets",
+                101,
+                3600,
+                false,
+            )
+            .unwrap();
+            let objects =
+                crate::backend::LocalBackend::open(directory.path().join("objects")).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let router =
+                crate::hub::router(HubState::new(store.clone(), std::sync::Arc::new(objects)));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            Self {
+                _directory: directory,
+                client: reqwest::Client::new(),
+                url,
+                token: token.expose().to_owned(),
+                store,
+                owner: user.id,
+                server,
+            }
+        }
+
+        fn token_for(&self, repository: &str, repository_id: i64, read_only: bool) -> String {
+            crate::hub::store::mint_bound_agent_token(
+                &*self.store,
+                &self.owner,
+                "codex",
+                repository,
+                repository_id,
+                3600,
+                read_only,
+            )
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+        }
+
+        async fn hook(&self, event: Value) -> Value {
+            self.hook_as(&self.token, event).await
+        }
+
+        async fn hook_as(&self, token: &str, event: Value) -> Value {
+            let body = self
+                .client
+                .post(format!("{}/v1/hub/hook/codex", self.url))
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(event.to_string())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn snapshot(&self, native: &str, offset: u64, count: usize) -> Value {
+            let pending = (0..count).map(|index| json!({
+                "id": serde_json::to_string(&("request_user_input_async", "call_example", index)).unwrap(),
+                "asks": "Choose a format",
+                "since": unix_now() - 70,
+            })).collect::<Vec<_>>();
+            self.hook(json!({
+                "hook_event_name": "QuestionsSnapshot", "session_id": native,
+                "questions": {"offset": offset, "pending": pending},
+            }))
+            .await
+        }
+
+        async fn status_as(&self, token: &str) -> Value {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/standup/status", self.url))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn assert_waiting_coverage(&self, token: &str, complete: bool, count: usize) {
+            let status = self.status_as(token).await;
+            assert_eq!(
+                status["limits"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("session_waiting_unavailable")),
+                !complete,
+            );
+            if !complete {
+                assert_eq!(status["complete"], false);
+            }
+            assert_eq!(
+                status["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|action| action["kind"] == "session_waiting")
+                    .count(),
+                count,
+            );
+        }
+
+        async fn activity(&self) -> Value {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/repos/acme%2Fwidgets/activity", self.url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn waiting_count(&self) -> usize {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/standup/status", self.url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let status: Value = serde_json::from_slice(&body).unwrap();
+            status["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["kind"] == "session_waiting")
+                .count()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_question_http_coverage_recovers_only_with_reliable_scoped_evidence() {
+        let hub = QuestionHub::new().await;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":NATIVE});
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 0).await["questions_accepted"],
+            true
+        );
+        let reader = hub.token_for("acme/widgets", 101, true);
+        assert_eq!(
+            hub.hook_as(&reader, unavailable.clone()).await["questions_accepted"],
+            false
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 0).await;
+        let activity = hub.activity().await;
+        assert_eq!(activity["waiting_complete"], false);
+        assert_eq!(activity["limits"], json!(["session_waiting_unavailable"]));
+        assert!(activity["sessions"].is_array());
+        assert!(activity["events"].is_array());
+        let elsewhere = hub.token_for("acme/elsewhere", 102, false);
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+        hub.hook(json!({"hook_event_name":"PostToolUse", "session_id":NATIVE, "tool_name":"Read"}))
+            .await;
+        hub.assert_waiting_coverage(&hub.token, false, 0).await;
+        // The unchanged offset can reconcile after the source becomes reliable again.
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        let activity = hub.activity().await;
+        assert_eq!(activity["waiting_complete"], true);
+        assert_eq!(activity["limits"], json!([]));
+        assert_eq!(
+            hub.hook_as(&elsewhere, unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        hub.assert_waiting_coverage(&elsewhere, false, 0).await;
+        assert_eq!(
+            hub.hook_as(
+                &elsewhere,
+                json!({
+                    "hook_event_name":"QuestionsSnapshot", "session_id":NATIVE,
+                    "questions":{"offset":100, "pending":[]},
+                })
+            )
+            .await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 1).await;
+        assert_eq!(
+            hub.snapshot(NATIVE, 200, 0).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":NATIVE, "reason":"clear"}))
+            .await;
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        assert_eq!(
+            hub.hook_as(&elsewhere, unavailable).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_clear_before_first_http_snapshot_prevents_backfill() {
+        let hub = QuestionHub::new().await;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":NATIVE, "reason":"clear"}))
+            .await;
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        // Another native source is still admitted for the same owner.
+        assert_eq!(
+            hub.snapshot("fresh-native", 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn more_than_two_hundred_fifty_six_http_clears_preserve_fresh_question_capacity() {
+        let hub = QuestionHub::new().await;
+        for index in 0..257 {
+            hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":format!("old-{index}"), "reason":"clear"})).await;
+        }
+        assert_eq!(
+            hub.snapshot("fresh-native", 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        // Clearing history frees capacity, while active pending questions keep their owner cap.
+        assert_eq!(
+            hub.snapshot("fresh-native", 200, 256).await["questions_accepted"],
+            true
+        );
+        assert_eq!(
+            hub.snapshot("excess-native", 100, 1).await["questions_accepted"],
+            false
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 256).await;
+        assert_eq!(
+            hub.snapshot("excess-native", 200, 0).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 256);
+        hub.assert_waiting_coverage(&hub.token, true, 256).await;
+    }
+
     #[test]
     fn a_session_end_keeps_its_ask_unless_its_person_cleared_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::hub::store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
         use crate::hub::store::{ForgeIdentity, User};
         let principal = Principal {
             token_id: "tok_a".into(),
@@ -3518,7 +3978,8 @@ mod tests {
         let post = |agent, v: Value| {
             let call = parse(agent, &v);
             let (native, all) = call.ends_wait().unwrap();
-            call.end_wait(&waiting, holder(&principal, native), native, all);
+            call.end_wait(&waiting, &*store, &principal, native, all)
+                .unwrap();
         };
         let end = |native: &str, reason: Option<&str>| {
             let mut v = json!({"hook_event_name":"SessionEnd","session_id":native});
