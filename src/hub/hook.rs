@@ -201,7 +201,7 @@ struct Call {
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
     /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
-    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    /// takes added context (`PreToolUse` and `PostToolUse` of the hosts that send those names).
     notice: Option<Shape>,
 }
 
@@ -830,16 +830,15 @@ impl Call {
         }
     }
 
-    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
-    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+    /// These tool events take added context on every host that sends them by these names, so a
+    /// lapse notice can ride on them.
+    fn noticed(mut self, event: &str) -> Self {
         let event = match event {
             "PreToolUse" => "PreToolUse",
             "PostToolUse" => "PostToolUse",
             _ => return self,
         };
-        if agent == Agent::Claude {
-            self.notice = Some(Shape::Hook(event));
-        }
+        self.notice = Some(Shape::Hook(event));
         self
     }
 
@@ -2042,7 +2041,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
-                .noticed(agent, event)
+                .noticed(event)
                 .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
@@ -2052,7 +2051,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Shape::Silent,
         )
         .launched(&v["subagent"])
-        .noticed(agent, event),
+        .noticed(event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";
