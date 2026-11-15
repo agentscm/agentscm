@@ -561,6 +561,31 @@ async fn onboarding_is_authenticated_revalidates_revocation_and_rejects_fabricat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_status_without_a_recorded_session_start_says_why() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "agent");
+    let (_, reply) = hub
+        .onboarding_request(
+            &secret,
+            &"a".repeat(64),
+            reqwest::Method::POST,
+            "/mcp",
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"agentscm_setup_status","arguments":{"agent":"claude","session":"s"}}}),
+        )
+        .await;
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Native session start is not verified; restart the native session"),
+        "{reply}"
+    );
+    assert!(!text.contains("check the required fields"), "{reply}");
+    let error = &reply["result"]["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_request");
+    assert_eq!(error["recovery"]["action"], "start_session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_lifecycle_invalidates_even_when_coordination_writes_fail() {
     let hub = Hub::start().await;
     let secret = hub.secret(1, "agent");
