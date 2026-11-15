@@ -481,7 +481,7 @@ async fn mcp(
                                     &serde_json::to_string(&status).unwrap_or_default(),
                                     false,
                                 ),
-                                Err(error) => hub_failure(&error),
+                                Err(error) => setup_failure(&error),
                             },
                         ),
                         Err(detail) => Ok(invalid_args("agentscm_setup_status", &detail)),
@@ -1237,7 +1237,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
         {"name": "agentscm_setup_status",
          "description": "Verifies onboarding with your native hook session ID: reports MCP and native edit-hook evidence separately, with the next setup step. Never send raw diagnostics or credentials in blocker reports.",
          "inputSchema": schema(json!({
-             "agent": {"type":"string", "enum":["claude","codex","cursor","copilot","gemini"]},
+             "agent": {"type":"string", "enum":(crate::clients::names().collect::<Vec<_>>())},
              "session": {"type":"string", "minLength":1, "maxLength":128},
              "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
          }), &["agent", "session"])},
@@ -1745,6 +1745,17 @@ fn refused(code: &str) -> Value {
 
 pub(super) fn hub_failure(error: &HubError) -> Value {
     error_envelope::from_hub_error(error).mcp()
+}
+
+/// A setup-status refusal keeps its reason: every `Invalid` on that path is fixed Hub text
+/// (an unverified native start, a fenced proof, a malformed session ID), never caller input.
+fn setup_failure(error: &HubError) -> Value {
+    let mut envelope = error_envelope::from_hub_error(error);
+    if let HubError::Invalid(why) = error {
+        envelope.message = error_envelope::server_message(why);
+        envelope.recovery = error_envelope::RecoveryAction::StartSession.recovery();
+    }
+    envelope.mcp()
 }
 
 /// Optional read enrichment never replaces a committed mutation or delivery receipt.

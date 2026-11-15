@@ -201,7 +201,7 @@ struct Call {
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
     /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
-    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    /// takes added context (`PreToolUse` and `PostToolUse` of the hosts that send those names).
     notice: Option<Shape>,
 }
 
@@ -830,16 +830,15 @@ impl Call {
         }
     }
 
-    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
-    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+    /// These tool events take added context on every host that sends them by these names, so a
+    /// lapse notice can ride on them.
+    fn noticed(mut self, event: &str) -> Self {
         let event = match event {
             "PreToolUse" => "PreToolUse",
             "PostToolUse" => "PostToolUse",
             _ => return self,
         };
-        if agent == Agent::Claude {
-            self.notice = Some(Shape::Hook(event));
-        }
+        self.notice = Some(Shape::Hook(event));
         self
     }
 
@@ -1062,6 +1061,11 @@ impl Call {
         };
         call.context_hook = context_hook;
         call
+    }
+
+    /// A natively wired client's own hook: its own route, or the generic one under its name.
+    fn native_client(&self) -> bool {
+        self.agent != Agent::Generic || crate::clients::generic_native(&self.via)
     }
 
     /// Whether the reply can carry text to the agent, so a handoff can be delivered with it.
@@ -1377,7 +1381,7 @@ impl Call {
                     };
                 }
                 // Native edit tools only: a shell call's observed change must not verify them.
-                if !applied && (self.agent != Agent::Generic || self.via == "hook:gemini") {
+                if !applied && self.native_client() {
                     state.onboarding.native(
                         &principal,
                         client,
@@ -1391,7 +1395,7 @@ impl Call {
             }
             Kind::Start => {
                 let principal = authenticate(state, token, repo).await?;
-                if self.agent != Agent::Generic || self.via == "hook:gemini" {
+                if self.native_client() {
                     state.onboarding.restart(
                         &principal,
                         client,
@@ -1720,7 +1724,7 @@ impl Call {
         if self.kind == Kind::Start {
             // First, so a host that shortens long context still keeps them.
             let mut head = String::new();
-            if (self.agent != Agent::Generic || self.via == "hook:gemini")
+            if self.native_client()
                 && let Some(session) = self.session.as_deref().filter(|id| check_name(id).is_ok())
             {
                 let literal = serde_json::to_string(session).unwrap_or_default();
@@ -2037,7 +2041,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
-                .noticed(agent, event)
+                .noticed(event)
                 .observed_shell(event, v.get("observed"))
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
@@ -2047,7 +2051,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Shape::Silent,
         )
         .launched(&v["subagent"])
-        .noticed(agent, event),
+        .noticed(event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";
@@ -2402,6 +2406,12 @@ mod tests {
                 json!({"agent":"gemini","event":"start","session":"native-id"}),
                 "text",
             ),
+            // Every table client takes the generic route under its own name.
+            (
+                Agent::Generic,
+                json!({"agent":"droid","event":"start","session":"native-id"}),
+                "text",
+            ),
         ] {
             let reply = Call::parse(agent, &serde_json::to_vec(&payload).unwrap(), None)
                 .render(&Outcome::clean());
@@ -2421,6 +2431,15 @@ mod tests {
                 "{context}"
             );
         }
+        // A generic client that is not natively wired gets the rules but no session ID.
+        let other = Call::parse(
+            Agent::Generic,
+            br#"{"agent":"other","event":"start","session":"native-id"}"#,
+            None,
+        )
+        .render(&Outcome::clean());
+        let text = other["text"].as_str().unwrap();
+        assert!(super::super::agent_rules::carries_all(text) && !text.contains("\"native-id\""));
         for session in ["", "bad\nvalue"] {
             let reply = Call::parse(
                 Agent::Codex,

@@ -46,7 +46,8 @@ npx agentscm
 ```
 
 This installs a release binary, guides local Hub setup, signs you in and sets up **every detected
-agent**: Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI. A managed Hub runs natively
+agent**: Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI, Factory Droid, Qwen Code, Junie
+CLI and Crush. A managed Hub runs natively
 on Apple Silicon macOS; Linux and Intel macOS need Docker or an existing Hub. Setup writes no
 repository files. The local Hub's first run opens a page to create and install its GitHub App.
 

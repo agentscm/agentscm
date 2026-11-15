@@ -207,7 +207,11 @@ pub(crate) fn detect(cwd: &Path) -> Detected {
         remote,
         docker,
         #[cfg(unix)]
-        agents: installed_agents(&|name| which(name).is_some(), &|path| path.is_dir()),
+        agents: installed_agents(
+            &|name| which(name).is_some(),
+            &|path| path.is_dir(),
+            &|name| std::env::var_os(name),
+        ),
     }
 }
 
@@ -217,12 +221,14 @@ pub(crate) fn detect(cwd: &Path) -> Detected {
 fn installed_agents(
     on_path: &dyn Fn(&str) -> bool,
     exists: &dyn Fn(&Path) -> bool,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<crate::client_setup::Agent> {
     use crate::client_setup::Agent;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    use clap::ValueEnum;
+    let home = var("HOME").map(PathBuf::from);
     let dir = |variable: Option<&str>, default: &str| {
         variable
-            .and_then(std::env::var_os)
+            .and_then(var)
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|home| home.join(default)))
             .is_some_and(|path| exists(&path))
@@ -241,6 +247,13 @@ fn installed_agents(
         (Agent::Gemini, on_path("gemini") || dir(None, ".gemini")),
     ]
     .into_iter()
+    .chain(Agent::value_variants().iter().filter_map(|agent| {
+        let table = agent.table()?;
+        let folder = home.as_ref().map(|home| table.folder(home, var));
+        let found = table.programs.iter().any(|program| on_path(program))
+            || folder.is_some_and(|folder| exists(&folder));
+        Some((*agent, found))
+    }))
     .filter_map(|(agent, found)| found.then_some(agent))
     .collect()
 }
@@ -274,7 +287,11 @@ fn unwired_line(agent: crate::client_setup::Agent) -> String {
 #[cfg(unix)]
 pub(crate) fn unwired_notice(root: &Path, configured: &[String]) -> Vec<String> {
     unwired(
-        installed_agents(&|name| which(name).is_some(), &|path| path.is_dir()),
+        installed_agents(
+            &|name| which(name).is_some(),
+            &|path| path.is_dir(),
+            &|name| std::env::var_os(name),
+        ),
         configured,
         &|agent| crate::client_setup::user_scope_installed(agent, root),
     )
@@ -291,12 +308,55 @@ mod tests {
     #[test]
     fn agents_are_found_by_program_or_config_directory() {
         use crate::client_setup::Agent;
-        assert!(installed_agents(&|_| false, &|_| false).is_empty());
+        let home = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/me"));
+        assert!(installed_agents(&|_| false, &|_| false, &home).is_empty());
         // A config directory alone is not enough for agents set up through their CLI.
-        let dirs = installed_agents(&|_| false, &|_| true);
-        assert_eq!(dirs, [Agent::Cursor, Agent::Copilot, Agent::Gemini]);
-        let programs = installed_agents(&|name| matches!(name, "claude" | "codex"), &|_| false);
+        let dirs = installed_agents(&|_| false, &|_| true, &home);
+        assert_eq!(
+            dirs,
+            [
+                Agent::Cursor,
+                Agent::Copilot,
+                Agent::Gemini,
+                Agent::Droid,
+                Agent::Qwen,
+                Agent::Junie,
+                Agent::Crush
+            ]
+        );
+        let programs = installed_agents(
+            &|name| matches!(name, "claude" | "codex"),
+            &|_| false,
+            &home,
+        );
         assert_eq!(programs, [Agent::Claude, Agent::Codex]);
+        // Each table agent by its program, or by its folder where its variable moves it.
+        for (program, agent) in [
+            ("droid", Agent::Droid),
+            ("qwen", Agent::Qwen),
+            ("junie", Agent::Junie),
+            ("crush", Agent::Crush),
+        ] {
+            assert_eq!(
+                installed_agents(&|name| name == program, &|_| false, &home),
+                [agent]
+            );
+        }
+        let moved = |name: &str| match name {
+            "HOME" => Some("/home/me".into()),
+            "QWEN_HOME" => Some("/elsewhere/qwen".into()),
+            "XDG_CONFIG_HOME" => Some("/xdg".into()),
+            _ => None,
+        };
+        let found = installed_agents(
+            &|_| false,
+            &|path| {
+                [Path::new("/elsewhere/qwen"), Path::new("/xdg/crush")].contains(&path)
+                    || path == Path::new("/home/me/.factory")
+            },
+            &moved,
+        );
+        assert_eq!(found, [Agent::Droid, Agent::Qwen, Agent::Crush]);
     }
 
     #[cfg(unix)]
