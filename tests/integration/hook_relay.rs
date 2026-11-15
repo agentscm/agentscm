@@ -433,8 +433,8 @@ async fn a_second_host_takes_over_when_the_owners_stdio_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_then_dead_is_not_resent_and_wedged_calls_keep_the_hook_deadlines() {
     for (event, kill, budget) in [
-        ("PreToolUse", true, Duration::from_secs(3)),
-        ("PreToolUse", false, Duration::from_secs(3)),
+        ("PreToolUse", true, Duration::from_millis(2500)),
+        ("PreToolUse", false, Duration::from_millis(2500)),
         ("SessionStart", false, Duration::from_millis(4500)),
     ] {
         let fixture = Fixture::new().await;

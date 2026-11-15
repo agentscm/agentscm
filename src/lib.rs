@@ -17,6 +17,7 @@ pub mod change_capture;
 pub mod change_record;
 pub mod checks;
 pub mod civil;
+pub mod clients;
 pub mod context;
 #[cfg(unix)]
 pub mod continuation;
