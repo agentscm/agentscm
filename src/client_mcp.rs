@@ -448,7 +448,9 @@ fn open(connection: &Connection, checkout: &Path) -> std::result::Result<String,
 fn hooked(client: Option<&str>) -> bool {
     client.is_none_or(|name| {
         let name = name.to_ascii_lowercase();
-        agentscm::clients::names().any(|agent| name.contains(agent))
+        // Whole words, so a short name such as `droid` does not match "Android Studio".
+        let mut words = name.split(|c: char| !c.is_ascii_alphanumeric());
+        words.any(|word| agentscm::clients::find(word).is_some())
             || name == "agentscm"
             || name.contains("visual studio code")
             || name.contains("vscode")
@@ -1719,6 +1721,8 @@ mod tests {
         // Qwen Code names its MCP client after the server entry.
         assert!(hooked(Some("agentscm")) && hooked(Some("Crush")) && hooked(None));
         assert!(!hooked(Some("plain-editor")) && !hooked(Some("agentscm-proxy")));
+        assert!(hooked(Some("claude-code")) && hooked(Some("GitHub Copilot Chat")));
+        assert!(!hooked(Some("Android Studio")) && !hooked(Some("crushed-ice")));
     }
 
     #[test]
