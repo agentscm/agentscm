@@ -101,7 +101,9 @@ What `reach` each client can have:
 
 ### Waking an idle Claude Code session
 
-The Claude Code plugin that `agentscm client setup` installs adds a background hook, `agentscm hook-wait claude`, at `SessionStart` and at every `Stop`, declared with `"asyncRewake": true`. Claude Code documents that it runs such a hook in the background and, when the hook exits with code 2, wakes the session, an idle one included, and shows the hook's stderr to the model as a system reminder. Plain `"async": true` does not wake an idle session, and a `Stop` hook alone cannot reach a session that is already idle.
+The Claude Code plugin that `agentscm client setup` installs adds a background hook, `agentscm hook-wait claude`, at `SessionStart` and at every `Stop`, declared with both `"async": true` and `"asyncRewake": true`. Explicit `async` keeps ordinary `claude -p` startup from waiting for the long-lived hook; `asyncRewake` preserves the interactive wake when the hook exits with code 2, showing its stderr to the model as a system reminder. Plain `"async": true` does not wake an idle session, and a `Stop` hook alone cannot reach a session that is already idle.
+
+Ordinary print mode can wait about 30 seconds during shutdown. It is not a reliable target for asynchronous Hub messages: notices arriving after the query completes can be marked delivered without reaching the model in that invocation.
 
 - The hook reads the session's id and directory from its input, finds the checkout's saved connection, and holds `POST /v1/hub/agent-messages/wait` open with the agent token, up to 25 seconds per request, then asks again.
 - When a message is sent, the Hub answers the waiting request at once with the same notice a hook reply carries and marks the message delivered via `wake:claude`, exactly as a hook reply would, so it is not delivered twice. The hook prints the notice and exits 2. The woken turn's `Stop` starts the next waiter.
