@@ -309,6 +309,13 @@ fn mcp_config_home(directory: &Path) -> Result<String> {
 }
 
 fn own_command(value: &Value) -> bool {
+    if ["command_windows", "args", "url"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+        || value.get("type").is_some_and(|kind| kind != "command")
+    {
+        return false;
+    }
     value["command"].as_str().is_some_and(|command| {
         let Some((quoted, args)) = command.rsplit_once(" --no-telemetry ") else {
             return false;
@@ -343,15 +350,44 @@ fn own_command(value: &Value) -> bool {
     })
 }
 
-fn agentscm_hook(value: &Value) -> bool {
-    value["command"].as_str().is_some_and(|command| {
-        command.to_ascii_lowercase().contains("agentscm")
-            && (command.contains(" hook ")
-                || command.contains(" hook-wait ")
-                || command.contains(" change-capture hook-claude"))
-    }) || value["url"]
+// Duplicate coordination detection is separate from permission to remove an owned command.
+pub(crate) fn agentscm_hook(value: &Value) -> bool {
+    value["url"]
         .as_str()
         .is_some_and(|url| url.contains("/v1/hub/hook/"))
+        || ["command", "command_windows"].iter().any(|key| {
+            value[*key].as_str().is_some_and(|command| {
+                let words: Vec<_> = command
+                    .split_whitespace()
+                    .chain(
+                        value["args"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .map(|word| word.trim_matches(['\'', '"']))
+                    .collect();
+                if !words
+                    .iter()
+                    .any(|word| word.to_ascii_lowercase().contains("agentscm"))
+                {
+                    return false;
+                }
+                words
+                    .iter()
+                    .any(|word| matches!(*word, "hook" | "hook-wait"))
+                    || words
+                        .windows(2)
+                        .any(|pair| pair == ["change-capture", "hook-claude"])
+                    || (words
+                        .windows(2)
+                        .any(|pair| matches!(pair, ["intent", "start" | "check" | "done"]))
+                        && words
+                            .iter()
+                            .any(|word| *word == "--hook" || word.starts_with("--hook=")))
+            })
+        })
 }
 
 fn has_foreign_hooks(value: &Value, allow_owned: bool) -> bool {
@@ -2529,6 +2565,55 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("another AgentSCM native hook"), "{error}");
+    }
+
+    #[test]
+    fn setup_and_removal_preserve_custom_invocations_of_an_owned_command() {
+        let program = Path::new("/opt/agentscm");
+        for extra in [
+            json!({"command_windows":"other-check.exe"}),
+            json!({"args":["--custom"]}),
+            json!({"type":"http", "url":"https://hooks.example.test/check"}),
+        ] {
+            let mut hook = extra;
+            hook["command"] = json!(command(Agent::Copilot, program).unwrap());
+            assert!(!own_command(&hook));
+            for entry in [hook.clone(), json!({"hooks":[hook]})] {
+                let original = json!({"hooks":{"notification":[entry]}});
+                let mut value = original.clone();
+                assert!(add_hooks(&mut value, Agent::Copilot, program).is_err());
+                assert_eq!(value, original);
+                assert_eq!(
+                    without_ours(&original.to_string(), &json!([]), FORM).unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_preflight_preserves_legacy_and_split_coordination_hooks() {
+        let (_dir, root) = repo();
+        let path = root.join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for hook in [
+            json!({"command":"/opt/agentscm intent start --hook claude"}),
+            json!({"command":"/opt/agentscm 'intent' 'check' --hook=claude"}),
+            json!({"command":"/opt/agentscm", "args":["intent", "done", "--hook", "claude"]}),
+            json!({"command":"/opt/agentscm", "args":["--no-telemetry", "hook", "claude", "--client-connection"]}),
+            json!({"command_windows":"C:\\tools\\agentscm.exe", "args":["hook", "claude"]}),
+            json!({"command":"npx", "args":["agentscm", "hook", "claude"]}),
+        ] {
+            let text = json!({"hooks":{"PreToolUse":[{"hooks":[hook]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            let error = check_other_hooks(Agent::Copilot, &root, Scope::User)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("another AgentSCM native hook"), "{error}");
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert!(!root.join(".github").exists());
+        }
     }
 
     #[test]

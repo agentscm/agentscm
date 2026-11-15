@@ -568,16 +568,7 @@ fn has_agentscm_hooks(path: &Path) -> Result<bool> {
         .flatten()
         .filter_map(|group| group["hooks"].as_array())
         .flatten()
-        .any(|hook| {
-            hook["url"]
-                .as_str()
-                .is_some_and(|url| url.contains("/v1/hub/hook/"))
-                || ["command", "command_windows"].iter().any(|key| {
-                    hook[*key]
-                        .as_str()
-                        .is_some_and(|command| command.to_ascii_lowercase().contains("agentscm"))
-                })
-        }))
+        .any(crate::client_setup::agentscm_hook))
 }
 
 fn check_existing_hooks(root: &Path) -> Result<()> {
@@ -1421,6 +1412,16 @@ mod tests {
         std::fs::write(&path, unrelated).unwrap();
         assert!(!has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), unrelated);
+        for helper in [
+            json!({"command":"node /opt/agentscm/hooks/helper.mjs"}),
+            json!({"command":"/opt/agentscm-helper.sh", "args":["--event", "notification"]}),
+            json!({"command_windows":"node C:\\agentscm\\hooks\\helper.mjs"}),
+        ] {
+            let text = json!({"hooks":{"Stop":[{"hooks":[helper]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            assert!(!has_agentscm_hooks(&path).unwrap(), "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
         let legacy = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"agentscm hook codex --hub-url https://hub.example.test"}]}]}}"#;
         std::fs::write(&path, legacy).unwrap();
         assert!(has_agentscm_hooks(&path).unwrap());
@@ -1433,6 +1434,20 @@ mod tests {
         std::fs::write(&path, http).unwrap();
         assert!(has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), http);
+        for hook in [
+            json!({"command":"agentscm intent start --hook claude"}),
+            json!({"command":"agentscm 'intent' 'check' --hook=claude"}),
+            json!({"command":"/opt/agentscm", "args":["intent", "done", "--hook", "claude"]}),
+            json!({"command_windows":"C:\\tools\\agentscm.exe", "args":["hook", "codex"]}),
+            json!({"command":"agentscm --no-telemetry hook-wait copilot --notification"}),
+            json!({"command":"agentscm change-capture hook-claude"}),
+            json!({"command":"node", "args":["/opt/agentscm/cli.js", "hook", "claude"]}),
+        ] {
+            let text = json!({"hooks":{"Stop":[{"hooks":[hook]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            assert!(has_agentscm_hooks(&path).unwrap(), "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]
