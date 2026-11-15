@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use agentscm::clients::{CommandHooks, Event, Note, Refusal};
 use agentscm::hook_relay::{self, Address, HookRequest, REPLY_BYTES, STDIN_BYTES};
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use clap::Args;
@@ -19,7 +20,9 @@ mod permission;
 #[cfg(unix)]
 mod shell_observation;
 
-const LIMIT: Duration = Duration::from_secs(3);
+/// Under the shortest timeout an installer gives a hook (3 seconds), so the hook's own "could
+/// not check" reply is printed before the host stops it.
+const LIMIT: Duration = Duration::from_millis(2500);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
 /// How long a session start waits for auto-connect before going on without it.
@@ -208,6 +211,9 @@ async fn hook(
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     #[cfg(unix)]
     let capture_payload = std::sync::Arc::new(payload.clone());
+    if let Some(table) = table(agent) {
+        prepare_table_payload(table, &mut payload);
+    }
     // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
     // Keep its original full reply for capture before this coordination-only tail is updated.
     let cursor_reply = if agent == "cursor"
@@ -740,6 +746,7 @@ fn within_context_limit(mut reply: Value) -> Value {
         "/additional_context",
         "/additionalContext",
         "/systemMessage",
+        "/context",
     ] {
         if let Some(value) = reply.pointer_mut(field)
             && let Some(text) = value.as_str()
@@ -789,10 +796,7 @@ async fn call_hub(
         deadline,
         report,
     } = context;
-    let supported_client = matches!(
-        agent.as_str(),
-        "claude" | "codex" | "cursor" | "copilot" | "gemini"
-    );
+    let supported_client = agentscm::clients::find(&agent).is_some();
     if client_connection && destination_args {
         return Err("client connection mode cannot use destination flags".into());
     }
@@ -980,10 +984,10 @@ async fn call_hub(
     };
     match status {
         200 if reply.is_object() => {
-            let reply = if agent == "gemini" && plugin_route {
-                gemini_reply(reply, &payload)
-            } else {
-                defanged(reply, &payload)
+            let reply = match table(&agent) {
+                _ if agent == "gemini" && plugin_route => gemini_reply(reply, &payload),
+                Some(table) if plugin_route => table_reply(table, reply, &payload),
+                _ => defanged(reply, &payload),
             };
             Ok(match note {
                 Some(note) => with_note(reply, &agent, &payload, &note),
@@ -1072,7 +1076,7 @@ fn branch_advisory_at(
             },
         ));
     }
-    let paths = if agent == "gemini" {
+    let paths = if generic_route(agent) {
         normalized["paths"]
             .as_array()?
             .iter()
@@ -1534,34 +1538,72 @@ fn tool_call(agent: &str, payload: &Value) -> (String, Value) {
     )
 }
 
+/// The files a patch names in its `*** ... File:` headers.
+fn patch_paths(patch: &str) -> Result<Vec<EditPath>, String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some((header, path)) = PATCH_HEADERS
+            .iter()
+            .find_map(|header| line.strip_prefix(header).map(|path| (*header, path)))
+        {
+            let path = path.trim();
+            if valid_path_text(path) {
+                paths.push(EditPath {
+                    header: Some(header),
+                    path: path.to_owned(),
+                });
+            } else {
+                return Err("edit path not understood".into());
+            }
+        }
+        if paths.len() > MAX_EDIT_PATHS {
+            return Err("too many edit paths".into());
+        }
+    }
+    if paths.is_empty() {
+        return Err("edit path not understood".into());
+    }
+    Ok(paths)
+}
+
+/// The files a table agent's tool call edits: none for a tool that is not one of its edit or
+/// patch tools, an error for one whose file cannot be read.
+fn table_edit_paths(table: &CommandHooks, payload: &Value) -> Result<Vec<EditPath>, String> {
+    let tool = payload["tool_name"].as_str().unwrap_or_default();
+    let input = &payload["tool_input"];
+    if let Some((_, key)) = table
+        .patch_tools
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool))
+    {
+        return patch_paths(input[*key].as_str().ok_or("edit path not understood")?);
+    }
+    if !table
+        .edit_tools
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(tool))
+    {
+        return Ok(Vec::new());
+    }
+    let path = input["file_path"]
+        .as_str()
+        .filter(|path| valid_path_text(path))
+        .ok_or("edit path not understood")?;
+    Ok(vec![EditPath {
+        header: None,
+        path: path.to_owned(),
+    }])
+}
+
 fn edit_paths(agent: &str, payload: &Value) -> Result<Vec<EditPath>, String> {
+    if let Some(table) = table(agent) {
+        return table_edit_paths(table, payload);
+    }
     let (tool, input) = tool_call(agent, payload);
     let mut paths = Vec::new();
     if tool.eq_ignore_ascii_case("apply_patch") {
         let patch = patch_text(&input).ok_or_else(|| "edit path not understood".to_owned())?;
-        for line in patch.lines() {
-            if let Some((header, path)) = PATCH_HEADERS
-                .iter()
-                .find_map(|header| line.strip_prefix(header).map(|path| (*header, path)))
-            {
-                let path = path.trim();
-                if valid_path_text(path) {
-                    paths.push(EditPath {
-                        header: Some(header),
-                        path: path.to_owned(),
-                    });
-                } else {
-                    return Err("edit path not understood".into());
-                }
-            }
-            if paths.len() > MAX_EDIT_PATHS {
-                return Err("too many edit paths".into());
-            }
-        }
-        if paths.is_empty() {
-            return Err("edit path not understood".into());
-        }
-        return Ok(paths);
+        return patch_paths(patch);
     }
     if [
         "edit",
@@ -1693,7 +1735,11 @@ fn route_client_with(
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
     let (connection, checkout, normalized) = select_client_checkout(agent, payload, connections)?;
-    let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
+    let endpoint_agent = if generic_route(agent) {
+        "generic"
+    } else {
+        agent
+    };
     Ok(RoutedClient {
         payload: sanitized_client(agent, payload, &normalized)?,
         connection,
@@ -1917,6 +1963,9 @@ async fn renew(connection: &Connection, session_start: bool) -> bool {
 /// Append historical local advice after connection and Hub context. Local scan
 /// availability must not replace or take priority over coordination messages.
 fn with_local_note(mut reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    if let Some(table) = table(agent) {
+        return with_table_note(reply, table, payload, note, false);
+    }
     for (field, supported) in [
         ("/hookSpecificOutput/additionalContext", true),
         ("/additional_context", agent == "cursor"),
@@ -1942,6 +1991,9 @@ fn with_local_note(mut reply: Value, agent: &str, payload: &Value, note: &str) -
 
 /// The hub's reply with `note` first in the agent's context.
 fn with_note(reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    if let Some(table) = table(agent) {
+        return with_table_note(reply, table, payload, note, true);
+    }
     let Value::Object(mut top) = reply else {
         return reply;
     };
@@ -2383,6 +2435,9 @@ fn bounded_string(value: &Value, max: usize) -> Option<&str> {
 }
 
 fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<Value, String> {
+    if let Some(table) = table(agent) {
+        return sanitized_table(agent, table, payload, paths);
+    }
     match agent {
         "claude" | "codex" => sanitized_codex(payload, Some(paths)),
         "cursor" => {
@@ -2510,6 +2565,191 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
     }
 }
 
+/// The table entry of a command-hook agent set up from [`agentscm::clients`].
+fn table(agent: &str) -> Option<&'static CommandHooks> {
+    agentscm::clients::find(agent)?.hooks
+}
+
+/// An agent whose hooks reach the Hub's generic endpoint.
+fn generic_route(agent: &str) -> bool {
+    agentscm::clients::find(agent).is_some_and(|client| client.generic)
+}
+
+/// The registered event a table agent's payload names.
+fn table_event(table: &CommandHooks, payload: &Value) -> Option<Event> {
+    table
+        .event(payload["hook_event_name"].as_str()?)
+        .map(|(_, event)| event)
+}
+
+/// A table agent's payload made ready: its event named as setup registered it, so every check
+/// here reads it. An agent that names its session and folder only at a session start gets the
+/// session the start hook recorded for the agent's process (none when that process has several
+/// open) and this hook's own folder, which the agent starts it in.
+fn prepare_table_payload(table: &CommandHooks, payload: &mut Value) {
+    let Some((native, event)) = payload["hook_event_name"]
+        .as_str()
+        .and_then(|name| table.event(name))
+    else {
+        return;
+    };
+    payload["hook_event_name"] = json!(native);
+    if !table.session_at_start_only {
+        return;
+    }
+    if event != Event::Start
+        && session_of(payload).is_none()
+        && let Ok(config) = config_dir()
+        && let crate::client_session::Recorded::One(session) =
+            crate::client_session::recorded(&config, &crate::client_session::ancestors())
+    {
+        payload["session_id"] = json!(session);
+    }
+    if payload["cwd"].as_str().is_none()
+        && let Some(cwd) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.to_str().map(str::to_owned))
+    {
+        payload["cwd"] = json!(cwd);
+    }
+}
+
+/// A table agent's payload in the Hub's generic shape, as [`sanitized_client`] does Gemini's.
+fn sanitized_table(
+    agent: &str,
+    table: &CommandHooks,
+    payload: &Value,
+    paths: &[EditPath],
+) -> Result<Value, String> {
+    let event = table_event(table, payload).ok_or("hook event not recognised")?;
+    let kind = match event {
+        Event::Start => "start",
+        Event::PreTool if !paths.is_empty() => "check",
+        Event::PreTool | Event::PostTool => "activity",
+        Event::Notification | Event::Stop => "waiting",
+        Event::End => "done",
+    };
+    let mut out = json!({"agent": agent, "event": kind});
+    let message = payload["message"].as_str();
+    match event {
+        // The end of the reply, and whether the whole of it asked its person anything.
+        Event::Stop => {
+            out["reason"] = json!("idle");
+            if let Some((asks, nothing)) = payload["last_assistant_message"]
+                .as_str()
+                .and_then(turn_end)
+            {
+                out["asks"] = json!(asks);
+                out["asked_nothing"] = json!(nothing);
+            }
+        }
+        // Without a reason the Hub ignores the wait.
+        Event::Notification => match payload["notification_type"].as_str() {
+            Some("permission_prompt") => {
+                out["reason"] = json!("permission");
+                if let Some(asks) = message.and_then(line_start) {
+                    out["asks"] = json!(asks);
+                }
+            }
+            Some("elicitation_dialog") => {
+                out["reason"] = json!("question");
+                if let Some(asks) = message.and_then(line_end) {
+                    out["asks"] = json!(asks);
+                }
+            }
+            Some("idle_prompt") => out["reason"] = json!("idle"),
+            _ => {}
+        },
+        Event::PreTool | Event::PostTool
+            if kind == "activity"
+                && table.is_shell(payload["tool_name"].as_str().unwrap_or("")) =>
+        {
+            out["phase"] = json!(if event == Event::PreTool {
+                "start"
+            } else {
+                "end"
+            });
+        }
+        _ => {}
+    }
+    if let Some(session) = bounded_string(&payload["session_id"], 1024) {
+        out["session"] = json!(session);
+    }
+    if !paths.is_empty() {
+        out["paths"] = json!(
+            paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
+}
+
+/// The Hub's generic reply as a table agent reads it: a refusal before a tool call, else a note
+/// where the agent takes one, else nothing. Built from the status and text alone, so nothing
+/// else in the reply reaches the agent.
+fn table_reply(table: &CommandHooks, reply: Value, payload: &Value) -> Value {
+    let text = reply["text"].as_str().unwrap_or_default();
+    if text.is_empty() {
+        return json!({});
+    }
+    match table_event(table, payload) {
+        Some(Event::PreTool) if reply["status"] == "stop" => match table.refusal {
+            Refusal::PermissionDecision => json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": text,
+            }}),
+            Refusal::Decision => json!({"decision": "deny", "reason": text}),
+        },
+        _ => with_table_note(json!({}), table, payload, text, true),
+    }
+}
+
+/// `reply` with `text` where the table agent takes a note on this event, before what is there
+/// when `first`, else after it. Unchanged on an event that takes none.
+fn with_table_note(
+    mut reply: Value,
+    table: &CommandHooks,
+    payload: &Value,
+    text: &str,
+    first: bool,
+) -> Value {
+    let note = match table_event(table, payload) {
+        Some(Event::Start) => table.start,
+        Some(Event::PreTool) => table.note,
+        _ => Note::None,
+    };
+    let field = match note {
+        Note::None => return reply,
+        Note::HookSpecific => "/hookSpecificOutput/additionalContext",
+        Note::AdditionalContext => "/additionalContext",
+        Note::Context => "/context",
+    };
+    if !reply.is_object() {
+        return reply;
+    }
+    let combined = match reply.pointer(field).and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() && first => format!("{text}\n\n{existing}"),
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+        _ => text.to_owned(),
+    };
+    if note == Note::HookSpecific {
+        if !reply["hookSpecificOutput"].is_object() {
+            reply["hookSpecificOutput"] = json!({});
+        }
+        let inner = &mut reply["hookSpecificOutput"];
+        if inner.get("hookEventName").is_none() {
+            inner["hookEventName"] = payload["hook_event_name"].clone();
+        }
+        inner["additionalContext"] = json!(combined);
+    } else {
+        reply[&field[1..]] = json!(combined);
+    }
+    reply
+}
+
 /// The Hub decides when an edit is refused: it reports a contested file once per hold, so a
 /// retry under the same hold comes back clean.
 fn gemini_reply(reply: Value, payload: &Value) -> Value {
@@ -2610,15 +2850,22 @@ fn is_pre_tool(payload: &Value) -> bool {
 /// subagent, which says what the subagent is for. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
     let session = session_of(payload)?;
-    if waits(agent, payload)
-        || agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0)
-        || started_subagent(payload).is_some()
-    {
+    let tool = tool_call(agent, payload).0;
+    let shell = match table(agent) {
+        Some(table) => table.is_shell(&tool),
+        None => agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool),
+    };
+    if waits(agent, payload) || shell || started_subagent(payload).is_some() {
         return None;
     }
     // A path that cannot be read is sent on, so the Hub decides.
     let edit = edit_paths(agent, payload).map_or(true, |paths| !paths.is_empty());
     let renews = match (agent, payload["hook_event_name"].as_str()) {
+        _ if let Some(table) = table(agent) => match table_event(table, payload) {
+            Some(Event::PreTool) => !edit,
+            Some(Event::PostTool) => true,
+            _ => false,
+        },
         ("cursor", Some("postToolUse")) => !edit,
         ("cursor", _) => false,
         ("gemini", Some("AfterTool")) | (_, Some("PostToolUse")) => true,
@@ -2645,6 +2892,12 @@ fn activity_marker(agent: &str, session: &str, payload: &Value) -> String {
 /// A report that the session stopped for its person: a permission prompt, a question or the end
 /// of a turn. The Hub reads which; this says only that the session's next call ends it.
 fn waits(agent: &str, payload: &Value) -> bool {
+    if let Some(table) = table(agent) {
+        return matches!(
+            table_event(table, payload),
+            Some(Event::Notification | Event::Stop)
+        );
+    }
     match payload["hook_event_name"].as_str() {
         Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
         Some("stop") => agent == "cursor",
@@ -3061,6 +3314,12 @@ fn context_reply(agent: &str, payload: &Value, text: &str) -> Value {
 }
 
 fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value {
+    if let Some(table) = table(agent) {
+        return note.map_or_else(
+            || json!({}),
+            |text| with_table_note(json!({}), table, payload, text, true),
+        );
+    }
     let event = payload["hook_event_name"].as_str();
     let text = |text: &str| text.to_owned();
     match (agent, event, note) {
@@ -5658,6 +5917,319 @@ mod tests {
         );
     }
 
+    /// One payload from a table agent: its event, session and folder, as its docs show them.
+    fn table_payload(event: &str, extra: Value) -> Value {
+        let mut payload = json!({"hook_event_name": event, "session_id": "s", "cwd": "/r"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        payload
+    }
+
+    /// The Hub's generic payload for one table agent's hook call.
+    fn generic_for(agent: &str, payload: &Value) -> Value {
+        let paths = edit_paths(agent, payload).unwrap();
+        sanitized_client(agent, payload, &paths).unwrap()
+    }
+
+    #[test]
+    fn table_agents_send_the_generic_shape_for_each_event() {
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let table = table(agent).unwrap();
+            let native = |kind: Event| {
+                table
+                    .events
+                    .iter()
+                    .find(|(_, event, _)| *event == kind)
+                    .map(|(name, ..)| *name)
+            };
+            let (pre, post) = (
+                native(Event::PreTool).unwrap(),
+                native(Event::PostTool).unwrap(),
+            );
+            let edit = table.edit_tools[0];
+            let shell = table.shell_tools[0];
+            let sent = |payload: Value| generic_for(agent, &payload);
+            assert_eq!(
+                sent(table_payload(
+                    native(Event::Start).unwrap(),
+                    json!({"source": "startup"})
+                )),
+                json!({"agent": agent, "event": "start", "session": "s"})
+            );
+            // An edit before it runs is checked; its content never leaves.
+            let edited = json!({"tool_name": edit,
+                "tool_input": {"file_path": "/r/src/a.rs", "content": "private"}});
+            assert_eq!(
+                sent(table_payload(pre, edited.clone())),
+                json!({"agent": agent, "event": "check", "session": "s", "paths": ["/r/src/a.rs"]})
+            );
+            assert_eq!(sent(table_payload(post, edited))["event"], "activity");
+            // Any other tool call is activity; a shell call's start and end are counted.
+            assert_eq!(
+                sent(table_payload(
+                    pre,
+                    json!({"tool_name": "Read", "tool_input": {}})
+                )),
+                json!({"agent": agent, "event": "activity", "session": "s"})
+            );
+            let command = json!({"tool_name": shell, "tool_input": {"command": "make private"}});
+            assert_eq!(
+                sent(table_payload(pre, command.clone())),
+                json!({"agent": agent, "event": "activity", "phase": "start", "session": "s"})
+            );
+            assert_eq!(sent(table_payload(post, command))["phase"], "end");
+            // The end of a turn is a wait for the person, with what the reply ended on.
+            let stop = native(Event::Stop).unwrap();
+            let ended = sent(table_payload(
+                stop,
+                json!({"last_assistant_message": "Done. Shall I push it?"}),
+            ));
+            assert_eq!(ended["event"], "waiting");
+            assert_eq!(ended["reason"], "idle");
+            assert_eq!(ended["asks"], "Done. Shall I push it?");
+            assert_eq!(
+                sent(table_payload(
+                    native(Event::End).unwrap(),
+                    json!({"reason": "other"})
+                )),
+                json!({"agent": agent, "event": "done", "session": "s"})
+            );
+            if let Some(notification) = native(Event::Notification) {
+                let prompt = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "permission_prompt",
+                        "message": "Allow make private?"}),
+                ));
+                assert_eq!(prompt["reason"], "permission");
+                assert_eq!(prompt["asks"], "Allow make private?");
+                let idle = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "idle_prompt"}),
+                ));
+                assert_eq!(idle["reason"], "idle");
+                // A notification with no known reason is sent without one, which the Hub ignores.
+                let other = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "auth_success"}),
+                ));
+                assert!(other.get("reason").is_none(), "{other}");
+            }
+            assert!(
+                sanitized_client(agent, &table_payload("Unknown", json!({})), &[]).is_err(),
+                "{agent}"
+            );
+            assert!(waits(agent, &table_payload(stop, json!({}))));
+            assert!(!waits(agent, &table_payload(pre, json!({}))));
+        }
+    }
+
+    #[test]
+    fn table_agents_name_their_edits_by_their_own_tools() {
+        let edit = |agent: &str, tool: &str, input: Value| {
+            edit_paths(
+                agent,
+                &table_payload(
+                    "PreToolUse",
+                    json!({"tool_name": tool, "tool_input": input}),
+                ),
+            )
+        };
+        let path = |text: &str| {
+            vec![EditPath {
+                header: None,
+                path: text.into(),
+            }]
+        };
+        assert_eq!(
+            edit("qwen", "write_file", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("qwen", "edit", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("crush", "multiedit", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("droid", "Create", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        // An edit tool whose file cannot be read is an error, never a free file.
+        assert!(edit("droid", "Edit", json!({"path": "a.rs"})).is_err());
+        assert!(edit("junie", "Write", json!({"file_path": "bad\npath"})).is_err());
+        // Junie's patch names its files in its headers.
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n+private\n*** End Patch\n";
+        let named = edit("junie", "apply_patch", json!({"patch": patch})).unwrap();
+        assert_eq!(named[0].path, "src/a.rs");
+        assert!(edit("junie", "apply_patch", json!({"patch": "--- a\n+++ b\n"})).is_err());
+        // A tool not in the table edits nothing.
+        assert!(
+            edit("droid", "ApplyPatch", json!({"input": patch}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            edit("crush", "view", json!({"file_path": "a.rs"}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn table_agents_read_a_refusal_and_a_note_in_their_own_shape() {
+        let stop = json!({"status": "stop", "text": "coordinate this edit", "extra": "drop"});
+        let fyi = json!({"status": "fyi", "text": "overlap noted"});
+        let clean = json!({"status": "clean", "text": ""});
+        let pre = table_payload("PreToolUse", json!({"tool_name": "x"}));
+        let start = table_payload("SessionStart", json!({}));
+        let reply = |agent: &str, hub: &Value, payload: &Value| {
+            table_reply(table(agent).unwrap(), hub.clone(), payload)
+        };
+        let denied = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "deny", "permissionDecisionReason": "coordinate this edit"}});
+        let decided = json!({"decision": "deny", "reason": "coordinate this edit"});
+        for (agent, refusal, note, started) in [
+            (
+                "droid",
+                denied.clone(),
+                json!({}),
+                json!({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                    "additionalContext": "overlap noted"}}),
+            ),
+            (
+                "qwen",
+                denied,
+                json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                    "additionalContext": "overlap noted"}}),
+                json!({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                    "additionalContext": "overlap noted"}}),
+            ),
+            (
+                "junie",
+                decided.clone(),
+                json!({"additionalContext": "overlap noted"}),
+                json!({}),
+            ),
+            (
+                "crush",
+                decided,
+                json!({"context": "overlap noted"}),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(reply(agent, &stop, &pre), refusal, "{agent}");
+            assert_eq!(reply(agent, &fyi, &pre), note, "{agent}");
+            assert_eq!(reply(agent, &fyi, &start), started, "{agent}");
+            assert_eq!(reply(agent, &clean, &pre), json!({}), "{agent}");
+            // A stop is a refusal only before a tool call.
+            assert_eq!(
+                reply(agent, &stop, &table_payload("PostToolUse", json!({}))),
+                json!({}),
+                "{agent}"
+            );
+            // When the Hub cannot be asked, the agent goes on, told where it takes a note.
+            let failed = fail_open(agent, &pre, Some("no token"));
+            let text = failed.to_string();
+            assert!(
+                !text.contains("decision") && !text.contains("deny"),
+                "{agent}: {text}"
+            );
+            assert_eq!(
+                text.contains("no token"),
+                note != json!({}),
+                "{agent}: {text}"
+            );
+            assert_eq!(fail_open(agent, &pre, None), json!({}), "{agent}");
+            let started = fail_open(agent, &start, Some("hub unreachable"));
+            assert_eq!(
+                started.to_string().contains("hub unreachable"),
+                agent == "droid" || agent == "qwen",
+                "{agent}: {started}"
+            );
+            // A connection note comes first, beside what the Hub said.
+            let noted = with_note(reply(agent, &fyi, &pre), agent, &pre, "AgentSCM: first");
+            if note != json!({}) {
+                let text = noted.to_string();
+                assert!(
+                    text.contains("AgentSCM: first\\n\\noverlap noted"),
+                    "{agent}: {text}"
+                );
+            }
+            let local = with_local_note(reply(agent, &fyi, &pre), agent, &pre, "local");
+            if note != json!({}) {
+                assert!(
+                    local.to_string().contains("overlap noted\\n\\nlocal"),
+                    "{agent}: {local}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_agents_renew_on_tool_calls_that_check_nothing() {
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let table = table(agent).unwrap();
+            let read = table_payload("PreToolUse", json!({"tool_name": "Read"}));
+            assert!(activity_key(agent, &read).is_some(), "{agent}");
+            let edit = table_payload(
+                "PreToolUse",
+                json!({"tool_name": table.edit_tools[0],
+                "tool_input": {"file_path": "a.rs"}}),
+            );
+            assert!(activity_key(agent, &edit).is_none(), "{agent}");
+            let after = table_payload(
+                "PostToolUse",
+                json!({"tool_name": table.edit_tools[0],
+                "tool_input": {"file_path": "a.rs"}}),
+            );
+            assert!(activity_key(agent, &after).is_some(), "{agent}");
+            let shell = table_payload("PreToolUse", json!({"tool_name": table.shell_tools[0]}));
+            assert!(activity_key(agent, &shell).is_none(), "{agent}");
+        }
+    }
+
+    #[test]
+    fn a_table_payload_is_named_as_setup_registered_it() {
+        let mut crush = json!({"hook_event_name": "pre_tool_use", "session_id": "s", "cwd": "/r"});
+        prepare_table_payload(table("crush").unwrap(), &mut crush);
+        assert_eq!(crush["hook_event_name"], "PreToolUse");
+        assert_eq!(crush["cwd"], "/r");
+        // Junie names its folder only at a session start: later hooks use their own.
+        let mut junie = json!({"hook_event_name": "PreToolUse", "tool_name": "Read"});
+        prepare_table_payload(table("junie").unwrap(), &mut junie);
+        assert_eq!(
+            junie["cwd"].as_str().map(PathBuf::from),
+            std::env::current_dir().ok()
+        );
+        // An event setup did not register is left as it came.
+        let mut other = json!({"hook_event_name": "Elsewhere"});
+        prepare_table_payload(table("junie").unwrap(), &mut other);
+        assert_eq!(other, json!({"hook_event_name": "Elsewhere"}));
+    }
+
+    #[test]
+    fn table_agents_route_to_the_generic_endpoint() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = git_repo(parent.path(), "repo");
+        let connections = [connection(&root, "acme/widgets")];
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let tool = table(agent).unwrap().edit_tools[0];
+            let payload = json!({"hook_event_name": "PreToolUse", "session_id": "s", "cwd": root,
+                "tool_name": tool, "tool_input": {"file_path": "src/a.rs", "content": "secret"}});
+            let routed = route_client_with(agent, &payload, &connections).unwrap();
+            assert_eq!(routed.endpoint_agent, "generic");
+            assert_eq!(
+                routed.payload,
+                json!({"agent": agent, "event": "check", "session": "s", "paths": ["src/a.rs"]})
+            );
+        }
+        assert!(generic_route("gemini") && !generic_route("claude") && !generic_route("other"));
+    }
+
     #[test]
     fn generic_and_unknown_agents_get_an_empty_object() {
         for agent in ["generic", "mystery", ""] {
@@ -5687,5 +6259,14 @@ mod tests {
                 crate::change_capture_cli::captured_harness("cursor", &payload, None).is_none()
             );
         }
+    }
+
+    /// The installers' hook tables are private to them; their own tests pin the shortest
+    /// timeout, 3 seconds, that this deadline has to stay under.
+    #[test]
+    fn the_hook_deadline_leaves_time_to_reply_before_the_host_stops_it() {
+        let shortest_host_timeout = Duration::from_secs(3);
+        assert!(LIMIT + Duration::from_millis(500) <= shortest_host_timeout);
+        assert!(CAPTURE_BUDGET + Duration::from_millis(500) <= shortest_host_timeout);
     }
 }

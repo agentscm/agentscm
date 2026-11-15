@@ -1237,7 +1237,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
         {"name": "agentscm_setup_status",
          "description": "Verifies onboarding with your native hook session ID: reports MCP and native edit-hook evidence separately, with the next setup step. Never send raw diagnostics or credentials in blocker reports.",
          "inputSchema": schema(json!({
-             "agent": {"type":"string", "enum":["claude","codex","cursor","copilot","gemini"]},
+             "agent": {"type":"string", "enum":(crate::clients::names().collect::<Vec<_>>())},
              "session": {"type":"string", "minLength":1, "maxLength":128},
              "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
          }), &["agent", "session"])},

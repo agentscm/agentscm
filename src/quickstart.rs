@@ -179,7 +179,7 @@ To run it without one, pass --yes and choose with flags: --local (recommended) o
 --hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --init";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush (repeatable) or --no-agents, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -392,7 +392,10 @@ impl Live {
             ),
             (Some(_), None) if !self.wanted_agents => off(
                 "no coding agent was set up",
-                &format!("run `{cli} quickstart --agent claude|codex|cursor|copilot|gemini`"),
+                &format!(
+                    "run `{cli} quickstart --agent {}`",
+                    agentscm::clients::names_joined("|")
+                ),
             ),
             (Some(_), None) => off(
                 "this checkout isn't connected to the hub",
@@ -1832,6 +1835,8 @@ mod tests {
         ] {
             assert!(NEEDS_TERMINAL.contains(flag), "{flag}");
         }
+        let agents = format!("--agent {} ", agentscm::clients::names_joined("|"));
+        assert!(NEEDS_TERMINAL.contains(&agents), "{agents}");
     }
 
     #[test]
@@ -1924,7 +1929,7 @@ mod tests {
         live.hub_up = true;
         assert!(
             live.line("agentscm")
-                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini`)")
+                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush`)")
         );
         live.wanted_agents = true;
         assert!(

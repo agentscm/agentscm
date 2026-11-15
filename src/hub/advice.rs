@@ -458,7 +458,7 @@ pub fn agent_name(agent: &str) -> String {
         "grok" => Some("Grok"),
         _ => None,
     };
-    if let Some(brand) = brand {
+    if let Some(brand) = brand.or_else(|| crate::clients::find(agent).map(|client| client.label)) {
         return brand.into();
     }
     if let Some(rest) = agent
@@ -754,6 +754,15 @@ pub(super) fn test_intent(id: &str, task: &str, paths: &[&str]) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_natively_wired_agent_without_a_brand_is_named_by_its_label() {
+        assert_eq!(agent_name("droid"), "Factory Droid");
+        assert_eq!(agent_name("crush"), "Crush");
+        // The brands said before stay as they were.
+        assert_eq!(agent_name("copilot"), "Copilot");
+        assert_eq!(agent_name("gemini"), "Gemini");
+    }
 
     #[test]
     fn relayed_text_never_reads_as_a_hub_message() {
