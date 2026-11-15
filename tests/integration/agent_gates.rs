@@ -18,20 +18,31 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-/// The agents `client setup` wires: one row each in docs/agents.md and in harness_coverage.rs.
-const WIRED: [&str; 5] = ["claude", "codex", "copilot", "cursor", "gemini"];
+/// The agents `client setup` wires, read from the engine's own list so this cannot go stale.
+fn wired() -> impl Iterator<Item = &'static str> {
+    agentscm::clients::names()
+}
 
-/// Agent variants as the engine's enums spell them, and the agent each means.
-const VARIANTS: [(&str, &str); 8] = [
-    ("Claude", "claude"),
+/// `text` when it is a wired agent's name.
+fn wired_named(text: &str) -> Option<&'static str> {
+    agentscm::clients::find(text).map(|client| client.name)
+}
+
+/// Agent variants spelled other than the agent's name with a capital.
+const ALIASES: [(&str, &str); 3] = [
     ("ClaudeCode", "claude"),
-    ("Codex", "codex"),
-    ("Copilot", "copilot"),
-    ("Cursor", "cursor"),
-    ("Gemini", "gemini"),
     ("GeminiCli", "gemini"),
     ("Generic", "generic"),
 ];
+
+/// The agent an enum variant means (`Codex`, `ClaudeCode`), if any.
+fn variant_agent(variant: &str) -> Option<&'static str> {
+    ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == variant)
+        .map(|(_, agent)| *agent)
+        .or_else(|| wired_named(&variant.to_lowercase()))
+}
 
 /// Files whose job is to write or detect each host's own configuration, so every branch in them
 /// is the host's file format rather than a feature: setup, install, onboarding and detection.
@@ -51,8 +62,14 @@ const SETUP_FILES: [&str; 9] = [
 /// transport runs Claude Code as a model, whichever agent the person uses.
 const NOT_AGENTS: [&str; 1] = ["TransportBasis"];
 
-/// Items that use an agent's name for something else: `cursor` is a page cursor there.
-const NOT_GATES: [(&str, &str); 1] = [("src/team/http.rs", "native_query")];
+/// Items that name agents without singling any out: `cursor` is a page cursor in
+/// `native_query`; `agent_name` falls back to every agent's label in src/clients.rs; and
+/// `native_client` admits every agent there through `generic_native`.
+const NOT_GATES: [(&str, &str); 3] = [
+    ("src/team/http.rs", "native_query"),
+    ("src/hub/advice.rs", "agent_name"),
+    ("src/hub/hook.rs", "native_client"),
+];
 
 struct Gate {
     file: &'static str,
@@ -71,7 +88,7 @@ const REGISTER: &[Gate] = &[
         agents: "claude codex",
         reason: "not wired yet: docs/agents.md lists no Stop adapter for Copilot, whose vendor \
                  documents a blocking agentStop; Cursor's stop hook cannot block (host limit); \
-                 Gemini CLI is not in that matrix",
+                 Gemini CLI and the src/clients.rs table agents are not in that matrix",
     },
     Gate {
         file: "src/change_capture_cli.rs",
@@ -133,9 +150,8 @@ const REGISTER: &[Gate] = &[
     Gate {
         file: "src/hook_cli.rs",
         item: "branch_advisory_at",
-        agents: "copilot gemini",
-        reason: "host limit: Copilot CLI's preToolUse cannot carry advisory text (comment); \
-                 Gemini CLI's paths come in another field",
+        agents: "copilot",
+        reason: "host limit: Copilot CLI's preToolUse cannot carry advisory text (comment)",
     },
     Gate {
         file: "src/hook_cli.rs",
@@ -143,6 +159,13 @@ const REGISTER: &[Gate] = &[
         agents: "codex gemini",
         reason: "host limit: each host's hook payload and reply format (Codex payloads are \
                  sanitized, Gemini CLI replies are reshaped)",
+    },
+    Gate {
+        file: "src/hook_cli.rs",
+        item: "context_reply_with",
+        agents: "claude codex copilot cursor gemini",
+        reason: "host limit: each host takes added context in its own reply field and events; \
+                 the table agents are answered from src/clients.rs before this match",
     },
     Gate {
         file: "src/hook_cli.rs",
@@ -171,9 +194,10 @@ const REGISTER: &[Gate] = &[
     },
     Gate {
         file: "src/hook_cli.rs",
-        item: "route_client_with",
-        agents: "gemini",
-        reason: "unknown: Gemini CLI is sent to the Hub's generic endpoint; why is not said",
+        item: "sanitized_client",
+        agents: "claude codex copilot cursor gemini",
+        reason: "host limit: each of the five agents with its own payload code sends its own \
+                 shape; the table agents are read from src/clients.rs before this match",
     },
     Gate {
         file: "src/hook_cli.rs",
@@ -229,34 +253,31 @@ const REGISTER: &[Gate] = &[
         file: "src/hub/hook.rs",
         item: "enum Agent",
         agents: "claude codex copilot cursor",
-        reason: "unknown: Gemini CLI uses the generic endpoint; why is not said",
+        reason: "unknown: Gemini CLI and the table agents reach the generic endpoint as \
+                 `hook:<name>` (src/clients.rs); why these four have their own routes is not \
+                 said",
     },
     Gate {
         file: "src/hub/hook.rs",
         item: "from_name",
         agents: "claude codex copilot cursor",
-        reason: "unknown: Gemini CLI uses the generic endpoint; why is not said",
-    },
-    Gate {
-        file: "src/hub/hook.rs",
-        item: "noticed",
-        agents: "claude",
-        reason: "unknown: the comment says Claude Code's tool events take added context, not \
-                 that other hosts' cannot",
+        reason: "unknown: Gemini CLI and the table agents reach the generic endpoint as \
+                 `hook:<name>` (src/clients.rs); why these four have their own routes is not \
+                 said",
     },
     Gate {
         file: "src/hub/hook.rs",
         item: "render",
-        agents: "claude copilot gemini generic",
+        agents: "claude copilot",
         reason: "host limit: Claude Code reads the rules in the MCP instructions; Copilot's \
                  reply shape (comments)",
     },
     Gate {
         file: "src/hub/hook.rs",
         item: "run",
-        agents: "claude gemini generic",
-        reason: "host limit: native edit tools only, and Claude Code with a read-only token \
-                 gets its one rule here (comments)",
+        agents: "claude",
+        reason: "host limit: Claude Code with a read-only token gets its one rule here, as it \
+                 reads the others in the MCP instructions (comment)",
     },
     Gate {
         file: "src/hub/work_lifecycle.rs",
@@ -283,6 +304,13 @@ const REGISTER: &[Gate] = &[
         item: "enum AgentArg",
         agents: "claude codex",
         reason: "not wired yet: the agents with a Stop adapter (see enum StopAgent)",
+    },
+    Gate {
+        file: "src/workspace_client.rs",
+        item: "enum ClientAgent",
+        agents: "claude codex copilot cursor gemini",
+        reason: "not wired yet: workspace-client install has adapters for these five only \
+                 (docs/workspace-timeline.md); the src/clients.rs table agents have none",
     },
 ];
 
@@ -370,10 +398,10 @@ fn every_agent_name_gate_is_in_the_register() {
     );
 }
 
-/// WIRED is written out, so it cannot follow `client setup` on its own: this fails when the agents
-/// setup wires (its `Agent` enum) change, and says what else then has to change.
+/// Variants are mapped to agents by name: this fails when setup's `Agent` enum spells an agent
+/// in a way `variant_agent` does not read, which would hide that agent's enum gates.
 #[test]
-fn the_wired_agents_are_the_ones_client_setup_wires() {
+fn every_setup_agent_variant_reads_as_a_wired_agent() {
     let source = fs::read_to_string(format!(
         "{}/src/client_setup.rs",
         env!("CARGO_MANIFEST_DIR")
@@ -385,27 +413,15 @@ fn the_wired_agents_are_the_ones_client_setup_wires() {
         .expect("client_setup.rs has no `enum Agent`")
         + 11;
     let variants = enum_variants(&m, open);
-    let wired: Vec<&str> = variants
+    let read: BTreeSet<&str> = variants
         .iter()
-        .map(|variant| {
-            VARIANTS
-                .iter()
-                .find(|(name, _)| name == variant)
-                .map_or(variant.as_str(), |(_, agent)| *agent)
-        })
+        .map(|variant| variant_agent(variant).unwrap_or(variant))
         .collect();
-    let mut expected = WIRED.to_vec();
-    expected.sort();
-    let mut wired = wired;
-    wired.sort();
     assert_eq!(
-        wired, expected,
-        "`client setup` now wires a different set of agents (its `Agent` enum in \
-         src/client_setup.rs). WIRED and VARIANTS in tests/integration/agent_gates.rs are a \
-         hard-coded copy: add the new agent there (its name as the hook names it, and its enum \
-         variant). Every match or enum that listed all the old agents then reads as a gate that \
-         leaves the new one out: wire it there, or add it to REGISTER with the reason, and update \
-         docs/agents.md."
+        read,
+        wired().collect::<BTreeSet<_>>(),
+        "src/client_setup.rs `Agent` variants do not all read as agents in src/clients.rs: add \
+         the variant's spelling to ALIASES in tests/integration/agent_gates.rs"
     );
 }
 
@@ -583,17 +599,17 @@ fn match_gate(m: &[u8], at: usize) -> BTreeSet<&'static str> {
         for (index, piece) in pattern.split('"').enumerate() {
             let agent = piece.strip_prefix("hook:").unwrap_or(piece);
             if index % 2 == 1
-                && let Some(agent) = WIRED.iter().find(|wired| **wired == agent)
+                && let Some(agent) = wired_named(agent)
             {
-                agents.insert(*agent);
+                agents.insert(agent);
             }
         }
         for path in pattern.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')) {
             if let Some((ty, variant)) = path.split_once("::")
                 && !NOT_AGENTS.contains(&ty)
-                && let Some((_, agent)) = VARIANTS.iter().find(|(name, _)| *name == variant)
+                && let Some(agent) = variant_agent(variant)
             {
-                agents.insert(*agent);
+                agents.insert(agent);
             }
         }
         let body = skip_space(m, arrow + 2);
@@ -610,7 +626,7 @@ fn match_gate(m: &[u8], at: usize) -> BTreeSet<&'static str> {
             if end < close { end + 1 } else { close }
         };
     }
-    let covered = WIRED.iter().all(|agent| agents.contains(agent));
+    let covered = wired().all(|agent| agents.contains(agent));
     if fallback && !covered {
         agents
     } else {
@@ -684,10 +700,7 @@ fn gates(source: &str) -> BTreeMap<String, String> {
                     .unwrap_or(m.len());
                 // A `matches!` that lists every wired agent asks "is this a wired agent at all".
                 let listed = std::str::from_utf8(&m[i..matches_end]).unwrap();
-                if WIRED
-                    .iter()
-                    .all(|agent| listed.contains(&format!("\"{agent}\"")))
-                {
+                if wired().all(|agent| listed.contains(&format!("\"{agent}\""))) {
                     i = matches_end;
                     continue;
                 }
@@ -706,7 +719,7 @@ fn gates(source: &str) -> BTreeMap<String, String> {
                 let end = (i + 1..m.len()).find(|&j| m[j] == b'"').unwrap_or(m.len());
                 let text = std::str::from_utf8(&m[i + 1..end]).unwrap();
                 let agent = text.strip_prefix("hook:").unwrap_or(text);
-                if let Some(agent) = WIRED.iter().find(|wired| **wired == agent)
+                if let Some(agent) = wired_named(agent)
                     && (i < matches_end || compared(&m, i, end + 1))
                 {
                     named.entry(item).or_default().insert(agent);
@@ -720,8 +733,7 @@ fn gates(source: &str) -> BTreeMap<String, String> {
                 if m[after..].starts_with(b"::") && !NOT_AGENTS.contains(&path) {
                     let variant = read_ident(&m, after + 2);
                     let end = after + 2 + variant.len();
-                    let agent = VARIANTS.iter().find(|(name, _)| *name == variant);
-                    if let Some((_, agent)) = agent
+                    if let Some(agent) = variant_agent(variant)
                         && (i < matches_end || compared(&m, i, end))
                     {
                         named.entry(item).or_default().insert(agent);
@@ -735,7 +747,7 @@ fn gates(source: &str) -> BTreeMap<String, String> {
         i += 1;
     }
 
-    let wired: BTreeSet<&str> = WIRED.into_iter().collect();
+    let wired: BTreeSet<&str> = wired().collect();
     let mut out = BTreeMap::new();
     for (item, gates) in named {
         out.insert(item, gates.into_iter().collect::<Vec<_>>().join(" "));
@@ -753,10 +765,10 @@ fn enum_agents(m: &[u8], open: usize) -> BTreeSet<&'static str> {
     let mut agents = BTreeSet::new();
     for name in enum_variants(m, open) {
         // `Generic` is the absence of an agent, so it alone does not make an agent enum.
-        if let Some((_, agent)) = VARIANTS.iter().find(|(variant, _)| *variant == name)
-            && *agent != "generic"
+        if let Some(agent) = variant_agent(&name)
+            && agent != "generic"
         {
-            agents.insert(*agent);
+            agents.insert(agent);
         }
     }
     agents
@@ -792,6 +804,20 @@ fn enum_variants(m: &[u8], open: usize) -> Vec<String> {
 
 #[test]
 fn the_scanner_finds_each_gate_form_and_skips_tests_comments_and_full_lists() {
+    // The full lists follow the wired agents, so they stay full when an agent is added.
+    let names: Vec<&str> = wired().collect();
+    let arms = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let (first, second) = names.split_at(names.len() / 2);
+    let variants: Vec<String> = names
+        .iter()
+        .map(|name| name[..1].to_uppercase() + &name[1..])
+        .collect();
     let source = r##"
         // agent == "claude" in a comment
         fn shell(agent: &str) -> bool { matches!(agent, "claude" | "codex") }
@@ -800,30 +826,33 @@ fn the_scanner_finds_each_gate_form_and_skips_tests_comments_and_full_lists() {
         fn harness(agent: &str) -> Option<u8> {
             match agent { "claude" if true => Some(1), "codex" => Some(2), _ => None }
         }
-        fn parse(agent: &str) -> u8 {
-            match agent { "claude" => 1, "codex" => 2, "cursor" => 3, "copilot" => 4,
-                "gemini" => 5, _ => 0 }
-        }
+        fn parse(agent: &str) -> u8 { match agent { ALL => 1, _ => 0 } }
         fn partial(agent: Agent) -> bool { match agent { Agent::Claude => true, _ => false } }
         fn exhaustive(agent: Waker) -> u8 {
             match agent { Waker::Claude => { 1 } Waker::Codex(n) => n }
         }
         fn two(a: &str, b: &str) -> u8 {
-            match a { "claude" | "codex" | "cursor" => 1, other => 0 }
-                + match b { "copilot" | "gemini" => 1, _ => 0 }
+            match a { FIRST => 1, other => 0 } + match b { SECOND => 1, _ => 0 }
         }
         enum Waker { Claude, #[serde(rename = "x")] Codex(u8) }
-        enum Every { Claude, Codex, Cursor, Copilot, Gemini }
+        enum Every { VARIANTS }
         #[cfg(test)]
         mod tests { fn t() { assert!(agent == "cursor"); } }
-    "##;
-    let found = gates(source);
+    "##
+    .replace("ALL", &arms(&names))
+    .replace("FIRST", &arms(first))
+    .replace("SECOND", &arms(second))
+    .replace("VARIANTS", &variants.join(", "));
+    let found = gates(&source);
+    let mut every = names.clone();
+    every.sort();
+    let every = every.join(" ");
     let expected: BTreeMap<String, String> = [
         ("shell", "claude codex"),
         ("route", "gemini"),
         ("variant", "generic"),
         ("partial", "claude"),
-        ("two", "claude codex copilot cursor gemini"),
+        ("two", every.as_str()),
         ("harness", "claude codex"),
         ("enum Waker", "claude codex"),
     ]
