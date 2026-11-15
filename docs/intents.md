@@ -55,12 +55,15 @@ Two current Work leads can agree to share named files while keeping separate res
    silently (see Limits).
 
    This recipe is for Claude Code only. Cursor, GitHub Copilot (CLI and VS Code) and Devin
-   document that they also run the hooks in `.claude/settings.json` and
-   `~/.claude/settings.json`, with their own payloads and tool names, so there this hook
-   would report their edits as Claude Code's or miss them. Do not use the recipe where one
-   of those agents also runs; a user-level file reaches every repository. Use
-   `agentscm client setup --agent <agent>` instead; for Claude Code it installs a plugin,
-   not settings hooks.
+   document that they also run the hooks in a repository's `.claude/settings.json`, with
+   their own payloads and tool names, so there this hook would report their edits as Claude
+   Code's or miss them. Cursor and Devin also document reading `~/.claude/settings.json`,
+   and a local run of Cursor's command-line agent ran hooks from it. Copilot documents its
+   own user hooks under `~/.copilot/` instead, and VS Code's migration guide says not to
+   assume Copilot discovers `~/.claude/settings.json`. Do not use the recipe where one of
+   those agents also runs. For a supported client (`claude`, `codex`, `cursor`, `copilot`,
+   `gemini`, `droid`, `qwen`, `junie` or `crush`), use `agentscm client setup --agent <agent>`
+   instead; for Claude Code it installs a plugin, not settings hooks.
 
 Setting this up for a whole team, or for agents other than Claude Code (Codex, Cursor, Copilot)? Use
 [`agentscm init-repo`](agents.md): it commits shared instructions for each agent, and each developer then runs
