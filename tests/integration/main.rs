@@ -26,6 +26,7 @@ mod team_pg;
 mod workspace_hub;
 
 // Test modules.
+mod agent_gates;
 #[cfg(unix)]
 mod agent_stop_cli;
 #[cfg(unix)]

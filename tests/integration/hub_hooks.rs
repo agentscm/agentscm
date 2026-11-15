@@ -2112,9 +2112,12 @@ async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
         hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
         json!({})
     );
-    // Only Claude Code's tool events are known to take added context.
-    assert_eq!(hub.hook_raw("codex", &lead, &read(None)), json!({}));
-    let answer = hub.hook_raw("claude", &lead, &read(None));
+    // Copilot CLI's own event names have no field for added context.
+    let mut cli = fixture("copilot-postToolUse");
+    cli["sessionId"] = json!(session);
+    assert_eq!(hub.hook_raw("copilot", &lead, &cli), json!({}));
+    // Every host that sends the tool event by this name takes the notice, not only Claude Code.
+    let answer = hub.hook_raw("codex", &lead, &read(None));
     assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     let text = text_at(&answer, CLAUDE_CONTEXT);
     assert!(text.contains("its next edit is refused"), "{answer}");
