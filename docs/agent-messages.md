@@ -4,7 +4,7 @@ title: "Messages to your own agent session"
 
 # Messages to your own agent session
 
-A person signed in to the Hub's web page can send a short message to an agent session they already run: for example, ask the agent that leads a stale Work to finish or release it. The Hub never starts a session. A Claude Code session with the AgentSCM plugin gets the message within seconds, even while it sits idle: a background hook waits at the Hub and wakes the session (tier `wake`). Other sessions get it in the reply to their next call the Hub can answer. A closed session gets nothing until it runs again; the message stays queued and the Hub page says so.
+A person signed in to the Hub's web page can send a short message to an agent session they already run: for example, ask the agent that leads a stale Work to finish or release it. The Hub never starts a session. A Claude Code session with the AgentSCM plugin gets the message within seconds, even while it sits idle: a background hook waits at the Hub and wakes the session (tier `wake`). Codex has a queue-based waiter, and Copilot CLI can wait after a native notification fires; their limits are below. A session without a waiter gets the message in the reply to its next call the Hub can answer. A closed session gets nothing until it runs again; the message stays queued and the Hub page says so.
 
 ## Trust model
 
@@ -44,6 +44,7 @@ From these facts the Hub derives the tier it can use:
 | Tier | Clients | When it arrives |
 | --- | --- | --- |
 | `wake` | Claude Code or Codex with the AgentSCM plugin, while its background waiter waits (seen within the last 90 seconds). | Claude Code: within seconds, idle or busy: the hook wakes the session with the notice. Codex: the waiter queues the notice in the chat, which starts it as a turn (see [Waking a Codex chat](#waking-a-codex-chat)). |
+| `wake` | Copilot CLI with the installed notification hook, after a notification starts its waiter (seen within the last 90 seconds). | The notification hook returns the notice as context that can start processing while idle. One notice ends the waiter; another native notification must rearm it (see [Waking a Copilot CLI session](#waking-a-copilot-cli-session)). |
 | `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
 | `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. |
 | `unknown` | Nothing from the session itself since the Hub started, only its subagents' hook calls. | Nothing is offered until the session calls; use copy and paste from the Hub page meanwhile. |
@@ -75,6 +76,7 @@ No message sits unseen. When a message is sent, the Hub gives it a deadline for 
 | `reach` | Deadline |
 | --- | --- |
 | `wake_now`: Claude Code's waiter waits at the Hub now, so it is woken within about a second, idle or busy | 2 minutes |
+| `wake_now`: Copilot CLI's notification waiter waits now; its hook can return context that starts idle processing (latency not yet measured) | 2 minutes |
 | `wake_soon`: Codex's waiter waits now; it queues the notice, which Codex should start as a turn within about ten seconds once the chat is idle (not yet measured) | 5 minutes |
 | `next_step`: at its next prompt or tool call; a session that sits idle makes none | 10 minutes |
 | `unreachable`: nothing from the session itself since the Hub started | 2 minutes, since it will not arrive on its own |
@@ -94,7 +96,8 @@ What `reach` each client can have:
 | --- | --- |
 | Claude Code with the AgentSCM plugin | `wake_now` while its waiter waits, else `next_step`; `ended` after its `SessionEnd` hook |
 | Codex with the AgentSCM plugin | `wake_soon` while its waiter waits, else `next_step`; `ended` after its `SessionEnd` hook |
-| Cursor, Copilot | `next_step`; `ended` after its end hook (`sessionEnd`) |
+| Copilot CLI with the installed notification hook | `wake_now` only while a notification-triggered waiter waits; otherwise `next_step`; `ended` after `sessionEnd` |
+| Cursor, Copilot without a notification waiter | `next_step`; `ended` after its end hook (`sessionEnd`) |
 | Gemini CLI, a generic hook | `next_step`, in its next AgentSCM tool result; `ended` after a `done` event |
 | MCP only (Codex without hooks, Antigravity, Devin, Amp, opencode) | `next_step` once a call of its own names its session; never `ended`, since MCP has no end signal |
 | Seen only through its subagents' calls, or not since the Hub started | `unreachable` |
@@ -117,7 +120,7 @@ Ordinary print mode can wait about 30 seconds during shutdown. It is not a relia
 
 What this does not cover:
 
-- **Other hosts.** Only Claude Code and Codex have a background waiter. Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above; when one of them sits idle, its message is not picked up by its deadline and the person is told.
+- **Other hosts.** Codex has a queue-based waiter and Copilot CLI has a notification-triggered waiter, described below. Cursor, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above; when one of them sits idle, its message is not picked up by its deadline and the person is told. Copilot behaves the same when no notification waiter is open.
 - **Sessions started before this change.** A session reads its plugin's hooks when it starts, so a session that was already running when the client was updated has no waiter until it restarts.
 - **Windows.** The waiter exits at once on Windows, because it cannot tell there when its session has ended. A Windows session gets its messages at its next hook or tool call.
 - **Requests in another repository, the cases not covered.** A session is woken for Work it leads in another repository only when both repositories are on the same Hub and the person's token for the other one is live and can write. The Hub reads the person's eight newest such tokens. A token that was replaced after the Work started is no longer read, so that Work's request waits for the session's next call in its repository. A session the Hub knows only by the shared name `default` is not looked up under other tokens, and two clients of one person that report the same session name can get each other's notice. In each case the lead's person is asked after 10 minutes as above.
@@ -141,12 +144,23 @@ What this does not cover:
 - **The Codex desktop app and IDE extension.** Whether their chats read the same queue is not documented.
 - **Windows.** The waiter exits at once, as for Claude Code.
 
+### Waking a Copilot CLI session
+
+`agentscm client setup --agent copilot` adds `agentscm hook-wait copilot --notification` to Copilot CLI's `notification` hooks and `agentscm hook-wait copilot --end` to `sessionEnd`. The notification-only argument identifies the asynchronous event because its native payload omits the event name. The [Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference#notification-hook) documents asynchronous notification hooks whose `additionalContext` output can trigger processing in an idle session. The waiter holds the same Hub request open and returns the framed notice as `{"additionalContext":"…"}` on stdout with exit code zero. The Hub records `via` as `wake:copilot`, and shows `reach` as `wake_now` only while the waiter is open or asking again after an empty response.
+
+- **Availability depends on notifications.** Session start and ordinary turn completion do not start this waiter. A native notification must fire first. Each delivered notice ends the hook; another native notification must start a new waiter. A quiet session can therefore remain `next_step`, even after an earlier successful wake. Copilot's `agent_idle` notification concerns a background agent, so it is not evidence that every root turn rearms the waiter.
+- **Only the parent's own hook waits.** The waiter uses the native `sessionId` and rejects both `agentId` and `agent_id` helper markers, including on session-end cleanup. It also requires a notification payload before opening a wait, so an accidental synchronous hook configuration cannot hold the session open.
+- **Receipts still matter.** Returning hook context is not proof that the model read it. An unanswered delivery can be offered again at a later hook or AgentSCM call, but never repeatedly wakes the session. The agent verifies the notice with `agentscm_hub_message` status `accepted` and follows the returned mode, as with other delivery paths.
+- **Lifetime and errors.** The waiter uses the same session lock, end marker, parent-process check and bounded retries as the other waiters. Errors and unframed Hub responses produce no context. An older Hub that rejects the Copilot waiter leaves the session on its ordinary next-call delivery path.
+- **Coverage limits.** This is for Copilot CLI; the cloud agent does not emit these notifications. Windows still has no waiter. Native idle wake and latency have not been observed with this build; installing the hook alone does not prove a session is reachable.
+
 ### Other clients
 
 - **Claude Code channels** (`notifications/claude/channel`) are a research preview behind `--dangerously-load-development-channels` for servers off the allowlist, and are not used.
 - **Codex** documents `codex app-server` (`turn/steer`, `thread/inject_items`) for a session that the app server itself runs. It does not document attaching to a terminal session that is already running.
-- **Cursor** documents steering only for its cloud agents.
-- **Copilot CLI** documents `copilot --acp` for sessions that the ACP client creates.
+- **Cursor** documents a `stop` hook follow-up at the end of a turn and initial context from `sessionStart`. Neither documents detached delivery that starts a turn in an already idle local session. Its cloud steering is a separate surface.
+- **Gemini CLI** runs hooks synchronously in the agent loop. A long wait there would hold the turn open; its terminal notifications alert the person and do not inject a message into an idle session.
+- **Copilot CLI** also documents `copilot --acp` for sessions that the ACP client creates. The notification waiter above does not start or take over an ACP session.
 
 ### Manual path
 
@@ -172,9 +186,9 @@ The routes are for the Hub's web page only:
 - `POST /v1/hub/session/agent-messages` with `{repository, token, session, work_id?, note}` queues a message and returns it (`201`). The note is 1 to 1000 bytes, with newlines allowed.
 - `DELETE /v1/hub/session/agent-messages?repository=…&id=…` withdraws a message that is still queued.
 
-The session's background hook uses one route with the agent token: `POST /v1/hub/agent-messages/wait` with `{session, agent?}`: the native session id, and whose waiter it is, `claude` (the default) or `codex`. A message it takes is recorded `via` `wake:<agent>`. It answers `200 {text}` with the notice when a message comes, `204` when none came in 25 seconds or the session ended, `403` for a read-only token, one without a repository, or the shared `default` session (it names no one conversation), `409 waiter_present` while another wait for the session is open, `410` while the person's mode is Ignore, and `429` when the Hub or the person holds too many waits.
+The session's background hook uses one route with the agent token: `POST /v1/hub/agent-messages/wait` with `{session, agent?}`: the native session id, and whose waiter it is, `claude` (the default), `codex` or `copilot`. A message it takes is recorded `via` `wake:<agent>`. It answers `200 {text}` with the notice when a message comes, `204` when none came in 25 seconds or the session ended, `403` for a read-only token, one without a repository, or the shared `default` session (it names no one conversation), `409 waiter_present` while another wait for the session is open, `410` while the person's mode is Ignore, and `429` when the Hub or the person holds too many waits.
 
-A message's `state` is `queued`, `delivered`, `accepted`, `declined`, `done` or `withdrawn`. `via` is `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`, the way of its first delivery, and `mode` is the mode it was delivered under. Its times and `deadline_at` are under [Pick-up deadline](#pick-up-deadline). A session's `waited_at` is when its background hook last waited, `waker` is whose waiter waited last (`claude` or `codex`), `ended` is true from its `SessionEnd` hook to its next own call, and its `reach` is `wake_now`, `wake_soon`, `next_step`, `unreachable` or `ended`.
+A message's `state` is `queued`, `delivered`, `accepted`, `declined`, `done` or `withdrawn`. `via` is `wake:claude`, `wake:codex`, `wake:copilot`, `hook:<agent>` or `mcp`, the way of its first delivery, and `mode` is the mode it was delivered under. Its times and `deadline_at` are under [Pick-up deadline](#pick-up-deadline). A session's `waited_at` is when its background hook last waited, `waker` is whose waiter waited last (`claude`, `codex` or `copilot`), `ended` is true from its `SessionEnd` hook to its next own call, and its `reach` is `wake_now`, `wake_soon`, `next_step`, `unreachable` or `ended`.
 
 ## MCP
 

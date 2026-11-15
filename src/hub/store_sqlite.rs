@@ -629,6 +629,20 @@ fn declare_shared_body(
             now
         ],
     )?;
+    tx.execute(
+        "INSERT INTO hub_change_conversation_occurrences
+         (work,generation,session_id,event_id,sequence,digest,author)
+         VALUES (?1,?2,?3,?4,?5,?6,(SELECT owner FROM hub_agent_tokens WHERE id=?7))",
+        params![
+            batch.work_id,
+            batch.generation,
+            batch.session.session_id,
+            event.event_id,
+            event.sequence as i64,
+            artifact.digest,
+            token
+        ],
+    )?;
     Ok(())
 }
 
@@ -3430,6 +3444,7 @@ fn current_capture_work_for_session(
     tx: &Transaction<'_>,
     who: &WorkWho,
     session: &str,
+    work_id: Option<&str>,
     now: i64,
 ) -> Result<Option<WorkItem>> {
     // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
@@ -3441,6 +3456,7 @@ fn current_capture_work_for_session(
            AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
            AND participant.generation=item.generation
+           AND (?7 IS NULL OR item.id=?7)
          ORDER BY item.state='active' DESC, participant.role='lead' DESC, item.id LIMIT 2",
     )?;
     let snapshots = statement
@@ -3451,7 +3467,8 @@ fn current_capture_work_for_session(
                 who.repository,
                 who.repository_id,
                 who.token,
-                session
+                session,
+                work_id
             ],
             |row| {
                 Ok((
@@ -10078,6 +10095,86 @@ impl Store for SqliteStore {
         )?)
     }
 
+    fn native_question_coverage_mark(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+        rejected_offset: u64,
+    ) -> Result<()> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope, native])?;
+        self.conn().execute(
+            "INSERT INTO hub_native_question_coverage(owner_hash, scope_hash, native_hash, rejected_offset)
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(owner_hash, scope_hash, native_hash)
+             DO UPDATE SET rejected_offset = MAX(hub_native_question_coverage.rejected_offset, excluded.rejected_offset)",
+            params![owner, scope, native, format!("{rejected_offset:020}")],
+        )?;
+        Ok(())
+    }
+
+    fn native_question_coverage_floor(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+    ) -> Result<Option<u64>> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope, native])?;
+        self.conn().query_row(
+            "SELECT rejected_offset FROM hub_native_question_coverage WHERE owner_hash = ?1 AND scope_hash = ?2 AND native_hash = ?3",
+            params![owner, scope, native], |row| row.get::<_, String>(0),
+        ).optional()?.map(|value| value.parse().map_err(|_| HubError::Unavailable("invalid native question retry offset".into()))).transpose()
+    }
+
+    fn native_question_coverage_unavailable(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: Option<&str>,
+    ) -> Result<bool> {
+        super::store::validate_native_question_coverage_keys(&[owner, scope])?;
+        if let Some(native) = native {
+            super::store::validate_native_question_coverage_keys(&[native])?;
+            Ok(self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = ?1 AND scope_hash = ?2 AND native_hash = ?3)",
+                params![owner, scope, native], |row| row.get(0),
+            )?)
+        } else {
+            Ok(self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = ?1 AND scope_hash = ?2)",
+                params![owner, scope], |row| row.get(0),
+            )?)
+        }
+    }
+
+    fn native_question_coverage_resolve(
+        &self,
+        owner: &str,
+        scope: Option<&str>,
+        native: &str,
+        through_offset: Option<u64>,
+    ) -> Result<bool> {
+        super::store::validate_native_question_coverage_keys(&[owner, native])?;
+        if let Some(scope) = scope {
+            super::store::validate_native_question_coverage_keys(&[scope])?;
+            let conn = self.conn();
+            let through_offset = through_offset.map(|offset| format!("{offset:020}"));
+            conn.execute(
+                "DELETE FROM hub_native_question_coverage WHERE owner_hash = ?1 AND scope_hash = ?2 AND native_hash = ?3 AND (?4 IS NULL OR rejected_offset <= ?4)",
+                params![owner, scope, native, through_offset],
+            )?;
+            Ok(!conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_native_question_coverage WHERE owner_hash = ?1 AND scope_hash = ?2 AND native_hash = ?3)",
+                params![owner, scope, native], |row| row.get::<_, bool>(0),
+            )?)
+        } else {
+            self.conn().execute(
+                "DELETE FROM hub_native_question_coverage WHERE owner_hash = ?1 AND native_hash = ?2",
+                params![owner, native],
+            )?;
+            Ok(true)
+        }
+    }
+
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hub_connections SET next_poll_at = ?2 WHERE id = ?1",
@@ -13407,45 +13504,59 @@ impl Store for SqliteStore {
         let opt_out_prefix = (audience == ConversationAudience::Sharing
             && who.repository_id.is_some())
         .then_some(super::conversation_sharing::OPT_OUT_KEY_PREFIX);
-        let mut statement = tx.prepare(&format!(
+        let mut statement = tx.prepare(
             "WITH page AS (
-                 SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
-                 WHERE work=?1 AND (?2 IS NULL OR (session_id,sequence,digest) > (?2,?3,?4))
-                   AND (?6 OR author=?7 OR (?8 IS NOT NULL AND NOT EXISTS (
+                 SELECT o.work,b.digest,b.size_bytes,o.session_id,o.generation,o.event_id,o.sequence,
+                    b.declared_token,b.declared_at,b.state,b.uploaded_at,b.expires_at,b.deleted_at,
+                    b.deleted_by,b.physical_deleted_at,b.author,b.delete_attempts FROM hub_change_conversation_occurrences o
+                 JOIN hub_change_shared_bodies b ON b.work=o.work AND b.digest=o.digest AND b.author=o.author
+                 WHERE o.work=?1 AND (?2 IS NULL OR (o.session_id,o.generation,o.sequence,o.digest) > (?2,?10,?3,?4))
+                   AND (o.event_id NOT LIKE 'evt:history:%' OR NOT EXISTS (
+                       SELECT 1 FROM hub_change_conversation_occurrences earlier
+                       WHERE earlier.work=o.work AND earlier.session_id=o.session_id
+                         AND earlier.event_id=o.event_id AND earlier.author=o.author
+                         AND earlier.digest=o.digest AND earlier.generation<o.generation))
+                   AND (?6 OR b.author=?7 OR (?8 IS NOT NULL AND NOT EXISTS (
                         SELECT 1 FROM hub_settings o
-                         WHERE o.key = ?8 || author || ':' || ?9 AND o.value <> '0')))
-                 ORDER BY session_id,sequence,digest LIMIT ?5)
-             SELECT page.*, e.event, e.observed_at FROM page
+                         WHERE o.key = ?8 || b.author || ':' || ?9 AND o.value <> '0')))
+                 ORDER BY o.session_id,o.generation,o.sequence,o.digest LIMIT ?5)
+             SELECT page.*, e.event, e.observed_at, s.identity FROM page
              JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
                AND e.session_id=page.session_id AND e.event_id=page.event_id
-             ORDER BY page.session_id,page.sequence,page.digest"
-        ))?;
+             JOIN hub_change_sessions s ON s.work=page.work AND s.generation=page.generation
+               AND s.session_id=page.session_id
+             ORDER BY page.session_id,page.generation,page.sequence,page.digest"
+        )?;
         let entries = statement
             .query_map(
                 params![
                     work_id,
                     after.as_ref().map(|after| after.0.as_str()),
-                    after.as_ref().map(|after| after.1 as i64),
-                    after.as_ref().map(|after| after.2.as_str()),
+                    after.as_ref().map(|after| after.2 as i64),
+                    after.as_ref().map(|after| after.3.as_str()),
                     MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1,
                     audience == ConversationAudience::Everyone,
                     who.owner.id,
                     // Set only for readers of a sharing repository: an author who opted out is
                     // left out, with what they shared before.
                     opt_out_prefix,
-                    who.repository_id
+                    who.repository_id,
+                    after.as_ref().map(|after| after.1)
                 ],
                 |row| {
                     Ok((
                         shared_body_row(row),
                         row.get::<_, String>(SHARED_BODY_COLUMN_COUNT)?,
                         row.get::<_, i64>(SHARED_BODY_COLUMN_COUNT + 1)?,
+                        row.get::<_, String>(SHARED_BODY_COLUMN_COUNT + 2)?,
                     ))
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(body, event, observed_at)| body?.conversation_entry(&event, observed_at, now))
+            .map(|(body, event, observed_at, session)| {
+                body?.conversation_entry(&event, &session, observed_at, now)
+            })
             .collect::<Result<Vec<_>>>()?;
         drop(statement);
         Ok(Some(entries))
@@ -14975,17 +15086,18 @@ impl Store for SqliteStore {
         Ok(item)
     }
 
-    fn capture_work_for_session(
+    fn capture_work_for_session_at(
         &self,
         token: &str,
         session: &str,
+        work_id: Option<&str>,
         now: i64,
     ) -> Result<Option<WorkItem>> {
         super::intent::text("session", session, 255)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
-        let item = current_capture_work_for_session(&tx, &who, session, now)?;
+        let item = current_capture_work_for_session(&tx, &who, session, work_id, now)?;
         tx.commit()?;
         Ok(item)
     }

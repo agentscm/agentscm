@@ -99,13 +99,19 @@ impl SharedBodyRow {
     pub(super) fn conversation_entry(
         &self,
         event: &str,
+        session: &str,
         observed_at: i64,
         now: i64,
     ) -> Result<ConversationEntryV1> {
         let event: CapturedEventV1 = serde_json::from_str(event)
             .map_err(|error| HubError::Unavailable(error.to_string()))?;
+        let session: crate::change_record::SessionIdentityV1 = serde_json::from_str(session)
+            .map_err(|error| HubError::Unavailable(error.to_string()))?;
         Ok(ConversationEntryV1 {
             session_id: self.session_id.clone(),
+            generation: Some(self.generation),
+            harness: Some(session.harness),
+            tool: event.tool,
             sequence: self.sequence,
             event_id: self.event_id.clone(),
             kind: event.kind,

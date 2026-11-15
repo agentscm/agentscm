@@ -24,7 +24,7 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
   )
 }
 
-export const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
+export const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini', droid: 'Factory Droid', qwen: 'Qwen Code', junie: 'Junie CLI', crush: 'Crush' }
 
 const STEPS = [
   { icon: 'clipboard-check', title: 'Paste into your agent', body: 'Open any coding agent and paste the instructions.' },

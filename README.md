@@ -46,7 +46,8 @@ npx agentscm
 ```
 
 This installs a release binary, guides local Hub setup, signs you in and sets up **every detected
-agent**: Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI. A managed Hub runs natively
+agent**: Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI, Factory Droid, Qwen Code, Junie
+CLI and Crush. A managed Hub runs natively
 on Apple Silicon macOS; Linux and Intel macOS need Docker or an existing Hub. Setup writes no
 repository files. The local Hub's first run opens a page to create and install its GitHub App.
 
@@ -118,15 +119,19 @@ working-file capture handles dirty source and reports omissions. Outcome, eviden
 coverage, source drift and freshness stay separate. A local receipt remains a caller assertion,
 not independently verified execution.
 
-Claude Code has the fuller capture adapter. Codex is captured as far as its hooks expose a
-session: prompts, tool starts and finishes, the last assistant message of each turn and each model
-request's token usage, with past sessions imported from a session file; **not** interim assistant
-messages, tool failures or hosted tool calls. Capture is best effort and bounded; missing events
-and unavailable evidence must remain visible. See
+Claude Code and Codex capture visible prompts, assistant replies and supported tool records
+from their native session files as well as hooks. When one parent chat explicitly starts Work in
+several repositories, its visible history follows each Work, including earlier context. Each
+repository's sharing setting and the author's opt-out still apply. Hidden reasoning and system
+instructions are excluded. Capture is bounded and best effort; missing events and unavailable
+evidence remain visible. Cursor, Copilot and Gemini CLI capture the visible fields their hooks
+provide, with no history-file replay. Cursor and Gemini supply replies and model metadata;
+Copilot does not. Automatic token usage is available for Claude Code and Codex. See
 [capture and qualification](docs/change-capture.md).
 
-Conversation capture defaults to **metadata-only**: no conversation bodies are retained or sent
-to the Hub. Per checkout, you can opt into local conversations or shared conversations.
+Manually configured capture defaults to **metadata-only**, retaining no conversation bodies.
+Connected checkouts that follow the Hub use its repository sharing setting; new Hubs enable
+sharing by default. Each author can opt out, and a checkout can be pinned to local capture.
 Shared bodies are redacted on the computer on a best-effort basis, then uploaded. While the
 repository shares agent conversations, anyone who can read the repository on the Hub can read
 them; otherwise only the person sharing them and Hub admins can. Hub retention defaults to 30 days.

@@ -16,12 +16,16 @@
 //! `agentscm hook-wait codex` is the same waiter for a Codex chat, run as an `async` hook. A
 //! finished background hook starts no turn in Codex, so on a notice it queues the notice into
 //! the chat with `codex queue`, which starts it as a turn once the chat is idle, and exits 0.
+//!
+//! `agentscm hook-wait copilot --notification` waits only from Copilot CLI's asynchronous hook.
+//! It returns a notice as `additionalContext` on stdout, which can start processing while idle.
+//! There is no waiter until a notification fires; another notification rearms it after delivery.
 use std::fs::{DirBuilder, File, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agentscm::hub::agent_messages::{FRAME, REQUEST_FRAME, WAIT_SECS};
+use agentscm::hub::agent_messages::{FRAME, REQUEST_FRAME, WAIT_SECS, Waker};
 use agentscm::hub::reply;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,35 +41,54 @@ const STDIN_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, clap::Args)]
 pub struct HookWaitArgs {
-    /// The agent whose hook this is: `claude` (woken by exit 2) or `codex` (woken through
-    /// `codex queue`); any other waits for nothing.
+    /// The agent whose hook this is: `claude` (exit 2), `codex` (`codex queue`) or
+    /// `copilot` (notification context); any other waits for nothing.
     pub agent: String,
     /// SessionEnd: tell this session's waiter to leave, then exit at once.
     #[arg(long)]
     pub end: bool,
+    /// Installed only on Copilot's asynchronous notification event, whose payload has no name.
+    #[arg(long)]
+    pub notification: bool,
 }
 
-/// Never returns: exits 2 with the Hub's notice on stderr when a message came, else 0.
+/// Never returns: Claude wakes with exit 2; other hosts and every failure exit 0.
 pub async fn run(args: HookWaitArgs) -> ! {
+    let Some(agent) = waiter(&args.agent).filter(|_| cfg!(unix)) else {
+        std::process::exit(0)
+    };
+    let Some(payload) = input() else {
+        std::process::exit(0)
+    };
+    // Inherited Claude hooks must neither wait for nor end another host's session.
+    if crate::client_session::hook_agent(&args.agent, &payload).await != Some(args.agent.as_str()) {
+        std::process::exit(0)
+    }
     if args.end {
         // The session ended while its process may live on (/clear), so its waiter cannot see it.
-        if let (Some(payload), Some(dir)) = (input(), wait_dir())
-            && let Some(session) = session_of(&payload)
+        if let Some(dir) = wait_dir()
+            && let Some(session) = session_of(&payload, agent)
         {
             let _ = File::create(marker(&dir, &session));
         }
         std::process::exit(0)
     }
-    let codex = args.agent == "codex";
-    let found = if (codex || args.agent == "claude") && cfg!(unix) {
-        waited(codex).await
-    } else {
-        None
-    };
-    std::process::exit(match found {
-        Some((session, text)) if codex => queue(&session, &text),
-        found => finish(found.map(|(_, text)| text), &mut std::io::stderr()),
+    let found = waited(agent, args.notification, &payload).await;
+    std::process::exit(match agent {
+        Waker::Claude => finish(found.map(|(_, text)| text), &mut std::io::stderr()),
+        Waker::Codex => found.map_or(0, |(session, text)| queue(&session, &text)),
+        Waker::Copilot => finish_copilot(found.map(|(_, text)| text), &mut std::io::stdout()),
     })
+}
+
+/// Only hosts with a documented background delivery mechanism may open a wait.
+fn waiter(agent: &str) -> Option<Waker> {
+    match agent {
+        "claude" => Some(Waker::Claude),
+        "codex" => Some(Waker::Codex),
+        "copilot" => Some(Waker::Copilot),
+        _ => None,
+    }
 }
 
 /// The Hub's own framed notices: a message, or a coordination request to the session's Work.
@@ -120,15 +143,41 @@ fn finish(found: Option<String>, err: &mut impl Write) -> i32 {
     }
 }
 
+/// Copilot notification output can wake an idle session; plain text or exit 2 cannot.
+fn finish_copilot(found: Option<String>, out: &mut impl Write) -> i32 {
+    if let Some(text) = found.filter(|text| framed(text)) {
+        let context = serde_json::json!({"additionalContext": text});
+        let _ = writeln!(out, "{context}");
+        let _ = out.flush();
+    }
+    0
+}
+
 /// The session id from the hook's input; `None` for a subagent's call, which never waits.
-fn session_of(payload: &Value) -> Option<String> {
-    if payload.get("agent_id").is_some() {
+fn session_of(payload: &Value, agent: Waker) -> Option<String> {
+    if payload.get("agent_id").is_some() || payload.get("agentId").is_some() {
         return None;
     }
-    payload["session_id"]
+    let field = match agent {
+        Waker::Copilot => "sessionId",
+        Waker::Claude | Waker::Codex => "session_id",
+    };
+    payload[field]
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
         .map(str::to_owned)
+}
+
+/// A synchronous Copilot hook must never hold a long wait, even if invoked by a bad config.
+fn can_wait(payload: &Value, agent: Waker, notification: bool) -> bool {
+    agent != Waker::Copilot
+        || (notification
+            && payload
+                .get("hook_event_name")
+                .is_none_or(|event| event == "Notification")
+            && payload["notification_type"]
+                .as_str()
+                .is_some_and(|kind| !kind.is_empty()))
 }
 
 /// The host's hook input, not a Hub reply.
@@ -161,11 +210,12 @@ fn marker(dir: &Path, session: &str) -> PathBuf {
     dir.join(format!("{}.ended", file_name(session)))
 }
 
-/// The session and the Hub's notice, once one comes. `codex` tells the Hub the notice goes into
-/// a Codex chat's own queue, so a hook reply never offers it again.
-async fn waited(codex: bool) -> Option<(String, String)> {
-    let payload = input()?;
-    let session = session_of(&payload)?;
+/// The session and the Hub's notice, once one comes; the agent names its delivery mechanism.
+async fn waited(agent: Waker, notification: bool, payload: &Value) -> Option<(String, String)> {
+    let session = session_of(payload, agent)?;
+    if !can_wait(payload, agent, notification) {
+        return None;
+    }
     let cwd = Path::new(payload["cwd"].as_str()?);
     let connections = client_config::load().ok()?;
     let (connection, checkout) = client_config::connection_for_checkout(&connections, cwd)?;
@@ -173,13 +223,14 @@ async fn waited(codex: bool) -> Option<(String, String)> {
         return None;
     }
     let dir = wait_dir()?;
-    // A resumed session keeps its id, so an old end marker must not stop its new waiter.
-    let ended = marker(&dir, &session);
-    let _ = std::fs::remove_file(&ended);
     // Held until this process exits; a second waiter for the session leaves at once.
     let _lock = lock(&dir, &session)?;
+    // A resumed session keeps its id, so an old end marker must not stop its new waiter.
+    // A duplicate waiter must not remove the marker that ends the first one.
+    let ended = marker(&dir, &session);
+    let _ = std::fs::remove_file(&ended);
     // Without a runnable `codex` a notice could not be queued, so this chat is not waited for.
-    if codex && !runs("codex") {
+    if agent == Waker::Codex && !runs("codex") {
         return None;
     }
     let client = reqwest::Client::builder()
@@ -192,7 +243,7 @@ async fn waited(codex: bool) -> Option<(String, String)> {
     let request = Wait {
         client: &client,
         url: format!("{}/v1/hub/agent-messages/wait", connection.hub),
-        body: wait_body(&session, codex),
+        body: wait_body(&session, agent),
         token_file: &connection.token_file,
     };
     let text = request
@@ -205,13 +256,12 @@ async fn waited(codex: bool) -> Option<(String, String)> {
     Some((session, text))
 }
 
-/// A Claude Code waiter names only its session, as before; a Codex one adds `agent`, so the Hub
-/// records the delivery as queued into the chat's own queue.
-fn wait_body(session: &str, codex: bool) -> String {
-    if codex {
-        serde_json::json!({ "session": session, "agent": "codex" })
-    } else {
+/// Preserve the original Claude body; other waiters identify their delivery mechanism.
+fn wait_body(session: &str, agent: Waker) -> String {
+    if agent == Waker::Claude {
         serde_json::json!({ "session": session })
+    } else {
+        serde_json::json!({ "session": session, "agent": agent })
     }
     .to_string()
 }
@@ -258,6 +308,10 @@ impl Wait<'_> {
             match sent.map(|reply| (reply.status().as_u16(), reply)) {
                 Ok((200, answer)) => {
                     let bytes = answer.bytes().await.ok()?;
+                    // SessionEnd or parent death can happen while the request is in flight.
+                    if !alive() {
+                        return None;
+                    }
                     return reply::decode_slice::<Notice>(&bytes).ok().map(|n| n.text);
                 }
                 // Nothing came in this request: ask again at once.
@@ -270,7 +324,7 @@ impl Wait<'_> {
                     continue;
                 }
                 // Signed out, a read-only token, Ignore, a Hub without the route, or one that
-                // refuses the request (a Hub older than the Codex waiter rejects `agent`).
+                // refuses the request (an older Hub may not recognize this waiter).
                 Ok((400 | 401 | 403 | 404 | 405 | 410, _)) => return None,
                 // Another wait for this session is still open at the Hub: ask again shortly.
                 Ok((409, _)) => {
@@ -353,17 +407,78 @@ mod tests {
 
     #[test]
     fn a_subagent_or_a_bad_session_never_waits() {
-        let session = |v: Value| session_of(&v);
-        assert_eq!(
-            session(serde_json::json!({"session_id":"abc"})).as_deref(),
-            Some("abc")
-        );
-        assert_eq!(
-            session(serde_json::json!({"session_id":"abc","agent_id":"sub"})),
-            None
-        );
-        assert_eq!(session(serde_json::json!({"session_id":""})), None);
-        assert_eq!(session(serde_json::json!({"session_id":"a\nb"})), None);
+        for (agent, field, wrong_field) in [
+            (Waker::Claude, "session_id", "sessionId"),
+            (Waker::Codex, "session_id", "sessionId"),
+            (Waker::Copilot, "sessionId", "session_id"),
+        ] {
+            let mut payload = serde_json::json!({field: "abc"});
+            assert_eq!(session_of(&payload, agent).as_deref(), Some("abc"));
+            for helper in ["agent_id", "agentId"] {
+                for value in [Value::String("child".into()), Value::Null] {
+                    payload[helper] = value;
+                    assert_eq!(session_of(&payload, agent), None);
+                }
+                payload.as_object_mut().unwrap().remove(helper);
+            }
+            for bad in ["".to_owned(), "a\nb".into(), "x".repeat(129)] {
+                payload[field] = Value::String(bad);
+                assert_eq!(session_of(&payload, agent), None);
+            }
+            assert_eq!(
+                session_of(&serde_json::json!({wrong_field: "abc"}), agent),
+                None
+            );
+            assert_eq!(session_of(&serde_json::json!({}), agent), None);
+        }
+    }
+
+    #[test]
+    fn copilot_waits_only_from_an_asynchronous_notification() {
+        let notice: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/hub_hooks/copilot-notification.json"
+        ))
+        .unwrap();
+        assert!(can_wait(&notice, Waker::Copilot, true));
+        assert!(!can_wait(&notice, Waker::Copilot, false));
+        for event in ["SessionStart", "Stop", "SessionEnd", "PostToolUse", ""] {
+            let mut other = notice.clone();
+            other["hook_event_name"] = Value::String(event.into());
+            assert!(!can_wait(&other, Waker::Copilot, true));
+        }
+        let mut incomplete = notice;
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .remove("notification_type");
+        assert!(!can_wait(&incomplete, Waker::Copilot, true));
+        for unsupported in ["cursor", "gemini", "generic", "unknown", ""] {
+            assert_eq!(waiter(unsupported), None, "{unsupported}");
+        }
+        for (name, agent) in [
+            ("claude", Waker::Claude),
+            ("codex", Waker::Codex),
+            ("copilot", Waker::Copilot),
+        ] {
+            assert_eq!(waiter(name), Some(agent));
+        }
+    }
+
+    #[test]
+    fn copilot_returns_only_framed_context_as_json_with_exit_zero() {
+        for frame in [FRAME, REQUEST_FRAME] {
+            let notice = format!("{frame} msg_1: \"quoted\"\nnext line\\end");
+            let mut out = Vec::new();
+            assert_eq!(finish_copilot(Some(notice.clone()), &mut out), 0);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out).unwrap(),
+                serde_json::json!({"additionalContext": notice})
+            );
+        }
+        let mut out = Vec::new();
+        assert_eq!(finish_copilot(None, &mut out), 0);
+        assert_eq!(finish_copilot(Some("unframed".into()), &mut out), 0);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -401,6 +516,14 @@ mod tests {
     async fn hub(
         replies: Vec<(u16, &'static str)>,
         end: Option<PathBuf>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        hub_for(replies, end, Waker::Claude).await
+    }
+
+    async fn hub_for(
+        replies: Vec<(u16, &'static str)>,
+        end: Option<PathBuf>,
+        agent: Waker,
     ) -> (String, tokio::task::JoinHandle<usize>) {
         let last = replies.len();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -443,7 +566,7 @@ mod tests {
                         || text.contains("Authorization: Bearer secret"),
                     "{text}"
                 );
-                assert!(text.ends_with(r#"{"session":"s1"}"#), "{text}");
+                assert!(text.ends_with(&wait_body("s1", agent)), "{text}");
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -462,6 +585,15 @@ mod tests {
     }
 
     async fn ask(url: &str, life: Duration, alive: impl Fn() -> bool) -> Option<String> {
+        ask_for(url, life, alive, Waker::Claude).await
+    }
+
+    async fn ask_for(
+        url: &str,
+        life: Duration,
+        alive: impl Fn() -> bool,
+        agent: Waker,
+    ) -> Option<String> {
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("token");
         let mut options = std::fs::OpenOptions::new();
@@ -477,7 +609,7 @@ mod tests {
         let wait = Wait {
             client: &client,
             url: format!("{url}/v1/hub/agent-messages/wait"),
-            body: r#"{"session":"s1"}"#.into(),
+            body: wait_body("s1", agent),
             token_file: &token_file,
         };
         wait.until(life, alive, Duration::ZERO).await
@@ -503,13 +635,53 @@ mod tests {
     }
 
     #[test]
-    fn only_a_codex_waiter_names_its_agent() {
-        assert_eq!(wait_body("s1", false), r#"{"session":"s1"}"#);
-        let codex: Value = serde_json::from_str(&wait_body("s1", true)).unwrap();
-        assert_eq!(
-            codex,
-            serde_json::json!({"session": "s1", "agent": "codex"})
+    fn wait_bodies_preserve_claude_and_identify_other_delivery_mechanisms() {
+        assert_eq!(wait_body("s1", Waker::Claude), r#"{"session":"s1"}"#);
+        for (agent, name) in [(Waker::Codex, "codex"), (Waker::Copilot, "copilot")] {
+            let body: Value = serde_json::from_str(&wait_body("s1", agent)).unwrap();
+            assert_eq!(body, serde_json::json!({"session": "s1", "agent": name}));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copilot_notice_returns_context_after_empty_waits() {
+        let notice = r#"{"text":"AgentSCM Hub message msg_1 for this session, from octo"}"#;
+        let (url, served) = hub_for(vec![(204, ""), (200, notice)], None, Waker::Copilot).await;
+        let found = ask_for(&url, MAX_LIFE, || true, Waker::Copilot).await;
+        assert_eq!(served.await.unwrap(), 2);
+        let mut out = Vec::new();
+        assert_eq!(finish_copilot(found, &mut out), 0);
+        assert!(
+            serde_json::from_slice::<Value>(&out).unwrap()["additionalContext"]
+                .as_str()
+                .unwrap()
+                .starts_with(FRAME)
         );
+    }
+
+    #[tokio::test]
+    async fn an_older_hub_refusing_a_copilot_waiter_produces_no_context() {
+        let (url, served) = hub_for(vec![(400, "")], None, Waker::Copilot).await;
+        let found = ask_for(&url, MAX_LIFE, || true, Waker::Copilot).await;
+        assert_eq!(served.await.unwrap(), 1);
+        assert_eq!(found, None);
+        let mut out = Vec::new();
+        assert_eq!(finish_copilot(found, &mut out), 0);
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_notice_after_the_session_ends_never_wakes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ended = marker(dir.path(), "s1");
+        let notice = r#"{"text":"AgentSCM Hub message msg_1 for this session, from octo"}"#;
+        let (url, served) = hub_for(vec![(200, notice)], Some(ended.clone()), Waker::Copilot).await;
+        let found = ask_for(&url, MAX_LIFE, || !ended.exists(), Waker::Copilot).await;
+        assert_eq!(served.await.unwrap(), 1);
+        assert_eq!(found, None);
+        let mut out = Vec::new();
+        assert_eq!(finish_copilot(found, &mut out), 0);
+        assert!(out.is_empty());
     }
 
     #[tokio::test]

@@ -755,6 +755,16 @@ struct SequenceState {
     start_observed: bool,
     #[serde(default)]
     provider_history: Option<ProviderHistoryCursorV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    visible_history: BTreeMap<String, VisibleHistoryCursorV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    history_starts: BTreeMap<String, HistoryStartCursorV1>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    failed_history: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_capture_mode: Option<crate::change_record::CaptureModeV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pinned_identities: BTreeMap<String, SessionAssociationV1>,
     /// Set before the session's first append-only sequence record. `next` and `events` then hold
     /// only the frozen whole-map allocations of earlier releases, and binaries that know only
     /// that format refuse the state instead of reallocating logged sequences.
@@ -774,6 +784,32 @@ pub struct ProviderHistoryCursorV1 {
     pub offset: u64,
 }
 
+/// One explicitly associated Work's progress through a native session. Each Work reads
+/// the session independently; a cursor from another Work must never hide its earlier context.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VisibleHistoryCursorV1 {
+    pub harness: crate::change_record::AgentHarnessV1,
+    pub file: ProviderHistoryCursorV1,
+    pub header_digest: String,
+    pub line_number: u64,
+    pub model: Option<String>,
+    pub questions: crate::hub::session_waiting::QuestionSnapshot,
+    pub questions_complete: bool,
+}
+
+/// Metadata-only evidence that this native file explicitly started one Work.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryStartCursorV1 {
+    pub harness: crate::change_record::AgentHarnessV1,
+    pub file: ProviderHistoryCursorV1,
+    pub header_digest: String,
+    pub line_number: u64,
+    pub authorized: bool,
+    pub pending_calls: std::collections::BTreeSet<String>,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ObservedOrderStateV1 {
@@ -787,6 +823,9 @@ struct DirectoryClaim(File);
 
 pub(crate) struct RecipeFenceGuard(File);
 pub(crate) struct ManagedCaptureGuard(File);
+pub(crate) struct VisibleHistoryGuard {
+    _claim: DirectoryClaim,
+}
 
 impl DirectoryClaim {
     fn lock(directory: File) -> Result<Self> {
@@ -1561,6 +1600,62 @@ impl LocalSpool {
         Ok(ManagedCaptureGuard(file))
     }
 
+    /// Source-page exclusion is separate from managed capture and spool state locks.
+    pub(crate) fn lock_visible_history(&self) -> Result<VisibleHistoryGuard> {
+        let root = DirectoryClaim::lock(open_private_directory(&self.root)?)?;
+        self.validate_identity_claim(&root.0)?;
+        let directory = openat_file(
+            &root.0,
+            OsStr::new("sessions"),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        let identity = file_identity(&directory)?;
+        drop(root);
+        let claim = DirectoryClaim::lock(directory)?;
+        let root = DirectoryClaim::lock(open_private_directory(&self.root)?)?;
+        self.validate_identity_claim(&root.0)?;
+        let current = openat_file(
+            &root.0,
+            OsStr::new("sessions"),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        if file_identity(&current)? != identity {
+            return Err(CaptureError::Conflict(
+                "native history lock directory changed".into(),
+            ));
+        }
+        Ok(VisibleHistoryGuard { _claim: claim })
+    }
+
+    pub(crate) fn visible_history_failed(&self, session: &str, key: &str) -> Result<bool> {
+        validate_session_key(session, "visible-history")?;
+        let _lock = self.lock()?;
+        Ok(load_sequence_state(&self.session_state_path(session))?
+            .failed_history
+            .contains(key))
+    }
+
+    pub(crate) fn fail_visible_history(&self, session: &str, key: &str) -> Result<()> {
+        validate_session_key(session, "visible-history")?;
+        if !valid_digest(key) {
+            return Err(CaptureError::Invalid(
+                "native history failure key is invalid".into(),
+            ));
+        }
+        let _lock = self.lock()?;
+        let path = self.session_state_path(session);
+        let mut state = load_sequence_state(&path)?;
+        if !state.failed_history.contains(key) && state.failed_history.len() >= 256 {
+            return Err(CaptureError::Limit(
+                "native history failure association limit reached".into(),
+            ));
+        }
+        state.failed_history.insert(key.to_owned());
+        save_sequence_state(&path, &state, self)
+    }
+
     pub(crate) fn managed_invocation_for_occurrence(
         &self,
         observed_session_id: &str,
@@ -2200,8 +2295,11 @@ impl LocalSpool {
         validate_association(&association)?;
         let path = association_path(&self.root, observed_session_id);
         let _lock = self.lock()?;
-        let first = load_association(&self.root, observed_session_id)?
-            .map_or(capture_mode, |earlier| earlier.first_capture_mode());
+        let first = load_sequence_state(&self.session_state_path(observed_session_id))?
+            .native_capture_mode
+            .or(load_association(&self.root, observed_session_id)?
+                .map(|earlier| earlier.first_capture_mode()))
+            .unwrap_or(capture_mode);
         let association = SessionAssociationV1 {
             capture_mode: clamp_shared(first, capture_mode),
             original_capture_mode: Some(first),
@@ -2228,38 +2326,102 @@ impl LocalSpool {
         parent_session_id: Option<&str>,
         capture_mode: CaptureModeV1,
     ) -> Result<(Option<String>, CaptureModeV1)> {
-        let mut live = SessionAssociationV1 {
-            observed_session_id: observed_session_id.to_owned(),
-            canonical_session_id: canonical_session_id.to_owned(),
-            work_id: work_id.to_owned(),
-            generation,
-            parent_session_id: parent_session_id.map(str::to_owned),
-            capture_mode,
-            original_capture_mode: Some(capture_mode),
-        };
+        self.pin_session_identity_mode(
+            SessionAssociationV1 {
+                observed_session_id: observed_session_id.to_owned(),
+                canonical_session_id: canonical_session_id.to_owned(),
+                work_id: work_id.to_owned(),
+                generation,
+                parent_session_id: parent_session_id.map(str::to_owned),
+                capture_mode,
+                original_capture_mode: Some(capture_mode),
+            },
+            true,
+        )
+    }
+
+    /// Pins an explicitly associated Work without changing the native session's default route.
+    pub fn pin_associated_session_identity(
+        &self,
+        observed_session_id: &str,
+        canonical_session_id: &str,
+        work_id: &str,
+        generation: i64,
+        parent_session_id: Option<&str>,
+        capture_mode: CaptureModeV1,
+    ) -> Result<(Option<String>, CaptureModeV1)> {
+        self.pin_session_identity_mode(
+            SessionAssociationV1 {
+                observed_session_id: observed_session_id.to_owned(),
+                canonical_session_id: canonical_session_id.to_owned(),
+                work_id: work_id.to_owned(),
+                generation,
+                parent_session_id: parent_session_id.map(str::to_owned),
+                capture_mode,
+                original_capture_mode: Some(capture_mode),
+            },
+            false,
+        )
+    }
+
+    fn pin_session_identity_mode(
+        &self,
+        mut live: SessionAssociationV1,
+        update_route: bool,
+    ) -> Result<(Option<String>, CaptureModeV1)> {
         validate_association(&live)?;
         let _lock = self.lock()?;
-        let earlier = load_association(&self.root, observed_session_id)?;
-        if let Some(pinned) = &earlier
-            && pinned.canonical_session_id == canonical_session_id
-            && pinned.work_id == work_id
-            && pinned.generation == generation
-        {
-            return Ok((
-                pinned.parent_session_id.clone(),
-                clamp_shared(pinned.first_capture_mode(), pinned.capture_mode),
+        let earlier = load_association(&self.root, &live.observed_session_id)?;
+        let state_path = self.session_state_path(&live.observed_session_id);
+        let mut state = load_sequence_state(&state_path)?;
+        let first = state
+            .native_capture_mode
+            .or(earlier
+                .as_ref()
+                .map(SessionAssociationV1::first_capture_mode))
+            .unwrap_or(live.capture_mode);
+        let key = sha256(
+            serde_json::to_vec(&(&live.work_id, live.generation, &live.canonical_session_id))?
+                .as_slice(),
+        );
+        let matching = earlier.as_ref().filter(|earlier| {
+            earlier.canonical_session_id == live.canonical_session_id
+                && earlier.work_id == live.work_id
+                && earlier.generation == live.generation
+        });
+        if let Some(pinned) = state.pinned_identities.get(&key).or(matching) {
+            if pinned.observed_session_id != live.observed_session_id
+                || pinned.canonical_session_id != live.canonical_session_id
+                || pinned.work_id != live.work_id
+                || pinned.generation != live.generation
+            {
+                return Err(CaptureError::Conflict(
+                    "native session identity pin names another association".into(),
+                ));
+            }
+            live = pinned.clone();
+            validate_association(&live)?;
+        }
+        live.original_capture_mode = Some(first);
+        live.capture_mode = clamp_shared(first, live.capture_mode);
+        if !state.pinned_identities.contains_key(&key) && state.pinned_identities.len() >= 256 {
+            return Err(CaptureError::Limit(
+                "native session identity association limit reached".into(),
             ));
         }
-        // A session that began unshared never starts sharing, even under a new Work or generation.
-        if let Some(earlier) = &earlier {
-            let first = earlier.first_capture_mode();
-            live.original_capture_mode = Some(first);
-            live.capture_mode = clamp_shared(first, capture_mode);
+        if state.native_capture_mode != Some(first)
+            || state.pinned_identities.get(&key) != Some(&live)
+        {
+            state.native_capture_mode = Some(first);
+            state.pinned_identities.insert(key, live.clone());
+            save_sequence_state(&state_path, &state, self)?;
         }
-        let bytes = serde_json::to_vec(&live)?;
-        let path = association_path(&self.root, observed_session_id);
-        self.reserve_replace(&path, bytes.len() as u64)?;
-        atomic_replace(&path, &bytes)?;
+        if update_route && earlier.as_ref() != Some(&live) {
+            let bytes = serde_json::to_vec(&live)?;
+            let path = association_path(&self.root, &live.observed_session_id);
+            self.reserve_replace(&path, bytes.len() as u64)?;
+            atomic_replace(&path, &bytes)?;
+        }
         Ok((live.parent_session_id, live.capture_mode))
     }
 
@@ -3840,6 +4002,141 @@ impl LocalSpool {
         Ok(load_sequence_state(&path)?.provider_history)
     }
 
+    pub(crate) fn history_start_cursor(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<HistoryStartCursorV1>> {
+        validate_session_key(session_id, "history-start")?;
+        let _lock = self.lock()?;
+        Ok(load_sequence_state(&self.session_state_path(session_id))?
+            .history_starts
+            .get(key)
+            .cloned())
+    }
+
+    pub(crate) fn advance_history_start_cursor(
+        &self,
+        session_id: &str,
+        key: &str,
+        expected: Option<&HistoryStartCursorV1>,
+        next: HistoryStartCursorV1,
+    ) -> Result<()> {
+        validate_session_key(session_id, "history-start")?;
+        if !valid_digest(key)
+            || !valid_provider_history_cursor(&next.file)
+            || next.file.canonical_session_id != session_id
+            || !valid_digest(&next.header_digest)
+            || next.pending_calls.len() > 256
+            || next
+                .pending_calls
+                .iter()
+                .any(|id| !bounded_identifier(id, 255))
+        {
+            return Err(CaptureError::Invalid(
+                "native start proof cursor is invalid".into(),
+            ));
+        }
+        let _lock = self.lock()?;
+        let path = self.session_state_path(session_id);
+        let mut state = load_sequence_state(&path)?;
+        if state.history_starts.get(key) != expected {
+            return Err(CaptureError::Conflict(
+                "native start proof changed concurrently".into(),
+            ));
+        }
+        if !state.history_starts.contains_key(key) && state.history_starts.len() >= 256 {
+            return Err(CaptureError::Limit(
+                "native start proof association limit reached".into(),
+            ));
+        }
+        state.history_starts.insert(key.to_owned(), next);
+        save_sequence_state(&path, &state, self)
+    }
+
+    pub(crate) fn visible_history_cursor(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        generation: i64,
+    ) -> Result<Option<VisibleHistoryCursorV1>> {
+        validate_session_key(session_id, "visible-history")?;
+        let _lock = self.lock()?;
+        let state = load_sequence_state(&self.session_state_path(session_id))?;
+        Ok(state
+            .visible_history
+            .get(&visible_history_key(work_id, generation))
+            .cloned())
+    }
+
+    /// Advances only after every selected complete record has been durably queued. A concurrent
+    /// reader may already have advanced farther through the same file and association.
+    pub(crate) fn advance_visible_history_cursor(
+        &self,
+        session_id: &str,
+        expected: Option<&VisibleHistoryCursorV1>,
+        next: VisibleHistoryCursorV1,
+    ) -> Result<()> {
+        validate_session_key(session_id, "visible-history")?;
+        if !valid_provider_history_cursor(&next.file)
+            || next.file.canonical_session_id != session_id
+            || !valid_digest(&next.header_digest)
+            || next
+                .model
+                .as_ref()
+                .is_some_and(|model| !bounded_identifier(model, 255))
+            || next.questions.offset != next.file.offset
+            || next.questions.pending.len() > 256
+        {
+            return Err(CaptureError::Invalid(
+                "visible history cursor is invalid".into(),
+            ));
+        }
+        let path = self.session_state_path(session_id);
+        let key = visible_history_key(&next.file.work_id, next.file.generation);
+        let _lock = self.lock()?;
+        let mut state = load_sequence_state(&path)?;
+        let same_file = |previous: &VisibleHistoryCursorV1| {
+            previous.harness == next.harness
+                && previous.file.path_digest == next.file.path_digest
+                && previous.file.file_device == next.file.file_device
+                && previous.file.file_inode == next.file.file_inode
+                && previous.file.canonical_session_id == next.file.canonical_session_id
+                && previous.file.work_id == next.file.work_id
+                && previous.file.generation == next.file.generation
+                && previous.header_digest == next.header_digest
+        };
+        if let Some(previous) = expected
+            && (!same_file(previous)
+                || previous.file.offset > next.file.offset
+                || previous.line_number > next.line_number)
+        {
+            return Err(CaptureError::Conflict(
+                "visible history was replaced or truncated".into(),
+            ));
+        }
+        let current = state.visible_history.get(&key);
+        if current != expected {
+            if current.is_some_and(|current| {
+                same_file(current)
+                    && current.file.offset >= next.file.offset
+                    && current.line_number >= next.line_number
+            }) {
+                return Ok(());
+            }
+            return Err(CaptureError::Conflict(
+                "visible history cursor changed concurrently".into(),
+            ));
+        }
+        if current.is_none() && state.visible_history.len() >= 256 {
+            return Err(CaptureError::Limit(
+                "visible history association limit reached".into(),
+            ));
+        }
+        state.visible_history.insert(key, next);
+        save_sequence_state(&path, &state, self)
+    }
+
     /// Advances one exact provider-history file only after its complete records were durably
     /// queued. Replacement and truncation remain conflicts rather than being reattributed.
     pub fn advance_provider_history_cursor(
@@ -5038,7 +5335,18 @@ fn provider_history_gap_operation(operation_id: &str) -> bool {
 }
 
 fn replayable_event_operation(operation_id: &str) -> bool {
-    claimed_event_operation(operation_id) || provider_history_gap_operation(operation_id)
+    let mut parts = operation_id.split(':');
+    let visible_history = parts.next() == Some("visible")
+        && parts.next() == Some("history")
+        && parts.next().is_some_and(valid_digest)
+        && matches!(parts.next(), Some("pre" | "post" | "record"))
+        && parts
+            .next()
+            .is_some_and(|index| index.parse::<usize>().is_ok())
+        && parts.next().is_none();
+    claimed_event_operation(operation_id)
+        || provider_history_gap_operation(operation_id)
+        || visible_history
 }
 
 /// The claim ids that retained recipe attempts name. The caller holds the spool lock.
@@ -5742,6 +6050,10 @@ fn valid_provider_history_cursor(cursor: &ProviderHistoryCursorV1) -> bool {
         && cursor.work_id.starts_with("wrk_")
         && cursor.generation > 0
         && bounded_identifier(&cursor.canonical_session_id, 255)
+}
+
+fn visible_history_key(work_id: &str, generation: i64) -> String {
+    sha256(format!("{work_id}\0{generation}").as_bytes())
 }
 
 fn load_observed_order_state(path: &Path, max_bytes: u64) -> Result<ObservedOrderStateV1> {
@@ -7605,7 +7917,12 @@ fn valid_hash_json_name(name: &str) -> bool {
 }
 
 fn valid_sequence_state(state: &SequenceState) -> bool {
-    state.next > 0
+    state.pinned_identities.len() <= 256
+        && state
+            .pinned_identities
+            .iter()
+            .all(|(key, identity)| valid_digest(key) && validate_association(identity).is_ok())
+        && state.next > 0
         && state.events.len() <= MAX_SEQUENCE_EVENTS
         && state
             .events

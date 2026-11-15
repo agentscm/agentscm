@@ -183,6 +183,9 @@ pub enum Waker {
     Claude,
     /// Codex's: it queues the notice, which Codex starts as a turn within about ten seconds.
     Codex,
+    /// Copilot CLI's asynchronous notification hook returns context that can wake an idle
+    /// session. It waits only after a notification fires, until one notice is returned.
+    Copilot,
 }
 
 impl Waker {
@@ -191,6 +194,7 @@ impl Waker {
         match self {
             Self::Claude => "wake:claude",
             Self::Codex => "wake:codex",
+            Self::Copilot => "wake:copilot",
         }
     }
 }
@@ -230,7 +234,7 @@ pub struct Message {
     /// The sender's login.
     pub from: String,
     pub state: MessageState,
-    /// How it first reached the session: `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`.
+    /// How it first reached the session: `wake:<agent>`, `hook:<agent>` or `mcp`.
     pub via: Option<String>,
     /// The mode of its latest offer.
     pub mode: Option<Mode>,
@@ -1623,9 +1627,10 @@ mod tests {
             m.not_picked_up(m.due_at()),
             "its deadline still tells the person"
         );
-        for offered_again in [Waker::Claude.via(), "hook:codex"] {
+        for offered_again in [Waker::Claude.via(), Waker::Copilot.via(), "hook:codex"] {
             m.via = Some(offered_again.into());
             assert!(due(&m, 100 + REOFFER_SECS + 1), "{offered_again}");
+            assert!(!wakes(&m, 100 + REOFFER_SECS + 1), "never wake repeatedly");
         }
     }
 
@@ -1674,6 +1679,8 @@ mod tests {
         assert_eq!(client.reach(100), Reach::WakeNow);
         client.waker = Some(Waker::Codex);
         assert_eq!(client.reach(100), Reach::WakeSoon);
+        client.waker = Some(Waker::Copilot);
+        assert_eq!(client.reach(100), Reach::WakeNow);
         client.waker = Some(Waker::Claude);
         client.open_waits = 0;
         client.wait_left_at = Some(100);
@@ -1736,6 +1743,54 @@ mod tests {
                 .unwrap()
                 .contains_key(&("tok_reach_unseen".to_owned(), session.to_owned()))
         );
+    }
+
+    #[test]
+    fn a_copilot_notification_wait_is_not_a_permanent_wake_capability() {
+        let (token, session) = ("tok_copilot_reach", "copilot_reach");
+        let reach = || reach_of(token, session, unix_now());
+        note_hook(token, session, "hook:copilot", true, false, unix_now());
+        assert_eq!(reach(), Reach::NextStep, "no notification waiter yet");
+        let slot = WaitSlot::open("u_copilot_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Copilot, unix_now());
+        assert_eq!(reach(), Reach::WakeNow);
+        drop(slot);
+        assert_eq!(reach(), Reach::NextStep, "one notice ends its waiter");
+        let slot = WaitSlot::open("u_copilot_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Copilot, unix_now());
+        assert_eq!(reach(), Reach::WakeNow, "another notification rearms it");
+        note_end(token, session);
+        assert_eq!(reach(), Reach::Ended);
+        drop(slot);
+        note_hook(token, session, "hook:copilot", false, false, unix_now());
+        assert_eq!(reach(), Reach::Ended, "a helper cannot resume its parent");
+        note_hook(token, session, "hook:copilot", true, false, unix_now());
+        assert_eq!(reach(), Reach::NextStep, "resume alone opens no wait");
+    }
+
+    #[test]
+    fn wait_bodies_name_only_supported_delivery_mechanisms() {
+        let legacy: WaitBody = serde_json::from_value(serde_json::json!({"session": "s"})).unwrap();
+        assert_eq!(legacy.agent, Waker::Claude);
+        for (name, agent, via) in [
+            ("claude", Waker::Claude, "wake:claude"),
+            ("codex", Waker::Codex, "wake:codex"),
+            ("copilot", Waker::Copilot, "wake:copilot"),
+        ] {
+            let body: WaitBody =
+                serde_json::from_value(serde_json::json!({"session": "s", "agent": name})).unwrap();
+            assert_eq!(body.agent, agent);
+            assert_eq!(body.agent.via(), via);
+            assert_eq!(serde_json::to_value(agent).unwrap(), name);
+        }
+        for unknown in ["cursor", "gemini", "generic", "unknown"] {
+            assert!(
+                serde_json::from_value::<WaitBody>(
+                    serde_json::json!({"session": "s", "agent": unknown})
+                )
+                .is_err()
+            );
+        }
     }
 
     /// Each step keeps its own time: the first delivery and its way, the agent's first answer,
