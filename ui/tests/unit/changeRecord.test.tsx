@@ -315,6 +315,15 @@ describe('change record response', () => {
     expect(() => decodeChangeRecordResponse(negative)).toThrow(/session_setups_omitted/)
   })
 
+  it('keeps model-only setup observations without inventing settings or usage', () => {
+    const value = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    value.summary['session_setups'] = [{ session_id: 'gemini-session', parent_session_id: null, model: 'gemini-test-model', permission_mode: null, effort: null }]
+    const decoded = decodeChangeRecordResponse(value).summary
+    expect(decoded.session_setups).toEqual([{ session_id: 'gemini-session', parent_session_id: null, model: 'gemini-test-model', permission_mode: null, effort: null }])
+    expect(decoded.completeness.usage).toBe('unknown')
+    expect(decoded.unknowns).toContain('usage')
+  })
+
   it('accepts a worst-case escaped projection only after explicit deterministic omissions fit the shared 48 KiB envelope', async () => {
     const value = fixture()
     const escaped = '"'.repeat(1000)
@@ -548,6 +557,12 @@ describe('shared conversation', () => {
       ['entries', conversationPage(Array.from({ length: 101 }, (_, i) => entry({ sequence: i + 1 })))],
     ]
     for (const [field, value] of bad) expect(() => decodeConversationPage(value), field).toThrow(new RegExp(field))
+  })
+
+  it('recognizes the setup-observation kind without treating it as a tool event', () => {
+    const decoded = decodeConversationPage(conversationPage([entry({ kind: 'setup_observed' })]))
+    expect(decoded.entries[0]).toMatchObject({ kind: 'setup_observed', session_id: 'session-1', event_id: 'event-1' })
+    expect(decoded.entries[0]).not.toHaveProperty('tool')
   })
 
   it('requests the list with a validated cursor and the body by digest, both as plain bearer GETs', async () => {

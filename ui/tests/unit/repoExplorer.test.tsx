@@ -15,6 +15,7 @@ import {
   decodeExplorerHistory,
   decodeExplorerSummary,
   fetchExplorerSummary,
+  harnessName,
 } from '../../src/repoExplorer.ts'
 import { saveLocalToken } from '../../src/localApi.ts'
 
@@ -88,6 +89,14 @@ describe('repository explorer decoders', () => {
     const wrong = conversation()
     wrong.events[0]!.session_id = 'another-session'
     expect(() => decodeExplorerConversation(wrong)).toThrow(/events.identity/)
+  })
+
+  it.each(['setup_observed', 'turn_ended', 'compaction', 'subagent_started', 'subagent_stopped'])('keeps a %s metadata event without requiring a conversation body or tool', (kind) => {
+    const page = conversation()
+    const event = { ...page.events[0], kind, tool: null, body: { availability: 'not_applicable', media: null, content: null } }
+    const decoded = decodeExplorerConversation({ ...page, events: [event] })
+    expect(decoded.events[0]).toMatchObject({ kind, tool: null, body: { availability: 'not_applicable', media: null, content: null } })
+    expect(() => decodeExplorerConversation({ ...page, events: [{ ...event, kind: 'unrecognized_event' }] })).toThrow(/kind/)
   })
 
   it('accepts the Rust DTO boundaries and rejects values immediately above them', () => {
@@ -419,6 +428,15 @@ describe('saved conversation listing', () => {
     const decoded = decodeExplorerSessions(page)
     expect(decoded.sessions[0]).toMatchObject({ entry: 'session', relation: 'same_work_session', work_id: 'wrk_synthetic', capture_gap_count: 1 })
     expect(decoded.projection_coverage.complete).toBe(false)
+  })
+
+  it.each([
+    ['claude_code', 'Claude Code'], ['codex', 'Codex'], ['cursor', 'Cursor'],
+    ['copilot', 'GitHub Copilot'], ['gemini_cli', 'Gemini CLI'], ['future_host', 'Agent'],
+  ])('keeps the recorded %s harness with a truthful label', (harness, label) => {
+    const decoded = decodeExplorerSessions({ ...page, sessions: [{ ...session, harness }] })
+    expect(decoded.sessions[0]!.harness).toBe(harness)
+    expect(harnessName(decoded.sessions[0]!.harness)).toBe(label)
   })
 
   it('rejects any other relation or an inconsistent page', () => {

@@ -24,8 +24,9 @@ while the setting is off.
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
 spool. Claude thinking and redacted-thinking blocks and Codex reasoning are never selected. Passive
-hook capture does not call a model or send content to a provider. Capture records Claude Code and
-Codex sessions; what differs for Codex is in the [Codex adapter](#codex-adapter).
+hook capture does not call a model or send content to a provider. Capture records Claude Code,
+Codex, Cursor, Copilot and Gemini CLI sessions, within each host's visible hook contract. See the
+[Codex adapter](#codex-adapter) and [other native hooks](#other-native-hooks) for their limits.
 
 Capture has three modes per checkout, and `metadata-only` is the default:
 
@@ -228,9 +229,16 @@ are dropped to make room (their spools stay on disk). `unconfigure` and `forget`
 followed binding like any other, and a disabled one is never re-created by the plugin hook;
 re-enabling it from the local page gives it hooks of its own.
 
-From the plugin hook, capture shares the hook's time: it gives up at 2.5 seconds (4 at session
-start). A target lookup that runs out leaves a sanitized deferred fact instead of the event, and
-records not yet delivered wait for the next hook.
+From the plugin hook, local capture has a bounded budget: 2.5 seconds (4 at session start).
+Blocking local spool and Git work runs separately so it cannot starve the coordination deadline.
+A target lookup that runs out leaves a sanitized deferred fact instead of the event.
+Backlog delivery runs in a separate bounded process, with one worker per checkout and coalesced
+wake requests. It rechecks the saved connection, binding and sharing authorization on each pass.
+Completed attempts can schedule another bounded pass, with a finite allowance carried across
+workers. Refused records stay pending while the worker advances to later records; it stops when
+the cursor wraps, the allowance is spent, on error or without completed attempts, leaving
+unacknowledged records for a later hook. Hooks do not wait for
+backlog uploads, and a worker does not make an unavailable Hub block an edit.
 
 ### Per-checkout configuration
 
@@ -378,7 +386,7 @@ What leaves the machine, and when:
   session's bodies local, and sharing starts with the next session. Switching away stops uploads
   at the next delivery.
 - **Upload follows event acceptance.** The hook appends locally first and delivers the event
-  batch as before; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
+  batch through the background worker; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
@@ -576,9 +584,10 @@ to copied history.
 
 Configuration adds marked `agentscm change-capture hook-claude` entries for the eleven lifecycle
 groups and preserves unrelated hooks. Each hook has a 20-second host timeout. The hook resolves the
-exact current Work and generation for the native session on every invocation, appends locally
-before delivery, then replays at most ten pending envelopes in causal order through the existing
-client connection with a five-second delivery deadline. Only an HTTP 200 acknowledges an envelope.
+exact current Work and generation for the native session on every invocation and appends locally
+before scheduling background delivery. Each delivery pass replays at most ten pending envelopes
+in causal order through the existing client connection with a five-second delivery deadline.
+Only an HTTP 200 acknowledges an envelope.
 The durable scheduling cursor advances after every attempted envelope, so more than one page of
 retained rejected records or a persistent transient failure cannot indefinitely hide newer work.
 Only an HTTP 200 writes the separate acknowledgement; rejected, network-failed, and transiently
@@ -864,6 +873,31 @@ avoid duplicate conversational tool phases. A terminal source-identity or format
 gap and switches that Work generation to future trusted hooks after any in-flight source page
 settles. That generation never resumes source replay, which could duplicate prompts. The failing
 page and its triggering prompt remain partial; a newly admitted generation can recover again.
+
+## Other native hooks
+
+The installed Cursor, Copilot and Gemini CLI hooks feed the same bounded capture, redaction,
+sharing and opt-out path. Run `agentscm client setup --agent cursor|copilot|gemini` again to update
+an existing installation. These adapters do not read historical files or reconstruct earlier parent
+context; the native-history association described for Claude Code and Codex does not apply to them.
+
+| Host | Visible conversation and tools | Model and automatic token usage |
+| --- | --- | --- |
+| Cursor | `beforeSubmitPrompt`, full `afterAgentResponse.text`, tool start/result/failure and lifecycle markers | Bounded native model field; no per-request token counts in the documented hooks |
+| Copilot | `userPromptSubmitted`, tool start/result/failure and lifecycle markers; no assistant reply in its documented hooks | Model and token counts unavailable |
+| Gemini CLI | `BeforeAgent.prompt`, `AfterAgent.prompt_response`, tool start/result and lifecycle markers | Bounded model from `BeforeModel`; no reliable additive token totals |
+
+Copilot's camelCase payload omits the event name, so setup supplies an exact `--hook-event` argument.
+Unknown or conflicting event hints are not captured. Tool observations without a native call ID
+remain unpaired; no tool ID is invented. Model-only observations use `setup_observed` without a body.
+Older Hubs that do not accept the new harnesses or event kind leave their envelopes pending; upgrade
+the Hub before the clients.
+
+Cursor thought hooks and Gemini's streamed `AfterModel` hook are not installed. Gemini's
+`BeforeModel` supplies only model metadata; capture excludes model messages, candidates and
+token snapshots. Visible Gemini replies come only from `AfterAgent`. Missing usage stays unknown,
+and is never reported as zero. These mappings are tested with synthetic native payloads; live host
+delivery across client versions is not qualified by those tests.
 
 ## Codex adapter
 

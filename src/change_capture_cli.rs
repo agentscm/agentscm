@@ -3,14 +3,14 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentscm::change_capture::claude_code::{self, CaptureRequest};
 use agentscm::change_capture::{
     CaptureError, ConfiguredRecipeReconcileRequest, ConfiguredRecipeRunRequest, DeferredReasonV1,
     GitSourceRequest, LocalSpool, ObservedCommandRequest, ObservedStop, RecipeReconcileOutcome,
-    codex, export_spool_archive, inspect_spool, reconcile_retained_configured_recipe,
+    codex, export_spool_archive, inspect_spool, native_hooks, reconcile_retained_configured_recipe,
     run_configured_recipe_with_cancellation, run_observed_command,
 };
 use agentscm::change_record::{
@@ -57,6 +57,9 @@ pub enum ChangeCaptureCommand {
     ReconcileRecipe(ReconcileRecipeArgs),
     /// Consume one Claude Code native hook payload from stdin without blocking the host session.
     HookClaude,
+    /// Drain retained capture in a bounded process independent of the native hook.
+    #[command(hide = true)]
+    DeliverWorker(DeliverWorkerArgs),
     /// Import the visible portion of one explicitly selected Claude Code session log.
     ImportClaude(ImportArgs),
     /// Import the visible portion and token usage of one explicitly selected Codex session file.
@@ -124,6 +127,15 @@ pub struct StatusArgs {
     /// Canonical Git checkout with a retained capture binding.
     #[arg(long, default_value = ".")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct DeliverWorkerArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Remaining terminal attempts in this traversal; only fresh native wakes replenish it.
+    #[arg(long)]
+    remaining_attempts: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -295,7 +307,8 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::Export(args) => export(args),
         ChangeCaptureCommand::RunRecipe(args) => run_recipe(args).await,
         ChangeCaptureCommand::ReconcileRecipe(args) => reconcile_recipe(args).await,
-        ChangeCaptureCommand::HookClaude => hook_claude().await,
+        ChangeCaptureCommand::HookClaude => legacy_capture_hook().await,
+        ChangeCaptureCommand::DeliverWorker(args) => deliver_worker_command(args).await,
         ChangeCaptureCommand::ImportClaude(args) => import(args, AgentHarnessV1::ClaudeCode),
         ChangeCaptureCommand::ImportCodex(args) => import(args, AgentHarnessV1::Codex),
         ChangeCaptureCommand::Observe(args) => observe(args),
@@ -333,6 +346,236 @@ async fn conversation(args: ConversationArgs) -> Result<i32> {
     };
     println!("{output}");
     Ok(0)
+}
+
+async fn legacy_capture_hook() -> ! {
+    let capture = tokio::task::spawn_blocking(|| -> Result<i32> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(hook_claude())
+    });
+    let code = match tokio::time::timeout(Duration::from_millis(18_500), capture).await {
+        Ok(Ok(Ok(code))) => code,
+        _ => {
+            eprintln!("AgentSCM local capture warning: the native hook could not finish in time");
+            0
+        }
+    };
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // Runtime shutdown otherwise waits for a capture task blocked on a spool lock.
+    std::process::exit(code)
+}
+
+const DELIVERY_WORKER_BUDGET: Duration = Duration::from_secs(20);
+const DELIVERY_WORKER_LIFE: Duration = Duration::from_secs(30);
+
+async fn deliver_worker_command(args: DeliverWorkerArgs) -> Result<i32> {
+    let started = tokio::time::Instant::now();
+    let (done, stopped) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("capture-delivery-deadline".into())
+        .spawn(move || {
+            if matches!(
+                stopped.recv_timeout(DELIVERY_WORKER_LIFE.saturating_sub(started.elapsed())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                // Only this disposable worker exits; durable spool writes recover normally.
+                std::process::exit(0);
+            }
+        })?;
+    let result = delivery_worker(
+        &args.root,
+        args.remaining_attempts,
+        started + DELIVERY_WORKER_BUDGET,
+    )
+    .await;
+    let _ = done.send(());
+    result.map(|()| 0)
+}
+
+fn delivery_worker_paths(root: &Path) -> Result<(PathBuf, PathBuf)> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let directory = crate::hub_cli::config_dir()?.join("agentscm/capture-delivery");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Invalid(
+            "capture delivery directory is not private".into(),
+        ));
+    }
+    let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    Ok((
+        directory.join(format!("{key}.lock")),
+        directory.join(format!("{key}.requested")),
+    ))
+}
+
+fn delivery_worker_lock(path: &Path) -> Result<Option<File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Invalid(
+            "capture delivery lock is not private".into(),
+        ));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn launch_delivery_worker(
+    root: &Path,
+    lock: &Path,
+    remaining_attempts: Option<usize>,
+) -> Result<()> {
+    let Some(probe) = delivery_worker_lock(lock)? else {
+        return Ok(());
+    };
+    drop(probe);
+    let mut worker = std::process::Command::new(std::env::current_exe()?);
+    worker
+        .args([
+            "--no-telemetry",
+            "change-capture",
+            "deliver-worker",
+            "--root",
+        ])
+        .arg(root);
+    if let Some(remaining) = remaining_attempts {
+        worker
+            .arg("--remaining-attempts")
+            .arg(remaining.to_string());
+    }
+    worker
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+fn schedule_delivery(root: &Path) -> Result<()> {
+    let (lock, requested) = delivery_worker_paths(root)?;
+    // Atomic replacement cannot lose a wake to a worker unlinking its previous marker.
+    crate::hub_cli::write_private(&requested, "")?;
+    launch_delivery_worker(root, &lock, None)
+}
+
+async fn delivery_worker(
+    root: &Path,
+    remaining_attempts: Option<usize>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let root = crate::client_config::canonical_root(root)?;
+    let (lock_path, requested) = delivery_worker_paths(&root)?;
+    let Some(lock) = delivery_worker_lock(&lock_path)? else {
+        return Ok(());
+    };
+    let result = drain_delivery(&root, &requested, deadline, remaining_attempts).await;
+    drop(lock);
+    // A hook that saw the lock held left this marker instead of spawning another process.
+    let next = if requested.try_exists()? {
+        launch_delivery_worker(&root, &lock_path, None)
+    } else if let Ok(Some(remaining)) = &result {
+        // Continuation is not a fresh wake: carry its decreasing allowance to the successor.
+        launch_delivery_worker(&root, &lock_path, Some(*remaining))
+    } else {
+        Ok(())
+    };
+    let _ = result?;
+    next
+}
+
+async fn drain_delivery(
+    root: &Path,
+    requested: &Path,
+    deadline: tokio::time::Instant,
+    remaining_attempts: Option<usize>,
+) -> Result<Option<usize>> {
+    let mut advanced = false;
+    let mut attempted = std::collections::BTreeSet::new();
+    // Consume only the wake that started this traversal. A hook arriving while it runs must
+    // leave a fresh wake even when the cursor subsequently wraps through older refusals.
+    let fresh = match fs::remove_file(requested) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let allowance = if fresh { None } else { remaining_attempts };
+    let mut remaining = None;
+    loop {
+        // Re-read the binding, origin and token before every pass; hooks grant no upload authority.
+        let Some((binding, spool, connection)) =
+            change_capture_client::binding_for_payload(&json!({"cwd": root}))?
+        else {
+            return Ok(None);
+        };
+        let remaining = match &mut remaining {
+            Some(remaining) => remaining,
+            empty @ None => {
+                let usage = spool.usage().map_err(capture_error)?;
+                empty.insert(
+                    allowance
+                        .unwrap_or(usage.records)
+                        .min(usage.limits.max_records),
+                )
+            }
+        };
+        if *remaining == 0 {
+            return Ok(None);
+        }
+        // The shared delivery cursor advances past refusals. Traverse until it wraps, so a
+        // blocked page cannot hide healthy later records or make this worker retry forever.
+        // The final fixed-size page may include an already attempted tail after wrapping.
+        let page = spool.delivery_page(10).map_err(capture_error)?;
+        let Some(first) = page.first() else {
+            return Ok(None);
+        };
+        if attempted.contains(&delivery_identity(first)) {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(advanced.then_some(*remaining));
+        }
+        let hub = change_capture_client::CaptureHub::new(connection)?;
+        // Delivery already bounds a pass to five seconds. Stop between passes so its terminal
+        // attempt count is known; the separate watchdog still bounds a stuck process.
+        let report =
+            change_capture_client::deliver_pending_with(&binding.root, &spool, &hub).await?;
+        let completed = report.delivered + report.blocked;
+        if completed == 0 {
+            return Ok(None);
+        }
+        advanced = true;
+        *remaining = remaining.saturating_sub(completed);
+        attempted.extend(page.iter().take(completed).map(delivery_identity));
+    }
+}
+
+fn delivery_identity(envelope: &CaptureEnvelopeV1) -> (&'static str, String) {
+    let (kind, identity) = match envelope {
+        CaptureEnvelopeV1::EventBatch(value) => ("event", &value.operation_id),
+        CaptureEnvelopeV1::ActionStart(value) => ("start", &value.operation_id),
+        CaptureEnvelopeV1::ActionFinish(value) => ("finish", &value.operation_id),
+        CaptureEnvelopeV1::Usage(value) => ("usage", &value.observation_id),
+    };
+    (kind, identity.clone())
 }
 
 async fn hook_claude() -> Result<i32> {
@@ -396,6 +639,7 @@ fn history_root(harness: AgentHarnessV1, checkout: &std::path::Path) -> Option<P
         AgentHarnessV1::ClaudeCode => crate::client_plugin::claude_config_dir(checkout)
             .ok()
             .map(|root| root.join("projects")),
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => None,
     }
 }
 
@@ -403,6 +647,7 @@ fn find_history(root: &std::path::Path, session: &str, harness: AgentHarnessV1) 
     match harness {
         AgentHarnessV1::Codex => codex::find_rollout(root, session).ok().flatten(),
         AgentHarnessV1::ClaudeCode => claude_code::find_transcript(root, session).ok().flatten(),
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => None,
     }
 }
 
@@ -424,6 +669,12 @@ async fn native_start_proven(
     path: &std::path::Path,
     deadline: tokio::time::Instant,
 ) -> bool {
+    if !matches!(
+        association.harness,
+        AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex
+    ) {
+        return false;
+    }
     use sha2::{Digest, Sha256};
     let scope = format!("{:?}\0{}", association.harness, association.session);
     let proofs = config.join("agentscm").join("native-start-proofs");
@@ -466,6 +717,11 @@ async fn native_start_proven(
                 }
                 AgentHarnessV1::ClaudeCode => {
                     claude_code::verify_history_start(&path, &request, &repo, &spool)
+                }
+                AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => {
+                    Err(CaptureError::Invalid(
+                        "this harness has no native history reader".into(),
+                    ))
                 }
             }
         });
@@ -639,13 +895,25 @@ pub(crate) async fn watch_session(config: PathBuf, session: String) {
 
 /// The harness whose hook events capture records for the hook client's `agent`, when `payload`
 /// is one of them.
-pub(crate) fn captured_harness(agent: &str, payload: &Value) -> Option<AgentHarnessV1> {
-    let event = payload.get("hook_event_name").and_then(Value::as_str)?;
+pub(crate) fn captured_harness(
+    agent: &str,
+    payload: &Value,
+    event_hint: Option<&str>,
+) -> Option<AgentHarnessV1> {
+    let event = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     match agent {
         "claude" if change_capture_client::is_claude_capture_event(event) => {
             Some(AgentHarnessV1::ClaudeCode)
         }
         "codex" if codex::HOOK_EVENTS.contains(&event) => Some(AgentHarnessV1::Codex),
+        "cursor" | "copilot" | "gemini" => native_hooks::normalize(agent, payload, event_hint)
+            .ok()
+            .flatten()
+            .filter(|hook| !hook.events.is_empty())
+            .map(|hook| hook.harness),
         _ => None,
     }
 }
@@ -733,9 +1001,9 @@ async fn plugin_capture_inner(
         let (checkout, connection) = (checkout.clone(), connection.clone());
         move || {
             let followed = change_capture_client::followed_binding(&checkout, &connection, create);
-            // A binding with hooks of its own has them for Claude Code only, so this hook is the
-            // one that captures Codex for it.
-            if (harness == AgentHarnessV1::Codex || explicit) && matches!(followed, Ok(None)) {
+            // A binding with hooks of its own has them for Claude Code only. The other native
+            // clients use their installed plugin hook while retaining the binding's mode.
+            if (harness != AgentHarnessV1::ClaudeCode || explicit) && matches!(followed, Ok(None)) {
                 let own = change_capture_client::binding_for_payload(&json!({"cwd": checkout}))
                     .ok()
                     .flatten()
@@ -781,10 +1049,10 @@ async fn plugin_capture_inner(
     .await
 }
 
-/// Records one native hook event for `binding` and delivers what is pending. Fails open: every
+/// Records one native hook event for `binding` and schedules pending delivery. Fails open: every
 /// problem is a warning. Returns the session-start context, if any. Past `deadline` a Hub call is
-/// given up: an unresolved target leaves a sanitized deferred fact, and pending records wait for
-/// the next hook.
+/// given up: an unresolved target leaves a sanitized deferred fact, and retained records are
+/// offered to the separate delivery worker.
 #[derive(Default)]
 struct NativeCapture<'a> {
     deadline: Option<tokio::time::Instant>,
@@ -835,21 +1103,10 @@ async fn capture_native(
             }
         },
     };
-    let deliver = || async {
-        match hub {
-            // Delivery leaves time for the session-start notice and the reply.
-            Some(hub) => tokio::time::timeout_at(
-                deadline - Duration::from_millis(400),
-                change_capture_client::deliver_pending_with(&binding.root, spool, hub),
-            )
-            .await
-            .unwrap_or_else(|_| Err(Error::Invalid("capture delivery ran out of time".into()))),
-            None => Err(Error::Invalid("capture Hub client unavailable".into())),
-        }
-    };
+    let deliver = || async { schedule_delivery(&binding.root) };
     // Upkeep runs beside the Hub lookups, and this event is written only after it, so a spool
-    // that filled with what the Hub has accepted makes room first; delivery, which can take the
-    // rest of the hook's time, comes after. Session start and turn end tidy from 80% of a limit;
+    // that filled with what the Hub has accepted makes room first; a separate process delivers
+    // pending records afterwards. Session start and turn end tidy from 80% of a limit;
     // any other event only a full spool, so a spool that stays past 80% does not cost every
     // tool hook a pass.
     let tidy = matches!(
@@ -892,8 +1149,9 @@ async fn capture_native(
     let event = payload.get("hook_event_name").and_then(Value::as_str);
     let session_start = event == Some("SessionStart");
     let claude = harness == AgentHarnessV1::ClaudeCode;
+    let codex_harness = harness == AgentHarnessV1::Codex;
     // A Codex model request is token usage, not an event of the session.
-    let model_request = !claude && event == Some("PostModelRequest");
+    let model_request = codex_harness && event == Some("PostModelRequest");
     if session_start {
         sweep_session_files();
     }
@@ -928,6 +1186,7 @@ async fn capture_native(
             }
             let retained = claude_code::deferred_native_hook(
                 input,
+                harness,
                 DeferredReasonV1::NoCurrentAuthorizedWork,
                 &actions,
                 spool,
@@ -947,6 +1206,7 @@ async fn capture_native(
         Err(_) => {
             let retained = claude_code::deferred_native_hook(
                 input,
+                harness,
                 DeferredReasonV1::TargetLookupUnavailable,
                 &actions,
                 spool,
@@ -1061,7 +1321,14 @@ async fn capture_native(
                             AgentHarnessV1::ClaudeCode => {
                                 claude_code::capture_transcript(&path, &request, &spool)
                             }
-                            _ => codex::capture_rollout(&path, &request, &spool),
+                            AgentHarnessV1::Codex => {
+                                codex::capture_rollout(&path, &request, &spool)
+                            }
+                            AgentHarnessV1::Cursor
+                            | AgentHarnessV1::Copilot
+                            | AgentHarnessV1::GeminiCli => Err(CaptureError::Invalid(
+                                "this harness has no native history reader".into(),
+                            )),
                         }
                     });
                     match tokio::time::timeout_at(deadline, read).await {
@@ -1121,7 +1388,7 @@ async fn capture_native(
     if options.association.is_some() {
         let lifecycle = matches!(event, Some("SessionStart" | "SessionEnd"));
         if !failed_now && (failed_before || lifecycle) {
-            if !claude
+            if codex_harness
                 && event == Some("Stop")
                 && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
                 && claude_code::capture_associated_hook(&reply, &request, spool).is_err()
@@ -1148,7 +1415,7 @@ async fn capture_native(
             }
         }
     }
-    if !claude
+    if codex_harness
         && !rollout
         && !failed_now
         && event == Some("Stop")
@@ -1165,6 +1432,22 @@ async fn capture_native(
             event: claude_code::HookCaptureOutcome::Ignored,
             action: claude_code::NativeActionOutcome::NotApplicable,
             warnings: Vec::new(),
+        })
+    } else if !matches!(harness, AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex)
+        && matches!(
+            event,
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        )
+        && payload.get("tool_use_id").and_then(Value::as_str).is_none()
+    {
+        // These hosts can report tool observations without a tool-call identity. Preserve the
+        // observations, but do not manufacture a phase pair or source-bound action receipt.
+        claude_code::capture_hook(input, &request, spool).map(|event| {
+            claude_code::NativeHookReport {
+                event,
+                action: claude_code::NativeActionOutcome::NotApplicable,
+                warnings: Vec::new(),
+            }
         })
     } else {
         claude_code::capture_native_hook(input, &request, &actions, spool)
@@ -1224,15 +1507,8 @@ async fn capture_native(
             );
         }
     }
-    match deliver().await {
-        Ok(report) if report.blocked > 0 => eprintln!(
-            "AgentSCM local capture warning: {} retained record(s) remain blocked by current Hub authorization or work generation",
-            report.blocked
-        ),
-        Ok(_) => {}
-        Err(_) => {
-            eprintln!("AgentSCM local capture warning: retained records remain pending delivery")
-        }
+    if deliver().await.is_err() {
+        eprintln!("AgentSCM local capture warning: retained records remain pending delivery");
     }
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
@@ -1633,6 +1909,11 @@ fn import(args: ImportArgs, harness: AgentHarnessV1) -> Result<i32> {
                 codex::import_rollout(input, &request, &spool).map_err(capture_error)?;
             (report, Some(usage))
         }
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => {
+            return Err(Error::Invalid(
+                "this harness has no native history importer".into(),
+            ));
+        }
     };
     let mut output = json!({
         "batches": report.batches,
@@ -1821,6 +2102,412 @@ fn capture_error(error: agentscm::change_capture::CaptureError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delivery_lock_coalesces_wakes_and_rejects_unsafe_files() {
+        use super::*;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        crate::client_config::in_isolated_config_home(|config| {
+            let root = config.join("repo");
+            let (path, requested) = delivery_worker_paths(&root).unwrap();
+            let lock = delivery_worker_lock(&path).unwrap().unwrap();
+            assert!(delivery_worker_lock(&path).unwrap().is_none());
+            schedule_delivery(&root).unwrap();
+            schedule_delivery(&root).unwrap();
+            assert!(requested.exists());
+            // Removing a previous request and replacing it while the worker holds the lock
+            // leaves the fresh request visible after release.
+            fs::remove_file(&requested).unwrap();
+            schedule_delivery(&root).unwrap();
+            drop(lock);
+            assert!(requested.exists());
+            assert!(delivery_worker_lock(&path).unwrap().is_some());
+
+            let alias = path.with_extension("alias");
+            fs::hard_link(&path, &alias).unwrap();
+            assert!(delivery_worker_lock(&path).is_err());
+            fs::remove_file(&alias).unwrap();
+            symlink(&path, &alias).unwrap();
+            assert!(delivery_worker_lock(&alias).is_err());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(delivery_worker_lock(&path).is_err());
+        });
+    }
+
+    fn delivery_fixture(
+        config: &Path,
+        status: u16,
+        slow_after_page: bool,
+    ) -> (std::path::PathBuf, LocalSpool) {
+        let (root, spool, _) =
+            delivery_fixture_reply(config, status, slow_after_page, move |_| status);
+        (root, spool)
+    }
+
+    fn delivery_fixture_reply(
+        config: &Path,
+        label: u16,
+        slow_after_page: bool,
+        reply: impl Fn(&Value) -> u16 + Send + 'static,
+    ) -> (
+        std::path::PathBuf,
+        LocalSpool,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = config.join(format!("repo-{label}"));
+        fs::create_dir(&root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let root = root.canonicalize().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let received = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut headers = Vec::new();
+                let mut byte = [0; 1];
+                while !headers.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                    headers.push(byte[0]);
+                }
+                let length = String::from_utf8_lossy(&headers)
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<u64>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = Vec::new();
+                (&mut stream).take(length).read_to_end(&mut body).unwrap();
+                let status = reply(&serde_json::from_slice(&body).unwrap());
+                let count = received.fetch_add(1, Ordering::Relaxed);
+                if slow_after_page && count >= 10 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        let token = config.join("token");
+        crate::hub_cli::write_private(&token, "synthetic-token").unwrap();
+        let spool = LocalSpool::open(config.join(format!("spool-{label}"))).unwrap();
+        let mut saved = binding(&root);
+        saved.spool = spool.root().to_owned();
+        saved.spool_identity = Some(spool.identity());
+        saved.hub = url.clone();
+        saved.spool_limits = agentscm::change_capture::SpoolLimits::default();
+        saved.action_rules = serde_json::from_value(json!([{
+            "native_tool":"Bash", "kind":"execution", "coverage":"partial",
+            "result_source":"unverified", "recipe_digest":null
+        }]))
+        .unwrap();
+        crate::hub_cli::write_private(
+            &config.join("agentscm/change-capture.json"),
+            &json!({"version":5,"bindings":[saved]}).to_string(),
+        )
+        .unwrap();
+        crate::hub_cli::write_private(&config.join("agentscm/connections.json"), &json!({"version":1,"connections":[{
+            "root":root,"origin_host":"github.com","hub":url,"repo":"acme/widgets","token_file":token
+        }]}).to_string()).unwrap();
+        (root, spool, requests)
+    }
+
+    #[test]
+    fn delivery_deadline_includes_setup_and_reserves_last_pass_and_handoff_time() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        assert!(
+            DELIVERY_WORKER_BUDGET + change_capture_client::DELIVERY_DEADLINE
+                < DELIVERY_WORKER_LIFE
+        );
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool, requests) = delivery_fixture_reply(config, 200, false, |_| 200);
+            spool.append(&batch(1)).unwrap();
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            // Setup has already spent the budget; the drain must not start a fresh clock.
+            let started = tokio::time::Instant::now() - DELIVERY_WORKER_BUDGET;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    started + DELIVERY_WORKER_BUDGET,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(requests.load(Ordering::Relaxed), 0);
+            assert_eq!(spool.pending(100).unwrap(), vec![batch(1)]);
+        });
+    }
+
+    #[test]
+    fn delivery_progress_schedules_a_successor_at_its_budget() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool) = delivery_fixture(config, 200, true);
+            for n in 0..30 {
+                spool.append(&batch(n)).unwrap();
+            }
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    None,
+                ))
+                .unwrap();
+            assert!(
+                remaining.is_some(),
+                "terminal progress must keep a large backlog draining"
+            );
+            assert!(
+                !requested.exists(),
+                "a continuation must not create a fresh native wake"
+            );
+            let pending = spool.pending(100).unwrap().len();
+            assert!(pending > 0 && pending < 30, "pending: {pending}");
+        });
+    }
+
+    #[test]
+    fn delivery_refusal_or_error_retains_records_without_self_chaining() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            for status in [401, 403, 500] {
+                let (root, spool) = delivery_fixture(config, status, false);
+                let envelope = batch(1);
+                spool.append(&envelope).unwrap();
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(drain_delivery(
+                        &root,
+                        &requested,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        None,
+                    ));
+                assert_eq!(result.is_ok(), status != 500);
+                assert!(!requested.exists());
+                assert_eq!(spool.pending(100).unwrap(), vec![envelope]);
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_traverses_blocked_pages_before_healthy_records_and_stops_at_cursor_wrap() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        crate::client_config::in_isolated_config_home(|config| {
+            for blocked in [15, 25] {
+                let (root, spool, requests) =
+                    delivery_fixture_reply(config, blocked, false, move |body| {
+                        let number: u16 = body["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("op:")
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if number < blocked { 403 } else { 200 }
+                    });
+                for n in 0..25 {
+                    let mut envelope = batch(n);
+                    let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope else {
+                        unreachable!()
+                    };
+                    batch.operation_id = format!("op:{n:03}");
+                    batch.events[0].sequence = n as u64 + 1;
+                    spool.append(&envelope).unwrap();
+                }
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let remaining = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(drain_delivery(
+                        &root,
+                        &requested,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        None,
+                    ))
+                    .unwrap();
+                assert_eq!(remaining, None);
+                assert_eq!(spool.pending(100).unwrap().len(), usize::from(blocked));
+                assert!(
+                    !requested.exists(),
+                    "blocked leftovers must not schedule a successor"
+                );
+                // A final ten-record page can wrap into five refused records already tried.
+                assert_eq!(requests.load(Ordering::Relaxed), 30);
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_preserves_a_new_wake_when_refused_records_wrap() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let requested = config.join("wake-during-pass");
+            let fresh = requested.clone();
+            let (root, spool, _) = delivery_fixture_reply(config, 403, false, move |_| {
+                crate::hub_cli::write_private(&fresh, "").unwrap();
+                403
+            });
+            spool.append(&batch(1)).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(remaining, None);
+            assert!(
+                requested.exists(),
+                "a wake arriving during traversal must survive cursor wrap"
+            );
+        });
+    }
+
+    #[test]
+    fn delivery_continuations_cross_a_slow_refused_prefix_with_a_finite_attempt_allowance() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        crate::client_config::in_isolated_config_home(|config| {
+            for blocked in [20, 25] {
+                let (root, spool, requests) =
+                    delivery_fixture_reply(config, blocked, false, move |body| {
+                        // One page exceeds the injected worker budget without timing out any request.
+                        std::thread::sleep(Duration::from_millis(75));
+                        let number: u16 = body["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("op:")
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if number < blocked { 403 } else { 200 }
+                    });
+                for n in 0..25 {
+                    let mut envelope = batch(n);
+                    let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope else {
+                        unreachable!()
+                    };
+                    batch.operation_id = format!("op:{n:03}");
+                    batch.events[0].sequence = n as u64 + 1;
+                    spool.append(&envelope).unwrap();
+                }
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let initial = spool.usage().unwrap().records;
+                let mut remaining = None;
+                let mut workers = 0;
+                loop {
+                    let previous = remaining.unwrap_or(initial);
+                    remaining = runtime
+                        .block_on(drain_delivery(
+                            &root,
+                            &requested,
+                            tokio::time::Instant::now() + Duration::from_millis(500),
+                            remaining,
+                        ))
+                        .unwrap();
+                    workers += 1;
+                    assert!(
+                        !requested.exists(),
+                        "continuation must carry its allowance, not a fresh wake"
+                    );
+                    if workers == 1 {
+                        assert!(
+                            remaining.is_some(),
+                            "a fully refused first page must still reach the tail"
+                        );
+                        assert_eq!(spool.pending(100).unwrap().len(), 25);
+                    }
+                    match remaining {
+                        Some(next) => assert!(next < previous),
+                        None => break,
+                    }
+                    assert!(workers < 4, "an all-refused traversal must finish");
+                }
+                assert_eq!(spool.pending(100).unwrap().len(), usize::from(blocked));
+                assert!(requests.load(Ordering::Relaxed) <= initial + 9);
+            }
+        });
+    }
+
+    #[test]
+    fn a_fresh_delivery_wake_replenishes_an_inherited_continuation_allowance() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool) = delivery_fixture(config, 200, false);
+            for n in 0..25 {
+                spool.append(&batch(n)).unwrap();
+            }
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            // A native hook wins the race after a predecessor chose its continuation argument.
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Some(1),
+                ))
+                .unwrap();
+            assert_eq!(remaining, None);
+            assert!(spool.pending(100).unwrap().is_empty());
+            assert!(!requested.exists());
+        });
+    }
+
     #[tokio::test]
     async fn native_start_proof_does_not_trust_a_candidates_claimed_chat() {
         use super::*;
@@ -2560,6 +3247,107 @@ mod tests {
                 super::NativeCapture::default(),
             ));
         assert_eq!(context, None);
+    }
+
+    #[test]
+    fn additional_native_harnesses_keep_unpaired_tool_facts_and_model_without_history_or_usage() {
+        use super::{NativeCapture, capture_native, find_history, history_root, native_hooks};
+        crate::client_config::in_isolated_config_home(|config| {
+            let (hub, url) = loopback(config, true);
+            let history = history_under(&config.join("unrelated-history"));
+            let bound = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(config.join("unrelated-history")),
+                ..binding(config)
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for (agent, hint, payload, kind) in [
+                (
+                    "cursor",
+                    None,
+                    json!({"hook_event_name":"postToolUse","conversation_id":"session_fixture",
+                    "tool_name":"Shell","tool_output":"visible output","transcript_path":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "copilot",
+                    Some("postToolUse"),
+                    json!({"sessionId":"session_fixture","toolName":"bash",
+                    "toolResult":{"resultType":"success","textResultForLlm":"visible output"},"transcriptPath":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "gemini",
+                    None,
+                    json!({"hook_event_name":"AfterTool","session_id":"session_fixture",
+                    "tool_name":"run_shell_command","tool_response":{"output":"visible output"},"transcript_path":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "gemini",
+                    None,
+                    json!({"hook_event_name":"BeforeModel","session_id":"session_fixture",
+                    "llm_request":{"model":"gemini-example","messages":["excluded-context"]},
+                    "llm_response":{"usageMetadata":{"totalTokenCount":42}},"transcript_path":history}),
+                    CapturedEventKindV1::SetupObserved,
+                ),
+            ] {
+                let hook = native_hooks::normalize(agent, &payload, hint)
+                    .unwrap()
+                    .unwrap();
+                assert!(history_root(hook.harness, config).is_none());
+                assert!(find_history(config, "session_fixture", hook.harness).is_none());
+                let directory = tempfile::tempdir_in(config).unwrap();
+                let spool =
+                    LocalSpool::open_with_limits(directory.path().join("spool"), SMALL).unwrap();
+                for event in hook.events {
+                    runtime.block_on(capture_native(
+                        hook.harness,
+                        &serde_json::to_vec(&event).unwrap(),
+                        &event,
+                        &bound,
+                        &spool,
+                        Some(&hub),
+                        NativeCapture::default(),
+                    ));
+                }
+                let pending = spool.pending(100).unwrap();
+                let mut found = false;
+                for envelope in pending {
+                    envelope.validate().unwrap();
+                    let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
+                        panic!(
+                            "unpaired observations must produce neither usage nor action receipts"
+                        );
+                    };
+                    assert_eq!(batch.session.harness, hook.harness);
+                    for event in batch.events {
+                        if event.kind != kind {
+                            continue;
+                        }
+                        found = true;
+                        if kind == CapturedEventKindV1::ToolFinished {
+                            assert!(event.tool.as_ref().unwrap().request_id.is_none());
+                            let body = spool
+                                .read_artifact(event.artifact.as_ref().unwrap())
+                                .unwrap();
+                            assert!(String::from_utf8(body).unwrap().contains("visible output"));
+                        } else {
+                            assert_eq!(
+                                event.setup.unwrap().model.as_deref(),
+                                Some("gemini-example")
+                            );
+                            assert!(event.artifact.is_none());
+                        }
+                    }
+                }
+                assert!(found, "missing normalized {agent} observation");
+            }
+        });
     }
 
     fn codex_model_request() -> Value {

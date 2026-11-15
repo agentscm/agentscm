@@ -307,25 +307,46 @@ fn mcp_config_home(directory: &Path) -> Result<String> {
 
 fn own_command(value: &Value) -> bool {
     value["command"].as_str().is_some_and(|command| {
+        let Some((quoted, args)) = command.rsplit_once(" --no-telemetry ") else {
+            return false;
+        };
+        let Some(program) = quoted.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+            return false;
+        };
+        let program = program.replace("'\\''", "'");
+        if shell_quote(&program) != quoted || program_text(Path::new(&program)).is_err() {
+            return false;
+        }
+        if matches!(
+            args,
+            "hook-wait copilot --notification" | "hook-wait copilot --end"
+        ) {
+            return true;
+        }
         [Agent::Claude, Agent::Cursor, Agent::Copilot, Agent::Gemini]
             .iter()
             .any(|agent| {
-                command.starts_with('\'')
-                    && command.ends_with(&format!(
-                        "' --no-telemetry hook {} --client-connection",
-                        agent.name()
-                    ))
+                let base = format!("hook {} --client-connection", agent.name());
+                args == base
+                    || (*agent == Agent::Copilot
+                        && args
+                            .strip_prefix(&format!("{base} --hook-event "))
+                            .is_some_and(|event| {
+                                COPILOT_EVENTS.iter().any(|(name, _)| *name == event)
+                            }))
             })
     })
 }
 
 fn agentscm_hook(value: &Value) -> bool {
-    value["command"]
+    value["command"].as_str().is_some_and(|command| {
+        command.to_ascii_lowercase().contains("agentscm")
+            && (command.contains(" hook ")
+                || command.contains(" hook-wait ")
+                || command.contains(" change-capture hook-claude"))
+    }) || value["url"]
         .as_str()
-        .is_some_and(|command| command.to_ascii_lowercase().contains("agentscm"))
-        || value["url"]
-            .as_str()
-            .is_some_and(|url| url.contains("/v1/hub/hook/"))
+        .is_some_and(|url| url.contains("/v1/hub/hook/"))
 }
 
 fn has_foreign_hooks(value: &Value, allow_owned: bool) -> bool {
@@ -384,6 +405,18 @@ fn add_typed_mcp(
     Ok(())
 }
 
+const COPILOT_EVENTS: [(&str, u64); 9] = [
+    ("sessionStart", 5),
+    ("userPromptSubmitted", 3),
+    ("preToolUse", 5),
+    ("postToolUse", 3),
+    ("postToolUseFailure", 3),
+    ("notification", 3),
+    ("preCompact", 3),
+    ("agentStop", 3),
+    ("sessionEnd", 3),
+];
+
 fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Value>)>> {
     let command = command(agent, program)?;
     let nested = |timeout, name: Option<&str>| {
@@ -409,24 +442,32 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             let hook = |timeout| json!({"command":command,"timeout":timeout});
             vec![
                 ("sessionStart", vec![hook(5)]),
+                ("beforeSubmitPrompt", vec![hook(3)]),
+                ("preToolUse", vec![hook(5)]),
                 ("postToolUse", vec![hook(5)]),
+                ("postToolUseFailure", vec![hook(3)]),
                 // Cursor names a reply's text here and not at `stop`; the hook keeps the end of
                 // it on the machine until the turn ends, so `stop` can say what was asked.
                 ("afterAgentResponse", vec![hook(3)]),
+                ("preCompact", vec![hook(3)]),
                 ("stop", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
         Agent::Copilot => {
-            let hook = |timeout| json!({"type":"command","command":command,"timeoutSec":timeout});
-            vec![
-                ("sessionStart", vec![hook(5)]),
-                ("preToolUse", vec![hook(5)]),
-                ("postToolUse", vec![hook(3)]),
-                ("notification", vec![hook(3)]),
-                ("agentStop", vec![hook(3)]),
-                ("sessionEnd", vec![hook(3)]),
-            ]
+            let wait = format!(
+                "{} --no-telemetry hook-wait copilot",
+                shell_quote(program_text(program)?)
+            );
+            COPILOT_EVENTS.into_iter().map(|(event, timeout)| {
+                let mut hooks = vec![json!({"type":"command","command":format!("{command} --hook-event {event}"),"timeoutSec":timeout})];
+                if event == "notification" {
+                    hooks.push(json!({"type":"command","command":format!("{wait} --notification"),"timeoutSec":crate::message_wait::MAX_LIFE.as_secs() + 300}));
+                } else if event == "sessionEnd" {
+                    hooks.push(json!({"type":"command","command":format!("{wait} --end"),"timeoutSec":5}));
+                }
+                (event, hooks)
+            }).collect()
         }
         Agent::Gemini => {
             vec![
@@ -438,7 +479,13 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
                     "BeforeTool",
                     vec![nested(5000, Some("AgentSCM edit coordination"))],
                 ),
+                ("BeforeAgent", vec![nested(3000, Some("AgentSCM prompt"))]),
                 ("AfterTool", vec![nested(3000, Some("AgentSCM activity"))]),
+                ("BeforeModel", vec![nested(3000, Some("AgentSCM model"))]),
+                (
+                    "PreCompress",
+                    vec![nested(3000, Some("AgentSCM compaction"))],
+                ),
                 (
                     "Notification",
                     vec![nested(3000, Some("AgentSCM waiting for you"))],
@@ -2078,8 +2125,12 @@ mod tests {
             events(Agent::Cursor),
             [
                 "sessionStart",
+                "beforeSubmitPrompt",
+                "preToolUse",
                 "postToolUse",
+                "postToolUseFailure",
                 "afterAgentResponse",
+                "preCompact",
                 "stop",
                 "sessionEnd"
             ]
@@ -2088,9 +2139,12 @@ mod tests {
             events(Agent::Copilot),
             [
                 "sessionStart",
+                "userPromptSubmitted",
                 "preToolUse",
                 "postToolUse",
+                "postToolUseFailure",
                 "notification",
+                "preCompact",
                 "agentStop",
                 "sessionEnd"
             ]
@@ -2100,13 +2154,69 @@ mod tests {
             [
                 "SessionStart",
                 "BeforeTool",
+                "BeforeAgent",
                 "AfterTool",
+                "BeforeModel",
+                "PreCompress",
                 "Notification",
                 "AfterAgent",
                 "SessionEnd"
             ]
         );
         assert!(events(Agent::Codex).is_empty());
+    }
+
+    #[test]
+    fn copilot_event_hints_and_waiter_survive_upgrade_and_remove_cleanly() {
+        let program = Path::new("/opt/agent's tools/agentscm");
+        let helper = json!({"type":"command","command":"node /opt/agentscm/hooks/commercial.mjs"});
+        let mut value = json!({"hooks":{"notification":[helper.clone()]}});
+        add_hooks(&mut value, Agent::Copilot, program).unwrap();
+        let once = value.clone();
+        add_hooks(&mut value, Agent::Copilot, program).unwrap();
+        assert_eq!(value, once);
+        for (event, _) in COPILOT_EVENTS {
+            let hooks = value["hooks"][event].as_array().unwrap();
+            let capture = hooks
+                .iter()
+                .find(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains(" --client-connection")
+                })
+                .unwrap();
+            assert!(
+                capture["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("--hook-event {event}"))
+            );
+            assert!(own_command(capture));
+        }
+        let notification = value["hooks"]["notification"].as_array().unwrap();
+        assert_eq!(notification[0], helper);
+        assert_eq!(
+            notification[2]["timeoutSec"],
+            crate::message_wait::MAX_LIFE.as_secs() + 300
+        );
+        assert!(
+            notification[2]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" hook-wait copilot --notification")
+        );
+        assert_eq!(value["hooks"]["sessionEnd"][1]["timeoutSec"], 5);
+        let removed = without_ours(&value.to_string(), &json!([])).unwrap();
+        assert_eq!(removed["hooks"], json!({"notification":[helper]}));
+        for command in [
+            "'/opt/agentscm' --no-telemetry hook copilot --client-connection --hook-event unknown",
+            "'/opt/agentscm' --no-telemetry hook copilot --client-connection; other",
+            "'relative' --no-telemetry hook copilot --client-connection",
+            "'/opt/agentscm'; other; 'x' --no-telemetry hook copilot --client-connection",
+        ] {
+            assert!(!own_command(&json!({"command":command})), "{command}");
+        }
     }
 
     /// The default Copilot setup writes the user locations that Copilot CLI and VS Code's

@@ -529,6 +529,202 @@ fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
     }
 }
 
+#[cfg(unix)]
+fn capture_checkout(
+    dir: &TempDir,
+    hub: &str,
+) -> (std::path::PathBuf, agentscm::change_capture::LocalSpool) {
+    use agentscm::change_capture::LocalSpool;
+    let root = connected_checkout(dir, hub);
+    let spool = LocalSpool::open(dir.path().join("capture-spool")).unwrap();
+    let binding = json!({
+        "enabled":true, "follows_hub":true, "root":root, "spool":spool.root(), "spool_identity":spool.identity(),
+        "repository":"acme/widgets", "hub":hub, "worktree_id":"checkout_fixture",
+        "base_ref":"origin/main", "setup_digest":"a".repeat(64), "capture_mode":"metadata_only",
+        "action_rules":[{"native_tool":"Bash", "kind":"execution", "coverage":"partial",
+            "result_source":"unverified", "recipe_digest":null}]
+    });
+    std::fs::write(
+        dir.path().join("agentscm/change-capture.json"),
+        json!({"version":7,"bindings":[binding]}).to_string(),
+    )
+    .unwrap();
+    (root, spool)
+}
+
+#[cfg(unix)]
+fn queued_capture(
+    spool: &agentscm::change_capture::LocalSpool,
+) -> agentscm::change_record::CaptureEnvelopeV1 {
+    use agentscm::change_record::*;
+    let envelope = CaptureEnvelopeV1::EventBatch(CaptureBatchV1 {
+        schema_version: SCHEMA_VERSION_V1,
+        operation_id: "op:background:1".into(),
+        work_id: "wrk_fixture".into(),
+        generation: 1,
+        session: SessionIdentityV1 {
+            harness: AgentHarnessV1::ClaudeCode,
+            adapter_version: "1.0.0".into(),
+            session_id: "session_fixture".into(),
+            parent_session_id: None,
+            capture_mode: CaptureModeV1::MetadataOnly,
+        },
+        events: vec![CapturedEventV1 {
+            event_id: "event:background:1".into(),
+            sequence: 1,
+            observed_at: 1,
+            kind: CapturedEventKindV1::SessionEnded,
+            tool: None,
+            artifact: None,
+            setup: None,
+            gap: None,
+            boundary: None,
+            subagent: None,
+        }],
+    });
+    spool.append(&envelope).unwrap();
+    envelope
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_delivery_finishes_after_the_native_hook_exits_without_another_hook() {
+    let (release, wait) = channel();
+    let gate = std::sync::Once::new();
+    let (hub, seen) = serve(move |request| {
+        if request.path.ends_with("/change-records/events") {
+            // The Hub accepts only after the test has seen the native hook exit.
+            gate.call_once(|| wait.recv_timeout(Duration::from_secs(6)).unwrap());
+            return (200, json!({}));
+        }
+        if request.path.contains("conversation-sharing") {
+            return (
+                200,
+                json!({"sharing":false,"notified":true,"enabled":false,"opted_out":false,"consented":true}),
+            );
+        }
+        if request.path.starts_with("/v1/hub/hook/") {
+            return (200, json!({}));
+        }
+        (404, json!({}))
+    });
+    let dir = home();
+    let (root, spool) = capture_checkout(&dir, &hub);
+    queued_capture(&spool);
+    let payload = json!({"hook_event_name":"PostToolUse", "tool_name":"Read",
+        "session_id":"session_fixture", "cwd":root,"tool_input":{"file_path":"src/lib.rs"}});
+    let run = run_with(
+        &["claude", "--client-connection"],
+        &[("PATH", "/usr/bin:/bin")],
+        &dir,
+        payload.to_string().as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    assert!(run.json().is_object());
+    assert!(
+        run.elapsed < Duration::from_secs(2),
+        "hook waited for delivery: {:?}",
+        run.elapsed
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !spool.pending(100).unwrap().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(spool.pending(100).unwrap().is_empty());
+    assert!(
+        seen.try_iter()
+            .any(|request| request.path.ends_with("/change-records/events"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stalled_capture_and_coordination_cannot_starve_the_hook_deadline() {
+    let dir = home();
+    let (root, spool) = capture_checkout(&dir, "http://127.0.0.1:9");
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(spool.root().join("spool.lock"))
+        .unwrap();
+    locked.lock().unwrap();
+    // Capture and coordination independently validate Git; both can block at once. The
+    // captured checkout adds the second blocked task absent from the routing-only test.
+    let bin = stalled_git(&dir);
+    let payload = json!({"hook_event_name":"PreToolUse", "tool_name":"Read",
+        "session_id":"session_fixture", "cwd":root});
+    let path = bin.display().to_string();
+    let run = run_with(
+        &["claude", "--client-connection"],
+        &[("PATH", &path)],
+        &dir,
+        payload.to_string().as_bytes(),
+    );
+    drop(locked);
+    assert_eq!(run.code, Some(0));
+    assert!(run.json().is_object());
+    assert!(
+        run.elapsed < Duration::from_secs(4),
+        "deadline was starved: {:?}",
+        run.elapsed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_worker_checks_current_binding_and_authorization_before_acknowledging() {
+    for changed in [false, true] {
+        let (hub, seen) = serve(|_| (403, json!({})));
+        let dir = home();
+        let (root, spool) = capture_checkout(&dir, &hub);
+        let envelope = queued_capture(&spool);
+        if changed {
+            assert!(
+                Command::new("git")
+                    .current_dir(&root)
+                    .args([
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/acme/other.git"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args([
+                "--no-telemetry",
+                "change-capture",
+                "deliver-worker",
+                "--root",
+            ])
+            .arg(&root)
+            .env_clear()
+            .envs(base_env(&dir))
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), !changed);
+        assert_eq!(spool.pending(100).unwrap(), vec![envelope]);
+        if changed {
+            assert!(
+                seen.try_recv().is_err(),
+                "a moved checkout must not upload to its old namespace"
+            );
+        } else {
+            assert!(
+                seen.recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .path
+                    .ends_with("/change-records/events")
+            );
+        }
+    }
+}
+
 /// What the stub Hub's poll replies, given the hook's own input hash.
 #[cfg(unix)]
 type Poll = fn(&Value) -> Value;

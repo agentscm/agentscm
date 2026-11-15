@@ -123,7 +123,10 @@ from their native session files as well as hooks. When one parent chat explicitl
 several repositories, its visible history follows each Work, including earlier context. Each
 repository's sharing setting and the author's opt-out still apply. Hidden reasoning and system
 instructions are excluded. Capture is bounded and best effort; missing events and unavailable
-evidence remain visible. See [capture and qualification](docs/change-capture.md).
+evidence remain visible. Cursor, Copilot and Gemini CLI capture the visible fields their hooks
+provide, with no history-file replay. Cursor and Gemini supply replies and model metadata;
+Copilot does not. Automatic token usage is available for Claude Code and Codex. See
+[capture and qualification](docs/change-capture.md).
 
 Manually configured capture defaults to **metadata-only**, retaining no conversation bodies.
 Connected checkouts that follow the Hub use its repository sharing setting; new Hubs enable

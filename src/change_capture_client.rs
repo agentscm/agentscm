@@ -49,7 +49,7 @@ const MAX_RULES: usize = 32;
 const MAX_RECIPES: usize = 16;
 const REPLY_BYTES: usize = MAX_CHANGE_RECORD_RESPONSE_BYTES;
 const DELIVERY_PAGE: usize = 10;
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 const HOOK_TIMEOUT_SECONDS: u8 = 20;
 const MAX_SESSION_CONTEXT_BYTES: usize = 16 * 1024;
 const HOOK_MARKER: &str = "AGENTSCM_CAPTURE_HOOK_V1=1 ";

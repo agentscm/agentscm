@@ -929,6 +929,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             prompt,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::NoCurrentAuthorizedWork,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -944,6 +945,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             prompt,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::NoCurrentAuthorizedWork,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -961,6 +963,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -976,6 +979,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -992,6 +996,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert!(
         deferred_native_hook(
             changed_pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -1278,6 +1283,7 @@ fn deferred_alias_gap_keeps_original_target_across_resumed_generation() {
     assert_eq!(
         deferred_native_hook(
             deferred,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &actions,
             &spool,
@@ -1288,6 +1294,7 @@ fn deferred_alias_gap_keeps_original_target_across_resumed_generation() {
     assert_eq!(
         deferred_native_hook(
             deferred,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &actions,
             &spool,
@@ -5581,6 +5588,7 @@ fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session
     let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"OPENING_PROMPT_917"}"#;
     deferred_native_hook(
         prompt,
+        AgentHarnessV1::ClaudeCode,
         DeferredReasonV1::NoCurrentAuthorizedWork,
         &ActionCaptureConfig {
             source: git_request(repo.path()),

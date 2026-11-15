@@ -910,9 +910,10 @@ fn worker_threads(command: &Command) -> Option<usize> {
         command,
         Command::ChangeCapture {
             command: change_capture_cli::ChangeCaptureCommand::HookClaude
+                | change_capture_cli::ChangeCaptureCommand::DeliverWorker(_)
         }
     ) {
-        // A capture hook runs on every tool call, so it gets the `hook` path's runtime.
+        // Capture hooks and their bounded delivery worker need only a small runtime.
         return Some(2);
     }
     None

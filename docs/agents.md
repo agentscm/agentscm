@@ -456,6 +456,13 @@ These tools accept structured caller reports. Change capture submits a captured 
 usage automatically: for Claude Code from the session's own history file, in Claude Code's projects
 directory unless the checkout names another history root, and for Codex from its
 `PostModelRequest` hook.
+Cursor, Copilot and Gemini CLI capture their supported visible hook fields through the same path
+([capture coverage](change-capture.md#other-native-hooks)). Cursor and Gemini supply model metadata;
+Copilot does not. Automatic token totals are unavailable for these three: Cursor and Copilot expose
+no request counts, and Gemini's streamed snapshots lack reliable request identity. They are not
+summed or reported as zero. Copilot CLI can also receive a Hub message while idle after its
+notification hook starts a waiter; Cursor and Gemini wait for a later supported hook or tool call
+([message delivery](agent-messages.md)).
 Use `unknown` for an agent, provider or model label the client cannot determine, and omit token or
 cost fields that are unavailable. Do not
 treat missing values as zero. A `provider_result` basis is still a caller report; the Hub does not

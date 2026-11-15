@@ -48,6 +48,7 @@ src/hook_cli.rs let mut payload: Value = serde_json::from_slice(&body).unwrap_or
 src/hook_cli.rs .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
 src/hook_cli.rs let snapshot: AdvisorySnapshot = serde_json::from_slice(&bytes).ok()?;
 src/hook_cli.rs serde_json::from_str(text.trim()).ok()
+src/hook_cli.rs serde_json::from_value(payload["questions"].clone())
 
 # src/hook_relay.rs: frames between the hook and the local relay; the Hub's reply inside stays untyped JSON
 src/hook_relay.rs let mut head: Head = serde_json::from_slice(&head).map_err(|_| unavailable())?;

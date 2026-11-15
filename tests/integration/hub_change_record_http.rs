@@ -139,6 +139,25 @@ fn capture_cli_command(
     command
 }
 
+/// Native hooks retain before returning, but their detached worker acknowledges later. Observe
+/// that worker's durable progress instead of firing extra hooks or retrying delivery ourselves.
+async fn wait_for_capture_delivery(spool: &std::path::Path) {
+    let spool = agentscm::change_capture::LocalSpool::open(spool).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let pending = spool.pending(100).unwrap();
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "detached capture delivery did not acknowledge {} retained envelopes",
+            pending.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 impl Hub {
     async fn start() -> Self {
         let directory = TempDir::new().unwrap();
@@ -736,6 +755,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
         "{}",
         String::from_utf8_lossy(&post.stderr)
     );
+    wait_for_capture_delivery(&spool).await;
     let latest = hub
         .store
         .change_record(&writer_token, &work.id, unix_now())
@@ -848,6 +868,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
             String::from_utf8_lossy(&replay.stderr)
         );
     }
+    wait_for_capture_delivery(&moved_spool).await;
     let replayed = hub
         .store
         .change_record(&writer_token, &work.id, unix_now())
@@ -1075,6 +1096,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    wait_for_capture_delivery(&spool).await;
     let before_outage = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1157,6 +1179,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         }));
         assert!(replay.status.success());
     }
+    wait_for_capture_delivery(&spool).await;
     let after_recipe = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1380,6 +1403,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         }));
         assert!(replay.status.success());
     }
+    wait_for_capture_delivery(&spool).await;
     let after_signal = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1413,6 +1437,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         "{}",
         String::from_utf8_lossy(&ended.stderr)
     );
+    wait_for_capture_delivery(&spool).await;
     let after_outage = hub
         .store
         .change_record(&writer_token, &work.id, now + 3)
@@ -3886,22 +3911,27 @@ mod shared_bodies {
                 .unwrap();
         }
 
-        /// A hook for a session with no Work: it captures nothing of its own but delivers.
-        fn deliver(&self) {
-            let payload = json!({
-                "hook_event_name": "SessionStart",
-                "session_id": "unrelated-native-session",
-                "source": "startup",
-                "timestamp": "2026-10-24T10:00:00Z",
-                "cwd": self.root,
-            });
-            let output = run_capture_cli(
-                &self.config,
-                &self.home,
-                &["change-capture".into(), "hook-claude".into()],
-                Some(&serde_json::to_vec(&payload).unwrap()),
+        /// Run one delivery traversal to completion. These tests queue their own fixture batch
+        /// and test delivery/acknowledgement, not the native hook's detached scheduling.
+        fn deliver(&self, success: bool) {
+            let output = self.cli(&[
+                "change-capture",
+                "deliver-worker",
+                "--root",
+                &self.root.display().to_string(),
+            ]);
+            assert_eq!(
+                output.status.success(),
+                success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
             );
-            assert!(output.status.success());
+            if !success {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("capture Hub body upload returned status 503")
+                );
+            }
         }
 
         /// Compacts what the Hub acknowledged and frees the shared bodies upkeep could then free
@@ -3938,13 +3968,13 @@ mod shared_bodies {
 
         // The Hub accepts the events but cannot store the body: the envelope must stay pending.
         f.backend.fail_put.store(true, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(false);
         assert_eq!(checkout.pending(), 1);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
 
         f.backend.fail_put.store(false, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Available);
         assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
@@ -3963,7 +3993,7 @@ mod shared_bodies {
         );
         let checkout = Checkout::new(&f);
         checkout.queue(&f);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Deleted);
         assert!(f.object().is_none());
@@ -3978,7 +4008,7 @@ mod shared_bodies {
         checkout.queue(&f);
 
         f.backend.fail_put.store(true, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(false);
         assert_eq!(checkout.pending(), 1);
         assert_eq!(f.puts.load(Ordering::SeqCst), 1);
 
@@ -3989,7 +4019,7 @@ mod shared_bodies {
             StatusCode::NO_CONTENT
         );
         assert_eq!(f.puts.load(Ordering::SeqCst), 2);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.puts.load(Ordering::SeqCst), 2);
         assert_eq!(f.row().state, SharedBodyState::Available);
@@ -4009,7 +4039,7 @@ mod shared_bodies {
             "metadata-only",
         ]);
         assert!(switched.status.success());
-        off.deliver();
+        off.deliver(true);
         assert_eq!(off.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
@@ -4021,7 +4051,7 @@ mod shared_bodies {
         let missing = Checkout::new(&f);
         missing.queue(&f);
         std::fs::remove_file(missing.spool.join("artifacts").join(&f.sha)).unwrap();
-        missing.deliver();
+        missing.deliver(true);
         assert_eq!(missing.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
@@ -4262,6 +4292,7 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    wait_for_capture_delivery(&private.path().join("spool")).await;
     let record = hub
         .store
         .change_record(&token, &work.id, unix_now())

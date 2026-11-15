@@ -7,6 +7,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod native_hooks;
 pub mod spool;
 
 // Redaction has no platform dependency and the hook client uses it where capture does not build.

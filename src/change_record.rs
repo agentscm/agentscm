@@ -28,6 +28,9 @@ pub const MAX_CONVERSATION_MISSING_DIGESTS: usize = 100;
 pub enum AgentHarnessV1 {
     ClaudeCode,
     Codex,
+    Cursor,
+    Copilot,
+    GeminiCli,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -65,6 +68,8 @@ pub enum CapturedEventKindV1 {
     Compaction,
     SubagentStarted,
     SubagentStopped,
+    /// An observed setup fact without a conversation body or an implied model request total.
+    SetupObserved,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1047,6 +1052,13 @@ impl CapturedEventV1 {
                     "shared artifact retention requires a shared-conversation session and a bounded local JSON body",
                 ));
             }
+        }
+        if self.kind == CapturedEventKindV1::SetupObserved
+            && (self.setup.is_none() || self.artifact.is_some())
+        {
+            return Err(invalid(
+                "setup observations require setup facts and no conversation body",
+            ));
         }
         if let Some(setup) = &self.setup {
             setup.validate()?;

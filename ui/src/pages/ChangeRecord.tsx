@@ -401,6 +401,7 @@ const CONVERSATION_KIND: Record<ConversationEventKind, string> = {
   compaction: 'Compaction',
   subagent_started: 'Subagent started',
   subagent_stopped: 'Subagent stopped',
+  setup_observed: 'Setup observed',
 }
 
 const CONVERSATION_AVAILABILITY: Record<ConversationAvailability, Status> = {

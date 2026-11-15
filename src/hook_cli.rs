@@ -112,6 +112,7 @@ pub async fn run_unparsed(args: Vec<String>) -> ! {
         client_connection,
         destination_args,
         hold_limit(&args),
+        hook_event_hint(&args),
     )
     .await;
     let mut out = std::io::stdout();
@@ -137,6 +138,9 @@ fn parse_args(args: &[String]) -> (String, Option<String>, Option<String>) {
             repo = rest.next().cloned();
         } else if let Some(value) = arg.strip_prefix("--repo=") {
             repo = Some(value.to_owned());
+        } else if arg == "--hook-event" {
+            // The configured native event is not a positional agent name.
+            let _ = rest.next();
         } else if !arg.starts_with('-') && agent.is_none() {
             agent = Some(arg.clone());
         }
@@ -163,6 +167,30 @@ fn hold_limit(args: &[String]) -> Option<Duration> {
     None
 }
 
+/// A configured event hint for hosts whose native payload omits it. Ambiguous or malformed
+/// hints disable capture; they never change the native payload used by coordination.
+fn hook_event_hint(args: &[String]) -> std::result::Result<Option<String>, ()> {
+    let mut found = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let value = match arg.strip_prefix("--hook-event") {
+            Some("") => rest.next().map(String::as_str),
+            Some(value) if value.starts_with('=') => value.strip_prefix('='),
+            _ => continue,
+        }
+        .ok_or(())?;
+        if found.is_some()
+            || value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(());
+        }
+        found = Some(value.to_owned());
+    }
+    Ok(found)
+}
+
 async fn hook(
     agent: &str,
     flag_url: Option<String>,
@@ -170,6 +198,7 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
     hold_limit: Option<Duration>,
+    event_hint: std::result::Result<Option<String>, ()>,
 ) -> Value {
     let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
@@ -177,20 +206,27 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    #[cfg(unix)]
+    let capture_payload = std::sync::Arc::new(payload.clone());
     // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
-    if agent == "cursor"
+    // Keep its original full reply for capture before this coordination-only tail is updated.
+    let cursor_reply = if agent == "cursor"
         && client_connection
         && let Ok(config) = config_dir()
-        && keep_reply(&config, &mut payload)
     {
-        return json!({});
-    }
+        keep_reply(&config, &mut payload)
+    } else {
+        false
+    };
     let payload = std::sync::Arc::new(payload);
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
-    let wants_capture =
-        client_connection && crate::change_capture_cli::captured_harness(agent, &payload).is_some();
+    let wants_capture = client_connection
+        && event_hint.as_ref().is_ok_and(|hint| {
+            crate::change_capture_cli::captured_harness(agent, &capture_payload, hint.as_deref())
+                .is_some()
+        });
     // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
     #[cfg(not(unix))]
     let wants_capture = false;
@@ -203,12 +239,20 @@ async fn hook(
         };
     #[cfg(unix)]
     let spawn_capture = || {
-        tokio::spawn(capture(
+        let (agent, body, payload, hint) = (
             agent.to_owned(),
             body.clone(),
-            std::sync::Arc::clone(&payload),
-            budget,
-        ))
+            std::sync::Arc::clone(&capture_payload),
+            event_hint.as_ref().ok().and_then(|hint| hint.clone()),
+        );
+        // Spool locks and source reads must not occupy the workers driving the hook deadline.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?
+                .block_on(capture(agent, body, payload, budget, hint))
+        })
     };
     // Never called: nothing wants capture where it is not built.
     #[cfg(not(unix))]
@@ -217,8 +261,16 @@ async fn hook(
     // and runs beside it otherwise.
     let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
-    let reply = if client_connection
-        && capture_only(agent, payload["hook_event_name"].as_str().unwrap_or(""))
+    let reply = if cursor_reply {
+        json!({})
+    } else if client_connection
+        && capture_only(
+            agent,
+            payload["hook_event_name"]
+                .as_str()
+                .or_else(|| event_hint.as_ref().ok().and_then(|hint| hint.as_deref()))
+                .unwrap_or(""),
+        )
         && !observes_shell(agent, &payload)
     {
         fail_open(agent, &payload, None)
@@ -276,8 +328,42 @@ async fn capture(
     body: Vec<u8>,
     payload: std::sync::Arc<Value>,
     budget: Instant,
+    event_hint: Option<String>,
 ) -> Option<String> {
-    let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
+    if matches!(agent.as_str(), "cursor" | "copilot" | "gemini") {
+        let hook = agentscm::change_capture::native_hooks::normalize(
+            &agent,
+            &payload,
+            event_hint.as_deref(),
+        )
+        .ok()
+        .flatten()?;
+        let connections = client_config::load().ok()?;
+        let (connection, checkout, _) =
+            select_client_checkout(&agent, &payload, &connections).ok()?;
+        if !client_config::is_current_in(&connection, &checkout) {
+            return None;
+        }
+        let mut context = None;
+        for event in hook.events {
+            let input = serde_json::to_vec(&event).ok()?;
+            let (captured, _) = crate::change_capture_cli::plugin_capture(
+                hook.harness,
+                &input,
+                &event,
+                checkout.clone(),
+                connection.clone(),
+                budget.into(),
+            )
+            .await;
+            if context.is_none() {
+                context = captured;
+            }
+        }
+        // These hosts have no vetted retrospective reader or source-authenticated fanout.
+        return context;
+    }
+    let harness = crate::change_capture_cli::captured_harness(&agent, &payload, None)?;
     let routed = route_client(&agent, &payload).ok();
     let mut default = None;
     let mut context = None;
@@ -486,6 +572,20 @@ fn capture_only(agent: &str, event: &str) -> bool {
                 | "SubagentStart"
                 | "SubagentStop"
         ),
+        "cursor" => matches!(
+            event,
+            "beforeSubmitPrompt" | "afterAgentResponse" | "preCompact" | "postToolUseFailure"
+        ),
+        "copilot" => matches!(
+            event,
+            "userPromptSubmitted"
+                | "UserPromptSubmit"
+                | "preCompact"
+                | "PreCompact"
+                | "postToolUseFailure"
+                | "PostToolUseFailure"
+        ),
+        "gemini" => matches!(event, "BeforeAgent" | "BeforeModel" | "PreCompress"),
         _ => matches!(
             event,
             "PostToolUseFailure" | "MessageDisplay" | "PreCompact"
@@ -1592,6 +1692,24 @@ fn route_client_with(
     payload: &Value,
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
+    let (connection, checkout, normalized) = select_client_checkout(agent, payload, connections)?;
+    let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
+    Ok(RoutedClient {
+        payload: sanitized_client(agent, payload, &normalized)?,
+        connection,
+        checkout,
+        endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
+    })
+}
+
+/// Select source with the same connection and worktree checks for capture and coordination.
+/// Capture-only native events need no coordination payload or invented lifecycle event.
+fn select_client_checkout(
+    agent: &str,
+    payload: &Value,
+    connections: &[Connection],
+) -> Result<(Connection, PathBuf, Vec<EditPath>), String> {
     if connections.is_empty() {
         return Err(NO_CONNECTION.into());
     }
@@ -1636,14 +1754,7 @@ fn route_client_with(
             .map(|(connection, checkout)| (connection.clone(), checkout))
             .ok_or_else(|| NO_CONNECTION.to_owned())?,
     };
-    let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
-    Ok(RoutedClient {
-        payload: sanitized_client(agent, payload, &normalized)?,
-        connection,
-        checkout,
-        endpoint_agent: endpoint_agent.to_owned(),
-        edits: normalized,
-    })
+    Ok((connection, checkout, normalized))
 }
 
 /// One sentence for the start context that names the other repositories this computer can
@@ -2973,6 +3084,127 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
             json!({"permission": "allow"})
         }
         _ => json!({}),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_capture_tests {
+    use super::*;
+
+    #[test]
+    fn configured_hook_event_is_not_a_position_and_ambiguous_hints_are_refused() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for values in [
+            args(&[
+                "copilot",
+                "--client-connection",
+                "--hook-event",
+                "userPromptSubmitted",
+            ]),
+            args(&["--hook-event=userPromptSubmitted", "copilot"]),
+            args(&["--hook-event", "userPromptSubmitted", "copilot"]),
+        ] {
+            assert_eq!(parse_args(&values).0, "copilot");
+            assert_eq!(
+                hook_event_hint(&values).unwrap().as_deref(),
+                Some("userPromptSubmitted")
+            );
+        }
+        for values in [
+            args(&["copilot", "--hook-event"]),
+            args(&["copilot", "--hook-event="]),
+            args(&["copilot", "--hook-event", "bad event"]),
+            args(&[
+                "copilot",
+                "--hook-event=postToolUse",
+                "--hook-event=preToolUse",
+            ]),
+        ] {
+            assert!(hook_event_hint(&values).is_err());
+        }
+    }
+
+    #[test]
+    fn gemini_capture_only_events_select_source_without_coordination_payloads() {
+        use agentscm::change_capture::{LocalSpool, claude_code, native_hooks};
+        use agentscm::change_record::{
+            AgentHarnessV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let connection = Connection {
+            root: root.clone(),
+            origin_host: "example.test".into(),
+            hub: "https://hub.example.test".into(),
+            repo: "acme/widgets".into(),
+            token_file: temp.path().join("token"),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        };
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        for (name, expected) in [
+            ("BeforeAgent", CapturedEventKindV1::UserPrompt),
+            ("BeforeModel", CapturedEventKindV1::SetupObserved),
+        ] {
+            let payload = json!({"hook_event_name":name,"session_id":"native_session","cwd":root,
+                "prompt":"Visible user prompt", "llm_request":{"model":"gemini-example","messages":["excluded-context"]},
+                "llm_response":{"candidates":["excluded-thought"],"usageMetadata":{"totalTokenCount":42}}});
+            let original = payload.clone();
+            let (_, checkout, paths) =
+                select_client_checkout("gemini", &payload, std::slice::from_ref(&connection))
+                    .unwrap();
+            assert_eq!(checkout, root);
+            assert!(paths.is_empty());
+            assert!(capture_only("gemini", name));
+            assert!(sanitized_client("gemini", &payload, &paths).is_err());
+            let hook = native_hooks::normalize("gemini", &payload, None)
+                .unwrap()
+                .unwrap();
+            let request = claude_code::CaptureRequest {
+                operation_prefix: name.into(),
+                work_id: "wrk_native".into(),
+                generation: 1,
+                observed_session_id: "native_session".into(),
+                canonical_session_id: "native_session".into(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::LocalConversation,
+                live_capture_mode: CaptureModeV1::LocalConversation,
+                harness: AgentHarnessV1::GeminiCli,
+            };
+            for event in hook.events {
+                claude_code::capture_hook(&serde_json::to_vec(&event).unwrap(), &request, &spool)
+                    .unwrap();
+            }
+            assert_eq!(payload, original);
+            assert!(spool.pending(100).unwrap().iter().any(|envelope| matches!(envelope,
+                CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().any(|event| event.kind == expected))));
+        }
+        assert!(
+            !spool
+                .pending(100)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(envelope, CaptureEnvelopeV1::Usage(_)))
+        );
+        let child = root.join("unregistered");
+        std::fs::create_dir_all(child.join(".git")).unwrap();
+        assert!(
+            select_client_checkout(
+                "gemini",
+                &json!({"hook_event_name":"BeforeModel","cwd":child}),
+                &[connection]
+            )
+            .is_err()
+        );
     }
 }
 
@@ -5450,8 +5682,10 @@ mod tests {
         #[cfg(unix)]
         for event in agentscm::change_capture::codex::HOOK_EVENTS {
             let payload = json!({"hook_event_name": event});
-            assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
-            assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
+            assert!(crate::change_capture_cli::captured_harness("codex", &payload, None).is_some());
+            assert!(
+                crate::change_capture_cli::captured_harness("cursor", &payload, None).is_none()
+            );
         }
     }
 }

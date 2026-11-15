@@ -1254,6 +1254,7 @@ fn capture_hook_with_identity_mode(
         "PreCompact" => (CapturedEventKindV1::Compaction, None, None),
         "SubagentStart" => (CapturedEventKindV1::SubagentStarted, None, None),
         "SubagentStop" => (CapturedEventKindV1::SubagentStopped, None, None),
+        "SetupObserved" => (CapturedEventKindV1::SetupObserved, None, None),
         _ => return Ok(HookCaptureOutcome::Ignored),
     };
     let boundary = hook_boundary(event_name, payload);
@@ -1291,14 +1292,15 @@ fn capture_hook_with_identity_mode(
         "message_index": payload.get("index"),
         "message_final": payload.get("final"),
     }))?;
-    let unstable_identity =
-        identity_override.is_none() && provider_id.is_none() && provider_timestamp.is_none();
-    // A replayed turn, compaction or subagent marker is informational and cannot hide work, so
+    let unstable_identity = identity_override.is_none()
+        && native_identity_uncertain(request.harness, provider_id, provider_timestamp);
+    // A replayed setup, turn, compaction or subagent marker is informational and cannot hide work, so
     // it needs a unique occurrence id but not an identity-uncertainty gap on every turn.
     let identity_uncertain = unstable_identity
         && !matches!(
             kind,
-            CapturedEventKindV1::TurnEnded
+            CapturedEventKindV1::SetupObserved
+                | CapturedEventKindV1::TurnEnded
                 | CapturedEventKindV1::Compaction
                 | CapturedEventKindV1::SubagentStarted
                 | CapturedEventKindV1::SubagentStopped
@@ -1441,6 +1443,7 @@ fn capture_hook_with_identity_mode(
 /// source can be captured.
 pub fn deferred_native_hook(
     input: &[u8],
+    harness: AgentHarnessV1,
     reason: DeferredReasonV1,
     actions: &ActionCaptureConfig,
     spool: &LocalSpool,
@@ -1478,6 +1481,7 @@ pub fn deferred_native_hook(
         "PreCompact" => Some(CapturedEventKindV1::Compaction),
         "SubagentStart" => Some(CapturedEventKindV1::SubagentStarted),
         "SubagentStop" => Some(CapturedEventKindV1::SubagentStopped),
+        "SetupObserved" => Some(CapturedEventKindV1::SetupObserved),
         _ => None,
     };
     let tool_kind = matches!(
@@ -1510,7 +1514,7 @@ pub fn deferred_native_hook(
         "message_index": payload.get("index"),
         "message_final": payload.get("final"),
     }))?;
-    let occurrence_id = if provider_id.is_none() && provider_timestamp.is_none() {
+    let occurrence_id = if native_identity_uncertain(harness, provider_id, provider_timestamp) {
         spool.uncertain_event_id(session_id, &sha256(&identity))?
     } else {
         format!("evt:{}", sha256(&identity))
@@ -3888,6 +3892,21 @@ fn check_kind(default: CapturedEventKindV1, tool_name: Option<&str>) -> Captured
         }
         _ => default,
     }
+}
+
+/// Keep legacy capture identities unchanged. New native hosts can emit distinct calls and
+/// repeated prompts at the same timestamp, so their reported time remains observation metadata
+/// and cannot stand in for a genuine event ID. The trusted capture harness selects this rule.
+fn native_identity_uncertain(
+    harness: AgentHarnessV1,
+    provider_id: Option<&str>,
+    provider_timestamp: Option<&str>,
+) -> bool {
+    provider_id.is_none()
+        && match harness {
+            AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex => provider_timestamp.is_none(),
+            AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => true,
+        }
 }
 
 fn is_check(name: &str) -> bool {
