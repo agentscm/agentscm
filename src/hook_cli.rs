@@ -19,7 +19,9 @@ mod permission;
 #[cfg(unix)]
 mod shell_observation;
 
-const LIMIT: Duration = Duration::from_secs(3);
+/// Under the shortest timeout an installer gives a hook (3 seconds), so the hook's own "could
+/// not check" reply is printed before the host stops it.
+const LIMIT: Duration = Duration::from_millis(2500);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
 /// How long a session start waits for auto-connect before going on without it.
@@ -5088,5 +5090,14 @@ mod tests {
             assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
             assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
         }
+    }
+
+    /// The installers' hook tables are private to them; their own tests pin the shortest
+    /// timeout, 3 seconds, that this deadline has to stay under.
+    #[test]
+    fn the_hook_deadline_leaves_time_to_reply_before_the_host_stops_it() {
+        let shortest_host_timeout = Duration::from_secs(3);
+        assert!(LIMIT + Duration::from_millis(500) <= shortest_host_timeout);
+        assert!(CAPTURE_BUDGET + Duration::from_millis(500) <= shortest_host_timeout);
     }
 }
