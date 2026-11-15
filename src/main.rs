@@ -308,8 +308,8 @@ enum Command {
     /// program copy and a local hub.
     Uninstall(quickstart::UninstallArgs),
     /// Agent hook client: reads the hook JSON on stdin, asks the hub, prints the agent's reply.
-    /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|gemini>
-    /// --client-connection` (what `client setup` writes; hub, repository and token come from the
+    /// Always exits 0 and fails open. Usage: `agentscm hook
+    /// <claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush> --client-connection` (what `client setup` writes; hub, repository and token come from the
     /// saved connection), or `agentscm hook <agent|generic> [--hub-url URL] [--repo OWNER/NAME]`
     /// with the token from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
     Hook(hook_cli::HookArgs),
@@ -1820,6 +1820,17 @@ mod tests {
             assert!(body["retryable"].is_boolean());
             assert!(body["recovery"].is_object());
         }
+    }
+
+    #[test]
+    fn hook_help_names_every_natively_wired_agent() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("hook")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let names = format!("<{}>", agentscm::clients::names_joined("|"));
+        assert!(help.contains(&names), "{help}");
     }
 
     #[test]
