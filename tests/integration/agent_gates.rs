@@ -3,11 +3,12 @@
 //!
 //! The test reads every Rust file under `src/` and finds the agent-name gates in it: a string
 //! compared with `==` or `!=` to an agent name (`"claude"`) or a hook route (`"hook:gemini"`),
-//! agent names inside `matches!`, string match arms on agent names, an agent variant compared
-//! or matched (`agent == Agent::Claude`, `matches!(agent, Agent::Cursor | Agent::Copilot)`),
-//! and an enum whose agent variants are fewer than the wired agents. Comments, test modules and
-//! a match that lists every wired agent (a parser or a display name) are not gates. Exhaustive
-//! matches on an agent enum are left to the compiler: adding a variant breaks them already.
+//! agent names inside `matches!`, an agent variant compared or matched (`agent == Agent::Claude`,
+//! `matches!(agent, Agent::Cursor | Agent::Copilot)`), a `match` whose arms name some agents
+//! (strings or variants) and fall through a wildcard or binding arm, and an enum whose agent
+//! variants are fewer than the wired agents. Comments, test modules and a match that lists every
+//! wired agent (a parser or a display name) are not gates; each match is judged on its own. A
+//! match with no wildcard is left to the compiler: adding a variant breaks it already.
 //!
 //! An entry names the file and the enclosing function (or `enum Name`), never a line, so
 //! unrelated edits do not break it. Several gates in one function make one entry naming every
@@ -105,6 +106,13 @@ const REGISTER: &[Gate] = &[
     },
     Gate {
         file: "src/continuation.rs",
+        item: "observed_session",
+        agents: "claude codex",
+        reason: "host limit: each client's output names its session in its own form \
+                 (`session_id`; Codex's `thread.started` `thread_id`)",
+    },
+    Gate {
+        file: "src/continuation.rs",
         item: "warning_count",
         agents: "codex",
         reason: "host limit: it counts Codex's own `item.completed` error events in its output",
@@ -118,9 +126,9 @@ const REGISTER: &[Gate] = &[
     Gate {
         file: "src/hook_cli.rs",
         item: "activity_key",
-        agents: "cursor",
-        reason: "host limit: Cursor's edit check is postToolUse, just after the write \
-                 (docs/agents.md, Edit check)",
+        agents: "copilot cursor gemini",
+        reason: "host limit: each host's own tool event names; Cursor's edit check is \
+                 postToolUse, just after the write (docs/agents.md, Edit check)",
     },
     Gate {
         file: "src/hook_cli.rs",
@@ -533,28 +541,88 @@ fn compared(m: &[u8], start: usize, end: usize) -> bool {
         .any(|side| matches!(side, Some(b"==") | Some(b"!=")))
 }
 
-/// For a string literal ending at `end`: whether it is a match arm pattern (`"a" | "b" =>` or
-/// `"a" if ... =>`).
-fn arm(m: &[u8], end: usize) -> bool {
-    let mut j = skip_space(m, end);
-    while m.get(j) == Some(&b'|') && m.get(j + 1) != Some(&b'|') {
-        j = skip_space(m, j + 1);
-        if m.get(j) != Some(&b'"') {
-            return false;
+/// The first index from `from` where `stop` holds at bracket depth 0 relative to `from`, or
+/// where a bracket closes below that depth.
+fn at_depth(m: &[u8], from: usize, stop: impl Fn(&[u8]) -> bool) -> usize {
+    let mut depth = 0;
+    for j in from..m.len() {
+        if depth == 0 && stop(&m[j..]) {
+            return j;
         }
-        j = (j + 1..m.len())
-            .find(|&k| m[k] == b'"')
-            .map_or(m.len(), |k| k + 1);
-        j = skip_space(m, j);
+        match m[j] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return j,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
     }
-    m[j..].starts_with(b"=>") || (m[j..].starts_with(b"if") && !ident(m[j + 2]))
+    m.len()
+}
+
+/// The agents named by the arms of the `match` keyword at `at`, when that match singles some
+/// out: it names fewer than every wired agent and has a wildcard or binding arm, so a new agent
+/// falls through it without the compiler noticing. Each match counts on its own.
+fn match_gate(m: &[u8], at: usize) -> BTreeSet<&'static str> {
+    let open = at_depth(m, at + 5, |rest| rest[0] == b'{');
+    if open >= m.len() || m[open] != b'{' {
+        return BTreeSet::new();
+    }
+    let close = at_depth(m, open + 1, |_| false);
+    let (mut agents, mut fallback) = (BTreeSet::new(), false);
+    let mut j = open + 1;
+    while skip_space(m, j) < close {
+        let arrow = at_depth(m, j, |rest| rest.starts_with(b"=>"));
+        if arrow >= close {
+            break;
+        }
+        let pattern = std::str::from_utf8(&m[j..arrow]).unwrap();
+        let pattern = pattern.split(" if ").next().unwrap().trim();
+        fallback |= pattern == "_"
+            || pattern.contains(" @ ")
+            || pattern.starts_with(|c: char| c.is_ascii_lowercase()) && pattern.bytes().all(ident);
+        for (index, piece) in pattern.split('"').enumerate() {
+            let agent = piece.strip_prefix("hook:").unwrap_or(piece);
+            if index % 2 == 1
+                && let Some(agent) = WIRED.iter().find(|wired| **wired == agent)
+            {
+                agents.insert(*agent);
+            }
+        }
+        for path in pattern.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')) {
+            if let Some((ty, variant)) = path.split_once("::")
+                && !NOT_AGENTS.contains(&ty)
+                && let Some((_, agent)) = VARIANTS.iter().find(|(name, _)| *name == variant)
+            {
+                agents.insert(*agent);
+            }
+        }
+        let body = skip_space(m, arrow + 2);
+        j = if m.get(body) == Some(&b'{') {
+            let end = at_depth(m, body + 1, |_| false) + 1;
+            let after = skip_space(m, end);
+            if m.get(after) == Some(&b',') {
+                after + 1
+            } else {
+                end
+            }
+        } else {
+            let end = at_depth(m, body, |rest| rest[0] == b',');
+            if end < close { end + 1 } else { close }
+        };
+    }
+    let covered = WIRED.iter().all(|agent| agents.contains(agent));
+    if fallback && !covered {
+        agents
+    } else {
+        BTreeSet::new()
+    }
 }
 
 /// The agent-name gates in one file: enclosing item to the agents it names.
 fn gates(source: &str) -> BTreeMap<String, String> {
     let m = mask(source);
-    // Per item: agents named by comparisons and `matches!`, and agents named by match arms.
-    let mut named: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    // Per item: agents named by comparisons, `matches!` and partial matches.
+    let mut named: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     let mut enums = BTreeMap::new();
     // Open braces: Some(item) for a function body, None for any other block.
     let mut stack: Vec<(Option<String>, bool)> = Vec::new();
@@ -624,17 +692,24 @@ fn gates(source: &str) -> BTreeMap<String, String> {
                     continue;
                 }
             }
+            b'm' if starts_word
+                && !in_test
+                && m[i..].starts_with(b"match")
+                && !m.get(i + 5).copied().is_some_and(ident) =>
+            {
+                let agents = match_gate(&m, i);
+                if !agents.is_empty() {
+                    named.entry(item).or_default().extend(agents);
+                }
+            }
             b'"' if !in_test => {
                 let end = (i + 1..m.len()).find(|&j| m[j] == b'"').unwrap_or(m.len());
                 let text = std::str::from_utf8(&m[i + 1..end]).unwrap();
                 let agent = text.strip_prefix("hook:").unwrap_or(text);
-                if let Some(agent) = WIRED.iter().find(|wired| **wired == agent) {
-                    let entry = named.entry(item).or_default();
-                    if i < matches_end || compared(&m, i, end + 1) {
-                        entry.0.insert(agent);
-                    } else if arm(&m, end + 1) {
-                        entry.1.insert(agent);
-                    }
+                if let Some(agent) = WIRED.iter().find(|wired| **wired == agent)
+                    && (i < matches_end || compared(&m, i, end + 1))
+                {
+                    named.entry(item).or_default().insert(agent);
                 }
                 i = end + 1;
                 continue;
@@ -649,7 +724,7 @@ fn gates(source: &str) -> BTreeMap<String, String> {
                     if let Some((_, agent)) = agent
                         && (i < matches_end || compared(&m, i, end))
                     {
-                        named.entry(item).or_default().0.insert(agent);
+                        named.entry(item).or_default().insert(agent);
                     }
                 }
                 i = after.max(i + 1);
@@ -662,14 +737,8 @@ fn gates(source: &str) -> BTreeMap<String, String> {
 
     let wired: BTreeSet<&str> = WIRED.into_iter().collect();
     let mut out = BTreeMap::new();
-    for (item, (mut gates, arms)) in named {
-        // A match listing every wired agent maps names, it does not single any out.
-        if !arms.is_superset(&wired) {
-            gates.extend(arms);
-        }
-        if !gates.is_empty() {
-            out.insert(item, gates.into_iter().collect::<Vec<_>>().join(" "));
-        }
+    for (item, gates) in named {
+        out.insert(item, gates.into_iter().collect::<Vec<_>>().join(" "));
     }
     for (item, agents) in enums {
         if !agents.is_superset(&wired) {
@@ -735,6 +804,14 @@ fn the_scanner_finds_each_gate_form_and_skips_tests_comments_and_full_lists() {
             match agent { "claude" => 1, "codex" => 2, "cursor" => 3, "copilot" => 4,
                 "gemini" => 5, _ => 0 }
         }
+        fn partial(agent: Agent) -> bool { match agent { Agent::Claude => true, _ => false } }
+        fn exhaustive(agent: Waker) -> u8 {
+            match agent { Waker::Claude => { 1 } Waker::Codex(n) => n }
+        }
+        fn two(a: &str, b: &str) -> u8 {
+            match a { "claude" | "codex" | "cursor" => 1, other => 0 }
+                + match b { "copilot" | "gemini" => 1, _ => 0 }
+        }
         enum Waker { Claude, #[serde(rename = "x")] Codex(u8) }
         enum Every { Claude, Codex, Cursor, Copilot, Gemini }
         #[cfg(test)]
@@ -745,6 +822,8 @@ fn the_scanner_finds_each_gate_form_and_skips_tests_comments_and_full_lists() {
         ("shell", "claude codex"),
         ("route", "gemini"),
         ("variant", "generic"),
+        ("partial", "claude"),
+        ("two", "claude codex copilot cursor gemini"),
         ("harness", "claude codex"),
         ("enum Waker", "claude codex"),
     ]
