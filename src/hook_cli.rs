@@ -96,6 +96,40 @@ pub async fn run(args: HookArgs) {
     run_unparsed(args.args).await
 }
 
+/// A host that dropped a hook's argv must not turn CLI usage (exit 2) into a tool refusal.
+pub(crate) fn missing_arguments() -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return false;
+    }
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("agentscm-hook-input".into())
+        .spawn(move || {
+            let hook = read_stdin()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .is_some_and(|payload| {
+                    let named = payload["hook_event_name"].as_str().is_some_and(|event| {
+                        !event.is_empty()
+                            && event.len() <= 64
+                            && event.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    });
+                    let copilot_tool = payload["sessionId"].as_str().is_some()
+                        && payload["toolName"].as_str().is_some()
+                        && payload.get("toolArgs").is_some();
+                    (named || copilot_tool) && session_of(&payload).is_some()
+                });
+            let _ = send.send(hook);
+        })
+        .is_err()
+    {
+        return false;
+    }
+    receive
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or(false)
+}
+
 /// Never returns: prints the agent's reply and exits 0.
 pub async fn run_unparsed(args: Vec<String>) -> ! {
     let (agent, flag_url, repo) = parse_args(&args);
@@ -115,6 +149,7 @@ pub async fn run_unparsed(args: Vec<String>) -> ! {
         client_connection,
         destination_args,
         hold_limit(&args),
+        hook_event_hint(&args),
     )
     .await;
     let mut out = std::io::stdout();
@@ -140,6 +175,9 @@ fn parse_args(args: &[String]) -> (String, Option<String>, Option<String>) {
             repo = rest.next().cloned();
         } else if let Some(value) = arg.strip_prefix("--repo=") {
             repo = Some(value.to_owned());
+        } else if arg == "--hook-event" {
+            // The configured native event is not a positional agent name.
+            let _ = rest.next();
         } else if !arg.starts_with('-') && agent.is_none() {
             agent = Some(arg.clone());
         }
@@ -166,6 +204,30 @@ fn hold_limit(args: &[String]) -> Option<Duration> {
     None
 }
 
+/// A configured event hint for hosts whose native payload omits it. Ambiguous or malformed
+/// hints disable capture; they never change the native payload used by coordination.
+fn hook_event_hint(args: &[String]) -> std::result::Result<Option<String>, ()> {
+    let mut found = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let value = match arg.strip_prefix("--hook-event") {
+            Some("") => rest.next().map(String::as_str),
+            Some(value) if value.starts_with('=') => value.strip_prefix('='),
+            _ => continue,
+        }
+        .ok_or(())?;
+        if found.is_some()
+            || value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(());
+        }
+        found = Some(value.to_owned());
+    }
+    Ok(found)
+}
+
 async fn hook(
     agent: &str,
     flag_url: Option<String>,
@@ -173,6 +235,7 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
     hold_limit: Option<Duration>,
+    event_hint: std::result::Result<Option<String>, ()>,
 ) -> Value {
     let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
@@ -180,23 +243,60 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let configured = agent;
+    let Some(agent) = crate::client_session::hook_agent(configured, &payload).await else {
+        eprintln!(
+            "AgentSCM: coordination unknown (inherited hook host is ambiguous or unsupported)"
+        );
+        return json!({});
+    };
+    #[cfg(unix)]
+    if configured == "claude" && agent == "cursor" && client_connection && !destination_args {
+        let root = payload["workspace_roots"][0]
+            .as_str()
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd_of(&payload));
+        let event = payload["hook_event_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::task::spawn_blocking(move || {
+                crate::client_setup::cursor_hook_registered(&root, &event)
+            }),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok_and(|found| found))
+        {
+            return json!({});
+        }
+    }
+    #[cfg(unix)]
+    let capture_payload = std::sync::Arc::new(payload.clone());
     if let Some(table) = table(agent) {
         prepare_table_payload(table, &mut payload);
     }
     // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
-    if agent == "cursor"
+    // Keep its original full reply for capture before this coordination-only tail is updated.
+    let cursor_reply = if agent == "cursor"
         && client_connection
         && let Ok(config) = config_dir()
-        && keep_reply(&config, &mut payload)
     {
-        return json!({});
-    }
+        keep_reply(&config, &mut payload)
+    } else {
+        false
+    };
     let payload = std::sync::Arc::new(payload);
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
-    let wants_capture =
-        client_connection && crate::change_capture_cli::captured_harness(agent, &payload).is_some();
+    let wants_capture = client_connection
+        && event_hint.as_ref().is_ok_and(|hint| {
+            crate::change_capture_cli::captured_harness(agent, &capture_payload, hint.as_deref())
+                .is_some()
+        });
     // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
     #[cfg(not(unix))]
     let wants_capture = false;
@@ -209,12 +309,20 @@ async fn hook(
         };
     #[cfg(unix)]
     let spawn_capture = || {
-        tokio::spawn(capture(
+        let (agent, body, payload, hint) = (
             agent.to_owned(),
             body.clone(),
-            std::sync::Arc::clone(&payload),
-            budget,
-        ))
+            std::sync::Arc::clone(&capture_payload),
+            event_hint.as_ref().ok().and_then(|hint| hint.clone()),
+        );
+        // Spool locks and source reads must not occupy the workers driving the hook deadline.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?
+                .block_on(capture(agent, body, payload, budget, hint))
+        })
     };
     // Never called: nothing wants capture where it is not built.
     #[cfg(not(unix))]
@@ -223,8 +331,16 @@ async fn hook(
     // and runs beside it otherwise.
     let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
-    let reply = if client_connection
-        && capture_only(agent, payload["hook_event_name"].as_str().unwrap_or(""))
+    let reply = if cursor_reply {
+        json!({})
+    } else if client_connection
+        && capture_only(
+            agent,
+            payload["hook_event_name"]
+                .as_str()
+                .or_else(|| event_hint.as_ref().ok().and_then(|hint| hint.as_deref()))
+                .unwrap_or(""),
+        )
         && !observes_shell(agent, &payload)
     {
         fail_open(agent, &payload, None)
@@ -259,6 +375,13 @@ async fn hook(
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
     }
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        crate::client_session::forget(&config, session);
+    }
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
     if permission::applies(agent, client_connection, &payload) {
@@ -275,18 +398,116 @@ async fn capture(
     body: Vec<u8>,
     payload: std::sync::Arc<Value>,
     budget: Instant,
+    event_hint: Option<String>,
 ) -> Option<String> {
-    let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
-    let routed = route_client(&agent, &payload).ok()?;
-    crate::change_capture_cli::plugin_capture(
-        harness,
-        &body,
-        &payload,
-        routed.checkout,
-        routed.connection,
-        budget.into(),
-    )
-    .await
+    if matches!(agent.as_str(), "cursor" | "copilot" | "gemini") {
+        let hook = agentscm::change_capture::native_hooks::normalize(
+            &agent,
+            &payload,
+            event_hint.as_deref(),
+        )
+        .ok()
+        .flatten()?;
+        let connections = client_config::load().ok()?;
+        let (connection, checkout, _) =
+            select_client_checkout(&agent, &payload, &connections).ok()?;
+        if !client_config::is_current_in(&connection, &checkout) {
+            return None;
+        }
+        let mut context = None;
+        for event in hook.events {
+            let input = serde_json::to_vec(&event).ok()?;
+            let (captured, _) = crate::change_capture_cli::plugin_capture(
+                hook.harness,
+                &input,
+                &event,
+                checkout.clone(),
+                connection.clone(),
+                budget.into(),
+            )
+            .await;
+            if context.is_none() {
+                context = captured;
+            }
+        }
+        // These hosts have no vetted retrospective reader or source-authenticated fanout.
+        return context;
+    }
+    let harness = crate::change_capture_cli::captured_harness(&agent, &payload, None)?;
+    let routed = route_client(&agent, &payload).ok();
+    let mut default = None;
+    let mut context = None;
+    if let Some(routed) = routed {
+        let namespace = (
+            routed.connection.hub.clone(),
+            routed.connection.repo.clone(),
+        );
+        let (captured, target) = crate::change_capture_cli::plugin_capture(
+            harness,
+            &body,
+            &payload,
+            routed.checkout,
+            routed.connection,
+            budget.into(),
+        )
+        .await;
+        context = captured;
+        default = target.map(|target| (namespace, target));
+    }
+    if matches!(agent.as_str(), "codex" | "claude")
+        && let (Some(session), Ok(config), Ok(connections)) =
+            (session_of(&payload), config_dir(), client_config::load())
+    {
+        let tool = matches!(
+            payload["hook_event_name"].as_str(),
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        );
+        for association in crate::client_session::capture_associations(&config, session)
+            .iter()
+            .filter(|association| association.harness == harness)
+        {
+            // The default route already handled this literal event. Tool claims can retain an
+            // older Work route, so those use each association's exact phase dedup instead.
+            if !needs_associated_capture(association, default.as_ref(), tool) {
+                continue;
+            }
+            let Some((connection, _)) =
+                client_config::connection_for_checkout(&connections, &association.checkout).filter(
+                    |(connection, _)| {
+                        connection.hub == association.hub
+                            && connection.repo.eq_ignore_ascii_case(&association.repo)
+                            && client_config::is_current_in(connection, &association.checkout)
+                    },
+                )
+            else {
+                continue;
+            };
+            crate::change_capture_cli::plugin_capture_for_work(
+                harness,
+                &body,
+                &payload,
+                association.checkout.clone(),
+                connection.clone(),
+                budget.into(),
+                Some(association),
+            )
+            .await;
+        }
+    }
+    context
+}
+
+fn needs_associated_capture(
+    association: &crate::client_session::CaptureAssociation,
+    default: Option<&((String, String), agentscm::change_record::CaptureTargetV1)>,
+    tool: bool,
+) -> bool {
+    tool || !default.is_some_and(|((hub, repo), target)| {
+        association.hub == *hub
+            && association.repo.eq_ignore_ascii_case(repo)
+            && association.work_id == target.work_id
+            && association.generation == target.generation
+    })
 }
 
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
@@ -301,12 +522,6 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
         return Some(tokio::task::spawn_blocking(move || {
             crate::client_session::record(&config, &session);
         }));
-    }
-    if matches!(
-        payload["hook_event_name"].as_str(),
-        Some("SessionEnd" | "sessionEnd")
-    ) {
-        crate::client_session::forget(&config, &session);
     }
     None
 }
@@ -427,6 +642,20 @@ fn capture_only(agent: &str, event: &str) -> bool {
                 | "SubagentStart"
                 | "SubagentStop"
         ),
+        "cursor" => matches!(
+            event,
+            "beforeSubmitPrompt" | "afterAgentResponse" | "preCompact" | "postToolUseFailure"
+        ),
+        "copilot" => matches!(
+            event,
+            "userPromptSubmitted"
+                | "UserPromptSubmit"
+                | "preCompact"
+                | "PreCompact"
+                | "postToolUseFailure"
+                | "PostToolUseFailure"
+        ),
+        "gemini" => matches!(event, "BeforeAgent" | "BeforeModel" | "PreCompress"),
         _ => matches!(
             event,
             "PostToolUseFailure" | "MessageDisplay" | "PreCompact"
@@ -1569,6 +1798,28 @@ fn route_client_with(
     payload: &Value,
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
+    let (connection, checkout, normalized) = select_client_checkout(agent, payload, connections)?;
+    let endpoint_agent = if generic_route(agent) {
+        "generic"
+    } else {
+        agent
+    };
+    Ok(RoutedClient {
+        payload: sanitized_client(agent, payload, &normalized)?,
+        connection,
+        checkout,
+        endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
+    })
+}
+
+/// Select source with the same connection and worktree checks for capture and coordination.
+/// Capture-only native events need no coordination payload or invented lifecycle event.
+fn select_client_checkout(
+    agent: &str,
+    payload: &Value,
+    connections: &[Connection],
+) -> Result<(Connection, PathBuf, Vec<EditPath>), String> {
     if connections.is_empty() {
         return Err(NO_CONNECTION.into());
     }
@@ -1613,18 +1864,7 @@ fn route_client_with(
             .map(|(connection, checkout)| (connection.clone(), checkout))
             .ok_or_else(|| NO_CONNECTION.to_owned())?,
     };
-    let endpoint_agent = if generic_route(agent) {
-        "generic"
-    } else {
-        agent
-    };
-    Ok(RoutedClient {
-        payload: sanitized_client(agent, payload, &normalized)?,
-        connection,
-        checkout,
-        endpoint_agent: endpoint_agent.to_owned(),
-        edits: normalized,
-    })
+    Ok((connection, checkout, normalized))
 }
 
 /// One sentence for the start context that names the other repositories this computer can
@@ -1852,6 +2092,48 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
     route_client_with("codex", payload, connections)
 }
 
+/// Sends only a completely read native question snapshot, independently of conversation
+/// sharing. The caller has already bound the native file to this session and checkout.
+pub(crate) async fn forward_questions(
+    connection: &Connection,
+    session: &str,
+    snapshot: Option<&agentscm::hub::session_waiting::QuestionSnapshot>,
+) -> Result<(), String> {
+    if session.is_empty() || session.len() > 1024 || session.chars().any(char::is_control) {
+        return Err("invalid native question session".into());
+    }
+    let payload = match snapshot {
+        Some(snapshot) => {
+            json!({"hook_event_name": "QuestionsSnapshot", "session_id": session, "questions": snapshot})
+        }
+        None => json!({"hook_event_name": "QuestionsUnavailable", "session_id": session}),
+    };
+    let payload = sanitized_codex(&payload, Some(&[]))?;
+    let token = crate::client_cli::read_token(&connection.token_file).map_err(|_| "no token")?;
+    let request = HookRequest {
+        agent: "codex".into(),
+        repo: Some(connection.repo.clone()),
+        client: Some(client_config::onboarding_client(&connection.root, &token)),
+        token,
+        root: None,
+        report_completion: false,
+        report: None,
+        body: serde_json::to_vec(&payload).map_err(|_| "invalid native question snapshot")?,
+    };
+    let client = forge_http::client().map_err(|_| "hub unreachable")?;
+    let request = request
+        .request(&client, &connection.hub)
+        .map_err(|_| "hub unreachable")?;
+    let (status, reply) = tokio::time::timeout(LIMIT, send(request, REPLY_BYTES))
+        .await
+        .map_err(|_| "hub unreachable")?
+        .map_err(|_| "hub unreachable")?;
+    if status != 200 || reply["questions_accepted"] != true {
+        return Err("native question snapshot not accepted".into());
+    }
+    Ok(())
+}
+
 /// Codex may include source, patch bodies and prompts outside the tool input. Only fields needed
 /// for coordination leave the machine. For patches, only recognized operation headers survive.
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
@@ -1873,6 +2155,18 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         {
             out.insert(key.into(), json!(value));
         }
+    }
+    if payload["hook_event_name"] == "QuestionsSnapshot" {
+        let mut snapshot: agentscm::hub::session_waiting::QuestionSnapshot =
+            serde_json::from_value(payload["questions"].clone())
+                .map_err(|_| "invalid native question snapshot")?;
+        for question in &mut snapshot.pending {
+            question.asks = question.asks.as_deref().and_then(line_end);
+        }
+        if !snapshot.valid() {
+            return Err("invalid native question snapshot".into());
+        }
+        out.insert("questions".into(), json!(snapshot));
     }
     // A session its person cleared (`/clear`) waits for nobody; no other end reason leaves.
     if payload["hook_event_name"] == "SessionEnd" && payload["reason"] == "clear" {
@@ -1966,14 +2260,21 @@ const ASKS_CHARS: usize = 400;
 fn wait_asks(payload: &Value) -> Option<String> {
     match payload["hook_event_name"].as_str()? {
         "Stop" if !resumes_itself(payload) => line_end(payload["last_assistant_message"].as_str()?),
-        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => line_end(
-            &payload["tool_input"]["questions"]
-                .as_array()?
-                .iter()
-                .filter_map(|q| q["question"].as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
+        "PreToolUse"
+            if matches!(
+                payload["tool_name"].as_str(),
+                Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+            ) =>
+        {
+            line_end(
+                &payload["tool_input"]["questions"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|q| q["question"].as_str().or_else(|| q["title"].as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
         _ => None,
     }
 }
@@ -2664,7 +2965,11 @@ fn waits(agent: &str, payload: &Value) -> bool {
     match payload["hook_event_name"].as_str() {
         Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
         Some("stop") => agent == "cursor",
-        Some("PreToolUse") => payload["tool_name"] == "AskUserQuestion",
+        Some("QuestionsSnapshot" | "QuestionsUnavailable") => true,
+        Some("PreToolUse") => matches!(
+            payload["tool_name"].as_str(),
+            Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+        ),
         Some(_) => false,
         None => {
             agent == "copilot"
@@ -2689,11 +2994,17 @@ fn path_segment(agent: &str) -> String {
 
 /// Where the agent is working: the payload's `cwd`, else its first workspace root, else here.
 fn cwd_of(payload: &Value) -> PathBuf {
-    let first_root = payload["workspace_roots"][0].as_str();
-    payload["cwd"].as_str().or(first_root).map_or_else(
-        || std::env::current_dir().unwrap_or_default(),
-        PathBuf::from,
-    )
+    let first_root = payload["workspace_roots"][0]
+        .as_str()
+        .filter(|root| !root.is_empty());
+    payload["cwd"]
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .or(first_root)
+        .map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        )
 }
 
 /// Added to a failure note: it is given once per session and failure, so it has to cover the edits
@@ -3105,8 +3416,184 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
     }
 }
 
+#[cfg(all(test, unix))]
+mod native_capture_tests {
+    use super::*;
+
+    #[test]
+    fn configured_hook_event_is_not_a_position_and_ambiguous_hints_are_refused() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for values in [
+            args(&[
+                "copilot",
+                "--client-connection",
+                "--hook-event",
+                "userPromptSubmitted",
+            ]),
+            args(&["--hook-event=userPromptSubmitted", "copilot"]),
+            args(&["--hook-event", "userPromptSubmitted", "copilot"]),
+        ] {
+            assert_eq!(parse_args(&values).0, "copilot");
+            assert_eq!(
+                hook_event_hint(&values).unwrap().as_deref(),
+                Some("userPromptSubmitted")
+            );
+        }
+        for values in [
+            args(&["copilot", "--hook-event"]),
+            args(&["copilot", "--hook-event="]),
+            args(&["copilot", "--hook-event", "bad event"]),
+            args(&[
+                "copilot",
+                "--hook-event=postToolUse",
+                "--hook-event=preToolUse",
+            ]),
+        ] {
+            assert!(hook_event_hint(&values).is_err());
+        }
+    }
+
+    #[test]
+    fn gemini_capture_only_events_select_source_without_coordination_payloads() {
+        use agentscm::change_capture::{LocalSpool, claude_code, native_hooks};
+        use agentscm::change_record::{
+            AgentHarnessV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let connection = Connection {
+            root: root.clone(),
+            origin_host: "example.test".into(),
+            hub: "https://hub.example.test".into(),
+            repo: "acme/widgets".into(),
+            token_file: temp.path().join("token"),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        };
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        for (name, expected) in [
+            ("BeforeAgent", CapturedEventKindV1::UserPrompt),
+            ("BeforeModel", CapturedEventKindV1::SetupObserved),
+        ] {
+            let payload = json!({"hook_event_name":name,"session_id":"native_session","cwd":root,
+                "prompt":"Visible user prompt", "llm_request":{"model":"gemini-example","messages":["excluded-context"]},
+                "llm_response":{"candidates":["excluded-thought"],"usageMetadata":{"totalTokenCount":42}}});
+            let original = payload.clone();
+            let (_, checkout, paths) =
+                select_client_checkout("gemini", &payload, std::slice::from_ref(&connection))
+                    .unwrap();
+            assert_eq!(checkout, root);
+            assert!(paths.is_empty());
+            assert!(capture_only("gemini", name));
+            assert!(sanitized_client("gemini", &payload, &paths).is_err());
+            let hook = native_hooks::normalize("gemini", &payload, None)
+                .unwrap()
+                .unwrap();
+            let request = claude_code::CaptureRequest {
+                operation_prefix: name.into(),
+                work_id: "wrk_native".into(),
+                generation: 1,
+                observed_session_id: "native_session".into(),
+                canonical_session_id: "native_session".into(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::LocalConversation,
+                live_capture_mode: CaptureModeV1::LocalConversation,
+                harness: AgentHarnessV1::GeminiCli,
+            };
+            for event in hook.events {
+                claude_code::capture_hook(&serde_json::to_vec(&event).unwrap(), &request, &spool)
+                    .unwrap();
+            }
+            assert_eq!(payload, original);
+            assert!(spool.pending(100).unwrap().iter().any(|envelope| matches!(envelope,
+                CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().any(|event| event.kind == expected))));
+        }
+        assert!(
+            !spool
+                .pending(100)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(envelope, CaptureEnvelopeV1::Usage(_)))
+        );
+        let child = root.join("unregistered");
+        std::fs::create_dir_all(child.join(".git")).unwrap();
+        assert!(
+            select_client_checkout(
+                "gemini",
+                &json!({"hook_event_name":"BeforeModel","cwd":child}),
+                &[connection]
+            )
+            .is_err()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literal_fanout_skips_only_the_exact_default_work_and_preserves_tool_context() {
+        let association = crate::client_session::CaptureAssociation {
+            session: "native".into(),
+            harness: agentscm::change_record::AgentHarnessV1::ClaudeCode,
+            hub: "https://hub.example".into(),
+            repo: "acme/one".into(),
+            checkout: std::path::PathBuf::from("/synthetic/checkout"),
+            work_id: "wrk_one".into(),
+            generation: 1,
+            native_start_verified: true,
+        };
+        let default = (
+            (association.hub.clone(), association.repo.clone()),
+            agentscm::change_record::CaptureTargetV1 {
+                version: 1,
+                work_id: association.work_id.clone(),
+                generation: 1,
+                session_id: "native".into(),
+            },
+        );
+        assert!(!super::needs_associated_capture(
+            &association,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(
+            &association,
+            Some(&default),
+            true
+        ));
+        let mut other = association.clone();
+        other.work_id = "wrk_two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.repo = "acme/two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.generation += 1;
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(&association, None, false));
+    }
+
     use super::*;
 
     fn changed(paths: &[&str], truncated: bool) -> Value {
@@ -3267,6 +3754,186 @@ mod tests {
         assert_eq!(edit(&real, &nested.join("src/a.rs")), unplaced);
         // A `cwd` outside every checkout, editing inside one.
         assert_eq!(edit(temp.path(), &real.join("src/a.rs")), unplaced);
+    }
+
+    #[test]
+    fn native_question_snapshots_send_only_validated_redacted_wait_metadata() {
+        let raw = json!({"hook_event_name":"QuestionsSnapshot","session_id":"s",
+            "prompt":"private reply", "transcript_path":"private path",
+            "questions":{"offset":123,"pending":[{"id":"[\"request_user_input_async\",\"call_example\",0]",
+                "since":1000,"asks":"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nChoose a format"}]}});
+        let sent = sanitized_codex(&raw, Some(&[])).unwrap();
+        let text = sent.to_string();
+        assert!(!text.contains("private") && !text.contains("ghp_abc"));
+        assert!(text.contains("Choose a format"));
+        assert_eq!(sent["questions"]["offset"], 123);
+        assert!(waits("codex", &raw));
+        let mut malformed = raw;
+        malformed["questions"]["pending"][0]["id"] = json!("not a question id");
+        assert!(sanitized_codex(&malformed, Some(&[])).is_err());
+        let synchronous = json!({"hook_event_name":"PreToolUse","tool_name":"request_user_input",
+            "tool_input":{"questions":[{"question":"Choose a format"}]}});
+        assert_eq!(wait_asks(&synchronous).as_deref(), Some("Choose a format"));
+        assert!(waits("codex", &synchronous));
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":"s",
+            "prompt":"private", "transcript_path":"private", "questions":{"pending":["private"]}});
+        let sent = sanitized_codex(&unavailable, Some(&[])).unwrap();
+        assert!(waits("codex", &sent));
+        assert_eq!(sent["hook_event_name"], "QuestionsUnavailable");
+        assert!(!sent.to_string().contains("private"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_question_poll_forward_and_status_preserve_the_wait_until_a_matched_reply() {
+        use agentscm::backend::LocalBackend;
+        use agentscm::change_capture::codex::poll_questions;
+        use agentscm::hub::store::{self, ForgeIdentity, mint_bound_agent_token, unix_now};
+        use agentscm::hub::{HubState, router};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        const SESSION: &str = "55555555-5555-4555-8555-555555555555";
+        let temp = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            temp.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 913,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(&*store, &user.id, "codex", "acme/widgets", 101, 3600, false)
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connection = connection(temp.path(), "acme/widgets");
+        connection.hub = format!("http://{}", listener.local_addr().unwrap());
+        connection.token_file = temp.path().join("token");
+        std::fs::write(&connection.token_file, secret.expose()).unwrap();
+        std::fs::set_permissions(
+            &connection.token_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let app = router(HubState::new(
+            store,
+            Arc::new(LocalBackend::open(temp.path().join("objects")).unwrap()),
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = temp.path().join("rollout.jsonl");
+        let append = |value: Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{value}").unwrap();
+        };
+        append(json!({"type":"session_meta","payload":{"id":SESSION}}));
+        let item = |value: Value| {
+            json!({"type":"event_msg","timestamp":"2026-11-15T12:00:00Z",
+            "payload":{"type":"item_completed","thread_id":SESSION,"item":value}})
+        };
+        append(item(
+            json!({"type":"AgentMessage","id":"call_question","delivery":"async",
+            "content":[],"questions":[{"title":"Choose a format","options":["JSON","CSV"]}]}),
+        ));
+        let mut cursor = None;
+        let read = |cursor: &mut Option<_>| {
+            let mut report = poll_questions(&path, SESSION, cursor).unwrap();
+            assert!(report.complete && report.reliable);
+            // Simulate an elapsed grace interval without making a local test wait a minute.
+            for question in &mut report.snapshot.pending {
+                question.since = unix_now() - 70;
+            }
+            report.snapshot
+        };
+        let first = read(&mut cursor);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let status = || async {
+            let body = client
+                .get(format!("{}/v1/hub/standup/status", connection.hub))
+                .bearer_auth(secret.expose())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        };
+        let waiting_count = |value: &Value| {
+            value["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["kind"] == "session_waiting")
+                .count()
+        };
+        assert_eq!(waiting_count(&status().await), 1);
+        append(
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_question","output":"{\"accepted\":true}"}}),
+        );
+        append(item(
+            json!({"type":"UserMessage","id":"unrelated","content":[{"type":"Text","text":"Here is a screenshot"}]}),
+        ));
+        // Continued native work and a normal user prompt also flow through the real hooks.
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"] {
+            client
+                .post(format!(
+                    "{}/v1/hub/hook/codex?repo=acme/widgets",
+                    connection.hub
+                ))
+                .bearer_auth(secret.expose())
+                .header("content-type", "application/json")
+                .body(
+                    json!({"hook_event_name":event,"session_id":SESSION,"tool_name":"exec"})
+                        .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        forward_questions(&connection, SESSION, Some(&read(&mut cursor)))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 1);
+        let reply = json!([{"questionItemId":first.pending[0].id,"question":"Choose a format","answer":"JSON"}]);
+        append(item(
+            json!({"type":"UserMessage","id":"reply","content":[{"type":"Text",
+            "text":format!("<send_user_message_question_reply>{reply}</send_user_message_question_reply>")}]}),
+        ));
+        let answered = read(&mut cursor);
+        assert!(answered.pending.is_empty());
+        forward_questions(&connection, SESSION, Some(&answered))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        std::fs::write(&connection.token_file, "invalid-token").unwrap();
+        assert!(
+            forward_questions(&connection, SESSION, Some(&answered))
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[test]
@@ -4731,6 +5398,10 @@ mod tests {
     #[test]
     fn payload_directory_comes_from_cwd_then_workspace_roots() {
         assert_eq!(
+            cwd_of(&json!({"cwd":"", "workspace_roots":["/b"]})),
+            PathBuf::from("/b")
+        );
+        assert_eq!(
             cwd_of(&json!({"cwd": "/a", "workspace_roots": ["/b"]})),
             PathBuf::from("/a")
         );
@@ -5657,8 +6328,10 @@ mod tests {
         #[cfg(unix)]
         for event in agentscm::change_capture::codex::HOOK_EVENTS {
             let payload = json!({"hook_event_name": event});
-            assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
-            assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
+            assert!(crate::change_capture_cli::captured_harness("codex", &payload, None).is_some());
+            assert!(
+                crate::change_capture_cli::captured_harness("cursor", &payload, None).is_none()
+            );
         }
     }
 

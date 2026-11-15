@@ -528,9 +528,12 @@ export async function fetchChangeRecord(repo: string, workId: string, token: str
   return decodeChangeRecordResponse(value, workId, repo)
 }
 
-export type ConversationEventKind =
-  | 'session_started' | 'user_prompt' | 'assistant_message' | 'tool_started' | 'tool_finished' | 'check_started'
-  | 'check_finished' | 'session_ended' | 'gap' | 'turn_ended' | 'compaction' | 'subagent_started' | 'subagent_stopped'
+/** Captured event kinds shared by the change record and repository conversation projections. */
+export const CONVERSATION_EVENT_KINDS = [
+  'session_started', 'user_prompt', 'assistant_message', 'tool_started', 'tool_finished', 'check_started',
+  'check_finished', 'session_ended', 'gap', 'turn_ended', 'compaction', 'subagent_started', 'subagent_stopped', 'setup_observed',
+] as const
+export type ConversationEventKind = typeof CONVERSATION_EVENT_KINDS[number]
 /** What a listing can say. A body that fails verification is only found by reading it (HTTP 424). */
 export type ConversationAvailability = 'local' | 'shared' | 'expired' | 'deleted'
 
@@ -552,10 +555,7 @@ export interface ConversationPage {
   next_cursor: string | null
 }
 
-const CONVERSATION_KIND = new Set<ConversationEventKind>([
-  'session_started', 'user_prompt', 'assistant_message', 'tool_started', 'tool_finished', 'check_started',
-  'check_finished', 'session_ended', 'gap', 'turn_ended', 'compaction', 'subagent_started', 'subagent_stopped',
-])
+const CONVERSATION_KIND = new Set<ConversationEventKind>(CONVERSATION_EVENT_KINDS)
 const CONVERSATION_AVAILABILITY = new Set<ConversationAvailability>(['local', 'shared', 'expired', 'deleted'])
 
 export function decodeConversationPage(value: unknown): ConversationPage {

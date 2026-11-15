@@ -309,28 +309,116 @@ fn mcp_config_home(directory: &Path) -> Result<String> {
 }
 
 fn own_command(value: &Value) -> bool {
+    if ["command_windows", "args", "url"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+        || value.get("type").is_some_and(|kind| kind != "command")
+    {
+        return false;
+    }
     value["command"].as_str().is_some_and(|command| {
+        let Some((quoted, args)) = command.rsplit_once(" --no-telemetry ") else {
+            return false;
+        };
+        let Some(program) = quoted.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+            return false;
+        };
+        let program = program.replace("'\\''", "'");
+        if shell_quote(&program) != quoted || program_text(Path::new(&program)).is_err() {
+            return false;
+        }
+        if matches!(
+            args,
+            "hook-wait copilot --notification" | "hook-wait copilot --end"
+        ) {
+            return true;
+        }
         // Codex's hooks come from its plugin only.
         Agent::value_variants()
             .iter()
             .filter(|agent| **agent != Agent::Codex)
             .any(|agent| {
-                command.starts_with('\'')
-                    && command.ends_with(&format!(
-                        "' --no-telemetry hook {} --client-connection",
-                        agent.name()
-                    ))
+                let base = format!("hook {} --client-connection", agent.name());
+                args == base
+                    || (*agent == Agent::Copilot
+                        && args
+                            .strip_prefix(&format!("{base} --hook-event "))
+                            .is_some_and(|event| {
+                                COPILOT_EVENTS.iter().any(|(name, _)| *name == event)
+                            }))
             })
     })
 }
 
-fn agentscm_hook(value: &Value) -> bool {
-    value["command"]
+/// Prefer the native Cursor registration when it also runs an inherited Claude plugin hook.
+pub(crate) fn cursor_hook_registered(root: &Path, event: &str) -> bool {
+    let paths = home().ok().into_iter().chain([root.to_path_buf()]);
+    paths
+        .map(|path| path.join(".cursor/hooks.json"))
+        .any(|path| {
+            let Some(value) = read(&path)
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                return false;
+            };
+            value["version"] == 1
+                && value["hooks"][event].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        own_command(hook)
+                            && hook["timeout"].as_u64().is_some_and(|timeout| timeout > 0)
+                            && hook.as_object().is_some_and(|object| {
+                                object.keys().all(|key| {
+                                    matches!(key.as_str(), "command" | "timeout" | "type")
+                                })
+                            })
+                            && hook["command"].as_str().is_some_and(|command| {
+                                command.ends_with(" --no-telemetry hook cursor --client-connection")
+                            })
+                    })
+                })
+        })
+}
+
+// Duplicate coordination detection is separate from permission to remove an owned command.
+pub(crate) fn agentscm_hook(value: &Value) -> bool {
+    value["url"]
         .as_str()
-        .is_some_and(|command| command.to_ascii_lowercase().contains("agentscm"))
-        || value["url"]
-            .as_str()
-            .is_some_and(|url| url.contains("/v1/hub/hook/"))
+        .is_some_and(|url| url.contains("/v1/hub/hook/"))
+        || ["command", "command_windows"].iter().any(|key| {
+            value[*key].as_str().is_some_and(|command| {
+                let words: Vec<_> = command
+                    .split_whitespace()
+                    .chain(
+                        value["args"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .map(|word| word.trim_matches(['\'', '"']))
+                    .collect();
+                if !words
+                    .iter()
+                    .any(|word| word.to_ascii_lowercase().contains("agentscm"))
+                {
+                    return false;
+                }
+                words
+                    .iter()
+                    .any(|word| matches!(*word, "hook" | "hook-wait"))
+                    || words
+                        .windows(2)
+                        .any(|pair| pair == ["change-capture", "hook-claude"])
+                    || (words
+                        .windows(2)
+                        .any(|pair| matches!(pair, ["intent", "start" | "check" | "done"]))
+                        && words
+                            .iter()
+                            .any(|word| *word == "--hook" || word.starts_with("--hook=")))
+            })
+        })
 }
 
 fn has_foreign_hooks(value: &Value, allow_owned: bool) -> bool {
@@ -389,6 +477,18 @@ fn add_typed_mcp(
     Ok(())
 }
 
+const COPILOT_EVENTS: [(&str, u64); 9] = [
+    ("sessionStart", 5),
+    ("userPromptSubmitted", 3),
+    ("preToolUse", 5),
+    ("postToolUse", 3),
+    ("postToolUseFailure", 3),
+    ("notification", 3),
+    ("preCompact", 3),
+    ("agentStop", 3),
+    ("sessionEnd", 3),
+];
+
 fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Value>)>> {
     let command = command(agent, program)?;
     let nested = |timeout, name: Option<&str>| {
@@ -428,24 +528,32 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             let hook = |timeout| json!({"command":command,"timeout":timeout});
             vec![
                 ("sessionStart", vec![hook(5)]),
+                ("beforeSubmitPrompt", vec![hook(3)]),
+                ("preToolUse", vec![hook(5)]),
                 ("postToolUse", vec![hook(5)]),
+                ("postToolUseFailure", vec![hook(3)]),
                 // Cursor names a reply's text here and not at `stop`; the hook keeps the end of
                 // it on the machine until the turn ends, so `stop` can say what was asked.
                 ("afterAgentResponse", vec![hook(3)]),
+                ("preCompact", vec![hook(3)]),
                 ("stop", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
         Agent::Copilot => {
-            let hook = |timeout| json!({"type":"command","command":command,"timeoutSec":timeout});
-            vec![
-                ("sessionStart", vec![hook(5)]),
-                ("preToolUse", vec![hook(5)]),
-                ("postToolUse", vec![hook(3)]),
-                ("notification", vec![hook(3)]),
-                ("agentStop", vec![hook(3)]),
-                ("sessionEnd", vec![hook(3)]),
-            ]
+            let wait = format!(
+                "{} --no-telemetry hook-wait copilot",
+                shell_quote(program_text(program)?)
+            );
+            COPILOT_EVENTS.into_iter().map(|(event, timeout)| {
+                let mut hooks = vec![json!({"type":"command","command":format!("{command} --hook-event {event}"),"timeoutSec":timeout})];
+                if event == "notification" {
+                    hooks.push(json!({"type":"command","command":format!("{wait} --notification"),"timeoutSec":crate::message_wait::MAX_LIFE.as_secs() + 300}));
+                } else if event == "sessionEnd" {
+                    hooks.push(json!({"type":"command","command":format!("{wait} --end"),"timeoutSec":5}));
+                }
+                (event, hooks)
+            }).collect()
         }
         Agent::Gemini => {
             vec![
@@ -457,7 +565,13 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
                     "BeforeTool",
                     vec![nested(5000, Some("AgentSCM edit coordination"))],
                 ),
+                ("BeforeAgent", vec![nested(3000, Some("AgentSCM prompt"))]),
                 ("AfterTool", vec![nested(3000, Some("AgentSCM activity"))]),
+                ("BeforeModel", vec![nested(3000, Some("AgentSCM model"))]),
+                (
+                    "PreCompress",
+                    vec![nested(3000, Some("AgentSCM compaction"))],
+                ),
                 (
                     "Notification",
                     vec![nested(3000, Some("AgentSCM waiting for you"))],
@@ -2246,8 +2360,12 @@ mod tests {
             events(Agent::Cursor),
             [
                 "sessionStart",
+                "beforeSubmitPrompt",
+                "preToolUse",
                 "postToolUse",
+                "postToolUseFailure",
                 "afterAgentResponse",
+                "preCompact",
                 "stop",
                 "sessionEnd"
             ]
@@ -2256,9 +2374,12 @@ mod tests {
             events(Agent::Copilot),
             [
                 "sessionStart",
+                "userPromptSubmitted",
                 "preToolUse",
                 "postToolUse",
+                "postToolUseFailure",
                 "notification",
+                "preCompact",
                 "agentStop",
                 "sessionEnd"
             ]
@@ -2268,7 +2389,10 @@ mod tests {
             [
                 "SessionStart",
                 "BeforeTool",
+                "BeforeAgent",
                 "AfterTool",
+                "BeforeModel",
+                "PreCompress",
                 "Notification",
                 "AfterAgent",
                 "SessionEnd"
@@ -2472,6 +2596,108 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("another AgentSCM native hook"), "{error}");
+    }
+
+    #[test]
+    fn setup_and_removal_preserve_custom_invocations_of_an_owned_command() {
+        let program = Path::new("/opt/agentscm");
+        for extra in [
+            json!({"command_windows":"other-check.exe"}),
+            json!({"args":["--custom"]}),
+            json!({"type":"http", "url":"https://hooks.example.test/check"}),
+        ] {
+            let mut hook = extra;
+            hook["command"] = json!(command(Agent::Copilot, program).unwrap());
+            assert!(!own_command(&hook));
+            for entry in [hook.clone(), json!({"hooks":[hook]})] {
+                let original = json!({"hooks":{"notification":[entry]}});
+                let mut value = original.clone();
+                assert!(add_hooks(&mut value, Agent::Copilot, program).is_err());
+                assert_eq!(value, original);
+                assert_eq!(
+                    without_ours(&original.to_string(), &json!([]), FORM).unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_preflight_preserves_legacy_and_split_coordination_hooks() {
+        let (_dir, root) = repo();
+        let path = root.join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for hook in [
+            json!({"command":"/opt/agentscm intent start --hook claude"}),
+            json!({"command":"/opt/agentscm 'intent' 'check' --hook=claude"}),
+            json!({"command":"/opt/agentscm", "args":["intent", "done", "--hook", "claude"]}),
+            json!({"command":"/opt/agentscm", "args":["--no-telemetry", "hook", "claude", "--client-connection"]}),
+            json!({"command_windows":"C:\\tools\\agentscm.exe", "args":["hook", "claude"]}),
+            json!({"command":"npx", "args":["agentscm", "hook", "claude"]}),
+        ] {
+            let text = json!({"hooks":{"PreToolUse":[{"hooks":[hook]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            let error = check_other_hooks(Agent::Copilot, &root, Scope::User)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("another AgentSCM native hook"), "{error}");
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert!(!root.join(".github").exists());
+        }
+    }
+
+    #[test]
+    fn copilot_event_hints_and_waiter_survive_upgrade_and_remove_cleanly() {
+        let program = Path::new("/opt/agent's tools/agentscm");
+        let helper = json!({"type":"command","command":"node /opt/agentscm/hooks/commercial.mjs"});
+        let mut value = json!({"hooks":{"notification":[helper.clone()]}});
+        add_hooks(&mut value, Agent::Copilot, program).unwrap();
+        let once = value.clone();
+        add_hooks(&mut value, Agent::Copilot, program).unwrap();
+        assert_eq!(value, once);
+        for (event, _) in COPILOT_EVENTS {
+            let hooks = value["hooks"][event].as_array().unwrap();
+            let capture = hooks
+                .iter()
+                .find(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains(" --client-connection")
+                })
+                .unwrap();
+            assert!(
+                capture["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("--hook-event {event}"))
+            );
+            assert!(own_command(capture));
+        }
+        let notification = value["hooks"]["notification"].as_array().unwrap();
+        assert_eq!(notification[0], helper);
+        assert_eq!(
+            notification[2]["timeoutSec"],
+            crate::message_wait::MAX_LIFE.as_secs() + 300
+        );
+        assert!(
+            notification[2]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" hook-wait copilot --notification")
+        );
+        assert_eq!(value["hooks"]["sessionEnd"][1]["timeoutSec"], 5);
+        let removed = without_ours(&value.to_string(), &json!([]), FORM).unwrap();
+        assert_eq!(removed["hooks"], json!({"notification":[helper]}));
+        for command in [
+            "'/opt/agentscm' --no-telemetry hook copilot --client-connection --hook-event unknown",
+            "'/opt/agentscm' --no-telemetry hook copilot --client-connection; other",
+            "'relative' --no-telemetry hook copilot --client-connection",
+            "'/opt/agentscm'; other; 'x' --no-telemetry hook copilot --client-connection",
+        ] {
+            assert!(!own_command(&json!({"command":command})), "{command}");
+        }
     }
 
     /// The default Copilot setup writes the user locations that Copilot CLI and VS Code's

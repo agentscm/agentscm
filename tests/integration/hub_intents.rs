@@ -1023,7 +1023,8 @@ async fn activity_is_authenticated_scoped_and_shaped() {
         (status, empty),
         (
             200,
-            json!({"sessions": [], "quiet_sessions": [], "events": [], "next_before": null})
+            json!({"sessions": [], "quiet_sessions": [], "events": [], "next_before": null,
+                "waiting_complete": true, "limits": []})
         )
     );
 

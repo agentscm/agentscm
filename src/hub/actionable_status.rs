@@ -846,7 +846,11 @@ fn read_scoped(
     actions.extend(dependency_actions);
     limits.extend(dependency_limits);
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
-    actions.extend(waiting_actions(store, setup, principal, &items, now)?);
+    let (waiting, waiting_complete) = waiting_actions(store, setup, principal, &items, now)?;
+    actions.extend(waiting);
+    if !waiting_complete {
+        limits.insert("session_waiting_unavailable".into());
+    }
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -855,9 +859,8 @@ fn read_scoped(
                 .expect("actions serialize"),
         ]);
     actions.dedup_by(|a, b| a.id == b.id);
-    if actions.len() > 200 {
+    if limit_actions(&mut actions) {
         limits.insert("status_actions_truncated".into());
-        actions.truncate(200);
     }
     for action in &mut actions {
         if action.recipients.len() > 8 {
@@ -932,32 +935,7 @@ fn read_scoped(
     // The existing agent CLI accepts at most 1 MiB. Preserve every selected Work/reservation
     // row and bound displayed actions below that transport limit. Their full identity remains
     // in complete_action_digest, so omission never makes changed captured facts look current.
-    let mut response_bytes = serde_json::to_vec(&result)
-        .expect("status serializes")
-        .len();
-    if response_bytes > 768 * 1024 {
-        while response_bytes > 767 * 1024 {
-            let Some(action) = result.actions.pop() else {
-                return Err(HubError::Unavailable(
-                    "shared status exceeds its response budget".into(),
-                ));
-            };
-            response_bytes = response_bytes.saturating_sub(
-                serde_json::to_vec(&action)
-                    .expect("action serializes")
-                    .len(),
-            );
-            result.counts.needs_you = result
-                .counts
-                .needs_you
-                .saturating_sub(usize::from(action.needs_you));
-        }
-        result.complete = false;
-        result
-            .limits
-            .push("status_response_budget_truncated".into());
-        result.limits.sort();
-    }
+    bound_response(&mut result)?;
     // Include complete request versions, even omitted/no-longer-actionable request bodies, so a
     // changed recipient/response invalidates the captured evidence. No credential is included.
     let mut hashed = result.clone();
@@ -972,6 +950,52 @@ fn read_scoped(
     ))
     .expect("status serializes")]);
     Ok(result)
+}
+
+/// The waiting store already bounds the viewer's human prompts. Preserve all of those
+/// accepted waits; the general action limit must not turn an unrelated busy queue into
+/// missing human questions. This applies to both token and role-checked person reads.
+fn limit_actions(actions: &mut Vec<StatusAction>) -> bool {
+    let before = actions.len();
+    let mut ordinary = 0;
+    actions.retain(|action| {
+        if action.kind == "session_waiting" {
+            return true;
+        }
+        ordinary += 1;
+        ordinary <= 200
+    });
+    actions.len() != before
+}
+
+fn bound_response(result: &mut ActionableStatus) -> Result<()> {
+    if serde_json::to_vec(result).expect("status serializes").len() <= 768 * 1024 {
+        return Ok(());
+    }
+    result.complete = false;
+    result
+        .limits
+        .push("status_response_budget_truncated".into());
+    result.limits.sort();
+    // Include the limit marker and count changes in the measured result. Leave room for the
+    // final digest; a successful response never silently omits a person's waiting prompt.
+    while serde_json::to_vec(result).expect("status serializes").len() > 767 * 1024 {
+        let Some(index) = result
+            .actions
+            .iter()
+            .rposition(|action| action.kind != "session_waiting")
+        else {
+            return Err(HubError::Unavailable(
+                "shared status exceeds its response budget".into(),
+            ));
+        };
+        let action = result.actions.remove(index);
+        result.counts.needs_you = result
+            .counts
+            .needs_you
+            .saturating_sub(usize::from(action.needs_you));
+    }
+    Ok(())
 }
 
 /// An action as a change marker hashes it. An overlap alert says how long ago each holder was
@@ -1058,7 +1082,7 @@ fn waiting_actions(
     principal: &Principal,
     items: &BTreeMap<String, WorkItem>,
     now: i64,
-) -> Result<Vec<StatusAction>> {
+) -> Result<(Vec<StatusAction>, bool)> {
     let owner = principal.owner.id.as_str();
     let viewer = StatusRecipient {
         kind: RecipientKind::Person,
@@ -1066,7 +1090,8 @@ fn waiting_actions(
         login: Some(principal.owner.login.clone()),
         agent: None,
     };
-    let waits = setup.waiting().owned(principal, now)?;
+    let waiting = setup.waiting().owned(store, principal, now);
+    let waits = waiting.waits;
     // Which of this person's sessions another started, and which lead unfinished Work in any
     // repository. Read only while one of them waits.
     let (starts, leads) = if waits.is_empty() {
@@ -1178,7 +1203,7 @@ fn waiting_actions(
             limits: vec![],
         });
     }
-    Ok(actions)
+    Ok((actions, waiting.complete))
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -1647,6 +1672,200 @@ mod tests {
             "scope":["src/example.rs"], "branch":null,"worktree":null,"next_action":null,"current":null,"blocker":null,
             "depends_on":[],"related_work":[],"created_at":100,"updated_at":100,"created_seq":1,"updated_seq":1
         })).unwrap()
+    }
+
+    fn queue_action(id: String, kind: &str, bytes: usize) -> StatusAction {
+        StatusAction {
+            id,
+            kind: kind.into(),
+            work_ids: vec![],
+            recipients: vec![],
+            needs_you: true,
+            action: "a".repeat(bytes),
+            updated_seq: 1,
+            semantic_version: None,
+            session: None,
+            limits: vec![],
+        }
+    }
+
+    #[test]
+    fn busy_status_keeps_every_wait_beyond_both_general_action_limits() {
+        let mut actions = (0..240)
+            .map(|n| queue_action(format!("first:{n:03}"), "directed_request", 10))
+            .collect::<Vec<_>>();
+        actions.extend(
+            (0..256)
+                .map(|n| queue_action(format!("waiting:question:{n:03}"), "session_waiting", 400)),
+        );
+        assert!(limit_actions(&mut actions));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind == "session_waiting")
+                .count(),
+            256
+        );
+        assert_eq!(actions.len(), 456);
+        // The response byte limit used to pop the last alphabetic actions, which are waits.
+        for action in actions
+            .iter_mut()
+            .filter(|action| action.kind != "session_waiting")
+        {
+            action.action = "a".repeat(5_000);
+        }
+        let mut status = ActionableStatus {
+            schema_version: 1,
+            repository: "acme/widgets".into(),
+            repository_id: Some(7),
+            provider: "github".into(),
+            host: "github.com".into(),
+            viewer_owner: "usr_me".into(),
+            counts: StatusCounts {
+                needs_you: actions.len(),
+                ..Default::default()
+            },
+            work: vec![],
+            actions,
+            observed_at: 1_000,
+            complete: true,
+            atomic_snapshot: false,
+            limits: vec![],
+            digest: String::new(),
+        };
+        bound_response(&mut status).unwrap();
+        assert!(!status.complete);
+        assert!(
+            status
+                .limits
+                .iter()
+                .any(|limit| limit == "status_response_budget_truncated")
+        );
+        assert_eq!(
+            status
+                .actions
+                .iter()
+                .filter(|action| action.kind == "session_waiting")
+                .count(),
+            256
+        );
+        assert_eq!(status.counts.needs_you, status.actions.len());
+        assert!(serde_json::to_vec(&status).unwrap().len() <= 767 * 1024);
+        status
+            .actions
+            .retain(|action| action.kind == "session_waiting");
+        for action in &mut status.actions {
+            action.action = "a".repeat(5_000);
+        }
+        assert!(matches!(
+            bound_response(&mut status),
+            Err(HubError::Unavailable(_))
+        ));
+        assert_eq!(status.actions.len(), 256);
+    }
+
+    #[test]
+    fn sqlite_status_returns_all_accepted_human_waits_above_two_hundred() {
+        use crate::hub::session_waiting::GRACE_SECONDS;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 812,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let viewer = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let observations = Observations::default();
+        for n in 0..256 {
+            let native = format!("session-{n}");
+            observations
+                .waiting()
+                .record(
+                    &viewer,
+                    &native,
+                    &native,
+                    "codex",
+                    WaitReason::Question,
+                    None,
+                    Some("Choose a format"),
+                    now - GRACE_SECONDS,
+                )
+                .unwrap();
+        }
+        let token = super::read(&*store, &observations, &viewer, now).unwrap();
+        let person =
+            super::read_person(&*store, &observations, &user, "acme/widgets", 101, now).unwrap();
+        for status in [token, person] {
+            assert_eq!(
+                status
+                    .actions
+                    .iter()
+                    .filter(|action| action.kind == "session_waiting")
+                    .count(),
+                256
+            );
+            assert_eq!(status.counts.needs_you, 256);
+            assert!(
+                !status
+                    .limits
+                    .iter()
+                    .any(|limit| limit == "status_actions_truncated")
+            );
+        }
+        assert!(matches!(
+            observations.waiting().questions_unavailable(
+                &*store,
+                &viewer,
+                "unavailable",
+                "unavailable",
+                now
+            ),
+            Err(HubError::Busy)
+        ));
+        let token = super::read(&*store, &observations, &viewer, now).unwrap();
+        let person =
+            super::read_person(&*store, &observations, &user, "acme/widgets", 101, now).unwrap();
+        for status in [token, person] {
+            assert!(!status.complete);
+            assert!(
+                status
+                    .limits
+                    .iter()
+                    .any(|limit| limit == "session_waiting_unavailable")
+            );
+            assert_eq!(
+                status
+                    .actions
+                    .iter()
+                    .filter(|action| action.kind == "session_waiting")
+                    .count(),
+                256,
+            );
+            assert_eq!(status.counts.needs_you, 256);
+        }
     }
     fn op(item: &WorkItem, held: bool, merged: bool) -> WorkOperationalV1 {
         work_operational(&OperationalFacts {
@@ -3751,7 +3970,9 @@ mod tests {
                 now - GRACE_SECONDS,
             )
             .unwrap();
-        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        let (actions, complete) =
+            waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        assert!(complete);
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             actions[0].action.contains("on “Current task”"),
@@ -3785,7 +4006,9 @@ mod tests {
                 now - GRACE_SECONDS,
             )
             .unwrap();
-        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        let (actions, complete) =
+            waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        assert!(complete);
         let started = actions
             .iter()
             .find(|a| a.action.contains("started under"))
@@ -4301,6 +4524,29 @@ mod tests {
         );
         let listed = status.actions.iter().find(|a| a.id == request).unwrap();
         assert_eq!(listed.recipients[0].kind, RecipientKind::LeadAgent);
+        // Missing question coverage leaves Work and directed requests available to the viewer.
+        let observations = Observations::default();
+        observations
+            .waiting()
+            .questions_unavailable(store, &viewer, "unavailable", "unavailable", later)
+            .unwrap();
+        let incomplete = super::read(store, &observations, &viewer, later).unwrap();
+        assert!(!incomplete.complete);
+        assert!(
+            incomplete
+                .limits
+                .iter()
+                .any(|limit| limit == "session_waiting_unavailable")
+        );
+        assert_eq!(
+            attention_signature(&incomplete),
+            attention_signature(&status)
+        );
+        assert!(incomplete.actions.iter().any(|action| action.id == request));
+        observations
+            .waiting()
+            .cleared(store, &viewer, "unavailable", later)
+            .unwrap();
         assert!(status.actions.iter().any(|a| {
             a.id == format!("pr:{}:7", repo.id) && a.recipients[0].kind == RecipientKind::LeadAgent
         }));

@@ -6,7 +6,7 @@
 //! JSONL and deliberately selects only visible user/assistant text and tool events. Thinking
 //! blocks, attachments, request caches and unrelated record types are not retained.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use crate::change_capture::redact::redact_json;
 use crate::change_capture::spool::{
-    LocalSpool, ManagedInvocationV1, NativeOccurrenceReceiptV1, NativeOccurrenceRouteV1,
-    ProviderHistoryCursorV1, limit_gap_reason,
+    HistoryStartCursorV1, LocalSpool, ManagedInvocationV1, NativeOccurrenceReceiptV1,
+    NativeOccurrenceRouteV1, ProviderHistoryCursorV1, VisibleHistoryCursorV1, limit_gap_reason,
 };
 use crate::change_capture::{
     AppendOutcome, CaptureError, DeferredHookV1, DeferredReasonV1, GitSourceRequest, OpenedGitRoot,
@@ -35,6 +35,7 @@ use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
     AttemptOutcome, AttemptPhase, UsageBasis, UsageMeasurementScope, UsageRecord,
 };
+use crate::hub::session_waiting::QuestionSnapshot;
 
 pub const ADAPTER_VERSION: &str = "1.0.0";
 const MAX_HOOK_BYTES: usize = 1024 * 1024;
@@ -124,12 +125,831 @@ pub struct CaptureReport {
     pub private_blocks_ignored: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Default)]
+pub struct VisibleHistoryReport {
+    pub report: CaptureReport,
+    pub usage_observations: usize,
+    /// Every complete record in the opened file snapshot was scanned.
+    pub complete: bool,
+    pub records: usize,
+    pub questions: QuestionSnapshot,
+    /// A malformed question or answer leaves the wait state unknown, independently of capture.
+    pub questions_complete: bool,
+}
+
+/// Progress through metadata-only native proof of an explicit, successful Work start.
+#[derive(Clone, Debug)]
+pub struct HistoryStartReport {
+    pub authorized: bool,
+    pub complete: bool,
+    pub records: usize,
+}
+
+/// Proves a start in this main native transcript before automatic history disclosure.
+pub fn verify_history_start(
+    path: &Path,
+    request: &CaptureRequest,
+    repository: &str,
+    spool: &LocalSpool,
+) -> Result<HistoryStartReport> {
+    if request.harness != AgentHarnessV1::ClaudeCode {
+        return Err(CaptureError::Invalid(
+            "Claude start proof requires Claude capture".into(),
+        ));
+    }
+    let mut opened = open_transcript(path, &request.observed_session_id)?;
+    verify_start_page(&mut opened, request, repository, spool, |raw, pending| {
+        let line: TranscriptLine = serde_json::from_slice(raw)?;
+        if line.is_sidechain == Some(true)
+            || line.is_meta == Some(true)
+            || line.is_compact_summary == Some(true)
+        {
+            return Ok(false);
+        }
+        if line
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != request.observed_session_id)
+        {
+            return Err(CaptureError::Invalid(
+                "Claude start proof contains another native session".into(),
+            ));
+        }
+        if line.session_id.as_deref() != Some(&request.observed_session_id) {
+            return Ok(false);
+        }
+        let Some(Value::Array(blocks)) = line.message.and_then(|message| message.content) else {
+            return Ok(false);
+        };
+        for block in blocks {
+            if line.kind.as_deref() == Some("assistant") && block["type"] == "tool_use" {
+                if let Some(id) = block["id"].as_str().filter(|id| identifier(id, 255)) {
+                    pending.remove(id);
+                    if matches!(
+                        block["name"].as_str(),
+                        Some(
+                            "mcp__agentscm__agentscm_start"
+                                | "mcp__plugin_agentscm_agentscm__agentscm_start"
+                        )
+                    ) && start_arguments_match(&block["input"], request)
+                    {
+                        if pending.len() >= 256 {
+                            return Err(CaptureError::Limit(
+                                "native start proof pending call limit reached".into(),
+                            ));
+                        }
+                        pending.insert(id.to_owned());
+                    }
+                }
+            } else if line.kind.as_deref() == Some("user")
+                && block["type"] == "tool_result"
+                && let Some(id) = block["tool_use_id"].as_str()
+                && pending.remove(id)
+                && block["is_error"] != true
+                && start_result_matches(&block["content"], request, repository)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
+
+pub(super) fn start_arguments_match(arguments: &Value, request: &CaptureRequest) -> bool {
+    arguments["session"].as_str() == Some(request.observed_session_id.as_str())
+}
+
+/// Only called for a correlated native tool result, never for visible message text.
+pub(super) fn start_result_matches(
+    result: &Value,
+    request: &CaptureRequest,
+    repository: &str,
+) -> bool {
+    if result["isError"] == true {
+        return false;
+    }
+    let matches = |value: &Value| {
+        if value["isError"] == true {
+            return false;
+        }
+        let data = value.get("structuredContent").unwrap_or(value);
+        data["claim_acquired"] == true
+            && data["work"]["item"]["id"].as_str() == Some(request.work_id.as_str())
+            && data["work"]["item"]["generation"].as_i64() == Some(request.generation)
+            && data["work"]["item"]["repository"]
+                .as_str()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(repository))
+    };
+    if result.get("structuredContent").is_some() || result.get("claim_acquired").is_some() {
+        return matches(result);
+    }
+    let text_matches =
+        |text: &str| serde_json::from_str::<Value>(text).is_ok_and(|value| matches(&value));
+    if result.as_str().is_some_and(text_matches) {
+        return true;
+    }
+    result
+        .as_array()
+        .or_else(|| result["content"].as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "text" && block["text"].as_str().is_some_and(text_matches)
+            })
+        })
+}
+
+pub(super) fn verify_start_page(
+    opened: &mut VisibleHistoryFile,
+    request: &CaptureRequest,
+    repository: &str,
+    spool: &LocalSpool,
+    mut observe: impl FnMut(&[u8], &mut std::collections::BTreeSet<String>) -> Result<bool>,
+) -> Result<HistoryStartReport> {
+    if repository.is_empty() || repository.len() > 512 || repository.chars().any(char::is_control) {
+        return Err(CaptureError::Invalid(
+            "native start proof repository is invalid".into(),
+        ));
+    }
+    let key = sha256(
+        serde_json::to_vec(&(
+            request.harness,
+            &request.observed_session_id,
+            repository.to_ascii_lowercase(),
+            &request.work_id,
+            request.generation,
+        ))?
+        .as_slice(),
+    );
+    let previous = spool.history_start_cursor(&request.canonical_session_id, &key)?;
+    let path_digest = sha256(opened.path.as_os_str().as_encoded_bytes());
+    let same = previous.as_ref().is_some_and(|cursor| {
+        cursor.harness == request.harness
+            && cursor.file.path_digest == path_digest
+            && cursor.file.file_device == opened.metadata.dev()
+            && cursor.file.file_inode == opened.metadata.ino()
+            && cursor.header_digest == opened.header_digest
+            && cursor.file.offset <= opened.metadata.len()
+    });
+    let mut next = previous
+        .clone()
+        .filter(|_| same)
+        .unwrap_or_else(|| HistoryStartCursorV1 {
+            harness: request.harness,
+            file: ProviderHistoryCursorV1 {
+                path_digest,
+                file_device: opened.metadata.dev(),
+                file_inode: opened.metadata.ino(),
+                work_id: request.work_id.clone(),
+                generation: request.generation,
+                canonical_session_id: request.canonical_session_id.clone(),
+                offset: 0,
+            },
+            header_digest: opened.header_digest.clone(),
+            line_number: 0,
+            authorized: false,
+            pending_calls: Default::default(),
+        });
+    if next.authorized {
+        return Ok(HistoryStartReport {
+            authorized: true,
+            complete: true,
+            records: 0,
+        });
+    }
+    let page = read_visible_page(opened, next.file.offset, next.line_number, |_, raw| {
+        if observe(raw, &mut next.pending_calls)? {
+            next.authorized = true;
+        }
+        Ok(())
+    })?;
+    next.file.offset = page.offset;
+    next.line_number = page.line_number;
+    let report = HistoryStartReport {
+        authorized: next.authorized,
+        complete: page.complete,
+        records: page.records,
+    };
+    spool.advance_history_start_cursor(
+        &request.canonical_session_id,
+        &key,
+        previous.as_ref(),
+        next,
+    )?;
+    Ok(report)
+}
+
+/// Finds the main native transcript under Claude's configured projects directory. Subagent
+/// directories and files are not candidates, and matching files must verify the native ID.
+pub fn find_transcript(history_root: &Path, native_session: &str) -> Result<Option<PathBuf>> {
+    if !identifier(native_session, 128) {
+        return Err(CaptureError::Invalid(
+            "Claude native session is invalid".into(),
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(history_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(CaptureError::Invalid(
+            "Claude history root is not a regular directory".into(),
+        ));
+    }
+    let root = history_root.canonicalize()?;
+    let mut directories = vec![(root.clone(), 0)];
+    let expected = format!("{native_session}.jsonl");
+    let mut entries = 0;
+    let mut found = None;
+    while let Some((directory, depth)) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > 16_384 {
+                return Err(CaptureError::Limit(
+                    "Claude history discovery reached its entry bound".into(),
+                ));
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() && depth == 0 {
+                directories.push((entry.path(), 1));
+            } else if kind.is_file() && entry.file_name().to_str() == Some(expected.as_str()) {
+                let opened = open_transcript(&entry.path(), native_session)?;
+                if !opened.path.starts_with(&root) {
+                    return Err(CaptureError::Invalid(
+                        "Claude transcript left its configured root".into(),
+                    ));
+                }
+                if found.replace(opened.path).is_some() {
+                    return Err(CaptureError::Conflict(
+                        "multiple Claude transcripts name this native session".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn open_transcript(path: &Path, session: &str) -> Result<VisibleHistoryFile> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(format!("{session}.jsonl").as_str())
+    {
+        return Err(CaptureError::Invalid(
+            "Claude transcript filename does not name the native session".into(),
+        ));
+    }
+    let mut identified = false;
+    let mut opened = open_history_file(path, |line| {
+        if line["isSidechain"] != true
+            && let Some(native) = line["sessionId"]
+                .as_str()
+                .or_else(|| line["session_id"].as_str())
+        {
+            if native != session {
+                return Err(CaptureError::Invalid(
+                    "Claude transcript starts with another native session".into(),
+                ));
+            }
+            identified = true;
+        }
+        Ok(0)
+    })?;
+    // Some hosts put a file-history snapshot before their first session-labelled record.
+    if !identified {
+        read_visible_page(&mut opened, 0, 0, |_, raw| {
+            let Ok(line) = serde_json::from_slice::<TranscriptLine>(raw) else {
+                return Ok(());
+            };
+            if line.is_sidechain != Some(true)
+                && let Some(native) = line.session_id
+            {
+                if native != session {
+                    return Err(CaptureError::Invalid(
+                        "Claude transcript contains another native session".into(),
+                    ));
+                }
+                identified = true;
+            }
+            Ok(())
+        })?;
+    }
+    if !identified {
+        return Err(CaptureError::Invalid(
+            "Claude transcript native identity is unavailable in the bounded header".into(),
+        ));
+    }
+    Ok(opened)
+}
+
+fn history_failure_key(request: &CaptureRequest) -> String {
+    history_failure_key_for(
+        request.harness,
+        &request.observed_session_id,
+        &request.work_id,
+        request.generation,
+    )
+}
+
+fn history_failure_key_for(
+    harness: AgentHarnessV1,
+    native: &str,
+    work: &str,
+    generation: i64,
+) -> String {
+    sha256(format!("{harness:?}\0{native}\0{work}\0{generation}").as_bytes())
+}
+
+/// Whether this association permanently fell back to hooks for its current generation.
+pub fn history_failed(request: &CaptureRequest, spool: &LocalSpool) -> Result<bool> {
+    spool.visible_history_failed(&request.canonical_session_id, &history_failure_key(request))
+}
+
+/// Waits for every source page to settle before permanently enabling hook-only capture.
+pub fn abandon_visible_history(
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+    reason: &str,
+) -> Result<()> {
+    let _source = spool.lock_visible_history()?;
+    abandon_visible_history_locked(request, spool, reason)
+}
+
+fn abandon_visible_history_locked(
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+    reason: &str,
+) -> Result<()> {
+    if history_failed(request, spool)? {
+        return Ok(());
+    }
+    record_provider_history_gap(request, spool, reason)?;
+    spool.fail_visible_history(&request.canonical_session_id, &history_failure_key(request))
+}
+
+pub(super) fn finish_visible_history(
+    result: Result<VisibleHistoryReport>,
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+) -> Result<VisibleHistoryReport> {
+    if let Err(error) = &result {
+        let terminal = match error {
+            CaptureError::Invalid(_) | CaptureError::Conflict(_) | CaptureError::Json(_) => true,
+            CaptureError::Limit(message) => {
+                message == "native history record exceeds its byte bound"
+            }
+            _ => false,
+        };
+        if terminal {
+            abandon_visible_history_locked(request, spool, "native-history-terminal-failure")?;
+        }
+    }
+    result
+}
+
+/// Recovers the exact parent session's visible history for one explicitly authorized Work.
+/// Thinking, internal user metadata, compact summaries and sidechains are never selected.
+pub fn capture_transcript(
+    path: &Path,
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+) -> Result<VisibleHistoryReport> {
+    if request.harness != AgentHarnessV1::ClaudeCode {
+        return Err(CaptureError::Invalid(
+            "Claude transcript requires a Claude capture request".into(),
+        ));
+    }
+    let _source = spool.lock_visible_history()?;
+    if history_failed(request, spool)? {
+        return Err(CaptureError::Conflict(
+            "native history permanently uses hooks for this generation".into(),
+        ));
+    }
+    finish_visible_history(
+        capture_transcript_page(path, request, spool),
+        request,
+        spool,
+    )
+}
+
+fn capture_transcript_page(
+    path: &Path,
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+) -> Result<VisibleHistoryReport> {
+    if request.harness != AgentHarnessV1::ClaudeCode {
+        return Err(CaptureError::Invalid(
+            "Claude transcript requires a Claude capture request".into(),
+        ));
+    }
+    let mut opened = open_transcript(path, &request.observed_session_id)?;
+    let mut previous = spool.visible_history_cursor(
+        &request.canonical_session_id,
+        &request.work_id,
+        request.generation,
+    )?;
+    let path_digest = sha256(opened.path.as_os_str().as_encoded_bytes());
+    if let Some(cursor) = &previous
+        && (cursor.harness != request.harness
+            || cursor.file.path_digest != path_digest
+            || cursor.file.file_device != opened.metadata.dev()
+            || cursor.file.file_inode != opened.metadata.ino()
+            || cursor.header_digest != opened.header_digest
+            || cursor.file.offset > opened.metadata.len())
+    {
+        record_provider_history_gap(request, spool, "claude-history-replaced-or-truncated")?;
+        return Err(CaptureError::Conflict(
+            "Claude transcript was replaced or truncated".into(),
+        ));
+    }
+    let mut next = previous.clone().unwrap_or_else(|| VisibleHistoryCursorV1 {
+        harness: request.harness,
+        file: ProviderHistoryCursorV1 {
+            path_digest,
+            file_device: opened.metadata.dev(),
+            file_inode: opened.metadata.ino(),
+            work_id: request.work_id.clone(),
+            generation: request.generation,
+            canonical_session_id: request.canonical_session_id.clone(),
+            offset: 0,
+        },
+        header_digest: opened.header_digest.clone(),
+        line_number: 0,
+        model: None,
+        questions: QuestionSnapshot::default(),
+        questions_complete: true,
+    });
+    if previous.is_none() {
+        spool.advance_visible_history_cursor(&request.canonical_session_id, None, next.clone())?;
+        previous = Some(next.clone());
+    }
+    let mut report = VisibleHistoryReport::default();
+    let page = read_visible_page(
+        &mut opened,
+        next.file.offset,
+        next.line_number,
+        |number, raw| {
+            let Ok(line) = serde_json::from_slice::<TranscriptLine>(raw) else {
+                record_provider_history_gap(
+                    request,
+                    spool,
+                    &format!("claude-malformed-line-{number}"),
+                )?;
+                report.report.gaps += 1;
+                return Ok(());
+            };
+            if line.is_sidechain == Some(true)
+                || line.is_meta == Some(true)
+                || line.is_compact_summary == Some(true)
+            {
+                return Ok(());
+            }
+            if line
+                .session_id
+                .as_deref()
+                .is_some_and(|native| native != request.observed_session_id)
+            {
+                return Err(CaptureError::Invalid(
+                    "Claude transcript contains another native session".into(),
+                ));
+            }
+            if matches!(line.kind.as_deref(), Some("user" | "assistant"))
+                && line.session_id.is_none()
+            {
+                record_provider_history_gap(
+                    request,
+                    spool,
+                    &format!("claude-unbound-line-{number}"),
+                )?;
+                report.report.gaps += 1;
+                return Ok(());
+            }
+            if let Some(usage) = provider_usage_record(line.clone(), request) {
+                match spool.append(&CaptureEnvelopeV1::Usage(usage)) {
+                    Ok(AppendOutcome::Stored) => report.usage_observations += 1,
+                    Ok(AppendOutcome::Duplicate) | Err(CaptureError::Conflict(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let (selected, ignored) = select_line(
+                line,
+                request,
+                usize::try_from(number).map_err(|_| {
+                    CaptureError::Limit("Claude transcript line count overflow".into())
+                })?,
+            )?;
+            report.report.private_blocks_ignored += ignored;
+            for event in selected {
+                let event = automatic_history_event(event, request);
+                let phase = match event.kind {
+                    CapturedEventKindV1::ToolStarted | CapturedEventKindV1::CheckStarted => {
+                        Some("pre")
+                    }
+                    CapturedEventKindV1::ToolFinished | CapturedEventKindV1::CheckFinished => {
+                        Some("post")
+                    }
+                    _ => None,
+                };
+                let tool_id = event
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.request_id.as_deref())
+                    .map(str::to_owned);
+                if let (Some(phase), Some(tool_id)) = (phase, tool_id) {
+                    let _managed = spool.lock_managed_capture()?;
+                    if native_tool_phase(spool, request, &tool_id, phase)? {
+                        continue;
+                    }
+                    let operation = tool_operation(
+                        &request.work_id,
+                        request.generation,
+                        &request.canonical_session_id,
+                        &request.observed_session_id,
+                        &tool_id,
+                        phase,
+                    );
+                    spool.bind_observation(&operation, &sha256(raw))?;
+                    add_report(
+                        &mut report.report,
+                        capture_history_record(vec![event], request, spool, &operation)?,
+                    );
+                } else {
+                    let identity = format!(
+                        "{}\0{}\0{}\0{}\0{}",
+                        request.work_id,
+                        request.generation,
+                        request.canonical_session_id,
+                        request.observed_session_id,
+                        event.event_id
+                    );
+                    let operation =
+                        format!("visible:history:{}:record", sha256(identity.as_bytes()));
+                    spool.bind_observation(&operation, &sha256(raw))?;
+                    add_report(
+                        &mut report.report,
+                        capture_history_record(vec![event], request, spool, &operation)?,
+                    );
+                }
+            }
+            Ok(())
+        },
+    );
+    let page = match page {
+        Ok(page) => page,
+        Err(error) => {
+            record_provider_history_gap(
+                request,
+                spool,
+                &format!("claude-history-read-{}", next.file.offset),
+            )?;
+            return Err(error);
+        }
+    };
+    next.file.offset = page.offset;
+    next.line_number = page.line_number;
+    next.questions.offset = page.offset;
+    report.complete = page.complete;
+    report.records = page.records;
+    report.questions = next.questions.clone();
+    report.questions_complete = true;
+    spool.advance_visible_history_cursor(&request.canonical_session_id, previous.as_ref(), next)?;
+    Ok(report)
+}
+
+pub(super) struct VisibleHistoryFile {
+    pub(super) file: File,
+    pub(super) path: PathBuf,
+    pub(super) metadata: std::fs::Metadata,
+    pub(super) header_digest: String,
+    pub(super) own_from: u64,
+}
+
+pub(super) fn open_history_file(
+    path: &Path,
+    validate: impl FnOnce(&Value) -> Result<u64>,
+) -> Result<VisibleHistoryFile> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(CaptureError::Invalid(
+            "native history is not a regular non-symlink file".into(),
+        ));
+    }
+    let path = path.canonicalize()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || before.dev() != metadata.dev() || before.ino() != metadata.ino() {
+        return Err(CaptureError::Conflict(
+            "native history changed during validation".into(),
+        ));
+    }
+    let mut header = Vec::new();
+    BufReader::new((&file).take(MAX_HISTORY_TAIL_BYTES + 1)).read_until(b'\n', &mut header)?;
+    if header.len() as u64 > MAX_HISTORY_TAIL_BYTES || header.last() != Some(&b'\n') {
+        return Err(CaptureError::Invalid(
+            "native history session record is incomplete or oversized".into(),
+        ));
+    }
+    let own_from = validate(&serde_json::from_slice(&header)?)?;
+    Ok(VisibleHistoryFile {
+        file,
+        path,
+        metadata,
+        header_digest: sha256(&header),
+        own_from,
+    })
+}
+
+pub(super) struct VisibleHistoryPage {
+    pub(super) offset: u64,
+    pub(super) line_number: u64,
+    pub(super) records: usize,
+    pub(super) complete: bool,
+}
+
+pub(super) fn read_visible_page(
+    opened: &mut VisibleHistoryFile,
+    offset: u64,
+    line_number: u64,
+    mut observe: impl FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<VisibleHistoryPage> {
+    let end = opened.metadata.len();
+    if offset > end {
+        return Err(CaptureError::Conflict(
+            "native history was truncated".into(),
+        ));
+    }
+    opened.file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new((&opened.file).take(end - offset));
+    let mut page = VisibleHistoryPage {
+        offset,
+        line_number,
+        records: 0,
+        complete: false,
+    };
+    while page.records < MAX_HISTORY_TAIL_LINES {
+        let remaining = MAX_HISTORY_TAIL_BYTES - (page.offset - offset);
+        if remaining == 0 {
+            break;
+        }
+        let mut bytes = Vec::new();
+        (&mut reader)
+            .take(remaining + 1)
+            .read_until(b'\n', &mut bytes)?;
+        if bytes.is_empty() {
+            break;
+        }
+        if bytes.len() as u64 > remaining && page.records == 0 {
+            return Err(CaptureError::Limit(
+                "native history record exceeds its byte bound".into(),
+            ));
+        }
+        if bytes.last() != Some(&b'\n') || bytes.len() as u64 > remaining {
+            break;
+        }
+        let number = page.line_number + 1;
+        observe(number, &bytes)?;
+        page.offset += bytes.len() as u64;
+        page.line_number = number;
+        page.records += 1;
+    }
+    let current = std::fs::symlink_metadata(&opened.path)?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || current.dev() != opened.metadata.dev()
+        || current.ino() != opened.metadata.ino()
+        || current.len() < end
+    {
+        return Err(CaptureError::Conflict(
+            "native history was replaced or truncated while reading".into(),
+        ));
+    }
+    page.complete = page.offset == end;
+    Ok(page)
+}
+
+pub(super) fn add_report(total: &mut CaptureReport, report: CaptureReport) {
+    total.batches += report.batches;
+    total.events += report.events;
+    total.gaps += report.gaps;
+    total.private_blocks_ignored += report.private_blocks_ignored;
+}
+
+/// Automatic native capture has a stable occurrence identity across Work generations. Keep it
+/// separate from manually imported IDs and from hook IDs that lack a source occurrence link.
+pub(super) fn automatic_history_event(
+    mut event: SelectedEvent,
+    request: &CaptureRequest,
+) -> SelectedEvent {
+    event.event_id = format!(
+        "evt:history:{}",
+        sha256(
+            format!(
+                "{:?}\0{}\0{}",
+                request.harness, request.observed_session_id, event.event_id
+            )
+            .as_bytes()
+        )
+    );
+    event
+}
+
+pub(super) fn tool_operation(
+    work: &str,
+    generation: i64,
+    canonical: &str,
+    observed: &str,
+    tool: &str,
+    phase: &str,
+) -> String {
+    let identity = format!("{work}\0{generation}\0{canonical}\0{observed}\0{tool}");
+    format!("visible:history:{}:{phase}", sha256(identity.as_bytes()))
+}
+
+pub(super) fn retained_tool_phase(
+    spool: &LocalSpool,
+    work: &str,
+    generation: i64,
+    canonical: &str,
+    observed: &str,
+    tool: &str,
+    phase: &str,
+) -> Result<bool> {
+    let operation = format!(
+        "{}:0",
+        tool_operation(work, generation, canonical, observed, tool, phase)
+    );
+    let Some(batch) = spool.replayable_event_batch(&operation)? else {
+        return Ok(false);
+    };
+    if batch.work_id != work
+        || batch.generation != generation
+        || batch.session.session_id != canonical
+        || !batch.events.iter().any(|event| {
+            matches!(
+                (phase, event.kind),
+                (
+                    "pre",
+                    CapturedEventKindV1::ToolStarted | CapturedEventKindV1::CheckStarted
+                ) | (
+                    "post",
+                    CapturedEventKindV1::ToolFinished | CapturedEventKindV1::CheckFinished
+                )
+            ) && event
+                .tool
+                .as_ref()
+                .and_then(|fact| fact.request_id.as_deref())
+                == Some(tool)
+        })
+    {
+        return Err(CaptureError::Conflict(
+            "visible history tool phase differs from its retained identity".into(),
+        ));
+    }
+    Ok(true)
+}
+
+pub(super) fn native_tool_phase(
+    spool: &LocalSpool,
+    request: &CaptureRequest,
+    tool: &str,
+    phase: &str,
+) -> Result<bool> {
+    let marker = sha256(format!("{}\0{tool}", request.observed_session_id).as_bytes());
+    for prefix in ["native", "managed"] {
+        if let Some(batch) =
+            spool.replayable_event_batch(&format!("{prefix}:event:{marker}:{phase}"))?
+            && batch.work_id == request.work_id
+            && batch.generation == request.generation
+            && batch.session.session_id == request.canonical_session_id
+        {
+            return Ok(true);
+        }
+    }
+    // A managed recipe owns its event lifecycle as well as its action receipts. An in-flight
+    // post phase must remain available to that adapter, rather than being replaced by history.
+    Ok(spool
+        .managed_invocation_for_occurrence(&request.observed_session_id, tool)?
+        .is_some_and(|claim| {
+            claim.work_id == request.work_id
+                && claim.generation == request.generation
+                && claim.route == Some(NativeOccurrenceRouteV1::Managed)
+        }))
+}
+
+#[derive(Clone, Deserialize)]
 struct TranscriptLine {
     #[serde(rename = "type")]
     kind: Option<String>,
     #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
+    #[serde(rename = "isMeta")]
+    is_meta: Option<bool>,
+    #[serde(rename = "isCompactSummary")]
+    is_compact_summary: Option<bool>,
     timestamp: Option<String>,
     uuid: Option<String>,
     #[serde(alias = "requestId")]
@@ -138,7 +958,7 @@ struct TranscriptLine {
     usage: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct TranscriptMessage {
     content: Option<Value>,
     model: Option<String>,
@@ -215,6 +1035,98 @@ pub fn capture_hook(
     outcome
 }
 
+/// Retains literal context for another explicitly authorized Work, without claiming actions
+/// or changing the session's current Work route. Tool phases share history's dedup fence.
+pub fn capture_associated_hook(
+    input: &[u8],
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+) -> Result<HookCaptureOutcome> {
+    if input.len() > MAX_HOOK_BYTES {
+        return Err(CaptureError::Limit(
+            "associated native hook exceeds its byte bound".into(),
+        ));
+    }
+    let payload: Value = serde_json::from_slice(input)?;
+    if payload["session_id"].as_str() != Some(request.observed_session_id.as_str()) {
+        return Err(CaptureError::Invalid(
+            "associated hook names another native session".into(),
+        ));
+    }
+    let event = payload["hook_event_name"]
+        .as_str()
+        .ok_or_else(|| CaptureError::Invalid("associated hook event name is missing".into()))?;
+    let phase = match event {
+        "PreToolUse" => Some("pre"),
+        "PostToolUse" | "PostToolUseFailure" => Some("post"),
+        _ => None,
+    };
+    let tool = payload["tool_use_id"]
+        .as_str()
+        .filter(|id| identifier(id, 255));
+    let _managed = phase.map(|_| spool.lock_managed_capture()).transpose()?;
+    if let (Some(phase), Some(tool)) = (phase, tool)
+        && (native_tool_phase(spool, request, tool, phase)?
+            || retained_tool_phase(
+                spool,
+                &request.work_id,
+                request.generation,
+                &request.canonical_session_id,
+                &request.observed_session_id,
+                tool,
+                phase,
+            )?)
+    {
+        return Ok(HookCaptureOutcome::Duplicate);
+    }
+    let provider = [
+        "tool_use_id",
+        "prompt_id",
+        "message_id",
+        "uuid",
+        "request_id",
+        "agent_id",
+    ]
+    .into_iter()
+    .find_map(|field| payload[field].as_str());
+    let timestamp = payload["timestamp"].as_str();
+    let identity = serde_json::to_vec(
+        &json!({"work":request.work_id,"generation":request.generation,
+        "session":request.observed_session_id,"event":event,"provider":provider,
+        "timestamp":timestamp,"index":payload.get("index"),"final":payload.get("final")}),
+    )?;
+    let event_id = if provider.is_none() && timestamp.is_none() {
+        spool.uncertain_event_id(&request.canonical_session_id, &sha256(&identity))?
+    } else {
+        format!("evt:associated:{}", sha256(&identity))
+    };
+    let operation_id = match (phase, tool) {
+        (Some(phase), Some(tool)) => format!(
+            "{}:0",
+            tool_operation(
+                &request.work_id,
+                request.generation,
+                &request.canonical_session_id,
+                &request.observed_session_id,
+                tool,
+                phase
+            )
+        ),
+        _ => format!("associated:hook:{}", sha256(event_id.as_bytes())),
+    };
+    spool.bind_observation(&operation_id, &sha256(input))?;
+    capture_hook_with_identity_mode(
+        input,
+        request,
+        spool,
+        Some(HookIdentityOverride {
+            event_id: &event_id,
+            operation_id: &operation_id,
+        }),
+        false,
+    )
+}
+
 thread_local! {
     // Non-fatal capture notes from the shared hook path, surfaced through `NativeHookReport`.
     static HOOK_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -261,6 +1173,11 @@ fn capture_hook_with_identity_mode(
         return Err(CaptureError::Invalid(
             "Claude Code hook session differs from the configured capture session".into(),
         ));
+    }
+    if matches!(event_name, "UserPromptSubmit" | "MessageDisplay")
+        && source_authoritative(request, spool)?
+    {
+        return Ok(HookCaptureOutcome::Duplicate);
     }
     if update_current_association {
         spool.remember_session_association(
@@ -337,6 +1254,7 @@ fn capture_hook_with_identity_mode(
         "PreCompact" => (CapturedEventKindV1::Compaction, None, None),
         "SubagentStart" => (CapturedEventKindV1::SubagentStarted, None, None),
         "SubagentStop" => (CapturedEventKindV1::SubagentStopped, None, None),
+        "SetupObserved" => (CapturedEventKindV1::SetupObserved, None, None),
         _ => return Ok(HookCaptureOutcome::Ignored),
     };
     let boundary = hook_boundary(event_name, payload);
@@ -374,14 +1292,15 @@ fn capture_hook_with_identity_mode(
         "message_index": payload.get("index"),
         "message_final": payload.get("final"),
     }))?;
-    let unstable_identity =
-        identity_override.is_none() && provider_id.is_none() && provider_timestamp.is_none();
-    // A replayed turn, compaction or subagent marker is informational and cannot hide work, so
+    let unstable_identity = identity_override.is_none()
+        && native_identity_uncertain(request.harness, provider_id, provider_timestamp);
+    // A replayed setup, turn, compaction or subagent marker is informational and cannot hide work, so
     // it needs a unique occurrence id but not an identity-uncertainty gap on every turn.
     let identity_uncertain = unstable_identity
         && !matches!(
             kind,
-            CapturedEventKindV1::TurnEnded
+            CapturedEventKindV1::SetupObserved
+                | CapturedEventKindV1::TurnEnded
                 | CapturedEventKindV1::Compaction
                 | CapturedEventKindV1::SubagentStarted
                 | CapturedEventKindV1::SubagentStopped
@@ -524,6 +1443,7 @@ fn capture_hook_with_identity_mode(
 /// source can be captured.
 pub fn deferred_native_hook(
     input: &[u8],
+    harness: AgentHarnessV1,
     reason: DeferredReasonV1,
     actions: &ActionCaptureConfig,
     spool: &LocalSpool,
@@ -561,6 +1481,7 @@ pub fn deferred_native_hook(
         "PreCompact" => Some(CapturedEventKindV1::Compaction),
         "SubagentStart" => Some(CapturedEventKindV1::SubagentStarted),
         "SubagentStop" => Some(CapturedEventKindV1::SubagentStopped),
+        "SetupObserved" => Some(CapturedEventKindV1::SetupObserved),
         _ => None,
     };
     let tool_kind = matches!(
@@ -593,7 +1514,7 @@ pub fn deferred_native_hook(
         "message_index": payload.get("index"),
         "message_final": payload.get("final"),
     }))?;
-    let occurrence_id = if provider_id.is_none() && provider_timestamp.is_none() {
+    let occurrence_id = if native_identity_uncertain(harness, provider_id, provider_timestamp) {
         spool.uncertain_event_id(session_id, &sha256(&identity))?
     } else {
         format!("evt:{}", sha256(&identity))
@@ -827,10 +1748,13 @@ fn capture_native_hook_inner(
         .get("hook_event_name")
         .and_then(Value::as_str)
         .ok_or_else(|| CaptureError::Invalid("Claude Code hook event name is missing".into()))?;
-    if !matches!(
-        event_name,
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-    ) {
+    // Cursor can reuse one ID for Read then Write, so its phases do not claim a native action.
+    if request.harness == AgentHarnessV1::Cursor
+        || !matches!(
+            event_name,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        )
+    {
         let event = capture_hook_with_identity(input, request, spool, None)?;
         return Ok(NativeHookReport {
             event,
@@ -1127,6 +2051,19 @@ fn claim_native_occurrence(
     Ok((Some(marker), None, true))
 }
 
+fn source_authoritative(request: &CaptureRequest, spool: &LocalSpool) -> Result<bool> {
+    if history_failed(request, spool)? {
+        return Ok(false);
+    }
+    Ok(spool
+        .visible_history_cursor(
+            &request.canonical_session_id,
+            &request.work_id,
+            request.generation,
+        )?
+        .is_some_and(|cursor| cursor.harness == request.harness))
+}
+
 fn capture_claimed_event(
     input: &[u8],
     request: &CaptureRequest,
@@ -1135,6 +2072,19 @@ fn capture_claimed_event(
     update_current_association: bool,
     spool: &LocalSpool,
 ) -> Result<HookCaptureOutcome> {
+    if source_authoritative(request, spool)?
+        || retained_tool_phase(
+            spool,
+            &request.work_id,
+            request.generation,
+            &request.canonical_session_id,
+            &request.observed_session_id,
+            &claim.tool_use_id,
+            phase,
+        )?
+    {
+        return Ok(HookCaptureOutcome::Duplicate);
+    }
     let operation_id = format!("native:event:{}:{phase}", claim.marker_id);
     let event_id = format!(
         "evt:{}",
@@ -1174,7 +2124,37 @@ fn replay_compacted_occurrence(
         }
         _ => format!("native:event:{}:{phase}", receipt.marker_id),
     };
-    let event = if spool.replayable_event_batch(&operation_id)?.is_some() {
+    let event = if spool.replayable_event_batch(&operation_id)?.is_some()
+        || spool
+            .visible_history_cursor(
+                &receipt.canonical_session_id,
+                &receipt.work_id,
+                receipt.generation,
+            )?
+            .map(|cursor| {
+                spool
+                    .visible_history_failed(
+                        &receipt.canonical_session_id,
+                        &history_failure_key_for(
+                            cursor.harness,
+                            &receipt.observed_session_id,
+                            &receipt.work_id,
+                            receipt.generation,
+                        ),
+                    )
+                    .map(|failed| !failed)
+            })
+            .transpose()?
+            .unwrap_or(false)
+        || retained_tool_phase(
+            spool,
+            &receipt.work_id,
+            receipt.generation,
+            &receipt.canonical_session_id,
+            &receipt.observed_session_id,
+            &receipt.tool_use_id,
+            phase,
+        )? {
         HookCaptureOutcome::Duplicate
     } else {
         return Err(CaptureError::Conflict(
@@ -2262,7 +3242,7 @@ fn usage_count(usage: &Value, key: &str) -> Option<i64> {
         .filter(|value| *value >= 0)
 }
 
-fn record_provider_history_gap(
+pub(super) fn record_provider_history_gap(
     request: &CaptureRequest,
     spool: &LocalSpool,
     detail: &str,
@@ -2505,6 +3485,37 @@ pub(super) fn import_history(
     Ok(report)
 }
 
+/// Retains an immutable visible-history record using the same body bounds and redaction as live
+/// capture. The per-record operation prefix makes a retry independent of later file appends.
+pub(super) fn capture_history_record(
+    selected: Vec<SelectedEvent>,
+    request: &CaptureRequest,
+    spool: &LocalSpool,
+    operation_prefix: &str,
+) -> Result<CaptureReport> {
+    let mut events = Vec::new();
+    for selected in selected {
+        let retained = retain_selected(selected, request, spool)?;
+        let missing = retained.retention_missing.is_some();
+        events.push(retained.event);
+        events.extend(retained.redacted_gap);
+        if missing {
+            record_provider_history_gap(request, spool, operation_prefix)?;
+        }
+    }
+    let mut report = CaptureReport::default();
+    for (index, events) in batch_chunks(&events).into_iter().enumerate() {
+        let operation_id = format!("{operation_prefix}:{index}");
+        let envelope = CaptureEnvelopeV1::EventBatch(batch(request, operation_id, events.to_vec()));
+        if spool.append(&envelope)? == AppendOutcome::Stored {
+            report.events += events.len();
+            report.gaps += events.iter().filter(|event| event.gap.is_some()).count();
+            report.batches += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// Splits sequence-ordered events into runs that respect both the per-batch event and gap limits.
 fn batch_chunks(events: &[CapturedEventV1]) -> Vec<&[CapturedEventV1]> {
     use crate::change_record::{MAX_EVENTS_PER_BATCH, MAX_GAPS_PER_SESSION};
@@ -2529,6 +3540,12 @@ fn select_line(
     request: &CaptureRequest,
     line_ordinal: usize,
 ) -> Result<(Vec<SelectedEvent>, usize)> {
+    if line.is_sidechain == Some(true)
+        || line.is_meta == Some(true)
+        || line.is_compact_summary == Some(true)
+    {
+        return Ok((Vec::new(), 0));
+    }
     let Some(kind @ ("user" | "assistant")) = line.kind.as_deref() else {
         return Ok((Vec::new(), 0));
     };
@@ -2878,6 +3895,21 @@ fn check_kind(default: CapturedEventKindV1, tool_name: Option<&str>) -> Captured
         }
         _ => default,
     }
+}
+
+/// Keep legacy capture identities unchanged. New native hosts can emit distinct calls and
+/// repeated prompts at the same timestamp, so their reported time remains observation metadata
+/// and cannot stand in for a genuine event ID. The trusted capture harness selects this rule.
+fn native_identity_uncertain(
+    harness: AgentHarnessV1,
+    provider_id: Option<&str>,
+    provider_timestamp: Option<&str>,
+) -> bool {
+    provider_id.is_none()
+        && match harness {
+            AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex => provider_timestamp.is_none(),
+            AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => true,
+        }
 }
 
 fn is_check(name: &str) -> bool {

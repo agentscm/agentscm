@@ -49,7 +49,7 @@ const MAX_RULES: usize = 32;
 const MAX_RECIPES: usize = 16;
 const REPLY_BYTES: usize = MAX_CHANGE_RECORD_RESPONSE_BYTES;
 const DELIVERY_PAGE: usize = 10;
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 const HOOK_TIMEOUT_SECONDS: u8 = 20;
 const MAX_SESSION_CONTEXT_BYTES: usize = 16 * 1024;
 const HOOK_MARKER: &str = "AGENTSCM_CAPTURE_HOOK_V1=1 ";
@@ -1619,6 +1619,16 @@ pub async fn resolve_target_with(
     hub: &CaptureHub,
     session_id: &str,
 ) -> Result<Option<CaptureTargetV1>> {
+    resolve_work_target_with(binding, hub, session_id, None).await
+}
+
+/// Revalidates the native session's participation in one explicitly started Work.
+pub(crate) async fn resolve_work_target_with(
+    binding: &CaptureBinding,
+    hub: &CaptureHub,
+    session_id: &str,
+    work_id: Option<&str>,
+) -> Result<Option<CaptureTargetV1>> {
     let CaptureHub {
         connection,
         token,
@@ -1638,6 +1648,10 @@ pub async fn resolve_target_with(
         .query(&[("session_id", session_id)])
         .bearer_auth(token)
         .timeout(Duration::from_secs(2));
+    let request = match work_id {
+        Some(work_id) => request.query(&[("work_id", work_id)]),
+        None => request,
+    };
     let (status, body) = send(request, REPLY_BYTES)
         .await
         .map_err(|_| invalid("capture target lookup unavailable"))?;

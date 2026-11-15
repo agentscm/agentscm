@@ -868,6 +868,17 @@ fn runtime(builder: &mut tokio::runtime::Builder) -> tokio::runtime::Runtime {
 }
 
 fn main() {
+    if std::env::args_os()
+        .skip(1)
+        .all(|arg| arg == "--no-telemetry")
+        && hook_cli::missing_arguments()
+    {
+        eprintln!(
+            "AgentSCM: coordination unknown (hook command arguments are missing); update the installed hooks"
+        );
+        println!("{{}}");
+        std::process::exit(0);
+    }
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook")
         && !std::env::args_os().any(|a| a == "--help" || a == "-h")
@@ -910,9 +921,10 @@ fn worker_threads(command: &Command) -> Option<usize> {
         command,
         Command::ChangeCapture {
             command: change_capture_cli::ChangeCaptureCommand::HookClaude
+                | change_capture_cli::ChangeCaptureCommand::DeliverWorker(_)
         }
     ) {
-        // A capture hook runs on every tool call, so it gets the `hook` path's runtime.
+        // Capture hooks and their bounded delivery worker need only a small runtime.
         return Some(2);
     }
     None

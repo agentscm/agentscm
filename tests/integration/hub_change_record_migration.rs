@@ -193,13 +193,14 @@ fn seed_representative_work(db: &Db) -> Fixture {
 
 fn remove_change_records(db: &Db) {
     db.execute(
-        "DROP TABLE hub_change_shared_bodies;
+        "DROP TABLE hub_change_conversation_occurrences;
+         DROP TABLE hub_change_shared_bodies;
          DROP TABLE hub_change_events;
          DROP TABLE hub_change_actions;
          DROP TABLE hub_change_sessions;
          DROP TABLE hub_change_operations;
          DELETE FROM hub_named_migrations
-         WHERE name IN ('change_records', 'shared_conversations', 'change_session_lifecycle');",
+         WHERE name IN ('change_records', 'shared_conversations', 'change_session_lifecycle', 'conversation_occurrences');",
     )
     .unwrap();
     assert_eq!(

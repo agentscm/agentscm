@@ -503,6 +503,8 @@ struct Client {
     /// The server answered `initialize` or `tools/list` itself because the Hub did not; the
     /// next Hub reply announces the tools changed so the host lists the Hub's own.
     answered_locally: bool,
+    #[cfg(unix)]
+    capture_tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 impl Client {
@@ -516,6 +518,8 @@ impl Client {
             // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
             session_tools: session_tools(&agentscm::hub::mcp::session_agent_tools()),
             answered_locally: false,
+            #[cfg(unix)]
+            capture_tasks: std::collections::HashMap::new(),
         })
     }
 
@@ -701,12 +705,103 @@ impl Client {
                 checkout.display()
             )}));
         }
+        #[cfg(unix)]
+        if method == "tools/call"
+            && let Some(session) = message
+                .pointer("/params/arguments/session")
+                .and_then(Value::as_str)
+            && let Ok(config) = crate::hub_cli::config_dir()
+        {
+            if let Some((connection, checkout)) = elsewhere
+                .as_ref()
+                .map(|(connection, checkout)| (connection, checkout.as_path()))
+                .or_else(|| default.map(|sent| (sent.connection, self.start.as_path())))
+                && let Some(association) = successful_capture_start(
+                    &message,
+                    &reply,
+                    connection,
+                    checkout,
+                    self.name.as_deref(),
+                )
+                && client_session::record_capture(&config, &association).is_err()
+            {
+                eprintln!("AgentSCM capture: the explicit Work association could not be retained");
+            }
+            self.capture_tasks.retain(|_, task| !task.is_finished());
+            if self.capture_tasks.len() < 32
+                && !self.capture_tasks.contains_key(session)
+                && !client_session::capture_associations(&config, session).is_empty()
+            {
+                let session = session.to_owned();
+                let task = tokio::spawn(crate::change_capture_cli::watch_session(
+                    config,
+                    session.clone(),
+                ));
+                self.capture_tasks.insert(session, task);
+            }
+        }
         write_json(writer, &reply)?;
         if announce {
             write_json(writer, &TOOLS_CHANGED)?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+impl Drop for Client {
+    fn drop(&mut self) {
+        for task in self.capture_tasks.values() {
+            task.abort();
+        }
+    }
+}
+
+/// Only a successful explicit start authorizes this session's history to follow the Work.
+#[cfg(unix)]
+fn successful_capture_start(
+    message: &Value,
+    reply: &Value,
+    connection: &Connection,
+    checkout: &Path,
+    client: Option<&str>,
+) -> Option<client_session::CaptureAssociation> {
+    let name = client?.to_ascii_lowercase();
+    let harness = if name.contains("claude") {
+        agentscm::change_record::AgentHarnessV1::ClaudeCode
+    } else if name.contains("codex") {
+        agentscm::change_record::AgentHarnessV1::Codex
+    } else {
+        return None;
+    };
+    if message.pointer("/params/name")?.as_str()? != "agentscm_start"
+        || reply.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+        || reply
+            .pointer("/result/structuredContent/claim_acquired")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let item = reply.pointer("/result/structuredContent/work/item")?;
+    let native = message.pointer("/params/arguments/session")?.as_str()?;
+    let checkout = message
+        .pointer("/params/arguments/worktree")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| is_current_in(connection, path))
+        .unwrap_or_else(|| checkout.to_path_buf());
+    Some(client_session::CaptureAssociation {
+        session: native.to_owned(),
+        harness,
+        hub: connection.hub.clone(),
+        repo: connection.repo.clone(),
+        checkout,
+        work_id: item.get("id")?.as_str()?.to_owned(),
+        generation: item.get("generation")?.as_i64()?,
+        native_start_verified: false,
+    })
 }
 
 /// Answers locally until `find` sees a connection. `tools/list` already names every tool, so an
@@ -1711,6 +1806,95 @@ mod tests {
             unnamed.ancestors = Some(Vec::new());
             assert_eq!(session(&mut unnamed, json!({"task": "t"})), Value::Null);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_successful_explicit_start_creates_a_capture_association() {
+        let connection = saved("https://hub.example".into(), "/checkout", "org/repo");
+        let message = json!({"params":{"name":"agentscm_start", "arguments":{"session":"native"}}});
+        let reply = json!({"result":{"isError":false,"structuredContent":{"claim_acquired":true,
+            "work":{"item":{"id":"wrk_one","generation":3}}}}});
+        let association = successful_capture_start(
+            &message,
+            &reply,
+            &connection,
+            Path::new("/checkout"),
+            Some("codex"),
+        )
+        .unwrap();
+        assert_eq!(association.session, "native");
+        assert_eq!(
+            (association.work_id.as_str(), association.generation),
+            ("wrk_one", 3)
+        );
+        for pointer in [
+            "/result/isError",
+            "/result/structuredContent/claim_acquired",
+        ] {
+            let mut refused = reply.clone();
+            *refused.pointer_mut(pointer).unwrap() = json!(pointer.ends_with("isError"));
+            assert!(
+                successful_capture_start(
+                    &message,
+                    &refused,
+                    &connection,
+                    Path::new("/checkout"),
+                    Some("codex")
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            successful_capture_start(&message, &reply, &connection, Path::new("/checkout"), None)
+                .is_none()
+        );
+        assert!(
+            successful_capture_start(
+                &message,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("plain editor")
+            )
+            .is_none()
+        );
+        assert_eq!(
+            successful_capture_start(
+                &message,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("claude-code")
+            )
+            .unwrap()
+            .harness,
+            agentscm::change_record::AgentHarnessV1::ClaudeCode
+        );
+        let mut read = message.clone();
+        read["params"]["name"] = json!("agentscm_work_status");
+        assert!(
+            successful_capture_start(
+                &read,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("codex")
+            )
+            .is_none()
+        );
+        let mut unnamed = message;
+        unnamed["params"]["arguments"] = json!({});
+        assert!(
+            successful_capture_start(
+                &unnamed,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("codex")
+            )
+            .is_none()
+        );
     }
 
     #[test]

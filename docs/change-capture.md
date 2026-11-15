@@ -24,8 +24,9 @@ while the setting is off.
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
 spool. Claude thinking and redacted-thinking blocks and Codex reasoning are never selected. Passive
-hook capture does not call a model or send content to a provider. Capture records Claude Code and
-Codex sessions; what differs for Codex is in the [Codex adapter](#codex-adapter).
+hook capture does not call a model or send content to a provider. Capture records Claude Code,
+Codex, Cursor, Copilot and Gemini CLI sessions, within each host's visible hook contract. See the
+[Codex adapter](#codex-adapter) and [other native hooks](#other-native-hooks) for their limits.
 
 Capture has three modes per checkout, and `metadata-only` is the default:
 
@@ -228,9 +229,16 @@ are dropped to make room (their spools stay on disk). `unconfigure` and `forget`
 followed binding like any other, and a disabled one is never re-created by the plugin hook;
 re-enabling it from the local page gives it hooks of its own.
 
-From the plugin hook, capture shares the hook's time: it gives up at 2.5 seconds (4 at session
-start). A target lookup that runs out leaves a sanitized deferred fact instead of the event, and
-records not yet delivered wait for the next hook.
+From the plugin hook, local capture has a bounded budget: 2.5 seconds (4 at session start).
+Blocking local spool and Git work runs separately so it cannot starve the coordination deadline.
+A target lookup that runs out leaves a sanitized deferred fact instead of the event.
+Backlog delivery runs in a separate bounded process, with one worker per checkout and coalesced
+wake requests. It rechecks the saved connection, binding and sharing authorization on each pass.
+Completed attempts can schedule another bounded pass, with a finite allowance carried across
+workers. Refused records stay pending while the worker advances to later records; it stops when
+the cursor wraps, the allowance is spent, on error or without completed attempts, leaving
+unacknowledged records for a later hook. Hooks do not wait for
+backlog uploads, and a worker does not make an unavailable Hub block an edit.
 
 ### Per-checkout configuration
 
@@ -378,7 +386,7 @@ What leaves the machine, and when:
   session's bodies local, and sharing starts with the next session. Switching away stops uploads
   at the next delivery.
 - **Upload follows event acceptance.** The hook appends locally first and delivers the event
-  batch as before; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
+  batch through the background worker; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
@@ -576,9 +584,10 @@ to copied history.
 
 Configuration adds marked `agentscm change-capture hook-claude` entries for the eleven lifecycle
 groups and preserves unrelated hooks. Each hook has a 20-second host timeout. The hook resolves the
-exact current Work and generation for the native session on every invocation, appends locally
-before delivery, then replays at most ten pending envelopes in causal order through the existing
-client connection with a five-second delivery deadline. Only an HTTP 200 acknowledges an envelope.
+exact current Work and generation for the native session on every invocation and appends locally
+before scheduling background delivery. Each delivery pass replays at most ten pending envelopes
+in causal order through the existing client connection with a five-second delivery deadline.
+Only an HTTP 200 acknowledges an envelope.
 The durable scheduling cursor advances after every attempted envelope, so more than one page of
 retained rejected records or a persistent transient failure cannot indefinitely hide newer work.
 Only an HTTP 200 writes the separate acknowledgement; rejected, network-failed, and transiently
@@ -825,49 +834,101 @@ This source branch is qualified with the source build and synthetic fixtures for
 
 Released-client with released-Hub combinations have not been qualified for the new `review` field. A source client against an older Hub remains compatible because the field is optional; an older strict client may reject a response from a newer Hub and must be upgraded. Real Claude Code and Codex host-adapter sessions producing the new summary have not been run, and no existing adapter qualification is evidence for this projection. Multi-machine, live forge, object-store deployment and captured working-file rendering remain unverified. Missing runtime evidence stays unknown.
 
+## Native parent history
+
+A successful explicit `agentscm_start` associates its native Claude Code or Codex chat with that
+Work and generation. A parent chat that starts Work in several repositories contributes its
+visible context to each of them, including prompts and replies before the claim. A tool's latest
+working directory or a read-only status call does not establish that association. The association
+survives a native chat restart; the Hub checks the current token, repository, participant and Work
+generation before accepting new records. Finished or superseded generations cannot receive new
+capture. The local association contains identifiers and checkout routing, never transcript bodies.
+Before automatic backfill, the same native file must contain the successful `agentscm_start` tool
+call for that exact session, repository, Work and generation. A session ID supplied by another chat
+does not authorize its history. Pending tool results are retried after the host writes them.
+
+The MCP process observes the exact native session file while it runs, and native hooks also drain
+available records. Readers retain a per-Work cursor, consume complete lines in bounded pages and
+retry interrupted delivery. Repeated identical prompts remain separate occurrences; their shared
+body bytes are stored once per author. Conversation entries carry the recorded harness, generation
+and tool request identity when available. Legacy entries without those fields remain unknown.
+Older duplicate submissions whose author cannot be determined are not reassigned during migration.
+Native history can overlap earlier hook or imported conversation records, including after a
+generation resumes. Older records do not always retain a matching native occurrence identity, so
+capture preserves both rather than discarding context or merging legitimate repeated messages by
+text. The conversation UI identifies mixed sources and counts their prompt records; this is not
+proof that every retained record is a distinct utterance.
+
+The configured capture mode, repository sharing, author opt-out, redaction, spool limits and body
+retention still apply. Turning sharing on does not retroactively upload bodies already retained
+under a local-only mode. No history is inferred from another native session or inherited subagent
+prefix. Unknown formats and partial records do not establish complete evidence.
+
+### Claude Code
+
+The reader selects visible user and assistant blocks and supported tool phases from the exact main
+transcript under the configured Claude projects directory. Thinking and system blocks and sidechain
+records are excluded. Native hooks continue to record lifecycle and observed actions; source records
+avoid duplicate conversational tool phases. A terminal source-identity or format failure records a
+gap and switches that Work generation to future trusted hooks after any in-flight source page
+settles. That generation never resumes source replay, which could duplicate prompts. The failing
+page and its triggering prompt remain partial; a newly admitted generation can recover again.
+
+## Other native hooks
+
+The installed Cursor, Copilot and Gemini CLI hooks feed the same bounded capture, redaction,
+sharing and opt-out path. Run `agentscm client setup --agent cursor|copilot|gemini` again to update
+an existing installation. These adapters do not read historical files or reconstruct earlier parent
+context; the native-history association described for Claude Code and Codex does not apply to them.
+
+| Host | Visible conversation and tools | Model and automatic token usage |
+| --- | --- | --- |
+| Cursor | `beforeSubmitPrompt`, full `afterAgentResponse.text`, tool start/result/failure and lifecycle markers | Bounded native model field; no per-request token counts in the documented hooks |
+| Copilot | `userPromptSubmitted`, tool start/result/failure and lifecycle markers; no assistant reply in its documented hooks | Model and token counts unavailable |
+| Gemini CLI | `BeforeAgent.prompt`, `AfterAgent.prompt_response`, tool start/result and lifecycle markers | Bounded model from `BeforeModel`; no reliable additive token totals |
+
+Copilot's camelCase payload omits the event name, so setup supplies an exact `--hook-event` argument.
+Unknown or conflicting event hints are not captured. Tool observations without a native call ID
+remain unpaired; no tool ID is invented. Model-only observations use `setup_observed` without a body.
+Cursor may reuse one native tool ID for a Read and then a Write, so its events do not claim one
+managed action or produce source-bound action receipts. IDs outside the capture identifier format,
+including multiline IDs, are omitted while the observation and its identity uncertainty remain.
+Older Hubs that do not accept the new harnesses or event kind leave their envelopes pending; upgrade
+the Hub before the clients.
+
+Cursor thought hooks and Gemini's streamed `AfterModel` hook are not installed. Gemini's
+`BeforeModel` supplies only model metadata; capture excludes model messages, candidates and
+token snapshots. Visible Gemini replies come only from `AfterAgent`. Missing usage stays unknown,
+and is never reported as zero. These mappings are tested with synthetic native payloads; live host
+delivery across client versions is not qualified by those tests.
+
 ## Codex adapter
 
-Codex command hooks use the same event names and fields as Claude Code's, so Codex is captured by
-the same hook path, with `codex` recorded as the session's harness. The modes, redaction, the
-spool and its bounds, gaps and the repository's sharing setting apply unchanged. The AgentSCM
-plugin's hook (`agentscm hook codex --client-connection`) captures for a checkout whose binding
-follows the Hub, and also for one configured by hand, whose own hooks are Claude Code's. There is
-no `configure` step for Codex. Live capture reads only what a hook payload carries.
+Codex hooks retain lifecycle, prompts, supported tool actions and model-request usage. The exact
+native rollout supplements them with interim assistant messages, typed tool results and supported
+hosted calls, including reported failures. It never decrypts reasoning or imports system instructions.
+Plan updates and agent-to-agent activity that exist only as model-level wrapper calls are not selected.
 
-| Fact | Hook event | Notes |
-|---|---|---|
-| Session start and end | `SessionStart`, `SessionEnd` | A `fork` start, like a resume, does not prove earlier history was observed. Codex gives every end the reason `other`, and ends and starts the session again around each non-interactive `resume`. |
-| Prompt | `UserPromptSubmit` | The `prompt` field. A prompt before the session has Work is held as for Claude Code. |
-| Tool start | `PreToolUse` | Tool name, call identity and input. A shell command is `Bash`, an MCP tool `mcp__server__tool`. |
-| Tool finish with its result | `PostToolUse` | The `tool_response` field: for a shell command, its output as text. Recorded as `returned`. |
-| Assistant message | `Stop` | The `last_assistant_message` field: the last message of the turn, recorded just before the turn's end. |
-| Token usage of one model request | `PostModelRequest` | See [token usage](#codex-token-usage). |
-| Compaction, subagent start and stop | `PreCompact`, `SubagentStart`, `SubagentStop` | Markers, as for Claude Code. |
+The plugin's `UserPromptSubmit`, `PostModelRequest`, `PreCompact`, `SubagentStart` and `SubagentStop`
+entries must be trusted in Codex `/hooks` after installation or an update. The MCP watcher can recover
+visible history after an explicit Work start even when a conversational hook is unavailable; this
+does not prove native edit-hook verification.
 
-The plugin registers `UserPromptSubmit`, `PostModelRequest`, `PreCompact`, `SubagentStart` and
-`SubagentStop` only for capture; they never reach the Hub's hook endpoint. Codex runs a new or
-changed hook entry only after its person trusts it in `/hooks`, so a checkout that installed the
-plugin before these entries existed records them once they are trusted.
+Codex asynchronous questions are read independently of conversation sharing. The human alert keeps
+pending question IDs and timestamps, without question or answer text, until the exact native answer
+or an explicit clear is observed. Unrelated tool calls, replies and session stops do not dismiss
+them. Unreliable scans report unavailable coverage without answering known questions. Scoped
+coverage remains unavailable across restarts until reliable evidence or a verified clear resolves
+that source. Pending questions have an active capacity bound; dismissing a status item does not
+answer its native question.
 
-What Codex does not expose to a hook is not recorded, and is not guessed:
-
-- **An assistant message before a turn's last one.** No hook carries it. `import-codex` reads it
-  from the session file.
-- **Whether a tool call failed.** There is no failure hook. A shell command runs `PostToolUse`
-  whatever its exit code, and its response is its output with no exit code, so it is `returned`
-  and an action's outcome is `unknown`. An MCP call that failed, and a call that a `PreToolUse`
-  hook refused, run no `PostToolUse`: each is recorded as started and never finished.
-  `import-codex` reads the exit code and the failure from the session file.
-- **Hosted tool calls**, such as web search. They run no hook.
-- **Reasoning.** Codex stores it encrypted; the adapter never reads it.
-- **An identity for a prompt or a session boundary.** `UserPromptSubmit` names the turn, not the
-  prompt, and `SessionStart` and `SessionEnd` name nothing, so each is recorded with an
-  `identity_uncertain` gap, like any event without a provider identity, and a Codex session is
-  never complete.
-- **A model request's identity** (see below), and **a reason for a session's end**.
-- **A subagent's own prompts and replies.** Its tool calls and model requests are recorded when
-  Codex runs the session's hooks for them; that was read from the hook schemas, which give those
-  events an `agent_id`. The session that was run had no subagent.
+If coverage cannot be persisted, the report is refused and retried. A bounded local failure guard
+marks question coverage incomplete while preserving known waits and other status. A rejected
+reliable snapshot also retains its offset so older snapshots cannot clear that uncertainty.
+Exhausting the guard's 4,096 tracked failures leaves question coverage incomplete indefinitely.
+Restarting does not clear it, and there is no supported in-product reset.
+Failed storage and a failed shutdown save cannot guarantee
+crash durability. These limits never establish that an unobserved question was answered.
 
 ### Codex token usage
 
@@ -893,8 +954,8 @@ identical counts are recorded once.
 ### Importing a Codex session file
 
 Codex keeps the whole of a session only in its session file (`rollout-*.jsonl` under its
-`sessions` directory). Codex documents that file's format as not stable for hooks, so no hook
-reads it; `import-codex` reads one file that a person names:
+`sessions` directory). The format is not a stable host API. The automatic reader validates the exact session and supported
+record shapes; `import-codex` also reads one file that a person names:
 
 ```text
 agentscm change-capture import-codex \
@@ -925,9 +986,8 @@ environment notes Codex adds around a prompt, or the model-level call records, w
 versions are scripts that wrap the calls above; plan updates and calls between agents, which the
 file has only at that level, are therefore not imported. A subagent's file opens with a copy of its parent's
 history; those records are skipped, and the subagent's file is imported as a session of its own,
-with `--parent-session-id` when the parent is known. Importing a file again adds nothing. A
-session that was recorded live gets its events a second time under the import's identities, as
-with `import-claude`; its usage is not repeated.
+with `--parent-session-id` when the parent is known. Importing a file again adds nothing. Native tool phases already retained under the same call identity are deduplicated; standalone
+imports keep their explicit import identity for other records. Usage is not repeated.
 
 ### Codex qualification
 
