@@ -350,6 +350,37 @@ fn own_command(value: &Value) -> bool {
     })
 }
 
+/// Prefer the native Cursor registration when it also runs an inherited Claude plugin hook.
+pub(crate) fn cursor_hook_registered(root: &Path, event: &str) -> bool {
+    let paths = home().ok().into_iter().chain([root.to_path_buf()]);
+    paths
+        .map(|path| path.join(".cursor/hooks.json"))
+        .any(|path| {
+            let Some(value) = read(&path)
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                return false;
+            };
+            value["version"] == 1
+                && value["hooks"][event].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        own_command(hook)
+                            && hook["timeout"].as_u64().is_some_and(|timeout| timeout > 0)
+                            && hook.as_object().is_some_and(|object| {
+                                object.keys().all(|key| {
+                                    matches!(key.as_str(), "command" | "timeout" | "type")
+                                })
+                            })
+                            && hook["command"].as_str().is_some_and(|command| {
+                                command.ends_with(" --no-telemetry hook cursor --client-connection")
+                            })
+                    })
+                })
+        })
+}
+
 // Duplicate coordination detection is separate from permission to remove an owned command.
 pub(crate) fn agentscm_hook(value: &Value) -> bool {
     value["url"]

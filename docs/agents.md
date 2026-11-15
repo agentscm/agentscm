@@ -127,6 +127,21 @@ less than fully:
 
 "Wired" means the files `client setup` generates match each vendor's current documentation (see [Verified against](#verified-against)). It does not mean the combination has been run in every product version. The hook client is tested against a stub hub with sample payloads written from the vendors' documentation, not in live sessions of each agent. Claude Code is the reference integration. The Codex, Cursor and Copilot wiring follows their documented hook formats.
 
+Other hosts can inherit Claude settings and plugins. The Claude hook checks Cursor and Copilot
+payload fields and the nearest host process before routing, capture or permission handling.
+Cursor inputs use the Cursor adapter, even when Claude environment variables were inherited.
+Recognizable Copilot processes use the Copilot adapter. An unsupported Devin process, conflicting
+host evidence, or foreign environment markers without a recognizable host skips the hook with
+exit 0; it neither captures Claude history nor starts or ends a Claude waiter. Identical PascalCase
+inputs without an observable host marker still use the configured adapter: use each host's native
+setup instead of relying on inherited Claude configuration. When the same event has an owned native
+Cursor registration, the inherited hook yields to it before any capture or coordination. Missing or
+partial native registrations keep the inherited path for the remaining events. Explicit Hub routing
+is preserved. The Unix-only plugin generator carries complete arguments in the command string.
+A bare invocation with recognizable hook input
+returns an empty reply with exit 0 and reports missing arguments instead of refusing a tool with
+CLI usage. These cases are covered by synthetic tests, not new live host qualification.
+
 ## Wire a repository
 
 One person on the team runs, from the repository:

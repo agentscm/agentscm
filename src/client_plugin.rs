@@ -143,10 +143,13 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str, Vec<u8>)> {
+    let command = format!(
+        "{} --no-telemetry hook claude --client-connection",
+        shell_quote(program)
+    );
     let hook = |timeout| {
         json!({
-            "type":"command", "command":program,
-            "args":["--no-telemetry", "hook", "claude", "--client-connection"],
+            "type":"command", "command":command,
             "timeout":timeout
         })
     };
@@ -161,14 +164,14 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     // the Hub for a message to this session and wakes it with one (asyncRewake, exit 2), idle or
     // busy. Only one waits per session; it leaves on its own before this timeout.
     let wait = json!({
-        "type":"command", "command":program,
-        "args":["--no-telemetry", "hook-wait", "claude"],
+        "type":"command",
+        "command":format!("{} --no-telemetry hook-wait claude", shell_quote(program)),
         "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
     });
     // SessionEnd tells this session's waiter to leave, as /clear keeps the same process.
     let wait_end = json!({
-        "type":"command", "command":program,
-        "args":["--no-telemetry", "hook-wait", "claude", "--end"], "timeout":5
+        "type":"command",
+        "command":format!("{} --no-telemetry hook-wait claude --end", shell_quote(program)), "timeout":5
     });
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
@@ -1267,11 +1270,11 @@ mod tests {
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let hook = &group["hooks"][0];
-                assert_eq!(hook["command"], "/opt/old agentscm");
                 assert_eq!(
-                    hook["args"],
-                    json!(["--no-telemetry", "hook", "claude", "--client-connection"])
+                    hook["command"],
+                    "'/opt/old agentscm' --no-telemetry hook claude --client-connection"
                 );
+                assert!(hook.get("args").is_none());
                 assert!(!hook.to_string().contains("token"));
                 assert!(!hook.to_string().contains("hub-url"));
             }
@@ -1280,8 +1283,8 @@ mod tests {
         for event in ["SessionStart", "Stop"] {
             let wait = &hooks["hooks"][event][0]["hooks"][1];
             assert_eq!(
-                wait["args"],
-                json!(["--no-telemetry", "hook-wait", "claude"])
+                wait["command"],
+                "'/opt/old agentscm' --no-telemetry hook-wait claude"
             );
             assert_eq!(wait["asyncRewake"], true);
             assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
@@ -1289,8 +1292,8 @@ mod tests {
         // SessionEnd ends the waiter, briefly and in the foreground.
         let end = &hooks["hooks"]["SessionEnd"][0]["hooks"][1];
         assert_eq!(
-            end["args"],
-            json!(["--no-telemetry", "hook-wait", "claude", "--end"])
+            end["command"],
+            "'/opt/old agentscm' --no-telemetry hook-wait claude --end"
         );
         assert!(end.get("asyncRewake").is_none());
         assert_eq!(end["timeout"], 5);
@@ -1309,6 +1312,53 @@ mod tests {
                 .1,
             SKILL.as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_hook_commands_preserve_arguments_without_separate_args() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("agent's executable");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let files = claude_package_files(program.to_str().unwrap());
+        let hooks: Value = serde_json::from_slice(
+            &files
+                .iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        for groups in hooks["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for hook in group["hooks"].as_array().unwrap() {
+                    assert!(hook.get("args").is_none());
+                    let output = std::process::Command::new("/bin/sh")
+                        .args(["-c", hook["command"].as_str().unwrap()])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    let output = String::from_utf8(output.stdout).unwrap();
+                    let args: Vec<_> = output.lines().collect();
+                    assert_eq!(args[0], "--no-telemetry");
+                    assert_eq!(args[2], "claude");
+                    if args[1] == "hook" {
+                        assert_eq!(
+                            args,
+                            ["--no-telemetry", "hook", "claude", "--client-connection"]
+                        );
+                    } else {
+                        assert_eq!(args[1], "hook-wait");
+                        assert!(
+                            args.len() == 3
+                                || args == ["--no-telemetry", "hook-wait", "claude", "--end"]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

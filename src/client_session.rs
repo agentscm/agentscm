@@ -95,6 +95,90 @@ fn host(ancestors: &[Process]) -> Option<&Process> {
     })
 }
 
+/// Claude configuration can be inherited by another host; it does not identify that host.
+pub(crate) async fn hook_agent<'a>(configured: &'a str, payload: &Value) -> Option<&'a str> {
+    if configured != "claude" {
+        return Some(configured);
+    }
+    let foreign_environment = ["CURSOR_VERSION", "CURSOR_PROJECT_DIR", "DEVIN_PROJECT_DIR"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    let ancestors = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::task::spawn_blocking(ancestors),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    let versions = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/share/claude/versions"))
+        .and_then(|path| path.canonicalize().ok());
+    let process =
+        host(&ancestors).and_then(|process| hook_process_name(&process.name, versions.as_deref()));
+    inherited_hook_agent(payload, process, foreign_environment)
+}
+
+fn hook_process_name<'a>(process: &'a str, versions: Option<&Path>) -> Option<&'a str> {
+    let path = Path::new(process);
+    if versions.is_some_and(|versions| path.parent() == Some(versions)) {
+        return Some("claude");
+    }
+    path.file_stem()?.to_str()
+}
+
+fn inherited_hook_agent(
+    payload: &Value,
+    process: Option<&str>,
+    foreign_environment: bool,
+) -> Option<&'static str> {
+    let cursor = payload.get("cursor_version").is_some()
+        || payload.get("conversation_id").is_some()
+        || payload.get("workspace_roots").is_some();
+    let copilot = payload.get("sessionId").is_some();
+    let text = |key| {
+        payload[key].as_str().filter(|text| {
+            !text.is_empty() && text.len() <= 1024 && !text.chars().any(char::is_control)
+        })
+    };
+    if cursor && (text("cursor_version").is_none() || text("conversation_id").is_none())
+        || copilot && text("sessionId").is_none()
+    {
+        return None;
+    }
+    let mut sessions = ["session_id", "conversation_id", "sessionId"]
+        .into_iter()
+        .filter(|key| payload.get(*key).is_some());
+    if let Some(first) = sessions.next() {
+        let first = text(first)?;
+        if sessions.any(|key| text(key) != Some(first)) {
+            return None;
+        }
+    }
+    let shaped = match (cursor, copilot) {
+        (true, false) => Some("cursor"),
+        (false, true) => Some("copilot"),
+        (true, true) => return None,
+        (false, false) => None,
+    };
+    // Only the nearest non-shell process counts: a host may itself launch another host.
+    let observed = match process {
+        Some("claude") => Some("claude"),
+        Some("cursor" | "cursor-agent") => Some("cursor"),
+        Some("copilot") => Some("copilot"),
+        Some("devin") => return None,
+        _ => None,
+    };
+    match (shaped, observed) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(agent), _) | (_, Some(agent)) => Some(agent),
+        (None, None) if foreign_environment => None,
+        // shortcut: identical PascalCase payloads have no host discriminator; use the
+        // configured adapter until the host supplies one or its executable is recognizable.
+        (None, None) => Some("claude"),
+    }
+}
+
 pub(crate) fn directory(config: &Path) -> PathBuf {
     config.join("agentscm").join("agent-hosts")
 }
@@ -427,6 +511,63 @@ pub(crate) fn recorded(config: &Path, ancestors: &[Process]) -> Recorded {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_claude_version_executables_are_recognized_only_in_the_install_directory() {
+        let versions = Path::new("/home/example/.local/share/claude/versions");
+        let process = versions.join("2.1.37");
+        assert_eq!(
+            super::hook_process_name(process.to_str().unwrap(), Some(versions)),
+            Some("claude")
+        );
+        assert_ne!(
+            super::hook_process_name("/other/versions/2.1.37", Some(versions)),
+            Some("claude")
+        );
+        assert_ne!(
+            super::hook_process_name("/usr/bin/node", Some(versions)),
+            Some("claude")
+        );
+    }
+    #[test]
+    fn inherited_hook_hosts_use_payload_and_nearest_process_not_config_origin() {
+        let cursor = serde_json::json!({"hook_event_name":"preToolUse", "conversation_id":"s", "cursor_version":"1"});
+        assert_eq!(
+            super::inherited_hook_agent(&cursor, None, true),
+            Some("cursor")
+        );
+        assert_eq!(
+            super::inherited_hook_agent(&cursor, Some("claude"), true),
+            None
+        );
+        let pascal = serde_json::json!({"hook_event_name":"PreToolUse", "session_id":"s"});
+        assert_eq!(
+            super::inherited_hook_agent(&pascal, Some("copilot"), false),
+            Some("copilot")
+        );
+        assert_eq!(
+            super::inherited_hook_agent(&pascal, Some("devin"), false),
+            None
+        );
+        assert_eq!(super::inherited_hook_agent(&pascal, None, true), None);
+        assert_eq!(
+            super::inherited_hook_agent(&pascal, Some("claude"), true),
+            Some("claude")
+        );
+        assert_eq!(
+            super::inherited_hook_agent(&pascal, None, false),
+            Some("claude")
+        );
+        let conflict = serde_json::json!({"conversation_id":"s", "sessionId":"s"});
+        assert_eq!(super::inherited_hook_agent(&conflict, None, false), None);
+        for bad in [
+            serde_json::json!({"cursor_version":"1"}),
+            serde_json::json!({"cursor_version":null, "conversation_id":"s"}),
+            serde_json::json!({"cursor_version":"1", "conversation_id":"s", "session_id":"other"}),
+            serde_json::json!({"sessionId":5}),
+        ] {
+            assert_eq!(super::inherited_hook_agent(&bad, None, false), None);
+        }
+    }
     use super::*;
 
     /// An absolute root on this platform: a route only keeps absolute roots.

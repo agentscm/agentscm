@@ -890,6 +890,9 @@ context; the native-history association described for Claude Code and Codex does
 Copilot's camelCase payload omits the event name, so setup supplies an exact `--hook-event` argument.
 Unknown or conflicting event hints are not captured. Tool observations without a native call ID
 remain unpaired; no tool ID is invented. Model-only observations use `setup_observed` without a body.
+Cursor may reuse one native tool ID for a Read and then a Write, so its events do not claim one
+managed action or produce source-bound action receipts. IDs outside the capture identifier format,
+including multiline IDs, are omitted while the observation and its identity uncertainty remain.
 Older Hubs that do not accept the new harnesses or event kind leave their envelopes pending; upgrade
 the Hub before the clients.
 

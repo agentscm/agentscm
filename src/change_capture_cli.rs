@@ -597,6 +597,12 @@ async fn hook_claude() -> Result<i32> {
             return Ok(0);
         }
     };
+    if crate::client_session::hook_agent("claude", &payload).await != Some("claude") {
+        eprintln!(
+            "AgentSCM local capture skipped: inherited hook belongs to another or unknown host"
+        );
+        return Ok(0);
+    }
     let (binding, spool, connection) = match change_capture_client::binding_for_payload(&payload) {
         Ok(Some(bound)) => bound,
         Ok(None) => return Ok(0),

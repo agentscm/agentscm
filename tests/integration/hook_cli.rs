@@ -188,6 +188,200 @@ fn assert_unknown(run: &Run, agent: &str, reason: &str) {
 const CLAUDE_PRE: &str = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","session_id":"s1","cwd":"/work/repo","tool_input":{"file_path":"/work/repo/src/a.rs"}}"#;
 
 #[test]
+fn inherited_claude_hook_routes_cursor_payload_to_cursor() {
+    let (url, seen) = stub(Reply::Status(200, r#"{"additional_context":"checked"}"#));
+    let dir = home();
+    let payload = json!({"hook_event_name":"postToolUse", "cursor_version":"1", "conversation_id":"s1", "session_id":"s1", "workspace_roots":["/work/repo"], "tool_name":"Write", "tool_input":{"file_path":"/work/repo/a.rs"}});
+    let run = run_with(
+        &["claude", "--hub-url", &url],
+        &[("AGENTSCM_HUB_TOKEN", TOKEN), ("CLAUDECODE", "1")],
+        &dir,
+        payload.to_string().as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.json()["additional_context"], "checked");
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(2)).unwrap().path,
+        "/v1/hub/hook/cursor"
+    );
+}
+
+#[test]
+fn inherited_claude_hook_skips_unknown_foreign_environment() {
+    let dir = home();
+    let run = run_with(
+        &["claude", "--client-connection"],
+        &[("DEVIN_PROJECT_DIR", "/work/repo"), ("CLAUDECODE", "1")],
+        &dir,
+        CLAUDE_PRE.as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.json(), json!({}));
+}
+
+#[test]
+#[cfg(unix)]
+fn inherited_cursor_hook_yields_only_to_its_owned_native_event() {
+    for user_scope in [true, false] {
+        let dir = home();
+        let (url, seen) = serve(|_| (200, json!({})));
+        let root = connected_checkout(&dir, &url);
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let hook_dir = if user_scope { dir.path() } else { &root }.join(".cursor");
+        std::fs::create_dir(&hook_dir).unwrap();
+        let hooks = hook_dir.join("hooks.json");
+        let owned = json!({"command":"'/opt/agentscm' --no-telemetry hook cursor --client-connection", "timeout":5});
+        std::fs::write(
+            &hooks,
+            json!({"version":1,"hooks":{"postToolUse":[owned]}}).to_string(),
+        )
+        .unwrap();
+        let mut payload = json!({"hook_event_name":"postToolUse", "cursor_version":"1", "conversation_id":"s1", "tool_name":"Write", "cwd":nested, "workspace_roots":[root], "tool_input":{"file_path":root.join("a.rs")}});
+        for cwd in [nested.to_string_lossy().as_ref(), ""] {
+            payload["cwd"] = json!(cwd);
+            let run = run_with(
+                &["claude", "--client-connection"],
+                &[],
+                &dir,
+                payload.to_string().as_bytes(),
+            );
+            assert_eq!(run.code, Some(0));
+            assert_eq!(run.json(), json!({}));
+            assert!(seen.recv_timeout(Duration::from_millis(100)).is_err());
+        }
+        // An explicit destination is independent of the native client-connection registration.
+        let run = run_with(
+            &["claude", "--hub-url", &url],
+            &[("AGENTSCM_HUB_TOKEN", TOKEN)],
+            &dir,
+            payload.to_string().as_bytes(),
+        );
+        assert_eq!(run.code, Some(0));
+        assert_eq!(
+            seen.try_iter()
+                .filter(|request| request.path == "/v1/hub/hook/cursor")
+                .count(),
+            1
+        );
+        for registration in [
+            json!({"preToolUse":[owned]}),
+            json!({"postToolUse":[{"command":"helper"}]}),
+            json!({"postToolUse":[{"command":owned["command"],"timeout":"invalid"}]}),
+        ] {
+            std::fs::write(
+                &hooks,
+                json!({"version":1,"hooks":registration}).to_string(),
+            )
+            .unwrap();
+            let run = run_with(
+                &["claude", "--client-connection"],
+                &[],
+                &dir,
+                payload.to_string().as_bytes(),
+            );
+            assert_eq!(run.code, Some(0));
+            assert_eq!(
+                seen.try_iter()
+                    .filter(|request| request.path == "/v1/hub/hook/cursor?repo=acme%2Fwidgets")
+                    .count(),
+                1,
+                "scope={user_scope} registration={registration} reply={}",
+                run.stdout
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn slow_host_process_lookup_preserves_configured_hook_routing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home();
+    let ps = dir.path().join("ps");
+    std::fs::write(&ps, "#!/bin/sh\n/bin/sleep 1\n").unwrap();
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (url, seen) = stub(Reply::Status(200, "{}"));
+    let run = run_with(
+        &["claude", "--hub-url", &url],
+        &[
+            ("PATH", dir.path().to_str().unwrap()),
+            ("AGENTSCM_HUB_TOKEN", TOKEN),
+        ],
+        &dir,
+        CLAUDE_PRE.as_bytes(),
+    );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(2)).unwrap().path,
+        "/v1/hub/hook/claude"
+    );
+}
+
+#[test]
+fn dropped_hook_arguments_do_not_turn_cli_usage_into_a_refusal() {
+    let copilot = r#"{"sessionId":"s1","toolName":"edit","toolArgs":{"path":"example.txt"}}"#;
+    for payload in [CLAUDE_PRE, copilot] {
+        for args in [vec![], vec!["--no-telemetry"]] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+                .args(args)
+                .env_clear()
+                .envs(std::env::var_os("SystemRoot").map(|v| ("SystemRoot", v)))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                json!({})
+            );
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("Usage:"));
+        }
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+}
+
+#[test]
+fn inherited_claude_waiter_does_not_create_end_marker_for_cursor() {
+    let dir = home();
+    let payload = json!({"hook_event_name":"sessionEnd", "cursor_version":"1", "conversation_id":"s1", "session_id":"s1"});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args(["hook-wait", "claude", "--end"])
+        .env_clear()
+        .envs(base_env(&dir))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!dir.path().join("agentscm/hook-wait").exists());
+}
+
+#[test]
 fn success_passes_the_hub_reply_through() {
     let (url, seen) = stub(Reply::Status(
         200,

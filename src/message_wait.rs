@@ -57,16 +57,23 @@ pub async fn run(args: HookWaitArgs) -> ! {
     let Some(agent) = waiter(&args.agent).filter(|_| cfg!(unix)) else {
         std::process::exit(0)
     };
+    let Some(payload) = input() else {
+        std::process::exit(0)
+    };
+    // Inherited Claude hooks must neither wait for nor end another host's session.
+    if crate::client_session::hook_agent(&args.agent, &payload).await != Some(args.agent.as_str()) {
+        std::process::exit(0)
+    }
     if args.end {
         // The session ended while its process may live on (/clear), so its waiter cannot see it.
-        if let (Some(payload), Some(dir)) = (input(), wait_dir())
+        if let Some(dir) = wait_dir()
             && let Some(session) = session_of(&payload, agent)
         {
             let _ = File::create(marker(&dir, &session));
         }
         std::process::exit(0)
     }
-    let found = waited(agent, args.notification).await;
+    let found = waited(agent, args.notification, &payload).await;
     std::process::exit(match agent {
         Waker::Claude => finish(found.map(|(_, text)| text), &mut std::io::stderr()),
         Waker::Codex => found.map_or(0, |(session, text)| queue(&session, &text)),
@@ -204,10 +211,9 @@ fn marker(dir: &Path, session: &str) -> PathBuf {
 }
 
 /// The session and the Hub's notice, once one comes; the agent names its delivery mechanism.
-async fn waited(agent: Waker, notification: bool) -> Option<(String, String)> {
-    let payload = input()?;
-    let session = session_of(&payload, agent)?;
-    if !can_wait(&payload, agent, notification) {
+async fn waited(agent: Waker, notification: bool, payload: &Value) -> Option<(String, String)> {
+    let session = session_of(payload, agent)?;
+    if !can_wait(payload, agent, notification) {
         return None;
     }
     let cwd = Path::new(payload["cwd"].as_str()?);

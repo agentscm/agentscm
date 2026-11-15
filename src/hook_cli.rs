@@ -96,6 +96,40 @@ pub async fn run(args: HookArgs) {
     run_unparsed(args.args).await
 }
 
+/// A host that dropped a hook's argv must not turn CLI usage (exit 2) into a tool refusal.
+pub(crate) fn missing_arguments() -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return false;
+    }
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("agentscm-hook-input".into())
+        .spawn(move || {
+            let hook = read_stdin()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .is_some_and(|payload| {
+                    let named = payload["hook_event_name"].as_str().is_some_and(|event| {
+                        !event.is_empty()
+                            && event.len() <= 64
+                            && event.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    });
+                    let copilot_tool = payload["sessionId"].as_str().is_some()
+                        && payload["toolName"].as_str().is_some()
+                        && payload.get("toolArgs").is_some();
+                    (named || copilot_tool) && session_of(&payload).is_some()
+                });
+            let _ = send.send(hook);
+        })
+        .is_err()
+    {
+        return false;
+    }
+    receive
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or(false)
+}
+
 /// Never returns: prints the agent's reply and exits 0.
 pub async fn run_unparsed(args: Vec<String>) -> ! {
     let (agent, flag_url, repo) = parse_args(&args);
@@ -209,6 +243,36 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let configured = agent;
+    let Some(agent) = crate::client_session::hook_agent(configured, &payload).await else {
+        eprintln!(
+            "AgentSCM: coordination unknown (inherited hook host is ambiguous or unsupported)"
+        );
+        return json!({});
+    };
+    #[cfg(unix)]
+    if configured == "claude" && agent == "cursor" && client_connection && !destination_args {
+        let root = payload["workspace_roots"][0]
+            .as_str()
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd_of(&payload));
+        let event = payload["hook_event_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::task::spawn_blocking(move || {
+                crate::client_setup::cursor_hook_registered(&root, &event)
+            }),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok_and(|found| found))
+        {
+            return json!({});
+        }
+    }
     #[cfg(unix)]
     let capture_payload = std::sync::Arc::new(payload.clone());
     if let Some(table) = table(agent) {
@@ -2930,11 +2994,17 @@ fn path_segment(agent: &str) -> String {
 
 /// Where the agent is working: the payload's `cwd`, else its first workspace root, else here.
 fn cwd_of(payload: &Value) -> PathBuf {
-    let first_root = payload["workspace_roots"][0].as_str();
-    payload["cwd"].as_str().or(first_root).map_or_else(
-        || std::env::current_dir().unwrap_or_default(),
-        PathBuf::from,
-    )
+    let first_root = payload["workspace_roots"][0]
+        .as_str()
+        .filter(|root| !root.is_empty());
+    payload["cwd"]
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .or(first_root)
+        .map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        )
 }
 
 /// Added to a failure note: it is given once per session and failure, so it has to cover the edits
@@ -5327,6 +5397,10 @@ mod tests {
 
     #[test]
     fn payload_directory_comes_from_cwd_then_workspace_roots() {
+        assert_eq!(
+            cwd_of(&json!({"cwd":"", "workspace_roots":["/b"]})),
+            PathBuf::from("/b")
+        );
         assert_eq!(
             cwd_of(&json!({"cwd": "/a", "workspace_roots": ["/b"]})),
             PathBuf::from("/a")

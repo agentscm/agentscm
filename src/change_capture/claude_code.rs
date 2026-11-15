@@ -1748,10 +1748,13 @@ fn capture_native_hook_inner(
         .get("hook_event_name")
         .and_then(Value::as_str)
         .ok_or_else(|| CaptureError::Invalid("Claude Code hook event name is missing".into()))?;
-    if !matches!(
-        event_name,
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-    ) {
+    // Cursor can reuse one ID for Read then Write, so its phases do not claim a native action.
+    if request.harness == AgentHarnessV1::Cursor
+        || !matches!(
+            event_name,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        )
+    {
         let event = capture_hook_with_identity(input, request, spool, None)?;
         return Ok(NativeHookReport {
             event,

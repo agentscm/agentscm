@@ -222,12 +222,11 @@ fn tool_event(
     } else if event == Event::ToolStart {
         return Err(invalid("native tool input is missing"));
     }
+    // Cursor can send multiline IDs; unrepresentable IDs retain an unpaired observation and gap.
     if harness == AgentHarnessV1::Cursor
         && let Some(id) = optional_text(object, "tool_use_id")?
+        && identifier(id, 255)
     {
-        if !identifier(id, 255) {
-            return Err(invalid("native tool identity is invalid"));
-        }
         normalized["tool_use_id"] = json!(id);
     }
     // Copilot and Gemini expose no documented tool-call identity. A timestamp or tool name
@@ -520,6 +519,104 @@ mod tests {
         assert_eq!(failed.events[0]["hook_event_name"], "PostToolUseFailure");
         assert_eq!(failed.events[0]["error"], "Tool was interrupted.");
         assert!(failed.events[0].get("tool_response").is_none());
+    }
+
+    #[test]
+    fn cursor_shared_and_multiline_tool_ids_preserve_each_observation_without_action_claims() {
+        use crate::change_capture::GitSourceRequest;
+        use crate::change_record::GapReasonV1;
+
+        for id in ["call-edit", "call-edit\nfc_edit"] {
+            let temp = tempfile::tempdir().unwrap();
+            let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+            let request = request(AgentHarnessV1::Cursor, CaptureModeV1::LocalConversation);
+            let actions = claude_code::ActionCaptureConfig {
+                source: GitSourceRequest {
+                    repository: "example/repository".into(),
+                    worktree_id: "worktree_native".into(),
+                    repository_path: temp.path().to_path_buf(),
+                    base_ref: "HEAD".into(),
+                },
+                setup_digest: "a".repeat(64),
+                rules: Vec::new(),
+                managed_invocations: Vec::new(),
+            };
+            let has_identity = identifier(id, 255);
+            for (event, tool) in [
+                ("preToolUse", "Read"),
+                ("preToolUse", "Write"),
+                ("postToolUse", "Write"),
+            ] {
+                let hook = normalized(
+                    "cursor",
+                    json!({"hook_event_name":event,"conversation_id":"session_native",
+                        "tool_name":tool,"tool_use_id":id,
+                        "tool_input":{"path":"example.txt"},"tool_output":"done"}),
+                    None,
+                );
+                assert_eq!(hook.events[0].get("tool_use_id").is_some(), has_identity);
+                let input = serde_json::to_vec(&hook.events[0]).unwrap();
+                for replay in [false, true] {
+                    let report =
+                        claude_code::capture_native_hook(&input, &request, &actions, &spool)
+                            .unwrap();
+                    assert_eq!(
+                        report.action,
+                        claude_code::NativeActionOutcome::NotApplicable
+                    );
+                    assert_eq!(
+                        report.event,
+                        if replay && has_identity {
+                            claude_code::HookCaptureOutcome::Duplicate
+                        } else {
+                            claude_code::HookCaptureOutcome::Stored
+                        }
+                    );
+                }
+            }
+            let events: Vec<_> = spool
+                .pending(100)
+                .unwrap()
+                .into_iter()
+                .flat_map(|envelope| match envelope {
+                    CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                    _ => panic!("Cursor observations must not assert source-bound actions"),
+                })
+                .collect();
+            let tools: Vec<_> = events
+                .iter()
+                .filter_map(|event| event.tool.as_ref())
+                .collect();
+            assert_eq!(tools.len(), if has_identity { 3 } else { 6 });
+            assert!(
+                tools
+                    .iter()
+                    .all(|tool| tool.request_id.as_deref() == has_identity.then_some(id))
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .filter(|tool| tool.name.as_deref() == Some("Read"))
+                    .count(),
+                if has_identity { 1 } else { 2 }
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event
+                        .gap
+                        .as_ref()
+                        .is_some_and(|gap| gap.reason == GapReasonV1::IdentityUncertain))
+                    .count(),
+                if has_identity { 0 } else { 6 }
+            );
+            assert!(
+                spool
+                    .managed_invocation_for_occurrence("session_native", "call-edit")
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

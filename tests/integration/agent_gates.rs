@@ -91,29 +91,114 @@ const REGISTER: &[Gate] = &[
                  Gemini CLI and the src/clients.rs table agents are not in that matrix",
     },
     Gate {
+        file: "src/change_capture/claude_code.rs",
+        item: "capture_native_hook_inner",
+        agents: "cursor",
+        reason: "host limit: Cursor may reuse a call ID for Read then Write, so its observations \
+                 cannot claim one managed action",
+    },
+    Gate {
+        file: "src/change_capture/claude_code.rs",
+        item: "capture_transcript",
+        agents: "claude",
+        reason: "host limit: this reader validates the Claude Code transcript schema; Codex uses its \
+                 own reader",
+    },
+    Gate {
+        file: "src/change_capture/claude_code.rs",
+        item: "capture_transcript_page",
+        agents: "claude",
+        reason: "host limit: this page parser validates Claude Code session identity and transcript \
+                 records",
+    },
+    Gate {
+        file: "src/change_capture/claude_code.rs",
+        item: "verify_history_start",
+        agents: "claude",
+        reason: "host limit: this proof parser requires a native Claude Code start record; Codex has \
+                 a separate parser",
+    },
+    Gate {
+        file: "src/change_capture/native_hooks.rs",
+        item: "event_for",
+        agents: "copilot cursor gemini",
+        reason: "host limit: Cursor, Copilot and Gemini CLI name their hook events differently",
+    },
+    Gate {
+        file: "src/change_capture/native_hooks.rs",
+        item: "model",
+        agents: "cursor gemini",
+        reason: "host limit: Cursor and Gemini CLI expose model identifiers in their own payload \
+                 fields",
+    },
+    Gate {
+        file: "src/change_capture/native_hooks.rs",
+        item: "normalize",
+        agents: "copilot cursor gemini",
+        reason: "not wired yet: these three native hook adapters are implemented; Claude Code and \
+                 Codex use their existing readers",
+    },
+    Gate {
+        file: "src/change_capture/native_hooks.rs",
+        item: "tool_event",
+        agents: "copilot cursor gemini",
+        reason: "host limit: tool fields differ by host; only Cursor exposes a native tool call ID in \
+                 these adapters",
+    },
+    Gate {
         file: "src/change_capture_cli.rs",
         item: "capture_native",
-        agents: "claude",
-        reason: "host limit: a Codex model request is token usage, not a session event (comment)",
+        agents: "claude codex",
+        reason: "host limit: Claude Code carries native transcript paths; Codex model events and \
+                 usage use its separate event schema",
     },
     Gate {
         file: "src/change_capture_cli.rs",
         item: "captured_harness",
-        agents: "claude codex",
-        reason: "unknown",
+        agents: "claude codex copilot cursor gemini",
+        reason: "not wired yet: capture supports Claude Code, Codex, Cursor, Copilot and Gemini CLI; \
+                 other setup clients have no capture adapter",
     },
     Gate {
         file: "src/change_capture_cli.rs",
-        item: "plugin_capture",
+        item: "native_start_proven",
+        agents: "claude codex",
+        reason: "not wired yet: source-authenticated history start proofs exist only for Claude Code \
+                 and Codex",
+    },
+    Gate {
+        file: "src/change_capture_cli.rs",
+        item: "plugin_capture_inner",
+        agents: "claude",
+        reason: "host limit: legacy bindings install their own Claude Code capture hook; other \
+                 clients use installed plugin hooks",
+    },
+    Gate {
+        file: "src/change_capture_cli.rs",
+        item: "watch_session",
         agents: "codex",
-        reason: "unknown: a binding's own hooks capture Claude Code only, so this hook captures \
-                 Codex (comment); why other agents are not captured is not said",
+        reason: "not wired yet: structured asynchronous question snapshots are read from Codex \
+                 history only",
     },
     Gate {
         file: "src/change_record.rs",
         item: "enum AgentHarnessV1",
-        agents: "claude codex",
-        reason: "unknown",
+        agents: "claude codex copilot cursor gemini",
+        reason: "not wired yet: named capture harnesses cover these five clients",
+    },
+    Gate {
+        file: "src/client_session.rs",
+        item: "hook_agent",
+        agents: "claude",
+        reason: "host limit: other hosts inherit Claude settings, so configured Claude hooks require \
+                 host detection first",
+    },
+    Gate {
+        file: "src/client_session.rs",
+        item: "inherited_hook_agent",
+        agents: "claude copilot cursor",
+        reason: "host limit: observable process and payload markers identify Claude Code, Cursor or \
+                 Copilot; unsupported or conflicting markers skip safely",
     },
     Gate {
         file: "src/continuation.rs",
@@ -162,6 +247,20 @@ const REGISTER: &[Gate] = &[
     },
     Gate {
         file: "src/hook_cli.rs",
+        item: "capture",
+        agents: "claude codex copilot cursor gemini",
+        reason: "not wired yet: the five capture adapters are implemented; retrospective history \
+                 fanout is limited to Claude Code and Codex",
+    },
+    Gate {
+        file: "src/hook_cli.rs",
+        item: "capture_only",
+        agents: "codex copilot cursor gemini",
+        reason: "host limit: each native adapter has its own events needed only for capture rather \
+                 than coordination",
+    },
+    Gate {
+        file: "src/hook_cli.rs",
         item: "context_reply_with",
         agents: "claude codex copilot cursor gemini",
         reason: "host limit: each host takes added context in its own reply field and events; \
@@ -169,15 +268,10 @@ const REGISTER: &[Gate] = &[
     },
     Gate {
         file: "src/hook_cli.rs",
-        item: "capture_only",
-        agents: "codex",
-        reason: "host limit: Codex's plugin registers its own set of capture-only events",
-    },
-    Gate {
-        file: "src/hook_cli.rs",
         item: "hook",
-        agents: "cursor",
-        reason: "host limit: Cursor names a reply apart from the end of its turn (comment)",
+        agents: "claude cursor",
+        reason: "host limit: Cursor separates reply and turn end, and may inherit Claude hooks beside \
+                 its native registration",
     },
     Gate {
         file: "src/hook_cli.rs",
@@ -246,8 +340,9 @@ const REGISTER: &[Gate] = &[
     Gate {
         file: "src/hub/agent_messages.rs",
         item: "enum Waker",
-        agents: "claude codex",
-        reason: "unknown",
+        agents: "claude codex copilot",
+        reason: "not wired yet: idle wake delivery supports Claude Code, Codex and Copilot \
+                 notification hooks only",
     },
     Gate {
         file: "src/hub/hook.rs",
@@ -264,6 +359,13 @@ const REGISTER: &[Gate] = &[
         reason: "unknown: Gemini CLI and the table agents reach the generic endpoint as \
                  `hook:<name>` (src/clients.rs); why these four have their own routes is not \
                  said",
+    },
+    Gate {
+        file: "src/hub/hook.rs",
+        item: "pascal",
+        agents: "codex",
+        reason: "not wired yet: durable structured question snapshots and native request_user_input \
+                 detection are implemented for Codex only",
     },
     Gate {
         file: "src/hub/hook.rs",
@@ -294,10 +396,30 @@ const REGISTER: &[Gate] = &[
     },
     Gate {
         file: "src/message_wait.rs",
-        item: "run",
-        agents: "claude codex",
-        reason: "unknown: Claude Code is woken by exit 2, Codex through `codex queue`; any \
-                 other waits for nothing (doc comment), not why",
+        item: "can_wait",
+        agents: "copilot",
+        reason: "host limit: Copilot can start this waiter only from a notification hook with a \
+                 notification type",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "wait_body",
+        agents: "claude",
+        reason: "host limit: preserve the legacy Claude waiter body; other waiters name their \
+                 delivery mechanism",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "waited",
+        agents: "codex",
+        reason: "host limit: Codex delivery requires a runnable codex queue command before a notice \
+                 is consumed",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "waiter",
+        agents: "claude codex copilot",
+        reason: "not wired yet: idle wake adapters exist only for Claude Code, Codex and Copilot",
     },
     Gate {
         file: "src/skill_cli.rs",
