@@ -75,7 +75,7 @@ stops coordination (the token was refused, or access ended), that reason replace
   (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label until
   the token is replaced, and Work records that already copied it keep it. Hook and MCP text,
   `agentscm intent`, Slack and pull-request text mask it; structured JSON fields such as `agent.name`
-  and `lead_agent`, the Hub page's `title` attribute and your own `agentscm hub tokens` listing still
+  and `lead_agent`, the Hub page's `title` attribute and your own `agentscm hub token list` listing still
   show it.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
   and allowed on the Hub and still have the repository role (on a public repository Triage or

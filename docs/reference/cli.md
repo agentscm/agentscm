@@ -6,7 +6,7 @@ title: "Native CLI reference"
 
 > **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [connected local page](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
 
-`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `hub whoami`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
+`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `hub whoami`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists the remaining visible commands, such as `serve`, `hub`, `client`, `work`, `intent`, `collisions` and `autopsy`. Most native and experimental commands are hidden from both lists, among them `change-capture`, `attached-worktree`, `agent-task`, `local-ci`, `local-validation`, `skill`, `skill-workflow`, `pipeline`, `continuation`, `operating-policy`, `git-export`, `git-snapshot`, `init`, `files`, `approve`, `workspace`, `sync` and the `check-*` commands. All of them keep working by name, and `agentscm COMMAND --help` prints any command's usage, where the experimental ones are marked "[experimental]". `workflow`, `recovery`, `team` and `package-native` are internal to the alpha, as is the `git-remote-credential` helper. `setup` is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other internal commands are not documented here.
 
 ## Commands
 
@@ -443,14 +443,16 @@ A saved token is configuration, not proof of coordination. Each connection repor
 | `authenticated` | The Hub accepted the token during this check. |
 | `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
 | `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
-| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `expired` | The token ended and nothing renewed it, whatever the Hub answers. |
 | `revoked` | The Hub rejected a token that has not ended. |
-| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+| `unreachable` | The Hub did not answer, or gave an error or an unreadable answer; hooks fail open, so coordination is unknown. |
 
 `coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
-for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
-Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
-same state and build, and stops with the reason when the Hub does not accept the token.
+for the checkout; `partial`, `unverified` and `unknown` otherwise. Whenever the Hub answered a check,
+including with a refusal or an error status, `hub_build` (version and commit) is reported when the
+Hub states one; it is absent when the Hub did not answer. `client doctor` prints the same state
+and build, and stops with the reason, naming the build when known, when the Hub does not accept
+the token.
 
 ## Shared actionable status
 

@@ -1496,7 +1496,7 @@ async fn list(
             candidates
         } else {
             let (readable, missed) =
-                super::login::devices::readable(&state, &user, candidates, true).await;
+                super::login::devices::readable(&state, &user, candidates).await;
             unchecked = (missed > 0).then_some(missed);
             readable
         };

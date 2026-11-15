@@ -27,6 +27,9 @@ async function walk(directory) {
 await walk(root);
 assert.ok(htmlFiles.includes(path.join(root, 'index.html')), 'documentation home route exists');
 assert.ok(await stat(path.join(root, 'pagefind', 'pagefind.js')).catch(() => false), 'Pagefind search index exists');
+const workflowPage = await readFile(path.join(root, 'advanced', 'claude-code-workflows', 'index.html'), 'utf8');
+assert.match(workflowPage, /<pre class="mermaid" data-mermaid(?:="")?>flowchart LR/, 'Mermaid blocks become diagram containers');
+assert.doesNotMatch(workflowPage, /data-language="mermaid"/, 'Mermaid blocks are not highlighted as code');
 assert.equal((await readFile(path.join(root, 'CNAME'), 'utf8')).trim(), 'docs.agentscm.dev', 'custom domain file is emitted');
 
 for (const file of outputFiles) {

@@ -1415,6 +1415,28 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
         context(&reply).contains("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
+    // The refusal is visible without opening the Hub: the token still works, so status says the
+    // renewal failed, and says what to do.
+    let root = machine.root();
+    let (ok, status, stderr) = machine.run(&[
+        "client",
+        "status",
+        "--json",
+        "--check",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let status: Value = serde_json::from_str(&status).unwrap();
+    let health = &status["connections"][0]["health"];
+    assert_eq!(health["state"], "renewal_failed", "{status}");
+    assert!(
+        health["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask a repository owner for"),
+        "{health}"
+    );
 
     // Revoking the computer signs it out: renewal says so, and nothing re-enrolls it.
     env.role(ALICE, "write", "write", 30);
@@ -1441,6 +1463,105 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// Two renewals that fall due together (two hooks, or a hook and a person) leave one live token
+/// and neither reports a failure. The two processes may or may not overlap on a given run. If both
+/// minted a token, both report `renewed` and the losing process's token is revoked, so exactly one
+/// is live. If they did not overlap, one renews and the other reports `not_due`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renewals_leave_one_live_token() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let (ok, _, stderr) = machine.run(&["hub", "login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    let first_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(env.whoami(&first).await, 200);
+    let alice = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let live = |env: &Env| -> Vec<String> {
+        let now = unix_now();
+        let mut ids: Vec<String> = env
+            .store
+            .list_agent_tokens(&alice.id)
+            .unwrap()
+            .into_iter()
+            .filter(|token| !token.revoked && token.expires_at > now)
+            .map(|token| token.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(live(&env), std::slice::from_ref(&first_id));
+
+    machine.age_token();
+    let root = machine.root();
+    let spawn = || {
+        machine
+            .command(&[
+                "--no-telemetry",
+                "client",
+                "renew",
+                "--root",
+                root.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // Both processes are running before either is waited on.
+    let children = [spawn(), spawn()];
+    let mut results = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reply: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        // Which process wins is not fixed; neither may report the renewal as failed.
+        assert!(
+            ["renewed", "not_due"].contains(&reply["result"].as_str().unwrap()),
+            "{reply}"
+        );
+        results.push(reply["result"].as_str().unwrap().to_owned());
+    }
+
+    let saved = machine.token();
+    let saved_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(saved_id, first_id);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&saved).await, 200);
+    assert_eq!(live(&env), [saved_id]);
+    // Every token issued for the user, live or revoked, including the first.
+    let issued = env.store.list_agent_tokens(&alice.id).unwrap().len();
+    if issued == 3 {
+        // The runs overlapped: both minted a token and the loser's was revoked.
+        assert_eq!(results, ["renewed", "renewed"]);
+    } else {
+        assert_eq!(issued, 2, "{results:?}");
+        assert!(results.contains(&"not_due".to_owned()), "{results:?}");
+    }
 }
 
 /// Signing in again replaces this computer's credential, which revokes the agent tokens it
@@ -3234,12 +3355,14 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         }
     }
 
-    // Losing access shows on the next fresh read: the role is asked, not cached.
-    {
+    // Within the 90-second role cache a lost access is not asked again: the forge is not called
+    // and the repository still lists; it drops out once the answer expires or alice signs out.
+    let reads = {
         let mut fake = env.fake.lock().unwrap();
         fake.roles.remove(&("acme/docs".into(), ALICE));
         fake.levels.remove(&(4343, ALICE));
-    }
+        fake.role_reads
+    };
     let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
     let names: Vec<_> = body["repositories"]
         .as_array()
@@ -3247,7 +3370,8 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         .iter()
         .map(|row| row["repository"].as_str().unwrap())
         .collect();
-    assert_eq!(names, [REPO], "{body}");
+    assert_eq!(names, ["acme/docs", REPO], "{body}");
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
     // The token that asked within the last 30 seconds gets its earlier answer back.
     let (_, again) = env.get(path, &alice).await;
     assert_eq!(again, first);
@@ -3662,7 +3786,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
-    // The detailed device list checks the forge again even while the web list's answer is cached.
+    // The detailed device list reuses the same cached answers, so the lost role still lists.
     let (status, device_after_role_loss) = env
         .call(
             &env.hub,
@@ -3678,12 +3802,9 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
-    assert_eq!(
-        device_after_role_loss["repositories"][0]["repository"],
-        "acme/docs"
-    );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
     // Signing out forgets them: losing the role leaves the repository out, with no refused
     // sign-in recorded.
@@ -3997,6 +4118,19 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
         .unwrap()
         .roles
         .remove(&("acme/docs".into(), ALICE));
+    // The role answer is kept for 90 seconds; signing out forgets it, so the next sign-in asks.
+    let (_, session) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let csrf = session["csrf_token"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &cookie,
+        Some(csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let cookie = web_sign_in(&env, ALICE).await;
     let (revoked_status, revoked) = with_cookie(&env.hub, Method::GET, &path, &cookie, None).await;
     assert_eq!(revoked_status, 404);
     assert_eq!(revoked, unknown);
@@ -4484,12 +4618,33 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     assert_eq!(page["dismissals"].as_array().unwrap().len(), 1);
     assert_eq!(page["dismissals"][0]["key"], "stale:wrk_1");
 
+    // A lost role reads from the 90-second role answer, without asking the forge, until it
+    // expires or bob signs out (and signing in again checks the role).
+    let reads = env.fake.lock().unwrap().role_reads;
     env.drop_role(BOB);
+    assert_eq!(read(&bob).await.0, 200);
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &bob.cookie,
+        Some(&bob.csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(read(&bob).await.0, 401);
+    // With nothing kept, a person without the role is refused and the forge was asked.
+    env.role(BOB, "read", "read", 20);
+    let bob = self::page(&env, BOB).await;
+    env.drop_role(BOB);
+    let reads = env.fake.lock().unwrap().role_reads;
     let (status, refused) = read(&bob).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("insufficient_role"))
     );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 1);
 }
 
 const PERMISSIONS: &str = "/v1/hub/session/permissions";

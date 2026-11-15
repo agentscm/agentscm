@@ -1,7 +1,9 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import { unified } from '@astrojs/markdown-remark';
+import rehypeCodeBreaks from './src/rehype-code-breaks.js';
 import removePageHeading from './src/remark-remove-page-heading.js';
+import remarkMermaid from './src/remark-mermaid.js';
 import starlightDocLinks from './src/remark-starlight-doc-links.js';
 
 export default defineConfig({
@@ -11,14 +13,18 @@ export default defineConfig({
       title: 'AgentSCM Documentation',
       favicon: '/favicon.png',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/agentscm/agentscm' }],
+      components: {
+        MarkdownContent: './src/components/MarkdownContent.astro',
+        SocialIcons: './src/components/SocialIcons.astro',
+      },
       sidebar: [
         { label: 'Start', items: [
-          { label: 'Scripted demo', link: '/scripted-demo/' },
           { label: 'Documentation', link: '/' },
+          { label: 'See it in action', link: '/scripted-demo/' },
           { label: 'Install', link: '/install/' },
+          { label: 'How it works', link: '/concepts/' },
           { label: 'Guided setup', link: '/setup-guide/' },
           { label: 'Two-container Hub walkthrough', link: '/two-agent-demo/' },
-          { label: 'Concepts', link: '/concepts/' },
         ] },
         { label: 'Coordinate', items: [
           { label: 'Supported agents', link: '/agents/' },
@@ -46,5 +52,7 @@ export default defineConfig({
       ],
     }),
   ],
-  markdown: { processor: unified({ remarkPlugins: [removePageHeading, starlightDocLinks] }) },
+  markdown: { processor: unified({ remarkPlugins: [removePageHeading, starlightDocLinks, remarkMermaid],
+    rehypePlugins: [rehypeCodeBreaks],
+  }) },
 });

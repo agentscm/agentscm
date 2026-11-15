@@ -1,0 +1,67 @@
+---
+// Starlight's Markdown content, plus a renderer for the Mermaid containers that
+// src/remark-mermaid.js emits. Mermaid loads only on pages that have a diagram, and each
+// diagram is drawn again when the reader switches between the light and dark themes.
+import Default from '@astrojs/starlight/components/MarkdownContent.astro';
+---
+
+<Default><slot /></Default>
+
+<script>
+	const blocks = [...document.querySelectorAll<HTMLElement>('pre[data-mermaid]')];
+
+	if (blocks.length > 0) {
+		for (const block of blocks) block.dataset.source = block.textContent ?? '';
+		const { default: mermaid } = await import('mermaid');
+		let count = 0;
+
+		async function render() {
+			const dark = document.documentElement.dataset.theme !== 'light';
+			// suppressErrorRendering stops Mermaid leaving a "Syntax error" graphic in <body> when
+			// a diagram fails to parse; the catch below shows the source instead.
+			mermaid.initialize({
+				startOnLoad: false,
+				securityLevel: 'strict',
+				suppressErrorRendering: true,
+				theme: dark ? 'dark' : 'default',
+			});
+			for (const block of blocks) {
+				try {
+					const { svg } = await mermaid.render(`mermaid-diagram-${count++}`, block.dataset.source ?? '');
+					block.innerHTML = svg;
+					block.dataset.rendered = '';
+				} catch {
+					// Leave the diagram source readable when Mermaid cannot parse it.
+					block.textContent = block.dataset.source ?? '';
+					delete block.dataset.rendered;
+				}
+			}
+		}
+
+		await render();
+		new MutationObserver(render).observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ['data-theme'],
+		});
+	}
+</script>
+
+<style is:global>
+	@layer starlight.content {
+		.sl-markdown-content pre.mermaid {
+			padding: 1rem;
+			border: 1px solid var(--sl-color-gray-5);
+			background: var(--sl-color-gray-7, var(--sl-color-black));
+			overflow-x: auto;
+			font-size: var(--sl-text-sm);
+		}
+		.sl-markdown-content pre.mermaid[data-rendered] {
+			display: flex;
+			justify-content: center;
+		}
+		.sl-markdown-content pre.mermaid svg {
+			max-width: 100%;
+			height: auto;
+		}
+	}
+</style>

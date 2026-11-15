@@ -1,7 +1,8 @@
 //! The few rules an agent must see to coordinate correctly, kept in one place. Every
 //! instruction surface renders them: the `init-repo` block, the MCP server instructions, the
-//! `coordinate-edits` skill and the SessionStart context. Each surface's tests check that it
-//! carries every rule. They are injected into every session, so keep the set short.
+//! `coordinate-edits` skill and the SessionStart context (except Claude Code's, whose MCP server
+//! instructions already carry them). Each surface's tests check that it carries every rule. They
+//! are injected into every session, so keep the set short.
 
 /// Each rule is one self-contained sentence or two, in the order an agent meets them.
 pub const REQUIRED_RULES: [&str; 7] = [
