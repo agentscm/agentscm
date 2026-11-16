@@ -16,7 +16,7 @@ use reqwest::Method;
 
 use crate::hub_cli::{self, Provider, call, clean};
 
-mod binary;
+pub(crate) mod binary;
 pub(crate) mod detect;
 mod hub_local;
 mod hub_native;
@@ -25,7 +25,7 @@ mod hub_setup;
 mod launcher;
 #[cfg(target_os = "macos")]
 mod login_item;
-mod manifest;
+pub(crate) mod manifest;
 pub(crate) mod process;
 
 use crate::prompt::Ui;
@@ -448,6 +448,10 @@ fn dry_run(args: &QuickstartArgs) -> Result<()> {
         "ask which hub to use, or skip live warnings".to_owned()
     };
     println!("  {hub}");
+    #[cfg(target_os = "macos")]
+    println!(
+        "  on an installer invocation or existing resident, hand off native maintenance to this version and preserve an explicit stopped choice"
+    );
     #[cfg(unix)]
     {
         let agents: Vec<&str> = if args.no_agents {
@@ -527,6 +531,7 @@ fn json_report(cx: &Cx<'_>) -> serde_json::Value {
         "hub": cx.live.hub,
         "hub_up": cx.live.hub_up,
         "signed_in": cx.live.hub.as_deref().is_some_and(|hub| hub_cli::has_session(Some(hub)).unwrap_or(false)),
+        "resident": crate::client_service::status().ok(),
     })
 }
 
@@ -604,6 +609,7 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         }
     }
     agents_stage(&mut cx).await;
+    let resident_changed = resident_stage(&mut cx).await;
     init_stage(&mut cx);
     // The menu bar app was removed: take away the launcher an earlier setup wrote.
     #[cfg(target_os = "macos")]
@@ -638,7 +644,8 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         || program_fingerprint(&cx.home) != original_program
         || sessions_file.as_deref().map(file_hash) != original_sessions
         || !cx.init_written.is_empty()
-        || launcher_removed;
+        || launcher_removed
+        || resident_changed;
     summary(&cx, changed, &command);
     println!("{}", cx.live.line(&command));
     #[cfg(unix)]
@@ -663,6 +670,41 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         ));
     }
     Ok(0)
+}
+
+async fn resident_stage(cx: &mut Cx<'_>) -> bool {
+    let result = async {
+        if !crate::client_service::auto_setup_requested()? {
+            println!("Native maintenance is not enabled by this source/manual setup; use `agentscm client service start` on macOS or `agentscm client run` in a Unix foreground session. Hooks and MCP retain their normal next-call behavior.");
+            return Ok(false);
+        }
+        let (_, exe) = program_plan(&cx.home).ok_or_else(|| invalid("could not identify the resident executable"))?;
+        if cfg!(target_os = "macos") {
+            let bin_dir = binary::bin_dir(&cx.home);
+            cx.manifest.bin_parent_created |= bin_dir.parent().is_some_and(|parent| !parent.exists());
+            cx.manifest.bin_dir = Some(bin_dir);
+        }
+        // Retain the binary recovery record before starting a process that depends on it.
+        if !cx.manifest.is_empty() { cx.manifest.save()?; }
+        println!("Native maintenance retries reports, observes qualified host exits and refreshes declared dependencies. It runs no model, starts no coding agent and serves no dashboard.");
+        let outcome = crate::client_service::setup(&exe).await?;
+        if outcome.managed_startup_supported {
+            println!("Native maintenance: {}. Control it with `agentscm client service start|stop|status`.", if outcome.running { "running" } else { "kept stopped by your saved choice" });
+        } else {
+            println!("Managed native maintenance is not qualified on this platform. Unix users can explicitly run `agentscm client run`; hooks and MCP retain next-call behavior.");
+        }
+        Ok::<bool, Error>(outcome.changed)
+    }.await;
+    match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            println!(
+                "Native maintenance setup did not finish: {error}. Program and recovery state were retained; run `agentscm client service status` before retrying setup."
+            );
+            cx.failure = Some(format!("native maintenance setup did not finish: {error}"));
+            false
+        }
+    }
 }
 
 fn record_fingerprint(path: &Path) -> (Option<String>, Option<u32>) {
@@ -1366,7 +1408,7 @@ pub struct RetiredTrayArgs {
 pub fn retired_tray() -> Result<()> {
     println!("The AgentSCM menu bar app has been removed.");
     #[cfg(unix)]
-    println!("Open the Hub page with `agentscm open`.");
+    println!("Check this computer with `agentscm client status` or `agentscm client doctor`.");
     #[cfg(target_os = "macos")]
     {
         let _lifecycle = crate::client_cli::lifecycle_lock()?;
@@ -1426,21 +1468,33 @@ fn summary(cx: &Cx<'_>, changed: bool, command: &str) {
 pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     let ui = Ui { yes: args.yes };
     let _quickstart_lease = manifest::acquire_lease()?;
-    let Some(mut m) = Manifest::load()? else {
+    let saved_manifest = Manifest::load()?;
+    let resident_present = crate::client_service::has_receipt()?;
+    if saved_manifest.is_none() && !resident_present {
         println!("Nothing to undo: nothing was installed by quickstart.");
         return Ok(());
-    };
+    }
+    let mut m = saved_manifest.unwrap_or_else(Manifest::fresh);
     if !args.yes && !std::io::stdin().is_terminal() {
         return Err(invalid(
             "agentscm uninstall asks before it removes anything, and there is no terminal here. Pass --yes (and --remove-hub-data to delete the local hub's data).",
         ));
     }
     let home = home_dir()?;
+    if resident_present && m.bin_dir.is_none() {
+        // A direct service start also retains its executable in this fixed installer directory.
+        m.bin_dir = Some(binary::bin_dir(&home));
+    }
     let programs = m
         .bin_dir
         .as_ref()
         .map(|d| (d.clone(), binary::installed(d)));
     println!("Will undo what quickstart did:");
+    if resident_present {
+        println!(
+            "  - stop the native maintenance resident and remove its owned startup entry; keep its stopped preference and pending evidence"
+        );
+    }
     for root in &m.clients {
         println!(
             "  - disconnect {} with `client remove`: take out its agents' hooks, MCP entries and skills, and delete and revoke the agent token setup created",
@@ -1511,6 +1565,10 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         println!("Nothing changed.");
         return Ok(());
     }
+    // Verify legacy cleanup before changing the resident or retiring credentials/programs.
+    #[cfg(unix)]
+    crate::open_cli::stop().await?;
+    crate::client_service::uninstall().await?;
     // What could not be undone stays in the record, with the command to finish by hand.
     let mut left = Manifest {
         created_at: m.created_at,

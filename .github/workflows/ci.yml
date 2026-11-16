@@ -51,6 +51,15 @@ jobs:
           rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
           "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Build the retained Hub UI
+        run: npm ci --ignore-scripts && npm run build
+        working-directory: ui
+      - name: Check the UI-enabled server
+        run: cargo check --locked --features ui
 
   # The one cache pull request and merge batch jobs restore. A merge batch's own ref is thrown away after
   # the run and pull request refs cannot share with each other, so only main's cache is readable by both.

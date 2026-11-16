@@ -155,7 +155,8 @@ async fn whoami_attributes_the_owner() {
             json!({"provider": "github", "host": "github.com", "user_id": 42, "login": "alice"})
         );
         assert_eq!(body["shared_conversation_retention_days"], 30);
-        assert_eq!(body.as_object().unwrap().len(), 3);
+        assert_eq!(body["cooperation_protocol"], 1);
+        assert_eq!(body.as_object().unwrap().len(), 4);
     }
     assert!(owner.starts_with("usr_"));
 }

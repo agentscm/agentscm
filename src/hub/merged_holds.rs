@@ -460,7 +460,7 @@ pub fn set_merged_release(
 const POLICY_RELEASE: &str = "policy_release";
 
 /// The audience under which the Hub's completion of merged Work is claimed, once per Work ever.
-const HUB_COMPLETE: &str = "hub_complete";
+pub(super) const HUB_COMPLETE: &str = "hub_complete";
 
 /// After a refused policy release: keeps the `policy_release` claim when a re-read shows the
 /// Work's hold is gone (someone else released it), else gives the claim back so a later run can
@@ -639,7 +639,7 @@ pub fn complete_merged(
         let Some(pull) = completes_on_merge(facts) else {
             continue;
         };
-        if complete_one(store, repo, item, pull, true, now) {
+        if complete_one(store, repo, item, pull, true, None, now) {
             completed.push(item.id.clone());
         }
     }
@@ -653,6 +653,36 @@ pub fn complete_led_merged(
     store: &dyn Store,
     principal: &Principal,
     session: &str,
+    now: i64,
+) -> Vec<String> {
+    complete_led_merged_for(store, principal, session, None, now)
+}
+
+/// A native callback retains its original transport identity through the policy transaction.
+pub fn complete_led_merged_with_transport(
+    store: &dyn Store,
+    principal: &Principal,
+    native: &str,
+    incarnation: Option<&str>,
+    now: i64,
+) -> Vec<String> {
+    let Ok(session) = store.session_name_for(&principal.token_id, Some(native), now) else {
+        return Vec::new();
+    };
+    complete_led_merged_for(
+        store,
+        principal,
+        &session,
+        Some((&principal.token_id, Some(native), incarnation)),
+        now,
+    )
+}
+
+fn complete_led_merged_for(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    guard: Option<(&str, Option<&str>, Option<&str>)>,
     now: i64,
 ) -> Vec<String> {
     if principal.read_only {
@@ -686,7 +716,7 @@ pub fn complete_led_merged(
         .filter(|item| {
             work_facts_in(store, principal, &repo, item, now)
                 .and_then(|facts| completes_on_merge(&facts))
-                .is_some_and(|pull| complete_one(store, &repo, item, pull, false, now))
+                .is_some_and(|pull| complete_one(store, &repo, item, pull, false, guard, now))
         })
         .map(|item| item.id)
         .collect()
@@ -700,6 +730,7 @@ fn complete_one(
     item: &WorkItem,
     pull: u64,
     quiet_only: bool,
+    guard: Option<(&str, Option<&str>, Option<&str>)>,
     now: i64,
 ) -> bool {
     use super::work_lifecycle::ActivityStatus;
@@ -730,11 +761,6 @@ fn complete_one(
         {
             return Ok(false);
         }
-        // Once ever, claimed before the transition so two callers cannot both complete, and so
-        // Work reopened after the Hub completed it is left to its lead.
-        if !store.claim_merge_prompt(&item.id, HUB_COMPLETE, now)? {
-            return Ok(false);
-        }
         let request = WorkTransitionRequest {
             work_id: item.id.clone(),
             operation_id: format!(
@@ -754,17 +780,7 @@ fn complete_one(
             repository: &repo.full_name,
             repository_id: repo.repository_id,
         };
-        let done = store.work_transition(&actor, &request, now);
-        if done.is_err() {
-            // The claim stays only when a re-read shows the Work is no longer open (someone
-            // finished it); otherwise it is given back so a later call can complete it.
-            let still_open = store
-                .work_operational(&reader, &OperationalSelect::One(&item.id), now)
-                .map_or(true, |o| o.work.first().is_some_and(open));
-            if still_open {
-                let _ = store.unclaim_merge_prompt(&item.id, HUB_COMPLETE);
-            }
-        }
+        let done = store.work_transition_with_guard(&actor, &request, guard, now);
         done.map(|_| true)
     };
     match attempt() {

@@ -172,6 +172,7 @@ mod hub_merge_queue;
 mod hub_merged_release;
 #[cfg(unix)]
 mod hub_narrative;
+mod hub_notice_delivery;
 mod hub_planned_issues;
 #[cfg(unix)]
 mod hub_promises;

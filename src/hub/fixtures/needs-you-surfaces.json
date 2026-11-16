@@ -263,14 +263,14 @@
       ],
       "recipients": [
         {
-          "kind": "lead_agent",
+          "kind": "person",
           "owner": "usr_synthetic_viewer",
           "login": "viewer",
-          "agent": "viewer"
+          "agent": null
         }
       ],
-      "needs_you": false,
-      "action": "Answer the outstanding directed coordination request.",
+      "needs_you": true,
+      "action": "The directed request is past its pickup deadline. Review the permitted response or recovery action, or release the held files.",
       "updated_seq": 9,
       "limits": []
     },
@@ -282,14 +282,14 @@
       ],
       "recipients": [
         {
-          "kind": "lead_agent",
+          "kind": "person",
           "owner": "usr_synthetic_third",
           "login": "third",
-          "agent": "third"
+          "agent": null
         }
       ],
       "needs_you": false,
-      "action": "Answer the outstanding directed coordination request.",
+      "action": "The directed request is past its pickup deadline. Review the permitted response or recovery action, or release the held files.",
       "updated_seq": 11,
       "limits": []
     }
@@ -301,7 +301,7 @@
     "reassessment_needed": 2,
     "retired": 0,
     "held_reservations": 3,
-    "needs_you": 1
+    "needs_you": 2
   },
   "observed_at": 1700000960,
   "complete": false,

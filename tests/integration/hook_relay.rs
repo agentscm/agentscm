@@ -550,8 +550,14 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_relay_pool() {
             .partition(|s| s.uri == "/v1/hub/hook/claude?repo=acme%2Fwidgets");
         assert_eq!(hooks.len(), 1);
         assert!(
-            rest.iter()
-                .all(|s| s.uri == "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"),
+            rest.iter().all(|s| matches!(
+                s.uri.as_str(),
+                "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"
+                    | "/v1/hub/whoami"
+                    | "/v1/hub/cooperation/state"
+                    | "/v1/hub/cooperation/register"
+                    | "/v1/hub/cooperation/end"
+            )),
             "{:?}",
             rest.iter().map(|s| &s.uri).collect::<Vec<_>>()
         );

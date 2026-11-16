@@ -312,8 +312,9 @@ fn page(status: StatusCode, title: &str, body: &str, form_to: Option<&str>) -> R
 /// An error page; it never redirects, so a bad request cannot send anyone anywhere.
 fn refused(status: StatusCode, message: &str) -> Response {
     let body = format!(
-        "<h1>This app can't connect</h1><p>{}</p><p><a href=\"/ui/\">Open the Hub</a></p>",
-        escape(message)
+        "<h1>This app can't connect</h1><p>{}</p><p><a href=\"{}\">Return to AgentSCM</a></p>",
+        escape(message),
+        super::super::ui::landing()
     );
     page(status, "Can't connect", &body, None)
 }

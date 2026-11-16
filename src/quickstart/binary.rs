@@ -120,7 +120,12 @@ pub(crate) fn install(dir: &Path, exe: &Path, version: &str) -> Result<PathBuf, 
     let keep = versioned.symlink_metadata().is_ok()
         && (versioned.canonicalize().ok().as_deref() == Some(exe)
             || same_contents(&versioned, exe));
-    if versioned.symlink_metadata().is_ok() && !keep && !version.contains('+') {
+    if versioned.symlink_metadata().is_ok()
+        && !keep
+        && (!version.contains('+')
+            || crate::client_service::protects_executable(&versioned)
+                .map_err(|error| error.to_string())?)
+    {
         return Err(format!(
             "{} already exists with different contents (it may be a verified release); I won't overwrite it",
             versioned.display()

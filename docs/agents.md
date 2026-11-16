@@ -44,6 +44,12 @@ the last is any client that has only the Hub's MCP server.
 | Crush | No: its session start hook only observes | Before the write (`edit`, `write`, `multiedit`) | Yes | Yes | End of turn (`TurnEnd`) | No | Before an edit as `context`, which does not hold the edit |
 | A client with no hooks (MCP only) | In the MCP server's instructions, when the client shows them; no session ID | Only when the agent calls `agentscm_check` | No | Only when the agent calls `agentscm_done` | No | No | Only in the replies to its own AgentSCM tool calls |
 
+The optional [idle-message path](agent-messages.md#native-capability-limits) is separate from
+these next-call deliveries. Native process qualification currently recognizes Claude Code and
+Codex CLI executables. Codex queue dispatch requires a qualified live host and a current session
+incarnation; a legacy wait response cannot authorize it. Claude and Copilot use their own native
+hook output contracts. These adapters do not establish live idle wake or recipient uptake.
+
 What the columns mean:
 
 - **Rules at session start.** The [required rules](#required-rules-and-the-session-id), and for

@@ -15,12 +15,13 @@ npx agentscm demo
 
 ## What you'll see
 
-The command starts a temporary Hub on this computer and opens its status page in your browser. If
-the browser doesn't open, it prints the link.
+The command starts a temporary Hub on this computer and prints each scripted step and result in
+your terminal. Native installations do not open a local dashboard. A server built with the `ui`
+feature can additionally open its demonstration page; `--no-open` suppresses that browser launch.
 
 Three simulated agents start work on files from your repository. When one of them goes to edit a
 file another agent is already working on, AgentSCM refuses that edit once and says who holds the
-file. The agent's retry goes through. The status page shows who is working on what.
+file. The agent's retry goes through. The terminal also shows the scripted handoff and request latency.
 
 Press Ctrl-C to stop. The temporary Hub and its data are removed.
 
@@ -29,7 +30,7 @@ Press Ctrl-C to stop. The temporary Hub and its data are removed.
 - It changes nothing in your repository and needs no GitHub or GitLab connection.
 - The agents are scripted. It doesn't start Claude Code, Codex or any other coding agent, and no
   model runs. The demo calls AgentSCM's real hook endpoint, the same one your agents will use, and
-  the values on the page are demonstration data built from your repository's name and file paths.
+  the printed values are demonstration data built from your repository's name and file paths.
 
 ## Next
 

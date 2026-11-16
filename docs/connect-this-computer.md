@@ -1,37 +1,24 @@
 ---
-title: "Open the Hub from this computer"
+title: "Manage connections on this computer"
 ---
 
-# Open the Hub from this computer
+# Manage connections on this computer
 
-Your team's Hub shows shared coordination: who owns which task, overlaps and handovers. Your
-committed files and saved agent conversations stay on your computer. To see both in one page, open
-the Hub from your computer:
+The installed native engine connects your coding agents to a Hub without running a local dashboard.
+Use the existing setup command to connect to your team's Hub:
 
-```text
-agentscm open
+```sh
+npx agentscm --hub-url https://hub.example.com
 ```
 
-Run it in any connected checkout.
-Your browser opens the Hub on **Repository explorer**, already connected: the page names your
-computer and repository, shows your files and saved conversations, and shows your team's work.
-There is no token to paste and no address to enter.
-
-`agentscm open` needs two things it will ask for if missing: the folder must be connected to a Hub
-(`npx agentscm --hub-url <url>` connects it and signs you in), and this computer must be signed in to that Hub
-(`agentscm hub login --hub <url>`).
-
-To have a coding agent connect itself instead, paste the
-[setup prompt](team-member-onboarding.md#or-paste-one-prompt-into-your-agent) into it. The agent
-runs `client setup` for itself, you approve the browser sign-in, and after a restart the same
-prompt verifies the agent's hooks with one edit to a disposable file. The prompt forbids commits,
-pushes and edits to `AGENTS.md` or `CLAUDE.md`.
+The Hub is the authority for shared Work, repository access and coordination. Its separately hosted
+web interface remains available when enabled. Removing the local page does not remove native
+source/workflow commands, local capture data or an explicitly hosted Hub's API and database.
 
 ## Sign in once per computer
 
 `agentscm hub login` signs this computer in to
-the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser lands
-on the Hub page saying who signed in and as which computer. The terminal says it is waiting, every
+the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser finishes on a small local result page and the terminal reports the signed-in account and computer. The terminal says it is waiting, every
 30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
 display (or with `--device`, or `AGENTSCM_NO_BROWSER=1`) it shows a code to enter on another
 device instead; when the Hub's GitHub App does not allow that, it says so and uses the browser
@@ -81,8 +68,7 @@ stops coordination (the token was refused, or access ended), that reason replace
   and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks
   the forge with the repository connection's own credential, never a stored token of yours. When
-  something refuses, the agent's context, `agentscm open`
-  and the CLI show the Hub's own sentence, such as
+  something refuses, the agent's context and the CLI show the Hub's own sentence, such as
   `alice has Read on public repository acme/widgets; ask a repository owner for Triage or higher`,
   and the current token keeps working until it ends or is revoked. When the Hub or the forge does
   not answer, nothing is marked as needing attention; the next hook call tries again.
@@ -99,121 +85,90 @@ renewal fails. A token file given to `client setup` is never renewed.
 
 Your computers: `agentscm hub devices list` shows each one with its name, last use and the
 repositories connected through it, live ones first; `agentscm hub devices rename NAME` renames
-this one; `agentscm hub devices revoke dev_…` signs one out (from any of your computers). The
-Hub page opened with `agentscm open` lists and revokes them too. Revoking a computer revokes every
+this one; `agentscm hub devices revoke dev_…` signs one out (from any of your computers). A UI-enabled team Hub can list and revoke them too. Revoking a computer revokes every
 agent token minted through it, so its agents stop at their next call, and ends the session that
 signed it in. `agentscm hub logout` signs this computer out the same way and warns if the Hub could
 not be told. Hub administrators can revoke any computer. See
 [computer credentials](hub.md#computer-credentials).
 
 Sign-ins made before computers had credentials keep working until their session ends; while that
-session lives, the next connect, renewal or `agentscm open` enrolls this computer without
+session lives, the next connect, renewal enrolls this computer without
 asking. Existing 30-day tokens keep working and are renewed into 24-hour ones once the computer
 has a credential. A sign-in that has already expired needs one more sign-in.
 
-## What happens
+## Local controls
 
-- The first `agentscm open` starts AgentSCM's local Hub page in the background, on
-  `http://127.0.0.1:7340` (or another free port). It keeps running after the terminal closes;
-  `agentscm open --stop` stops it.
-- The page is the same Hub page your team's Hub serves, served from your computer. It reads your
-  files and saved conversations directly. It fetches team data from each repository's own Hub
-  with a read-only token for that one repository, minted from this computer's Hub sign-in. That
-  token stays in the local service; the browser never receives it.
-- One browser connection covers every repository connected on this computer. When there is more
-  than one, a switcher at the top of the page changes repository. Each repository uses its own Hub
-  and its own read-only access.
-- Saved conversations appear only for repositories where change capture was already set up.
-  Opening the page never starts capture and never uploads conversations.
-- **Settings → Conversation sharing** lists the checkouts on this computer with a switch for
-  sharing agent conversations with the Hub. Apart from disconnecting this browser
-  (`DELETE /v1/local/session`), it is the only setting the page changes on this computer; see below.
+```sh
+agentscm client status --check
+agentscm client doctor
+agentscm client service status
+agentscm client service stop
+agentscm client service start
+agentscm hub whoami
+agentscm hub auto-connect off --hub https://hub.example.com
+agentscm hub devices list
+agentscm hub logout --hub https://hub.example.com
+```
 
-## Conversation sharing from the page
+`client status` distinguishes configured connections from observed native integration coverage.
+`client doctor` reports the Hub binding and native onboarding evidence; missing hooks or trust are
+not a successful connection test. Neither command needs a dashboard.
 
-Turning a switch on sets capture up for that checkout if it never was (one step, documented defaults; see
-[sharing conversations](change-capture.md#one-step-setup-from-the-local-page))
-and switches it to `shared-conversation`. The page first shows what that does: conversations are
-redacted on this computer (best effort), uploaded to that checkout's Hub, kept for the number of days that Hub reports (or, if it did not
-say, for as long as its operator sets, 30 days unless changed) and readable by you and Hub admins. Only after you confirm does it send the request, with an
-explicit `confirm_sharing`; the service refuses a request without it and changes nothing. Turning
-it off needs no confirmation, switches the checkout to `metadata-only` and stops future uploads.
-The request is a `POST` to `/v1/local/capture`, which needs the same live browser connection, loopback
-Host and own-origin check as every other route here, sets no cross-origin headers, accepts at most
-1 KiB, and names the checkout by the `id` the list gives it, never by a path. The id is derived
-from the service's random instance and the checkout's path and mapped back only by the service, so
-it is opaque to the browser and valid for one service run (ids change after a restart). It is a
-name, not a secret: the unauthenticated identity probe exposes the instance, so anyone who also
-knew a path could compute it; the capture routes themselves need a live browser connection. If a
-change names a checkout that is no longer listed, the page re-reads the list and asks you to review
-and try again. Two
-checkouts of one repository and Hub are listed and controlled separately. The request also carries
-the repository and Hub the page showed; if the checkout is connected to anything else by then, the
-service refuses to turn sharing on and changes nothing.
-A page opened from a Hub elsewhere has no such control and points to `agentscm open`.
+On macOS, the verified installer/setup flow configures a per-user launchd resident from the same
+versioned native executable. It retries retained reports, observes only qualified native host exits
+and refreshes declared dependencies. It runs no model, starts no coding agent, sends no native
+wake and serves no HTTP listener. Existing native hook waiters still deliver notices; a closed
+agent session remains a resume/recovery action.
 
-## How the connection is protected
+`client service stop` keeps the resident stopped across login and later setup/updates; `start` is
+the explicit way to enable it again. `client service status` reports the invoked, installed and
+running versions separately and retains unknown recovery state. `client status` also reports
+pending/stalled journal coverage. Installing a package version changes the installed binary; only
+the next setup/quickstart run hands the resident over to that version.
 
-- `agentscm open` asks the running service for a connection code using a secret stored in an
-  owner-only file (`$XDG_CONFIG_HOME/agentscm/front-door/service.json`, default under
-  `~/.config`). Before sending that secret it checks which process is listening on the port.
-- The code reaches the browser through an owner-only file in that directory, not on a command
-  line, where other users of the computer could list it. The browser URL carries the code only in
-  the fragment, which browsers do not send to servers. The page removes it from the address bar
-  and history, then exchanges it once, within two minutes, for a browser connection. The service
-  accepts the exchange only from its own page.
-- The connection lives only in the running service's memory. Stopping or restarting the service
-  ends every browser connection, so a connection taken from a browser cannot be used against a
-  later service or another program on the same port. Run `agentscm open`
-  again to reconnect.
-- The service answers only on loopback, refuses requests that name another host (DNS
-  rebinding) and refuses pages from any other origin. It forwards only the Hub reads the page
-  makes, in their plain form, never Hub sign-in, workspace or token areas. Requests to the service
-  itself bypass any configured HTTP proxy.
-- Hub tokens the service mints last 30 minutes at most, minted with this computer's
-  credential (or, for a sign-in from before computers had one, its session). It revokes them
-  when it is stopped normally (`agentscm open --stop`, quitting, or Ctrl-C); if it is killed or
-  crashes, they simply expire. After you sign this computer out of a Hub (`agentscm hub logout`),
-  the token minted from that sign-in is revoked the next time the page reads that Hub, and
-  otherwise expires.
-- For a self-hosted forge, the service mints a token only for the forge the Hub reports for the
-  checkout's own connection.
+An observed exit that the Hub cannot qualify is parked locally without ending the Hub session or
+changing its Work. Pending reports remain eligible for recovery; lease expiry still applies.
+Status separates pending and retained journal records and reports `journal_full` when the
+512-record limit is reached. Uncertain attempts are kept; new journal admissions and Codex queue
+dispatch stop at that limit. Claude and Copilot can still deliver hook context, but a full journal
+cannot retain its transport report. Restore connection or file access where possible; seek support
+for a full unresolved journal instead of deleting evidence that prevents duplicate execution.
 
-## Lifetime and disconnecting
+A source/manual quickstart does not newly enable managed startup. Use `client service start`
+explicitly on macOS, or `client run` in a Unix foreground session. Linux managed startup is not
+implemented; Windows retains next-call delivery. Without a running resident, ordinary hooks/MCP
+and lease expiry remain available, with no background dependency-refresh guarantee.
 
-- A connection lasts while the local service runs, for up to seven days. To renew it, run `agentscm open` again.
-- If a repository stops being connected on this computer (its checkout moved, or its connection
-  was removed), the page says so and offers the others; the browser stays connected.
-- **Settings → This computer → Disconnect this browser** ends the connection for this browser.
-- `agentscm open --stop` ends every connection.
+Inspect conversation capture with `agentscm change-capture status` in the checkout. To stop sharing
+your own conversation bodies for that repository on every computer, use `agentscm change-capture
+opt-out`; `opt-in` resumes only while the repository shares them. `set-mode --mode metadata-only`
+changes one local capture binding. `unconfigure` disables that checkout's capture and retains its
+spool. Turning sharing off stops future uploads; existing Hub copies need explicit deletion or
+expiry. See [capture controls and recovery](change-capture.md).
 
-## Hosted team Hub
+`agentscm client remove` removes a checkout's AgentSCM wiring and revokes its owned agent token.
+`agentscm uninstall` removes what setup recorded; Hub and capture data are retained by default.
+A resident is stopped before connections, credentials or program files are retired. Its explicit
+stopped preference and pending journal evidence remain in private config. A changed executable,
+service file or unknown receipt blocks cleanup and retains the files needed for inspection.
+A failed remote revocation leaves the state needed to retry and reports that the credential may
+remain valid. Do not delete that recovery state to hide an incomplete uninstall.
 
-The hosted team Hub keeps working as before for shared work, signed in with a read-only token. Its
-This computer pages explain that your files and conversations open with `agentscm open`. The
-manual setup in [Repository explorer](repository-explorer.md#advanced-connect-without-agentscm-open)
-remains for a Hub page served elsewhere.
+## Earlier local dashboards
+
+`agentscm open` no longer starts a detached presentation service. If an earlier installation left
+one running, `agentscm open --stop` confirms its instance before stopping it. A mismatched or
+unreachable instance is left unchanged with a recovery diagnostic. Existing private files under
+`front-door/` are not automatically deleted. This cleanup does not stop an optional self-hosted Hub.
 
 ## Limits
 
-- Auto-connect sends the checkout's forge host and `owner/name` to every Hub with auto-connect on
-  (up to four), including Hubs that do not have that repository.
-- A stolen credential file can mint agent tokens for your repositories until the computer is
-  revoked or unused for 90 days. It cannot open the Hub's web pages, act as an administrator or
-  read the forge.
-- Losing a repository role takes effect at the next renewal, usually within 12 hours and at most
-  24; revoking the computer or disabling the account takes effect at once.
-- An older AgentSCM binary that rewrites `hub-sessions.json` drops this computer's credential from
-  it (the Hub keeps it until revoked or idle); sign in again with the current one.
-- `agentscm open` gives the browser an owner-only local file that forwards it to the page. A
-  browser that cannot read files in your config directory (for example some sandboxed Linux
-  browser packages), or a computer where `.html` files open in an editor, does not open the page;
-  `agentscm open` prints the file to open by hand.
-- The MCP server fills in an omitted session from the start hook's record on macOS and Linux only.
-- The page runs on this computer only. Over SSH, `agentscm open` has no local browser to hand the
-  connection to; use the team's Hub there, with the manual setup for files.
-- Templates and Timeline read a native workspace chosen with `agentscm serve --timeline-workspace`;
-  this page does not serve them and shows their labelled preview data.
-- Capture records a session in the repository where the agent started, so a session that edited
-  several repositories appears under the first.
-- Hub areas that use their own browser sign-in (Community workspace) open on the team's Hub.
+- Auto-connect sends the checkout's forge host and `owner/name` to each opted-in Hub (up to four),
+  including Hubs that do not have that repository.
+- A stolen computer credential can mint repository agent tokens until revoked or expired from
+  inactivity. Keep the config directory private and revoke a lost computer.
+- Losing repository access is checked at token renewal; revoking the computer or disabling the
+  account revokes its agent tokens immediately.
+- Native installation, CLI/API behavior and a team's UI deployment are separate capabilities.
+  A build without `ui` has no dashboard assets/routes; the container and explicit `--features ui`
+  builds retain the Hub UI and its own authorization.

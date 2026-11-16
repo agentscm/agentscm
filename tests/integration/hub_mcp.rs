@@ -150,10 +150,154 @@ impl Hub {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_native_calls_do_not_publish_mcp_reach_or_deliver_messages() {
+    use agentscm::hub::agent_messages;
+    use agentscm::hub::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
+    for (terminal, alias) in [(false, false), (true, false), (false, true)] {
+        let hub = Hub::start().await;
+        let now = unix_now();
+        let owner = hub
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 9001,
+                },
+                "synthetic-owner",
+            )
+            .unwrap();
+        let (token, secret, _) =
+            mint_bound_agent_token(&*hub.store, &owner.id, "native", REPO, 7, 3600, false).unwrap();
+        let domain = if alias { "default" } else { "native-message" };
+        if alias {
+            let started = hub.tool_result(secret.expose(), "agentscm_start", json!({
+                "request_key":"alias-message", "task":"Read canonical messages", "session":domain, "paths":["src/lib.rs"]
+            })).await;
+            assert_eq!(started["isError"], false, "{started}");
+            for session in [domain, "native-message"] {
+                hub.store
+                    .touch_session(
+                        &token,
+                        &agentscm::hub::session::SessionCall {
+                            session: Some(session.into()),
+                            via: "hook:claude".into(),
+                            task: None,
+                            paths: vec!["src/lib.rs".into()],
+                            deny: false,
+                            report: true,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                hub.store
+                    .session_name_for(&token, Some("native-message"), now)
+                    .unwrap(),
+                domain
+            );
+        }
+        let register = |nonce: &str, expected| LifecycleRegister {
+            session: "native-message".into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("start-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+        let old = hub
+            .store
+            .lifecycle_register(&token, &register("old", None), now)
+            .unwrap();
+        let current = if terminal {
+            hub.store
+                .lifecycle_end(
+                    &token,
+                    &LifecycleEnd {
+                        session: old.session.clone(),
+                        incarnation: old.incarnation.clone(),
+                        operation_id: "end-old".into(),
+                        observed_at: now,
+                        reason: EndReason::ExplicitEnd,
+                        work: vec![],
+                    },
+                    now,
+                )
+                .unwrap()
+                .lifecycle
+        } else {
+            hub.store
+                .lifecycle_register(
+                    &token,
+                    &register("current", Some(old.incarnation.clone())),
+                    now,
+                )
+                .unwrap()
+        };
+        let key = format!("agent_messages:{}:7", owner.id);
+        let queued = json!([{"id":format!("msg_{}", "a".repeat(32)), "token":token,
+            "session":domain, "note":"synthetic private message body", "from":"synthetic-owner",
+            "state":"queued", "created_at":now, "deadline_at":now + 600}]);
+        hub.store
+            .set_setting(&key, &queued.to_string(), &owner.id)
+            .unwrap();
+        let call = |incarnation: String| {
+            let client = hub.client.clone();
+            let url = format!("{}/mcp", hub.base);
+            let secret = secret.expose().to_owned();
+            async move {
+                let response = client.post(url).bearer_auth(secret)
+                    .header("x-agentscm-session", "native-message")
+                    .header("x-agentscm-incarnation", incarnation)
+                    .header("content-type", "application/json")
+                    .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                        "params":{"name":"agentscm_status","arguments":{"session":"native-message"}}}).to_string())
+                    .send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()["result"]
+                    .clone()
+            }
+        };
+        let refused = call(old.incarnation).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(!agent_messages::mcp_delivers(&token, domain));
+        let saved: Value =
+            serde_json::from_str(&hub.store.get_setting(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(saved, queued);
+        assert!(
+            !refused
+                .to_string()
+                .contains("synthetic private message body")
+        );
+
+        let fresh = hub
+            .store
+            .lifecycle_register(&token, &register("fresh", Some(current.incarnation)), now)
+            .unwrap();
+        let accepted = call(fresh.incarnation).await;
+        assert_eq!(accepted["isError"], false, "{accepted}");
+        assert_eq!(agent_messages::mcp_delivers(&token, domain), !alias);
+        assert!(
+            accepted["_meta"]["agentscm"]["source_notice"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("agentscm_hub_message")),
+            "{accepted}"
+        );
+        assert!(
+            !accepted
+                .to_string()
+                .contains("synthetic private message body"),
+            "modern delivery exposes only the ledger pointer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn named_overlap_tools_and_dependency_summary_delivery() {
     let hub = Hub::start().await;
     let (a_token, a) = hub.secret_with_id(801, "first");
-    let (_, b) = hub.secret_with_id(802, "second");
+    let (b_token, b) = hub.secret_with_id(802, "second");
     let listed = hub
         .rpc(&a, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .await
@@ -193,7 +337,7 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
         json!(["src/shared.rs"])
     );
     let accepted = hub
-        .tool_result(&b, "agentscm_work_overlap_start", envelope)
+        .tool_result(&b, "agentscm_work_overlap_start", envelope.clone())
         .await;
     assert_eq!(accepted["isError"], false, "{accepted}");
     assert_eq!(accepted["structuredContent"]["created"], true);
@@ -212,6 +356,113 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
         dependent["structuredContent"]["work"]["preflight"]["dependencies"]["conditions"][0]["disposition"]
             ["state"],
         "unknown"
+    );
+    let now = unix_now();
+    let registration =
+        |nonce: &str, expected| agentscm::hub::session_lifecycle::LifecycleRegister {
+            session: "second".into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("nested-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+    let old = hub
+        .store
+        .lifecycle_register(&b_token, &registration("old", None), now)
+        .unwrap();
+    let current = hub
+        .store
+        .lifecycle_register(
+            &b_token,
+            &registration("current", Some(old.incarnation.clone())),
+            now,
+        )
+        .unwrap();
+    let cursor = || {
+        rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap()
+        .query_row("SELECT dependency_notice_cursor FROM hub_sessions WHERE token=?1 AND session='second'", [&b_token], |row| row.get::<_, i64>(0)).unwrap()
+    };
+    let before = cursor();
+    let notice = hub
+        .store
+        .notice_record(
+            &b_token,
+            &agentscm::hub::notices::NoticeSource {
+                kind: agentscm::hub::notices::SourceKind::Operational,
+                id: "synthetic-nested-pickup".into(),
+                version: "1".into(),
+            },
+            &agentscm::hub::notices::NoticeRecipient {
+                token: b_token.clone(),
+                session: "second".into(),
+                work_id: None,
+                generation: None,
+            },
+            now,
+        )
+        .unwrap();
+    let nested = |incarnation: String| {
+        let client = hub.client.clone();
+        let url = format!("{}/mcp", hub.base);
+        let token = b.clone();
+        let arguments = envelope.clone();
+        async move {
+            let reply = client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("x-agentscm-session", "second")
+                .header("x-agentscm-incarnation", incarnation)
+                .body(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"agentscm_work_overlap_start","arguments":arguments}})
+                    .to_string(),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+            serde_json::from_str::<Value>(&reply.text().await.unwrap()).unwrap()["result"].clone()
+        }
+    };
+    let refused = nested(old.incarnation).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        hub.store
+            .notice_pending(&b_token, "second", now)
+            .unwrap()
+            .iter()
+            .find(|saved| saved.id == notice.id)
+            .unwrap()
+            .offered_at
+            .is_none()
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "a stale nested call cannot consume successor notices"
+    );
+    assert!(
+        refused["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none()
+    );
+    let modern = nested(current.incarnation).await;
+    assert_eq!(modern["isError"], false, "{modern}");
+    assert!(
+        modern["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none()
+    );
+    assert_eq!(
+        modern["_meta"]["agentscm"]["source_notice"]["delivery_id"], notice.id,
+        "{modern}"
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "modern nested calls use the notice ledger"
     );
     let pure=hub.tool_result(&a,"agentscm_work_preflight",json!({"request_key":"first","task":"First behavior","session":"first","paths":["src/shared.rs"]})).await;
     assert_eq!(pure["isError"], false, "{pure}");
@@ -782,6 +1033,7 @@ async fn protocol_basics() {
             "agentscm_promise_propose",
             "agentscm_promise_report",
             "agentscm_hub_message",
+            "agentscm_work_dependency_ack",
             "agentscm_view_settings",
             "agentscm_coordination_ack",
             "agentscm_coordination_reply",
@@ -3224,7 +3476,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 46] = [
+    const CORE: [&str; 47] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -3252,6 +3504,7 @@ async fn default_tool_list_cost() {
         "agentscm_work_catchup",
         "agentscm_work_catchup_ack",
         "agentscm_work_checkpoint",
+        "agentscm_work_dependency_ack",
         "agentscm_work_dependency_notices",
         "agentscm_work_insight",
         "agentscm_work_insights",
@@ -3281,7 +3534,7 @@ async fn default_tool_list_cost() {
     names.sort_unstable();
     assert_eq!(names, CORE);
     assert!(
-        chars <= 17_500,
+        chars <= 18_100,
         "default descriptions grew to {chars} characters"
     );
 }

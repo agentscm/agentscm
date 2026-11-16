@@ -88,7 +88,7 @@ pub(super) fn dependents(tx: &Transaction<'_>, id: &str) -> Result<Vec<String>> 
     Ok(ids)
 }
 
-fn refresh(
+pub(super) fn refresh(
     tx: &Transaction<'_>,
     who: &WorkWho,
     id: &str,
@@ -144,16 +144,42 @@ fn refresh(
     recipients.sort();
     recipients.dedup();
     let evidence = reconciliation_evidence(tx, who, &declared, now)?;
+    let conditions = declarations::prerequisite_dispositions(&declared, &evidence);
+    let semantic_fingerprint = crate::hub::notices::dependency_fingerprint(&declared, &conditions);
+    let semantic_version = match &previous_record {
+        Some(previous)
+            if previous.generation == item.generation
+                && previous.declaration_seq == declared.declaration_seq
+                && !previous.semantic_fingerprint.is_empty() =>
+        {
+            previous.semantic_version
+                + i64::from(previous.semantic_fingerprint != semantic_fingerprint)
+        }
+        _ => 0,
+    };
     let record = DependencyNoticeRecord {
         work_id: id.into(),
         generation: item.generation,
         declaration_seq: declared.declaration_seq,
+        semantic_version,
+        semantic_fingerprint,
         evidence_digest: evidence.digest(),
-        conditions: declarations::prerequisite_dispositions(&declared, &evidence),
+        conditions,
         notification_fanout_complete: fanout_complete,
         prerequisites,
         recipients,
     };
+    // Current projections retain fresh evidence; polling-only changes do not append notice events.
+    if previous_record.as_ref().is_some_and(|previous| {
+        previous.generation == record.generation
+            && previous.declaration_seq == record.declaration_seq
+            && previous.semantic_fingerprint == record.semantic_fingerprint
+            && previous.notification_fanout_complete == record.notification_fanout_complete
+            && previous.recipients == record.recipients
+            && previous.prerequisites == record.prerequisites
+    }) {
+        return Ok(());
+    }
     let snapshot = json_string(&record)?;
     if snapshot.len() > MAX_DEPENDENCY_NOTICE_BYTES {
         return Err(HubError::Invalid(

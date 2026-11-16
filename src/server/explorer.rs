@@ -47,6 +47,7 @@ pub(super) fn open(
 }
 
 /// An explorer for one connected checkout, with its capture spool when one is bound to it.
+#[cfg(feature = "ui")]
 pub(super) fn open_checkout(
     root: &std::path::Path,
     repository: &str,
@@ -141,12 +142,13 @@ async fn read(
     State(state): State<AppState>,
     Path(operation): Path<String>,
     RawQuery(raw): RawQuery,
-    selected: Option<axum::Extension<super::front_door::Selected>>,
+    #[cfg(feature = "ui")] selected: Option<axum::Extension<super::front_door::Selected>>,
 ) -> Response {
     let Some(operation) = Operation::parse(&operation) else {
         return failure(StatusCode::NOT_FOUND, "Unknown repository explorer read.");
     };
     // The front door picks the checkout per request; `serve --explorer-repo` has exactly one.
+    #[cfg(feature = "ui")]
     let explorer = match (&selected, &state.front_door) {
         (Some(axum::Extension(selected)), Some(front_door)) => {
             match front_door.explorer(selected) {
@@ -162,6 +164,8 @@ async fn read(
         }
         _ => state.explorer.clone(),
     };
+    #[cfg(not(feature = "ui"))]
+    let explorer = state.explorer.clone();
     let Some(explorer) = explorer else {
         return failure(
             StatusCode::NOT_FOUND,
@@ -186,6 +190,7 @@ async fn read(
             "Private capture is not connected. Configure --explorer-spool to read retained evidence on this computer.",
         );
     }
+    #[cfg(feature = "ui")]
     let front_door = state.front_door.clone();
     let result = blocking(state, move |_| {
         let value = project(&explorer, operation, &fields, limit)?;
@@ -205,6 +210,7 @@ async fn read(
         ),
         Err(error) => {
             // A rejected query says nothing about the checkout; other failures may mean it moved.
+            #[cfg(feature = "ui")]
             if error.status != StatusCode::BAD_REQUEST
                 && let (Some(axum::Extension(selected)), Some(front_door)) =
                     (&selected, &front_door)

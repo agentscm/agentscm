@@ -1788,16 +1788,51 @@ async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_a
     // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
     // that could be compared with it, so the two agents are told apart by name only.
 
-    // Ending the session drops its route record, and the hook does not write it back.
+    // Ending the session retains its terminal lifecycle evidence for recovery.
     let routes = machine.config.path().join("agentscm/session-routes");
-    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
-    assert_eq!(recorded(), 1);
+    let recorded = || {
+        std::fs::read_dir(&routes)
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = recorded();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["lifecycle"]["terminal"], false);
     machine.hook_in(
         &linked,
         "native-1",
         json!({"hook_event_name": "SessionEnd"}),
     );
-    assert_eq!(recorded(), 0);
+    let after = recorded();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["session"], "native-1");
+    assert_eq!(after[0]["lifecycle"]["terminal"], true);
+    assert_eq!(after[0]["lifecycle"]["explicit_end_requested"], true);
+    for key in ["start_nonce", "incarnation"] {
+        assert_eq!(after[0]["lifecycle"][key], before[0]["lifecycle"][key]);
+    }
+    for entry in std::fs::read_dir(machine.config.path().join("agentscm/agent-hosts")).unwrap() {
+        let host: Value =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        assert_ne!(host["session"], "native-1");
+    }
+    let remaining = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let main_work = |items: &[agentscm::hub::work::WorkItem]| {
+        let work = items
+            .iter()
+            .find(|work| work.title == "Work in the main checkout")
+            .unwrap();
+        (work.id.clone(), work.generation, work.updated_seq)
+    };
+    assert_eq!(main_work(&remaining), main_work(&current));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2151,7 +2186,14 @@ async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
 async fn web_sign_in(env: &Env, user: i64) -> String {
     let done = web_callback(env, user).await;
     assert_eq!(done.status(), 302);
-    assert_eq!(done.headers()[header::LOCATION], "/ui/#home");
+    assert_eq!(
+        done.headers()[header::LOCATION],
+        if cfg!(feature = "ui") {
+            "/ui/#home"
+        } else {
+            "/auth/complete/#home"
+        }
+    );
     let all: Vec<_> = done
         .headers()
         .get_all(header::SET_COOKIE)
@@ -2421,7 +2463,10 @@ async fn a_web_session_closes_a_request_only_once_its_requester_is_gone() {
             "session": "alice-session", "expected_updated_seq": request.updated_seq,
             "target_work_id": target.work_id, "target_generation": target.generation})
     };
-    let action = format!("request:{}:{}", request.id, target.work_id);
+    let action = format!(
+        "request:{}:{}:{}",
+        request.id, target.work_id, target.generation
+    );
     let has_action = |status: &Value| {
         status["actions"]
             .as_array()
@@ -3049,7 +3094,11 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
     assert_eq!(refused.status(), 302);
     assert_eq!(
         refused.headers()[header::LOCATION],
-        "/ui/#/signed-in?status=refused&reason=user_disabled"
+        if cfg!(feature = "ui") {
+            "/ui/#/signed-in?status=refused&reason=user_disabled"
+        } else {
+            "/auth/complete/#/signed-in?status=refused&reason=user_disabled"
+        }
     );
     assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
     // A page that asked to come back gets the refusal on itself.

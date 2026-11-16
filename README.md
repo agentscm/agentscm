@@ -32,7 +32,7 @@ npx agentscm demo
 ```
 
 This starts a temporary local Hub, simulates three agents through its real hook endpoint and
-opens the status page. No account, Docker or forge is required; nothing is written to your
+prints the results in your terminal. No account, Docker or forge is required; nothing is written to your
 repository. The agents and decisions are scripted. Press Ctrl-C to stop. The
 [demo guide](docs/scripted-demo.md) covers prerequisites and limits.
 
@@ -68,15 +68,16 @@ In Codex, run `/hooks` once and trust the AgentSCM hooks. Other clients may ask 
 the folder or enable MCP. Installation does not mean every integration has been qualified in
 live sessions; see [agent support and qualification](docs/agents.md#support-tiers).
 
-Open a connected checkout's source and team view:
+Check this computer's connection and agent setup:
 
 ```sh
-npx agentscm open
+npx agentscm client status --check
+npx agentscm client doctor
 ```
 
-The page can switch between repositories connected on this computer, each using its own Hub
-and access. The local source explorer is currently Unix-only.
-Windows users can use `agentscm client status`.
+Native installations run without a local dashboard. Your team's Hub can still serve its web
+interface. The CLI retains setup, sharing controls, sign-out, diagnostics and recovery; see
+[this computer](docs/connect-this-computer.md).
 
 See [install options](docs/install.md) for platform/runtime requirements, `--only`, `--dry-run`,
 containers and uninstall (`npx agentscm uninstall`). A managed native Hub is qualified on Apple
@@ -140,9 +141,9 @@ Read [sharing, access and deletion](docs/change-capture.md#sharing-conversations
 before enabling it. This is distinct from task text and coordination metadata the Hub already
 stores; see [Hub data](docs/hub.md#data-the-hub-stores).
 
-The repository explorer reads local source and retained evidence. It does not run an agent,
-execute checks, fetch or check out branches. One connected local page can combine that private
-view with read-only team data from multiple repositories and Hubs.
+The optional repository explorer API reads local source and retained evidence. It does not run an
+agent, execute checks, fetch or check out branches. Native CLI source and workflow tools remain
+available; removing the local dashboard does not remove those facilities.
 
 ## Git, forge checks and native workflows
 

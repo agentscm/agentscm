@@ -408,7 +408,9 @@ fn slow_hub_is_bounded_and_reported_unavailable() {
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (_stream, _) = listener.accept().unwrap();
+        let accepted = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_secs(6));
+        accepted
     });
     save(
         temp.path(),
@@ -417,10 +419,11 @@ fn slow_hub_is_bounded_and_reported_unavailable() {
             "repo":"acme/slow","token_file":token
         }]),
     );
-    let started = std::time::Instant::now();
     let output = run(temp.path(), Some(&root), true);
-    assert!(started.elapsed() < std::time::Duration::from_secs(6));
-    server.join().unwrap();
+    let completed = std::time::Instant::now();
+    let accepted = server.join().unwrap();
+    // Measure the Hub timeout independently of OS process-loader delays.
+    assert!(completed.duration_since(accepted) < std::time::Duration::from_secs(6));
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["connections"][0]["hub_check"]["state"], "unavailable");

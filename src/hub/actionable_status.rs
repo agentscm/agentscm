@@ -643,6 +643,14 @@ fn read_scoped(
     }
     let ids = selected.keys().cloned().collect::<Vec<_>>();
     let operational = store.work_operational(reader, &OperationalSelect::Many(&ids), now)?;
+    let terminal = match store.notice_owner_terminal(reader, &ids, now) {
+        Ok(ids) => ids.into_iter().collect::<BTreeSet<_>>(),
+        Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+        Err(_) => {
+            limits.insert("native_lifecycle_unavailable".into());
+            BTreeSet::new()
+        }
+    };
     // When each live session last called. A claim follows its lead's reports only, so a lead
     // that works on without reporting would read as quiet: its session's calls say it is there.
     let sessions = store.live_sessions(principal, now, MAX_STATUS_WORK + 1)?;
@@ -688,13 +696,17 @@ fn read_scoped(
         let called_at = called
             .get(session_key(&item.lead_token, &item.lead_session).as_str())
             .copied();
-        let wait = setup.waiting().lead(
-            &item.owner,
-            &item.lead_token,
-            &item.lead_session,
-            called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
-            now,
-        );
+        let wait = if terminal.contains(&id) {
+            LeadWait::NotWaiting
+        } else {
+            setup.waiting().lead(
+                &item.owner,
+                &item.lead_token,
+                &item.lead_session,
+                called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
+                now,
+            )
+        };
         // Only the row reads the session's calls: where a request goes and which overlaps count
         // still follow the lead's reports.
         let mut shown = item.clone();
@@ -752,11 +764,12 @@ fn read_scoped(
         .filter(|w| w.operational.reservation.status == ReservationStatus::Held)
         .map(|w| w.work_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut actions = request_actions(
+    let mut actions = request_actions_with_terminal(
         &requests,
         &items,
         &holding,
         live_keys.as_ref(),
+        &terminal,
         &principal.owner.id,
         now,
     );
@@ -782,7 +795,11 @@ fn read_scoped(
                                     && request.proposal.scope == source.scope
                                     && request.requester.token == source.lead_token
                                     && request.requester.session == source.lead_session
-                                    && action.id == format!("request:{}:{}", request.id, target.id)
+                                    && action.id
+                                        == format!(
+                                            "request:{}:{}:{}",
+                                            request.id, target.id, target.generation
+                                        )
                             })
                         })
             })
@@ -845,8 +862,30 @@ fn read_scoped(
         dependency_actions(store, reader, &items, &principal.owner.id, now)?;
     actions.extend(dependency_actions);
     limits.extend(dependency_limits);
+    let (notice_actions, notice_limits) =
+        notice_recovery_actions(store, reader, &principal.owner.id, now)?;
+    limits.extend(notice_limits);
+    for action in notice_actions {
+        if let Some(existing) = actions.iter_mut().find(|existing| existing.id == action.id) {
+            if action.needs_you && !existing.needs_you {
+                *existing = action;
+            }
+        } else if !(action.kind == "session_recovery"
+            && actions.iter().any(|existing| {
+                existing.kind == "directed_request"
+                    && existing.needs_you
+                    && existing
+                        .work_ids
+                        .iter()
+                        .any(|id| action.work_ids.contains(id))
+            }))
+        {
+            actions.push(action);
+        }
+    }
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
-    let (waiting, waiting_complete) = waiting_actions(store, setup, principal, &items, now)?;
+    let (waiting, waiting_complete) =
+        waiting_actions_with_terminal(store, setup, principal, &items, &terminal, now)?;
     actions.extend(waiting);
     if !waiting_complete {
         limits.insert("session_waiting_unavailable".into());
@@ -1076,11 +1115,23 @@ fn lead_order(i: &WorkItem) -> Option<(u8, std::cmp::Reverse<i64>, &str)> {
 /// session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
 /// version the time the wait began. A permission wait whose hook offers its prompt to the Hub
 /// (`permission_answer`) says so; every other wait is answered in the session.
+#[cfg(test)]
 fn waiting_actions(
     store: &dyn Store,
     setup: &Observations,
     principal: &Principal,
     items: &BTreeMap<String, WorkItem>,
+    now: i64,
+) -> Result<(Vec<StatusAction>, bool)> {
+    waiting_actions_with_terminal(store, setup, principal, items, &BTreeSet::new(), now)
+}
+
+fn waiting_actions_with_terminal(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    terminal: &BTreeSet<String>,
     now: i64,
 ) -> Result<(Vec<StatusAction>, bool)> {
     let owner = principal.owner.id.as_str();
@@ -1116,6 +1167,9 @@ fn waiting_actions(
                 leads && i.lead_session == wait.session && lead_order(i).is_some()
             })
             .collect::<Vec<_>>();
+        if !led.is_empty() && led.iter().all(|item| terminal.contains(&item.id)) {
+            continue;
+        }
         led.sort_by_key(|&i| lead_order(i));
         // The sessions that started this one, nearest first.
         let above = session_ancestors(&starts, &wait.session);
@@ -1471,6 +1525,83 @@ fn dependency_actions(
     Ok((actions, limits))
 }
 
+/// Observe owner-readable declarations, then project existing durable receipt facts.
+fn notice_recovery_actions(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    viewer: &str,
+    now: i64,
+) -> Result<(Vec<StatusAction>, BTreeSet<String>)> {
+    let mut limits = BTreeSet::new();
+    let mut after = None;
+    let mut refreshed = false;
+    for _ in 0..16 {
+        match store.notice_owner_refresh(reader, after.as_deref(), 100, now) {
+            Ok(page) => {
+                if !page.coverage_complete {
+                    limits.insert("dependency_refresh_incomplete".into());
+                }
+                if page.complete {
+                    refreshed = true;
+                    break;
+                }
+                after = page.next_after;
+                if after.is_none() {
+                    break;
+                }
+            }
+            Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+            Err(_) => {
+                limits.insert("dependency_refresh_unavailable".into());
+                break;
+            }
+        }
+    }
+    if !refreshed {
+        limits.insert("dependency_refresh_incomplete".into());
+    }
+    let notices = match store.notice_owner_pending(reader, now) {
+        Ok(notices) => notices,
+        Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+        Err(_) => {
+            limits.insert("notice_receipts_unavailable".into());
+            return Ok((vec![], limits));
+        }
+    };
+    let mut actions = vec![];
+    for notice in notices
+        .into_iter()
+        .filter(|notice| notice.needs_recovery(now))
+    {
+        use crate::hub::notices::SourceKind;
+        let work_ids = notice.recipient.work_id.iter().cloned().collect::<Vec<_>>();
+        let id = match (
+            &notice.source.kind,
+            &notice.recipient.work_id,
+            notice.recipient.generation,
+        ) {
+            (SourceKind::Coordination, Some(work), Some(generation)) => {
+                format!("request:{}:{work}:{generation}", notice.source.id)
+            }
+            (SourceKind::Operational, Some(work), Some(generation)) => {
+                format!("session-ended:{work}:{generation}")
+            }
+            _ => format!("notice:{}", notice.id),
+        };
+        let terminal = notice.terminal_at.is_some();
+        let label = if terminal {
+            "The recipient session ended"
+        } else {
+            "The recipient has not acknowledged this notice by its fixed pickup deadline"
+        };
+        actions.push(StatusAction{id,kind:if notice.source.kind==SourceKind::Operational {"session_recovery"} else {"notice_not_picked_up"}.into(),
+            work_ids,recipients:vec![StatusRecipient{kind:RecipientKind::Person,owner:Some(viewer.into()),login:None,agent:None}],needs_you:true,
+            action:format!("{label}. Review the current source {} and its permitted recovery action. Queued or offered delivery is not recipient acknowledgement; this notice grants no resume, replacement, edit or merge authority.",notice.source.id),
+            updated_seq:0,semantic_version:Some(notice.source.version),session:None,limits:vec![]});
+    }
+    Ok((actions, limits))
+}
+
 /// Requests still waiting for an answer from the lead agent they were sent to. An answer is
 /// that agent's to give, not its person's, and `holding` is the Work that still holds its scope:
 /// once the target holds nothing the asker's next start takes the scope, so nothing waits. The
@@ -1481,11 +1612,24 @@ fn dependency_actions(
 /// reads too, says why it waits and when it is raised. `live` holds the keys of the live
 /// sessions, or is `None` when that list was incomplete: a quiet Work whose lead session is live
 /// can still answer, and one whose session is not in a complete list cannot.
+#[cfg(test)]
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
     holding: &BTreeSet<&str>,
     live: Option<&BTreeSet<String>>,
+    viewer: &str,
+    now: i64,
+) -> Vec<StatusAction> {
+    request_actions_with_terminal(inbox, items, holding, live, &BTreeSet::new(), viewer, now)
+}
+
+fn request_actions_with_terminal(
+    inbox: &CoordinationInbox,
+    items: &BTreeMap<String, WorkItem>,
+    holding: &BTreeSet<&str>,
+    live: Option<&BTreeSet<String>>,
+    terminal: &BTreeSet<String>,
     viewer: &str,
     now: i64,
 ) -> Vec<StatusAction> {
@@ -1526,15 +1670,14 @@ fn request_actions(
                     && a.agent == target.lead
             });
             let due = request.created_at + ACK_BOUND_SECS;
-            // Between two agents of one person the asking agent asks that person in its session,
-            // so the request never becomes their action too.
-            let one_person = request.requester.owner == target.lead.owner;
-            // An incomplete receipt page proves no missing acknowledgement.
+            let ended = terminal.contains(&target.work_id);
+            let unreachable = item.lead_idle()
+                && live.is_some_and(|keys| {
+                    !keys.contains(&session_key(&item.lead_token, &item.lead_session))
+                });
+            // Activity, a shared owner and old process facts do not prove recipient uptake.
             let stuck = request.acknowledgements_complete
-                && !acknowledged
-                && !one_person
-                && !item.lead_idle()
-                && now >= due;
+                && (ended || (now >= due && (!acknowledged || unreachable)));
             let mut files = target
                 .reasons
                 .iter()
@@ -1569,10 +1712,16 @@ fn request_actions(
             };
             let (recipients, needs_you, action) = if stuck {
                 let needs_you = people.iter().any(|p| p.owner.as_deref() == Some(viewer));
-                let action = format!(
-                    "{about} Its lead agent has not responded to it since it was made at Unix {}, though its Work is live, so it is raised to {to}: answer it for that agent from the Hub's Inbox, or release that Work's hold so the asker's next agentscm_start takes the files.",
-                    request.created_at
-                );
+                let action = if ended {
+                    format!(
+                        "{about} Its current lead session ended while this Work retains the requested files. {to} must review the permitted resume or recovery action, or release the hold. No replacement session or takeover is authorized by this notice."
+                    )
+                } else {
+                    format!(
+                        "{about} Its lead agent has not responded to it since it was made at Unix {}, so it is raised to {to}: review its permitted response or recovery action, or release that Work's hold so the asker's next agentscm_start takes the files.",
+                        request.created_at
+                    )
+                };
                 (people, needs_you, action)
             } else {
                 let why = if acknowledged {
@@ -1589,8 +1738,6 @@ fn request_actions(
                     "Its lead is not running, so it is not raised in Needs you; its Work row says whether its hold lapses or is retained.".to_owned()
                 } else if !request.acknowledgements_complete {
                     "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
-                } else if one_person {
-                    "Both agents are one person's, so it is not raised in Needs you: the asking agent asks its person in its session.".to_owned()
                 } else {
                     format!(
                         "Its lead has not acknowledged it; if it still has not at Unix {due}, it is raised to {to}."
@@ -1610,7 +1757,10 @@ fn request_actions(
                 limits.push("request_acknowledgements_truncated".to_owned());
             }
             actions.push(StatusAction {
-                id: format!("request:{}:{}", request.id, target.work_id),
+                id: format!(
+                    "request:{}:{}:{}",
+                    request.id, target.work_id, target.generation
+                ),
                 kind: "directed_request".into(),
                 work_ids: vec![target.work_id.clone()],
                 needs_you,
@@ -4400,7 +4550,7 @@ mod tests {
         };
         let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
         report(&paused, CheckpointKind::Pause, "pause");
-        // The one thing here that asks a person: Work its agent reported blocked.
+        // Blocked Work asks its person; unacknowledged requests also escalate after their deadline.
         let blocked: WorkStart = serde_json::from_value(json!({
             "request_key": "Blocked own work-viewer", "title": "Blocked own work",
             "session": "viewer-blocked", "scope": ["src/blocked.rs"]
@@ -4497,9 +4647,9 @@ mod tests {
             text
         };
         assert_eq!(overlap_text(&status), overlap_text(&fixture));
-        // The paused Work, the request to it, the shared file and the pull request over a held
-        // file are for agents to settle, so none of them counts.
-        assert_eq!(status.counts.needs_you, 1);
+        // The overdue directed request and blocked Work ask the viewer. Quiet Work and
+        // unrelated file/PR overlaps remain listed without becoming personal actions.
+        assert_eq!(status.counts.needs_you, 2);
         assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
         let mut personal = status
             .work
@@ -4515,15 +4665,17 @@ mod tests {
             )
             .collect::<Vec<_>>();
         personal.sort();
-        assert_eq!(personal, std::slice::from_ref(&blocked.id));
-        // The request to the viewer's paused Work is still listed, for its lead agent.
         let request = format!(
-            "request:{}:{}",
+            "request:{}:{}:{}",
             to_viewer.coordination_request.unwrap().id,
-            paused.id
+            paused.id,
+            paused.generation
         );
+        let mut expected = vec![blocked.id.clone(), request.clone()];
+        expected.sort();
+        assert_eq!(personal, expected);
         let listed = status.actions.iter().find(|a| a.id == request).unwrap();
-        assert_eq!(listed.recipients[0].kind, RecipientKind::LeadAgent);
+        assert_eq!(listed.recipients[0].kind, RecipientKind::Person);
         // Missing question coverage leaves Work and directed requests available to the viewer.
         let observations = Observations::default();
         observations
@@ -4552,8 +4704,8 @@ mod tests {
         }));
         assert_eq!(
             read(store, &third, later).unwrap().counts.needs_you,
-            0,
-            "the third person's quiet Work, request, file and pull request ask nobody"
+            1,
+            "the third person's overdue request asks that person, not the viewer"
         );
         // Once the paused Work's hold has lapsed nothing waits on the request to it.
         let lapsed = now + crate::hub::work_lifecycle::LEASE_SECONDS + 1;
@@ -4582,22 +4734,22 @@ mod tests {
             read(store, &viewer, later).unwrap()
         };
         let aside = set_aside(row.updated_seq, None);
-        assert_eq!(aside.counts.needs_you, 0);
+        assert_eq!(aside.counts.needs_you, 1, "the overdue request remains");
         assert_ne!(aside.digest, status.digest, "a reader sees the change");
         assert_eq!(
             set_aside(row.updated_seq, Some(later + 60))
                 .counts
                 .needs_you,
-            0
+            1
         );
         assert_eq!(
             set_aside(row.updated_seq - 1, None).counts.needs_you,
-            1,
+            2,
             "a changed item returns"
         );
         assert_eq!(
             set_aside(row.updated_seq, Some(later)).counts.needs_you,
-            1,
+            2,
             "an ended snooze returns"
         );
     }
@@ -4906,7 +5058,7 @@ mod tests {
         );
         // A quiet lead whose session is not live will not answer; no lapse is promised.
         item.claim_status = ClaimStatus::Stale;
-        let quiet = actions(&request, &item, "usr_owner", due);
+        let quiet = actions(&request, &item, "usr_owner", due - 1);
         assert!(!quiet.needs_you);
         assert_eq!(quiet.recipients[0].kind, RecipientKind::LeadAgent);
         let with_live = |live: Option<&BTreeSet<String>>| {
@@ -4917,7 +5069,7 @@ mod tests {
                 &holding,
                 live,
                 "usr_owner",
-                due,
+                due - 1,
             )
             .remove(0)
             .action
@@ -4934,17 +5086,32 @@ mod tests {
         assert!(said.contains("its session is live"), "{said}");
         assert!(!said.contains("not running"), "{said}");
         assert!(with_live(None).contains("is unknown"));
-        // Between two agents of one person the asking agent asks that person in its session.
+        // Sharing one owner does not establish uptake by either agent.
         item.claim_status = ClaimStatus::Active;
         let mut own = request.clone();
         own.requester.owner = "usr_lead".into();
-        let own = actions(&own, &item, "usr_lead", due);
-        assert!(!own.needs_you);
-        assert_eq!(own.recipients[0].kind, RecipientKind::LeadAgent);
+        let own_action = actions(&own, &item, "usr_lead", due);
+        assert!(own_action.needs_you);
+        assert_eq!(own_action.recipients[0].kind, RecipientKind::Person);
+        let ended = BTreeSet::from([id.clone()]);
+        let items = BTreeMap::from([(id.clone(), item.clone())]);
+        let closed = request_actions_with_terminal(
+            &inbox(own),
+            &items,
+            &holding,
+            None,
+            &ended,
+            "usr_lead",
+            100,
+        );
+        assert_eq!(closed.len(), 1);
         assert!(
-            own.action.contains("Both agents are one person's"),
-            "{}",
-            own.action
+            closed[0].needs_you,
+            "positive terminal state asks immediately, before deadline"
+        );
+        assert_eq!(
+            closed[0].id,
+            format!("request:{}:{}:{}", request.id, id, item.generation)
         );
     }
 
@@ -4985,7 +5152,10 @@ mod tests {
         let request = refused
             .coordination_request
             .expect("the start files a request");
-        let id = format!("request:{}:{}", request.id, release.id);
+        let id = format!(
+            "request:{}:{}:{}",
+            request.id, release.id, release.generation
+        );
         let row = |status: &ActionableStatus| {
             status.actions.iter().find(|a| a.id == id).cloned().unwrap()
         };

@@ -44,9 +44,12 @@ mod change_capture_cli;
 mod change_capture_client;
 mod client_cli;
 mod client_config;
+mod client_cooperation;
+mod client_journal;
 mod client_mcp;
 #[cfg(unix)]
 mod client_plugin;
+mod client_service;
 mod client_session;
 #[cfg(unix)]
 mod client_setup;
@@ -78,7 +81,7 @@ mod hook_report;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 mod hub_read_token;
 mod init_cli;
 mod intent_cli;
@@ -168,8 +171,7 @@ enum Command {
     /// Removed: the menu bar app. Kept so an old Start at Login entry cleans itself up.
     #[command(hide = true)]
     Tray(quickstart::RetiredTrayArgs),
-    /// Open this checkout's Hub page in your browser, connected to this computer's files and
-    /// saved conversations. Starts the local page when needed; `--stop` stops it.
+    /// Stop a legacy local dashboard with --stop; opening it is no longer supported.
     #[cfg(unix)]
     Open(open_cli::OpenArgs),
     /// [experimental] Capture local agent events and observed command receipts.
@@ -686,8 +688,7 @@ enum Command {
         /// Allow a non-loopback bind address.
         #[arg(long)]
         public: bool,
-        /// Serve the Hub page and every checkout connected on this computer, for
-        /// `agentscm open`. Takes no source flags.
+        /// Serve the legacy local dashboard in UI-enabled builds. Takes no source flags.
         #[arg(long, hide = true)]
         front_door: bool,
     },

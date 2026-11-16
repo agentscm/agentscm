@@ -38,6 +38,13 @@ fn invalid(message: &str) -> Error {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClientCommand {
+    /// Run native report retries, qualified exit observation and dependency refresh in the foreground.
+    Run,
+    /// Start, stop or inspect this computer's native maintenance service.
+    Service {
+        #[command(subcommand)]
+        command: crate::client_service::ServiceCommand,
+    },
     /// Verify and save a checkout-bound Hub connection.
     Connect(ConnectArgs),
     /// Connect this checkout and install hooks for one local coding agent.
@@ -193,11 +200,17 @@ pub(crate) struct RemoveArgs {
 pub(crate) async fn run(command: ClientCommand) -> Result<()> {
     if !matches!(
         command,
-        ClientCommand::Mcp(_) | ClientCommand::Renew(_) | ClientCommand::AutoConnect(_)
+        ClientCommand::Mcp(_)
+            | ClientCommand::Renew(_)
+            | ClientCommand::AutoConnect(_)
+            | ClientCommand::Run
+            | ClientCommand::Service { .. }
     ) {
         crate::hub_cli::ask_auto_connect_unasked();
     }
     match command {
+        ClientCommand::Run => crate::client_cooperation::run().await,
+        ClientCommand::Service { command } => crate::client_service::run(command).await,
         ClientCommand::Connect(args) => {
             let root = selected_root(args.root.as_deref())?;
             let ui = Ui { yes: false };
@@ -224,6 +237,10 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
                 terminal_wait(&ui).as_ref(),
             )
             .await?;
+            if crate::client_service::auto_setup_requested()? {
+                let _installer = crate::quickstart::manifest::acquire_lease()?;
+                crate::client_service::setup(&std::env::current_exe()?).await?;
+            }
             offer_instructions(&root);
             report_unwired(&root, &configured_agents(&root));
             Ok(())
@@ -277,10 +294,57 @@ async fn status(args: StatusArgs) -> Result<()> {
         .map(|root| connected_root(Some(root)))
         .transpose()?;
     let snapshot = crate::client_status::snapshot_for(args.check, root.as_deref()).await?;
+    let resident = match crate::client_service::status() {
+        Ok(status) => serde_json::to_value(status)?,
+        Err(_) => {
+            serde_json::json!({"coverage":"unknown","next_action":"Run agentscm client service status to inspect retained recovery state."})
+        }
+    };
+    let cooperation = match crate::hub_cli::config_dir().and_then(|config| {
+        let journal = crate::client_journal::inspect(&config)?;
+        let contexts = crate::client_session::contexts(&config)?;
+        let disposition = |name: &str| {
+            journal
+                .records
+                .iter()
+                .filter(|record| record.payload["disposition"] == name)
+                .count()
+        };
+        let revoked = contexts.contexts.iter().filter(|context| context.revoked).count();
+        Ok(serde_json::json!({
+            "context_coverage": if contexts.complete() { "complete" } else { "incomplete" },
+            "context_stalled": contexts.stalled,
+            "context_truncated": contexts.truncated,
+            "journal_pending": journal.records.iter().filter(|record| !record.payload["disposition"].is_string()).count(),
+            "journal_full": journal.full(),
+            "journal_retained": journal.records.iter().filter(|record| record.payload["disposition"].is_string()).count(),
+            "journal_stalled": journal.stalled + disposition("revoked") + disposition("changed") + disposition("superseded"),
+            "journal_unknown_schema_or_corrupt": journal.stalled,
+            "revoked_contexts": revoked,
+            "terminal_contexts": contexts.contexts.iter().filter(|context| context.terminal).count(),
+            "exit_ineligible_contexts": contexts.contexts.iter().filter(|context| context.exit_ineligible && !context.terminal).count(),
+            "next_action": if journal.full() || journal.stalled != 0 || !contexts.complete() {
+                Some("Retain the native journal and session records for recovery; do not delete uncertain attempts. Repair connection or file-access problems and retry; full unresolved journals require support before new native operations.")
+            } else { None },
+        }))
+    }) {
+        Ok(value) => value,
+        Err(_) => {
+            serde_json::json!({"coverage":"unknown","next_action":"Inspect retained native journal and session records; nothing was removed."})
+        }
+    };
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        let mut value = serde_json::to_value(&snapshot)?;
+        value["resident"] = resident;
+        value["cooperation"] = cooperation;
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
+    println!("Native resident: {}", serde_json::to_string(&resident)?);
+    println!(
+        "Native cooperation: {}",
+        serde_json::to_string(&cooperation)?
+    );
     if snapshot.connections.is_empty() {
         println!("No client connections configured.");
     }

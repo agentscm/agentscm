@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::session::check_name;
-use super::store::{Principal, unix_now};
+use super::store::{Principal, Store, unix_now};
 use super::{HubError, HubState, Result};
 
 pub const CLIENT_HEADER: &str = "x-agentscm-client";
@@ -289,6 +289,7 @@ pub struct Observations(
     StartNudges,
     super::permission_answer::Requests,
     super::session_subagents::Subagents,
+    Mutex<()>,
 );
 
 /// Native sessions already told once to declare their Work, by repository, agent token and
@@ -351,6 +352,25 @@ pub fn client(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl Observations {
+    /// Serialize current native effects before checking their incarnation. Every current
+    /// native writer uses this mutex; registration only takes the database lifecycle lock.
+    /// Lock order is this guard, waiting snapshots/rows, then database transaction. Never
+    /// acquire this guard from a database transaction or hold it across an await.
+    pub(super) fn native_effect<T>(
+        &self,
+        store: &dyn Store,
+        principal: &Principal,
+        native: Option<&str>,
+        incarnation: Option<&str>,
+        effect: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _serial = self.6.lock().map_err(|_| HubError::Busy)?;
+        if let Some(native) = native {
+            store.lifecycle_check(&principal.token_id, native, incarnation, unix_now())?;
+        }
+        effect()
+    }
+
     pub(super) fn waiting(&self) -> &super::session_waiting::Waiting {
         &self.2
     }
@@ -756,6 +776,9 @@ impl Observations {
         call: SetupCall,
         epoch: u64,
     ) -> Result<Status> {
+        // A successor's MCP proof publishes under the same lock as native end cleanup.
+        // No database transaction is held here; update_fenced remains conservative on epoch.
+        let _serial = self.6.lock().map_err(|_| HubError::Busy)?;
         let client = client.ok_or_else(|| {
             HubError::Invalid(
                 "Restart the checkout-bound AgentSCM MCP transport to verify setup".into(),

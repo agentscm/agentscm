@@ -13,6 +13,7 @@ pub mod connection;
 pub mod context_source;
 pub mod continuity;
 pub mod conversation_sharing;
+pub mod cooperation;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
@@ -40,6 +41,7 @@ pub mod login;
 pub mod mcp;
 pub mod merged_holds;
 pub mod narrative;
+pub mod notices;
 pub mod onboarding;
 mod overlap_detail;
 mod permission_answer;
@@ -58,6 +60,7 @@ mod repo_setup;
 mod repository_summary;
 mod retention;
 pub mod session;
+pub mod session_lifecycle;
 pub mod session_subagents;
 pub mod session_waiting;
 pub mod setup_attention;
@@ -599,6 +602,7 @@ pub fn router_with(state: HubState, extra: Router<HubState>) -> Router {
     let workspace_routes = workspace::routes();
     let router = Router::new()
         .merge(http::routes())
+        .merge(cooperation::routes())
         .merge(onboarding::routes())
         .merge(repo_setup::routes())
         .merge(slack::routes())

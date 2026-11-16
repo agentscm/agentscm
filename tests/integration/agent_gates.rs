@@ -201,6 +201,13 @@ const REGISTER: &[Gate] = &[
                  Copilot; unsupported or conflicting markers skip safely",
     },
     Gate {
+        file: "src/client_session.rs",
+        item: "native_host",
+        agents: "claude codex",
+        reason: "not wired yet: native process qualification recognizes Claude Code and Codex CLI \
+                 executables; other hosts retain ordinary hook and MCP delivery",
+    },
+    Gate {
         file: "src/continuation.rs",
         item: "enum NativeClient",
         agents: "claude codex",
@@ -407,6 +414,26 @@ const REGISTER: &[Gate] = &[
         agents: "claude",
         reason: "host limit: preserve the legacy Claude waiter body; other waiters name their \
                  delivery mechanism",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "request",
+        agents: "codex",
+        reason: "host limit: Codex queue dispatch requires a current incarnation and qualified live \
+                 native host; Claude and Copilot can use their legacy wait contract",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "run",
+        agents: "codex",
+        reason: "host limit: Codex asynchronous hooks do not wake a turn by returning output, so \
+                 the waiter uses the native queue command",
+    },
+    Gate {
+        file: "src/message_wait.rs",
+        item: "valid",
+        agents: "codex",
+        reason: "host limit: a legacy wait response cannot authorize Codex queue dispatch",
     },
     Gate {
         file: "src/message_wait.rs",

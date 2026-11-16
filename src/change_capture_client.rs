@@ -630,6 +630,7 @@ const LINEAGE: &str = "this checkout's saved capture belongs to";
 /// Why a change made from the local page was refused, in terms safe to show a browser. Error
 /// text can carry local paths (spool, config), so the page gets only these fixed messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "ui")]
 pub(crate) enum PageRefusal {
     Busy,
     Reconnected,
@@ -637,6 +638,7 @@ pub(crate) enum PageRefusal {
     NeedsAttention,
 }
 
+#[cfg(feature = "ui")]
 impl PageRefusal {
     pub(crate) fn of(error: &Error) -> Self {
         match error {
@@ -868,6 +870,7 @@ fn settings_excludes(root: &Path, settings: &Path) -> Result<[(String, String); 
 /// `git status` through the repository's local exclude unless Git already ignores them. The
 /// tracked `.gitignore` is never edited. Git's `info/exclude` is shared by every worktree of the
 /// repository.
+#[cfg(any(test, feature = "ui"))]
 fn keep_new_settings_untracked(root: &Path, settings: &Path) -> Result<()> {
     for (sample, pattern) in settings_excludes(root, settings)? {
         if !git_ignores(root, &sample)? {
@@ -901,6 +904,7 @@ fn release_excludes(
     Ok(())
 }
 
+#[cfg(any(test, feature = "ui"))]
 fn git_ignores(root: &Path, relative: &str) -> Result<bool> {
     let status = std::process::Command::new("git")
         .args(["check-ignore", "-q", "--", relative])
@@ -921,7 +925,7 @@ fn git_ignores(root: &Path, relative: &str) -> Result<bool> {
     }
 }
 
-/// What [`enable_capture`] builds from the bindings read under the lock: `None` when the binding
+/// What browser `enable_capture` builds from the bindings read under the lock: `None` when the binding
 /// is already enabled and only its mode changes, else the spec that creates the binding or
 /// re-enables the disabled one.
 fn plan_enable(
@@ -1000,6 +1004,7 @@ fn plan_enable(
 ///
 /// Any mode other than the one asked for is never chosen here, so `shared-conversation` is
 /// enabled only by an explicit request.
+#[cfg(any(test, feature = "ui"))]
 pub fn enable_capture(
     root: &Path,
     mode: CaptureModeV1,
@@ -1029,7 +1034,7 @@ pub fn enable_capture(
     }
 }
 
-/// Everything a binding is built from. `configure` fills it from flags; [`enable_capture`] fills
+/// Everything a binding is built from. `configure` fills it from flags; browser `enable_capture` fills
 /// it from documented defaults or from the saved binding; both go through [`install_binding`].
 struct BindingSpec {
     root: PathBuf,
@@ -1452,6 +1457,7 @@ pub async fn capture_status(root: &Path) -> Result<Value> {
 
 /// The enabled capture spool bound to exactly this checkout for `repository` and `hub`, found
 /// without opening or binding the spool, for read-only browsing.
+#[cfg(feature = "ui")]
 pub(crate) fn spool_for_checkout(
     root: &Path,
     repository: &str,

@@ -879,7 +879,7 @@ async fn browser_start(
     let web = !workspace && params.get("web").is_some_and(|value| value == "1");
     let return_to = match params.get("return_to") {
         Some(path) if web => web_return_path(path).ok_or_else(ApiError::invalid)?,
-        _ => "/ui/",
+        _ => super::ui::landing(),
     }
     .to_owned();
     let cli_port = if workspace || web {
@@ -986,7 +986,7 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .append_pair("reason", error.code());
         // A connected app's approval page cannot word the reason; the Hub's own page can.
         let page = if apps::return_path(&pending.return_to) {
-            "/ui/"
+            super::ui::landing()
         } else {
             &pending.return_to
         };
@@ -1087,7 +1087,10 @@ async fn callback_inner(
         let cookie = blocking(state, move || workspace.issue_session(&signed.user))
             .await
             .map_err(super::workspace::api_error)?;
-        let mut response = found("/ui/#workspace", cookie_attributes("", 0))?;
+        let mut response = found(
+            &format!("{}#workspace", super::ui::landing()),
+            cookie_attributes("", 0),
+        )?;
         response.headers_mut().append(
             header::SET_COOKIE,
             HeaderValue::from_str(&cookie).map_err(|_| ApiError::invalid())?,

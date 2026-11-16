@@ -41,6 +41,10 @@ pub struct DependencyNoticeRecord {
     pub work_id: String,
     pub generation: i64,
     pub declaration_seq: i64,
+    #[serde(default)]
+    pub semantic_version: i64,
+    #[serde(default)]
+    pub semantic_fingerprint: String,
     pub evidence_digest: String,
     pub conditions: Vec<ConditionDisposition>,
     pub notification_fanout_complete: bool,

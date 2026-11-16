@@ -33,6 +33,10 @@ use super::insights::{
     WorkInsight,
 };
 use super::intent::{Announced, Intent, NewIntent};
+use super::notices::{
+    DependencyNoticeAck, DependencyRefresh, NoticeAcknowledgement, NoticeOffer, NoticeOfferRequest,
+    NoticeReceipt, NoticeRefreshPage, NoticeTransportReport,
+};
 use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1, PromiseHistoryPageV1,
@@ -41,6 +45,9 @@ use super::promise::{
 };
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, SessionEnd, Touched};
+use super::session_lifecycle::{
+    LifecycleEnd, LifecycleEndResult, LifecycleRegister, LifecycleView,
+};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
@@ -516,10 +523,135 @@ pub trait Store: Send + Sync {
         call: &SessionCall,
         named: bool,
         now: i64,
+    ) -> Result<Touched> {
+        self.touch_session_named_with_transport(token, call, named, None, now)
+    }
+    fn touch_session_named_with_transport(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<Touched>;
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;
+    /// Native transport fences never renew activity on registration or replay.
+    fn lifecycle_register(
+        &self,
+        token: &str,
+        request: &LifecycleRegister,
+        now: i64,
+    ) -> Result<LifecycleView>;
+    fn lifecycle_check(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<LifecycleView>>;
+    /// Check native effect authority and persist its opaque wait-clear marker atomically.
+    /// Caller holds native-effect and waiting-map locks before entering the transaction.
+    fn clear_native_wait_with_transport(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        setting_key: &str,
+        now: i64,
+    ) -> Result<()>;
+    /// Exact raw native ID lookup for state/retry; canonical domain ambiguity does not hide it.
+    fn lifecycle_get(&self, token: &str, session: &str, now: i64) -> Result<Option<LifecycleView>>;
+    /// Read-only projection through domain aliases; multiple native lifecycles remain unknown.
+    fn lifecycle_domain_get(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<LifecycleView>>;
+    fn lifecycle_fences(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::session_lifecycle::WorkFence>>;
+    fn lifecycle_end(
+        &self,
+        token: &str,
+        request: &LifecycleEnd,
+        now: i64,
+    ) -> Result<LifecycleEndResult>;
+    /// Refresh changes semantic notices only; offering and recipient acknowledgement are separate.
+    fn notice_refresh(
+        &self,
+        token: &str,
+        query: &DependencyRefresh,
+        now: i64,
+    ) -> Result<NoticeRefreshPage>;
+    fn notice_offer(
+        &self,
+        token: &str,
+        query: &NoticeOfferRequest,
+        now: i64,
+    ) -> Result<Option<NoticeOffer>>;
+    fn notice_transport(
+        &self,
+        token: &str,
+        report: &NoticeTransportReport,
+        now: i64,
+    ) -> Result<NoticeReceipt>;
+    fn dependency_notice_ack(
+        &self,
+        token: &str,
+        ack: &DependencyNoticeAck,
+        now: i64,
+    ) -> Result<NoticeAcknowledgement>;
+    fn notice_pending(&self, token: &str, session: &str, now: i64) -> Result<Vec<NoticeReceipt>>;
+    fn notice_record(
+        &self,
+        token: &str,
+        source: &super::notices::NoticeSource,
+        recipient: &super::notices::NoticeRecipient,
+        now: i64,
+    ) -> Result<NoticeReceipt>;
+    fn notice_resolve(
+        &self,
+        token: &str,
+        session: &str,
+        source: &super::notices::NoticeSource,
+        now: i64,
+    ) -> Result<bool>;
+    #[allow(clippy::too_many_arguments)]
+    fn notice_message_update(
+        &self,
+        token: &str,
+        session: &str,
+        setting_key: &str,
+        expected: Option<&str>,
+        replacement: &str,
+        source: &super::notices::NoticeSource,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<super::agent_messages::Mode>>;
+    fn notice_owner_refresh(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<NoticeRefreshPage>;
+    fn notice_owner_pending(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<Vec<NoticeReceipt>>;
+    fn notice_owner_terminal(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        work_ids: &[String],
+        now: i64,
+    ) -> Result<Vec<String>>;
     /// `end_session`, and in the same transaction pause the active Work the session leads, with
     /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
     /// Work with no session row is still paused. If the pause fails nothing is written, so the
@@ -532,6 +664,16 @@ pub trait Store: Send + Sync {
         token: &str,
         session: Option<&str>,
         via: &str,
+        now: i64,
+    ) -> Result<SessionEnd> {
+        self.end_session_pausing_with_transport(token, session, via, None, now)
+    }
+    fn end_session_pausing_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        via: &str,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<SessionEnd>;
     /// Asks the live session intent holding exactly the file `path` to hand it over to the
@@ -557,6 +699,17 @@ pub trait Store: Send + Sync {
         note: Option<&str>,
         via: Via,
         now: i64,
+    ) -> Result<Asked> {
+        self.ask_handoff_with_transport(token, session, path, note, (via, None), now)
+    }
+    fn ask_handoff_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        note: Option<&str>,
+        transport: (Via, Option<&str>),
+        now: i64,
     ) -> Result<Asked>;
     /// The holder's answer to the oldest open request for `path` addressed to the token (to its
     /// session `session`, if given). Accepting moves the file to the requester's session; a
@@ -580,6 +733,17 @@ pub trait Store: Send + Sync {
         path: &str,
         answer: (bool, Option<&str>),
         via: Via,
+        now: i64,
+    ) -> Result<Answered> {
+        self.answer_handoff_with_transport(token, session, path, answer, (via, None), now)
+    }
+    fn answer_handoff_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        answer: (bool, Option<&str>),
+        transport: (Via, Option<&str>),
         now: i64,
     ) -> Result<Answered>;
     /// The newest handoffs in the repository with `scope` (see [`repository_scope`]; most recent
@@ -1032,13 +1196,41 @@ pub trait Store: Send + Sync {
         start: &WorkStart,
         named: bool,
         now: i64,
+    ) -> Result<WorkStartResult> {
+        self.work_start_named_with_transport(token, start, named, None, now)
+    }
+    fn work_start_named_with_transport(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
-    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.work_start_auto_with_transport(token, start, None, now)
+    }
+    fn work_start_auto_with_transport(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<WorkStartResult>;
     fn work_checkpoint(
         &self,
         token: &str,
         checkpoint: &WorkCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.work_checkpoint_with_transport(token, checkpoint, None, now)
+    }
+    fn work_checkpoint_with_transport(
+        &self,
+        token: &str,
+        checkpoint: &WorkCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     /// Scoped read. Person callers must first check the current repository role; no token is minted.
@@ -1127,6 +1319,15 @@ pub trait Store: Send + Sync {
         token: &str,
         update: &super::work_reconciliation::WorkDeclarationsUpdate,
         now: i64,
+    ) -> Result<super::work_reconciliation::WorkDeclarationsResult> {
+        self.work_declarations_set_with_transport(token, update, None, now)
+    }
+    fn work_declarations_set_with_transport(
+        &self,
+        token: &str,
+        update: &super::work_reconciliation::WorkDeclarationsUpdate,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<super::work_reconciliation::WorkDeclarationsResult>;
     /// Release, retain, finish or reopen Work as its lead, owner or an administrator. One
     /// transaction, idempotent by `operation_id`, fenced by generation and `updated_seq`.
@@ -1134,6 +1335,31 @@ pub trait Store: Send + Sync {
         &self,
         actor: &WorkTransitionActor<'_>,
         request: &WorkTransitionRequest,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        self.work_transition_with_transport(actor, request, None, now)
+    }
+    fn work_transition_with_transport(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        let guard = match actor {
+            WorkTransitionActor::Agent { token } => {
+                Some((*token, request.session.as_deref(), incarnation))
+            }
+            _ => None,
+        };
+        self.work_transition_with_guard(actor, request, guard, now)
+    }
+    /// A native-triggered policy effect keeps policy authority but must fence its originating session.
+    fn work_transition_with_guard(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        guard: Option<(&str, Option<&str>, Option<&str>)>,
         now: i64,
     ) -> Result<WorkTransitionResult>;
     /// The `WorkOperationalV1` projection of the selected Work, ordered by id and bounded to
@@ -1420,6 +1646,16 @@ pub trait Store: Send + Sync {
         call: &SessionCall,
         phase: super::work_lifecycle::CallPhase,
         now: i64,
+    ) -> Result<Option<String>> {
+        self.session_activity_with_transport(token, call, phase, None, now)
+    }
+    fn session_activity_with_transport(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: super::work_lifecycle::CallPhase,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<Option<String>>;
     /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
     /// observation, every reservation that was live then gets one lease of grace.
@@ -1483,11 +1719,29 @@ pub trait Store: Send + Sync {
         token: &str,
         ack: &CoordinationAck,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_ack_with_transport(token, ack, None, now)
+    }
+    fn coordination_ack_with_transport(
+        &self,
+        token: &str,
+        ack: &CoordinationAck,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn work_overlap_start(
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult> {
+        self.work_overlap_start_with_transport(token, request, None, now)
+    }
+    fn work_overlap_start_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult>;
     fn work_overlap_preflight(
@@ -1500,6 +1754,15 @@ pub trait Store: Send + Sync {
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.work_overlap_checkpoint_with_transport(token, request, None, now)
+    }
+    fn work_overlap_checkpoint_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
@@ -1530,6 +1793,15 @@ pub trait Store: Send + Sync {
         token: &str,
         request: &super::work_overlap::WorkOverlapConsentRequest,
         now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView> {
+        self.work_overlap_consent_with_transport(token, request, None, now)
+    }
+    fn work_overlap_consent_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<super::work_overlap::WorkOverlapConsentView>;
     /// Bounded current consent state, visible to the requester and affected current leads.
     fn work_overlap_consents(
@@ -1544,17 +1816,44 @@ pub trait Store: Send + Sync {
         token: &str,
         reply: &CoordinationReply,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_reply_with_transport(token, reply, None, now)
+    }
+    fn coordination_reply_with_transport(
+        &self,
+        token: &str,
+        reply: &CoordinationReply,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn coordination_resolve(
         &self,
         token: &str,
         resolve: &CoordinationResolve,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_resolve_with_transport(token, resolve, None, now)
+    }
+    fn coordination_resolve_with_transport(
+        &self,
+        token: &str,
+        resolve: &CoordinationResolve,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn coordination_withdraw(
         &self,
         token: &str,
         withdraw: &CoordinationWithdraw,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_withdraw_with_transport(token, withdraw, None, now)
+    }
+    fn coordination_withdraw_with_transport(
+        &self,
+        token: &str,
+        withdraw: &CoordinationWithdraw,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest>;
     fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()>;
