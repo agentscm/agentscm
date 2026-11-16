@@ -152,6 +152,12 @@ export async function fetchRecovery(session: BrowserSession, repository: string,
   return work.length ? decodeRecoveryWork(work[0]) : null
 }
 
+function findingList(value: unknown): unknown[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new ApiError(502, 'The Hub sent an unreadable recovery answer')
+  return value
+}
+
 export function decodeInventory(value: unknown): Inventory {
   const page = rec(value)
   const work = page['work']
@@ -159,14 +165,14 @@ export function decodeInventory(value: unknown): Inventory {
   const after = page['next_after']
   return {
     findings_reported: page['findings_reported'] === true,
-    complete: page['complete'] !== false,
+    complete: page['complete'] === true,
     work: work.map((w) => {
       const o = rec(w)
       return {
         work_id: text(o['work_id'], 64),
         title: text(o['title'], 300),
         owner_login: text(o['owner_login'], 200),
-        findings: (Array.isArray(o['findings']) ? o['findings'] : []).map((f) => {
+        findings: findingList(o['findings']).map((f) => {
           const r = rec(f)
           const pr = r['pull_request']
           return { kind: text(r['kind'], 64), evidence: text(r['evidence']), complete: r['complete'] === true, pull_request: typeof pr === 'number' && Number.isInteger(pr) && pr > 0 ? pr : null }

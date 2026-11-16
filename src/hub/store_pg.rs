@@ -5337,6 +5337,9 @@ fn repair_renamed_work(
                     &[&provider, &repo.host, &previous, &repo.repository_id],
                 )?
                 .get(0);
+            if rows == 0 {
+                return Ok(RenameRepair::None);
+            }
             if rows > super::store::MAX_ONLINE_RENAME_REPAIR_ROWS {
                 eprintln!("hub: rename Work repair skipped: {rows} rows exceed the online ceiling");
                 return Ok(RenameRepair::Skipped("too_many"));
@@ -5355,7 +5358,9 @@ fn repair_renamed_work(
                 Ok(_) => Ok(RenameRepair::Applied),
                 Err(error) => {
                     eprintln!("hub: rename Work repair skipped: {error}");
-                    Ok(RenameRepair::Skipped("conflict"))
+                    Ok(RenameRepair::Skipped(
+                        super::store::rename_repair_failure_reason(&error),
+                    ))
                 }
             }
         })();

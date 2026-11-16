@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { BrowserSession } from '../../src/devices.ts'
 import type { WorkItem } from '../../src/standup.ts'
 import { clearPollCache } from '../../src/usePoll.ts'
-import { decodePreview, fetchInventory } from '../../src/workRecovery.ts'
+import { decodePreview, decodeInventory, fetchInventory } from '../../src/workRecovery.ts'
 import { WorkRecovery } from '../../src/WorkRecovery.tsx'
 
 afterEach(() => {
@@ -102,5 +102,15 @@ describe('all-owners inventory', () => {
       { kind: 'hidden_hold', evidence: 'Merged.', complete: true, pull_request: 7 },
       { kind: 'future_kind', evidence: 'Newer.', complete: false, pull_request: null },
     ])
+  })
+
+  it('treats a missing complete as incomplete and a missing findings as none, but rejects a non-array', () => {
+    const item = { work_id: id, title: 't', owner_login: 'o' }
+    const page = decodeInventory({ work: [item], next_after: null })
+    expect(page.complete).toBe(false)
+    expect(page.work[0]!.findings).toEqual([])
+    expect(decodeInventory({ work: [item], complete: true }).complete).toBe(true)
+    expect(() => decodeInventory({ work: [{ ...item, findings: 'x' }] })).toThrow()
+    expect(() => decodeInventory({ work: [{ ...item, findings: null }] })).toThrow()
   })
 })

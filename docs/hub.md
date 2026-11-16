@@ -695,7 +695,7 @@ GitHub sync adds, all with exact ids and appended in the change's transaction:
 `connection_created`, `connection_status` (only when status or detail
 changes), `connection_outbound`, `repository_connected` and
 `repository_renamed` (subject is the hub's `rep_` id; data has the forge
-`repository_id`, `full_name`, `node_id`, `installation_id`; a rename also carries `work_repair`, `applied` or `skipped`, and `work_repair_reason` when skipped),
+`repository_id`, `full_name`, `node_id`, `installation_id`; a rename also carries `work_repair`, `applied`, `none` or `skipped`, and `work_repair_reason` when skipped: `too_many`, `conflict` for a refusal or collision, or `unavailable` for lock contention or other transient failures, which the Hub does not retry),
 `pull_request_observed` and `pull_request_closed` (data is the observation plus
 `repository_id` and `full_name`; a close carries `state`, `merged` and
 `merge_commit_sha`), `branch_observed`, `branch_deleted` and `branch_unobserved`, `pr_comment_written`

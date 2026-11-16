@@ -208,6 +208,11 @@ impl From<postgres::Error> for HubError {
         }) {
             return Self::Busy;
         }
+        // The driver's Display omits the server detail, so keep the SQLSTATE of a unique
+        // violation: the online rename repair reports it as a collision.
+        if error.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+            return Self::Unavailable(format!("{error} (SQLSTATE 23505)"));
+        }
         Self::Unavailable(error.to_string())
     }
 }

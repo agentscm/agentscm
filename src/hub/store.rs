@@ -2798,6 +2798,8 @@ pub(super) const MAX_ONLINE_RENAME_REPAIR_ROWS: i64 = 500;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RenameRepair {
     Applied,
+    /// Nothing was recorded under the former name, so there was nothing to move.
+    None,
     Skipped(&'static str),
 }
 
@@ -2805,7 +2807,55 @@ impl RenameRepair {
     pub(super) fn event_fields(self) -> (&'static str, Option<&'static str>) {
         match self {
             Self::Applied => ("applied", None),
+            Self::None => ("none", None),
             Self::Skipped(reason) => ("skipped", Some(reason)),
         }
+    }
+}
+
+/// The `work_repair_reason` for a repair that failed. Only a refusal (an invalid
+/// repair or a unique-index collision) is a `conflict`; a busy store, a lock
+/// timeout, a deadlock or any other failure is `unavailable`. The store error
+/// mapping keeps no error code on `HubError::Unavailable`, so a
+/// collision is recognised by the text the store mappings leave (SQLite's
+/// `UNIQUE constraint failed`, PostgreSQL's `SQLSTATE 23505` suffix).
+pub(super) fn rename_repair_failure_reason(error: &super::HubError) -> &'static str {
+    match error {
+        super::HubError::Invalid(_) => "conflict",
+        super::HubError::Unavailable(message)
+            if message.contains("UNIQUE constraint failed")
+                || message.contains("SQLSTATE 23505") =>
+        {
+            "conflict"
+        }
+        _ => "unavailable",
+    }
+}
+
+#[cfg(test)]
+mod rename_repair_reason_tests {
+    use super::rename_repair_failure_reason as reason;
+    use crate::hub::HubError;
+
+    #[test]
+    fn only_refusals_and_collisions_are_conflicts() {
+        assert_eq!(reason(&HubError::Invalid("x".into())), "conflict");
+        assert_eq!(
+            reason(&HubError::Unavailable(
+                "UNIQUE constraint failed: t.c".into()
+            )),
+            "conflict"
+        );
+        assert_eq!(
+            reason(&HubError::Unavailable("db error (SQLSTATE 23505)".into())),
+            "conflict"
+        );
+        assert_eq!(reason(&HubError::Busy), "unavailable");
+        assert_eq!(
+            reason(&HubError::Unavailable(
+                "canceling statement due to lock timeout".into()
+            )),
+            "unavailable"
+        );
     }
 }

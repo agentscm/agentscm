@@ -3745,6 +3745,57 @@ fn postgres_rename_over_the_online_ceiling_skips_the_repair() {
     }
 }
 
+// A rename of a repository with no Work under the old name records `none` and moves nothing.
+fn rename_without_work_records_none(fixture: &Fixture) {
+    use agentscm::hub::connection::NewConnection;
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 853,
+            },
+            "user-853",
+        )
+        .unwrap();
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85300000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    for name in ["acme/empty-before", "acme/empty-after"] {
+        fixture
+            .store
+            .upsert_repository(&connection.id, "github.com", 853, name, None, None)
+            .unwrap();
+    }
+    let events = fixture.events("repository_renamed");
+    assert_eq!(events[0]["work_repair"], "none");
+    assert!(events[0].get("work_repair_reason").is_none());
+}
+
+#[test]
+fn sqlite_rename_without_work_records_none() {
+    rename_without_work_records_none(&Fixture::sqlite());
+}
+#[test]
+fn postgres_rename_without_work_records_none() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_without_work_records_none(&fixture);
+    }
+}
+
 #[test]
 fn sqlite_rename_repairs_work_namespace() {
     rename_repairs_work_namespace(&Fixture::sqlite(), false);
