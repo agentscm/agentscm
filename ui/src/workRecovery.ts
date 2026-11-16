@@ -69,6 +69,10 @@ export interface InventoryWork {
 export interface Inventory {
   work: InventoryWork[]
   next_after: string | null
+  /** False for an older Hub that sends no findings: an empty list there is not "nothing noticed". */
+  findings_reported: boolean
+  /** False when the Hub says this page does not cover everything. */
+  complete: boolean
 }
 export interface BatchItem {
   outcome: 'applied' | 'replayed' | 'conflict' | 'refused' | 'unavailable'
@@ -150,9 +154,12 @@ export async function fetchRecovery(session: BrowserSession, repository: string,
 
 export function decodeInventory(value: unknown): Inventory {
   const page = rec(value)
-  const work = Array.isArray(page['work']) ? page['work'] : []
+  const work = page['work']
+  if (!Array.isArray(work)) throw new ApiError(502, 'The Hub sent an unreadable recovery answer')
   const after = page['next_after']
   return {
+    findings_reported: page['findings_reported'] === true,
+    complete: page['complete'] !== false,
     work: work.map((w) => {
       const o = rec(w)
       return {

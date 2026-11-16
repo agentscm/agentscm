@@ -362,6 +362,7 @@ function RetainedClaims({ repositories, session }: { repositories: AdminReposito
         </select>
         {page?.kind === 'loading' && <Skeleton rows={2} />}
         {page?.kind === 'error' && <Failure error={page.error} what="the retained claims" />}
+        {inventory && !inventory.complete && <p className="muted small">This page is incomplete: the Hub did not cover all of this repository's Work.</p>}
         {inventory && inventory.work.length === 0 && <p className="muted small">No unfinished Work here.</p>}
         {inventory && inventory.work.length > 0 && (
           <ul className="list-unstyled stack">
@@ -369,7 +370,7 @@ function RetainedClaims({ repositories, session }: { repositories: AdminReposito
               <li key={w.work_id}>
                 <a href={workHref(w.work_id)}>{w.title || w.work_id}</a> <span className="muted small">· {w.owner_login}</span>
                 {w.findings.length === 0 ? (
-                  <div className="muted small">Nothing noticed.</div>
+                  <div className="muted small">{inventory.findings_reported ? 'Nothing noticed.' : 'Findings not reported by this Hub.'}</div>
                 ) : (
                   <ul className="small">
                     {w.findings.map((f, i) => (

@@ -194,3 +194,36 @@ describe('AdminPage', () => {
     expect(calls.some((c) => c.url.includes('/admin/'))).toBe(false)
   })
 })
+
+describe('Retained claims', () => {
+  function stubAdmin(inventory: unknown) {
+    stubFetch({
+      'GET /v1/hub/session': () => ({ status: 200, body: SESSION }),
+      'GET /v1/hub/admin/repositories': () => ({ status: 200, body: { repositories: [{ full_name: 'counterbranch/agentscm', provider: 'github', host: 'github.com', connection: 'con_1', devices: 1, agent_tokens: 1 }] } }),
+      'GET /v1/hub/admin/sign-in-refusals': () => ({ status: 200, body: { refusals: [] } }),
+      'GET /v1/hub/admin/devices': () => ({ status: 200, body: { devices: [] } }),
+      'POST /v1/hub/session/work/recovery': () => ({ status: 200, body: inventory }),
+    })
+  }
+
+  it('names the pull request in a finding', async () => {
+    stubAdmin({
+      work: [{ work_id: `wrk_${'1'.repeat(32)}`, title: 'Fix it', owner_login: 'maria', findings: [{ kind: 'hidden_hold', evidence: 'merged but still held', complete: true, pull_request: 88 }] }],
+      findings_reported: true,
+      complete: true,
+    })
+    render(<Admin token="read-only-token" />)
+    fireEvent.change(await screen.findByLabelText('Repository'), { target: { value: 'counterbranch/agentscm' } })
+    expect(await screen.findByText('hidden_hold')).toBeTruthy()
+    expect(screen.getByText(/#88: merged but still held/)).toBeTruthy()
+  })
+
+  it('says findings are not reported, and that a page is incomplete, instead of "Nothing noticed"', async () => {
+    stubAdmin({ work: [{ work_id: `wrk_${'1'.repeat(32)}`, title: 'Fix it', owner_login: 'maria', findings: [] }], complete: false })
+    render(<Admin token="read-only-token" />)
+    fireEvent.change(await screen.findByLabelText('Repository'), { target: { value: 'counterbranch/agentscm' } })
+    expect(await screen.findByText('Findings not reported by this Hub.')).toBeTruthy()
+    expect(screen.getByText(/This page is incomplete/)).toBeTruthy()
+    expect(screen.queryByText('Nothing noticed.')).toBeNull()
+  })
+})
