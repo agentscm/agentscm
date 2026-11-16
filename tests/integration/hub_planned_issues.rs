@@ -499,7 +499,7 @@ fn planned_projection(f: Fixture) {
     assert_eq!(view.planned_issues.linked.len(), 1);
     assert_eq!(
         view.planned_issues.linked[0].work_ids,
-        [created.item.id.clone()]
+        std::slice::from_ref(&created.item.id)
     );
     let frozen = f
         .store
