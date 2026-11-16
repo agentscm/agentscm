@@ -1093,7 +1093,15 @@ pub fn annotate_findings(
         });
         // `Working` is only reached from a link read as absent with no limit; a declared link
         // or another open candidate still leaves the Work unsettled.
-        if retained && stage.stage == WorkStage::Working && !unsettled.contains(&work.work_id) {
+        // A declared link (kept apart from the explicit target) is a link too, merged or not.
+        if retained
+            && stage.stage == WorkStage::Working
+            && !unsettled.contains(&work.work_id)
+            && matches!(
+                store.work_declared_links_scoped(&lifecycle, &work.work_id, now),
+                Ok(Some(links)) if links.is_empty()
+            )
+        {
             work.findings.push(FindingV1::no_pr_link());
         }
     }

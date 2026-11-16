@@ -144,6 +144,21 @@ impl Fixture {
             .get(0)
     }
 
+    fn request_repository(&self, id: &str) -> String {
+        const SQL: &str = "SELECT repository FROM hub_coordination_requests WHERE id=";
+        if let Some(database) = &self.database {
+            return rusqlite::Connection::open(database)
+                .unwrap()
+                .query_row(&format!("{SQL}'{id}'"), [], |row| row.get(0))
+                .unwrap();
+        }
+        Client::connect(&self._pg.as_ref().unwrap().url, NoTls)
+            .unwrap()
+            .query_one(&format!("{SQL}'{id}'"), &[])
+            .unwrap()
+            .get(0)
+    }
+
     fn merge_ids(&self, repository_id: i64) -> Vec<String> {
         const SQL: &str = "SELECT id FROM hub_catchup_merges WHERE repository_id=";
         if let Some(database) = &self.database {
@@ -3539,11 +3554,24 @@ fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
         .store
         .upsert_repository(&connection.id, "github.com", 851, old, None, None)
         .unwrap();
+    let before_rename = fixture.store.latest_event_seq().unwrap();
     let renamed = fixture
         .store
         .upsert_repository(&connection.id, "github.com", 851, new, None, None)
         .unwrap();
     assert_eq!(renamed.full_name, new, "the rename commits either way");
+    let rename_events = fixture.events("repository_renamed");
+    assert_eq!(rename_events.len(), 1);
+    assert_eq!(
+        rename_events[0]["work_repair"],
+        if collision { "skipped" } else { "applied" }
+    );
+    assert_eq!(
+        rename_events[0]
+            .get("work_repair_reason")
+            .and_then(|v| v.as_str()),
+        collision.then_some("conflict")
+    );
     assert_eq!(
         fixture
             .store
@@ -3562,6 +3590,22 @@ fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
                 .work_get(&old_token, &work.id, now + 1)
                 .is_err()
         );
+        // The coordination request stayed under the old name too.
+        assert_eq!(fixture.request_repository(&request_id), old);
+        let new_inbox = fixture
+            .store
+            .coordination_list(&new_token, &Default::default(), now + 1)
+            .unwrap();
+        assert!(new_inbox.requests.iter().all(|r| r.id != request_id));
+        // Only the rename was appended: the rolled-back repair left no checkpoint events.
+        let appended: Vec<String> = fixture
+            .store
+            .events_after(before_rename, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(appended, ["repository_renamed"]);
         return;
     }
     let moved = moved.unwrap().unwrap();
@@ -3603,6 +3647,102 @@ fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
         .upsert_repository(&connection.id, "github.com", 851, new, None, None)
         .unwrap();
     assert_eq!(fixture.store.latest_event_seq().unwrap(), before);
+}
+
+// A repository with more Work than the online ceiling is renamed without the repair; the event
+// says so and the Work stays under the old name for `work repair-repository`.
+fn rename_over_the_online_ceiling_skips_the_repair(fixture: &Fixture) {
+    use agentscm::hub::connection::NewConnection;
+    let now = unix_now();
+    let (old, new) = ("acme/big-before", "acme/big-after");
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 852,
+            },
+            "user-852",
+        )
+        .unwrap();
+    let old_token = fixture.token_for_repository(&user.id, "big", old, 852, false);
+    let new_token = fixture.token_for_repository(&user.id, "bigger", new, 852, false);
+    let mut first = None;
+    for n in 0..501 {
+        let item = fixture
+            .store
+            .work_start(
+                &old_token,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("bulk-{n}")),
+                    title: format!("bulk {n}"),
+                    description: None,
+                    session: format!("session-bulk-{n}"),
+                    role: WorkRole::Lead,
+                    scope: vec![],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                now,
+            )
+            .unwrap()
+            .item;
+        first.get_or_insert(item.id);
+    }
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85200000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 852, old, None, None)
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 852, new, None, None)
+        .unwrap();
+    let events = fixture.events("repository_renamed");
+    assert_eq!(events[0]["work_repair"], "skipped");
+    assert_eq!(events[0]["work_repair_reason"], "too_many");
+    assert!(
+        fixture
+            .store
+            .work_get(&new_token, &first.unwrap(), now + 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_rename_over_the_online_ceiling_skips_the_repair() {
+    rename_over_the_online_ceiling_skips_the_repair(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_rename_over_the_online_ceiling_skips_the_repair() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_over_the_online_ceiling_skips_the_repair(&fixture);
+    }
 }
 
 #[test]

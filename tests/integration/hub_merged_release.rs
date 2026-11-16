@@ -1240,6 +1240,14 @@ fn no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link(db: &Db) 
             unix_now(),
         )
         .unwrap();
+    // The declared pull request merges: the Work still has a link, so no absence is reported.
+    db.store
+        .record_catchup_merge(
+            &scope(),
+            &merge_row(88, "feature/declared", true),
+            unix_now() + 7,
+        )
+        .unwrap();
     let at = lapsed();
     for annotate in [false, true] {
         use agentscm::hub::merged_holds::{FindingsReader, annotate_findings};
@@ -1285,7 +1293,7 @@ fn no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link(db: &Db) 
             "{:?}",
             kinds(&plain.id)
         );
-        // A declared link this read cannot show merged is not an absent link.
+        // A declared link, merged or not, is not an absent link.
         assert!(!kinds(&declared.id).contains(&FindingKind::NoPrLink));
         // The Work whose branch merged has a link.
         assert!(!kinds(&w.work).contains(&FindingKind::NoPrLink));

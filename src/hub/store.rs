@@ -2787,3 +2787,25 @@ mod tests {
         );
     }
 }
+
+/// The most Work items plus coordination requests a rename repairs inside the sync transaction.
+/// // ponytail: a fixed ceiling; beyond it the rename is recorded and `agentscm work
+/// repair-repository` is the path, since the repair rewrites every row in one write transaction.
+pub(super) const MAX_ONLINE_RENAME_REPAIR_ROWS: i64 = 500;
+
+/// What became of the online Work repair after a repository rename, as recorded on the
+/// `repository_renamed` event: a fixed code, never raw error text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RenameRepair {
+    Applied,
+    Skipped(&'static str),
+}
+
+impl RenameRepair {
+    pub(super) fn event_fields(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Applied => ("applied", None),
+            Self::Skipped(reason) => ("skipped", Some(reason)),
+        }
+    }
+}

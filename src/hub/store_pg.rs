@@ -100,11 +100,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
-    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
-    like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, repository_scope, search_number,
-    session_key, unix_now, validate_display_name, validate_login,
+    NewAgentToken, Principal, PromiseInputScope, RenameRepair, SESSION_START_RETAIN_SECONDS,
+    SESSION_STARTS_MAX, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User,
+    check_session_start, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id,
+    owner_session, pending, plan_local_ci_change, plan_local_ci_enroll, plan_named,
+    repository_scope, search_number, session_key, unix_now, validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -5308,44 +5308,67 @@ fn resolved_scope(
 
 /// See [`super::store::ADOPT_NAME_SCOPE`]; run when `repo` is connected or renamed.
 /// Moves Work recorded under `previous` to the repository's new name. The rename
-/// itself must not depend on it: a collision or any other failure rolls back only
-/// this repair, leaving the Work under the old name for `work repair-repository`.
+/// itself must not depend on it: a collision, a size over the online ceiling or any
+/// other failure rolls back only this repair, leaving the Work under the old name for
+/// `work repair-repository`. Every query runs inside the savepoint, so an error cannot
+/// leave the outer transaction aborted, and the outcome is returned for the
+/// `repository_renamed` event.
 fn repair_renamed_work(
     tx: &mut postgres::Transaction<'_>,
     connection: &str,
     repo: &ConnectedRepository,
     previous: String,
-) {
-    let attempt = || -> Result<()> {
-        let provider: String = tx
-            .query_one(
-                "SELECT provider FROM hub_connections WHERE id = $1",
-                &[&connection],
-            )?
-            .get(0);
-        let repair = super::work::WorkRepositoryRename {
-            scope: WorkRepositoryScope {
-                provider,
-                host: repo.host.clone(),
-                repository: previous,
-                repository_id: Some(repo.repository_id),
-            },
-            destination: repo.full_name.clone(),
-            apply: true,
-        };
+) -> RenameRepair {
+    let mut attempt = || -> Result<RenameRepair> {
         let mut savepoint = tx.savepoint("rename_repair")?;
-        match repository_rename::repair(&mut savepoint, &repair, unix_now()) {
-            Ok(_) => savepoint.commit()?,
-            Err(error) => {
-                savepoint.rollback()?;
-                eprintln!("hub: rename Work repair skipped: {error}");
+        let outcome = (|| -> Result<RenameRepair> {
+            let provider: String = savepoint
+                .query_one(
+                    "SELECT provider FROM hub_connections WHERE id = $1",
+                    &[&connection],
+                )?
+                .get(0);
+            let rows: i64 = savepoint
+                .query_one(
+                    "SELECT (SELECT COUNT(*) FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3 AND repository_id = $4)
+                          + (SELECT COUNT(*) FROM hub_coordination_requests
+                             WHERE provider = $1 AND host = $2 AND repository = $3 AND repository_id = $4)",
+                    &[&provider, &repo.host, &previous, &repo.repository_id],
+                )?
+                .get(0);
+            if rows > super::store::MAX_ONLINE_RENAME_REPAIR_ROWS {
+                eprintln!("hub: rename Work repair skipped: {rows} rows exceed the online ceiling");
+                return Ok(RenameRepair::Skipped("too_many"));
             }
+            let repair = super::work::WorkRepositoryRename {
+                scope: WorkRepositoryScope {
+                    provider,
+                    host: repo.host.clone(),
+                    repository: previous.clone(),
+                    repository_id: Some(repo.repository_id),
+                },
+                destination: repo.full_name.clone(),
+                apply: true,
+            };
+            match repository_rename::repair(&mut savepoint, &repair, unix_now()) {
+                Ok(_) => Ok(RenameRepair::Applied),
+                Err(error) => {
+                    eprintln!("hub: rename Work repair skipped: {error}");
+                    Ok(RenameRepair::Skipped("conflict"))
+                }
+            }
+        })();
+        match outcome {
+            Ok(RenameRepair::Applied) => savepoint.commit()?,
+            _ => savepoint.rollback()?,
         }
-        Ok(())
+        outcome
     };
-    if let Err(error) = attempt() {
+    attempt().unwrap_or_else(|error| {
         eprintln!("hub: rename Work repair not attempted: {error}");
-    }
+        RenameRepair::Skipped("unavailable")
+    })
 }
 
 fn adopt_name_scope(tx: &mut postgres::Transaction<'_>, repo: &ConnectedRepository) -> Result<()> {
@@ -10250,7 +10273,6 @@ impl Store for PgStore {
                     let mut renamed_from = None;
                     if repo.full_name != full_name {
                         let previous = std::mem::replace(&mut repo.full_name, full_name.to_owned());
-                        append(&mut tx, &Event::repository_renamed(&repo, &previous)?)?;
                         adopt_name_scope(&mut tx, &repo)?;
                         renamed_from = Some(previous);
                     }
@@ -10262,7 +10284,13 @@ impl Store for PgStore {
                         &[&repo.id, &repo.full_name, &repo.node_id, &repo.installation_id],
                     )?;
                     if let Some(previous) = renamed_from {
-                        repair_renamed_work(&mut tx, connection, &repo, previous);
+                        // Appended after the repair so the event can say how it went.
+                        let outcome =
+                            repair_renamed_work(&mut tx, connection, &repo, previous.clone());
+                        append(
+                            &mut tx,
+                            &Event::repository_renamed(&repo, &previous, outcome.event_fields())?,
+                        )?;
                     }
                 }
                 repo
