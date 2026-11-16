@@ -174,7 +174,7 @@ The first briefing page fixes an upper event watermark. Continue with the exact 
 The response contains two independent sections:
 
 - `items`: a page from the current unfinished-work snapshot, without Work that has a merged pull request. Work created before the acknowledgement boundary still appears here.
-- `events`: ordered changes after the previous acknowledged cursor and no later than the fixed watermark.
+- `events`: ordered changes after the previous acknowledged cursor and no later than the fixed watermark. A `work_transition` event also carries `transition`, its kind (`release`, `retain`, `complete`, `abandon`, `supersede`, `reopen` or `prune_participants`); other events omit it, and the catch-up `work_events` carry it the same way.
 
 `retention_gap: true` means some requested history is no longer retained. Do not turn that gap into an empty or complete history claim. A writable agent briefing has a delivery identifier. Acknowledge it only after every page was delivered successfully; acknowledgement advances only that token and subscriber/session's boundary for the repository. Repeat `subscriber` on each continuation; the delivery records which subscriber an acknowledgement advances. Separate sessions cannot consume each other's recap when they use distinct subscriber identities. Omitting `subscriber` on the HTTP API keeps a token-level compatibility cursor. MCP and supported startup hooks resolve the current session automatically. A read-only token receives authorized inspection data without a delivery identifier and cannot acknowledge or mutate work.
 

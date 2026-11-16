@@ -879,9 +879,11 @@ fn sqlite_catchup_page(
         ));
     }
     let mut statement = tx.prepare(
-        "SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
+        "SELECT seq,at,kind,subject,stream,snapshot,title,status,transition FROM (
              SELECT e.seq,e.at,e.kind,e.subject,'work' AS stream,v.snapshot,
-                    NULL AS title,NULL AS status
+                    NULL AS title,NULL AS status,
+                    CASE WHEN e.kind='work_transition'
+                         THEN json_extract(e.data,'$.transition') END AS transition
                FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq
                JOIN hub_work_items w ON w.id=v.work
               WHERE e.seq>?1 AND e.seq<=?2 AND w.provider=?3 AND w.host=?4
@@ -889,7 +891,7 @@ fn sqlite_catchup_page(
                   OR (?6 IS NULL AND w.repository=?5 AND w.repository_id IS NULL))
              UNION ALL
              SELECT e.seq,e.at,e.kind,e.subject,'coordination' AS stream,NULL AS snapshot,
-                    r.proposed_title,v.status
+                    r.proposed_title,v.status,NULL AS transition
                FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
                JOIN hub_coordination_requests r ON r.id=v.request
               WHERE e.seq>?1 AND e.seq<=?2 AND r.provider=?3 AND r.host=?4
@@ -918,6 +920,7 @@ fn sqlite_catchup_page(
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )?
@@ -927,7 +930,7 @@ fn sqlite_catchup_page(
     let mut coordination_events = Vec::new();
     let mut last_event = event_after;
     let mut page_payload_bytes = 0usize;
-    for (seq, at, kind, subject, stream, snapshot, title, status) in event_rows {
+    for (seq, at, kind, subject, stream, snapshot, title, status, transition) in event_rows {
         if work_events.len() + coordination_events.len() >= limit {
             more_events = true;
             break;
@@ -937,6 +940,7 @@ fn sqlite_catchup_page(
             + snapshot.as_ref().map_or(0, String::len)
             + title.as_ref().map_or(0, String::len)
             + status.as_ref().map_or(0, String::len)
+            + transition.as_ref().map_or(0, String::len)
             + 128;
         if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
             if work_events.is_empty() && coordination_events.is_empty() {
@@ -958,6 +962,9 @@ fn sqlite_catchup_page(
                 item: json_value(snapshot.as_deref().ok_or_else(|| {
                     HubError::Unavailable("missing retained work snapshot".into())
                 })?)?,
+                transition: transition
+                    .as_deref()
+                    .and_then(work_transition::WorkTransitionKind::from_stored),
             });
         } else {
             coordination_events.push(CatchupCoordinationEvent {
@@ -5334,7 +5341,9 @@ fn briefing_page(
     let next_work_done = work_done || !more_work;
 
     let mut statement = tx.prepare(
-        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot,
+                CASE WHEN e.kind = 'work_transition'
+                     THEN json_extract(e.data, '$.transition') END
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > ?1 AND e.seq <= ?2 AND w.provider = ?3 AND w.host = ?4
@@ -5359,13 +5368,14 @@ fn briefing_page(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut more_events = rows.len() > limit;
     let mut events = Vec::new();
-    for (seq, at, kind, work_id, snapshot) in rows.into_iter().take(limit) {
+    for (seq, at, kind, work_id, snapshot, transition) in rows.into_iter().take(limit) {
         if !events.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
             more_events = true;
             break;
@@ -5379,6 +5389,9 @@ fn briefing_page(
             kind,
             work_id,
             item,
+            transition: transition
+                .as_deref()
+                .and_then(work_transition::WorkTransitionKind::from_stored),
         });
     }
     let next_after = if more_events {

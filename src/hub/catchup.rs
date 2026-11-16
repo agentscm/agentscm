@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::github::valid_ref_name;
 use super::work::{WorkItem, normalized_scope, validate_id};
+use super::work_lifecycle::WorkTransitionKind;
 use super::{HubError, Result};
 
 pub const MAX_CATCHUP_PAGE: usize = 50;
@@ -182,6 +183,10 @@ pub struct CatchupWorkEvent {
     pub kind: String,
     pub work_id: String,
     pub item: WorkItem,
+    /// The transition kind, present only on `work_transition` events. An unrecognised stored
+    /// kind is dropped rather than failing the feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<WorkTransitionKind>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

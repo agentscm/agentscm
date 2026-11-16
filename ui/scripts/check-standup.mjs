@@ -270,6 +270,10 @@ assert.throws(() => decodeWorkItem({ ...item, depends_on: [relatedId], related_w
 assert.throws(() => decodeWorkItem({ ...item, current: { ...item.current, source_refs: Array(101).fill(item.current.source_refs[0]) } }), InvalidStandupResponse)
 assert.throws(() => decodeWorkItem({ ...item, scope: ['../outside'] }), InvalidStandupResponse)
 assert.throws(() => decodeWorkItem({ ...item, current: { ...item.current, source_refs: [{ kind: 'commit', oid: 'not-a-commit', path: null }] } }), InvalidStandupResponse)
+const withTransition = (transition) => decodeBriefing({ ...envelope, events: [{ ...envelope.events[0], kind: 'work_transition', transition }] }).events[0]
+assert.equal(withTransition('prune_participants').transition, 'prune_participants')
+assert.equal(withTransition('prune_all_the_things').transition, undefined, 'an unknown transition is dropped, not an error')
+assert.equal('transition' in decodeBriefing(envelope).events[0], false)
 assert.throws(() => decodeBriefing({ ...envelope, events: [{ ...envelope.events[0], seq: 13 }] }), InvalidStandupResponse)
 assert.throws(() => decodeBriefing({ ...envelope, next_after: 13 }), InvalidStandupResponse)
 assert.throws(() => decodeBriefing({ ...envelope, items: Array(101).fill(item) }), InvalidStandupResponse)

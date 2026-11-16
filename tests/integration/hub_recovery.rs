@@ -5,9 +5,11 @@ use crate::hub_pg;
 use std::sync::Arc;
 
 use agentscm::hub::HubError;
+use agentscm::hub::catchup::CatchupQuery;
 use agentscm::hub::store::{self, ForgeIdentity, Store, User, mint_bound_agent_token, unix_now};
 use agentscm::hub::work::{
-    CheckpointKind, WorkCheckpoint, WorkItem, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
+    BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkRepositoryScope, WorkRole,
+    WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::{
     ActivityStatus, LEASE_SECONDS, Recipient, ReservationStatus, WorkTransitionKind,
@@ -1269,7 +1271,71 @@ fn a_full_participant_list_is_repairable_and_resumable(db: &Db) {
             later + 2,
         )
         .unwrap();
-    assert!(!pruned.receipt.unwrap().replayed);
+    let receipt = pruned.receipt.as_ref().unwrap();
+    assert!(!receipt.replayed);
+    // Both Work event feeds name the transition kind; an event that is not a transition names none.
+    let prune_seq = receipt.event_seq;
+    let mut page = store
+        .work_catchup(&alice.token, &CatchupQuery::default(), later + 2)
+        .unwrap();
+    let mut catchup: Vec<_> = page
+        .work_events
+        .iter()
+        .map(|e| (e.seq, e.transition))
+        .collect();
+    while !page.complete {
+        page = store
+            .work_catchup(
+                &alice.token,
+                &CatchupQuery {
+                    subscriber: page.subscriber.clone(),
+                    delivery_client: page.delivery_client.clone(),
+                    delivery: Some(page.delivery.clone()),
+                    event_after: Some(page.next_event_after),
+                    event_through: Some(page.event_through),
+                    merge_after: Some(page.next_merge_after),
+                    merge_through: Some(page.merge_through),
+                    ..CatchupQuery::default()
+                },
+                later + 2,
+            )
+            .unwrap();
+        catchup.extend(page.work_events.iter().map(|e| (e.seq, e.transition)));
+    }
+    let mut query = BriefingQuery::default();
+    let mut briefing = Vec::new();
+    loop {
+        let page = store
+            .work_briefing(&alice.token, &query, later + 2)
+            .unwrap();
+        briefing.extend(page.events.iter().map(|e| (e.seq, e.transition)));
+        if page.complete {
+            break;
+        }
+        query = BriefingQuery {
+            after: Some(page.next_after),
+            work_after: page.next_work_after,
+            work_done: page.next_work_done,
+            through: Some(page.through),
+            delivery: page.delivery,
+            subscriber: page.subscriber,
+            ..BriefingQuery::default()
+        };
+    }
+    let kinds = |events: Vec<(i64, Option<WorkTransitionKind>)>| {
+        let named = events.iter().find(|(seq, _)| *seq == prune_seq).unwrap().1;
+        let plain = events.iter().filter(|(seq, _)| *seq < prune_seq).count();
+        assert!(
+            plain > 0
+                && events
+                    .iter()
+                    .filter(|(seq, _)| *seq < prune_seq)
+                    .all(|e| e.1.is_none())
+        );
+        named
+    };
+    assert_eq!(kinds(catchup), Some(WorkTransitionKind::PruneParticipants));
+    assert_eq!(kinds(briefing), Some(WorkTransitionKind::PruneParticipants));
     assert_eq!(pruned.item.participants.len(), 98);
     assert_eq!(pruned.item.generation, full.generation);
     assert_eq!(pruned.item.state, full.state);

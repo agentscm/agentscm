@@ -8,6 +8,7 @@ use super::coordination::CoordinationRequest;
 use super::github::valid_ref_name;
 use super::intent::{display, overlaps, spec_key, text};
 use super::store::{User, validate_repository};
+use super::work_lifecycle::WorkTransitionKind;
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult};
 use super::{HubError, Result};
 
@@ -667,6 +668,10 @@ pub struct WorkEvent {
     pub kind: String,
     pub work_id: String,
     pub item: WorkItem,
+    /// The transition kind, present only on `work_transition` events. An unrecognised stored
+    /// kind is dropped rather than failing the feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<WorkTransitionKind>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

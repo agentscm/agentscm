@@ -2018,6 +2018,7 @@ mod tests {
                     kind: "checkpoint".into(),
                     work_id: work.id.clone(),
                     item: work.clone(),
+                    transition: None,
                 })
                 .collect(),
             coordination_events: vec![],

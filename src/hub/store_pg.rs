@@ -1455,14 +1455,15 @@ fn pg_catchup_page(
             "catch-up cursor is outside its delivery".into(),
         ));
     }
-    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
-        SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status
+    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status,transition FROM (
+        SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status,
+               CASE WHEN e.kind='work_transition' THEN e.data::jsonb->>'transition' END transition
           FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq JOIN hub_work_items w ON w.id=v.work
          WHERE e.seq>$1 AND e.seq<=$2 AND w.provider=$3 AND w.host=$4
            AND (($6::bigint IS NOT NULL AND w.repository_id=$6)
              OR ($6::bigint IS NULL AND w.repository=$5 AND w.repository_id IS NULL))
         UNION ALL
-        SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status
+        SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status,NULL::text
           FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
           JOIN hub_coordination_requests r ON r.id=v.request
          WHERE e.seq>$1 AND e.seq<=$2 AND r.provider=$3 AND r.host=$4
@@ -1488,11 +1489,13 @@ fn pg_catchup_page(
         let snapshot: Option<String> = row.get(5);
         let title: Option<String> = row.get(6);
         let row_status: Option<String> = row.get(7);
+        let transition: Option<String> = row.get(8);
         let row_bytes = kind.len()
             + subject.len()
             + snapshot.as_ref().map_or(0, String::len)
             + title.as_ref().map_or(0, String::len)
             + row_status.as_ref().map_or(0, String::len)
+            + transition.as_ref().map_or(0, String::len)
             + 128;
         if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
             if work_events.is_empty() && coordination_events.is_empty() {
@@ -1514,6 +1517,9 @@ fn pg_catchup_page(
                 item: json_value(snapshot.as_deref().ok_or_else(|| {
                     HubError::Unavailable("missing retained work snapshot".into())
                 })?)?,
+                transition: transition
+                    .as_deref()
+                    .and_then(work_transition::WorkTransitionKind::from_stored),
             });
         } else {
             coordination_events.push(CatchupCoordinationEvent {
@@ -5212,7 +5218,9 @@ fn briefing_page(
         .or_else(|| work_after.clone());
     let next_work_done = work_done || !more_work;
     let rows = tx.query(
-        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot,
+                CASE WHEN e.kind = 'work_transition'
+                     THEN e.data::jsonb->>'transition' END
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > $1 AND e.seq <= $2 AND w.provider = $3 AND w.host = $4
@@ -5245,6 +5253,10 @@ fn briefing_page(
             kind: row.get(2),
             work_id: row.get(3),
             item,
+            transition: row
+                .get::<_, Option<String>>(5)
+                .as_deref()
+                .and_then(work_transition::WorkTransitionKind::from_stored),
         });
     }
     let next_after = if more_events {
