@@ -465,9 +465,29 @@ fn launch_delivery_worker(
     worker
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    spawn_delivery_worker(worker)?;
     Ok(())
+}
+
+fn spawn_delivery_worker(mut worker: std::process::Command) -> Result<u32> {
+    let (started, result) = std::sync::mpsc::sync_channel(1);
+    // Start the waiter first: failing to create it must not leave an unwatched child.
+    std::thread::Builder::new()
+        .name("capture-delivery-reaper".into())
+        .spawn(move || match worker.spawn() {
+            Ok(mut child) => {
+                let _ = started.send(Ok(child.id()));
+                // The worker's existing lifetime budget also bounds this waiter.
+                let _ = child.wait();
+            }
+            Err(error) => {
+                let _ = started.send(Err(error));
+            }
+        })?;
+    Ok(result
+        .recv()
+        .map_err(|_| Error::Invalid("capture delivery worker did not start".into()))??)
 }
 
 fn schedule_delivery(root: &Path) -> Result<()> {
@@ -2108,6 +2128,70 @@ fn capture_error(error: agentscm::change_capture::CaptureError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn delivery_worker_returns_before_exit_and_reaps_child() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let (input, release) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r line"])
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let pid = super::spawn_delivery_worker(command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = false;
+        let mut release = Some(release);
+        loop {
+            // SAFETY: writable siginfo_t; WNOWAIT observes only this child's status without
+            // reaping it or signalling a PID that the OS might subsequently reuse.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                assert!(released, "the worker must remain alive until released");
+                assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+                break;
+            }
+            assert_eq!(result, 0);
+            if !released {
+                assert_eq!(
+                    info.si_signo, 0,
+                    "worker exited before its input was released"
+                );
+                drop(release.take());
+                released = true;
+            }
+            assert!(Instant::now() < deadline, "exited worker was not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn delivery_worker_reports_spawn_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = std::process::Command::new(directory.path().join("missing-worker"));
+        assert!(matches!(
+            super::spawn_delivery_worker(command),
+            Err(agentscm::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
     #[test]
     fn delivery_lock_coalesces_wakes_and_rejects_unsafe_files() {
         use super::*;
