@@ -735,6 +735,41 @@ fn sqlite_interrupted_change_record_migration_rolls_back_and_retries() {
 }
 
 #[test]
+fn sqlite_occurrence_recovery_finds_each_batch_item_by_primary_key() {
+    let db = Db::sqlite();
+    drop(db.open());
+    let migration =
+        include_str!("../../src/hub/migrations/named/conversation_occurrences.sqlite.sql");
+    let recovery = &migration[migration.rfind("INSERT OR IGNORE").unwrap()..];
+    let connection = rusqlite::Connection::open(db.sqlite_path.as_ref().unwrap()).unwrap();
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {recovery}"))
+        .unwrap();
+    let plan: Vec<String> = statement
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // Starting from events can scan every batch for each event.
+    let searches = [
+        "SCAN o",
+        "SEARCH e USING INDEX sqlite_autoindex_hub_change_events_1 (work=? AND generation=? AND session_id=? AND event_id=?)",
+        "SEARCH t USING INDEX sqlite_autoindex_hub_agent_tokens_1 (id=?)",
+        "SEARCH b USING COVERING INDEX sqlite_autoindex_hub_change_shared_bodies_1 (work=? AND digest=? AND author=?)",
+    ];
+    for search in searches {
+        assert!(plan.iter().any(|step| step == search), "{search}: {plan:?}");
+    }
+    let scans: Vec<&String> = plan
+        .iter()
+        .filter(|step| {
+            step.starts_with("SCAN") && *step != "SCAN o" && !step.starts_with("SCAN item")
+        })
+        .collect();
+    assert!(scans.is_empty(), "{plan:?}");
+}
+
+#[test]
 fn sqlite_cold_restore_preserves_change_record_rows_and_projection() {
     let db = Db::sqlite();
     let fixture = representative_pre_change(&db);
