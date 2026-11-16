@@ -75,6 +75,10 @@ use super::intent::{
     display_all, finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
+use super::notices::{
+    DependencyNoticeAck, DependencyRefresh, NoticeAcknowledgement, NoticeOffer, NoticeOfferRequest,
+    NoticeReceipt, NoticeRefreshPage, NoticeTransportReport,
+};
 use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
@@ -94,6 +98,9 @@ use super::session::{
     Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
     SessionCall, SessionEnd, Touched, check, check_name, expiry_cause, guard, held,
     plan as plan_touch,
+};
+use super::session_lifecycle::{
+    LifecycleEnd, LifecycleEndResult, LifecycleRegister, LifecycleView,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -141,8 +148,10 @@ use super::work_transition::{
 use super::{HubError, Result, store_sql};
 use crate::local_ci::DeviceAuthorization;
 
+mod notices;
 mod preflight;
 mod repository_rename;
+mod session_lifecycle;
 mod validation_evidence;
 mod work_dependencies;
 mod work_intent;
@@ -8135,6 +8144,168 @@ fn checkpoint_overlap_in(
 }
 
 impl Store for PgStore {
+    fn notice_owner_pending(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<Vec<NoticeReceipt>> {
+        PgStore::notice_owner_pending(self, reader, now)
+    }
+    fn notice_owner_terminal(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        work_ids: &[String],
+        now: i64,
+    ) -> Result<Vec<String>> {
+        PgStore::notice_owner_terminal(self, reader, work_ids, now)
+    }
+    fn notice_record(
+        &self,
+        token: &str,
+        source: &super::notices::NoticeSource,
+        recipient: &super::notices::NoticeRecipient,
+        now: i64,
+    ) -> Result<NoticeReceipt> {
+        PgStore::notice_record(self, token, source, recipient, now)
+    }
+    fn notice_resolve(
+        &self,
+        token: &str,
+        session: &str,
+        source: &super::notices::NoticeSource,
+        now: i64,
+    ) -> Result<bool> {
+        PgStore::notice_resolve(self, token, session, source, now)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn notice_message_update(
+        &self,
+        token: &str,
+        session: &str,
+        setting_key: &str,
+        expected: Option<&str>,
+        replacement: &str,
+        source: &super::notices::NoticeSource,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<super::agent_messages::Mode>> {
+        PgStore::notice_message_update(
+            self,
+            token,
+            session,
+            setting_key,
+            expected,
+            replacement,
+            source,
+            incarnation,
+            now,
+        )
+    }
+    fn lifecycle_register(
+        &self,
+        token: &str,
+        request: &LifecycleRegister,
+        now: i64,
+    ) -> Result<LifecycleView> {
+        PgStore::lifecycle_register_impl(self, token, request, now)
+    }
+    fn lifecycle_check(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<LifecycleView>> {
+        PgStore::lifecycle_check_impl(self, token, session, incarnation, now)
+    }
+    fn lifecycle_get(&self, token: &str, session: &str, now: i64) -> Result<Option<LifecycleView>> {
+        PgStore::lifecycle_get_impl(self, token, session, now)
+    }
+    fn lifecycle_domain_get(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<LifecycleView>> {
+        Self::lifecycle_domain_get_impl(self, token, session, now)
+    }
+    fn clear_native_wait_with_transport(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        setting_key: &str,
+        now: i64,
+    ) -> Result<()> {
+        Self::clear_native_wait_with_transport_impl(
+            self,
+            token,
+            session,
+            incarnation,
+            setting_key,
+            now,
+        )
+    }
+    fn lifecycle_fences(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::session_lifecycle::WorkFence>> {
+        PgStore::lifecycle_fences_impl(self, token, session, now)
+    }
+    fn lifecycle_end(
+        &self,
+        token: &str,
+        request: &LifecycleEnd,
+        now: i64,
+    ) -> Result<LifecycleEndResult> {
+        PgStore::lifecycle_end_impl(self, token, request, now)
+    }
+    fn notice_refresh(
+        &self,
+        token: &str,
+        query: &DependencyRefresh,
+        now: i64,
+    ) -> Result<NoticeRefreshPage> {
+        PgStore::notice_refresh(self, token, query, now)
+    }
+    fn notice_offer(
+        &self,
+        token: &str,
+        query: &NoticeOfferRequest,
+        now: i64,
+    ) -> Result<Option<NoticeOffer>> {
+        PgStore::notice_offer(self, token, query, now)
+    }
+    fn notice_transport(
+        &self,
+        token: &str,
+        report: &NoticeTransportReport,
+        now: i64,
+    ) -> Result<NoticeReceipt> {
+        PgStore::notice_transport(self, token, report, now)
+    }
+    fn dependency_notice_ack(
+        &self,
+        token: &str,
+        ack: &DependencyNoticeAck,
+        now: i64,
+    ) -> Result<NoticeAcknowledgement> {
+        PgStore::dependency_notice_ack(self, token, ack, now)
+    }
+    fn notice_pending(&self, token: &str, session: &str, now: i64) -> Result<Vec<NoticeReceipt>> {
+        PgStore::notice_pending(self, token, session, now)
+    }
+    fn notice_owner_refresh(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<NoticeRefreshPage> {
+        PgStore::notice_owner_refresh(self, reader, after, limit, now)
+    }
     fn configure_validation_summary(
         &self,
         config: &super::validation_evidence::ValidationSummaryConfig,
@@ -9169,16 +9340,19 @@ impl Store for PgStore {
         })
     }
 
-    fn touch_session_named(
+    fn touch_session_named_with_transport(
         &self,
         token: &str,
         call: &SessionCall,
         named: bool,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<Touched> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, call.session.as_deref(), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = active_token(&mut tx, token, now)?;
             let touched = touch_in(&mut tx, &who, &call, named, now)?;
             tx.commit()?;
@@ -9186,16 +9360,19 @@ impl Store for PgStore {
         })
     }
 
-    fn session_activity(
+    fn session_activity_with_transport(
         &self,
         token: &str,
         call: &SessionCall,
         phase: CallPhase,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<Option<String>> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, call.session.as_deref(), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = active_token(&mut tx, token, now)?;
             let touched = touch_in(&mut tx, &who, &call, call.session.is_some(), now)?;
             let mut lapsed = None;
@@ -9235,11 +9412,12 @@ impl Store for PgStore {
         })
     }
 
-    fn end_session_pausing(
+    fn end_session_pausing_with_transport(
         &self,
         token: &str,
         session: Option<&str>,
         via: &str,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<SessionEnd> {
         if let Some(session) = session {
@@ -9247,6 +9425,8 @@ impl Store for PgStore {
         }
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, session, now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             active_token(&mut tx, token, now)?;
             let name = session_name(&mut tx, token, session, now)?;
             let work = match work_who(&mut tx, token, now) {
@@ -9297,13 +9477,13 @@ impl Store for PgStore {
         })
     }
 
-    fn ask_handoff_via(
+    fn ask_handoff_with_transport(
         &self,
         token: &str,
         session: Option<&str>,
         path: &str,
         note: Option<&str>,
-        via: Via,
+        (via, incarnation): (Via, Option<&str>),
         now: i64,
     ) -> Result<Asked> {
         let key = file_key(path)?;
@@ -9313,6 +9493,10 @@ impl Store for PgStore {
         let note = clean_note(note);
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            if via == Via::Agent {
+                let native = session_name(&mut tx, token, session, now)?;
+                session_lifecycle::check(&mut tx, token, &native, incarnation, now)?;
+            }
             let who = active_token(&mut tx, token, now)?;
             lock_repository(&mut tx, &who.scope)?;
             let name = session_name(&mut tx, token, session, now)?;
@@ -9334,13 +9518,13 @@ impl Store for PgStore {
         })
     }
 
-    fn answer_handoff_via(
+    fn answer_handoff_with_transport(
         &self,
         token: &str,
         session: Option<&str>,
         path: &str,
         (accept, reason): (bool, Option<&str>),
-        via: Via,
+        (via, incarnation): (Via, Option<&str>),
         now: i64,
     ) -> Result<Answered> {
         let key = file_key(path)?;
@@ -9350,6 +9534,10 @@ impl Store for PgStore {
         let reason = clean_note(reason).filter(|_| !accept);
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            if via == Via::Agent {
+                let native = session_name(&mut tx, token, session, now)?;
+                session_lifecycle::check(&mut tx, token, &native, incarnation, now)?;
+            }
             let who = active_token(&mut tx, token, now)?;
             let name = session_name(&mut tx, token, session, now)?;
             let found = tx.query_opt(
@@ -11643,15 +11831,18 @@ impl Store for PgStore {
             &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64),&status.window_from])?;Ok(())})
     }
 
-    fn work_start_named(
+    fn work_start_named_with_transport(
         &self,
         token: &str,
         start: &WorkStart,
         named: bool,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(start.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             if start.preflight.is_some() {
@@ -11740,7 +11931,13 @@ impl Store for PgStore {
         })
     }
 
-    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+    fn work_start_auto_with_transport(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<WorkStartResult> {
         if start.work_id.is_some() || start.source.is_some() || start.request_key.is_some() {
             return Err(HubError::Invalid(
                 "automatic start does not accept a work resolver".into(),
@@ -11753,6 +11950,8 @@ impl Store for PgStore {
         }
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(start.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);
@@ -11831,14 +12030,18 @@ impl Store for PgStore {
         })
     }
 
-    fn work_checkpoint(
+    fn work_checkpoint_with_transport(
         &self,
         token: &str,
         checkpoint: &WorkCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session =
+                session_name(&mut tx, token, Some(checkpoint.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             match work_checkpoint_in(&mut tx, token, checkpoint, now) {
                 Ok(result) => {
                     tx.commit()?;
@@ -11854,15 +12057,20 @@ impl Store for PgStore {
         })
     }
 
-    fn work_transition(
+    fn work_transition_with_guard(
         &self,
         actor: &WorkTransitionActor<'_>,
         request: &WorkTransitionRequest,
+        guard: Option<(&str, Option<&str>, Option<&str>)>,
         now: i64,
     ) -> Result<WorkTransitionResult> {
         request.validate()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+        if let Some((token, session, incarnation)) = guard {
+            let native_session = session_name(&mut tx, token, session, now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
+        }
             let who = match actor {
                 WorkTransitionActor::Agent { token } => work_who(&mut tx, token, now)?,
                 WorkTransitionActor::Person {
@@ -11930,6 +12138,15 @@ impl Store for PgStore {
             let acting =
                 work_transition::classify(&item, &who, actor, request.session.as_deref())?
                     .ok_or(HubError::Unauthorized)?;
+            if matches!(actor, WorkTransitionActor::Policy { .. })
+                && request.transition == work_transition::WorkTransitionKind::Complete
+                && tx.execute(
+                    "INSERT INTO hub_work_merge_prompts (work, audience, delivered_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    &[&item.id, &super::merged_holds::HUB_COMPLETE, &now],
+                )? == 0
+            {
+                return Err(HubError::invalid_or_changed("The Hub already completed this Work once.".into()));
+            }
             let columns_row = tx.query_one(
                 "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = $1",
                 &[&item.id],
@@ -12502,15 +12719,18 @@ impl Store for PgStore {
         })
     }
 
-    fn work_declarations_set(
+    fn work_declarations_set_with_transport(
         &self,
         token: &str,
         update: &WorkDeclarationsUpdate,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkDeclarationsResult> {
         update.validate()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(update.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);
@@ -15623,15 +15843,18 @@ impl Store for PgStore {
         })
     }
 
-    fn coordination_ack(
+    fn coordination_ack_with_transport(
         &self,
         token: &str,
         ack: &CoordinationAck,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest> {
         ack.validate()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(ack.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);
@@ -15716,6 +15939,18 @@ impl Store for PgStore {
                 coordination_payload_bytes(&[&receipt, ""], &event)?,
                 now,
             )?;
+            let source = match &ack.target_work_id {
+                Some(work) => super::agent_messages::coordination_source(
+                    &request,
+                    request
+                        .targets
+                        .iter()
+                        .find(|target| &target.work_id == work)
+                        .ok_or(HubError::Unauthorized)?,
+                )?,
+                None => super::agent_messages::coordination_reply_source(&request)?,
+            };
+            notices::resolve_source(&mut tx, &source, token, &ack.session, now)?;
             let updated = coordination_request_at(&mut tx, &who, &ack.request_id, i64::MAX, now)?
                 .ok_or_else(|| {
                 HubError::Unavailable("coordination request disappeared".into())
@@ -15748,13 +15983,14 @@ impl Store for PgStore {
     ) -> Result<super::work_dependencies::WorkDependencyNoticePage> {
         self.dependency_owner_notices(reader, now)
     }
-    fn work_overlap_start(
+    fn work_overlap_start_with_transport(
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapStart,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult> {
-        self.overlap_start(token, request, false, now)
+        self.overlap_start(token, request, false, incarnation, now)
     }
     fn work_overlap_preflight(
         &self,
@@ -15762,7 +15998,7 @@ impl Store for PgStore {
         request: &super::work_overlap::WorkOverlapStart,
         now: i64,
     ) -> Result<super::work_preflight::WorkPreflightResult> {
-        match self.overlap_start(token, request, true, now) {
+        match self.overlap_start(token, request, true, None, now) {
             Err(HubError::WorkPreflight(result)) => Ok(*result),
             Err(e) => Err(e),
             Ok(_) => Err(HubError::Invalid(
@@ -15770,21 +16006,23 @@ impl Store for PgStore {
             )),
         }
     }
-    fn work_overlap_checkpoint(
+    fn work_overlap_checkpoint_with_transport(
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult> {
-        self.overlap_checkpoint(token, request, now)
+        self.overlap_checkpoint(token, request, incarnation, now)
     }
-    fn work_overlap_consent(
+    fn work_overlap_consent_with_transport(
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapConsentRequest,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<super::work_overlap::WorkOverlapConsentView> {
-        self.overlap_consent(token, request, now)
+        self.overlap_consent(token, request, incarnation, now)
     }
     fn work_overlap_consents(
         &self,
@@ -15795,16 +16033,19 @@ impl Store for PgStore {
     ) -> Result<Vec<super::work_overlap::WorkOverlapConsentView>> {
         self.overlap_consents(token, request_id, session, now)
     }
-    fn coordination_reply(
+    fn coordination_reply_with_transport(
         &self,
         token: &str,
         reply: &CoordinationReply,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest> {
         reply.validate()?;
         let payload = json_string(reply)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(reply.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);
@@ -15919,6 +16160,8 @@ impl Store for PgStore {
                 coordination_payload_bytes(&[&payload, &response, ""], &event)?,
                 now,
             )?;
+            let source = super::agent_messages::coordination_source(&request, target)?;
+            notices::resolve_source(&mut tx, &source, token, &reply.session, now)?;
             let updated = coordination_request_at(&mut tx, &who, &reply.request_id, i64::MAX, now)?
                 .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()))?;
             tx.commit()?;
@@ -15926,16 +16169,19 @@ impl Store for PgStore {
         })
     }
 
-    fn coordination_resolve(
+    fn coordination_resolve_with_transport(
         &self,
         token: &str,
         resolve: &CoordinationResolve,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest> {
         resolve.validate()?;
         let payload = json_string(resolve)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session = session_name(&mut tx, token, Some(resolve.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);
@@ -16087,15 +16333,19 @@ impl Store for PgStore {
         })
     }
 
-    fn coordination_withdraw(
+    fn coordination_withdraw_with_transport(
         &self,
         token: &str,
         withdraw: &CoordinationWithdraw,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest> {
         withdraw.validate()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let native_session =
+                session_name(&mut tx, token, Some(withdraw.session.as_str()), now)?;
+            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             if who.read_only {
                 return Err(HubError::Unauthorized);

@@ -1396,14 +1396,8 @@ async fn loopback_login(
         .map_err(|_| invalid("sign-in wait failed"))??;
     let code = match returned {
         Returned::Code(code) => code,
-        Returned::Refused(kind, message) => {
-            let mut page =
-                reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
-            page.query_pairs_mut()
-                .append_pair("status", "refused")
-                .append_pair("reason", &kind);
-            let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
-            let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
+        Returned::Refused(_kind, message) => {
+            let _ = tokio::task::spawn_blocking(move || complete_browser(browser, false)).await;
             return Err(invalid(if message.is_empty() {
                 "The Hub refused the sign-in; run it again"
             } else {
@@ -1421,49 +1415,28 @@ async fn loopback_login(
         let body = json!({"code": code, "verifier": verifier});
         reply = call(client, Method::POST, &url, None, Some(body)).await;
     }
-    // The browser lands on the Hub's page saying who signed in, or why not.
-    let mut page = reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
-    match &reply {
-        Ok((200, signed)) => {
-            let mut pairs = page.query_pairs_mut();
-            pairs.append_pair("status", "signed_in");
-            for (key, value) in [
-                ("login", &signed["user"]["login"]),
-                ("provider", &signed["user"]["provider"]),
-                ("computer", &signed["device"]["name"]),
-            ] {
-                if let Some(value) = value.as_str() {
-                    pairs.append_pair(key, value);
-                }
-            }
-        }
-        // The reason alone: anyone can forge the page's link, so the page words it itself.
-        Ok((_, refused)) => {
-            page.query_pairs_mut()
-                .append_pair("status", "refused")
-                .append_pair(
-                    "reason",
-                    refused["error"].as_str().unwrap_or("login_failed"),
-                );
-        }
-        Err(_) => {
-            page.query_pairs_mut()
-                .append_pair("status", "refused")
-                .append_pair("reason", "login_failed");
-        }
-    }
-    let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
-    tokio::task::spawn_blocking(move || redirect_browser(browser, &location));
+    // Finish in the existing callback; a headless Hub has no dashboard to redirect to.
+    let signed_in = matches!(&reply, Ok((200, _)));
+    let _ = tokio::task::spawn_blocking(move || complete_browser(browser, signed_in)).await;
     match reply? {
         (200, signed) => Ok(signed),
         (_, refused) => Err(sign_in_failed(&refused)),
     }
 }
 
-fn redirect_browser(mut stream: std::net::TcpStream, location: &str) {
+fn complete_browser(mut stream: std::net::TcpStream, signed_in: bool) {
+    let message = if signed_in {
+        "Sign-in accepted. Return to your terminal to finish setup. You can close this window."
+    } else {
+        "Sign-in did not finish. Return to your terminal for the reason and next step."
+    };
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>AgentSCM sign-in</title><h1>AgentSCM sign-in</h1><p>{message}</p></html>"
+    );
     let _ = write!(
         stream,
-        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Security-Policy: default-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
 }
 
@@ -1702,6 +1675,7 @@ impl HubAuth {
 
     /// The request that mints a token for `repository`. A computer's tokens get the Hub's
     /// lifetime (24 hours, or 30 minutes read-only); a session asks for `ttl_seconds`.
+    #[cfg(feature = "ui")]
     pub(crate) fn mint(
         &self,
         hub: &str,

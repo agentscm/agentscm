@@ -5406,7 +5406,14 @@ async fn synthetic_browser_authorize_page_uses_exact_registered_loopback_callbac
         .await
         .unwrap();
     assert_eq!(selected.status().as_u16(), 302);
-    assert_eq!(selected.headers()[header::LOCATION], "/ui/#workspace");
+    assert_eq!(
+        selected.headers()[header::LOCATION],
+        if cfg!(feature = "ui") {
+            "/ui/#workspace"
+        } else {
+            "/auth/complete/#workspace"
+        }
+    );
     let mut wrong = authorize.clone();
     let params: Vec<_> = authorize
         .query_pairs()

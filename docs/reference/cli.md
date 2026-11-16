@@ -4,7 +4,7 @@ title: "Native CLI reference"
 
 # Native CLI reference
 
-> **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [connected local page](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
+> **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [this computer's controls](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
 
 `agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `hub whoami`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists the remaining visible commands, such as `serve`, `hub`, `client`, `work`, `intent`, `collisions` and `autopsy`. Most native and experimental commands are hidden from both lists, among them `change-capture`, `attached-worktree`, `agent-task`, `local-ci`, `local-validation`, `skill`, `skill-workflow`, `pipeline`, `continuation`, `operating-policy`, `git-export`, `git-snapshot`, `init`, `files`, `approve`, `workspace`, `sync` and the `check-*` commands. All of them keep working by name, and `agentscm COMMAND --help` prints any command's usage, where the experimental ones are marked "[experimental]". `workflow`, `recovery`, `team` and `package-native` are internal to the alpha, as is the `git-remote-credential` helper. `setup` is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other internal commands are not documented here.
 
@@ -479,9 +479,27 @@ agentscm telemetry configure --clear-endpoint
 agentscm demo [--no-open]
 ```
 
-`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints a link to its status page. It never writes to the repository. Its last line, and the status page banner, name the next step: `agentscm quickstart` (or `npx agentscm`) for the guided setup. `--no-open` does not open a browser.
+`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints the scripted results in the terminal. It never writes to the repository. Its last line names `agentscm quickstart` (or `npx agentscm`) for setup. Native builds have no dashboard or browser launch; builds with the `ui` feature additionally print a demonstration page link, and `--no-open` suppresses opening it.
 
 ## Agent wiring
+
+```sh
+agentscm client status --check --json
+agentscm client doctor
+agentscm client service start
+agentscm client service stop
+agentscm client service status
+agentscm client run
+```
+
+`service` controls the same native executable's macOS user resident. `stop` persists across login
+and setup/update; only an explicit `start` enables it again. `status` separates invoked, installed
+and running versions and reports retained handoff recovery. The ordinary client status adds bounded
+pending/stalled journal coverage. `run` is the explicit Unix foreground maintenance loop; it runs
+no model, starts no agent and exposes no listener. Linux managed startup is not implemented;
+Windows retains next-call hooks/MCP behavior. Native hook waiters remain the transport for notices,
+and receipt acknowledgement remains an operation of the actual recipient. See
+[computer controls](../connect-this-computer.md) for setup/update and cleanup limits.
 
 ```sh
 agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--yes]

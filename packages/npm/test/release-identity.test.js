@@ -67,7 +67,7 @@ for (const [name, repository, environment] of [
 
 test('all release jobs require the immutable public repository identity', () => {
   const workflow = fs.readFileSync(path.join(source, '.github/workflows/release.yml'), 'utf8');
-  assert.equal(workflow.match(/if: \$\{\{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private \}\}/g)?.length, 7);
+  assert.equal(workflow.match(/if: \$\{\{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private \}\}/g)?.length, 6);
   assert.equal(workflow.match(/node \.github\/pin-release-installers.js/g)?.length, 2);
   assert.doesNotMatch(workflow, /github.repository ==/);
 });

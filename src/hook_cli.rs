@@ -243,6 +243,18 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let end_cleanup = if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        let at = agentscm::hub::store::unix_now();
+        crate::client_session::cleanup_fence(&config, session)
+            .ok()
+            .map(|fence| (config, fence, at))
+    } else {
+        None
+    };
     let configured = agent;
     let Some(agent) = crate::client_session::hook_agent(configured, &payload).await else {
         eprintln!(
@@ -289,7 +301,23 @@ async fn hook(
         false
     };
     let payload = std::sync::Arc::new(payload);
+    let end_contexts = matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    )
+    .then(|| {
+        end_cleanup
+            .as_ref()
+            .map(|(_, fence, _)| (fence.end_contexts().to_vec(), fence.complete()))
+            .unwrap_or_default()
+    });
     let session_start = is_session_start(agent, &payload);
+    if client_connection
+        && let Some((config, fence, at)) = &end_cleanup
+        && remember_session_end_in(config, agent, &payload, fence, *at).is_err()
+    {
+        eprintln!("AgentSCM: terminal observation could not be retained; coordination is unknown.");
+    }
     let host_session = host_session(agent, &payload);
     #[cfg(unix)]
     let wants_capture = client_connection
@@ -353,6 +381,7 @@ async fn hook(
             destination_args,
             body.clone(),
             std::sync::Arc::clone(&payload),
+            end_contexts,
             started,
         )
         .await
@@ -375,12 +404,8 @@ async fn hook(
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
     }
-    if matches!(
-        payload["hook_event_name"].as_str(),
-        Some("SessionEnd" | "sessionEnd")
-    ) && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
-    {
-        crate::client_session::forget(&config, session);
+    if let Some((config, fence, _)) = end_cleanup {
+        let _ = crate::client_session::forget(&config, &fence);
     }
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
@@ -524,6 +549,24 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
         }));
     }
     None
+}
+
+fn remember_session_end_in(
+    config: &Path,
+    agent: &str,
+    payload: &Value,
+    fence: &crate::client_session::CleanupFence,
+    at: i64,
+) -> Result<(), String> {
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) && session_of(payload).is_some()
+    {
+        crate::client_cooperation::remember_end(config, agent, fence, at)
+            .map_err(|_| "terminal observation unavailable".to_owned())?;
+    }
+    Ok(())
 }
 
 /// Remembers which connection this session's hooks route to, so the checkout's MCP server names
@@ -672,6 +715,7 @@ async fn coordinate(
     destination_args: bool,
     body: Vec<u8>,
     payload: std::sync::Arc<Value>,
+    end_contexts: Option<(Vec<crate::client_session::SessionContext>, bool)>,
     started: Instant,
 ) -> Value {
     let mut deadline = started + LIMIT;
@@ -717,6 +761,7 @@ async fn coordinate(
             observed: observed.clone(),
             deadline,
             report: report.header(),
+            end_contexts,
         },
     ));
     let result = tokio::time::timeout(remaining, &mut call).await;
@@ -842,6 +887,7 @@ struct HubCallContext {
     observed: ObservedSlot,
     deadline: Instant,
     report: Option<String>,
+    end_contexts: Option<(Vec<crate::client_session::SessionContext>, bool)>,
 }
 
 async fn call_hub(
@@ -859,6 +905,7 @@ async fn call_hub(
         observed: observed_slot,
         deadline,
         report,
+        end_contexts,
     } = context;
     let supported_client = agentscm::clients::find(&agent).is_some();
     if client_connection && destination_args {
@@ -913,6 +960,18 @@ async fn call_hub(
                 routed = route_client(&agent, &payload)?;
             }
             record_session_route(&payload, &routed.connection);
+            if end_contexts.is_none()
+                && let Some(session) = session_of(&payload)
+            {
+                let _ = crate::client_cooperation::prepare(
+                    &routed.connection,
+                    &agent,
+                    session,
+                    session_start,
+                    payload["hook_event_name"].as_str().unwrap_or(""),
+                )
+                .await;
+            }
             let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
             if !conflicted.is_empty() {
                 routed.edits.retain(|edit| !conflicted.contains(&edit.path));
@@ -1010,7 +1069,31 @@ async fn call_hub(
         // Preserve the legacy transport contract, including original JSON bytes.
         original_body
     };
+    let native_context = match (&client_connection, &end_contexts) {
+        (Some(connection), Some((contexts, complete))) => {
+            crate::client_cooperation::end_transport_context(connection, contexts, *complete)
+                .map_err(|_| "native end identity unavailable or changed")?
+        }
+        (Some(connection), None) => session_of(&payload)
+            .and_then(|session| crate::client_cooperation::transport_context(connection, session)),
+        _ => None,
+    };
     let request = HookRequest {
+        native: native_context
+            .as_ref()
+            .map(|context| agentscm::hub::cooperation::NativeMetadata {
+                session: context.session.clone(),
+                incarnation: context.incarnation.clone().expect("validated incarnation"),
+            })
+            .or_else(|| {
+                end_contexts
+                    .as_ref()
+                    .and_then(|_| session_of(&payload))
+                    .map(|session| agentscm::hub::cooperation::NativeMetadata {
+                        session: session.into(),
+                        incarnation: agentscm::hub::session_lifecycle::EXPECT_NO_LIFECYCLE.into(),
+                    })
+            }),
         agent: path_segment(&endpoint_agent),
         repo,
         client: client_connection
@@ -1048,6 +1131,13 @@ async fn call_hub(
     };
     match status {
         200 if reply.is_object() => {
+            if matches!(
+                payload["hook_event_name"].as_str(),
+                Some("SessionEnd" | "sessionEnd")
+            ) && let (Some(connection), Some(expected)) = (&client_connection, &native_context)
+            {
+                let _ = crate::client_cooperation::finish_hook(connection, expected).await;
+            }
             let reply = match table(&agent) {
                 _ if agent == "gemini" && plugin_route => gemini_reply(reply, &payload),
                 Some(table) if plugin_route => table_reply(table, reply, &payload),
@@ -2112,6 +2202,8 @@ pub(crate) async fn forward_questions(
     let token = crate::client_cli::read_token(&connection.token_file).map_err(|_| "no token")?;
     let request = HookRequest {
         agent: "codex".into(),
+        // A retained question snapshot is observation, not current-session activity.
+        native: None,
         repo: Some(connection.repo.clone()),
         client: Some(client_config::onboarding_client(&connection.root, &token)),
         token,
@@ -5442,10 +5534,42 @@ mod tests {
         // The end event drops the record first (as `host_session` does) and must not rewrite it.
         for name in ["SessionEnd", "sessionEnd"] {
             record_session_route_in(config.path(), &event("PreToolUse"), &connection);
-            crate::client_session::forget(config.path(), "s-1");
+            let fence = crate::client_session::cleanup_fence(config.path(), "s-1").unwrap();
+            crate::client_session::forget(config.path(), &fence).unwrap();
             record_session_route_in(config.path(), &event(name), &connection);
             assert_eq!(route(), None, "{name}");
         }
+    }
+
+    #[test]
+    fn failed_session_end_cleanup_retains_the_lifecycle_intent_and_route() {
+        let config = tempfile::tempdir().unwrap();
+        let context:crate::client_session::SessionContext=serde_json::from_value(json!({"session":"s-1","start_nonce":"nonce","incarnation":"inc","agent":"codex","hub":"https://hub.example.test","repo":"acme/widgets","root":"/synthetic/repo","protocol":1,"registered":true,"observed_at":10,"host":null,"credential_id":"token-id","binding_id":"binding"})).unwrap();
+        crate::client_session::save_context(config.path(), &context).unwrap();
+        let event = json!({"hook_event_name":"SessionEnd","session_id":"s-1"});
+        let fence = crate::client_session::cleanup_fence(config.path(), "s-1").unwrap();
+        remember_session_end_in(config.path(), "codex", &event, &fence, 20).unwrap();
+        // The ordinary Hub request failed or exceeded its deadline before any successful reply.
+        crate::client_session::forget(config.path(), &fence).unwrap();
+        let saved =
+            crate::client_session::context(config.path(), "s-1", &context.hub, &context.repo)
+                .unwrap()
+                .unwrap();
+        assert!(saved.explicit_end_requested);
+        assert!(saved.exit_observed_at.is_some());
+        assert_eq!(saved.start_nonce, context.start_nonce);
+        assert_eq!(saved.incarnation, context.incarnation);
+        let journal = crate::client_journal::inspect(config.path()).unwrap();
+        assert_eq!(journal.records.len(), 1);
+        assert_eq!(
+            journal.records[0].kind,
+            crate::client_journal::Kind::TerminalEnd
+        );
+        assert_eq!(journal.records[0].payload["end_intent"], true);
+        assert!(
+            crate::client_session::route_of(config.path(), "s-1", &context.hub, &context.repo)
+                .is_some()
+        );
     }
 
     fn git_repo(parent: &Path, name: &str) -> PathBuf {
@@ -5872,6 +5996,7 @@ mod tests {
         )
         .unwrap();
         let request = HookRequest {
+            native: None,
             agent: "codex".into(),
             repo: Some("acme/widgets".into()),
             token: "synthetic-token".into(),

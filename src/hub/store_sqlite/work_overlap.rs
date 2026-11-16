@@ -93,12 +93,14 @@ impl SqliteStore {
         &self,
         token: &str,
         input: &WorkOverlapConsentRequest,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkOverlapConsentView> {
         let paths = input.validate()?;
         let payload = json_string(input)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        session_lifecycle::check(&tx, token, &input.session, incarnation, now)?;
         let who = work_who(&tx, token, now)?;
         if who.read_only {
             return Err(HubError::Unauthorized);
@@ -386,10 +388,14 @@ impl SqliteStore {
         token: &str,
         input: &crate::hub::work_overlap::WorkOverlapStart,
         preflight_only: bool,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !preflight_only {
+            session_lifecycle::check(&tx, token, &input.start.session, incarnation, now)?;
+        }
         let who = work_who(&tx, token, now)?;
         if who.read_only {
             return Err(HubError::Unauthorized);
@@ -479,10 +485,12 @@ impl SqliteStore {
         &self,
         token: &str,
         input: &crate::hub::work_overlap::WorkOverlapCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        session_lifecycle::check(&tx, token, &input.checkpoint.session, incarnation, now)?;
         let who = work_who(&tx, token, now)?;
         if who.read_only {
             return Err(HubError::Unauthorized);

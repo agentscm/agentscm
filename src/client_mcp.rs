@@ -2,7 +2,7 @@
 //! connection is its default; a tool call that names another connected checkout goes to that
 //! repository's connection instead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Map, Value, json};
 
+use agentscm::hub::cooperation::{INCARNATION_HEADER, NativeMetadata, SESSION_HEADER};
 use agentscm::hub::forge_http::{self, send_full};
 use agentscm::{Error, Result};
 
@@ -205,6 +206,7 @@ async fn forward(
     body: Vec<u8>,
     client_id: &str,
     report_completion: bool,
+    native: Option<&NativeMetadata>,
 ) -> Result<(u16, bool, Value)> {
     let request = client
         .post(url.clone())
@@ -212,6 +214,12 @@ async fn forward(
         .header(agentscm::hub::onboarding::CLIENT_HEADER, client_id)
         .header(CONTENT_TYPE, "application/json")
         .body(body);
+    let request = match native {
+        Some(native) => request
+            .header(INCARNATION_HEADER, &native.incarnation)
+            .header(SESSION_HEADER, &native.session),
+        None => request,
+    };
     let request = crate::client_config::with_completion_reporting(request, report_completion);
     let reply = send_full(request, RESPONSE_BYTES)
         .await
@@ -488,6 +496,54 @@ struct Sent<'a> {
 }
 
 /// What the server knows about the agent it serves, apart from its default connection.
+type NativeKey = (String, String, PathBuf);
+
+fn native_key(connection: &Connection) -> NativeKey {
+    (
+        connection.hub.clone(),
+        connection.repo.to_ascii_lowercase(),
+        connection.root.clone(),
+    )
+}
+
+/// An existing MCP process cannot adopt a resumed chat's newer incarnation, even from local files.
+fn pin_native(
+    bindings: &mut HashMap<NativeKey, Option<NativeMetadata>>,
+    key: NativeKey,
+    observed: impl FnOnce() -> Option<NativeMetadata>,
+) -> Option<NativeMetadata> {
+    bindings.entry(key).or_insert_with(observed).clone()
+}
+
+/// Discovery can precede SessionStart. Only an actual ancestor association, established
+/// hookless session, or first session-bearing call freezes a legacy/current binding.
+fn pin_recorded_native(
+    bindings: &mut HashMap<NativeKey, Option<NativeMetadata>>,
+    key: NativeKey,
+    recorded: Recorded,
+    established_legacy: bool,
+    observed: impl FnOnce(String) -> Option<NativeMetadata>,
+) -> Option<NativeMetadata> {
+    if let Some(bound) = bindings.get(&key).cloned() {
+        if let (Some(previous), Recorded::One(session)) = (&bound, recorded)
+            && let Some(current) = observed(session)
+            && (previous.session != current.session || previous.incarnation != current.incarnation)
+        {
+            // A genuine successor in the same ancestor host keeps calls usable, but this
+            // surviving MCP process never adopts the successor's qualified identity.
+            bindings.insert(key, None);
+            return None;
+        }
+        return bound;
+    }
+    match recorded {
+        Recorded::One(session) => pin_native(bindings, key, || observed(session)),
+        Recorded::Several => pin_native(bindings, key, || None),
+        Recorded::None if established_legacy => pin_native(bindings, key, || None),
+        Recorded::None => None,
+    }
+}
+
 struct Client {
     http: reqwest::Client,
     /// Where the server started. Relative paths are read against it.
@@ -498,6 +554,10 @@ struct Client {
     ancestors: Option<Vec<Process>>,
     /// The session of a client without hooks, made once so it is the same for every call.
     own_session: Option<String>,
+    /// Captured outside model arguments once per routed native association; None stays legacy.
+    native_bindings: HashMap<NativeKey, Option<NativeMetadata>>,
+    /// The actual forwarded credential, including while discovery awaits SessionStart.
+    native_credentials: HashMap<NativeKey, String>,
     /// The tools that take `session`, from the last `tools/list`.
     session_tools: HashSet<String>,
     /// The server answered `initialize` or `tools/list` itself because the Hub did not; the
@@ -515,6 +575,8 @@ impl Client {
             name: None,
             ancestors: None,
             own_session: None,
+            native_bindings: HashMap::new(),
+            native_credentials: HashMap::new(),
             // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
             session_tools: session_tools(&agentscm::hub::mcp::session_agent_tools()),
             answered_locally: false,
@@ -542,6 +604,69 @@ impl Client {
                 )
             }
         }
+    }
+
+    fn native_metadata(
+        &mut self,
+        connection: &Connection,
+        token: &str,
+        session_call: bool,
+    ) -> Option<NativeMetadata> {
+        let key = native_key(connection);
+        let credential = crate::client_config::onboarding_client(&connection.root, token);
+        if let Some(previous) = self
+            .native_credentials
+            .insert(key.clone(), credential.clone())
+            && previous != credential
+        {
+            // A permitted managed renewal keeps ordinary calls working, but cannot transfer
+            // the previous credential's incarnation or adopt a successor native start.
+            self.native_bindings.insert(key.clone(), None);
+        }
+        if matches!(self.native_bindings.get(&key), Some(None)) {
+            return None;
+        }
+        // Only the recorded native ancestor association supplies transport identity.
+        let config = crate::hub_cli::config_dir().ok();
+        let ancestors = self.ancestors.get_or_insert_with(client_session::ancestors);
+        let recorded = config.as_ref().map_or(Recorded::None, |config| {
+            client_session::recorded(config, ancestors)
+        });
+        pin_recorded_native(
+            &mut self.native_bindings,
+            key,
+            recorded,
+            self.own_session.is_some() || session_call,
+            |session| {
+                let context = client_session::context(
+                    config.as_ref()?,
+                    &session,
+                    &connection.hub,
+                    &connection.repo,
+                )
+                .ok()??;
+                let now = agentscm::hub::store::unix_now();
+                // Match the token selected for this request, never a second token-file read.
+                // Capability freshness matches the native negotiation's five-minute bound.
+                if context.root != connection.root
+                    || context.repo != connection.repo
+                    || context.binding_id != credential
+                    || context.credential_id
+                        != connection.owned_token_id.as_deref().unwrap_or(&credential)
+                    || context.terminal
+                    || context.revoked
+                    || !context.registered
+                    || context.protocol != 1
+                    || !(0..=300).contains(&now.saturating_sub(context.protocol_checked_at))
+                {
+                    return None;
+                }
+                Some(NativeMetadata {
+                    session,
+                    incarnation: context.incarnation?,
+                })
+            },
+        )
     }
 
     /// Completes a tool call: routes it, and names its session when it names none. Returns the
@@ -642,6 +767,12 @@ impl Client {
                 Err(reason) => return refuse(id.as_ref(), &reason, writer),
             }
         }
+        // The tool contract says this call bears a session; its model-supplied value is
+        // never transport identity. Discovery without a native record remains pending.
+        let session_call = method == "tools/call"
+            && message["params"]["name"]
+                .as_str()
+                .is_some_and(|name| self.session_tools.contains(name));
         let reply = match (&elsewhere, default) {
             (Some((connection, checkout)), _) => {
                 let token = match open(connection, checkout) {
@@ -652,14 +783,25 @@ impl Client {
                     connection,
                     token: &token,
                 };
-                exchange(&self.http, &sent, body, id.clone(), writer).await?
+                let native = self.native_metadata(sent.connection, sent.token, session_call);
+                exchange(&self.http, &sent, body, id.clone(), native.as_ref(), writer).await?
             }
             // A host drops a server whose `initialize` fails and never retries it, so while the
             // Hub cannot answer, the server answers `initialize` and `tools/list` itself and each
             // tool call reports the outage. Every request is sent again, so it recovers by itself.
             (None, Some(default)) if local_result(&message, HUB_UNAVAILABLE).is_some() => {
+                let native = self.native_metadata(default.connection, default.token, session_call);
                 let mut failed = Vec::new();
-                match exchange(&self.http, default, body, id.clone(), &mut failed).await? {
+                match exchange(
+                    &self.http,
+                    default,
+                    body,
+                    id.clone(),
+                    native.as_ref(),
+                    &mut failed,
+                )
+                .await?
+                {
                     Some(reply) => Some(reply),
                     None => {
                         self.answered_locally = true;
@@ -676,7 +818,16 @@ impl Client {
                 }
             }
             (None, Some(default)) => {
-                exchange(&self.http, default, body, id.clone(), writer).await?
+                let native = self.native_metadata(default.connection, default.token, session_call);
+                exchange(
+                    &self.http,
+                    default,
+                    body,
+                    id.clone(),
+                    native.as_ref(),
+                    writer,
+                )
+                .await?
             }
             (None, None) => return refuse(id.as_ref(), STILL_CONNECTING, writer),
         };
@@ -958,6 +1109,7 @@ async fn exchange(
     sent: &Sent<'_>,
     body: Vec<u8>,
     id: Option<Value>,
+    native: Option<&NativeMetadata>,
     writer: &mut impl Write,
 ) -> Result<Option<Value>> {
     let &Sent { connection, token } = sent;
@@ -969,6 +1121,7 @@ async fn exchange(
         body,
         &client_id,
         connection.report_completion,
+        native,
     )
     .await;
     match (id, forwarded) {
@@ -1469,6 +1622,11 @@ mod tests {
         })
         .collect();
         std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::set_permissions(
+            config.join("agentscm"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(
             config.join("agentscm").join("connections.json"),
             json!({"version": 1, "connections": connections}).to_string(),
@@ -1615,6 +1773,11 @@ mod tests {
             })
             .collect();
         std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::set_permissions(
+            config.join("agentscm"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(
             config.join("agentscm").join("connections.json"),
             json!({"version": 1, "connections": connections}).to_string(),
@@ -1959,6 +2122,380 @@ mod tests {
             }
             assert!(listener.accept().is_err());
         }
+    }
+
+    #[test]
+    fn discovery_before_the_start_hook_leaves_the_native_binding_pending() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        let key = native_key(&connection);
+        let mut bindings = HashMap::new();
+        // initialize/tools/list before SessionStart has no native association yet.
+        for _ in 0..2 {
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::None,
+                    false,
+                    |_| panic!("discovery has no native identity"),
+                )
+                .is_none()
+            );
+            assert!(!bindings.contains_key(&key));
+        }
+        let current = pin_recorded_native(
+            &mut bindings,
+            key.clone(),
+            Recorded::One("native".into()),
+            false,
+            |session| {
+                Some(NativeMetadata {
+                    session,
+                    incarnation: "first".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(current.session, "native");
+        assert_eq!(current.incarnation, "first");
+        assert_eq!(
+            pin_recorded_native(
+                &mut bindings,
+                key,
+                Recorded::One("native".into()),
+                false,
+                |session| Some(NativeMetadata {
+                    session,
+                    incarnation: "first".into()
+                }),
+            )
+            .unwrap()
+            .incarnation,
+            "first"
+        );
+    }
+
+    #[test]
+    fn surviving_native_client_downgrades_on_clear_or_compaction_without_adopting_successor() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        for next_session in ["native", "cleared-chat"] {
+            let key = native_key(&connection);
+            let mut bindings = HashMap::new();
+            let initial = pin_recorded_native(
+                &mut bindings,
+                key.clone(),
+                Recorded::One("native".into()),
+                true,
+                |session| {
+                    Some(NativeMetadata {
+                        session,
+                        incarnation: "first".into(),
+                    })
+                },
+            );
+            assert_eq!(initial.unwrap().incarnation, "first");
+            // Unavailable state is not evidence of a new start.
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::One("native".into()),
+                    true,
+                    |_| None
+                )
+                .is_some()
+            );
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::One(next_session.into()),
+                    true,
+                    |session| Some(NativeMetadata {
+                        session,
+                        incarnation: "successor".into()
+                    })
+                )
+                .is_none()
+            );
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key,
+                    Recorded::One(next_session.into()),
+                    true,
+                    |_| panic!("the old process remains legacy")
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn established_legacy_or_ambiguous_native_bindings_never_upgrade() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        for (recorded, established) in [
+            (Recorded::None, true), // Hookless own session or first session-bearing call.
+            (Recorded::Several, false),
+            (Recorded::One("native".into()), false), // Associated legacy hook.
+        ] {
+            let key = native_key(&connection);
+            let mut bindings = HashMap::new();
+            assert!(
+                pin_recorded_native(&mut bindings, key.clone(), recorded, established, |_| None,)
+                    .is_none()
+            );
+            assert!(bindings.contains_key(&key));
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key,
+                    Recorded::One("native".into()),
+                    false,
+                    |_| panic!("an established legacy binding cannot adopt a new incarnation"),
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn native_binding_pins_incarnation_and_legacy_without_model_identity() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        let key = native_key(&connection);
+        let mut bindings = HashMap::new();
+        let first = pin_native(&mut bindings, key.clone(), || {
+            Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "old".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(first.incarnation, "old");
+        let resumed = pin_native(&mut bindings, key.clone(), || {
+            Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "new".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(resumed.incarnation, "old");
+        let mut legacy = HashMap::new();
+        assert!(pin_native(&mut legacy, key.clone(), || None).is_none());
+        assert!(
+            pin_native(&mut legacy, key, || Some(NativeMetadata {
+                session: "caller-claimed".into(),
+                incarnation: "new".into()
+            }))
+            .is_none()
+        );
+        let other = saved("http://127.0.0.2".into(), "/checkout", "acme/widgets");
+        assert_eq!(
+            pin_native(&mut bindings, native_key(&other), || Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "other-hub".into()
+            }))
+            .unwrap()
+            .incarnation,
+            "other-hub"
+        );
+    }
+
+    #[cfg(unix)]
+    fn native_context(connection: &Connection, token: &str) -> client_session::SessionContext {
+        let binding = crate::client_config::onboarding_client(&connection.root, token);
+        let now = agentscm::hub::store::unix_now();
+        client_session::SessionContext {
+            session: "native-renewal".into(),
+            start_nonce: "original-start".into(),
+            incarnation: Some("original-incarnation".into()),
+            agent: "codex".into(),
+            hub: connection.hub.clone(),
+            repo: connection.repo.clone(),
+            root: connection.root.clone(),
+            protocol: 1,
+            protocol_checked_at: now,
+            terminal: false,
+            registered: true,
+            qualification: None,
+            exit_ineligible: false,
+            revoked: false,
+            exit_observed_at: None,
+            explicit_end_requested: false,
+            observed_at: now,
+            host: None,
+            registration_host: None,
+            credential_id: connection
+                .owned_token_id
+                .clone()
+                .unwrap_or_else(|| binding.clone()),
+            binding_id: binding,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_renewal_keeps_next_calls_without_transferring_native_identity() {
+        crate::client_config::in_isolated_config_home(|config| {
+            use std::os::unix::fs::PermissionsExt;
+            let answer =
+                r#"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+            let (hub, requests) = servers(&[(200, "application/json", answer); 3]);
+            let (_dir, [root, _, _]) = checkouts(config, [&hub, &hub]);
+            let mut connection = selected(&root, &load().unwrap()).unwrap();
+            connection.owned_token_id = Some("tok_original".into());
+            connection.owned_token_expires_at = Some(agentscm::hub::store::unix_now() + 3600);
+            connection.token_file =
+                crate::client_config::owned_token_path(&connection, "tok_original").unwrap();
+            crate::hub_cli::write_private(&connection.token_file, "token-widgets").unwrap();
+            let save_connection = |saved: &Connection| {
+                std::fs::write(
+                    config.join("agentscm/connections.json"),
+                    json!({"version":1,"connections":[saved]}).to_string(),
+                )
+                .unwrap();
+            };
+            save_connection(&connection);
+            load().unwrap();
+            let context = native_context(&connection, "token-widgets");
+            client_session::save_context(config, &context).unwrap();
+            let host = Process {
+                pid: 300,
+                started: "synthetic-native-start".into(),
+                name: "codex".into(),
+            };
+            client_session::record_under(
+                &client_session::directory(config),
+                &host,
+                &context.session,
+            )
+            .unwrap();
+            let mut client = client(&root);
+            client.name = Some("codex".into());
+            client.ancestors = Some(vec![host]);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let input = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agentscm_status","arguments":{}}}
+"#;
+            let mut verified = None;
+            for step in 0..3 {
+                if step == 1 {
+                    // Model the actual managed connection replacement, retaining the old token
+                    // file so a second read through the process's old Connection would be wrong.
+                    let token_file =
+                        crate::client_config::owned_token_path(&connection, "tok_renewed").unwrap();
+                    std::fs::write(&token_file, "renewed-token").unwrap();
+                    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    save_connection(&Connection {
+                        token_file,
+                        owned_token_id: Some("tok_renewed".into()),
+                        owned_token_expires_at: Some(agentscm::hub::store::unix_now() + 7200),
+                        ..connection.clone()
+                    });
+                    load().unwrap();
+                } else if step == 2 {
+                    let renewed = selected(&root, &load().unwrap()).unwrap();
+                    let successor = client_session::SessionContext {
+                        start_nonce: "successor-start".into(),
+                        incarnation: Some("successor-incarnation".into()),
+                        ..native_context(&renewed, "renewed-token")
+                    };
+                    client_session::begin_context(config, Some(&context.start_nonce), &successor)
+                        .unwrap();
+                }
+                let mut reader = Cursor::new(input.as_bytes());
+                let mut output = Vec::new();
+                runtime
+                    .block_on(serve(
+                        &connection,
+                        "token-widgets",
+                        None,
+                        &mut reader,
+                        &mut output,
+                        || current_token(&connection, &root, "token-widgets", &mut verified),
+                        &mut client,
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output).unwrap()["result"]["content"][0]["text"],
+                    "ok"
+                );
+                let request = requests.recv().unwrap().to_ascii_lowercase();
+                if step == 0 {
+                    assert!(request.contains("authorization: bearer token-widgets"));
+                    assert!(request.contains("x-agentscm-incarnation: original-incarnation"));
+                } else {
+                    assert!(request.contains("authorization: bearer renewed-token"));
+                    assert!(!request.contains("x-agentscm-session:"));
+                    assert!(!request.contains("x-agentscm-incarnation:"));
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_native_metadata_matches_the_sent_token_not_a_token_file_reread() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let (_dir, [root, _, _]) = checkouts(config, ["https://hub.example"; 2]);
+            let connection = selected(&root, &load().unwrap()).unwrap();
+            let context = native_context(&connection, "token-widgets");
+            client_session::save_context(config, &context).unwrap();
+            let host = Process {
+                pid: 300,
+                started: "synthetic-native-start".into(),
+                name: "codex".into(),
+            };
+            client_session::record_under(
+                &client_session::directory(config),
+                &host,
+                &context.session,
+            )
+            .unwrap();
+            let mut client = client(&root);
+            client.ancestors = Some(vec![host]);
+            assert!(
+                client
+                    .native_metadata(&connection, "renewed-token", true)
+                    .is_none()
+            );
+            // Even returning to the old credential cannot upgrade this established legacy route.
+            assert!(
+                client
+                    .native_metadata(&connection, "token-widgets", true)
+                    .is_none()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn transport_headers_use_pinned_context_not_tool_arguments() {
+        let (hub, request) = server(
+            200,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":7,"result":{"content":[]}}"#,
+        );
+        let connection = saved(hub, "/checkout", "acme/widgets");
+        let mut client = client(Path::new("/checkout"));
+        client.native_bindings.insert(
+            native_key(&connection),
+            Some(NativeMetadata {
+                session: "actual-native".into(),
+                incarnation: "pinned-incarnation".into(),
+            }),
+        );
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"agentscm_status\",\"arguments\":{\"session\":\"model-claimed\"}}}\n";
+        let _ = proxied_as(input, &connection, "private-token", &mut client).await;
+        let request = request.recv().unwrap().to_ascii_lowercase();
+        assert!(request.contains("x-agentscm-session: actual-native"));
+        assert!(request.contains("x-agentscm-incarnation: pinned-incarnation"));
+        assert!(
+            request.contains("model-claimed"),
+            "domain args stay separate; Hub rejects an identity mismatch"
+        );
     }
 
     #[tokio::test]

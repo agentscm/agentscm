@@ -1363,13 +1363,26 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer, and a Claude Code lead's background waiter wakes it once for one it has not acknowledged (see [Waking an idle Claude Code session](agent-messages.md#waking-an-idle-claude-code-session)). It shows in the Dashboard's Needs you only when that lead is live but has not acknowledged it 10 minutes after it was made: then it is one action for the lead's person (and for the Work's owner, if someone else), naming the request, the files, the requester and the time since which the lead has not responded; that person answers it for their agent from the Inbox, or the owner releases that Work's hold so the asker's next start takes the files. Only the acknowledgement counts as responding: a renewed lease, a checkpoint or a connection that looks live does not. The row every reader sees, the asker's included, says so; before that it says when it will be raised, or that the lead acknowledged it and has not replied. When that lead is paused or quiet it is not raised there, and the [Slack adapter](slack.md) does not send it either (by default Slack sends only `session_waiting`): the refused agent's `agentscm_start` reply says its lead is not running only when that lead's session is also not live; a quiet or paused Work whose session is live can still reply, and a session that could not be checked is reported as unknown. The reply promises no lapse, since a hold can be retained: `agentscm_work_status` says whether it lapses, and the asker reads `agentscm_coordination_inbox` for a reply. Once the target's hold has lapsed the asker's next start takes the files. Between two agents of one person it is never raised: the asking agent asks that person in its session, History (Finished, Changes, Change records, and Files from this
-computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
-Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
-[local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in
-light and dark, and in Spacious and Condensed densities, chosen in the top bar and kept in the browser. The container image serves it (it is built
-with `--features ui`, as are the release binaries); `/` and `/ui` redirect to it. A binary built
-from source without the feature answers `/ui/` with a short notice page and nothing else.
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)),
+History (Finished, Changes, Change records, and Files from this computer), Timeline,
+Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub, Access and Preferences).
+Files, Timeline and Recipes read an explicit local `agentscm serve`, not the hub: see
+[local template and timeline reads](api.md#local-template-and-timeline-reads).
+
+A directed request is addressed to its target's current lead. Supported hooks and MCP calls can
+offer its pointer; a qualified native waiter can attempt idle delivery. Neither proves that the
+agent read it. The Hub raises unresolved requests for the person after their pickup deadline, or
+when it observes a terminal recipient while the requested hold remains. Sharing one owner does
+not suppress that recovery action. Only the recipient's acknowledgement clears the unread
+condition; a lease renewal or checkpoint does not. See
+[messages and continuation notices](agent-messages.md#deadlines-and-recovery) for the bounds and
+native capability limits. Read `agentscm_work_status` and `agentscm_coordination_inbox` for current
+hold and reply state; a deadline grants no takeover authority.
+
+The page comes in light and dark, and in Spacious and Condensed densities, chosen in the top bar
+and kept in the browser. The container image and explicit builds with `--features ui` serve it;
+`/` and `/ui` redirect to it. Native release binaries omit the dashboard, and a build without the
+feature returns not found for `/ui/`. Its setup and authentication endpoints remain available.
 
 The page signs in with a [read-only token](#read-only-tokens) for the repository, sent as
 `Authorization: Bearer`, and refuses an agent token, so the browser never holds a token that can

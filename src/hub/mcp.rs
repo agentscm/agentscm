@@ -35,8 +35,8 @@ use super::promise::{
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    DEFAULT_SESSION, SessionCall, announce_for, announce_named, done_pausing_for, duplicates_for,
-    others_for, status_for,
+    DEFAULT_SESSION, SessionCall, announce_native, done_pausing_native, duplicates_for, others_for,
+    status_native,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -216,6 +216,17 @@ struct HandoffArgs {
 #[serde(deny_unknown_fields)]
 struct SessionArgs {
     session: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependencyAckArgs {
+    session: String,
+    delivery_id: String,
+    work_id: String,
+    generation: i64,
+    declaration_seq: i64,
+    semantic_version: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -1331,6 +1342,9 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "id": {"type": "string", "description": "The message id (msg_...)."},
              "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
              "session": session}), &["id", "status", "session"])},
+        {"name": "agentscm_work_dependency_ack",
+         "description": "Acknowledge a dependency notice you read after inspecting its current Work and conditions. Does not authorize execution or release holds.",
+         "inputSchema": schema(json!({"session":session,"delivery_id":{"type":"string"},"work_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"declaration_seq":{"type":"integer","minimum":0},"semantic_version":{"type":"integer","minimum":1}}), &["session","delivery_id","work_id","generation","declaration_seq","semantic_version"])},
         {"name": "agentscm_view_settings",
          "description": "Read or change your inline work and value-metrics views. Your choices override the Hub default for your agents only. Omit arguments to read effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -1366,7 +1380,7 @@ fn overlap_tools(read_only: bool) -> Vec<Value> {
         ),
         read(
             "agentscm_work_dependency_notices",
-            "Read current-lead notices.",
+            "Read current-lead notices. After reading a delivered notice, acknowledge it with agentscm_work_dependency_ack using its delivery_id and the current generation, declaration_seq and semantic_version.",
             json!({"session":{"type":"string"},"after":{"type":"integer","minimum":0},"through":{"type":["integer","null"],"minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100}}),
             &["session", "after", "limit"],
         ),
@@ -1418,7 +1432,7 @@ fn consent_summary(view: &super::work_overlap::WorkOverlapConsentView) -> Value 
 
 fn dependency_summary(page: &super::work_dependencies::WorkDependencyNoticePage) -> Value {
     json!({"through":page.through,"next_after":page.next_after,"complete":page.complete,"latest_only":page.latest_only,"atomic_snapshot":page.atomic_snapshot,"coverage_complete":page.coverage_complete,
-        "notices":page.notices.iter().map(|n| json!({"sequence":n.sequence,"work_id":n.recorded.work_id,"declaration_seq":n.recorded.declaration_seq,"recorded_conditions":n.recorded.conditions.iter().take(5).collect::<Vec<_>>(),"recorded_conditions_complete":n.recorded.conditions.len()<=5,"notification_fanout_complete":n.recorded.notification_fanout_complete,"current_conditions":n.current.conditions.iter().take(5).collect::<Vec<_>>(),"current_conditions_complete":n.current.conditions.len()<=5,"current_observed_at":n.current.observed_at,"evidence_digest":n.current.evidence_digest})).collect::<Vec<_>>(),"read":"agentscm_work_dependency_notices"})
+        "notices":page.notices.iter().map(|n| json!({"sequence":n.sequence,"work_id":n.recorded.work_id,"generation":n.recorded.generation,"declaration_seq":n.recorded.declaration_seq,"semantic_version":n.recorded.semantic_version,"recorded_conditions":n.recorded.conditions.iter().take(5).collect::<Vec<_>>(),"recorded_conditions_complete":n.recorded.conditions.len()<=5,"notification_fanout_complete":n.recorded.notification_fanout_complete,"current_conditions":n.current.conditions.iter().take(5).collect::<Vec<_>>(),"current_conditions_complete":n.current.conditions.len()<=5,"current_observed_at":n.current.observed_at,"evidence_digest":n.current.evidence_digest})).collect::<Vec<_>>(),"read":"agentscm_work_dependency_notices"})
 }
 
 async fn overlap_call(
@@ -1426,6 +1440,7 @@ async fn overlap_call(
     principal: &Principal,
     name: &str,
     arguments: Option<&Value>,
+    incarnation: Option<String>,
 ) -> Option<Value> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
@@ -1438,12 +1453,18 @@ async fn overlap_call(
             }
         };
     }
+    let transport = incarnation.clone();
     let result = match name {
         "agentscm_work_overlap_consent" => {
             let request = parsed!(super::work_overlap::WorkOverlapConsentRequest);
             blocking(state, move || {
                 store
-                    .work_overlap_consent(&token, &request, unix_now())
+                    .work_overlap_consent_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                     .map(|v| consent_summary(&shown(v, &owner)))
             })
             .await
@@ -1488,7 +1509,12 @@ async fn overlap_call(
                         })
                 } else {
                     store
-                        .work_overlap_start(&token, &request, unix_now())
+                        .work_overlap_start_with_transport(
+                            &token,
+                            &request,
+                            incarnation.as_deref(),
+                            unix_now(),
+                        )
                         .map_err(|mut error| {
                             super::work_intent::enrich_error(
                                 &*store,
@@ -1515,7 +1541,12 @@ async fn overlap_call(
             let request = parsed!(super::work_overlap::WorkOverlapCheckpoint);
             blocking(state, move || {
                 store
-                    .work_overlap_checkpoint(&token, &request, unix_now())
+                    .work_overlap_checkpoint_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                     .map_err(|mut error| {
                         super::work_intent::enrich_error(&*store, &token, &mut error, unix_now());
                         error
@@ -1560,8 +1591,14 @@ async fn overlap_call(
                             .or_else(|| a["checkpoint"]["session"].as_str())
                     })
                     .map(str::to_owned);
-                if let Err(error) =
-                    announce_for(state, principal, session_call(session, None, Vec::new())).await
+                if let Err(error) = announce_native(
+                    state,
+                    principal,
+                    session_call(session, None, Vec::new()),
+                    true,
+                    transport,
+                )
+                .await
                 {
                     // The durable mutation already committed. A failed activity report cannot undo it.
                     reply["structuredContent"]["session_activity"] =
@@ -1574,6 +1611,14 @@ async fn overlap_call(
     })
 }
 
+fn argument_session(arguments: Option<&Value>) -> Option<&str> {
+    let arguments = arguments?;
+    arguments["session"]
+        .as_str()
+        .or_else(|| arguments["start"]["session"].as_str())
+        .or_else(|| arguments["checkpoint"]["session"].as_str())
+}
+
 async fn append_dependency_notices(
     state: &HubState,
     principal: &Principal,
@@ -1581,27 +1626,24 @@ async fn append_dependency_notices(
     value: &mut Value,
 ) {
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or_default();
-    if principal.read_only
+    if value["isError"] == true
+        || principal.read_only
         || read_only_call("tools/call", params)
         || name == "agentscm_work_overlap_preflight"
     {
         return;
     }
     let args = params.and_then(|p| p.get("arguments"));
-    let session = args
-        .and_then(|a| {
-            a["session"]
-                .as_str()
-                .or_else(|| a["start"]["session"].as_str())
-                .or_else(|| a["checkpoint"]["session"].as_str())
-        })
-        .map(str::to_owned);
+    let session = argument_session(args).map(str::to_owned);
     let store = state.store.clone();
-    let token = principal.token_id.clone();
+    let scope = principal.clone();
+    let observations = state.onboarding.clone();
     let page = blocking(state, move || {
         let now = unix_now();
-        let session = store.session_name_for(&token, session.as_deref(), now)?;
-        store.work_dependency_notice_delivery(&token, &session, now)
+        let session = store.session_name_for(&scope.token_id, session.as_deref(), now)?;
+        observations.native_effect(&*store, &scope, Some(&session), None, || {
+            store.work_dependency_notice_delivery(&scope.token_id, &session, now)
+        })
     })
     .await;
     match page {
@@ -1940,13 +1982,48 @@ async fn call(
     ) {
         super::coordination_http::CHANGED.notify_waiters();
     }
-    append_dependency_notices(state, principal, params, &mut value).await;
+    let native_session = argument_session(params.and_then(|p| p.get("arguments"))).or_else(|| {
+        headers
+            .get(super::cooperation::SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+    });
+    let native = super::cooperation::incarnation(headers, native_session)
+        .ok()
+        .flatten();
+    if let (Some(session), Some(incarnation)) = (native_session, native.clone()) {
+        if !principal.read_only && value["isError"] != true {
+            let (store, scope, session) =
+                (state.store.clone(), principal.clone(), session.to_owned());
+            match blocking(state, move || {
+                super::cooperation::offer_on_call(
+                    &*store,
+                    &scope,
+                    &session,
+                    &incarnation,
+                    unix_now(),
+                )
+            })
+            .await
+            {
+                Ok(Some(offer)) => {
+                    value["_meta"]["agentscm"]["source_notice"] = json!(offer);
+                    if let Some(content) = value["content"].as_array_mut() {
+                        content.push(json!({"type":"text","text":offer.text}));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    value["_meta"]["agentscm"]["source_notice"] = json!({"status":"unknown"});
+                }
+            }
+        }
+    } else if native.is_none() && value["isError"] != true {
+        append_dependency_notices(state, principal, params, &mut value).await;
+    }
     if name == "agentscm_coordination_inbox" {
         return Ok(value);
     }
-    let session = params
-        .and_then(|p| p["arguments"]["session"].as_str())
-        .map(str::to_owned);
+    let session = native_session.map(str::to_owned);
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let inbox = blocking(state, move || {
@@ -2026,9 +2103,7 @@ async fn call(
         && !principal.read_only
         && value["isError"] != true
         && let Some(source) = &state.context_source
-        && let Some(requested) = params
-            .and_then(|p| p["arguments"]["session"].as_str())
-            .map(str::to_owned)
+        && let Some(requested) = native_session.map(str::to_owned)
     {
         let (store, token) = (state.store.clone(), principal.token_id.clone());
         let resolved = blocking(state, move || {
@@ -2056,20 +2131,25 @@ async fn call(
     // excluded; any other session takes them here. An MCP call cannot say whether a subagent made
     // it, so the notice tells a subagent to leave the message for the session that started it.
     if !principal.read_only
-        && let Some(requested) = params
-            .and_then(|p| p["arguments"]["session"].as_str())
-            .map(str::to_owned)
+        && value["isError"] != true
+        && let Some(requested) = native_session.map(str::to_owned)
     {
         let install = super::onboarding::client(headers).map(str::to_owned);
         let (store, scope) = (state.store.clone(), principal.clone());
+        let observations = state.onboarding.clone();
         if let Ok(Some(text)) = blocking(state, move || {
-            let now = unix_now();
-            let session = store.session_name_for(&scope.token_id, Some(requested.as_str()), now)?;
-            super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
-            if !super::agent_messages::mcp_delivers(&scope.token_id, &session) {
-                return Ok(None);
-            }
-            super::agent_messages::take(&*store, &scope, &session, "mcp", now)
+            observations.native_effect(&*store, &scope, Some(&requested), native.as_deref(), || {
+                let now = unix_now();
+                let session = store.session_name_for(&scope.token_id, Some(&requested), now)?;
+                super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
+                // Protocol-1 calls already use the source-notice ledger above.
+                if native.is_some()
+                    || !super::agent_messages::mcp_delivers(&scope.token_id, &session)
+                {
+                    return Ok(None);
+                }
+                super::agent_messages::take(&*store, &scope, &session, "mcp", now)
+            })
         })
         .await
             && let Some(content) = value["content"].as_array_mut()
@@ -2351,6 +2431,7 @@ async fn call_inner(
             | "agentscm_work_overlap_start"
             | "agentscm_work_overlap_checkpoint"
             | "agentscm_work_dependency_notices"
+            | "agentscm_work_dependency_ack"
             | "agentscm_start"
             | "agentscm_check"
             | "agentscm_status"
@@ -2418,8 +2499,65 @@ async fn call_inner(
         return Ok(refused("wrong_repository"));
     }
     let arguments = params.and_then(|params| params.get("arguments"));
-    if let Some(value) = overlap_call(state, principal, name, arguments).await {
+    let native_session = argument_session(arguments);
+    let incarnation = match super::cooperation::incarnation(headers, native_session) {
+        Ok(value) => value,
+        Err(error) => return Ok(work_failure(&error)),
+    };
+    if !principal.read_only {
+        let session = native_session.or_else(|| {
+            headers
+                .get(super::cooperation::SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+        });
+        if let Some(session) = session {
+            let store = state.store.clone();
+            let token = principal.token_id.clone();
+            let session = session.to_owned();
+            let fence = incarnation.clone();
+            if let Err(error) = blocking(state, move || {
+                store.lifecycle_check(&token, &session, fence.as_deref(), unix_now())
+            })
+            .await
+            {
+                return Ok(work_failure(&error));
+            }
+        }
+    }
+    if let Some(value) = overlap_call(state, principal, name, arguments, incarnation.clone()).await
+    {
         return Ok(value);
+    }
+    if name == "agentscm_work_dependency_ack" {
+        let args = match try_args::<DependencyAckArgs>(arguments) {
+            Ok(args) => args,
+            Err(detail) => return Ok(invalid_args(name, &detail)),
+        };
+        let Some(incarnation) = incarnation else {
+            return Ok(work_failure(&super::HubError::invalid_or_changed(
+                "A current native session transport is required to acknowledge this notice.".into(),
+            )));
+        };
+        let ack = super::notices::DependencyNoticeAck {
+            session: args.session,
+            incarnation,
+            delivery_id: args.delivery_id,
+            work_id: args.work_id,
+            generation: args.generation,
+            declaration_seq: args.declaration_seq,
+            semantic_version: args.semantic_version,
+        };
+        let (store, token) = (state.store.clone(), principal.token_id.clone());
+        return Ok(
+            match blocking(state, move || {
+                store.dependency_notice_ack(&token, &ack, unix_now())
+            })
+            .await
+            {
+                Ok(receipt) => structured(&json!(receipt)),
+                Err(error) => work_failure(&error),
+            },
+        );
     }
     if name == "agentscm_value_metrics" {
         let query = match try_args::<super::value_metrics::ValueMetricsQuery>(arguments) {
@@ -2527,7 +2665,12 @@ async fn call_inner(
                     Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
-                    store.coordination_ack(&token, &request, unix_now())
+                    store.coordination_ack_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                 })
                 .await
             }
@@ -2537,7 +2680,12 @@ async fn call_inner(
                     Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
-                    store.coordination_reply(&token, &request, unix_now())
+                    store.coordination_reply_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                 })
                 .await
             }
@@ -2547,7 +2695,12 @@ async fn call_inner(
                     Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
-                    store.coordination_resolve(&token, &request, unix_now())
+                    store.coordination_resolve_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                 })
                 .await
             }
@@ -2557,7 +2710,12 @@ async fn call_inner(
                     Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
-                    store.coordination_withdraw(&token, &request, unix_now())
+                    store.coordination_withdraw_with_transport(
+                        &token,
+                        &request,
+                        incarnation.as_deref(),
+                        unix_now(),
+                    )
                 })
                 .await
             }
@@ -2581,7 +2739,15 @@ async fn call_inner(
                 let now = unix_now();
                 let session =
                     store.session_name_for(&scope.token_id, Some(args.session.as_str()), now)?;
-                super::agent_messages::answer(&*store, &scope, &session, &args.id, args.status, now)
+                super::agent_messages::answer_with_transport(
+                    &*store,
+                    &scope,
+                    &session,
+                    &args.id,
+                    args.status,
+                    incarnation.as_deref(),
+                    now,
+                )
             })
             .await
             {
@@ -2826,7 +2992,12 @@ async fn call_inner(
         let token = principal.token_id.clone();
         return Ok(
             match blocking(state, move || {
-                store.work_declarations_set(&token, &request, unix_now())
+                store.work_declarations_set_with_transport(
+                    &token,
+                    &request,
+                    incarnation.as_deref(),
+                    unix_now(),
+                )
             })
             .await
             {
@@ -3154,14 +3325,21 @@ async fn call_inner(
             Ok(value) => value,
             Err(error) => return Ok(invalid_args(name, &error)),
         };
-        return Ok(work_checkpoint(state, principal, checkpoint, completion_reporting).await);
+        return Ok(work_checkpoint(
+            state,
+            principal,
+            checkpoint,
+            completion_reporting,
+            incarnation,
+        )
+        .await);
     }
     if name == "agentscm_work_transition" {
         let request = match try_args::<WorkTransitionRequest>(arguments) {
             Ok(value) => value,
             Err(error) => return Ok(invalid_args(name, &error)),
         };
-        return Ok(work_transition(state, principal, request).await);
+        return Ok(work_transition(state, principal, request, incarnation).await);
     }
     if name == "agentscm_work_transitions" {
         let batch = match try_args::<super::work_recovery::WorkTransitionBatch>(arguments) {
@@ -3173,10 +3351,11 @@ async fn call_inner(
         let owner = principal.owner.id.clone();
         return Ok(
             match blocking(state, move || {
-                super::work_recovery::apply_batch(
+                super::work_recovery::apply_batch_with_transport(
                     &*store,
                     &WorkTransitionActor::Agent { token: &token },
                     &batch,
+                    incarnation.as_deref(),
                     unix_now(),
                 )
                 .map(|mut result| {
@@ -3276,7 +3455,7 @@ async fn call_inner(
             Err(error) => return Ok(invalid_args(name, &error)),
         };
         let unlinked = started_by(state, principal, &arguments).await;
-        let mut reply = match start(state, principal, arguments).await {
+        let mut reply = match start(state, principal, arguments, incarnation).await {
             Ok(value) => value,
             Err(mut error) => {
                 error.show(Viewer(&principal.owner.id));
@@ -3288,7 +3467,16 @@ async fn call_inner(
         }
         return Ok(reply);
     }
-    let outcome = match run(state, principal, name, arguments, completion_reporting).await {
+    let outcome = match run(
+        state,
+        principal,
+        name,
+        arguments,
+        completion_reporting,
+        incarnation,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(detail) => return Ok(invalid_args(name, &detail)),
     };
@@ -3612,13 +3800,14 @@ async fn work_checkpoint(
     principal: &Principal,
     checkpoint: WorkCheckpoint,
     completion_reporting: bool,
+    incarnation: Option<String>,
 ) -> Value {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     match blocking(state, move || {
         let now = unix_now();
         let result = store
-            .work_checkpoint(&token, &checkpoint, now)
+            .work_checkpoint_with_transport(&token, &checkpoint, incarnation.as_deref(), now)
             .map_err(|mut error| {
                 super::work_intent::enrich_error(&*store, &token, &mut error, now);
                 error
@@ -3656,13 +3845,18 @@ async fn work_transition(
     state: &HubState,
     principal: &Principal,
     request: WorkTransitionRequest,
+    incarnation: Option<String>,
 ) -> Value {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     match blocking(state, move || {
         let now = unix_now();
-        let mut result =
-            store.work_transition(&WorkTransitionActor::Agent { token: &token }, &request, now)?;
+        let mut result = store.work_transition_with_transport(
+            &WorkTransitionActor::Agent { token: &token },
+            &request,
+            incarnation.as_deref(),
+            now,
+        )?;
         if let Some(conflict) = &mut result.conflict {
             conflict.operational = super::work_http::operational_for_overlaps(
                 &*store,
@@ -3835,6 +4029,7 @@ async fn run(
     name: &str,
     arguments: Option<&Value>,
     completion_reporting: bool,
+    incarnation: Option<String>,
 ) -> std::result::Result<Result<String>, String> {
     let token = principal.token_id.clone();
     Ok(match name {
@@ -3843,11 +4038,23 @@ async fn run(
             if !(1..=MAX_CHECK_PATHS).contains(&paths.len()) {
                 return Err(format!("paths must hold 1 to {MAX_CHECK_PATHS} entries"));
             }
-            check(state, principal, session_call(session, None, paths)).await
+            check(
+                state,
+                principal,
+                session_call(session, None, paths),
+                incarnation,
+            )
+            .await
         }
         "agentscm_status" => {
             let SessionArgs { session } = try_args(arguments)?;
-            status_for(state, principal, session_call(session, None, Vec::new())).await
+            status_native(
+                state,
+                principal,
+                session_call(session, None, Vec::new()),
+                incarnation,
+            )
+            .await
         }
         "agentscm_ask" => {
             let AskArgs {
@@ -3858,11 +4065,12 @@ async fn run(
             let store = state.store.clone();
             blocking(state, move || {
                 store
-                    .ask_handoff(
+                    .ask_handoff_with_transport(
                         &token,
                         session.as_deref(),
                         &path,
                         note.as_deref(),
+                        (super::handoff::Via::Agent, incarnation.as_deref()),
                         unix_now(),
                     )
                     .map(|outcome| asked(&outcome, &path))
@@ -3878,12 +4086,12 @@ async fn run(
             } = try_args(arguments)?;
             let (store, wanted) = (state.store.clone(), path.clone());
             blocking(state, move || {
-                store.answer_handoff(
+                store.answer_handoff_with_transport(
                     &token,
                     session.as_deref(),
                     &wanted,
-                    accept,
-                    reason.as_deref(),
+                    (accept, reason.as_deref()),
+                    (super::handoff::Via::Agent, incarnation.as_deref()),
                     unix_now(),
                 )
             })
@@ -3903,6 +4111,7 @@ async fn run(
                 outcome,
                 summary,
                 completion_reporting,
+                incarnation,
             )
             .await
         }
@@ -3917,6 +4126,7 @@ async fn done(
     outcome: DoneOutcome,
     summary: Option<String>,
     completion_reporting: bool,
+    incarnation: Option<String>,
 ) -> Result<String> {
     let completed = match outcome {
         DoneOutcome::Complete => Some(
@@ -3926,6 +4136,7 @@ async fn done(
                 session.clone(),
                 summary,
                 completion_reporting,
+                incarnation.clone(),
             )
             .await,
         ),
@@ -3933,7 +4144,15 @@ async fn done(
     };
     // The files are released even when the completion failed: the Work is then paused, and a
     // retry of this call completes it.
-    let end = done_pausing_for(state, principal, session, "mcp", completion_reporting).await?;
+    let end = done_pausing_native(
+        state,
+        principal,
+        session,
+        "mcp",
+        completion_reporting,
+        incarnation,
+    )
+    .await?;
     let released = released_text(&end);
     let tail = released.strip_prefix("AgentSCM: ").unwrap_or(released);
     Ok(match completed {
@@ -3976,6 +4195,7 @@ async fn complete_led(
     session: Option<String>,
     summary: Option<String>,
     completion_reporting: bool,
+    incarnation: Option<String>,
 ) -> Result<Option<String>> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
@@ -3999,8 +4219,12 @@ async fn complete_led(
             superseded_by: None,
             participants: Vec::new(),
         };
-        let result =
-            store.work_transition(&WorkTransitionActor::Agent { token: &token }, &request, now)?;
+        let result = store.work_transition_with_transport(
+            &WorkTransitionActor::Agent { token: &token },
+            &request,
+            incarnation.as_deref(),
+            now,
+        )?;
         if completion_reporting
             && result.item.state == WorkState::Finished
             && super::insights::record_completion(store.as_ref(), &token, &result.item, &name, now)
@@ -4058,7 +4282,12 @@ async fn started_by(
     ))
 }
 
-async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) -> Result<Value> {
+async fn start(
+    state: &HubState,
+    principal: &Principal,
+    arguments: StartArgs,
+    incarnation: Option<String>,
+) -> Result<Value> {
     let StartArgs {
         issue_choice,
         task,
@@ -4176,7 +4405,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let named = session.is_some();
     // Resolve the same session rules as hooks without taking any coordinated path. The durable
     // claim below must succeed before this call announces the requested paths.
-    let resolved = announce_for(
+    let resolved = announce_native(
         state,
         principal,
         SessionCall {
@@ -4187,6 +4416,8 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             deny: false,
             report: false,
         },
+        named,
+        incarnation.clone(),
     )
     .await?
     .touched
@@ -4197,6 +4428,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let token = principal.token_id.clone();
     let title = task.clone();
     let caller = principal.clone();
+    let fence = incarnation.clone();
     let work = blocking(state, move || {
         let start = WorkStart {
             issue_choice,
@@ -4217,9 +4449,15 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             preflight,
         };
         if explicit {
-            store.work_start_named(&token, &start, named, unix_now())
+            store.work_start_named_with_transport(
+                &token,
+                &start,
+                named,
+                fence.as_deref(),
+                unix_now(),
+            )
         } else {
-            store.work_start_auto(&token, &start, unix_now())
+            store.work_start_auto_with_transport(&token, &start, fence.as_deref(), unix_now())
         }
         .map_err(|mut error| {
             super::work_intent::enrich_error(&*store, &token, &mut error, unix_now());
@@ -4346,11 +4584,12 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
 
     // The session resolved once above is the target, so a hook session that turns fresh meanwhile
     // cannot make this touch ambiguous after the start committed.
-    let advice = announce_named(
+    let advice = announce_native(
         state,
         principal,
         session_call(Some(resolved), Some(task.clone()), paths),
         named,
+        incarnation,
     )
     .await?;
     let own = advice
@@ -4783,7 +5022,12 @@ fn briefing_summary(briefing: &Briefing) -> String {
     )
 }
 
-async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Result<String> {
+async fn check(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    incarnation: Option<String>,
+) -> Result<String> {
     super::session::check(&call)?;
     let store = state.store.clone();
     let token = principal.token_id.clone();
@@ -4801,7 +5045,8 @@ async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Re
         }
         Ok(())
     }).await?;
-    let advice = announce_for(state, principal, call).await?;
+    let named = call.session.is_some();
+    let advice = announce_native(state, principal, call, named, incarnation).await?;
     Ok(if advice.text.is_empty() {
         NO_OVERLAPS.to_owned()
     } else {

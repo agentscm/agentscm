@@ -68,6 +68,9 @@ src/intent_cli.rs let state: State = serde_json::from_str(&std::fs::read_to_stri
 src/intent_cli.rs serde_json::from_str(&text).unwrap_or(Value::Null)
 src/intent_cli.rs serde_json::from_str(text)
 
+# src/message_wait.rs: the locally constructed waiter request body
+src/message_wait.rs serde_json::from_str(&wait_body(session, agent)).expect("wait body is JSON");
+
 # src/pipeline_cli.rs: an operator's input file
 src/pipeline_cli.rs Ok(serde_json::from_slice(&bytes)?)
 

@@ -1,12 +1,13 @@
 //! `agentscm hook-wait claude`: the background hook that lets a message sent from the Hub page
-//! reach a Claude Code session within seconds, even while it sits idle.
+//! attempt delivery to an existing Claude Code session through its native hook contract.
 //!
 //! Claude Code runs it at session start and after every turn as an `asyncRewake` hook: it runs
 //! in the background, and when it exits with code 2 its stderr wakes the session as a new turn.
 //! It holds one request at a time open at the Hub (`/v1/hub/agent-messages/wait`) for this
 //! session; when a message comes, or a coordination request to Work the session leads waits for
 //! its acknowledgement, it prints the Hub's notice and exits 2. Only one waits per
-//! session: a later start finds the lock held and exits at once. It ends quietly when its time is
+//! session: a SessionStart briefly waits for a predecessor's lock; other duplicates leave at once.
+//! It ends quietly when its time is
 //! up, when the process that started it is gone or the session's `SessionEnd` hook
 //! (`hook-wait claude --end`) left its end marker, when the checkout is not connected, when the
 //! person's mode is `ignore`, or when the Hub refuses, lacks the route or stays unreachable.
@@ -15,7 +16,8 @@
 //!
 //! `agentscm hook-wait codex` is the same waiter for a Codex chat, run as an `async` hook. A
 //! finished background hook starts no turn in Codex, so on a notice it queues the notice into
-//! the chat with `codex queue`, which starts it as a turn once the chat is idle, and exits 0.
+//! the chat with `codex queue` from a qualified live host and exits 0. Queue acceptance does not
+//! prove that the model read the notice or started a turn.
 //!
 //! `agentscm hook-wait copilot --notification` waits only from Copilot CLI's asynchronous hook.
 //! It returns a notice as `additionalContext` on stdout, which can start processing while idle.
@@ -25,18 +27,23 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::client_journal::{Kind, Phase, Record};
 use agentscm::hub::agent_messages::{FRAME, REQUEST_FRAME, WAIT_SECS, Waker};
+use agentscm::hub::notices::{AttemptOutcome, NoticeTransportReport};
 use agentscm::hub::reply;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::client_config;
 
-/// How long one waiter lives, so a session left idle over a weekend is still reached; the
-/// plugin's hook timeout is a little longer, so the waiter leaves on its own and quietly.
+/// Maximum lifetime of one waiter; the plugin timeout is slightly longer. Host availability
+/// and current session identity still bound delivery throughout this lifetime.
 pub const MAX_LIFE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Failing this long without one answer from the Hub ends the waiter; the next turn starts one.
 const UNREACHABLE: Duration = Duration::from_secs(15 * 60);
+const REGISTRATION_GRACE: Duration = Duration::from_secs(15);
+// A predecessor can be in a 40-second request followed by a 60-second backoff.
+const START_LOCK_GRACE: Duration = Duration::from_secs(WAIT_SECS + 15 + 60);
 const STDIN_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, clap::Args)]
@@ -74,10 +81,30 @@ pub async fn run(args: HookWaitArgs) -> ! {
         std::process::exit(0)
     }
     let found = waited(agent, args.notification, &payload).await;
-    std::process::exit(match agent {
-        Waker::Claude => finish(found.map(|(_, text)| text), &mut std::io::stderr()),
-        Waker::Codex => found.map_or(0, |(session, text)| queue(&session, &text)),
-        Waker::Copilot => finish_copilot(found.map(|(_, text)| text), &mut std::io::stdout()),
+    std::process::exit(match found {
+        Some((session, notice, connection)) if agent == Waker::Codex => {
+            enqueue(&session, &notice, &connection).await;
+            0
+        }
+        Some((session, notice, connection)) => {
+            let framed = framed(&notice.text);
+            let status = match agent {
+                Waker::Claude => finish(Some(notice.text.clone()), &mut std::io::stderr()),
+                Waker::Copilot => finish_copilot(Some(notice.text.clone()), &mut std::io::stdout()),
+                Waker::Codex => unreachable!("Codex enqueues above"),
+            };
+            if framed {
+                report_delivery(
+                    &session,
+                    &notice,
+                    &connection,
+                    AttemptOutcome::TransportReported,
+                )
+                .await;
+            }
+            status
+        }
+        None => 0,
     })
 }
 
@@ -93,7 +120,9 @@ fn waiter(agent: &str) -> Option<Waker> {
 
 /// The Hub's own framed notices: a message, or a coordination request to the session's Work.
 fn framed(text: &str) -> bool {
-    text.starts_with(FRAME) || text.starts_with(REQUEST_FRAME)
+    text.starts_with(FRAME)
+        || text.starts_with(REQUEST_FRAME)
+        || text.starts_with(agentscm::hub::notices::FRAME)
 }
 
 fn runs(program: &str) -> bool {
@@ -115,18 +144,202 @@ fn queue_args(session: &str, text: &str) -> [String; 3] {
     ]
 }
 
-/// Queues the Hub's framed notice into Codex chat `session`, which Codex starts as a turn once
-/// the chat is idle; anything else is dropped. Always 0: a background hook's exit wakes nothing.
-fn queue(session: &str, text: &str) -> i32 {
-    if framed(text) {
-        let _ = std::process::Command::new("codex")
-            .args(queue_args(session, text))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+/// Queue only from this live native session, never resume or replace a conversation.
+async fn enqueue(session: &str, notice: &Notice, connection: &client_config::Connection) {
+    if !framed(&notice.text) {
+        return;
     }
-    0
+    let Some(context) = notice.incarnation.as_deref().and_then(|incarnation| {
+        crate::client_cooperation::delivery_context(connection, session, incarnation)
+    }) else {
+        return;
+    };
+    let Some(attempt) = notice.attempt_id.as_deref() else {
+        return;
+    };
+    let Ok(config) = crate::hub_cli::config_dir() else {
+        return;
+    };
+    let Some(report) = transport_report(session, notice, AttemptOutcome::Unknown) else {
+        return;
+    };
+    let payload = journal_payload(connection, &context, &report);
+    let record = Record {
+        id: attempt.into(),
+        kind: Kind::Enqueue,
+        phase: Phase::Prepared,
+        payload: payload.clone(),
+    };
+    if crate::client_journal::put(&config, &record).is_err() {
+        eprintln!(
+            "AgentSCM: delivery evidence is unavailable; inspect `agentscm client status`. This waiter did not run a queue command."
+        );
+        return;
+    }
+    match crate::client_journal::admit_enqueue(&config, &record) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            eprintln!(
+                "AgentSCM: delivery admission is unavailable; inspect `agentscm client status`. This waiter did not run a queue command."
+            );
+            return;
+        }
+    }
+    let host = crate::client_session::qualified_host(session).filter(|_| {
+        !context.terminal && !context.explicit_end_requested && context.exit_observed_at.is_none()
+    });
+    let Some(host) = host else {
+        report_delivery(
+            session,
+            notice,
+            connection,
+            AttemptOutcome::ProvenNoDispatch,
+        )
+        .await;
+        return;
+    };
+    // This exact process fingerprint is checked immediately before the only external action.
+    let still_current =
+        crate::client_cooperation::delivery_context(connection, session, &report.incarnation)
+            .is_some_and(|current| {
+                current.start_nonce == context.start_nonce
+                    && !current.terminal
+                    && !current.explicit_end_requested
+                    && current.exit_observed_at.is_none()
+            });
+    if !still_current
+        || crate::client_session::observe_host(&host)
+            != crate::client_session::HostObservation::Same
+    {
+        report_delivery(
+            session,
+            notice,
+            connection,
+            AttemptOutcome::ProvenNoDispatch,
+        )
+        .await;
+        return;
+    }
+    let outcome = spawn_queue(Path::new("codex"), session, &notice.text);
+    let outcome = if outcome != AttemptOutcome::ProvenNoDispatch
+        && crate::client_session::observe_host(&host)
+            != crate::client_session::HostObservation::Same
+    {
+        AttemptOutcome::Unknown
+    } else {
+        outcome
+    };
+    report_delivery(session, notice, connection, outcome).await;
+}
+
+fn spawn_queue(program: &Path, session: &str, text: &str) -> AttemptOutcome {
+    let child = std::process::Command::new(program)
+        .args(queue_args(session, text))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return AttemptOutcome::ProvenNoDispatch;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return AttemptOutcome::TransportReported,
+            Ok(Some(_)) | Err(_) => return AttemptOutcome::Unknown,
+            Ok(None) if Instant::now() >= deadline => {
+                // Only this owned queue command is stopped; whether it enqueued stays unknown.
+                let _ = child.kill();
+                let _ = child.wait();
+                return AttemptOutcome::Unknown;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn transport_report(
+    session: &str,
+    notice: &Notice,
+    outcome: AttemptOutcome,
+) -> Option<NoticeTransportReport> {
+    Some(NoticeTransportReport {
+        session: session.into(),
+        incarnation: notice.incarnation.clone()?,
+        delivery_id: notice.delivery_id.clone()?,
+        attempt_id: notice.attempt_id.clone()?,
+        outcome,
+        observed_at: agentscm::hub::store::unix_now(),
+    })
+}
+
+fn journal_payload(
+    connection: &client_config::Connection,
+    context: &crate::client_session::SessionContext,
+    report: &NoticeTransportReport,
+) -> Value {
+    serde_json::json!({"hub": connection.hub,"repo": connection.repo,"root": connection.root,
+        "credential_id":context.credential_id,"binding_id":context.binding_id,
+        "session":report.session,"incarnation":report.incarnation,
+        "endpoint":"/v1/hub/cooperation/transport","body":report,"observed_at":report.observed_at})
+}
+
+async fn report_delivery(
+    session: &str,
+    notice: &Notice,
+    connection: &client_config::Connection,
+    outcome: AttemptOutcome,
+) {
+    let Some(report) = transport_report(session, notice, outcome) else {
+        return;
+    };
+    let Some(context) =
+        crate::client_cooperation::delivery_context(connection, session, &report.incarnation)
+    else {
+        return;
+    };
+    let Ok(config) = crate::hub_cli::config_dir() else {
+        return;
+    };
+    let payload = journal_payload(connection, &context, &report);
+    // Claude's native stderr delivery has no external queue step but retains its HTTP outcome.
+    let record = Record {
+        id: report.attempt_id.clone(),
+        kind: Kind::Enqueue,
+        phase: Phase::Prepared,
+        payload: payload.clone(),
+    };
+    let _ = crate::client_journal::put(&config, &record);
+    if crate::client_journal::update(&config, &report.attempt_id, Phase::Outcome, payload).is_err()
+    {
+        return;
+    }
+    let Ok(token) = crate::client_cli::read_token(&connection.token_file) else {
+        return;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return;
+    };
+    let Ok(body) = serde_json::to_vec(&report) else {
+        return;
+    };
+    if client
+        .post(format!("{}/v1/hub/cooperation/transport", connection.hub))
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+    {
+        let _ = crate::client_journal::remove(&config, &report.attempt_id);
+    }
 }
 
 /// Writes the notice and returns 2 only for the Hub's framed notice (a message, or a coordination
@@ -211,7 +424,11 @@ fn marker(dir: &Path, session: &str) -> PathBuf {
 }
 
 /// The session and the Hub's notice, once one comes; the agent names its delivery mechanism.
-async fn waited(agent: Waker, notification: bool, payload: &Value) -> Option<(String, String)> {
+async fn waited(
+    agent: Waker,
+    notification: bool,
+    payload: &Value,
+) -> Option<(String, Notice, client_config::Connection)> {
     let session = session_of(payload, agent)?;
     if !can_wait(payload, agent, notification) {
         return None;
@@ -223,8 +440,18 @@ async fn waited(agent: Waker, notification: bool, payload: &Value) -> Option<(St
         return None;
     }
     let dir = wait_dir()?;
-    // Held until this process exits; a second waiter for the session leaves at once.
-    let _lock = lock(&dir, &session)?;
+    let started = parent();
+    let startup = payload["hook_event_name"] == "SessionStart";
+    let registration_host = if startup {
+        crate::client_session::registration_host()
+    } else {
+        None
+    };
+    // A start may follow a waiter still draining its predecessor's request or backoff.
+    let _lock = lock_until(&dir, &session, startup, START_LOCK_GRACE, || {
+        parent() == started
+    })
+    .await?;
     // A resumed session keeps its id, so an old end marker must not stop its new waiter.
     // A duplicate waiter must not remove the marker that ends the first one.
     let ended = marker(&dir, &session);
@@ -239,21 +466,231 @@ async fn waited(agent: Waker, notification: bool, payload: &Value) -> Option<(St
         .timeout(Duration::from_secs(WAIT_SECS + 15))
         .build()
         .ok()?;
-    let started = parent();
-    let request = Wait {
-        client: &client,
-        url: format!("{}/v1/hub/agent-messages/wait", connection.hub),
-        body: wait_body(&session, agent),
-        token_file: &connection.token_file,
+    let mut waiter = Waiter {
+        connection,
+        checkout: &checkout,
+        session: &session,
+        agent,
+        startup,
+        registration_host,
+        nonce: None,
+        incarnation: None,
+        sent: false,
     };
-    let text = request
-        .until(
-            MAX_LIFE,
-            || parent() == started && !ended.exists(),
-            Duration::from_secs(5),
+    let (text, request) = wait_until(
+        &client,
+        MAX_LIFE,
+        || parent() == started && !ended.exists(),
+        Duration::from_secs(5),
+        |grace| waiter.prepare(grace),
+        |request, notice| request.valid(&checkout, &session, agent, notice),
+    )
+    .await?;
+    Some((session, text, request.connection))
+}
+
+struct Waiter<'a> {
+    connection: &'a client_config::Connection,
+    checkout: &'a Path,
+    session: &'a str,
+    agent: Waker,
+    startup: bool,
+    registration_host: Option<crate::client_session::HostIdentity>,
+    nonce: Option<String>,
+    incarnation: Option<String>,
+    sent: bool,
+}
+
+enum Admission {
+    Ready(Box<WaitRequest>),
+    Pending,
+    Stop,
+}
+
+struct WaitRequest {
+    connection: client_config::Connection,
+    token: String,
+    body: String,
+    nonce: Option<String>,
+    incarnation: Option<String>,
+}
+
+impl Waiter<'_> {
+    fn prepare(&mut self, grace: bool) -> Admission {
+        self.request(grace).unwrap_or(Admission::Stop)
+    }
+
+    fn request(&mut self, grace: bool) -> Option<Admission> {
+        let saved = client_config::load().ok()?;
+        let (connection, checkout) = client_config::connection_for_checkout(&saved, self.checkout)?;
+        if checkout != self.checkout
+            || connection.root != self.connection.root
+            || connection.hub != self.connection.hub
+            || connection.repo != self.connection.repo
+            || connection.origin_host != self.connection.origin_host
+            || !client_config::is_current_in(connection, &checkout)
+        {
+            return None;
+        }
+        let token = crate::client_cli::read_token(&connection.token_file).ok()?;
+        let config = crate::hub_cli::config_dir().ok()?;
+        let context = crate::client_session::context(
+            &config,
+            self.session,
+            &connection.hub,
+            &connection.repo,
         )
-        .await?;
-    Some((session, text))
+        .ok()?;
+        // The relay alone mints a start. A foreign or ended route is a predecessor, so leave
+        // it unpinned while the parallel relay catches up. Absence keeps legacy compatibility.
+        if self.startup
+            && !self.sent
+            && self.nonce.is_none()
+            && context.as_ref().is_some_and(|context| {
+                self.registration_host.is_none()
+                    || context.registration_host != self.registration_host
+                    || context.terminal
+                    || context.revoked
+                    || context.explicit_end_requested
+                    || context.exit_observed_at.is_some()
+            })
+        {
+            return grace.then_some(Admission::Pending);
+        }
+        let nonce = context.as_ref().map(|context| &context.start_nonce);
+        if self
+            .nonce
+            .as_ref()
+            .is_some_and(|prior| nonce != Some(prior))
+            || (self.sent && self.nonce.is_none() && nonce.is_some())
+        {
+            return None;
+        }
+        self.nonce = nonce.cloned();
+        let mut incarnation = None;
+        if let Some(context) = context {
+            if context.root != connection.root
+                || waiter(&context.agent) != Some(self.agent)
+                || context.terminal
+                || context.revoked
+                || context.explicit_end_requested
+                || context.exit_observed_at.is_some()
+                || context.protocol > 1
+            {
+                return None;
+            }
+            let binding = client_config::onboarding_client(&connection.root, &token);
+            let same_binding = context.binding_id == binding
+                && context.credential_id
+                    == connection.owned_token_id.as_deref().unwrap_or(&binding);
+            if same_binding && context.protocol == 1 {
+                if !context.registered || context.incarnation.is_none() {
+                    return grace.then_some(Admission::Pending);
+                }
+                let current = crate::client_cooperation::delivery_context(
+                    connection,
+                    self.session,
+                    context.incarnation.as_deref()?,
+                )?;
+                if current.start_nonce != context.start_nonce
+                    || current.terminal
+                    || current.explicit_end_requested
+                    || current.exit_observed_at.is_some()
+                {
+                    return None;
+                }
+                if self
+                    .incarnation
+                    .as_ref()
+                    .is_some_and(|prior| current.incarnation.as_ref() != Some(prior))
+                {
+                    return None;
+                }
+                incarnation = current.incarnation;
+            } else if same_binding && context.protocol_checked_at == 0 && grace {
+                return Some(Admission::Pending);
+            }
+        } else if grace {
+            return Some(Admission::Pending);
+        }
+        if self.agent == Waker::Codex {
+            incarnation.as_ref()?;
+            if crate::client_session::qualified_host(self.session).is_none() {
+                return grace.then_some(Admission::Pending);
+            }
+        }
+        let body = match incarnation.as_deref() {
+            Some(incarnation) => wait_body_current(self.session, self.agent, incarnation),
+            None => wait_body(self.session, self.agent),
+        };
+        self.sent = true;
+        if incarnation.is_some() {
+            self.incarnation = incarnation.clone();
+        }
+        Some(Admission::Ready(Box::new(WaitRequest {
+            connection: connection.clone(),
+            token,
+            body,
+            nonce: self.nonce.clone(),
+            incarnation,
+        })))
+    }
+}
+
+impl WaitRequest {
+    fn valid(&self, checkout: &Path, session: &str, agent: Waker, notice: &Notice) -> bool {
+        let Some(current) = client_config::load().ok().and_then(|saved| {
+            client_config::connection_for_checkout(&saved, checkout)
+                .map(|(connection, _)| connection.clone())
+        }) else {
+            return false;
+        };
+        if current != self.connection
+            || !client_config::is_current_in(&current, checkout)
+            || crate::client_cli::read_token(&current.token_file)
+                .ok()
+                .as_deref()
+                != Some(self.token.as_str())
+        {
+            return false;
+        }
+        let Some(context) = crate::hub_cli::config_dir().ok().and_then(|config| {
+            crate::client_session::context(&config, session, &current.hub, &current.repo).ok()
+        }) else {
+            return false;
+        };
+        if context.as_ref().map(|context| &context.start_nonce) != self.nonce.as_ref()
+            || context.as_ref().is_some_and(|context| {
+                context.root != current.root
+                    || waiter(&context.agent) != Some(agent)
+                    || context.terminal
+                    || context.revoked
+                    || context.explicit_end_requested
+                    || context.exit_observed_at.is_some()
+            })
+        {
+            return false;
+        }
+        match self.incarnation.as_deref() {
+            Some(incarnation) => {
+                notice.incarnation.as_deref() == Some(incarnation)
+                    && crate::client_cooperation::delivery_context(&current, session, incarnation)
+                        .is_some_and(|context| {
+                            Some(&context.start_nonce) == self.nonce.as_ref()
+                                && !context.terminal
+                                && !context.explicit_end_requested
+                                && context.exit_observed_at.is_none()
+                        })
+            }
+            None => {
+                agent != Waker::Codex
+                    && notice.incarnation.is_none()
+                    && notice.attempt_id.is_none()
+                    && notice.delivery_id.is_none()
+                    && (notice.text.starts_with(FRAME) || notice.text.starts_with(REQUEST_FRAME))
+            }
+        }
+    }
 }
 
 /// Preserve the original Claude body; other waiters identify their delivery mechanism.
@@ -266,82 +703,97 @@ fn wait_body(session: &str, agent: Waker) -> String {
     .to_string()
 }
 
-/// The Hub's answer when a message came.
+fn wait_body_current(session: &str, agent: Waker, incarnation: &str) -> String {
+    let mut value: Value =
+        serde_json::from_str(&wait_body(session, agent)).expect("wait body is JSON");
+    value["cooperation_protocol"] = serde_json::json!(agentscm::hub::notices::PROTOCOL);
+    value["incarnation"] = serde_json::json!(incarnation);
+    value.to_string()
+}
+
+/// The Hub's answer when a message came; absent receipt fields are never enqueue permission.
 #[derive(serde::Deserialize)]
 struct Notice {
     text: String,
+    #[serde(default)]
+    delivery_id: Option<String>,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    incarnation: Option<String>,
 }
 
-struct Wait<'a> {
-    client: &'a reqwest::Client,
-    url: String,
-    body: String,
-    token_file: &'a Path,
-}
-
-impl Wait<'_> {
-    /// Asks the Hub again and again until a notice comes, `life` is up, `alive` turns false, or
-    /// the Hub says there is nothing to wait for. Failures back off from `pause` to a minute.
-    async fn until(
-        &self,
-        life: Duration,
-        alive: impl Fn() -> bool,
-        pause: Duration,
-    ) -> Option<String> {
-        let started = Instant::now();
-        let mut answered = Instant::now();
-        let mut backoff = pause;
-        loop {
-            if !alive() {
-                return None;
-            }
-            // Read each time: the session's other hooks renew the token file.
-            let token = crate::client_cli::read_token(self.token_file).ok()?;
-            let sent = self
-                .client
-                .post(&self.url)
-                .bearer_auth(token)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(self.body.clone())
-                .send()
-                .await;
-            match sent.map(|reply| (reply.status().as_u16(), reply)) {
-                Ok((200, answer)) => {
-                    let bytes = answer.bytes().await.ok()?;
-                    // SessionEnd or parent death can happen while the request is in flight.
-                    if !alive() {
-                        return None;
-                    }
-                    return reply::decode_slice::<Notice>(&bytes).ok().map(|n| n.text);
-                }
-                // Nothing came in this request: ask again at once.
-                Ok((204, _)) => {
-                    answered = Instant::now();
-                    backoff = pause;
-                    if started.elapsed() >= life {
-                        return None;
-                    }
-                    continue;
-                }
-                // Signed out, a read-only token, Ignore, a Hub without the route, or one that
-                // refuses the request (an older Hub may not recognize this waiter).
-                Ok((400 | 401 | 403 | 404 | 405 | 410, _)) => return None,
-                // Another wait for this session is still open at the Hub: ask again shortly.
-                Ok((409, _)) => {
-                    answered = Instant::now();
-                    backoff = pause;
-                }
-                // 429 and other answers: the Hub is there but busy.
-                Ok(_) => answered = Instant::now(),
-                Err(_) if answered.elapsed() >= UNREACHABLE => return None,
-                Err(_) => {}
-            }
-            if started.elapsed() >= life {
-                return None;
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(60));
+/// Each retry gets its own credential and lifecycle snapshot; a response cannot borrow the next one.
+async fn wait_until(
+    client: &reqwest::Client,
+    life: Duration,
+    alive: impl Fn() -> bool,
+    pause: Duration,
+    mut prepare: impl FnMut(bool) -> Admission,
+    valid: impl Fn(&WaitRequest, &Notice) -> bool,
+) -> Option<(Notice, WaitRequest)> {
+    let started = Instant::now();
+    let mut answered = Instant::now();
+    let mut backoff = pause;
+    loop {
+        if !alive() {
+            return None;
         }
+        let request = match prepare(started.elapsed() < REGISTRATION_GRACE) {
+            Admission::Ready(request) => *request,
+            Admission::Pending if started.elapsed() < life => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Admission::Pending | Admission::Stop => return None,
+        };
+        let sent = client
+            .post(format!(
+                "{}/v1/hub/agent-messages/wait",
+                request.connection.hub
+            ))
+            .bearer_auth(&request.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.body.clone())
+            .send()
+            .await;
+        match sent.map(|reply| (reply.status().as_u16(), reply)) {
+            Ok((200, answer)) => {
+                let bytes = answer.bytes().await.ok()?;
+                // SessionEnd or parent death can happen while the request is in flight.
+                if !alive() {
+                    return None;
+                }
+                let notice = reply::decode_slice::<Notice>(&bytes).ok()?;
+                return valid(&request, &notice).then_some((notice, request));
+            }
+            // Nothing came in this request: ask again at once.
+            Ok((204, _)) => {
+                answered = Instant::now();
+                backoff = pause;
+                if started.elapsed() >= life {
+                    return None;
+                }
+                continue;
+            }
+            // Signed out, a read-only token, Ignore, a Hub without the route, or one that
+            // refuses the request (an older Hub may not recognize this waiter).
+            Ok((400 | 401 | 403 | 404 | 405 | 410, _)) => return None,
+            // Another wait for this session is still open at the Hub: ask again shortly.
+            Ok((409, _)) => {
+                answered = Instant::now();
+                backoff = pause;
+            }
+            // 429 and other answers: the Hub is there but busy.
+            Ok(_) => answered = Instant::now(),
+            Err(_) if answered.elapsed() >= UNREACHABLE => return None,
+            Err(_) => {}
+        }
+        if started.elapsed() >= life {
+            return None;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
 
@@ -364,8 +816,13 @@ fn lock(dir: &Path, session: &str) -> Option<File> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir).ok()?;
+    let file = File::create(dir.join(file_name(session))).ok()?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock | TryLockError::Error(_)) => return None,
+    }
     // Files of sessions long gone. Each start rewrites its lock file, so a live waiter's file
-    // is younger than its life.
+    // is younger than its life. Only the holder may inspect or remove its predecessor's marker.
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let stale = entry
             .metadata()
@@ -377,10 +834,30 @@ fn lock(dir: &Path, session: &str) -> Option<File> {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    let file = File::create(dir.join(file_name(session))).ok()?;
-    match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(TryLockError::WouldBlock | TryLockError::Error(_)) => None,
+    Some(file)
+}
+
+/// Only SessionStart waits for a predecessor. Its end marker is not ours until we hold the lock.
+async fn lock_until(
+    dir: &Path,
+    session: &str,
+    startup: bool,
+    grace: Duration,
+    alive: impl Fn() -> bool,
+) -> Option<File> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if !alive() {
+            return None;
+        }
+        if let Some(file) = lock(dir, session) {
+            return Some(file);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !startup || remaining.is_zero() {
+            return None;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
 }
 
@@ -388,6 +865,618 @@ fn lock(dir: &Path, session: &str) -> Option<File> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_connection(root: &Path, hub: &str, token: &Path) -> client_config::Connection {
+        client_config::Connection {
+            root: root.to_owned(),
+            origin_host: "github.com".into(),
+            hub: hub.into(),
+            repo: "acme/widgets".into(),
+            token_file: token.to_owned(),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    fn save_connection(config: &Path, connection: &client_config::Connection) {
+        crate::hub_cli::write_private(
+            &config.join("agentscm/connections.json"),
+            &serde_json::json!({"version":1,"connections":[connection]}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn session_fixture(
+        config: &Path,
+        hub: &str,
+        agent: &str,
+    ) -> (
+        tempfile::TempDir,
+        client_config::Connection,
+        crate::client_session::SessionContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        crate::client_journal::locked(config, || Ok(())).unwrap();
+        let token = config.join("synthetic-token");
+        crate::hub_cli::write_private(&token, "secret").unwrap();
+        let connection = test_connection(&root, hub, &token);
+        save_connection(config, &connection);
+        let binding = client_config::onboarding_client(&root, "secret");
+        let context = serde_json::from_value(serde_json::json!({
+            "session":"s1", "start_nonce":"start-a", "incarnation":"inc-a", "agent":agent,
+            "hub":hub, "repo":"acme/widgets", "root":root, "protocol":1, "protocol_checked_at":1,
+            "terminal":false, "registered":true, "revoked":false, "observed_at":1,
+            "host":null, "credential_id":binding, "binding_id":binding,
+        }))
+        .unwrap();
+        (directory, connection, context)
+    }
+
+    #[cfg(unix)]
+    fn test_waiter(connection: &client_config::Connection, agent: Waker) -> Waiter<'_> {
+        Waiter {
+            connection,
+            checkout: &connection.root,
+            session: "s1",
+            agent,
+            startup: false,
+            registration_host: None,
+            nonce: None,
+            incarnation: None,
+            sent: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn startup_waiter(
+        connection: &client_config::Connection,
+        registration_host: Option<crate::client_session::HostIdentity>,
+    ) -> Waiter<'_> {
+        Waiter {
+            startup: true,
+            registration_host,
+            ..test_waiter(connection, Waker::Claude)
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_host(pid: u32) -> crate::client_session::HostIdentity {
+        crate::client_session::HostIdentity {
+            pid,
+            started: "synthetic process start and boot".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn ready(admission: Admission) -> WaitRequest {
+        match admission {
+            Admission::Ready(request) => *request,
+            _ => panic!("expected an admitted request"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn notice(incarnation: Option<&str>) -> Notice {
+        Notice {
+            text: format!("{FRAME}msg_synthetic"),
+            delivery_id: None,
+            attempt_id: None,
+            incarnation: incarnation.map(str::to_owned),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_race_is_retried_then_opens_an_age_free_modern_wait() {
+        client_config::in_isolated_config_home(|config| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (url, served) = hub_request(vec![(200,
+                    r#"{"text":"AgentSCM Hub message msg_synthetic","incarnation":"inc-a"}"#)],
+                    None, wait_body_current("s1", Waker::Claude, "inc-a")).await;
+                    let (_directory, connection, mut context) =
+                        session_fixture(config, &url, "claude");
+                    context.registered = false;
+                    context.incarnation = None;
+                    crate::client_session::save_context(config, &context).unwrap();
+                    let mut waiter = test_waiter(&connection, Waker::Claude);
+                    let mut polls = 0;
+                    let client = reqwest::Client::new();
+                    let found = wait_until(
+                        &client,
+                        Duration::from_secs(3),
+                        || true,
+                        Duration::ZERO,
+                        |grace| {
+                            polls += 1;
+                            let admission = waiter.prepare(grace);
+                            if polls == 1 {
+                                assert!(matches!(admission, Admission::Pending));
+                                context.registered = true;
+                                context.incarnation = Some("inc-a".into());
+                                crate::client_session::save_context(config, &context).unwrap();
+                            }
+                            admission
+                        },
+                        |request, notice| {
+                            request.valid(&connection.root, "s1", Waker::Claude, notice)
+                        },
+                    )
+                    .await;
+                    assert!(found.is_some());
+                    assert_eq!(polls, 2);
+                    assert_eq!(served.await.unwrap(), 1);
+                    assert!(
+                        crate::client_cooperation::transport_context(&connection, "s1").is_none(),
+                        "ordinary transport still has its capability-age bound"
+                    );
+                });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_registration_and_unknown_codex_authority_are_bounded() {
+        client_config::in_isolated_config_home(|config| {
+            let (_directory, connection, mut context) =
+                session_fixture(config, "https://hub.example", "codex");
+            let mut waiter = test_waiter(&connection, Waker::Codex);
+            assert!(matches!(waiter.prepare(true), Admission::Pending));
+            assert!(matches!(waiter.prepare(false), Admission::Stop));
+            context.registered = false;
+            context.incarnation = None;
+            crate::client_session::save_context(config, &context).unwrap();
+            assert!(matches!(waiter.prepare(true), Admission::Pending));
+            assert!(matches!(waiter.prepare(false), Admission::Stop));
+            context.registered = true;
+            context.incarnation = Some("inc-a".into());
+            crate::client_session::save_context(config, &context).unwrap();
+            assert!(
+                matches!(waiter.prepare(true), Admission::Pending),
+                "host qualification is also allowed to arrive"
+            );
+            assert!(
+                matches!(waiter.prepare(false), Admission::Stop),
+                "no qualified host never authorizes Codex wait"
+            );
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    assert!(
+                        wait_until(
+                            &reqwest::Client::new(),
+                            Duration::ZERO,
+                            || true,
+                            Duration::ZERO,
+                            |_| Admission::Pending,
+                            |_, _| true
+                        )
+                        .await
+                        .is_none()
+                    );
+                });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_and_copilot_keep_legacy_bodies_without_modern_authority() {
+        client_config::in_isolated_config_home(|config| {
+            for (agent, name, hub) in [
+                (Waker::Claude, "claude", "https://claude.example"),
+                (Waker::Copilot, "copilot", "https://copilot.example"),
+            ] {
+                let (_directory, connection, mut context) = session_fixture(config, hub, name);
+                let mut waiter = test_waiter(&connection, agent);
+                assert!(matches!(waiter.prepare(true), Admission::Pending));
+                let absent = ready(waiter.prepare(false));
+                assert_eq!(absent.body, wait_body("s1", agent));
+                assert!(absent.valid(&connection.root, "s1", agent, &notice(None)));
+                assert!(!absent.valid(&connection.root, "s1", agent, &notice(Some("inc-a"))));
+                context.protocol = 0;
+                crate::client_session::save_context(config, &context).unwrap();
+                assert!(
+                    matches!(waiter.prepare(true), Admission::Stop),
+                    "an unbound old wait cannot adopt a later start"
+                );
+                let legacy = ready(test_waiter(&connection, agent).prepare(true));
+                assert_eq!(legacy.body, wait_body("s1", agent));
+                assert!(legacy.valid(&connection.root, "s1", agent, &notice(None)));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renewal_reloads_bearer_and_managed_path_without_retired_metadata() {
+        client_config::in_isolated_config_home(|config| {
+            let (_directory, connection, mut context) =
+                session_fixture(config, "https://hub.example", "claude");
+            crate::client_session::save_context(config, &context).unwrap();
+            let mut waiter = test_waiter(&connection, Waker::Claude);
+            let original = ready(waiter.prepare(true));
+            crate::hub_cli::write_private(&connection.token_file, "renewed").unwrap();
+            assert!(!original.valid(
+                &connection.root,
+                "s1",
+                Waker::Claude,
+                &notice(Some("inc-a"))
+            ));
+            let renewed = ready(waiter.prepare(false));
+            assert_eq!(renewed.token, "renewed");
+            assert_eq!(renewed.body, wait_body("s1", Waker::Claude));
+            assert!(renewed.valid(&connection.root, "s1", Waker::Claude, &notice(None)));
+            let mut managed = connection.clone();
+            managed.token_file =
+                client_config::owned_token_path(&managed, "tok_synthetic").unwrap();
+            managed.owned_token_id = Some("tok_synthetic".into());
+            managed.owned_token_expires_at = Some(agentscm::hub::store::unix_now() + 3600);
+            crate::hub_cli::write_private(&managed.token_file, "managed-renewal").unwrap();
+            save_connection(config, &managed);
+            assert!(!renewed.valid(&connection.root, "s1", Waker::Claude, &notice(None)));
+            let selected = ready(waiter.prepare(false));
+            assert_eq!(selected.token, "managed-renewal");
+            assert_eq!(selected.connection, managed);
+            assert!(selected.incarnation.is_none());
+            assert!(selected.valid(&connection.root, "s1", Waker::Claude, &notice(None)));
+            context.agent = "codex".into();
+            crate::client_session::save_context(config, &context).unwrap();
+            assert!(matches!(
+                test_waiter(&connection, Waker::Codex).prepare(false),
+                Admission::Stop
+            ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modern_response_rejects_successor_end_corruption_and_rebinding() {
+        client_config::in_isolated_config_home(|config| {
+            let (_directory, connection, mut context) =
+                session_fixture(config, "https://hub.example", "claude");
+            crate::client_session::save_context(config, &context).unwrap();
+            let mut waiter = test_waiter(&connection, Waker::Claude);
+            let request = ready(waiter.prepare(true));
+            assert!(request.valid(
+                &connection.root,
+                "s1",
+                Waker::Claude,
+                &notice(Some("inc-a"))
+            ));
+            assert!(!request.valid(&connection.root, "s1", Waker::Claude, &notice(None)));
+            context.explicit_end_requested = true;
+            crate::client_session::save_context(config, &context).unwrap();
+            assert!(!request.valid(
+                &connection.root,
+                "s1",
+                Waker::Claude,
+                &notice(Some("inc-a"))
+            ));
+            assert!(matches!(waiter.prepare(true), Admission::Stop));
+            context.start_nonce = "start-b".into();
+            context.incarnation = Some("inc-b".into());
+            context.explicit_end_requested = false;
+            crate::client_session::begin_context(config, Some("start-a"), &context).unwrap();
+            assert!(!request.valid(
+                &connection.root,
+                "s1",
+                Waker::Claude,
+                &notice(Some("inc-a"))
+            ));
+            assert!(matches!(waiter.prepare(true), Admission::Stop));
+            let mut next = test_waiter(&connection, Waker::Claude);
+            let next_request = ready(next.prepare(true));
+            let route = std::fs::read_dir(config.join("agentscm/session-routes"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(&route, "corrupt").unwrap();
+            assert!(
+                matches!(next.prepare(false), Admission::Stop),
+                "corruption is not legacy absence"
+            );
+            assert!(!next_request.valid(
+                &connection.root,
+                "s1",
+                Waker::Claude,
+                &notice(Some("inc-b"))
+            ));
+            let mut rebound = connection.clone();
+            rebound.hub = "https://another.example".into();
+            save_connection(config, &rebound);
+            assert!(matches!(
+                test_waiter(&connection, Waker::Claude).prepare(false),
+                Admission::Stop
+            ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_waits_unpinned_for_foreign_or_ended_routes() {
+        for (same_host, state) in [
+            (false, "live"),
+            (false, "terminal"),
+            (false, "explicit-end"),
+            (false, "exited"),
+            (false, "revoked"),
+            (true, "terminal"),
+            (true, "explicit-end"),
+            (true, "exited"),
+            (true, "revoked"),
+        ] {
+            client_config::in_isolated_config_home(|config| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (url, served) = hub_request(
+                            vec![(200, r#"{"text":"AgentSCM Hub message msg_synthetic","incarnation":"inc-b"}"#)],
+                            None,
+                            wait_body_current("s1", Waker::Claude, "inc-b"),
+                        ).await;
+                        let (_directory, connection, mut context) =
+                            session_fixture(config, &url, "claude");
+                        let own = test_host(101);
+                        context.registration_host = Some(if same_host { own.clone() } else { test_host(202) });
+                        context.terminal = state == "terminal";
+                        context.explicit_end_requested = state == "explicit-end";
+                        context.exit_observed_at = (state == "exited").then_some(1);
+                        context.revoked = state == "revoked";
+                        crate::client_session::save_context(config, &context).unwrap();
+                        let mut waiter = startup_waiter(&connection, Some(own.clone()));
+                        assert!(matches!(waiter.prepare(true), Admission::Pending), "{same_host}/{state}");
+                        assert!(waiter.nonce.is_none());
+                        assert!(!waiter.sent);
+                        assert!(matches!(
+                            startup_waiter(&connection, Some(own.clone())).prepare(false),
+                            Admission::Stop
+                        ));
+
+                        // Only the relay's replacement can be the first HTTP request.
+                        context.start_nonce = "start-b".into();
+                        context.incarnation = Some("inc-b".into());
+                        context.registration_host = Some(own);
+                        context.terminal = false;
+                        context.explicit_end_requested = false;
+                        context.exit_observed_at = None;
+                        context.revoked = false;
+                        crate::client_session::begin_context(config, Some("start-a"), &context).unwrap();
+                        let found = wait_until(
+                            &reqwest::Client::new(), MAX_LIFE, || true, Duration::ZERO,
+                            |grace| waiter.prepare(grace),
+                            |request, notice| request.valid(&connection.root, "s1", Waker::Claude, notice),
+                        ).await;
+                        assert!(found.is_some());
+                        assert_eq!(served.await.unwrap(), 1);
+                        assert_eq!(waiter.nonce.as_deref(), Some("start-b"));
+                    });
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_unknown_or_foreign_host_never_uses_legacy_context() {
+        client_config::in_isolated_config_home(|config| {
+            let (_directory, connection, mut context) =
+                session_fixture(config, "https://hub.example", "claude");
+            // A genuinely absent context retains legacy compatibility after the bounded grace.
+            let mut absent = startup_waiter(&connection, None);
+            assert!(matches!(absent.prepare(true), Admission::Pending));
+            assert_eq!(
+                ready(absent.prepare(false)).body,
+                wait_body("s1", Waker::Claude)
+            );
+            context.protocol = 0;
+            context.registration_host = Some(test_host(101));
+            crate::client_session::save_context(config, &context).unwrap();
+            for own in [None, Some(test_host(202))] {
+                let mut waiter = startup_waiter(&connection, own);
+                assert!(matches!(waiter.prepare(true), Admission::Pending));
+                assert!(matches!(waiter.prepare(false), Admission::Stop));
+                assert!(waiter.nonce.is_none());
+                assert!(!waiter.sent);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_handoff_adopts_only_the_published_successor() {
+        client_config::in_isolated_config_home(|config| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (url, served) = hub_request(
+                        vec![(200, r#"{"text":"AgentSCM Hub message msg_synthetic","incarnation":"inc-b"}"#)],
+                        None,
+                        wait_body_current("s1", Waker::Claude, "inc-b"),
+                    ).await;
+                    let (_directory, connection, mut context) = session_fixture(config, &url, "claude");
+                    let own = test_host(101);
+                    context.registration_host = Some(own.clone());
+                    crate::client_session::save_context(config, &context).unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let held = lock(dir.path(), "s1").unwrap();
+                    let ended = marker(dir.path(), "s1");
+                    File::create(&ended).unwrap().set_modified(
+                        std::time::SystemTime::now() - MAX_LIFE - Duration::from_secs(2 * 24 * 3600),
+                    ).unwrap();
+                    let mut waiter = startup_waiter(&connection, Some(own));
+                    let contender = lock_until(dir.path(), "s1", true, Duration::from_secs(2), || true);
+                    tokio::pin!(contender);
+                    tokio::select! {
+                        biased;
+                        _ = &mut contender => panic!("SessionStart must wait for its predecessor"),
+                        _ = std::future::ready(()) => {}
+                    }
+                    assert!(ended.exists(), "a contender cannot remove even a stale predecessor marker");
+                    assert!(waiter.nonce.is_none());
+                    context.start_nonce = "start-b".into();
+                    context.incarnation = Some("inc-b".into());
+                    crate::client_session::begin_context(config, Some("start-a"), &context).unwrap();
+                    drop(held);
+                    let _acquired = contender.await.expect("the successor acquires the released lock");
+                    assert!(!ended.exists(), "stale marker cleanup happens only while holding the lock");
+                    let found = wait_until(
+                        &reqwest::Client::new(), MAX_LIFE, || true, Duration::ZERO,
+                        |grace| {
+                            assert!(grace, "registration grace starts after lock handoff");
+                            waiter.prepare(grace)
+                        },
+                        |request, notice| request.valid(&connection.root, "s1", Waker::Claude, notice),
+                    ).await;
+                    assert!(found.is_some());
+                    assert_eq!(served.await.unwrap(), 1);
+                    assert_eq!(waiter.nonce.as_deref(), Some("start-b"));
+                });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_relay_first_and_live_predecessor_both_keep_successor_fences() {
+        // Relay-first B is immediately usable. A live same-host predecessor A with no holder
+        // is indistinguishable: it may be pinned, but the later relay mint must fence its reply.
+        for (nonce, incarnation, response) in [
+            (
+                "start-b",
+                "inc-b",
+                r#"{"text":"AgentSCM Hub message msg_synthetic","incarnation":"inc-b"}"#,
+            ),
+            (
+                "start-a",
+                "inc-a",
+                r#"{"text":"AgentSCM Hub message msg_synthetic","incarnation":"inc-a"}"#,
+            ),
+        ] {
+            client_config::in_isolated_config_home(|config| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (url, served) = hub_request(
+                            vec![(200, response)],
+                            None,
+                            wait_body_current("s1", Waker::Claude, incarnation),
+                        )
+                        .await;
+                        let (_directory, connection, mut context) =
+                            session_fixture(config, &url, "claude");
+                        let own = test_host(101);
+                        context.registration_host = Some(own.clone());
+                        context.start_nonce = nonce.into();
+                        context.incarnation = Some(incarnation.into());
+                        crate::client_session::save_context(config, &context).unwrap();
+                        let mut waiter = startup_waiter(&connection, Some(own));
+                        assert_eq!(
+                            ready(waiter.prepare(true)).incarnation.as_deref(),
+                            Some(incarnation)
+                        );
+                        let mut successor = context.clone();
+                        successor.start_nonce = "start-c".into();
+                        successor.incarnation = Some("inc-c".into());
+                        let found = wait_until(
+                            &reqwest::Client::new(),
+                            MAX_LIFE,
+                            || true,
+                            Duration::ZERO,
+                            |grace| waiter.prepare(grace),
+                            |request, reply| {
+                                crate::client_session::begin_context(
+                                    config,
+                                    Some(nonce),
+                                    &successor,
+                                )
+                                .unwrap();
+                                assert!(!request.valid(
+                                    &connection.root,
+                                    "s1",
+                                    Waker::Claude,
+                                    &notice(Some("inc-c"))
+                                ));
+                                request.valid(&connection.root, "s1", Waker::Claude, reply)
+                            },
+                        )
+                        .await;
+                        assert!(
+                            found.is_none(),
+                            "the in-flight predecessor reply is discarded"
+                        );
+                        assert_eq!(served.await.unwrap(), 1);
+                        assert!(matches!(waiter.prepare(true), Admission::Stop));
+                        assert_eq!(waiter.nonce.as_deref(), Some(nonce));
+                    });
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_lock_wait_is_bounded_and_other_duplicates_exit_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = lock(dir.path(), "s1").unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(
+            lock_until(dir.path(), "s1", true, Duration::from_secs(1), || true)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        let started = tokio::time::Instant::now();
+        assert!(
+            lock_until(dir.path(), "s1", false, START_LOCK_GRACE, || true)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        let alive = std::cell::Cell::new(true);
+        let contender = lock_until(dir.path(), "s1", true, START_LOCK_GRACE, || alive.get());
+        tokio::pin!(contender);
+        tokio::select! {
+            biased;
+            _ = &mut contender => panic!("the holder has not released"),
+            _ = std::future::ready(()) => {}
+        }
+        alive.set(false);
+        assert!(contender.await.is_none(), "parent loss stops lock retries");
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
 
     #[test]
     fn one_waiter_per_session() {
@@ -507,8 +1596,35 @@ mod tests {
                 "--message=--remote=ws://elsewhere".to_owned()
             ]
         );
-        // Only the Hub's framed notice is queued: anything else runs nothing and exits 0.
-        assert_eq!(queue("019a7c-thread", "something else"), 0);
+        assert!(!framed("something else"));
+        assert!(
+            !queue_args("019a7c-thread", "notice")
+                .iter()
+                .any(|arg| arg == "--resume")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_queue_failure_and_unknown_outcomes_are_distinct() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("synthetic-queue");
+        assert_eq!(
+            spawn_queue(&program, "synthetic", "notice"),
+            AttemptOutcome::ProvenNoDispatch
+        );
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            spawn_queue(&program, "synthetic", "notice"),
+            AttemptOutcome::TransportReported
+        );
+        std::fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
+        assert_eq!(
+            spawn_queue(&program, "synthetic", "notice"),
+            AttemptOutcome::Unknown
+        );
     }
 
     /// A Hub that answers each request with the next of `replies` (status, body).
@@ -524,6 +1640,14 @@ mod tests {
         replies: Vec<(u16, &'static str)>,
         end: Option<PathBuf>,
         agent: Waker,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        hub_request(replies, end, wait_body("s1", agent)).await
+    }
+
+    async fn hub_request(
+        replies: Vec<(u16, &'static str)>,
+        end: Option<PathBuf>,
+        body_expected: String,
     ) -> (String, tokio::task::JoinHandle<usize>) {
         let last = replies.len();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -566,7 +1690,7 @@ mod tests {
                         || text.contains("Authorization: Bearer secret"),
                     "{text}"
                 );
-                assert!(text.ends_with(&wait_body("s1", agent)), "{text}");
+                assert!(text.ends_with(&body_expected), "{text}");
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -606,13 +1730,24 @@ mod tests {
             .write_all(b"secret\n")
             .unwrap();
         let client = reqwest::Client::new();
-        let wait = Wait {
-            client: &client,
-            url: format!("{url}/v1/hub/agent-messages/wait"),
-            body: wait_body("s1", agent),
-            token_file: &token_file,
-        };
-        wait.until(life, alive, Duration::ZERO).await
+        wait_until(
+            &client,
+            life,
+            alive,
+            Duration::ZERO,
+            |_| {
+                Admission::Ready(Box::new(WaitRequest {
+                    connection: test_connection(dir.path(), url, &token_file),
+                    token: crate::client_cli::read_token(&token_file).unwrap(),
+                    body: wait_body("s1", agent),
+                    nonce: None,
+                    incarnation: None,
+                }))
+            },
+            |_, _| true,
+        )
+        .await
+        .map(|(notice, _)| notice.text)
     }
 
     #[tokio::test]

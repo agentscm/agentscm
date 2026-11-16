@@ -586,6 +586,7 @@ async fn whoami(
     let owner = principal.owner;
     Json(json!({
         "shared_conversation_retention_days": retention_days,
+        "cooperation_protocol": super::notices::PROTOCOL,
         "token": {
             "id": principal.token_id,
             "name": principal.name,

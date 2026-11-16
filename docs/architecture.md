@@ -39,11 +39,13 @@ conversation bodies are uploaded with best-effort redaction, readable by anyone 
 repository, and kept for a bounded retention period; while it is off, they stay in the local spool.
 It does not complete the wider privacy and recovery lifecycle.
 
-`agentscm open` starts a loopback [front door](connect-this-computer.md) that joins selected local
-checkouts to their Hub views. The [repository explorer](repository-explorer.md) reads committed
-Git source, history and diffs alongside available local evidence. A same-origin browser grant
-authorizes the local settings and library operations; a read-only Hub token is not local write
-authority. The [local workflow library](advanced/workflow-library.md) retains immutable skills
+Native release binaries have no local dashboard or detached presentation startup. The existing
+CLI provides [this computer's setup and controls](connect-this-computer.md). Explicit optional
+Hub hosting retains its API/authentication and data, while container/UI-enabled builds retain
+the web interface. The [repository explorer](repository-explorer.md) can still serve committed
+Git source, history and diffs alongside available local evidence through its separately configured
+read-only API. A read-only Hub token is not local write authority.
+The [local workflow library](advanced/workflow-library.md) retains immutable skills
 and workflow versions, simulates declarations and exports reviewed setup to the separate
 operator-local pipeline. It does not execute a deployment or install a native landing requirement.
 

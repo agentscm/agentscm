@@ -33,7 +33,7 @@ use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
-    done_pausing_for, others_for, record_hook_ms,
+    done_pausing_native, others_for, record_hook_ms,
 };
 use super::session_waiting::{QuestionSnapshot, WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
@@ -357,6 +357,34 @@ impl Outcome {
     }
 }
 
+/// Current native memory effects share one short serialization point. Register is DB-only;
+/// a successor's memory facts can only be installed by another guarded effect after it.
+async fn native_effect<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    native: Option<&str>,
+    incarnation: Option<&str>,
+    effect: impl FnOnce(&super::onboarding::Observations, &dyn Store, &Principal) -> super::Result<T>
+    + Send
+    + 'static,
+) -> super::Result<T> {
+    let store = state.store.clone();
+    let observations = state.onboarding.clone();
+    let principal = principal.clone();
+    let native = native.map(str::to_owned);
+    let incarnation = incarnation.map(str::to_owned);
+    blocking(state, move || {
+        observations.native_effect(
+            &*store,
+            &principal,
+            native.as_deref(),
+            incarnation.as_deref(),
+            || effect(&observations, &*store, &principal),
+        )
+    })
+    .await
+}
+
 async fn hook(
     State(state): State<HubState>,
     Path(name): Path<String>,
@@ -424,23 +452,42 @@ async fn hook(
     };
     // Ordinary activity authenticates only when there is a known wait. An explicit clear
     // must persist even before the first native snapshot arrives, so it always authenticates.
-    if let Some((native, all)) = call.ends_wait()
+    if failure.is_none()
+        && call.kind != Kind::Done
+        && let Some((native, all)) = call.ends_wait()
         && (call.cleared || state.onboarding.waiting().has_session(native))
     {
         let end = async {
             let principal = authenticate(&state, token.clone(), repo.clone()).await?;
+            let incarnation =
+                super::cooperation::incarnation(&parts.headers, Some(native)).map_err(reason)?;
             let store = state.store.clone();
             let onboarding = state.onboarding.clone();
             let call = call.clone();
             let native = native.to_owned();
             blocking(&state, move || {
-                call.end_wait(onboarding.waiting(), &*store, &principal, &native, all)?;
-                if all {
-                    onboarding
-                        .subagents()
-                        .answered(&principal.token_id, &native);
-                }
-                Ok(())
+                onboarding.native_effect(
+                    &*store,
+                    &principal,
+                    Some(&native),
+                    incarnation.as_deref(),
+                    || {
+                        call.end_wait(
+                            onboarding.waiting(),
+                            &*store,
+                            &principal,
+                            &native,
+                            all,
+                            incarnation.as_deref(),
+                        )?;
+                        if all {
+                            onboarding
+                                .subagents()
+                                .answered(&principal.token_id, &native);
+                        }
+                        Ok(())
+                    },
+                )
             })
             .await
             .map_err(reason)
@@ -459,30 +506,56 @@ async fn hook(
             _ => {}
         }
     }
-    if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
+    if failure.is_none()
+        && matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
     {
         let delivery = async {
             // The touch already read the inbox; only a call that did not touch reads it here.
             if let Some((principal, session, page)) = delivered {
+                let incarnation =
+                    super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                        .map_err(reason)?;
+                native_effect(
+                    &state,
+                    &principal,
+                    call.session.as_deref(),
+                    incarnation.as_deref(),
+                    |_, _, _| Ok(()),
+                )
+                .await
+                .map_err(reason)?;
                 return Ok((principal, session, page.map_err(reason)?));
             }
             let principal = authenticate(&state, Some(token), repo).await?;
             let store = state.store.clone();
             let requested = call.session.clone();
             let id = principal.token_id.clone();
+            let incarnation =
+                super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                    .map_err(reason)?;
+            let observations = state.onboarding.clone();
+            let scope = principal.clone();
             let (session, page) = blocking(&state, move || {
-                let now = unix_now();
-                let session = store.session_name_for(&id, requested.as_deref(), now)?;
-                let page = store.coordination_inbox(
-                    &id,
-                    &CoordinationInboxQuery {
-                        session: Some(session.clone()),
-                        ..Default::default()
+                observations.native_effect(
+                    &*store,
+                    &scope,
+                    requested.as_deref(),
+                    incarnation.as_deref(),
+                    || {
+                        let now = unix_now();
+                        let session = store.session_name_for(&id, requested.as_deref(), now)?;
+                        let page = store.coordination_inbox(
+                            &id,
+                            &CoordinationInboxQuery {
+                                session: Some(session.clone()),
+                                ..Default::default()
+                            },
+                            now,
+                        )?;
+                        Ok((session, page))
                     },
-                    now,
-                )?;
-                Ok((session, page))
+                )
             })
             .await
             .map_err(reason)?;
@@ -585,21 +658,64 @@ async fn hook(
                     && matches!(call.shape, Shape::Hook(_) | Shape::Snake | Shape::Camel)
                     && outcome.deny.is_none()
                     && !call.child;
-                super::agent_messages::note_hook(
-                    &principal.token_id,
-                    &session,
-                    &call.via,
-                    !call.child,
-                    call.context_hook,
-                    unix_now(),
-                );
+                let note = call.clone();
+                let native = session.clone();
+                let incarnation =
+                    super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                        .ok()
+                        .flatten();
+                if let Err(error) = native_effect(
+                    &state,
+                    &principal,
+                    call.session.as_deref(),
+                    incarnation.as_deref(),
+                    move |_, _, principal| {
+                        super::agent_messages::note_hook(
+                            &principal.token_id,
+                            &native,
+                            &note.via,
+                            !note.child,
+                            note.context_hook,
+                            unix_now(),
+                        );
+                        Ok(())
+                    },
+                )
+                .await
+                {
+                    let error = reason(error);
+                    outcome.text = error.hook_note();
+                    outcome.status = "unknown";
+                    failure = Some(error);
+                }
                 // An unknown reply loses its text after the session's first, so it takes nothing.
                 // A take that finishes past the deadline is offered again later (REOFFER_SECS).
                 let merged_scope = (principal.clone(), session.clone());
                 if context && outcome.status != "unknown" {
                     let (store, via) = (state.store.clone(), call.via.clone());
+                    let incarnation =
+                        super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                            .ok()
+                            .flatten();
                     let taken = blocking(&state, move || {
-                        super::agent_messages::take(&*store, &principal, &session, &via, unix_now())
+                        if let Some(incarnation) = incarnation {
+                            super::cooperation::offer_on_call(
+                                &*store,
+                                &principal,
+                                &session,
+                                &incarnation,
+                                unix_now(),
+                            )
+                            .map(|offer| offer.map(|offer| offer.text))
+                        } else {
+                            super::agent_messages::take(
+                                &*store,
+                                &principal,
+                                &session,
+                                &via,
+                                unix_now(),
+                            )
+                        }
                     });
                     if let Ok(Ok(Some(text))) = timeout_at(deadline, taken).await {
                         outcome.text.push('\n');
@@ -980,11 +1096,15 @@ impl Call {
 
     /// Keeps the roster of the session's subagents: the one that made this call, and the one
     /// this call started. Best effort and silent.
-    fn note_subagents(&self, state: &HubState, principal: &Principal) {
+    fn note_subagents(
+        &self,
+        observations: &super::onboarding::Observations,
+        principal: &Principal,
+    ) {
         let Some(native) = self.session.as_deref() else {
             return;
         };
-        let (roster, now) = (state.onboarding.subagents(), unix_now());
+        let (roster, now) = (observations.subagents(), unix_now());
         match self.asker.as_deref() {
             Some(id) if self.stopped => roster.ended(principal, native, id, now),
             Some(id) => {
@@ -1004,6 +1124,108 @@ impl Call {
             let running = sub.agent_type.as_deref().filter(|_| sub.running);
             roster.described(principal, native, &sub.id, running, &sub.does, now);
         }
+    }
+
+    async fn note_subagents_guarded(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        incarnation: Option<&str>,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, _, principal| {
+                call.note_subagents(observations, principal);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn note_onboarding_guarded(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        client: Option<&str>,
+        incarnation: Option<&str>,
+        epoch: u64,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        let client = client.map(str::to_owned);
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, _, principal| {
+                let agent = call.via.strip_prefix("hook:").unwrap_or("");
+                if call.kind == Kind::Start {
+                    observations.restart(
+                        principal,
+                        client.as_deref(),
+                        agent,
+                        call.session.as_deref(),
+                        epoch,
+                    );
+                } else {
+                    observations.native(
+                        principal,
+                        client.as_deref(),
+                        agent,
+                        call.session.as_deref(),
+                        call.kind == Kind::Done,
+                        epoch,
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The domain end may have committed before a successor starts. All later native
+    /// projections therefore share one guarded cleanup; no late callback addresses its rows.
+    async fn finish_native_done(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        incarnation: Option<&str>,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        let fence = incarnation.map(str::to_owned);
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, store, principal| {
+                if let Some(native) = call.session.as_deref() {
+                    if fence.as_deref() == Some(super::session_lifecycle::EXPECT_NO_LIFECYCLE) {
+                        let canonical = store.session_name_for(
+                            &principal.token_id,
+                            Some(native),
+                            unix_now(),
+                        )?;
+                        super::agent_messages::note_end(&principal.token_id, &canonical);
+                    }
+                    call.end_wait(
+                        observations.waiting(),
+                        store,
+                        principal,
+                        native,
+                        true,
+                        fence.as_deref(),
+                    )?;
+                    observations.subagents().forget(&principal.token_id, native);
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// The wait this call ends, if any: the session's, and whether the call ends every wait
@@ -1034,10 +1256,21 @@ impl Call {
         principal: &Principal,
         native: &str,
         all: bool,
+        incarnation: Option<&str>,
     ) -> super::Result<()> {
         let holder = holder(principal, native);
         if self.cleared {
-            waiting.cleared(store, principal, native, unix_now())?;
+            if incarnation.is_some() {
+                waiting.cleared_with_transport(
+                    store,
+                    principal,
+                    native,
+                    incarnation,
+                    unix_now(),
+                )?;
+            } else {
+                waiting.cleared(store, principal, native, unix_now())?;
+            }
         } else if self.kind == Kind::Done {
             waiting.ended(holder, native);
         } else {
@@ -1121,6 +1354,8 @@ impl Call {
         onboarding_epoch: u64,
         delivered: &mut Option<Delivered>,
     ) -> Result<Outcome, ErrorEnvelope> {
+        let incarnation =
+            super::cooperation::incarnation(headers, self.session.as_deref()).map_err(reason)?;
         let client = super::onboarding::client(headers);
         let completion_reporting = super::insights::completion_enabled(headers);
         let call = |paths: Vec<String>| SessionCall {
@@ -1138,10 +1373,27 @@ impl Call {
                 _ => ErrorCode::InvalidRequest,
             })),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
-            Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Ignore => Ok(Outcome::clean()),
+            Kind::Prompt => {
+                if incarnation.is_some() {
+                    let principal = authenticate(state, token, repo).await?;
+                    native_effect(
+                        state,
+                        &principal,
+                        self.session.as_deref(),
+                        incarnation.as_deref(),
+                        |_, _, _| Ok(()),
+                    )
+                    .await
+                    .map_err(reason)?;
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Subagent => {
                 if let Ok(principal) = authenticate(state, token, repo).await {
-                    self.note_subagents(state, &principal);
+                    self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                        .await
+                        .map_err(reason)?;
                 }
                 Ok(Outcome::clean())
             }
@@ -1151,7 +1403,9 @@ impl Call {
                 let mut lapsed = None;
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
-                    self.note_subagents(state, &principal);
+                    self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                        .await
+                        .map_err(reason)?;
                     let store = state.store.clone();
                     let heartbeat = call(Vec::new());
                     let heartbeat = SessionCall {
@@ -1161,8 +1415,15 @@ impl Call {
                         ..heartbeat
                     };
                     let id = principal.token_id.clone();
+                    let fence = incarnation.clone();
                     let found = blocking(state, move || {
-                        store.session_activity(&id, &heartbeat, phase, unix_now())
+                        store.session_activity_with_transport(
+                            &id,
+                            &heartbeat,
+                            phase,
+                            fence.as_deref(),
+                            unix_now(),
+                        )
                     })
                     .await
                     .map_err(reason)?;
@@ -1229,50 +1490,60 @@ impl Call {
                 if let Some(native) = self.session.clone()
                     && let Ok(principal) = authenticate(state, token, repo).await
                 {
-                    self.note_subagents(state, &principal);
-                    let store = state.store.clone();
-                    let id = principal.token_id.clone();
+                    let call = self.clone();
                     let requested = native.clone();
-                    let recorded = blocking(state, move || {
-                        store.session_name_for(&id, Some(&requested), unix_now())
-                    })
-                    .await
-                    .and_then(|session| {
-                        let waiting = state.onboarding.waiting();
-                        let agent = self.via.strip_prefix("hook:").unwrap_or("");
-                        // The host's notice says only that a dialog is on screen: it must not
-                        // replace the wait that says whose dialog it is and what it asks.
-                        if self.prompt_shown {
-                            return waiting.notice(
-                                &principal,
-                                &native,
+                    let recorded = native_effect(
+                        state,
+                        &principal,
+                        Some(&native),
+                        incarnation.as_deref(),
+                        move |observations, store, principal| {
+                            call.note_subagents(observations, principal);
+                            let session = store.session_name_for(
+                                &principal.token_id,
+                                Some(&requested),
+                                unix_now(),
+                            )?;
+                            let waiting = observations.waiting();
+                            let agent = call.via.strip_prefix("hook:").unwrap_or("");
+                            // The host's notice says only that a dialog is on screen: it must not
+                            // replace the wait that says whose dialog it is and what it asks.
+                            if call.prompt_shown {
+                                waiting.notice(
+                                    principal,
+                                    &requested,
+                                    &session,
+                                    agent,
+                                    unix_now(),
+                                )?;
+                                observations.permissions().confirm(
+                                    holder(principal, &requested),
+                                    &requested,
+                                    unix_now(),
+                                );
+                                return Ok(());
+                            }
+                            waiting.record(
+                                principal,
+                                &requested,
                                 &session,
                                 agent,
+                                reason,
+                                call.asker.as_deref(),
+                                call.asks.as_deref(),
                                 unix_now(),
-                            );
-                        }
-                        waiting.record(
-                            &principal,
-                            &native,
-                            &session,
-                            agent,
-                            reason,
-                            self.asker.as_deref(),
-                            self.asks.as_deref(),
-                            unix_now(),
-                        )
-                    });
+                            )
+                        },
+                    )
+                    .await;
                     if let Err(error) = recorded {
                         eprintln!("hub: waiting hook not recorded: {error}");
-                    } else if self.prompt_shown {
-                        let requests = state.onboarding.permissions();
-                        requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
                     // A merge settles the Work the session leads, whether or not its turn asks
                     // its person something; the ask stays a wait. A dialog shown mid-turn is not
                     // held up for it.
                     if !matches!(reason, WaitReason::Permission | WaitReason::Question) {
-                        complete_led_merged(state, &principal, &native).await;
+                        complete_led_merged(state, &principal, &native, incarnation.clone()).await;
                     }
                 }
                 Ok(Outcome::clean())
@@ -1280,7 +1551,9 @@ impl Call {
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
-                self.note_subagents(state, &principal);
+                self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                    .await
+                    .map_err(reason)?;
                 let applied = self.applied();
                 let observed = self.observed_line();
                 // Files changed by a shell call: the call has ended, whatever the check finds.
@@ -1293,8 +1566,15 @@ impl Call {
                         report: false,
                         ..call(Vec::new())
                     };
+                    let fence = incarnation.clone();
                     let _ = blocking(state, move || {
-                        store.session_activity(&id, &ended, CallPhase::End, unix_now())
+                        store.session_activity_with_transport(
+                            &id,
+                            &ended,
+                            CallPhase::End,
+                            fence.as_deref(),
+                            unix_now(),
+                        )
                     })
                     .await;
                 }
@@ -1327,6 +1607,7 @@ impl Call {
                     state,
                     &principal,
                     call(self.paths.clone()),
+                    incarnation.clone(),
                     read_inbox(principal.token_id.clone()),
                 )
                 .await;
@@ -1415,12 +1696,25 @@ impl Call {
                     && !self.child
                     && !holdable.is_empty()
                     && let Some(native) = self.session.as_deref()
-                    && state.onboarding.start_nudges().first(
-                        &principal.repository,
-                        &principal.token_id,
-                        native,
-                        unix_now(),
-                    )
+                    && {
+                        let native = native.to_owned();
+                        native_effect(
+                            state,
+                            &principal,
+                            self.session.as_deref(),
+                            incarnation.as_deref(),
+                            move |observations, _, principal| {
+                                Ok(observations.start_nudges().first(
+                                    &principal.repository,
+                                    &principal.token_id,
+                                    &native,
+                                    unix_now(),
+                                ))
+                            },
+                        )
+                        .await
+                        .map_err(reason)?
+                    }
                 {
                     super::session::count_undeclared();
                     let why = self.undeclared_text(&principal.repository, &holdable);
@@ -1453,27 +1747,30 @@ impl Call {
                 }
                 // Native edit tools only: a shell call's observed change must not verify them.
                 if !applied && self.native_client() {
-                    state.onboarding.native(
+                    self.note_onboarding_guarded(
+                        state,
                         &principal,
                         client,
-                        self.via.strip_prefix("hook:").unwrap_or(""),
-                        self.session.as_deref(),
-                        false,
+                        incarnation.as_deref(),
                         onboarding_epoch,
-                    );
+                    )
+                    .await
+                    .map_err(reason)?;
                 }
                 Ok(outcome)
             }
             Kind::Start => {
                 let principal = authenticate(state, token, repo).await?;
                 if self.native_client() {
-                    state.onboarding.restart(
+                    self.note_onboarding_guarded(
+                        state,
                         &principal,
                         client,
-                        self.via.strip_prefix("hook:").unwrap_or(""),
-                        self.session.as_deref(),
+                        incarnation.as_deref(),
                         onboarding_epoch,
-                    );
+                    )
+                    .await
+                    .map_err(reason)?;
                 }
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
@@ -1501,10 +1798,15 @@ impl Call {
                 })
                 .await;
                 let inbox = read_inbox(principal.token_id.clone());
-                let (advice, (session, page)) =
-                    announce_reading(state, &principal, call(Vec::new()), inbox)
-                        .await
-                        .map_err(reason)?;
+                let (advice, (session, page)) = announce_reading(
+                    state,
+                    &principal,
+                    call(Vec::new()),
+                    incarnation.clone(),
+                    inbox,
+                )
+                .await
+                .map_err(reason)?;
                 *delivered = Some((principal.clone(), session, page));
                 let own = advice.touched.intent.as_ref().map(|i| i.id.as_str());
                 // The touch is committed; a failed listing must not report the whole call as unknown.
@@ -1630,28 +1932,31 @@ impl Call {
             }
             Kind::Done => {
                 let principal = authenticate(state, token, repo).await?;
-                state.onboarding.native(
+                // Readiness is an observation of this authenticated native end, independent
+                // of whether coordination writes finish. Its guarded blocking task survives
+                // the hook deadline, like Start, while stale incarnations cannot erase proof.
+                self.note_onboarding_guarded(
+                    state,
                     &principal,
                     client,
-                    self.via.strip_prefix("hook:").unwrap_or(""),
-                    self.session.as_deref(),
-                    true,
+                    incarnation.as_deref(),
                     onboarding_epoch,
-                );
+                )
+                .await
+                .map_err(reason)?;
                 // A call that names no session pauses no Work, since the session it resolves to
                 // is not the call's own.
                 match self.session.clone() {
                     Some(session) => {
-                        let roster = state.onboarding.subagents();
-                        roster.forget(&principal.token_id, &session);
                         // Before the end pauses it: merged Work the session leads is complete.
-                        complete_led_merged(state, &principal, &session).await;
-                        done_pausing_for(
+                        complete_led_merged(state, &principal, &session, incarnation.clone()).await;
+                        done_pausing_native(
                             state,
                             &principal,
-                            Some(session),
+                            Some(session.clone()),
                             &self.via,
                             completion_reporting,
+                            incarnation.clone(),
                         )
                         .await
                         .map_err(reason)?;
@@ -1660,6 +1965,9 @@ impl Call {
                         done_for(state, &principal, None).await.map_err(reason)?;
                     }
                 }
+                self.finish_native_done(state, &principal, incarnation.as_deref())
+                    .await
+                    .map_err(reason)?;
                 Ok(Outcome::clean())
             }
         }
@@ -2159,13 +2467,21 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 /// end or its end. Best effort and silent: the hook waits for it at most `MERGED_NOTICE_BUDGET`
 /// (the store call runs on after that) and never fails by it. One that ran past the budget may
 /// meet the end's pause, whose fence then refuses it, and the poll completes the Work later.
-async fn complete_led_merged(state: &HubState, principal: &Principal, native: &str) {
+async fn complete_led_merged(
+    state: &HubState,
+    principal: &Principal,
+    native: &str,
+    incarnation: Option<String>,
+) {
     let (store, principal, native) = (state.store.clone(), principal.clone(), native.to_owned());
     let done = blocking(state, move || {
         let now = unix_now();
-        let name = store.session_name_for(&principal.token_id, Some(&native), now)?;
-        Ok(super::merged_holds::complete_led_merged(
-            &*store, &principal, &name, now,
+        Ok(super::merged_holds::complete_led_merged_with_transport(
+            &*store,
+            &principal,
+            &native,
+            incarnation.as_deref(),
+            now,
         ))
     });
     if let Ok(Err(error)) = tokio::time::timeout(MERGED_NOTICE_BUDGET, done).await {
@@ -3638,6 +3954,7 @@ mod tests {
         url: String,
         token: String,
         store: std::sync::Arc<dyn Store>,
+        state: HubState,
         owner: String,
         server: tokio::task::JoinHandle<()>,
     }
@@ -3680,8 +3997,8 @@ mod tests {
                 crate::backend::LocalBackend::open(directory.path().join("objects")).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            let router =
-                crate::hub::router(HubState::new(store.clone(), std::sync::Arc::new(objects)));
+            let state = HubState::new(store.clone(), std::sync::Arc::new(objects));
+            let router = crate::hub::router(state.clone());
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             Self {
                 _directory: directory,
@@ -3689,6 +4006,7 @@ mod tests {
                 url,
                 token: token.expose().to_owned(),
                 store,
+                state,
                 owner: user.id,
                 server,
             }
@@ -3712,6 +4030,27 @@ mod tests {
 
         async fn hook(&self, event: Value) -> Value {
             self.hook_as(&self.token, event).await
+        }
+
+        async fn native_hook(&self, event: Value, incarnation: &str) -> Value {
+            let body = self
+                .client
+                .post(format!("{}/v1/hub/hook/codex", self.url))
+                .bearer_auth(&self.token)
+                .header("content-type", "application/json")
+                .header(
+                    super::super::cooperation::SESSION_HEADER,
+                    event["session_id"].as_str().unwrap(),
+                )
+                .header(super::super::cooperation::INCARNATION_HEADER, incarnation)
+                .body(event.to_string())
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
         }
 
         async fn hook_as(&self, token: &str, event: Value) -> Value {
@@ -3821,6 +4160,387 @@ mod tests {
                 .filter(|action| action["kind"] == "session_waiting")
                 .count()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregistered_end_cleans_legacy_reach_but_never_a_registered_successor() {
+        use crate::hub::session_lifecycle::{EXPECT_NO_LIFECYCLE, LifecycleRegister};
+        let hub = QuestionHub::new().await;
+        let now = unix_now();
+        let principal = hub
+            .store
+            .authenticate(
+                &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let native = "legacy-end";
+        let ended = || {
+            super::super::agent_messages::save_sessions(&*hub.store, now).unwrap();
+            let saved: Value = serde_json::from_str(
+                &hub.store
+                    .get_setting("hub.agent_messages.sessions.v1")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            saved["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["token"] == principal.token_id && entry["session"] == native)
+                .unwrap()["client"]["ended"]
+                .as_bool()
+                .unwrap()
+        };
+        let call = parse(
+            Agent::Codex,
+            &json!({"hook_event_name":"SessionEnd","session_id":native}),
+        );
+        super::super::agent_messages::note_mcp(&principal.token_id, None, native, now);
+        assert!(!ended());
+        call.finish_native_done(&hub.state, &principal, Some(EXPECT_NO_LIFECYCLE))
+            .await
+            .unwrap();
+        assert!(ended());
+        hub.store
+            .lifecycle_register(
+                &principal.token_id,
+                &LifecycleRegister {
+                    session: native.into(),
+                    start_nonce: "successor".into(),
+                    operation_id: "register-successor".into(),
+                    observed_at: now,
+                    expected_incarnation: None,
+                    qualified: false,
+                },
+                now,
+            )
+            .unwrap();
+        super::super::agent_messages::note_mcp(&principal.token_id, None, native, now);
+        assert!(
+            call.finish_native_done(&hub.state, &principal, Some(EXPECT_NO_LIFECYCLE))
+                .await
+                .is_err()
+        );
+        assert!(!ended());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_old_native_end_cannot_clear_successor_projections() {
+        use crate::hub::session_lifecycle::LifecycleRegister;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        for clear in [false, true] {
+            let hub = QuestionHub::new().await;
+            let now = unix_now();
+            let principal = hub
+                .store
+                .authenticate(
+                    &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                    now,
+                )
+                .unwrap()
+                .unwrap();
+            let register = |nonce: &str, expected| LifecycleRegister {
+                session: NATIVE.into(),
+                start_nonce: nonce.into(),
+                operation_id: format!("register-{nonce}"),
+                observed_at: now,
+                expected_incarnation: expected,
+                qualified: false,
+            };
+            let old = hub
+                .store
+                .lifecycle_register(&principal.token_id, &register("old", None), now)
+                .unwrap();
+            hub.store
+                .touch_session_named_with_transport(
+                    &principal.token_id,
+                    &SessionCall {
+                        session: Some(NATIVE.into()),
+                        via: "hook:codex".into(),
+                        task: None,
+                        paths: vec![],
+                        deny: false,
+                        report: false,
+                    },
+                    true,
+                    Some(&old.incarnation),
+                    now,
+                )
+                .unwrap();
+            let call = parse(
+                Agent::Codex,
+                &json!({"hook_event_name":"SessionEnd","session_id":NATIVE,"reason":if clear {"clear"} else {"exit"}}),
+            );
+            let (committed, at_commit) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let state = hub.state.clone();
+            let scope = principal.clone();
+            let incarnation = old.incarnation.clone();
+            let client = "a".repeat(64);
+            let old_request = tokio::spawn(async move {
+                done_pausing_native(
+                    &state,
+                    &scope,
+                    Some(NATIVE.into()),
+                    "hook:codex",
+                    false,
+                    Some(incarnation.clone()),
+                )
+                .await
+                .unwrap();
+                committed.send(()).unwrap();
+                resumed.await.unwrap();
+                call.finish_native_done(&state, &scope, Some(&incarnation))
+                    .await
+            });
+            at_commit.await.unwrap();
+            let current = hub
+                .store
+                .lifecycle_register(
+                    &principal.token_id,
+                    &register("current", Some(old.incarnation.clone())),
+                    now,
+                )
+                .unwrap();
+            hub.native_hook(json!({"hook_event_name":"PermissionRequest","session_id":NATIVE,"tool_name":"request_user_input","asks":"Current question"}), &current.incarnation).await;
+            hub.state
+                .onboarding
+                .native_effect(
+                    &*hub.store,
+                    &principal,
+                    Some(NATIVE),
+                    Some(&current.incarnation),
+                    || {
+                        hub.state.onboarding.subagents().seen(
+                            &principal,
+                            NATIVE,
+                            "current-child",
+                            Some("Explore"),
+                            true,
+                            now,
+                        );
+                        let epoch = hub.state.onboarding.epoch();
+                        hub.state.onboarding.restart(
+                            &principal,
+                            Some(&client),
+                            "codex",
+                            Some(NATIVE),
+                            epoch,
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+                true
+            );
+            hub.state
+                .onboarding
+                .verify_mcp(
+                    &principal,
+                    Some(&client),
+                    super::super::onboarding::SetupCall {
+                        agent: super::super::onboarding::Agent::Codex,
+                        session: NATIVE.into(),
+                        blocker: None,
+                    },
+                    hub.state.onboarding.epoch(),
+                )
+                .unwrap();
+            let ordinary_wait =
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .dialog_wait(holder(&principal, NATIVE), NATIVE, now);
+            assert!(ordinary_wait.is_some());
+            let waits = hub
+                .state
+                .onboarding
+                .waiting()
+                .owned(&*hub.store, &principal, now)
+                .waits
+                .len();
+            let subagents = hub.state.onboarding.subagents().of(
+                &principal.token_id,
+                NATIVE,
+                &principal.owner.id,
+                now,
+            );
+            let epoch = hub.state.onboarding.epoch();
+            let onboarding = serde_json::to_value(
+                hub.state
+                    .onboarding
+                    .owned_rows(&principal, &principal.owner.id, now)
+                    .unwrap(),
+            )
+            .unwrap();
+            resume.send(()).unwrap();
+            assert!(
+                old_request.await.unwrap().is_err(),
+                "the accepted old end lost authority before cleanup"
+            );
+            assert_eq!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .dialog_wait(holder(&principal, NATIVE), NATIVE, now),
+                ordinary_wait
+            );
+            assert_eq!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .owned(&*hub.store, &principal, now)
+                    .waits
+                    .len(),
+                waits
+            );
+            assert_eq!(
+                hub.state.onboarding.subagents().of(
+                    &principal.token_id,
+                    NATIVE,
+                    &principal.owner.id,
+                    now
+                ),
+                subagents
+            );
+            assert_eq!(hub.state.onboarding.epoch(), epoch);
+            assert_eq!(
+                serde_json::to_value(
+                    hub.state
+                        .onboarding
+                        .owned_rows(&principal, &principal.owner.id, now)
+                        .unwrap()
+                )
+                .unwrap(),
+                onboarding
+            );
+            // Exercise the marker transaction independently of the earlier effect guard.
+            assert!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .cleared_with_transport(
+                        &*hub.store,
+                        &principal,
+                        NATIVE,
+                        Some(&old.incarnation),
+                        now
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                hub.snapshot(NATIVE, 200, 1).await["questions_accepted"],
+                true
+            );
+            for event in [
+                json!({"hook_event_name":"UserPromptSubmit","session_id":NATIVE}),
+                json!({"hook_event_name":"PermissionRequest","session_id":NATIVE,"tool_name":"request_user_input","asks":"Stale question"}),
+                json!({"hook_event_name":"Notification","session_id":NATIVE,"notification_type":"permission_prompt"}),
+            ] {
+                hub.native_hook(event, &old.incarnation).await;
+                assert_eq!(
+                    hub.state.onboarding.waiting().dialog_wait(
+                        holder(&principal, NATIVE),
+                        NATIVE,
+                        now
+                    ),
+                    ordinary_wait
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_session_end_clear_does_not_clear_successor_questions() {
+        use crate::hub::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let hub = QuestionHub::new().await;
+        let now = unix_now();
+        let principal = hub
+            .store
+            .authenticate(
+                &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let registration = |nonce: &str, expected: Option<String>| LifecycleRegister {
+            session: NATIVE.into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("register-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+        let old = hub
+            .store
+            .lifecycle_register(&principal.token_id, &registration("old", None), now)
+            .unwrap();
+        hub.store
+            .lifecycle_end(
+                &principal.token_id,
+                &LifecycleEnd {
+                    session: NATIVE.into(),
+                    incarnation: old.incarnation.clone(),
+                    operation_id: "end-old".into(),
+                    observed_at: now,
+                    reason: EndReason::ExplicitEnd,
+                    work: vec![],
+                },
+                now,
+            )
+            .unwrap();
+        let current = hub
+            .store
+            .lifecycle_register(
+                &principal.token_id,
+                &registration("current", Some(old.incarnation.clone())),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        let response = hub
+            .client
+            .post(format!("{}/v1/hub/hook/codex", hub.url))
+            .bearer_auth(&hub.token)
+            .header("content-type", "application/json")
+            .header(super::super::cooperation::SESSION_HEADER, NATIVE)
+            .header(
+                super::super::cooperation::INCARNATION_HEADER,
+                &old.incarnation,
+            )
+            .body(
+                json!({"hook_event_name":"SessionEnd","session_id":NATIVE,"reason":"clear"})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        // A stale clear must not leave the durable marker that rejects later snapshots either.
+        assert_eq!(
+            hub.snapshot(NATIVE, 200, 1).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        assert_eq!(
+            hub.store
+                .lifecycle_get(&principal.token_id, NATIVE, now)
+                .unwrap()
+                .unwrap()
+                .incarnation,
+            current.incarnation
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3997,7 +4717,7 @@ mod tests {
         let post = |agent, v: Value| {
             let call = parse(agent, &v);
             let (native, all) = call.ends_wait().unwrap();
-            call.end_wait(&waiting, &*store, &principal, native, all)
+            call.end_wait(&waiting, &*store, &principal, native, all, None)
                 .unwrap();
         };
         let end = |native: &str, reason: Option<&str>| {

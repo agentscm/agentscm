@@ -98,12 +98,14 @@ impl PgStore {
         &self,
         token: &str,
         input: &WorkOverlapConsentRequest,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkOverlapConsentView> {
         let paths = input.validate()?;
         let payload = json_string(input)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            session_lifecycle::check(&mut tx, token, &input.session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             if who.read_only {
@@ -381,10 +383,14 @@ impl PgStore {
         token: &str,
         input: &crate::hub::work_overlap::WorkOverlapStart,
         preflight_only: bool,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+        if !preflight_only {
+        session_lifecycle::check(&mut tx, token, &input.start.session, incarnation, now)?;
+        }
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
@@ -475,10 +481,12 @@ impl PgStore {
         &self,
         token: &str,
         input: &crate::hub::work_overlap::WorkOverlapCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            session_lifecycle::check(&mut tx, token, &input.checkpoint.session, incarnation, now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;

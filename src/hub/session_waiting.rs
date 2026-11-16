@@ -1282,6 +1282,17 @@ impl Waiting {
         native: &str,
         now: i64,
     ) -> Result<()> {
+        self.cleared_with_transport(store, principal, native, None, now)
+    }
+
+    pub(super) fn cleared_with_transport(
+        &self,
+        store: &dyn Store,
+        principal: &Principal,
+        native: &str,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
         if principal.read_only || now >= principal.expires_at {
             return Err(HubError::Unauthorized);
         }
@@ -1290,7 +1301,17 @@ impl Waiting {
         let mut rows = self.0.lock().map_err(|_| HubError::Busy)?;
         // Write before removing known waits. A failed write leaves both maps intact, and a
         // durable marker also suppresses a saved list made just before this clear.
-        store.set_setting(&clear_key(holder, native), "1", "hub")?;
+        if incarnation.is_some() {
+            store.clear_native_wait_with_transport(
+                &principal.token_id,
+                native,
+                incarnation,
+                &clear_key(holder, native),
+                now,
+            )?;
+        } else {
+            store.set_setting(&clear_key(holder, native), "1", "hub")?;
+        }
         self.resolve_unavailable(store, principal, native, true, None)?;
         snapshots.retain(|(owner, session, _), _| owner != holder || session != native);
         rows.retain(|(owner, session, _), _| owner != holder || session != native);

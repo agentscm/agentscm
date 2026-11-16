@@ -1634,6 +1634,16 @@ pub fn apply_batch(
     batch: &WorkTransitionBatch,
     now: i64,
 ) -> Result<WorkTransitionBatchV1> {
+    apply_batch_with_transport(store, actor, batch, None, now)
+}
+
+pub fn apply_batch_with_transport(
+    store: &dyn Store,
+    actor: &WorkTransitionActor<'_>,
+    batch: &WorkTransitionBatch,
+    incarnation: Option<&str>,
+    now: i64,
+) -> Result<WorkTransitionBatchV1> {
     if batch.items.is_empty() || batch.items.len() > MAX_BATCH_TRANSITIONS {
         return Err(invalid("a batch takes 1 to 25 transitions"));
     }
@@ -1650,7 +1660,7 @@ pub fn apply_batch(
             superseded_by: entry.superseded_by.clone(),
             participants: entry.participants.clone(),
         };
-        let item = match store.work_transition(actor, &request, now) {
+        let item = match store.work_transition_with_transport(actor, &request, incarnation, now) {
             Ok(result) => {
                 let (outcome, retry) = match (&result.receipt, &result.conflict) {
                     (Some(receipt), _) if receipt.replayed => (

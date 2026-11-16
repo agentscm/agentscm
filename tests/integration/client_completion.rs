@@ -82,11 +82,17 @@ fn native_client_connection_sends_completion_header_only_when_enabled() {
     let config = temp.path().join("config");
     let agentscm = config.join("agentscm");
     std::fs::create_dir_all(&agentscm).unwrap();
+    std::fs::set_permissions(&agentscm, std::fs::Permissions::from_mode(0o700)).unwrap();
     let token = temp.path().join("client.token");
     std::fs::write(&token, "synthetic-private-token\n").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    for enabled in [false, true] {
+    for (event, enabled) in [
+        ("UserPromptSubmit", false),
+        ("UserPromptSubmit", true),
+        ("SessionEnd", false),
+        ("SessionEnd", true),
+    ] {
         let (hub, request) = listener();
         let reporting = if enabled {
             ",\"report_completion\":true"
@@ -114,7 +120,7 @@ fn native_client_connection_sends_completion_header_only_when_enabled() {
             .unwrap();
         write!(
             child.stdin.take().unwrap(),
-            "{{\"hook_event_name\":\"SessionEnd\",\"session_id\":\"session\",\"cwd\":{}}}",
+            "{{\"hook_event_name\":\"{event}\",\"session_id\":\"session\",\"cwd\":{}}}",
             serde_json::to_string(&root).unwrap()
         )
         .unwrap();
@@ -125,6 +131,12 @@ fn native_client_connection_sends_completion_header_only_when_enabled() {
             String::from_utf8_lossy(&output.stderr)
         );
         let request = request.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-agentscm-incarnation: unregistered"),
+            event == "SessionEnd"
+        );
         assert_eq!(
             request
                 .to_ascii_lowercase()
