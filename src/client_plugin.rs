@@ -163,10 +163,11 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     // The waiter runs in the background from session start and after every turn: it waits at
     // the Hub for a message to this session and wakes it with one (asyncRewake, exit 2), idle or
     // busy. Only one waits per session; it leaves on its own before this timeout.
+    // Explicit async also backgrounds the waiter in single-shot print mode.
     let wait = json!({
         "type":"command",
         "command":format!("{} --no-telemetry hook-wait claude", shell_quote(program)),
-        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
+        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "async":true, "asyncRewake":true
     });
     // SessionEnd tells this session's waiter to leave, as /clear keeps the same process.
     let wait_end = json!({
@@ -1277,6 +1278,8 @@ mod tests {
                 assert!(hook.get("args").is_none());
                 assert!(!hook.to_string().contains("token"));
                 assert!(!hook.to_string().contains("hub-url"));
+                assert!(hook.get("async").is_none());
+                assert!(hook.get("asyncRewake").is_none());
             }
         }
         // The background waiter starts with the session and again after each turn, only there.
@@ -1287,6 +1290,7 @@ mod tests {
                 "'/opt/old agentscm' --no-telemetry hook-wait claude"
             );
             assert_eq!(wait["asyncRewake"], true);
+            assert_eq!(wait["async"], true, "print mode must not wait for the hook");
             assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
         }
         // SessionEnd ends the waiter, briefly and in the foreground.
@@ -1296,6 +1300,7 @@ mod tests {
             "'/opt/old agentscm' --no-telemetry hook-wait claude --end"
         );
         assert!(end.get("asyncRewake").is_none());
+        assert!(end.get("async").is_none());
         assert_eq!(end["timeout"], 5);
         let waits = hooks.to_string().matches("hook-wait").count();
         assert_eq!(waits, 3, "no other event starts or ends a waiter");
