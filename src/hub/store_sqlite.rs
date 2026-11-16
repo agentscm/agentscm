@@ -8365,6 +8365,16 @@ fn checkpoint_overlap_in(
 }
 
 impl Store for SqliteStore {
+    fn notice_message_receipts(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        messages: &[super::agent_messages::Message],
+        now: i64,
+    ) -> Result<Vec<super::agent_messages::MessageReceipt>> {
+        SqliteStore::notice_message_receipts(self, owner, repository, repository_id, messages, now)
+    }
     fn notice_owner_pending(
         &self,
         reader: &WorkLifecycleReader<'_>,

@@ -1,5 +1,6 @@
 //! One transactional delivery ledger shared by source domains.
 use super::*;
+use crate::hub::agent_messages::{Message, MessageReceipt, ReceiptCoverage};
 use crate::hub::intent::text;
 use crate::hub::notices::*;
 use crate::hub::work_dependencies::DependencyNoticeRecord;
@@ -411,6 +412,82 @@ fn owner_reader(
 }
 
 impl SqliteStore {
+    pub(super) fn notice_message_receipts(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        messages: &[Message],
+        now: i64,
+    ) -> Result<Vec<MessageReceipt>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let reader = WorkLifecycleReader::Person {
+            owner,
+            repository,
+            repository_id,
+        };
+        // Owner validation must succeed before unavailable evidence can preserve a legacy page.
+        owner_reader(&tx, &reader, now)?;
+        if repository_id <= 0 || messages.len() > crate::hub::agent_messages::MAX_MESSAGES {
+            return Err(HubError::Invalid("Invalid message receipt batch.".into()));
+        }
+        let read = || -> Result<Vec<MessageReceipt>> {
+            let source_kind = json_string(&SourceKind::HumanMessage)?;
+            let mut statement = tx.prepare(
+                "SELECT id,snapshot FROM hub_notice_deliveries
+                 WHERE token=?1 AND session=?2 AND owner=?3 AND provider=?4 AND host=?5
+                 AND repository_id=?6 AND source_kind=?7 AND source_id=?8 AND source_version='1'
+                 ORDER BY id LIMIT 2",
+            )?;
+            let mut out = Vec::with_capacity(messages.len());
+            for message in messages {
+                let eligible = match work_who(&tx, &message.token, now) {
+                    Ok(who) => {
+                        !who.read_only
+                            && who.owner.id == owner.id
+                            && who.owner.identity == owner.identity
+                            && who.repository == repository
+                            && who.repository_id == Some(repository_id)
+                    }
+                    Err(HubError::Unauthorized) => false,
+                    Err(error) => return Err(error),
+                };
+                if !eligible {
+                    out.push(MessageReceipt::unknown(ReceiptCoverage::Unavailable));
+                    continue;
+                }
+                let rows = statement
+                    .query_map(
+                        params![
+                            message.token,
+                            message.session,
+                            owner.id,
+                            owner.identity.provider,
+                            owner.identity.host,
+                            repository_id,
+                            source_kind,
+                            message.id
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                out.push(match rows.as_slice() {
+                    [] => MessageReceipt::unknown(ReceiptCoverage::LegacyUnknown),
+                    [(id, snapshot)] => MessageReceipt::from_snapshot(id, snapshot, message)?,
+                    _ => MessageReceipt::unknown(ReceiptCoverage::Unavailable),
+                });
+            }
+            Ok(out)
+        };
+        Ok(read().unwrap_or_else(|_| {
+            messages
+                .iter()
+                .map(|_| MessageReceipt::unknown(ReceiptCoverage::Unavailable))
+                .collect()
+        }))
+    }
+
     pub(super) fn notice_record(
         &self,
         token: &str,
