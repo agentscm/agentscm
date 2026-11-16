@@ -2318,9 +2318,24 @@ pub fn is_shell_tool(tool: &str) -> bool {
     .contains(&tool.to_ascii_lowercase().as_str())
 }
 
-/// The activity phase of a tool event: a shell call starts before and ends after it runs.
+/// Calls whose observed duration keeps the session live, independently of shell observation.
+/// Background launches cover only the launch call, never the lifetime of the child.
+pub fn is_in_flight_tool(tool: &str) -> bool {
+    is_shell_tool(tool)
+        || matches!(
+            tool.to_ascii_lowercase().as_str(),
+            "agent"
+                | "task"
+                | "wait"
+                | "functions.wait"
+                | "wait_agent"
+                | "collaboration.wait_agent"
+        )
+}
+
+/// The activity phase of a tool event: bounded long calls start before and end after running.
 fn phase(tool: &str, before: bool) -> CallPhase {
-    match (is_shell_tool(tool), before) {
+    match (is_in_flight_tool(tool), before) {
         (false, _) => CallPhase::Tick,
         (true, true) => CallPhase::Start,
         (true, false) => CallPhase::End,
@@ -2439,6 +2454,9 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .launched(&v["subagent"])
                 .noticed(event)
                 .observed_shell(event, v.get("observed"))
+        }
+        Some("PostToolUseFailure") if is_in_flight_tool(tool) => {
+            call(Kind::Activity(CallPhase::End), Shape::Silent)
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
         // call's input or result is read.
@@ -2744,6 +2762,48 @@ mod tests {
             created_seq: 1,
             updated_seq: 1,
         }
+    }
+
+    #[test]
+    fn delegated_calls_balance_without_shell_observation() {
+        for tool in [
+            "Agent",
+            "Task",
+            "wait",
+            "functions.wait",
+            "wait_agent",
+            "collaboration.wait_agent",
+        ] {
+            assert!(is_in_flight_tool(tool));
+            assert!(!is_shell_tool(tool));
+            for (event, phase) in [
+                ("PreToolUse", CallPhase::Start),
+                ("PostToolUse", CallPhase::End),
+                ("PostToolUseFailure", CallPhase::End),
+            ] {
+                for agent in [Agent::Claude, Agent::Codex] {
+                    let call = parse(
+                        agent,
+                        &json!({
+                            "hook_event_name":event, "session_id":"s", "tool_name":tool,
+                            "observed":{"outcome":"changed","paths":["a.rs"]}
+                        }),
+                    );
+                    assert_eq!(call.kind, Kind::Activity(phase), "{tool} {event}");
+                    assert!(call.observed.is_none());
+                    assert!(call.paths.is_empty());
+                }
+            }
+            let cursor = parse(
+                Agent::Cursor,
+                &json!({
+                    "hook_event_name":"postToolUse","conversation_id":"s","tool_name":tool
+                }),
+            );
+            assert_eq!(cursor.kind, Kind::Activity(CallPhase::Tick));
+        }
+        assert!(!is_in_flight_tool("unknown_delegation"));
+        assert!(!is_in_flight_tool("collaboration.spawn_agent"));
     }
 
     #[test]

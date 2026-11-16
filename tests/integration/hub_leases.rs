@@ -51,6 +51,14 @@ impl Db {
         })
     }
 
+    fn fresh(&self) -> Self {
+        if self._pg.is_some() {
+            Self::postgres().unwrap()
+        } else {
+            Self::sqlite()
+        }
+    }
+
     fn open(&self) -> Arc<dyn Store> {
         store::open(&self.url).unwrap()
     }
@@ -659,6 +667,218 @@ fn a_running_shell_call_stays_live_up_to_the_cap(db: &Db) {
     admitted(&*store, &bob, &start("b3", "s-b3", "src/**"), capped);
 }
 
+/// Exercise the public hook decoder and its store dispatch without sleeping on lease time.
+struct DelegatedHooks {
+    runtime: tokio::runtime::Runtime,
+    url: String,
+    bearer: String,
+    _objects: TempDir,
+}
+
+impl DelegatedHooks {
+    fn new(store: Arc<dyn Store>, owner: &str) -> (Self, Agent) {
+        let (token, bearer, _) =
+            mint_bound_agent_token(&*store, owner, "delegated", REPO, REPOSITORY_ID, TTL, false)
+                .unwrap();
+        let objects = TempDir::new().unwrap();
+        let backend = agentscm::backend::LocalBackend::open(objects.path()).unwrap();
+        let router = agentscm::hub::hook::routes()
+            .with_state(agentscm::hub::HubState::new(store, Arc::new(backend)));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            url
+        });
+        (
+            Self {
+                runtime,
+                url,
+                bearer: bearer.expose().to_owned(),
+                _objects: objects,
+            },
+            Agent {
+                token,
+                owner: owner.to_owned(),
+            },
+        )
+    }
+
+    fn call(&self, event: &str, tool: &str, session: Option<&str>, child: bool) {
+        let mut payload = serde_json::json!({
+            "hook_event_name": event,
+            "tool_name": tool,
+            "cwd": "/synthetic/project",
+            "tool_input": {"file_path": "/synthetic/project/src/lib.rs"}
+        });
+        if let Some(session) = session {
+            payload["session_id"] = session.into();
+        }
+        if child {
+            payload["agent_id"] = "synthetic-child".into();
+        }
+        self.runtime.block_on(async {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/hub/hook/claude", self.url))
+                .bearer_auth(&self.bearer)
+                .header("content-type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert!(
+                !response.headers().contains_key("x-agentscm-correlation-id"),
+                "hook returned a fail-open error"
+            );
+            let bytes = response.bytes().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body.get("error").is_none(), "{body}");
+        });
+    }
+}
+
+fn delegated_hook_calls_hold_until_the_cap_and_crashes_expire(db: &Db) {
+    // Each spelling gets a fresh database so its clock advances independently.
+    for (n, tool) in ["Agent", "Task"].into_iter().enumerate() {
+        let db = db.fresh();
+        let store = db.open();
+        let owner = agent(&*store, 10 + n as i64);
+        let (hooks, alice) = DelegatedHooks::new(store.clone(), &owner.owner);
+        let bob = agent(&*store, 20 + n as i64);
+        let now = unix_now();
+        store.observe_lease_clock(now).unwrap();
+        let scope = format!("delegated{n}/**");
+        let held = admitted(&*store, &alice, &start(tool, tool, &scope), now).item;
+        hooks.call("PreToolUse", tool, Some(tool), false);
+        let (renewed, expires) = db.lease(&held.id);
+        let began: i64 = renewed.parse().unwrap();
+        let capped = began + IN_FLIGHT_CAP_SECONDS;
+        assert_eq!(
+            expires,
+            capped.to_string(),
+            "{tool} must hold a blocked caller"
+        );
+        let blocked = began + LEASE_SECONDS + 60;
+        tick(&*store, began, blocked);
+        assert_overlap(
+            &store
+                .work_start(&bob.token, &start("blocked", "rival", &scope), blocked)
+                .unwrap(),
+        );
+        tick(&*store, blocked, capped - 1);
+        assert_overlap(
+            &store
+                .work_start(
+                    &bob.token,
+                    &start("before-cap", "rival", &scope),
+                    capped - 1,
+                )
+                .unwrap(),
+        );
+        // No end event arrives after a crash; the cap must still release the reservation.
+        tick(&*store, capped - 1, capped);
+        admitted(&*store, &bob, &start("after-cap", "rival", &scope), capped);
+        assert_eq!(db.lapse_events(&held.id), 1);
+    }
+}
+
+fn delegated_hook_ends_and_failures_restore_the_idle_lease(db: &Db) {
+    for (n, (tool, event)) in [
+        ("Agent", "PostToolUse"),
+        ("Agent", "PostToolUseFailure"),
+        ("Task", "PostToolUse"),
+        ("Task", "PostToolUseFailure"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let db = db.fresh();
+        let store = db.open();
+        let owner = agent(&*store, 30 + n as i64);
+        let (hooks, alice) = DelegatedHooks::new(store.clone(), &owner.owner);
+        let now = unix_now();
+        store.observe_lease_clock(now).unwrap();
+        let held = admitted(
+            &*store,
+            &alice,
+            &start(tool, tool, &format!("ended{n}/**")),
+            now,
+        )
+        .item;
+        hooks.call("PreToolUse", tool, Some(tool), false);
+        let began: i64 = db.lease(&held.id).0.parse().unwrap();
+        assert_eq!(
+            db.lease(&held.id).1,
+            (began + IN_FLIGHT_CAP_SECONDS).to_string()
+        );
+        // Overlap a shell call with delegation: ending either must leave the other live.
+        hooks.call("PreToolUse", "Bash", Some(tool), false);
+        let (first_tool, first_end, last_tool, last_end) = if n % 2 == 0 {
+            (tool, event, "Bash", "PostToolUse")
+        } else {
+            ("Bash", "PostToolUseFailure", tool, event)
+        };
+        hooks.call(first_end, first_tool, Some(tool), false);
+        assert_eq!(
+            db.lease(&held.id).1,
+            (began + IN_FLIGHT_CAP_SECONDS).to_string()
+        );
+        // End before advancing the deterministic clock: HTTP hooks use the wall clock.
+        let before_end = unix_now();
+        hooks.call(last_end, last_tool, Some(tool), false);
+        let after_end = unix_now();
+        let expires: i64 = db.lease(&held.id).1.parse().unwrap();
+        let ended = expires - LEASE_SECONDS;
+        assert!(
+            (before_end..=after_end).contains(&ended),
+            "{tool} {event} must restore the idle lease: {expires}"
+        );
+        tick(&*store, ended, ended + LEASE_SECONDS);
+        assert_eq!(
+            activity(&*store, &alice, &held.id, ended + LEASE_SECONDS),
+            ActivityStatus::Lapsed
+        );
+    }
+}
+
+fn delegated_hooks_renew_only_the_named_parent_session(db: &Db) {
+    let store = db.open();
+    let owner = agent(&*store, 50);
+    let (hooks, alice) = DelegatedHooks::new(store.clone(), &owner.owner);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(
+        &*store,
+        &alice,
+        &start("parent", "parent", "src/**"),
+        now - 120,
+    )
+    .item;
+    let original = db.lease(&held.id);
+    for session in [None, Some("sibling")] {
+        for tool in ["Agent", "Task"] {
+            hooks.call("PreToolUse", tool, session, false);
+            assert_eq!(db.lease(&held.id), original);
+            hooks.call("PostToolUse", tool, session, false);
+            assert_eq!(db.lease(&held.id), original);
+        }
+    }
+    // A child edit names the parent's native session, as Claude's hooks do.
+    hooks.call("PreToolUse", "Edit", Some("parent"), true);
+    let (renewed, expires) = db.lease(&held.id);
+    let edited: i64 = renewed.parse().unwrap();
+    assert!(edited >= now, "the child edit must renew its parent lease");
+    assert_ne!(db.lease(&held.id), original);
+    assert_eq!(expires, (edited + LEASE_SECONDS).to_string());
+    assert_eq!(
+        activity(&*store, &alice, &held.id, edited),
+        ActivityStatus::Live
+    );
+}
+
 fn a_leaked_call_count_falls_back_to_the_idle_lease(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -1246,6 +1466,9 @@ conformance!(
     a_partitioned_lead_reconnects_to_a_fence,
     helpers_reviewers_and_plain_intents_cannot_bypass_the_fence,
     a_running_shell_call_stays_live_up_to_the_cap,
+    delegated_hook_calls_hold_until_the_cap_and_crashes_expire,
+    delegated_hook_ends_and_failures_restore_the_idle_lease,
+    delegated_hooks_renew_only_the_named_parent_session,
     coverage_follows_what_the_hub_saw_of_the_lead_session,
     a_stale_report_alone_never_opens_takeover,
     a_lapsed_lead_is_told_when_who_and_how_to_resume,

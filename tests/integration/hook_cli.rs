@@ -1461,6 +1461,74 @@ fn empty_hub() -> (String, Receiver<Seen>) {
 }
 
 #[cfg(unix)]
+#[test]
+fn claude_delegation_events_reach_the_hub_after_throttled_activity() {
+    for tool in ["Agent", "Task"] {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let dir = home();
+            let (url, seen) = empty_hub();
+            let args = ["claude", "--hub-url", &url];
+            let env = [("AGENTSCM_HUB_TOKEN", TOKEN)];
+            let activity = json!({"hook_event_name":"PreToolUse", "session_id":"s1",
+                "tool_name":"Read", "tool_input":{"file_path":"/work/repo/a.rs"}});
+            for forwarded in [true, false] {
+                let run = run_with(&args, &env, &dir, activity.to_string().as_bytes());
+                assert_eq!(run.code, Some(0));
+                assert!(run.json().is_object());
+                assert_eq!(seen.try_iter().count(), usize::from(forwarded));
+            }
+            let payload = json!({"hook_event_name":event, "session_id":"s1",
+                "tool_name":tool, "tool_use_id":"delegation-1",
+                "tool_input":{"prompt":"SYNTHETIC-DELEGATED-WORK"}});
+            let run = run_with(&args, &env, &dir, payload.to_string().as_bytes());
+            assert_eq!(run.code, Some(0));
+            assert!(run.json().is_object());
+            let requests: Vec<_> = seen.try_iter().collect();
+            assert_eq!(requests.len(), 1, "{tool} {event}: {}", run.stdout);
+            assert_eq!(requests[0].path, "/v1/hub/hook/claude");
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["hook_event_name"], event);
+            assert_eq!(body["tool_name"], tool);
+            assert_eq!(body["tool_use_id"], "delegation-1");
+            assert!(body.get("observed").is_none(), "{body}");
+            assert!(!run.stdout.contains("shell call"), "{}", run.stdout);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_claude_hooks_forward_delegation_failures_without_shell_observation() {
+    for tool in ["Agent", "Task"] {
+        let dir = home();
+        let (url, seen) = empty_hub();
+        let root = connected_checkout(&dir, &url);
+        let path = std::env::var("PATH").unwrap_or_default();
+        for event in ["PreToolUse", "PostToolUseFailure"] {
+            let payload = json!({"hook_event_name":event,"session_id":"s1",
+                "cwd":root,"tool_name":tool,"tool_use_id":"delegation-1",
+                "tool_input":{"prompt":"SYNTHETIC-DELEGATED-WORK"}});
+            let run = run_with(
+                CLAUDE,
+                &[("PATH", &path)],
+                &dir,
+                payload.to_string().as_bytes(),
+            );
+            assert_eq!(run.code, Some(0));
+            let requests: Vec<_> = seen
+                .try_iter()
+                .filter(|request| request.path.starts_with("/v1/hub/hook/claude"))
+                .collect();
+            assert_eq!(requests.len(), 1, "{tool} {event}: {}", run.stdout);
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["hook_event_name"], event);
+            assert_eq!(body["tool_name"], tool);
+            assert!(body.get("observed").is_none(), "{body}");
+        }
+    }
+}
+
+#[cfg(unix)]
 fn git_in(root: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .current_dir(root)

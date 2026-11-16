@@ -276,9 +276,10 @@ const REGISTER: &[Gate] = &[
     Gate {
         file: "src/hook_cli.rs",
         item: "hook",
-        agents: "claude cursor",
+        agents: "claude codex copilot cursor",
         reason: "host limit: Cursor separates reply and turn end, and may inherit Claude hooks beside \
-                 its native registration",
+                 its native registration; Claude Code, Codex and Copilot use PostToolUseFailure \
+                 to close in-flight tool calls even when the event otherwise only captures",
     },
     Gate {
         file: "src/hook_cli.rs",
