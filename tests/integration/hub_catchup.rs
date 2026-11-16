@@ -3463,6 +3463,161 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
     );
 }
 
+// Recording a rename moves the Work to the new name in the same transaction, so its owner can
+// release it by person route. A collision leaves the Work under the old name and the rename stands.
+fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let now = unix_now();
+    let old = "acme/before-rename";
+    let new = "acme/after-rename";
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 851,
+            },
+            "user-851",
+        )
+        .unwrap();
+    let old_token = fixture.token_for_repository(&user.id, "before", old, 851, false);
+    let new_token = fixture.token_for_repository(&user.id, "after", new, 851, false);
+    let start = |key: &str, path: &str| WorkStart {
+        issue_choice: None,
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        description: None,
+        session: format!("session-{key}"),
+        role: WorkRole::Lead,
+        scope: vec![path.into()],
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: vec![],
+        related_work: vec![],
+        takeover_generation: None,
+        preflight: None,
+    };
+    let work = fixture
+        .store
+        .work_start(&old_token, &start("retained", "src/retained.rs"), now)
+        .unwrap()
+        .item;
+    let blocked = fixture
+        .store
+        .work_start(&old_token, &start("proposal", "src/retained.rs"), now)
+        .unwrap();
+    let request_id = blocked.coordination_request.unwrap().id;
+    if collision {
+        fixture
+            .store
+            .work_start(&new_token, &start("retained", "src/collision.rs"), now)
+            .unwrap();
+    }
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85100000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, old, None, None)
+        .unwrap();
+    let renamed = fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, new, None, None)
+        .unwrap();
+    assert_eq!(renamed.full_name, new, "the rename commits either way");
+    assert_eq!(
+        fixture
+            .store
+            .repository_by_id("github.com", 851)
+            .unwrap()
+            .unwrap()
+            .full_name,
+        new
+    );
+    let moved = fixture.store.work_get(&new_token, &work.id, now + 1);
+    if collision {
+        assert!(moved.unwrap().is_none(), "a collision leaves the Work");
+        assert!(
+            fixture
+                .store
+                .work_get(&old_token, &work.id, now + 1)
+                .is_err()
+        );
+        return;
+    }
+    let moved = moved.unwrap().unwrap();
+    assert_eq!(moved.repository, new);
+    let inbox = fixture
+        .store
+        .coordination_list(&new_token, &Default::default(), now + 1)
+        .unwrap();
+    let request = inbox.requests.iter().find(|r| r.id == request_id).unwrap();
+    assert_eq!(request.targets[0].work_id, work.id);
+    let released = fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Person {
+                user: &user,
+                repository: new,
+                repository_id: 851,
+                is_admin: false,
+            },
+            &WorkTransitionRequest {
+                work_id: work.id.clone(),
+                operation_id: "person-release".into(),
+                generation: moved.generation,
+                expected_updated_seq: moved.updated_seq,
+                session: None,
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+                participants: Vec::new(),
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(released.item.repository, new);
+    // The same rename recorded again changes nothing.
+    let before = fixture.store.latest_event_seq().unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, new, None, None)
+        .unwrap();
+    assert_eq!(fixture.store.latest_event_seq().unwrap(), before);
+}
+
+#[test]
+fn sqlite_rename_repairs_work_namespace() {
+    rename_repairs_work_namespace(&Fixture::sqlite(), false);
+    rename_repairs_work_namespace(&Fixture::sqlite(), true);
+}
+#[test]
+fn postgres_rename_repairs_work_namespace() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_repairs_work_namespace(&fixture, false);
+        rename_repairs_work_namespace(&Fixture::postgres().unwrap(), true);
+    }
+}
+
 #[test]
 fn sqlite_repository_namespace_repair() {
     repository_namespace_repair(&Fixture::sqlite(), false);

@@ -5480,6 +5480,46 @@ fn resolved_scope(
 }
 
 /// See [`super::store::ADOPT_NAME_SCOPE`]; run when `repo` is connected or renamed.
+/// Moves Work recorded under `previous` to the repository's new name. The rename
+/// itself must not depend on it: a collision or any other failure rolls back only
+/// this repair, leaving the Work under the old name for `work repair-repository`.
+fn repair_renamed_work(
+    tx: &Transaction<'_>,
+    connection: &str,
+    repo: &ConnectedRepository,
+    previous: String,
+) {
+    let attempt = || -> Result<()> {
+        let provider: String = tx.query_row(
+            "SELECT provider FROM hub_connections WHERE id = ?1",
+            [connection],
+            |row| row.get(0),
+        )?;
+        let repair = super::work::WorkRepositoryRename {
+            scope: WorkRepositoryScope {
+                provider,
+                host: repo.host.clone(),
+                repository: previous,
+                repository_id: Some(repo.repository_id),
+            },
+            destination: repo.full_name.clone(),
+            apply: true,
+        };
+        tx.execute_batch("SAVEPOINT rename_repair")?;
+        match repository_rename::repair(tx, &repair, unix_now()) {
+            Ok(_) => tx.execute_batch("RELEASE rename_repair")?,
+            Err(error) => {
+                tx.execute_batch("ROLLBACK TO rename_repair; RELEASE rename_repair")?;
+                eprintln!("hub: rename Work repair skipped: {error}");
+            }
+        }
+        Ok(())
+    };
+    if let Err(error) = attempt() {
+        eprintln!("hub: rename Work repair not attempted: {error}");
+    }
+}
+
 fn adopt_name_scope(tx: &Connection, repo: &ConnectedRepository) -> Result<()> {
     let named = repository_scope(&repo.host, &repo.full_name, None);
     for statement in super::store::ADOPT_NAME_SCOPE {
@@ -10248,10 +10288,12 @@ impl Store for SqliteStore {
                 repo
             }
             Some(mut repo) if repo.connection == connection => {
+                let mut renamed_from = None;
                 if repo.full_name != full_name {
                     let previous = std::mem::replace(&mut repo.full_name, full_name.to_owned());
                     append(&tx, &Event::repository_renamed(&repo, &previous)?)?;
                     adopt_name_scope(&tx, &repo)?;
+                    renamed_from = Some(previous);
                 }
                 // Not events: they say how to reach the repository, not what it is.
                 repo.node_id = node_id.map(str::to_owned).or(repo.node_id);
@@ -10260,6 +10302,9 @@ impl Store for SqliteStore {
                     "UPDATE hub_repositories SET full_name = ?2, node_id = ?3, installation_id = ?4 WHERE id = ?1",
                     params![repo.id, repo.full_name, repo.node_id, repo.installation_id],
                 )?;
+                if let Some(previous) = renamed_from {
+                    repair_renamed_work(&tx, connection, &repo, previous);
+                }
                 repo
             }
             Some(repo) => repo,
