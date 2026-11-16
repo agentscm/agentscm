@@ -321,6 +321,9 @@ pub enum FindingKind {
     ParticipantCap,
     /// A held reservation that a merged pull request hides from the active views. Report only.
     HiddenHold,
+    /// Retained Work (a lapsed hold or an abandoned session) with no pull request linked to it.
+    /// Report only; the Hub adds it after the read, only when the link is known to be absent.
+    NoPrLink,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -334,6 +337,33 @@ pub struct FindingV1 {
     /// The remedy this caller may apply to it now; absent when none fits or none is permitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed: Option<RemedyKind>,
+    /// The pull request number the finding names, when the Hub's later read established one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<i64>,
+}
+
+/// The tail of a `hidden_hold` evidence sentence that does not name the pull request.
+const UNNAMED_PULL: &str = "the Hub does not name the pull request here";
+
+impl FindingV1 {
+    /// Names the merged pull request a `hidden_hold` finding rests on.
+    pub(super) fn name_merged_pull(&mut self, number: i64) {
+        self.evidence = self
+            .evidence
+            .replace(UNNAMED_PULL, &format!("pull request #{number} merged"));
+        self.pull_request = Some(number);
+    }
+
+    /// The report-only finding for retained Work whose pull request link is known to be absent.
+    pub(super) fn no_pr_link() -> Self {
+        Self {
+            kind: FindingKind::NoPrLink,
+            evidence: "No pull request is linked to this Work.".to_owned(),
+            complete: true,
+            proposed: None,
+            pull_request: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1148,17 +1178,19 @@ fn findings(
                     name == "activity_coverage" || name == "activity"
                 }),
             proposed: permitted(RemedyKind::Release),
+            pull_request: None,
         });
     }
     if !finished && subject.live() && operational.merge.hidden_by_merged_pr {
         found.push(FindingV1 {
             kind: FindingKind::HiddenHold,
             evidence: format!(
-                "A merged pull request hides the {} Work, but the hold of {lead} is still live and blocks overlapping Work; the Hub does not name the pull request here.",
+                "A merged pull request hides the {} Work, but the hold of {lead} is still live and blocks overlapping Work; {UNNAMED_PULL}.",
                 word(&item.state)
             ),
             complete: operational.merge.status == MergeStatus::Observed,
             proposed: None,
+            pull_request: None,
         });
     }
     if !finished && item.claim_status == ClaimStatus::Stale && !subject.live() {
@@ -1172,6 +1204,7 @@ fn findings(
             proposed: matches!(subject.standing, Standing::Lead | Standing::Owner)
                 .then(|| permitted(RemedyKind::Resume))
                 .flatten(),
+            pull_request: None,
         });
     }
     if !requests.is_empty() && (finished || subject.lapsed()) {
@@ -1194,6 +1227,7 @@ fn findings(
             ),
             complete: requests_complete,
             proposed: None,
+            pull_request: None,
         });
     }
     let blocker = item.blocker.is_some();
@@ -1203,6 +1237,7 @@ fn findings(
             evidence: "The Work is finished but still records a blocker.".to_owned(),
             complete: true,
             proposed: None,
+            pull_request: None,
         });
     } else if item.state == WorkState::Blocked && !blocker {
         found.push(FindingV1 {
@@ -1210,6 +1245,7 @@ fn findings(
             evidence: "The Work is blocked but records no blocker.".to_owned(),
             complete: true,
             proposed: None,
+            pull_request: None,
         });
     }
     let total = item.participants.len();
@@ -1226,6 +1262,7 @@ fn findings(
             ),
             complete: true,
             proposed: permitted(RemedyKind::PruneParticipants),
+            pull_request: None,
         });
     }
     found
@@ -1827,7 +1864,8 @@ fn repair_item(
         return Err(match finding.kind {
             FindingKind::OrphanedRequests
             | FindingKind::ContradictoryBlocker
-            | FindingKind::HiddenHold => "report only: this finding proposes no remedy".to_owned(),
+            | FindingKind::HiddenHold
+            | FindingKind::NoPrLink => "report only: this finding proposes no remedy".to_owned(),
             _ => "no remedy is proposed: none is permitted to this caller".to_owned(),
         });
     };
@@ -2565,6 +2603,38 @@ mod tests {
     }
 
     #[test]
+    fn no_pr_link_is_report_only_and_never_planned() {
+        let finding = FindingV1::no_pr_link();
+        assert_eq!(finding.proposed, None);
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["kind"], "no_pr_link");
+        assert!(json.get("pull_request").is_none(), "{json}");
+        let plan = repair_plan(&inventory(vec![recovered(
+            "wrk_a",
+            Standing::Owner,
+            vec![finding.clone()],
+            Vec::new(),
+        )]));
+        assert!(plan.planned.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].reason.starts_with("report only"));
+        let mut named = FindingV1 {
+            kind: FindingKind::HiddenHold,
+            evidence: format!("A merged pull request hides it; {UNNAMED_PULL}."),
+            complete: true,
+            proposed: None,
+            pull_request: None,
+        };
+        named.name_merged_pull(41);
+        assert_eq!(named.pull_request, Some(41));
+        assert!(named.evidence.contains("pull request #41 merged"));
+        // An older client's strict reader ignores the new field through the Hub reply decoder.
+        let reply = serde_json::to_value(&named).unwrap();
+        let back: FindingV1 = crate::hub::reply::decode(&reply).unwrap();
+        assert_eq!(back, named);
+    }
+
+    #[test]
     fn a_batch_item_without_participants_omits_the_key() {
         let plain = BatchTransitionItem {
             work_id: "wrk_a".to_owned(),
@@ -2586,6 +2656,7 @@ mod tests {
             evidence: "synthetic".to_owned(),
             complete: true,
             proposed,
+            pull_request: None,
         }
     }
 

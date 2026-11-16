@@ -100,11 +100,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
-    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
-    like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, repository_scope, search_number,
-    session_key, unix_now, validate_display_name, validate_login,
+    NewAgentToken, Principal, PromiseInputScope, RenameRepair, SESSION_START_RETAIN_SECONDS,
+    SESSION_STARTS_MAX, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User,
+    check_session_start, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id,
+    owner_session, pending, plan_local_ci_change, plan_local_ci_enroll, plan_named,
+    repository_scope, search_number, session_key, unix_now, validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -1455,14 +1455,15 @@ fn pg_catchup_page(
             "catch-up cursor is outside its delivery".into(),
         ));
     }
-    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
-        SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status
+    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status,transition FROM (
+        SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status,
+               CASE WHEN e.kind='work_transition' THEN e.data::jsonb->>'transition' END transition
           FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq JOIN hub_work_items w ON w.id=v.work
          WHERE e.seq>$1 AND e.seq<=$2 AND w.provider=$3 AND w.host=$4
            AND (($6::bigint IS NOT NULL AND w.repository_id=$6)
              OR ($6::bigint IS NULL AND w.repository=$5 AND w.repository_id IS NULL))
         UNION ALL
-        SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status
+        SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status,NULL::text
           FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
           JOIN hub_coordination_requests r ON r.id=v.request
          WHERE e.seq>$1 AND e.seq<=$2 AND r.provider=$3 AND r.host=$4
@@ -1488,11 +1489,13 @@ fn pg_catchup_page(
         let snapshot: Option<String> = row.get(5);
         let title: Option<String> = row.get(6);
         let row_status: Option<String> = row.get(7);
+        let transition: Option<String> = row.get(8);
         let row_bytes = kind.len()
             + subject.len()
             + snapshot.as_ref().map_or(0, String::len)
             + title.as_ref().map_or(0, String::len)
             + row_status.as_ref().map_or(0, String::len)
+            + transition.as_ref().map_or(0, String::len)
             + 128;
         if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
             if work_events.is_empty() && coordination_events.is_empty() {
@@ -1514,6 +1517,9 @@ fn pg_catchup_page(
                 item: json_value(snapshot.as_deref().ok_or_else(|| {
                     HubError::Unavailable("missing retained work snapshot".into())
                 })?)?,
+                transition: transition
+                    .as_deref()
+                    .and_then(work_transition::WorkTransitionKind::from_stored),
             });
         } else {
             coordination_events.push(CatchupCoordinationEvent {
@@ -5212,7 +5218,9 @@ fn briefing_page(
         .or_else(|| work_after.clone());
     let next_work_done = work_done || !more_work;
     let rows = tx.query(
-        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot,
+                CASE WHEN e.kind = 'work_transition'
+                     THEN e.data::jsonb->>'transition' END
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > $1 AND e.seq <= $2 AND w.provider = $3 AND w.host = $4
@@ -5245,6 +5253,10 @@ fn briefing_page(
             kind: row.get(2),
             work_id: row.get(3),
             item,
+            transition: row
+                .get::<_, Option<String>>(5)
+                .as_deref()
+                .and_then(work_transition::WorkTransitionKind::from_stored),
         });
     }
     let next_after = if more_events {
@@ -5295,6 +5307,75 @@ fn resolved_scope(
 }
 
 /// See [`super::store::ADOPT_NAME_SCOPE`]; run when `repo` is connected or renamed.
+/// Moves Work recorded under `previous` to the repository's new name. The rename
+/// itself must not depend on it: a collision, a size over the online ceiling or any
+/// other failure rolls back only this repair, leaving the Work under the old name for
+/// `work repair-repository`. Every query runs inside the savepoint, so an error cannot
+/// leave the outer transaction aborted, and the outcome is returned for the
+/// `repository_renamed` event.
+fn repair_renamed_work(
+    tx: &mut postgres::Transaction<'_>,
+    connection: &str,
+    repo: &ConnectedRepository,
+    previous: String,
+) -> RenameRepair {
+    let mut attempt = || -> Result<RenameRepair> {
+        let mut savepoint = tx.savepoint("rename_repair")?;
+        let outcome = (|| -> Result<RenameRepair> {
+            let provider: String = savepoint
+                .query_one(
+                    "SELECT provider FROM hub_connections WHERE id = $1",
+                    &[&connection],
+                )?
+                .get(0);
+            let rows: i64 = savepoint
+                .query_one(
+                    "SELECT (SELECT COUNT(*) FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3 AND repository_id = $4)
+                          + (SELECT COUNT(*) FROM hub_coordination_requests
+                             WHERE provider = $1 AND host = $2 AND repository = $3 AND repository_id = $4)",
+                    &[&provider, &repo.host, &previous, &repo.repository_id],
+                )?
+                .get(0);
+            if rows == 0 {
+                return Ok(RenameRepair::None);
+            }
+            if rows > super::store::MAX_ONLINE_RENAME_REPAIR_ROWS {
+                eprintln!("hub: rename Work repair skipped: {rows} rows exceed the online ceiling");
+                return Ok(RenameRepair::Skipped("too_many"));
+            }
+            let repair = super::work::WorkRepositoryRename {
+                scope: WorkRepositoryScope {
+                    provider,
+                    host: repo.host.clone(),
+                    repository: previous.clone(),
+                    repository_id: Some(repo.repository_id),
+                },
+                destination: repo.full_name.clone(),
+                apply: true,
+            };
+            match repository_rename::repair(&mut savepoint, &repair, unix_now()) {
+                Ok(_) => Ok(RenameRepair::Applied),
+                Err(error) => {
+                    eprintln!("hub: rename Work repair skipped: {error}");
+                    Ok(RenameRepair::Skipped(
+                        super::store::rename_repair_failure_reason(&error),
+                    ))
+                }
+            }
+        })();
+        match outcome {
+            Ok(RenameRepair::Applied) => savepoint.commit()?,
+            _ => savepoint.rollback()?,
+        }
+        outcome
+    };
+    attempt().unwrap_or_else(|error| {
+        eprintln!("hub: rename Work repair not attempted: {error}");
+        RenameRepair::Skipped("unavailable")
+    })
+}
+
 fn adopt_name_scope(tx: &mut postgres::Transaction<'_>, repo: &ConnectedRepository) -> Result<()> {
     let (scope, named) = (
         repo.repository_scope(),
@@ -10194,10 +10275,11 @@ impl Store for PgStore {
                 )?;
                 let mut repo = repository_row(&row);
                 if repo.connection == connection {
+                    let mut renamed_from = None;
                     if repo.full_name != full_name {
                         let previous = std::mem::replace(&mut repo.full_name, full_name.to_owned());
-                        append(&mut tx, &Event::repository_renamed(&repo, &previous)?)?;
                         adopt_name_scope(&mut tx, &repo)?;
+                        renamed_from = Some(previous);
                     }
                     // Not events: they say how to reach the repository, not what it is.
                     repo.node_id = node_id.map(str::to_owned).or(repo.node_id);
@@ -10206,6 +10288,15 @@ impl Store for PgStore {
                         "UPDATE hub_repositories SET full_name = $2, node_id = $3, installation_id = $4 WHERE id = $1",
                         &[&repo.id, &repo.full_name, &repo.node_id, &repo.installation_id],
                     )?;
+                    if let Some(previous) = renamed_from {
+                        // Appended after the repair so the event can say how it went.
+                        let outcome =
+                            repair_renamed_work(&mut tx, connection, &repo, previous.clone());
+                        append(
+                            &mut tx,
+                            &Event::repository_renamed(&repo, &previous, outcome.event_fields())?,
+                        )?;
+                    }
                 }
                 repo
             };

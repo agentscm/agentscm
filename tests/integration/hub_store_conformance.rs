@@ -1363,7 +1363,9 @@ fn connections_and_repositories(db: &Db) {
     );
     assert_eq!(
         events_of(&*store, "repository_renamed"),
-        [json!({"repository_id": 4242, "previous": "Acme/Widgets", "full_name": "Acme/Gadgets"})]
+        [
+            json!({"repository_id": 4242, "previous": "Acme/Widgets", "full_name": "Acme/Gadgets", "work_repair": "none"})
+        ]
     );
     assert_eq!(
         store

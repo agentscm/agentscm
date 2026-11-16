@@ -6,6 +6,7 @@ import {
   hasMoreBriefing,
   workIdFromHash,
   workMatchesSearch,
+  TRANSITION_LABEL,
   type BriefingQuery,
   type StandupBriefing,
   type BriefingEvent,
@@ -232,7 +233,7 @@ function History({ token }: { token: string }) {
                 <div className="change-main">
                   <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
                   <div className="change-meta">
-                    <span>{EVENT_LABEL[e.kind] ?? e.kind}</span>
+                    <span>{(e.transition && TRANSITION_LABEL[e.transition]) || EVENT_LABEL[e.kind] || e.kind}</span>
                     <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{who(l.login, l.agent)}</span></span>
                     <StatePill state={e.item.state} />
                   </div>

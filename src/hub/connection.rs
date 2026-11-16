@@ -442,9 +442,18 @@ impl Event {
         Self::new("repository_connected", &repo.id, data)
     }
 
-    pub(super) fn repository_renamed(repo: &ConnectedRepository, previous: &str) -> Result<Self> {
-        let data = json!({"repository_id": repo.repository_id, "previous": previous,
-            "full_name": repo.full_name});
+    /// `repair` says what became of the online Work repair: `("applied", None)` or
+    /// `("skipped", Some(code))` with a fixed code (`too_many`, `conflict`, `unavailable`).
+    pub(super) fn repository_renamed(
+        repo: &ConnectedRepository,
+        previous: &str,
+        repair: (&str, Option<&str>),
+    ) -> Result<Self> {
+        let mut data = json!({"repository_id": repo.repository_id, "previous": previous,
+            "full_name": repo.full_name, "work_repair": repair.0});
+        if let Some(reason) = repair.1 {
+            data["work_repair_reason"] = json!(reason);
+        }
         Self::new("repository_renamed", &repo.id, data)
     }
 

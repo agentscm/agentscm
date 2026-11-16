@@ -294,6 +294,11 @@ pub enum WorkTransitionKind {
 }
 
 impl WorkTransitionKind {
+    /// Decodes a stored `data.transition` string; `None` for an unrecognised value.
+    pub(super) fn from_stored(value: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+    }
+
     pub(super) const ALL: [Self; 7] = [
         Self::Release,
         Self::Retain,

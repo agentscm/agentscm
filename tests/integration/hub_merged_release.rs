@@ -1114,3 +1114,251 @@ async fn only_an_admin_switches_the_release_on_and_it_reads_off_by_default() {
     assert_eq!(status, 200, "{view}");
     assert_eq!(view["enabled"], false);
 }
+
+// Recovery findings the Work stage read completes after the recovery transaction.
+
+fn recovery_findings(
+    db: &Db,
+    w: &World,
+    session: &str,
+    now: i64,
+    annotate: bool,
+) -> Vec<agentscm::hub::work_recovery::FindingV1> {
+    use agentscm::hub::merged_holds::{FindingsReader, annotate_findings};
+    use agentscm::hub::work_recovery::{RecoveryCaller, RecoveryQuery, inspect};
+    let mut recovery = inspect(
+        &*db.store,
+        &RecoveryCaller::Agent {
+            token: &w.token,
+            session: Some(session),
+        },
+        &RecoveryQuery::default(),
+        now,
+    )
+    .unwrap();
+    if annotate {
+        let principal = db
+            .store
+            .authenticate(&agent_token_digest(&w.secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap();
+        annotate_findings(
+            &*db.store,
+            &FindingsReader::Agent(&principal),
+            &mut recovery,
+            now,
+        );
+    }
+    recovery
+        .work
+        .into_iter()
+        .flat_map(|work| work.findings)
+        .collect()
+}
+
+fn start_unlinked(db: &Db, w: &World, key: &str) -> WorkItem {
+    db.store
+        .work_start(
+            &w.token,
+            &serde_json::from_value::<WorkStart>(json!({
+                "request_key": key, "title": "Synthetic unlinked Work",
+                "session": format!("{key}-session"), "scope": [format!("src/{key}.rs")]
+            }))
+            .unwrap(),
+            unix_now(),
+        )
+        .unwrap()
+        .item
+}
+
+fn the_inventory_names_the_merged_pull_of_a_hidden_hold(db: &Db) {
+    use agentscm::hub::work_recovery::FindingKind;
+    let w = world(db, None);
+    let now = unix_now() + 10;
+    let bare = recovery_findings(db, &w, SESSION, now, false);
+    let hidden: Vec<_> = bare
+        .iter()
+        .filter(|f| f.kind == FindingKind::HiddenHold)
+        .collect();
+    assert_eq!(hidden.len(), 1, "{bare:?}");
+    assert_eq!(hidden[0].pull_request, None);
+    let named = recovery_findings(db, &w, SESSION, now, true);
+    let hidden: Vec<_> = named
+        .iter()
+        .filter(|f| f.kind == FindingKind::HiddenHold)
+        .collect();
+    assert_eq!(hidden.len(), 1, "{named:?}");
+    assert_eq!(hidden[0].pull_request, Some(41));
+    assert!(hidden[0].evidence.contains("#41 merged"), "{hidden:?}");
+    assert_eq!(hidden[0].proposed, None);
+    assert!(named.iter().all(|f| f.kind != FindingKind::NoPrLink));
+}
+
+fn an_ambiguous_merge_leaves_the_hidden_hold_unnamed(db: &Db) {
+    use agentscm::hub::work_recovery::FindingKind;
+    let w = world(db, None);
+    db.store
+        .record_catchup_merge(&scope(), &merge_row(42, "feature/m", true), unix_now() + 6)
+        .unwrap();
+    let found = recovery_findings(db, &w, SESSION, unix_now() + 10, true);
+    assert!(
+        found.iter().any(|f| f.kind == FindingKind::HiddenHold),
+        "the hold is still hidden: {found:?}"
+    );
+    for finding in found.iter().filter(|f| f.kind == FindingKind::HiddenHold) {
+        assert_eq!(finding.pull_request, None, "{finding:?}");
+        assert!(!finding.evidence.contains('#'), "{finding:?}");
+    }
+}
+
+fn no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link(db: &Db) {
+    use agentscm::hub::work_recovery::{FindingKind, repair_plan};
+    let w = world(db, None);
+    let plain = start_unlinked(db, &w, "plain");
+    let declared = start_unlinked(db, &w, "declared");
+    db.store
+        .work_declarations_set(
+            &w.token,
+            &WorkDeclarationsUpdate {
+                work_id: declared.id.clone(),
+                operation_id: "declare-88".into(),
+                generation: declared.generation,
+                session: "declared-session".into(),
+                expected_updated_seq: declared.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![DeclaredPrLink {
+                        id: "second".into(),
+                        target: WorkPrLinkTarget {
+                            repository_id: REPO_ID,
+                            number: 88,
+                            head_sha: "d".repeat(40),
+                        },
+                    }],
+                    prerequisites: vec![],
+                },
+            },
+            unix_now(),
+        )
+        .unwrap();
+    // The declared pull request merges: the Work still has a link, so no absence is reported.
+    db.store
+        .record_catchup_merge(
+            &scope(),
+            &merge_row(88, "feature/declared", true),
+            unix_now() + 7,
+        )
+        .unwrap();
+    let at = lapsed();
+    for annotate in [false, true] {
+        use agentscm::hub::merged_holds::{FindingsReader, annotate_findings};
+        use agentscm::hub::work_recovery::{RecoveryCaller, RecoveryQuery, inspect};
+        let mut recovery = inspect(
+            &*db.store,
+            &RecoveryCaller::Agent {
+                token: &w.token,
+                session: None,
+            },
+            &RecoveryQuery::default(),
+            at,
+        )
+        .unwrap();
+        if annotate {
+            let principal = db
+                .store
+                .authenticate(&agent_token_digest(&w.secret).unwrap(), unix_now())
+                .unwrap()
+                .unwrap();
+            annotate_findings(
+                &*db.store,
+                &FindingsReader::Agent(&principal),
+                &mut recovery,
+                at,
+            );
+        }
+        let kinds = |id: &str| -> Vec<FindingKind> {
+            recovery
+                .work
+                .iter()
+                .find(|work| work.work_id == id)
+                .unwrap()
+                .findings
+                .iter()
+                .map(|f| f.kind)
+                .collect()
+        };
+        assert!(kinds(&plain.id).contains(&FindingKind::LapsedHold));
+        assert_eq!(
+            kinds(&plain.id).contains(&FindingKind::NoPrLink),
+            annotate,
+            "{:?}",
+            kinds(&plain.id)
+        );
+        // A declared link, merged or not, is not an absent link.
+        assert!(!kinds(&declared.id).contains(&FindingKind::NoPrLink));
+        // The Work whose branch merged has a link.
+        assert!(!kinds(&w.work).contains(&FindingKind::NoPrLink));
+        if annotate {
+            let plan = repair_plan(&recovery);
+            assert!(
+                plan.planned
+                    .iter()
+                    .all(|item| item.finding != FindingKind::NoPrLink)
+            );
+            assert!(plan.skipped.iter().any(|skip| {
+                skip.work_id == plain.id
+                    && skip.finding == FindingKind::NoPrLink
+                    && skip.reason.starts_with("report only")
+            }));
+            let finding = recovery
+                .work
+                .iter()
+                .find(|work| work.work_id == plain.id)
+                .unwrap()
+                .findings
+                .last()
+                .unwrap();
+            assert_eq!(finding.kind, FindingKind::NoPrLink);
+            assert_eq!(finding.proposed, None);
+            assert!(finding.complete);
+        }
+    }
+}
+
+#[test]
+fn sqlite_the_inventory_names_the_merged_pull_of_a_hidden_hold() {
+    the_inventory_names_the_merged_pull_of_a_hidden_hold(&Db::sqlite());
+}
+
+#[test]
+fn postgres_the_inventory_names_the_merged_pull_of_a_hidden_hold() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    the_inventory_names_the_merged_pull_of_a_hidden_hold(&db);
+}
+
+#[test]
+fn sqlite_an_ambiguous_merge_leaves_the_hidden_hold_unnamed() {
+    an_ambiguous_merge_leaves_the_hidden_hold_unnamed(&Db::sqlite());
+}
+
+#[test]
+fn postgres_an_ambiguous_merge_leaves_the_hidden_hold_unnamed() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    an_ambiguous_merge_leaves_the_hidden_hold_unnamed(&db);
+}
+
+#[test]
+fn sqlite_no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link() {
+    no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link(&Db::sqlite());
+}
+
+#[test]
+fn postgres_no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    no_pr_link_is_reported_only_for_retained_work_known_to_have_no_link(&db);
+}

@@ -98,11 +98,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
-    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
-    like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
-    plan_local_ci_change, plan_local_ci_enroll, plan_named, repository_scope, search_number,
-    session_key, unix_now, validate_display_name, validate_login,
+    NewAgentToken, Principal, PromiseInputScope, RenameRepair, SESSION_START_RETAIN_SECONDS,
+    SESSION_STARTS_MAX, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User,
+    check_session_start, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id,
+    owner_session, pending, plan_local_ci_change, plan_local_ci_enroll, plan_named,
+    repository_scope, search_number, session_key, unix_now, validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -879,9 +879,11 @@ fn sqlite_catchup_page(
         ));
     }
     let mut statement = tx.prepare(
-        "SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
+        "SELECT seq,at,kind,subject,stream,snapshot,title,status,transition FROM (
              SELECT e.seq,e.at,e.kind,e.subject,'work' AS stream,v.snapshot,
-                    NULL AS title,NULL AS status
+                    NULL AS title,NULL AS status,
+                    CASE WHEN e.kind='work_transition'
+                         THEN json_extract(e.data,'$.transition') END AS transition
                FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq
                JOIN hub_work_items w ON w.id=v.work
               WHERE e.seq>?1 AND e.seq<=?2 AND w.provider=?3 AND w.host=?4
@@ -889,7 +891,7 @@ fn sqlite_catchup_page(
                   OR (?6 IS NULL AND w.repository=?5 AND w.repository_id IS NULL))
              UNION ALL
              SELECT e.seq,e.at,e.kind,e.subject,'coordination' AS stream,NULL AS snapshot,
-                    r.proposed_title,v.status
+                    r.proposed_title,v.status,NULL AS transition
                FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
                JOIN hub_coordination_requests r ON r.id=v.request
               WHERE e.seq>?1 AND e.seq<=?2 AND r.provider=?3 AND r.host=?4
@@ -918,6 +920,7 @@ fn sqlite_catchup_page(
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )?
@@ -927,7 +930,7 @@ fn sqlite_catchup_page(
     let mut coordination_events = Vec::new();
     let mut last_event = event_after;
     let mut page_payload_bytes = 0usize;
-    for (seq, at, kind, subject, stream, snapshot, title, status) in event_rows {
+    for (seq, at, kind, subject, stream, snapshot, title, status, transition) in event_rows {
         if work_events.len() + coordination_events.len() >= limit {
             more_events = true;
             break;
@@ -937,6 +940,7 @@ fn sqlite_catchup_page(
             + snapshot.as_ref().map_or(0, String::len)
             + title.as_ref().map_or(0, String::len)
             + status.as_ref().map_or(0, String::len)
+            + transition.as_ref().map_or(0, String::len)
             + 128;
         if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
             if work_events.is_empty() && coordination_events.is_empty() {
@@ -958,6 +962,9 @@ fn sqlite_catchup_page(
                 item: json_value(snapshot.as_deref().ok_or_else(|| {
                     HubError::Unavailable("missing retained work snapshot".into())
                 })?)?,
+                transition: transition
+                    .as_deref()
+                    .and_then(work_transition::WorkTransitionKind::from_stored),
             });
         } else {
             coordination_events.push(CatchupCoordinationEvent {
@@ -5334,7 +5341,9 @@ fn briefing_page(
     let next_work_done = work_done || !more_work;
 
     let mut statement = tx.prepare(
-        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot,
+                CASE WHEN e.kind = 'work_transition'
+                     THEN json_extract(e.data, '$.transition') END
          FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
          JOIN hub_work_items w ON w.id = v.work
          WHERE e.seq > ?1 AND e.seq <= ?2 AND w.provider = ?3 AND w.host = ?4
@@ -5359,13 +5368,14 @@ fn briefing_page(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut more_events = rows.len() > limit;
     let mut events = Vec::new();
-    for (seq, at, kind, work_id, snapshot) in rows.into_iter().take(limit) {
+    for (seq, at, kind, work_id, snapshot, transition) in rows.into_iter().take(limit) {
         if !events.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
             more_events = true;
             break;
@@ -5379,6 +5389,9 @@ fn briefing_page(
             kind,
             work_id,
             item,
+            transition: transition
+                .as_deref()
+                .and_then(work_transition::WorkTransitionKind::from_stored),
         });
     }
     let next_after = if more_events {
@@ -5467,6 +5480,73 @@ fn resolved_scope(
 }
 
 /// See [`super::store::ADOPT_NAME_SCOPE`]; run when `repo` is connected or renamed.
+/// Moves Work recorded under `previous` to the repository's new name. The rename
+/// itself must not depend on it: a collision, a size over the online ceiling or any
+/// other failure rolls back only this repair, leaving the Work under the old name for
+/// `work repair-repository`. Every query runs inside the savepoint, and the outcome is
+/// returned for the `repository_renamed` event.
+fn repair_renamed_work(
+    tx: &Transaction<'_>,
+    connection: &str,
+    repo: &ConnectedRepository,
+    previous: String,
+) -> RenameRepair {
+    let attempt = || -> Result<RenameRepair> {
+        tx.execute_batch("SAVEPOINT rename_repair")?;
+        let inner = || -> Result<RenameRepair> {
+            let provider: String = tx.query_row(
+                "SELECT provider FROM hub_connections WHERE id = ?1",
+                [connection],
+                |row| row.get(0),
+            )?;
+            let rows: i64 = tx.query_row(
+                "SELECT (SELECT COUNT(*) FROM hub_work_items
+                         WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id = ?4)
+                      + (SELECT COUNT(*) FROM hub_coordination_requests
+                         WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id = ?4)",
+                params![provider, repo.host, previous, repo.repository_id],
+                |row| row.get(0),
+            )?;
+            if rows == 0 {
+                return Ok(RenameRepair::None);
+            }
+            if rows > super::store::MAX_ONLINE_RENAME_REPAIR_ROWS {
+                eprintln!("hub: rename Work repair skipped: {rows} rows exceed the online ceiling");
+                return Ok(RenameRepair::Skipped("too_many"));
+            }
+            let repair = super::work::WorkRepositoryRename {
+                scope: WorkRepositoryScope {
+                    provider,
+                    host: repo.host.clone(),
+                    repository: previous.clone(),
+                    repository_id: Some(repo.repository_id),
+                },
+                destination: repo.full_name.clone(),
+                apply: true,
+            };
+            match repository_rename::repair(tx, &repair, unix_now()) {
+                Ok(_) => Ok(RenameRepair::Applied),
+                Err(error) => {
+                    eprintln!("hub: rename Work repair skipped: {error}");
+                    Ok(RenameRepair::Skipped(
+                        super::store::rename_repair_failure_reason(&error),
+                    ))
+                }
+            }
+        };
+        let outcome = inner();
+        match outcome {
+            Ok(RenameRepair::Applied) => tx.execute_batch("RELEASE rename_repair")?,
+            _ => tx.execute_batch("ROLLBACK TO rename_repair; RELEASE rename_repair")?,
+        }
+        outcome
+    };
+    attempt().unwrap_or_else(|error| {
+        eprintln!("hub: rename Work repair not attempted: {error}");
+        RenameRepair::Skipped("unavailable")
+    })
+}
+
 fn adopt_name_scope(tx: &Connection, repo: &ConnectedRepository) -> Result<()> {
     let named = repository_scope(&repo.host, &repo.full_name, None);
     for statement in super::store::ADOPT_NAME_SCOPE {
@@ -10235,10 +10315,11 @@ impl Store for SqliteStore {
                 repo
             }
             Some(mut repo) if repo.connection == connection => {
+                let mut renamed_from = None;
                 if repo.full_name != full_name {
                     let previous = std::mem::replace(&mut repo.full_name, full_name.to_owned());
-                    append(&tx, &Event::repository_renamed(&repo, &previous)?)?;
                     adopt_name_scope(&tx, &repo)?;
+                    renamed_from = Some(previous);
                 }
                 // Not events: they say how to reach the repository, not what it is.
                 repo.node_id = node_id.map(str::to_owned).or(repo.node_id);
@@ -10247,6 +10328,14 @@ impl Store for SqliteStore {
                     "UPDATE hub_repositories SET full_name = ?2, node_id = ?3, installation_id = ?4 WHERE id = ?1",
                     params![repo.id, repo.full_name, repo.node_id, repo.installation_id],
                 )?;
+                if let Some(previous) = renamed_from {
+                    // Appended after the repair so the event can say how it went.
+                    let outcome = repair_renamed_work(&tx, connection, &repo, previous.clone());
+                    append(
+                        &tx,
+                        &Event::repository_renamed(&repo, &previous, outcome.event_fields())?,
+                    )?;
+                }
                 repo
             }
             Some(repo) => repo,

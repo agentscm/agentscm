@@ -135,7 +135,7 @@ from the findings of `agentscm work recovery`. It reads every page of your owner
 20 pages; a longer listing is reported as incomplete) and plans one transition for each finding
 whose proposed remedy is a permitted transition: `release` for a lapsed hold, `prune_participants`
 for a full participant list. A finding it will not apply is listed as skipped with the reason:
-report-only, not permitted, incomplete facts, a resume or handover, input only you can supply, or a
+report-only (`hidden_hold`, `no_pr_link` and others), not permitted, incomplete facts, a resume or handover, input only you can supply, or a
 second repair of the same Work. It never plans `complete`. The default is a dry run that changes
 nothing. `--apply` sends the plan through `work transitions` in chunks of 25, each item with the
 fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`. A rerun reads a

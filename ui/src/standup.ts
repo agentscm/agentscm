@@ -95,12 +95,30 @@ export function currentLeadParticipant(item: WorkItem): WorkParticipant {
   return lead ?? fail('work.lead')
 }
 
+export type WorkTransitionKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants'
+
+/** How a `work_transition` event reads in a feed; callers fall back to a generic label for an absent kind. */
+export const TRANSITION_LABEL: Readonly<Record<WorkTransitionKind, string>> = {
+  release: 'Reservation released',
+  retain: 'Reservation retained',
+  complete: 'Work completed',
+  abandon: 'Work abandoned',
+  supersede: 'Work superseded',
+  reopen: 'Work reopened',
+  prune_participants: 'Participants pruned',
+}
+
+/** Leniently decodes a feed event's transition kind: anything unrecognised is undefined, never an error. */
+export const decodeTransition = (value: unknown): WorkTransitionKind | undefined =>
+  typeof value === 'string' && Object.hasOwn(TRANSITION_LABEL, value) ? value as WorkTransitionKind : undefined
+
 export interface BriefingEvent {
   seq: number
   at: number
   kind: WorkEventKind
   work_id: string
   item: WorkItem
+  transition?: WorkTransitionKind
 }
 
 export interface StandupBriefing {
@@ -457,6 +475,11 @@ export function decodeWorkItem(value: unknown, expectedId?: string): WorkItem {
   return decoded
 }
 
+export const transitionField = (value: unknown): { transition?: WorkTransitionKind } => {
+  const transition = decodeTransition(value)
+  return transition ? { transition } : {}
+}
+
 function event(value: unknown): BriefingEvent {
   const item = record(value, 'briefing.event')
   const id = workId(item['work_id'], 'briefing.event.work_id')
@@ -466,6 +489,7 @@ function event(value: unknown): BriefingEvent {
     kind: enumValue(item['kind'], EVENT_KINDS, 'briefing.event.kind'),
     work_id: id,
     item: decodeWorkItem(item['item'], id),
+    ...transitionField(item['transition']),
   }
 }
 

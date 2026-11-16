@@ -2674,18 +2674,14 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
     let reply = env.announce(&bound, 1, &["src/a.rs"], None).await;
     assert_eq!(reply["pull_requests"][0]["number"], 5);
 
-    // The guard still finds the token's released Work by repository id: a path in its scope is
-    // refused for the renamed repository's token, and the response says why.
+    // Recording the rename moved the token's released Work to the new name, so it no longer
+    // guards the old name, which another repository now holds.
     let body = json!({"intent_id": format!("int_{:032x}", 2), "task": "rework billing",
         "branch": null, "paths": ["lib/b.rs"], "ttl_s": 3600});
-    let (status, refused) = env
+    let (status, accepted) = env
         .post("/v1/hub/repos/acme%2Fwidgets/intents", Some(&bound), body)
         .await;
-    assert_eq!(status, 400, "{refused}");
-    assert!(
-        refused["message"].as_str().unwrap().contains(&started.id),
-        "{refused}"
-    );
+    assert_eq!(status, 200, "{accepted}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
