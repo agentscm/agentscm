@@ -9,6 +9,7 @@
 //   previewRemedy(session, repository, workId, remedy)    what one remedy would change and its fences
 //   applyTransition(session, repository, preview, operationId, reason)   one person transition; resolves to its batch outcome
 //   PERSON_REMEDIES                                       the remedies a person can apply from the Hub
+//   fetchInventory(session, repository, after, signal)    an administrator's page of every owner's unfinished Work, with findings
 import { ApiError } from './api.ts'
 import type { BrowserSession } from './devices.ts'
 import { refusalFrom } from './refusal.ts'
@@ -16,7 +17,7 @@ import { withTimeout } from './timeout.ts'
 
 export type RemedyKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants' | 'resume' | 'handover'
 /** Transitions a person applies through the Hub; resume, reopen and handover need an agent session. */
-export const PERSON_REMEDIES: RemedyKind[] = ['release', 'complete', 'abandon', 'retain']
+export const PERSON_REMEDIES: RemedyKind[] = ['release', 'complete', 'abandon', 'retain', 'prune_participants']
 
 export interface RecoveryRemedy {
   remedy: RemedyKind
@@ -47,6 +48,27 @@ export interface RemedyPreview {
   requests: string[]
   dependents: string[]
   unfinished: boolean
+  /** The sessions a prune would remove; for other remedies, the sessions that lose the Work. */
+  fenced: { login: string; agent: string; role: string }[]
+  /** Exactly the participants the prune apply names; empty for every other remedy. */
+  participants: { token: string; session: string }[]
+}
+export interface InventoryFinding {
+  /** Unknown kinds keep their raw text. */
+  kind: string
+  evidence: string
+  complete: boolean
+  pull_request: number | null
+}
+export interface InventoryWork {
+  work_id: string
+  title: string
+  owner_login: string
+  findings: InventoryFinding[]
+}
+export interface Inventory {
+  work: InventoryWork[]
+  next_after: string | null
 }
 export interface BatchItem {
   outcome: 'applied' | 'replayed' | 'conflict' | 'refused' | 'unavailable'
@@ -126,6 +148,50 @@ export async function fetchRecovery(session: BrowserSession, repository: string,
   return work.length ? decodeRecoveryWork(work[0]) : null
 }
 
+export function decodeInventory(value: unknown): Inventory {
+  const page = rec(value)
+  const work = Array.isArray(page['work']) ? page['work'] : []
+  const after = page['next_after']
+  return {
+    work: work.map((w) => {
+      const o = rec(w)
+      return {
+        work_id: text(o['work_id'], 64),
+        title: text(o['title'], 300),
+        owner_login: text(o['owner_login'], 200),
+        findings: (Array.isArray(o['findings']) ? o['findings'] : []).map((f) => {
+          const r = rec(f)
+          const pr = r['pull_request']
+          return { kind: text(r['kind'], 64), evidence: text(r['evidence']), complete: r['complete'] === true, pull_request: typeof pr === 'number' && Number.isInteger(pr) && pr > 0 ? pr : null }
+        }),
+      }
+    }),
+    next_after: typeof after === 'string' && after ? after.slice(0, 200) : null,
+  }
+}
+
+/** A Hub administrator's page of every owner's unfinished Work in a repository; the Hub refuses anyone else. */
+export async function fetchInventory(session: BrowserSession, repository: string, after: string | null, signal?: AbortSignal): Promise<Inventory> {
+  return decodeInventory(await call('/v1/hub/session/work/recovery', session, { repository, all_owners: true, ...(after ? { after } : {}) }, signal))
+}
+
+function decodeFenced(value: unknown): RemedyPreview['fenced'] {
+  return (Array.isArray(value) ? value : []).slice(0, 256).map((f) => {
+    const o = rec(f)
+    return { login: text(o['login'], 200), agent: text(o['agent'], 200), role: text(o['role'], 64) }
+  })
+}
+
+/** The prune apply's participants, exactly as the Hub named them; anything malformed is an error, never dropped. */
+function decodeParticipants(value: unknown): RemedyPreview['participants'] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new ApiError(502, 'The Hub sent an unreadable recovery answer')
+  return value.map((v) => {
+    const o = rec(v)
+    return { token: text(o['token'], 200), session: text(o['session'], 200) }
+  })
+}
+
 export function decodePreview(value: unknown): RemedyPreview {
   const p = rec(value)
   const e = rec(p['effects'])
@@ -133,9 +199,13 @@ export function decodePreview(value: unknown): RemedyPreview {
   const generation = p['generation']
   const seq = p['expected_updated_seq']
   if (typeof generation !== 'number' || typeof seq !== 'number') throw new ApiError(502, 'The Hub sent an unreadable recovery answer')
+  const remedy = choice<RemedyKind>(p['remedy'], KINDS)
+  const apply = p['apply'] === null || p['apply'] === undefined ? null : rec(p['apply'])
+  const participants = apply ? decodeParticipants(rec(apply['arguments'])['participants']) : []
+  if (remedy === 'prune_participants' && p['permitted'] === true && participants.length === 0) throw new ApiError(502, 'The Hub sent an unreadable recovery answer')
   return {
     work_id: text(p['work_id'], 64),
-    remedy: choice(p['remedy'], KINDS),
+    remedy,
     permitted: p['permitted'] === true,
     refusal: refusal(p['refusal']),
     generation,
@@ -146,6 +216,8 @@ export function decodePreview(value: unknown): RemedyPreview {
     requests: strings(e['requests']),
     dependents: strings(e['dependents']),
     unfinished: follow['unfinished'] === true,
+    fenced: decodeFenced(e['fenced']),
+    participants,
   }
 }
 
@@ -158,7 +230,7 @@ export async function applyTransition(session: BrowserSession, repository: strin
   const result = rec(
     await call('/v1/hub/session/work/transitions', session, {
       repository,
-      items: [{ work_id: preview.work_id, operation_id: operationId, generation: preview.generation, expected_updated_seq: preview.expected_updated_seq, transition: preview.remedy, reason }],
+      items: [{ work_id: preview.work_id, operation_id: operationId, generation: preview.generation, expected_updated_seq: preview.expected_updated_seq, transition: preview.remedy, reason, ...(preview.participants.length ? { participants: preview.participants } : {}) }],
     }),
   )
   const items = Array.isArray(result['items']) ? result['items'] : []

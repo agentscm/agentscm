@@ -16,6 +16,7 @@ const LABEL: Partial<Record<RemedyKind, string>> = {
   complete: 'Mark it complete',
   abandon: 'Abandon it',
   retain: 'Keep holding its files',
+  prune_participants: 'Remove listed sessions',
 }
 
 type Step = { kind: 'idle' } | { kind: 'previewing'; remedy: RemedyKind } | { kind: 'preview'; preview: RemedyPreview; op: string } | { kind: 'sending'; preview: RemedyPreview; op: string } | { kind: 'done'; preview: RemedyPreview; op: string; result: BatchItem } | { kind: 'error'; message: string }
@@ -81,6 +82,18 @@ function Panel({ item, session, refreshWork }: { item: WorkItem; session: Browse
               <div>
                 <span className="label">Files it frees</span>
                 <Paths items={shown.freed_paths} />
+              </div>
+            )}
+            {shown.remedy === 'prune_participants' && shown.fenced.length > 0 && (
+              <div>
+                <span className="label">Sessions it removes</span>
+                <ul className="small">
+                  {shown.fenced.map((f, i) => (
+                    <li key={i}>
+                      {f.login} · {f.agent} · {f.role}
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
             {(shown.requests.length > 0 || shown.dependents.length > 0) && (

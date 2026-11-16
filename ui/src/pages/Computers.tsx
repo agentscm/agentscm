@@ -7,6 +7,8 @@ import { loginHref } from '../hubLogin.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { Ago, Box, Empty, Icon, Notice, PageHead, Pill, Skeleton, Tip, localDate } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
+import { workHref } from '../standup.ts'
+import { fetchInventory, type Inventory } from '../workRecovery.ts'
 
 export type Load<T> = { kind: 'loading' } | { kind: 'ready'; value: T } | { kind: 'error'; error: unknown }
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
@@ -320,6 +322,81 @@ function Repositories({ rows }: { rows: AdminRepository[] }) {
   )
 }
 
+function RetainedClaims({ repositories, session }: { repositories: AdminRepository[]; session: BrowserSession }) {
+  const [repo, setRepo] = useState('')
+  const [after, setAfter] = useState<string | null>(null)
+  const [got, setGot] = useState<{ key: string; load: Load<Inventory> } | null>(null)
+  useEffect(() => {
+    if (!repo) return
+    const ctl = new AbortController()
+    const key = `${repo}|${after ?? ''}`
+    fetchInventory(session, repo, after, ctl.signal).then(
+      (value) => setGot({ key, load: { kind: 'ready', value } }),
+      (error) => !ctl.signal.aborted && setGot({ key, load: { kind: 'error', error } }),
+    )
+    return () => ctl.abort()
+  }, [session, repo, after])
+  const page: Load<Inventory> | null = !repo ? null : got?.key === `${repo}|${after ?? ''}` ? got.load : { kind: 'loading' }
+  const inventory = page?.kind === 'ready' ? page.value : null
+  return (
+    <Box icon="hourglass-split" title="Retained claims" explain="Every owner's unfinished Work in one repository, with what the Hub notices about each. Open a task to apply a remedy after its preview.">
+      <div className="stack">
+        <label className="label" htmlFor="retained-repository">
+          Repository
+        </label>
+        <select
+          id="retained-repository"
+          className="form-select form-select-sm"
+          value={repo}
+          onChange={(e) => {
+            setRepo(e.target.value)
+            setAfter(null)
+          }}
+        >
+          <option value="">Choose one</option>
+          {repositories.map((r) => (
+            <option key={r.fullName} value={r.fullName}>
+              {r.fullName}
+            </option>
+          ))}
+        </select>
+        {page?.kind === 'loading' && <Skeleton rows={2} />}
+        {page?.kind === 'error' && <Failure error={page.error} what="the retained claims" />}
+        {inventory && inventory.work.length === 0 && <p className="muted small">No unfinished Work here.</p>}
+        {inventory && inventory.work.length > 0 && (
+          <ul className="list-unstyled stack">
+            {inventory.work.map((w) => (
+              <li key={w.work_id}>
+                <a href={workHref(w.work_id)}>{w.title || w.work_id}</a> <span className="muted small">· {w.owner_login}</span>
+                {w.findings.length === 0 ? (
+                  <div className="muted small">Nothing noticed.</div>
+                ) : (
+                  <ul className="small">
+                    {w.findings.map((f, i) => (
+                      <li key={i}>
+                        <code>{f.kind}</code>
+                        {f.pull_request !== null && <> #{f.pull_request}</>}: {f.evidence}
+                        {!f.complete && <span className="muted"> (incomplete facts)</span>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {inventory?.next_after && (
+          <div>
+            <button className="btn btn-sm btn-outline-secondary" onClick={() => setAfter(inventory.next_after)}>
+              Next
+            </button>
+          </div>
+        )}
+      </div>
+    </Box>
+  )
+}
+
 export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; provider: 'github' | 'gitlab' }) {
   const [data, setData] = useState<Load<Awaited<ReturnType<typeof fetchAdmin>>>>({ kind: 'loading' })
   const [tick, setTick] = useState(0)
@@ -371,6 +448,7 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
           <Box icon="plug" title="Connected repositories" explain="Repositories this Hub serves, with the computers and agent tokens connected to each.">
             <Repositories rows={v.repositories} />
           </Box>
+          <RetainedClaims repositories={v.repositories} session={browser.session} />
           <Box icon="laptop" title="Every signed-in computer" count={v.devices.filter((d) => !d.revokedAt).length} explain="Revoking a computer revokes the agent tokens it made, so those agents lose access to this Hub at once. They keep running, and GitHub or GitLab access is unchanged. Last used is recorded at most once an hour.">
             <ComputerList devices={v.devices} auth={browser} showOwner onChange={() => setTick((t) => t + 1)} />
           </Box>
