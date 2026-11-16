@@ -3224,6 +3224,12 @@ async fn call_inner(
                     now,
                 )?;
                 super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+                super::merged_holds::annotate_findings(
+                    &*store,
+                    &super::merged_holds::FindingsReader::Agent(&caller),
+                    &mut recovery,
+                    now,
+                );
                 Ok(recovery)
             })
             .await
@@ -4328,6 +4334,12 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
                 now,
             )?;
             super::merged_holds::annotate_conflicts(&*store, &caller, &mut recovery, now);
+            super::merged_holds::annotate_findings(
+                &*store,
+                &super::merged_holds::FindingsReader::Agent(&caller),
+                &mut recovery,
+                now,
+            );
             Ok(recovery)
         })
         .await;

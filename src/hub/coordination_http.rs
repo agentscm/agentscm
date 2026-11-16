@@ -542,7 +542,8 @@ async fn person_recovery(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            super::work_recovery::inspect(
+            let now = unix_now();
+            let mut recovery = super::work_recovery::inspect(
                 &*store,
                 &super::work_recovery::RecoveryCaller::Person {
                     user: &user,
@@ -551,8 +552,18 @@ async fn person_recovery(
                     is_admin,
                 },
                 &query,
-                unix_now(),
-            )
+                now,
+            )?;
+            super::merged_holds::annotate_findings(
+                &*store,
+                &super::merged_holds::FindingsReader::Person {
+                    user: &user,
+                    repository: &repository,
+                },
+                &mut recovery,
+                now,
+            );
+            Ok(recovery)
         })
         .await
         .map_err(person_error)?,

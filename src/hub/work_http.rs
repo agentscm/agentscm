@@ -618,6 +618,12 @@ async fn recovery(
                 now,
             )?;
             super::merged_holds::annotate_conflicts(&*store, &principal, &mut recovery, now);
+            super::merged_holds::annotate_findings(
+                &*store,
+                &super::merged_holds::FindingsReader::Agent(&principal),
+                &mut recovery,
+                now,
+            );
             Ok(recovery)
         })
         .await?,

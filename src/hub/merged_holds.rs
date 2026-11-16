@@ -996,6 +996,109 @@ pub fn annotate_conflicts(
     }
 }
 
+/// Whose reads `annotate_findings` makes: an agent's token, or a signed-in person in one
+/// connected repository.
+pub enum FindingsReader<'a> {
+    Agent(&'a Principal),
+    Person {
+        user: &'a User,
+        repository: &'a ConnectedRepository,
+    },
+}
+
+/// Adds what the Work stage read establishes to the findings of the first
+/// `MAX_RECOVERY_PAGE` Work (by id) that carry one it can use: names the merged pull request on
+/// a `hidden_hold`, and appends `no_pr_link` to a `lapsed_hold` or `abandoned_session` Work whose
+/// link is known absent. A Work that cannot be read, a repository that is not connected, a limit
+/// on the read or an unreadable link adds nothing, so absence is never claimed without a read.
+/// This is a later read than the recovery transaction, not part of its snapshot.
+pub fn annotate_findings(
+    store: &dyn Store,
+    reader: &FindingsReader<'_>,
+    recovery: &mut super::work_recovery::WorkRecoveryV1,
+    now: i64,
+) {
+    use super::work_recovery::{FindingKind, FindingV1, MAX_RECOVERY_PAGE};
+    let wants = |work: &super::work_recovery::RecoveryWorkV1| {
+        work.findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                FindingKind::HiddenHold | FindingKind::LapsedHold | FindingKind::AbandonedSession
+            )
+        })
+    };
+    let mut ids: Vec<String> = recovery
+        .work
+        .iter()
+        .filter(|work| wants(work))
+        .map(|work| work.work_id.clone())
+        .collect();
+    ids.sort();
+    ids.truncate(MAX_RECOVERY_PAGE);
+    if ids.is_empty() {
+        return;
+    }
+    let (principal, lifecycle);
+    match reader {
+        FindingsReader::Agent(caller) => {
+            let Ok(Some(_)) = super::sync::find_repository(
+                store,
+                &caller.owner.identity.host,
+                &caller.repository,
+                caller.repository_id,
+            ) else {
+                return;
+            };
+            principal = (*caller).clone();
+            lifecycle = WorkLifecycleReader::Token(&principal.token_id);
+        }
+        FindingsReader::Person { user, repository } => {
+            let Ok(Some(connection)) = store.connection(&repository.connection) else {
+                return;
+            };
+            principal = repository_principal(&connection.provider, repository);
+            lifecycle = WorkLifecycleReader::Person {
+                owner: user,
+                repository: &repository.full_name,
+                repository_id: repository.repository_id,
+            };
+        }
+    }
+    let items: Vec<WorkItem> = ids
+        .iter()
+        .filter_map(|id| store.work_get_scoped(&lifecycle, id, now).ok().flatten())
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let pairs: Vec<_> = items.iter().map(|i| (i, OutcomeValue::None)).collect();
+    let (stages, _, unsettled) = work_stages_detailed(store, &principal, &lifecycle, &pairs, now);
+    for work in &mut recovery.work {
+        let Some(stage) = stages.get(&work.work_id) else {
+            continue;
+        };
+        for finding in &mut work.findings {
+            if finding.kind == FindingKind::HiddenHold
+                && stage.stage == WorkStage::PullRequestMerged
+                && let Some(number) = stage.pull_request
+            {
+                finding.name_merged_pull(number);
+            }
+        }
+        let retained = work.findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                FindingKind::LapsedHold | FindingKind::AbandonedSession
+            )
+        });
+        // `Working` is only reached from a link read as absent with no limit; a declared link
+        // or another open candidate still leaves the Work unsettled.
+        if retained && stage.stage == WorkStage::Working && !unsettled.contains(&work.work_id) {
+            work.findings.push(FindingV1::no_pr_link());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
