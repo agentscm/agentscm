@@ -1,7 +1,8 @@
 //! One private journal for native lifecycle operations and enqueue evidence, never heartbeats.
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +10,7 @@ use serde_json::Value;
 const VERSION: u8 = 1;
 const MAX_RECORDS: usize = 512;
 const MAX_BYTES: u64 = 64 * 1024;
+const LOCK_WAIT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +87,23 @@ fn private(metadata: &std::fs::Metadata, directory: bool) -> bool {
     }
 }
 
+// The shared config parent may be searchable; only its native journal must be private.
+fn shared_directory(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no arguments or preconditions.
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn open(path: &Path, create: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
@@ -107,6 +126,14 @@ fn open(path: &Path, create: bool) -> io::Result<File> {
 }
 
 pub(crate) fn locked<T>(config: &Path, run: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    locked_until(config, Instant::now() + LOCK_WAIT, run)
+}
+
+pub(crate) fn locked_until<T>(
+    config: &Path,
+    deadline: Instant,
+    run: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
     let directory = directory(config);
     for path in [
         config,
@@ -131,12 +158,35 @@ pub(crate) fn locked<T>(config: &Path, run: impl FnOnce() -> io::Result<T>) -> i
             }
             continue;
         }
-        if !private(&metadata, true) {
+        let valid = if path == directory.as_path() {
+            private(&metadata, true)
+        } else {
+            shared_directory(&metadata)
+        };
+        if !valid {
             return Err(invalid());
         }
     }
-    let lease = agentscm::lease::Lease::try_exclusive(open(&directory.join("journal.lock"), true)?)
-        .map_err(io::Error::from)?;
+    // The blocking host recorder can wait behind durable writes within its hook budget.
+    let lease = loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        match agentscm::lease::Lease::try_exclusive(open(&directory.join("journal.lock"), true)?) {
+            Ok(lease) => break lease,
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(5)),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
     let result = run();
     drop(lease);
     result
@@ -289,10 +339,9 @@ pub(crate) fn inspect(config: &Path) -> io::Result<Scan> {
         Err(error) => return Err(error),
     };
     if !private(&metadata, true)
-        || !private(
-            &std::fs::symlink_metadata(directory.parent().ok_or_else(invalid)?)?,
-            true,
-        )
+        || !shared_directory(&std::fs::symlink_metadata(
+            directory.parent().ok_or_else(invalid)?,
+        )?)
     {
         return Err(invalid());
     }
@@ -357,6 +406,103 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         assert!(inspect(config.path()).unwrap().records.is_empty());
         assert!(!config.path().join("agentscm").exists());
+    }
+
+    #[test]
+    fn caller_budget_waits_beyond_the_default_lock_cap() {
+        let config = tempfile::tempdir().unwrap();
+        locked(config.path(), || Ok(())).unwrap();
+        let lease = agentscm::lease::Lease::try_exclusive(
+            open(&directory(config.path()).join("journal.lock"), true).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(LOCK_WAIT * 2);
+                drop(lease);
+            });
+            locked_until(
+                config.path(),
+                Instant::now() + Duration::from_secs(2),
+                || write(config.path(), &record()),
+            )
+            .unwrap();
+        });
+        assert_eq!(inspect(config.path()).unwrap().records, [record()]);
+    }
+
+    #[test]
+    fn expired_caller_budget_does_not_run_the_write() {
+        let config = tempfile::tempdir().unwrap();
+        let error = locked_until::<()>(config.path(), Instant::now(), || {
+            panic!("expired write must not run")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(inspect(config.path()).unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn persistent_lock_contention_is_bounded_and_does_not_run_the_write() {
+        let config = tempfile::tempdir().unwrap();
+        locked(config.path(), || Ok(())).unwrap();
+        let lease = agentscm::lease::Lease::try_exclusive(
+            open(&directory(config.path()).join("journal.lock"), true).unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error =
+            locked::<()>(config.path(), || panic!("contended write must not run")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() >= LOCK_WAIT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(inspect(config.path()).unwrap().records.is_empty());
+        drop(lease);
+        put(config.path(), &record()).unwrap();
+    }
+
+    #[test]
+    fn an_existing_searchable_config_parent_keeps_the_journal_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let config = tempfile::tempdir().unwrap();
+        let parent = config.path().join("agentscm");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = record();
+        put(config.path(), &expected).unwrap();
+        assert_eq!(inspect(config.path()).unwrap().records, [expected]);
+        assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+        let journal = directory(config.path());
+        assert!(private(&std::fs::symlink_metadata(&journal).unwrap(), true));
+        for entry in std::fs::read_dir(&journal).unwrap() {
+            assert!(private(&entry.unwrap().metadata().unwrap(), false));
+        }
+        for mode in [0o775, 0o777] {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(put(config.path(), &record()).is_err());
+            assert!(inspect(config.path()).is_err());
+        }
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(put(config.path(), &record()).is_err());
+        assert!(inspect(config.path()).is_err());
+    }
+
+    #[test]
+    fn a_shared_config_parent_symlink_is_refused_without_changing_its_target() {
+        let config = tempfile::tempdir().unwrap();
+        put(config.path(), &record()).unwrap();
+        let parent = config.path().join("agentscm");
+        let outside = config.path().join("outside");
+        std::fs::rename(&parent, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        let retained = outside
+            .join("native-journal")
+            .join(path(config.path(), "attempt").unwrap().file_name().unwrap());
+        let before = std::fs::read(&retained).unwrap();
+        assert!(put(config.path(), &record()).is_err());
+        assert!(inspect(config.path()).is_err());
+        assert_eq!(std::fs::read(retained).unwrap(), before);
     }
 
     #[test]

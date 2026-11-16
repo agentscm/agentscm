@@ -418,13 +418,17 @@ fn prune_host_records(
 }
 
 /// Records the host for MCP association. Dead-host evidence is retained for lifecycle reconciliation.
-pub(crate) fn record(config: &Path, session: &str) {
+pub(crate) fn record(config: &Path, session: &str, deadline: std::time::Instant) {
     let Some(table) = table() else {
         return;
     };
     let directory = directory(config);
     if let Some(host) = host(&chain(&table, std::process::id())) {
-        let _ = records_locked(config, || record_under(&directory, host, session));
+        let run = || record_under(&directory, host, session);
+        #[cfg(unix)]
+        let _ = crate::client_journal::locked_until(config, deadline, run);
+        #[cfg(not(unix))]
+        let _ = (deadline, run());
     }
 }
 

@@ -31,11 +31,13 @@ describe('shared actionable status', () => {
   it('badges the needs the Hub counts in the shared fixture', () => {
     const status = decodeStatus(surfaces)
     const rail = dashboardStatus(null, null, null, null, new Set(), undefined, status).needs
-    // Only the blocked task asks its person. The quiet task, the request to it, the shared file and the
-    // pull request over a held file are listed for agents and are not counted.
-    expect(rail.map((n) => n.key).sort()).toEqual(['blocked:wrk_ffffffffffffffffffffffffffffffff'])
+    // The blocked task and overdue directed request ask the viewer; quiet Work and overlaps do not.
+    expect(rail.map((n) => n.key).sort()).toEqual([
+      'blocked:wrk_ffffffffffffffffffffffffffffffff',
+      'request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    ])
     expect(rail).toHaveLength(status.counts.needs_you)
-    expect(status.actions.filter((a) => a.needs_you)).toHaveLength(0)
+    expect(status.actions.filter((a) => a.needs_you)).toHaveLength(1)
   })
   it('uses semantic action versions for browser dismissals with legacy fixture compatibility', () => {
     const status = decodeStatus(fixture)

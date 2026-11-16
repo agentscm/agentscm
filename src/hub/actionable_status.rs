@@ -4550,7 +4550,7 @@ mod tests {
         };
         let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
         report(&paused, CheckpointKind::Pause, "pause");
-        // The one thing here that asks a person: Work its agent reported blocked.
+        // Blocked Work asks its person; unacknowledged requests also escalate after their deadline.
         let blocked: WorkStart = serde_json::from_value(json!({
             "request_key": "Blocked own work-viewer", "title": "Blocked own work",
             "session": "viewer-blocked", "scope": ["src/blocked.rs"]
@@ -4647,9 +4647,9 @@ mod tests {
             text
         };
         assert_eq!(overlap_text(&status), overlap_text(&fixture));
-        // The paused Work, the request to it, the shared file and the pull request over a held
-        // file are for agents to settle, so none of them counts.
-        assert_eq!(status.counts.needs_you, 1);
+        // The overdue directed request and blocked Work ask the viewer. Quiet Work and
+        // unrelated file/PR overlaps remain listed without becoming personal actions.
+        assert_eq!(status.counts.needs_you, 2);
         assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
         let mut personal = status
             .work
@@ -4665,16 +4665,17 @@ mod tests {
             )
             .collect::<Vec<_>>();
         personal.sort();
-        assert_eq!(personal, std::slice::from_ref(&blocked.id));
-        // The request to the viewer's paused Work is still listed, for its lead agent.
         let request = format!(
             "request:{}:{}:{}",
             to_viewer.coordination_request.unwrap().id,
             paused.id,
             paused.generation
         );
+        let mut expected = vec![blocked.id.clone(), request.clone()];
+        expected.sort();
+        assert_eq!(personal, expected);
         let listed = status.actions.iter().find(|a| a.id == request).unwrap();
-        assert_eq!(listed.recipients[0].kind, RecipientKind::LeadAgent);
+        assert_eq!(listed.recipients[0].kind, RecipientKind::Person);
         // Missing question coverage leaves Work and directed requests available to the viewer.
         let observations = Observations::default();
         observations
@@ -4703,8 +4704,8 @@ mod tests {
         }));
         assert_eq!(
             read(store, &third, later).unwrap().counts.needs_you,
-            0,
-            "the third person's quiet Work, request, file and pull request ask nobody"
+            1,
+            "the third person's overdue request asks that person, not the viewer"
         );
         // Once the paused Work's hold has lapsed nothing waits on the request to it.
         let lapsed = now + crate::hub::work_lifecycle::LEASE_SECONDS + 1;
@@ -4733,22 +4734,22 @@ mod tests {
             read(store, &viewer, later).unwrap()
         };
         let aside = set_aside(row.updated_seq, None);
-        assert_eq!(aside.counts.needs_you, 0);
+        assert_eq!(aside.counts.needs_you, 1, "the overdue request remains");
         assert_ne!(aside.digest, status.digest, "a reader sees the change");
         assert_eq!(
             set_aside(row.updated_seq, Some(later + 60))
                 .counts
                 .needs_you,
-            0
+            1
         );
         assert_eq!(
             set_aside(row.updated_seq - 1, None).counts.needs_you,
-            1,
+            2,
             "a changed item returns"
         );
         assert_eq!(
             set_aside(row.updated_seq, Some(later)).counts.needs_you,
-            1,
+            2,
             "an ended snooze returns"
         );
     }

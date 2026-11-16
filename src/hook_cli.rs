@@ -243,6 +243,12 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    #[cfg(unix)]
+    let capture_payload = std::sync::Arc::new(payload.clone());
+    // Recover start-only session identities before fencing an end, without an intervening await.
+    if let Some(table) = table(agent) {
+        prepare_table_payload(table, &mut payload);
+    }
     let end_cleanup = if matches!(
         payload["hook_event_name"].as_str(),
         Some("SessionEnd" | "sessionEnd")
@@ -285,11 +291,6 @@ async fn hook(
             return json!({});
         }
     }
-    #[cfg(unix)]
-    let capture_payload = std::sync::Arc::new(payload.clone());
-    if let Some(table) = table(agent) {
-        prepare_table_payload(table, &mut payload);
-    }
     // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
     // Keep its original full reply for capture before this coordination-only tail is updated.
     let cursor_reply = if agent == "cursor"
@@ -318,7 +319,14 @@ async fn hook(
     {
         eprintln!("AgentSCM: terminal observation could not be retained; coordination is unknown.");
     }
-    let host_session = host_session(agent, &payload);
+    // Capture and host recording finish before the host's hook timeout.
+    let budget = started
+        + if session_start {
+            CAPTURE_SESSION_START_BUDGET
+        } else {
+            CAPTURE_BUDGET
+        };
+    let host_session = host_session(agent, &payload, budget);
     #[cfg(unix)]
     let wants_capture = client_connection
         && event_hint.as_ref().is_ok_and(|hint| {
@@ -328,13 +336,6 @@ async fn hook(
     // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
     #[cfg(not(unix))]
     let wants_capture = false;
-    // Capture stops in time for the reply to be printed before the host's hook timeout.
-    let budget = started
-        + if session_start {
-            CAPTURE_SESSION_START_BUDGET
-        } else {
-            CAPTURE_BUDGET
-        };
     #[cfg(unix)]
     let spawn_capture = || {
         let (agent, body, payload, hint) = (
@@ -538,14 +539,18 @@ fn needs_associated_capture(
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
 /// conversation's session ([`crate::client_session`]): written when the session starts, dropped
 /// when it ends. Only an ID the Hub would accept as a session is recorded.
-fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<()>> {
+fn host_session(
+    agent: &str,
+    payload: &Value,
+    deadline: Instant,
+) -> Option<tokio::task::JoinHandle<()>> {
     let session = session_of(payload)
         .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))?
         .to_owned();
     let config = config_dir().ok()?;
     if is_session_start(agent, payload) {
         return Some(tokio::task::spawn_blocking(move || {
-            crate::client_session::record(&config, &session);
+            crate::client_session::record(&config, &session, deadline);
         }));
     }
     None
