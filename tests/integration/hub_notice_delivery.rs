@@ -1,12 +1,13 @@
 //! Source changes, enqueue attempts and model acknowledgements are separate durable facts.
+use agentscm::hub::agent_messages::{Message, MessageState, ReceiptCoverage};
 use agentscm::hub::catchup::{
     CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
     NewCatchupMerge,
 };
 use agentscm::hub::connection::NewConnection;
 use agentscm::hub::notices::{
-    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NoticeOfferRequest, NoticeRecipient,
-    NoticeSource, NoticeTransportReport, SourceKind,
+    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NoticeAttempt, NoticeOfferRequest,
+    NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport, SourceKind,
 };
 use agentscm::hub::session_lifecycle::LifecycleRegister;
 use agentscm::hub::store::{
@@ -978,4 +979,450 @@ fn postgres_notice_history_does_not_block_delivery_or_terminal() {
         return;
     };
     ledger_history_and_terminal_contract(&schema.url);
+}
+
+fn projection_sql(database: &str, sql: &str) {
+    if let Some(path) = database.strip_prefix("sqlite://") {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    } else {
+        postgres::Client::connect(database, postgres::NoTls)
+            .unwrap()
+            .batch_execute(sql)
+            .unwrap();
+    }
+}
+
+fn projection_rows(database: &str) -> Vec<(String, String)> {
+    let sql = "SELECT id,snapshot FROM hub_notice_deliveries ORDER BY id";
+    if let Some(path) = database.strip_prefix("sqlite://") {
+        let client = rusqlite::Connection::open(path).unwrap();
+        let mut statement = client.prepare(sql).unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    } else {
+        postgres::Client::connect(database, postgres::NoTls)
+            .unwrap()
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+}
+
+fn projection_insert(
+    database: &str,
+    owner: &str,
+    repository: &str,
+    repository_id: i64,
+    receipt: &NoticeReceipt,
+) {
+    let kind = serde_json::to_string(&receipt.source.kind).unwrap();
+    let snapshot = serde_json::to_string(receipt).unwrap();
+    if let Some(path) = database.strip_prefix("sqlite://") {
+        rusqlite::Connection::open(path).unwrap().execute(
+            "INSERT INTO hub_notice_deliveries(id,owner,provider,host,repository,repository_id,token,session,source_kind,source_id,source_version,snapshot) VALUES (?1,?2,'github','github.com',?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![receipt.id,owner,repository,repository_id,receipt.recipient.token,
+                receipt.recipient.session,kind,receipt.source.id,receipt.source.version,snapshot],
+        ).unwrap();
+    } else {
+        postgres::Client::connect(database, postgres::NoTls).unwrap().execute(
+            "INSERT INTO hub_notice_deliveries(id,owner,provider,host,repository,repository_id,token,session,source_kind,source_id,source_version,snapshot) VALUES ($1,$2,'github','github.com',$3,$4,$5,$6,$7,$8,$9,$10)",
+            &[&receipt.id,&owner,&repository,&repository_id,&receipt.recipient.token,
+                &receipt.recipient.session,&kind,&receipt.source.id,&receipt.source.version,&snapshot],
+        ).unwrap();
+    }
+}
+
+fn projection_message(token: &str, id: &str, now: i64) -> Message {
+    Message {
+        id: id.into(),
+        token: token.into(),
+        session: "receipt-session".into(),
+        work_id: None,
+        note: "Synthetic receipt history".into(),
+        from: "reader".into(),
+        state: MessageState::Delivered,
+        via: Some("notice".into()),
+        mode: None,
+        created_at: now,
+        delivered_at: Some(now),
+        offered_at: Some(now),
+        read_at: None,
+        done_at: None,
+        answered_at: None,
+        deadline_at: Some(now + 600),
+    }
+}
+
+fn projection_receipt(message: &Message, repository: &str, now: i64) -> NoticeReceipt {
+    NoticeReceipt::new(
+        repository,
+        NoticeSource {
+            kind: SourceKind::HumanMessage,
+            id: message.id.clone(),
+            version: "1".into(),
+        },
+        NoticeRecipient {
+            token: message.token.clone(),
+            session: message.session.clone(),
+            work_id: None,
+            generation: None,
+        },
+        now,
+    )
+}
+
+fn message_receipt_projection_contract(database: &str) {
+    let Fixture {
+        store,
+        owner,
+        token,
+        now,
+        ..
+    } = fixture(database);
+    let missing = projection_message(&token, "msg_missing", now);
+    let admitted = projection_message(&token, "msg_admitted", now);
+    let mut historical = projection_message(&token, "msg_historical", now);
+    historical.state = MessageState::Withdrawn;
+    let ambiguous = projection_message(&token, "msg_ambiguous", now);
+    let admitted_receipt = projection_receipt(&admitted, REPO, now);
+    projection_insert(database, &owner.id, REPO, REPO_ID, &admitted_receipt);
+    let old_repository = "former/widgets";
+    let mut history = projection_receipt(&historical, old_repository, now);
+    history.offered_at = Some(0);
+    history.read_at = Some(now);
+    history.resolved_at = Some(0);
+    history.withdrawn = true;
+    let outcomes = [
+        AttemptOutcome::NotAttempted,
+        AttemptOutcome::ProvenNoDispatch,
+        AttemptOutcome::PossiblyEnqueued,
+        AttemptOutcome::Unknown,
+        AttemptOutcome::TransportReported,
+    ];
+    history.attempts = outcomes
+        .into_iter()
+        .cycle()
+        .take(8)
+        .enumerate()
+        .map(|(i, outcome)| NoticeAttempt {
+            id: format!("private-attempt-{i}"),
+            incarnation: "private-incarnation".into(),
+            generation: Some(5),
+            outcome,
+            created_at: 8 - i as i64,
+            reported_at: Some(0),
+        })
+        .collect();
+    projection_insert(database, &owner.id, old_repository, REPO_ID, &history);
+    for repository in [REPO, old_repository] {
+        projection_insert(
+            database,
+            &owner.id,
+            repository,
+            REPO_ID,
+            &projection_receipt(&ambiguous, repository, now),
+        );
+    }
+    let mode_key = format!("agent_message_mode:{}:{REPO_ID}", owner.id);
+    store
+        .set_setting(&mode_key, "\"ignore\"", &owner.id)
+        .unwrap();
+    let messages = vec![missing, historical, admitted, ambiguous];
+    let before = projection_rows(database);
+    let receipts = store
+        .notice_message_receipts(&owner, REPO, REPO_ID, &messages, now)
+        .unwrap();
+    assert_eq!(receipts.len(), messages.len());
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| r.coverage.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ReceiptCoverage::LegacyUnknown,
+            ReceiptCoverage::Ledger,
+            ReceiptCoverage::Ledger,
+            ReceiptCoverage::Unavailable,
+        ],
+        "each result retains its input position, including unavailable history"
+    );
+    assert_eq!(
+        serde_json::to_value(&receipts[0]).unwrap(),
+        json!({"coverage":"legacy_unknown","delivery_id":null,"pointer_offer_recorded_at":null,
+            "transport_attempts":[],"presentation":"unknown","resolved_at":null})
+    );
+    assert_eq!(
+        receipts[1].delivery_id.as_deref(),
+        Some(history.id.as_str())
+    );
+    assert_eq!(receipts[1].pointer_offer_recorded_at, Some(0));
+    assert_eq!(receipts[1].resolved_at, Some(0));
+    assert_eq!(receipts[1].presentation, "unknown");
+    assert_eq!(receipts[1].transport_attempts.len(), 8);
+    for (projected, attempt) in receipts[1].transport_attempts.iter().zip(&history.attempts) {
+        assert_eq!(projected.outcome, attempt.outcome);
+        assert_eq!(projected.created_at, attempt.created_at);
+        assert_eq!(projected.reported_at, attempt.reported_at);
+    }
+    let exposed = serde_json::to_string(&receipts[1]).unwrap();
+    assert!(!exposed.contains("private-"));
+    assert!(!exposed.contains("read_at"));
+    assert!(!exposed.contains("withdrawn"));
+    assert_eq!(receipts[2].delivery_id, Some(admitted_receipt.id));
+    assert_eq!(
+        receipts[2].pointer_offer_recorded_at, None,
+        "legacy Delivered and offered_at do not manufacture a recorded pointer offer"
+    );
+    assert_eq!(receipts[3].delivery_id, None);
+    assert_eq!(
+        projection_rows(database),
+        before,
+        "history reads never mutate the ledger"
+    );
+    assert_eq!(
+        store.get_setting(&mode_key).unwrap().as_deref(),
+        Some("\"ignore\"")
+    );
+    assert!(
+        store
+            .notice_message_receipts(&owner, REPO, REPO_ID, &[], now)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .notice_message_receipts(&owner, REPO, REPO_ID, &vec![messages[2].clone(); 50], now)
+            .unwrap()
+            .len(),
+        50
+    );
+    assert!(matches!(
+        store.notice_message_receipts(&owner, REPO, REPO_ID, &vec![messages[2].clone(); 51], now),
+        Err(agentscm::hub::HubError::Invalid(_))
+    ));
+    assert!(matches!(
+        store.notice_message_receipts(&owner, REPO, 0, &messages, now),
+        Err(agentscm::hub::HubError::Invalid(_))
+    ));
+
+    let exact = projection_message(&token, "msg_exact", now);
+    projection_insert(
+        database,
+        &owner.id,
+        REPO,
+        REPO_ID,
+        &projection_receipt(&exact, REPO, now),
+    );
+    let mut other_session = exact.clone();
+    other_session.session = "another-session".into();
+    let other_source = projection_message(&token, "msg_other", now);
+    let wrong_kind = projection_message(&token, "msg_wrong_kind", now);
+    let mut receipt = projection_receipt(&wrong_kind, REPO, now);
+    receipt.source.kind = SourceKind::Coordination;
+    projection_insert(database, &owner.id, REPO, REPO_ID, &receipt);
+    let wrong_version = projection_message(&token, "msg_wrong_version", now);
+    let mut receipt = projection_receipt(&wrong_version, REPO, now);
+    receipt.source.version = "2".into();
+    projection_insert(database, &owner.id, REPO, REPO_ID, &receipt);
+    let wrong_repository = projection_message(&token, "msg_wrong_repo", now);
+    projection_insert(
+        database,
+        &owner.id,
+        REPO,
+        REPO_ID + 1,
+        &projection_receipt(&wrong_repository, REPO, now),
+    );
+    let stranger = store
+        .upsert_user(
+            &ForgeIdentity {
+                user_id: 999,
+                ..owner.identity.clone()
+            },
+            "stranger",
+        )
+        .unwrap();
+    let wrong_owner = projection_message(&token, "msg_wrong_owner", now);
+    projection_insert(
+        database,
+        &stranger.id,
+        REPO,
+        REPO_ID,
+        &projection_receipt(&wrong_owner, REPO, now),
+    );
+    let wrong_host = projection_message(&token, "msg_wrong_host", now);
+    projection_insert(
+        database,
+        &owner.id,
+        REPO,
+        REPO_ID,
+        &projection_receipt(&wrong_host, REPO, now),
+    );
+    let wrong_provider = projection_message(&token, "msg_wrong_provider", now);
+    projection_insert(
+        database,
+        &owner.id,
+        REPO,
+        REPO_ID,
+        &projection_receipt(&wrong_provider, REPO, now),
+    );
+    projection_sql(
+        database,
+        "UPDATE hub_notice_deliveries SET host='other.example' WHERE source_id='msg_wrong_host'; UPDATE hub_notice_deliveries SET provider='gitlab' WHERE source_id='msg_wrong_provider'",
+    );
+    let (other_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &owner.id,
+        "other-message-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let mut other_recipient = exact.clone();
+    other_recipient.token = other_token;
+    let mismatches = [
+        other_session,
+        other_source,
+        wrong_kind,
+        wrong_version,
+        wrong_repository,
+        wrong_owner,
+        wrong_host,
+        wrong_provider,
+        other_recipient,
+    ];
+    let receipts = store
+        .notice_message_receipts(&owner, REPO, REPO_ID, &mismatches, now)
+        .unwrap();
+    assert_eq!(receipts.len(), mismatches.len());
+    assert!(
+        receipts
+            .iter()
+            .all(|r| r.coverage == ReceiptCoverage::LegacyUnknown)
+    );
+
+    let mint = |user: &User, repository: &str, repository_id, read_only, ttl| {
+        mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "projection-agent",
+            repository,
+            repository_id,
+            ttl,
+            read_only,
+        )
+        .unwrap()
+    };
+    let (read_only, _, _) = mint(&owner, REPO, REPO_ID, true, 3600);
+    let (revoked, _, _) = mint(&owner, REPO, REPO_ID, false, 3600);
+    store.revoke_agent_token(&revoked).unwrap();
+    let (expired, _, expires) = mint(&owner, REPO, REPO_ID, false, 1);
+    let (foreign, _, _) = mint(&stranger, REPO, REPO_ID, false, 3600);
+    let (other_repo, _, _) = mint(&owner, "acme/other", REPO_ID + 1, false, 3600);
+    let invalid_tokens = [
+        read_only,
+        revoked,
+        expired,
+        foreign,
+        other_repo,
+        "missing-token".into(),
+    ];
+    let mut batch = vec![exact.clone()];
+    batch.extend(
+        invalid_tokens
+            .iter()
+            .map(|token| projection_message(token, &exact.id, now)),
+    );
+    let receipts = store
+        .notice_message_receipts(&owner, REPO, REPO_ID, &batch, expires)
+        .unwrap();
+    assert_eq!(receipts.len(), batch.len());
+    assert_eq!(receipts[0].coverage, ReceiptCoverage::Ledger);
+    assert!(
+        receipts[1..]
+            .iter()
+            .all(|r| r.coverage == ReceiptCoverage::Unavailable && r.delivery_id.is_none())
+    );
+    let mut forged_owner = owner.clone();
+    forged_owner.identity.host = "other.example".into();
+    assert!(matches!(
+        store.notice_message_receipts(&forged_owner, REPO, REPO_ID, &[], now),
+        Err(agentscm::hub::HubError::Unauthorized)
+    ));
+    store.set_user_disabled(&owner.id, true).unwrap();
+    assert!(matches!(
+        store.notice_message_receipts(&owner, REPO, REPO_ID, &batch, now),
+        Err(agentscm::hub::HubError::Unauthorized)
+    ));
+    store.set_user_disabled(&owner.id, false).unwrap();
+
+    projection_sql(
+        database,
+        "UPDATE hub_notice_deliveries SET snapshot='malformed' WHERE source_id='msg_exact'",
+    );
+    let failure_batch = [messages[2].clone(), exact, messages[0].clone()];
+    let receipts = store
+        .notice_message_receipts(&owner, REPO, REPO_ID, &failure_batch, now)
+        .unwrap();
+    assert_eq!(receipts.len(), failure_batch.len());
+    assert!(
+        receipts
+            .iter()
+            .all(|r| r.coverage == ReceiptCoverage::Unavailable)
+    );
+    projection_sql(
+        database,
+        "ALTER TABLE hub_notice_deliveries RENAME TO retained_notice_deliveries",
+    );
+    let receipts = store
+        .notice_message_receipts(&owner, REPO, REPO_ID, &failure_batch, now)
+        .unwrap();
+    assert!(
+        receipts
+            .iter()
+            .all(|r| r.coverage == ReceiptCoverage::Unavailable)
+    );
+    forged_owner = owner.clone();
+    forged_owner.disabled = true;
+    assert!(matches!(
+        store.notice_message_receipts(&forged_owner, REPO, REPO_ID, &failure_batch, now),
+        Err(agentscm::hub::HubError::Unauthorized)
+    ));
+    projection_sql(
+        database,
+        "ALTER TABLE retained_notice_deliveries RENAME TO hub_notice_deliveries; ALTER TABLE hub_users RENAME TO retained_users",
+    );
+    assert!(
+        store
+            .notice_message_receipts(&owner, REPO, REPO_ID, &failure_batch, now)
+            .is_err(),
+        "owner storage failure cannot become implicit authorization"
+    );
+    projection_sql(database, "ALTER TABLE retained_users RENAME TO hub_users");
+}
+
+#[test]
+fn sqlite_historical_message_receipt_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    message_receipt_projection_contract(&format!(
+        "sqlite://{}",
+        directory.path().join("hub.sqlite").display()
+    ));
+}
+
+#[test]
+fn postgres_historical_message_receipt_projection() {
+    let Some(schema) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    message_receipt_projection_contract(&schema.url);
 }

@@ -646,6 +646,14 @@ pub trait Store: Send + Sync {
         reader: &WorkLifecycleReader<'_>,
         now: i64,
     ) -> Result<Vec<NoticeReceipt>>;
+    fn notice_message_receipts(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        messages: &[super::agent_messages::Message],
+        now: i64,
+    ) -> Result<Vec<super::agent_messages::MessageReceipt>>;
     fn notice_owner_terminal(
         &self,
         reader: &WorkLifecycleReader<'_>,

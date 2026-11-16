@@ -55,9 +55,10 @@ use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
 use super::notices::{
-    DependencyRefresh, NoticeOfferRequest, NoticeRecipient, NoticeSource, SourceKind,
+    AttemptOutcome, DependencyRefresh, NoticeOfferRequest, NoticeReceipt, NoticeRecipient,
+    NoticeSource, SourceKind,
 };
-use super::store::{Principal, Store, new_id, unix_now, validate_repository};
+use super::store::{Principal, Store, User, new_id, unix_now, validate_repository};
 use super::{HubError, HubState, Result};
 
 /// Messages kept per person and repository; a new one beyond it drops the oldest.
@@ -304,12 +305,100 @@ impl Reach {
     }
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptCoverage {
+    Ledger,
+    LegacyUnknown,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageTransportAttempt {
+    pub outcome: AttemptOutcome,
+    pub created_at: i64,
+    pub reported_at: Option<i64>,
+}
+
+/// Historical delivery evidence, independent of the message's explicit answer.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageReceipt {
+    pub coverage: ReceiptCoverage,
+    pub delivery_id: Option<String>,
+    pub pointer_offer_recorded_at: Option<i64>,
+    pub transport_attempts: Vec<MessageTransportAttempt>,
+    pub presentation: &'static str,
+    pub resolved_at: Option<i64>,
+}
+
+impl MessageReceipt {
+    pub fn unknown(coverage: ReceiptCoverage) -> Self {
+        Self {
+            coverage,
+            delivery_id: None,
+            pointer_offer_recorded_at: None,
+            transport_attempts: vec![],
+            presentation: "unknown",
+            resolved_at: None,
+        }
+    }
+
+    pub(super) fn from_snapshot(id: &str, snapshot: &str, message: &Message) -> Result<Self> {
+        let invalid = || HubError::Unavailable("Message receipt history unavailable.".into());
+        if snapshot.len() > 64 * 1024 {
+            return Err(invalid());
+        }
+        let receipt: NoticeReceipt = serde_json::from_str(snapshot).map_err(|_| invalid())?;
+        let time = |value: i64| (0..=8_640_000_000_000).contains(&value);
+        if receipt.id != id
+            || !id.strip_prefix("ntc_").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || receipt.source.kind != SourceKind::HumanMessage
+            || receipt.source.id != message.id
+            || receipt.source.version != "1"
+            || receipt.recipient.token != message.token
+            || receipt.recipient.session != message.session
+            || receipt.recipient.work_id.is_some()
+            || receipt.recipient.generation.is_some()
+            || receipt.attempts.len() > super::notices::MAX_ATTEMPTS
+            || receipt.offered_at.is_some_and(|value| !time(value))
+            || receipt.resolved_at.is_some_and(|value| !time(value))
+            || receipt.attempts.iter().any(|attempt| {
+                !time(attempt.created_at) || attempt.reported_at.is_some_and(|value| !time(value))
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            coverage: ReceiptCoverage::Ledger,
+            delivery_id: Some(receipt.id),
+            pointer_offer_recorded_at: receipt.offered_at,
+            transport_attempts: receipt
+                .attempts
+                .into_iter()
+                .map(|attempt| MessageTransportAttempt {
+                    outcome: attempt.outcome,
+                    created_at: attempt.created_at,
+                    reported_at: attempt.reported_at,
+                })
+                .collect(),
+            presentation: "unknown",
+            resolved_at: receipt.resolved_at,
+        })
+    }
+}
+
 /// A message as the Hub page reads it.
 #[derive(Serialize)]
 struct MessageView {
     #[serde(flatten)]
     message: Message,
     not_picked_up: bool,
+    receipt: MessageReceipt,
 }
 
 impl MessageView {
@@ -318,6 +407,7 @@ impl MessageView {
         Self {
             message,
             not_picked_up,
+            receipt: MessageReceipt::unknown(ReceiptCoverage::LegacyUnknown),
         }
     }
 }
@@ -1677,10 +1767,12 @@ async fn scoped(
 
 fn page(
     store: &dyn Store,
-    user_id: &str,
+    user: &User,
+    repository: &str,
     repository_id: i64,
     tokens: &[(String, String)],
 ) -> Result<Page> {
+    let user_id = &user.id;
     let now = unix_now();
     let ids: Vec<String> = tokens.iter().map(|(id, _)| id.clone()).collect();
     let mut sessions: Vec<SessionView> = clients_of(&ids)
@@ -1705,6 +1797,9 @@ fn page(
     let mut messages = load(store, &messages_key(user_id, repository_id))?;
     messages.retain(|m| ids.contains(&m.token));
     messages.reverse();
+    messages.truncate(MAX_MESSAGES);
+    let receipts =
+        store.notice_message_receipts(user, repository, repository_id, &messages, now)?;
     Ok(Page {
         mode: effective_mode(store, user_id, repository_id)?,
         default_mode: load_mode(store, &mode_key(user_id, None))?,
@@ -1712,7 +1807,11 @@ fn page(
         sessions,
         messages: messages
             .into_iter()
-            .map(|m| MessageView::at(m, now))
+            .zip(receipts)
+            .map(|(m, receipt)| MessageView {
+                receipt,
+                ..MessageView::at(m, now)
+            })
             .collect(),
     })
 }
@@ -1727,7 +1826,7 @@ async fn list(
         scoped(&state, &human, &query.repository, Level::Read).await?;
     let store = state.store.clone();
     let page = blocking(&state, move || {
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &query.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1760,7 +1859,7 @@ async fn set_mode(
             .unwrap_or_default();
         // An empty value reads as unset.
         store.set_setting(&key, &value, &user.id)?;
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &body.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1893,7 +1992,7 @@ async fn withdraw(
                 }
             }
         })?;
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &query.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1922,6 +2021,97 @@ mod tests {
             answered_at: None,
             deadline_at: Some(at + Reach::NextStep.pickup_secs()),
         }
+    }
+
+    #[test]
+    fn message_receipt_projection_preserves_transport_without_inventing_an_answer() {
+        let m = message("msg_history", 0);
+        let mut receipt = NoticeReceipt::new(
+            "octo/repo",
+            NoticeSource {
+                kind: SourceKind::HumanMessage,
+                id: m.id.clone(),
+                version: "1".into(),
+            },
+            NoticeRecipient {
+                token: m.token.clone(),
+                session: m.session.clone(),
+                work_id: None,
+                generation: None,
+            },
+            0,
+        );
+        receipt.offered_at = Some(0);
+        receipt.resolved_at = Some(8_640_000_000_000);
+        receipt.read_at = Some(99);
+        receipt.withdrawn = true;
+        for outcome in [
+            AttemptOutcome::NotAttempted,
+            AttemptOutcome::ProvenNoDispatch,
+            AttemptOutcome::PossiblyEnqueued,
+            AttemptOutcome::Unknown,
+            AttemptOutcome::TransportReported,
+        ] {
+            receipt.attempts.push(super::super::notices::NoticeAttempt {
+                id: "private-attempt".into(),
+                incarnation: "private-incarnation".into(),
+                generation: Some(1),
+                outcome,
+                created_at: 2,
+                reported_at: Some(0),
+            });
+        }
+        let snapshot = serde_json::to_string(&receipt).unwrap();
+        let projected = MessageReceipt::from_snapshot(&receipt.id, &snapshot, &m).unwrap();
+        let wire = serde_json::to_value(projected).unwrap();
+        assert_eq!(wire["pointer_offer_recorded_at"], 0);
+        assert_eq!(wire["resolved_at"], 8_640_000_000_000_i64);
+        assert_eq!(wire["presentation"], "unknown");
+        assert_eq!(wire["transport_attempts"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            wire["transport_attempts"][2]["outcome"],
+            "possibly_enqueued"
+        );
+        for attempt in wire["transport_attempts"].as_array().unwrap() {
+            assert_eq!(attempt.as_object().unwrap().len(), 3);
+            assert_eq!(attempt["reported_at"], 0);
+        }
+        assert!(wire.get("read_at").is_none());
+        assert!(wire.get("withdrawn").is_none());
+        assert_eq!(m.read_at, None);
+        for (field, value) in [
+            (
+                "source",
+                serde_json::json!({"kind":"dependency", "id":m.id, "version":"1"}),
+            ),
+            (
+                "recipient",
+                serde_json::json!({"token":m.token, "session":m.session, "work_id":"wrk_other", "generation":1}),
+            ),
+            ("offered_at", serde_json::json!(8_640_000_000_001_i64)),
+            ("resolved_at", serde_json::json!(-1)),
+        ] {
+            let mut invalid = serde_json::to_value(&receipt).unwrap();
+            invalid[field] = value;
+            assert!(MessageReceipt::from_snapshot(&receipt.id, &invalid.to_string(), &m).is_err());
+        }
+        receipt.attempts.resize(9, receipt.attempts[0].clone());
+        assert!(
+            MessageReceipt::from_snapshot(
+                &receipt.id,
+                &serde_json::to_string(&receipt).unwrap(),
+                &m
+            )
+            .is_err()
+        );
+        let unknown = serde_json::to_value(MessageView::at(m, 0)).unwrap();
+        assert_eq!(
+            unknown["receipt"],
+            serde_json::json!({
+                "coverage":"legacy_unknown", "delivery_id":null, "pointer_offer_recorded_at":null,
+                "transport_attempts":[], "presentation":"unknown", "resolved_at":null,
+            })
+        );
     }
 
     #[test]
@@ -3045,7 +3235,16 @@ mod tests {
             )
             .unwrap();
         let tokens = [(principal.token_id.clone(), "codex".into())];
-        let page_at = || page(&*store, &principal.owner.id, 101, &tokens).unwrap();
+        let page_at = || {
+            page(
+                &*store,
+                &principal.owner,
+                &principal.repository,
+                101,
+                &tokens,
+            )
+            .unwrap()
+        };
         let ended = page_at();
         assert_eq!(ended.sessions.len(), 1);
         assert_eq!(ended.sessions[0].reach, Reach::Ended);
