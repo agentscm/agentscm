@@ -2280,6 +2280,119 @@ fn a_prune_refuses_after_a_rejoin_since_the_plan(db: &Db) {
     );
 }
 
+/// The lead session acts under a renewed token at `at`, which writes a `work_lead_credential`
+/// event and moves the Work's `updated_seq`.
+fn carry_lead_credential(
+    store: &dyn Store,
+    alice: &Agent,
+    id: &str,
+    session: &str,
+    at: i64,
+) -> Agent {
+    let renewed = token(store, &alice.user, 11, false);
+    let item = store.work_get(&renewed.token, id, at).unwrap().unwrap();
+    let carry = WorkCheckpoint {
+        work_id: id.into(),
+        operation_id: "carry-credential".into(),
+        generation: item.generation,
+        session: session.into(),
+        expected_updated_seq: Some(item.updated_seq),
+        kind: CheckpointKind::Progress,
+        summary: "same session, renewed token".into(),
+        next_action: Some("next".into()),
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: vec![],
+        depends_on: vec![],
+        related_work: vec![],
+    };
+    let carried = store.work_checkpoint(&renewed.token, &carry, at).unwrap();
+    assert_eq!(carried.item.lead_token, renewed.token);
+    assert!(carried.item.updated_seq > item.updated_seq);
+    assert!(store.revoke_agent_token(&alice.token).unwrap());
+    renewed
+}
+
+/// A lead-credential carry after the plan was read moves the Work, so the stale plan is
+/// refused with nothing written, and a fresh inventory plans again at the new seq.
+fn a_lead_credential_carried_mid_repair_refuses_the_stale_plan(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (id, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let stale = repair_plan(&read(&*store, &me, RecoveryQuery::default(), later + 1));
+    assert_eq!(stale.planned.len(), 1, "{stale:?}");
+    assert_eq!(stale.planned[0].remedy, RemedyKind::PruneParticipants);
+    let renewed = carry_lead_credential(&*store, &alice, &id, "s-lead", later + 2);
+    let participants = current(&*store, &renewed, &id, later + 3)
+        .participants
+        .len();
+    let events = db.scalar("SELECT COUNT(*) FROM hub_events");
+    let refused = apply_batch(
+        &*store,
+        &as_agent(&renewed),
+        &repair_batch(&stale),
+        later + 4,
+    )
+    .unwrap();
+    assert_eq!(refused.applied, 0, "{refused:?}");
+    for item in &refused.items {
+        assert_eq!(item.outcome, BatchOutcome::Refused, "{item:?}");
+        assert_eq!(item.code.as_deref(), Some("work_changed"), "{item:?}");
+    }
+    assert_eq!(db.scalar("SELECT COUNT(*) FROM hub_events"), events);
+    assert_eq!(
+        current(&*store, &renewed, &id, later + 5)
+            .participants
+            .len(),
+        participants
+    );
+    let me = caller(&renewed, "s-sweeper");
+    let fresh = repair_plan(&read(&*store, &me, RecoveryQuery::default(), later + 6));
+    assert_eq!(fresh.planned.len(), 1, "{fresh:?}");
+    assert!(
+        fresh.planned[0].item.expected_updated_seq > stale.planned[0].item.expected_updated_seq
+    );
+    let applied = apply_batch(
+        &*store,
+        &as_agent(&renewed),
+        &repair_batch(&fresh),
+        later + 7,
+    )
+    .unwrap();
+    assert!(
+        applied
+            .items
+            .iter()
+            .all(|i| i.outcome == BatchOutcome::Applied),
+        "{applied:?}"
+    );
+}
+
+/// Joins after the plan are tolerated, but a carry among them is not a join and still refuses.
+fn a_lead_credential_carry_among_joins_still_refuses(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let (id, later) = crowded(&*store, &alice);
+    let me = caller(&alice, "s-sweeper");
+    let stale = repair_plan(&read(&*store, &me, RecoveryQuery::default(), later + 1));
+    assert_eq!(stale.planned.len(), 1, "{stale:?}");
+    join(&*store, &alice, &id, "h-0", WorkRole::Reviewer, later + 2);
+    let renewed = carry_lead_credential(&*store, &alice, &id, "s-lead", later + 3);
+    let refused = apply_batch(
+        &*store,
+        &as_agent(&renewed),
+        &repair_batch(&stale),
+        later + 4,
+    )
+    .unwrap();
+    assert_eq!(refused.applied, 0, "{refused:?}");
+    assert_eq!(refused.items[0].outcome, BatchOutcome::Refused);
+    assert_eq!(refused.items[0].code.as_deref(), Some("work_changed"));
+}
+
 conformance!(
     an_owner_retires_an_obsolete_hold_and_keeps_its_follow_up,
     the_owner_resumes_expired_work_after_a_session_restart,
@@ -2309,4 +2422,6 @@ conformance!(
     a_recorded_seq_below_the_event_floor_is_refused,
     pruning_finished_work_keeps_its_outcome_and_provenance,
     a_prune_refuses_after_a_rejoin_since_the_plan,
+    a_lead_credential_carried_mid_repair_refuses_the_stale_plan,
+    a_lead_credential_carry_among_joins_still_refuses,
 );
