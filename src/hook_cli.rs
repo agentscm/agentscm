@@ -3006,7 +3006,7 @@ fn is_pre_tool(payload: &Value) -> bool {
 }
 
 /// The marker key of a tool event that only renews the session's lease: every tool event except
-/// the one that checks an edit (preToolUse, or postToolUse in Cursor), a shell call's start or
+/// the one that checks an edit (preToolUse, or postToolUse in Cursor), an in-flight call's start or
 /// end, which the Hub counts so a long call stays live, and the end of a call that started a
 /// subagent, which says what the subagent is for. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
@@ -3016,7 +3016,8 @@ fn activity_key(agent: &str, payload: &Value) -> Option<String> {
         Some(table) => table.is_shell(&tool),
         None => agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool),
     };
-    if waits(agent, payload) || shell || started_subagent(payload).is_some() {
+    let in_flight = agent != "cursor" && agentscm::hub::hook::is_in_flight_tool(&tool);
+    if waits(agent, payload) || shell || in_flight || started_subagent(payload).is_some() {
         return None;
     }
     // A path that cannot be read is sent on, so the Hub decides.
@@ -4405,6 +4406,42 @@ mod tests {
         };
         assert_eq!(read(json!({})), "activity\0claude\0s");
         assert_ne!(read(json!({"agent_id":"a"})), read(json!({"agent_id":"b"})));
+    }
+
+    #[test]
+    fn delegated_call_boundaries_are_never_throttled() {
+        for tool in [
+            "Agent",
+            "Task",
+            "wait",
+            "functions.wait",
+            "wait_agent",
+            "collaboration.wait_agent",
+        ] {
+            for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+                for agent in ["claude", "codex"] {
+                    assert!(
+                        activity_key(
+                            agent,
+                            &json!({
+                                "hook_event_name":event,"session_id":"s","tool_name":tool
+                            })
+                        )
+                        .is_none(),
+                        "{tool} {event}"
+                    );
+                }
+            }
+            assert!(
+                activity_key(
+                    "cursor",
+                    &json!({
+                        "hook_event_name":"postToolUse","conversation_id":"s","tool_name":tool
+                    })
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]

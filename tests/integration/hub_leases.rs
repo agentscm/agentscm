@@ -814,9 +814,21 @@ fn delegated_hook_ends_and_failures_restore_the_idle_lease(db: &Db) {
             db.lease(&held.id).1,
             (began + IN_FLIGHT_CAP_SECONDS).to_string()
         );
+        // Overlap a shell call with delegation: ending either must leave the other live.
+        hooks.call("PreToolUse", "Bash", Some(tool), false);
+        let (first_tool, first_end, last_tool, last_end) = if n % 2 == 0 {
+            (tool, event, "Bash", "PostToolUse")
+        } else {
+            ("Bash", "PostToolUseFailure", tool, event)
+        };
+        hooks.call(first_end, first_tool, Some(tool), false);
+        assert_eq!(
+            db.lease(&held.id).1,
+            (began + IN_FLIGHT_CAP_SECONDS).to_string()
+        );
         // End before advancing the deterministic clock: HTTP hooks use the wall clock.
         let before_end = unix_now();
-        hooks.call(event, tool, Some(tool), false);
+        hooks.call(last_end, last_tool, Some(tool), false);
         let after_end = unix_now();
         let expires: i64 = db.lease(&held.id).1.parse().unwrap();
         let ended = expires - LEASE_SECONDS;
