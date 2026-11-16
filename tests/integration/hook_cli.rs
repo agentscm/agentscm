@@ -1497,6 +1497,38 @@ fn claude_delegation_events_reach_the_hub_after_throttled_activity() {
 }
 
 #[cfg(unix)]
+#[test]
+fn installed_claude_hooks_forward_delegation_failures_without_shell_observation() {
+    for tool in ["Agent", "Task"] {
+        let dir = home();
+        let (url, seen) = empty_hub();
+        let root = connected_checkout(&dir, &url);
+        let path = std::env::var("PATH").unwrap_or_default();
+        for event in ["PreToolUse", "PostToolUseFailure"] {
+            let payload = json!({"hook_event_name":event,"session_id":"s1",
+                "cwd":root,"tool_name":tool,"tool_use_id":"delegation-1",
+                "tool_input":{"prompt":"SYNTHETIC-DELEGATED-WORK"}});
+            let run = run_with(
+                CLAUDE,
+                &[("PATH", &path)],
+                &dir,
+                payload.to_string().as_bytes(),
+            );
+            assert_eq!(run.code, Some(0));
+            let requests: Vec<_> = seen
+                .try_iter()
+                .filter(|request| request.path.starts_with("/v1/hub/hook/claude"))
+                .collect();
+            assert_eq!(requests.len(), 1, "{tool} {event}: {}", run.stdout);
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["hook_event_name"], event);
+            assert_eq!(body["tool_name"], tool);
+            assert!(body.get("observed").is_none(), "{body}");
+        }
+    }
+}
+
+#[cfg(unix)]
 fn git_in(root: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .current_dir(root)

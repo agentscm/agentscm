@@ -371,6 +371,12 @@ async fn hook(
                 .unwrap_or(""),
         )
         && !observes_shell(agent, &payload)
+        // Native failure events also close delegated calls, without shell observation.
+        && !(matches!(agent, "claude" | "codex" | "copilot")
+            && payload["hook_event_name"] == "PostToolUseFailure"
+            && agentscm::hub::hook::is_in_flight_tool(
+                payload["tool_name"].as_str().unwrap_or(""),
+            ))
     {
         fail_open(agent, &payload, None)
     } else {
