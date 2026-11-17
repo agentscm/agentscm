@@ -33,6 +33,26 @@ pub struct DependencyVersion {
     pub generation: Option<i64>,
 }
 
+/// A relevant prerequisite transition observed independently of whether the declared merge
+/// condition is satisfied. These facts are notification inputs, never completion authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DependencyTransition {
+    PullRequestClosed {
+        condition_id: String,
+        work_id: String,
+        repository_id: i64,
+        number: i64,
+        head_sha: String,
+    },
+    WorkHandover {
+        condition_id: String,
+        work_id: String,
+        generation: i64,
+        updated_seq: i64,
+    },
+}
+
 /// The latest recorded relationship version. A current projection is read separately below;
 /// neither an old notice nor a completed Work establishes prerequisite success.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -49,6 +69,8 @@ pub struct DependencyNoticeRecord {
     pub conditions: Vec<ConditionDisposition>,
     pub notification_fanout_complete: bool,
     pub prerequisites: Vec<DependencyVersion>,
+    #[serde(default)]
+    pub transitions: Vec<DependencyTransition>,
     /// Current dependent and prerequisite Work IDs; removed targets lose mailbox access.
     pub recipients: Vec<String>,
 }

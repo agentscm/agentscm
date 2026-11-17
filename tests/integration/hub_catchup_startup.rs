@@ -164,23 +164,28 @@ async fn mcp_catchup_wait_returns_a_relevant_notice_without_acknowledging_it() {
     let hub = Hub::start().await;
     let (sender, _, _) = hub.bound_token(21, "notice-sender", REPOSITORY);
     let (_, recipient_secret, recipient) = hub.bound_token(22, "notice-reader", REPOSITORY);
+    let started = std::time::Instant::now();
     let wait = hub.mcp(
         &recipient_secret,
         "agentscm_work_catchup",
         json!({"subscriber":"agent:waiting","delivery_client":"mcp-wait",
             "wait_seconds":3}),
     );
-    tokio::pin!(wait);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let notice = hub
-        .store
-        .owner_notice_put(
-            &sender,
-            &addressed_notice(&recipient, "wait-delivery"),
-            unix_now(),
-        )
-        .unwrap();
-    let page = wait.await;
+    let create = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "the notice is created only after the concurrent wait has started"
+        );
+        hub.store
+            .owner_notice_put(
+                &sender,
+                &addressed_notice(&recipient, "wait-delivery"),
+                unix_now(),
+            )
+            .unwrap()
+    };
+    let (page, notice) = tokio::join!(wait, create);
     assert_eq!(page["isError"], false, "{page}");
     assert_eq!(
         page["structuredContent"]["owner_notices"][0]["id"],

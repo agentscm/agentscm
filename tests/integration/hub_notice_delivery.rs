@@ -15,7 +15,7 @@ use agentscm::hub::session_lifecycle::LifecycleRegister;
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, User, mint_bound_agent_token, new_connection_id, unix_now,
 };
-use agentscm::hub::work::{WorkItem, WorkRole, WorkStart};
+use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, WorkStart};
 use agentscm::hub::work_links::WorkPrLinkTarget;
 use agentscm::hub::work_reconciliation::{
     PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations, WorkDeclarationsUpdate,
@@ -184,6 +184,7 @@ fn fixture(database: &str) -> Fixture {
     };
     Fixture {
         store,
+        repository: repo.id,
         owner,
         token,
         dependent,
@@ -195,12 +196,192 @@ fn fixture(database: &str) -> Fixture {
 
 struct Fixture {
     store: std::sync::Arc<dyn Store>,
+    repository: String,
     owner: User,
     token: String,
     dependent: WorkItem,
     incarnation: String,
     now: i64,
     query: DependencyRefresh,
+}
+
+fn dependency_transition_contract(database: &str) {
+    let Fixture {
+        store,
+        repository,
+        token,
+        dependent,
+        incarnation,
+        now,
+        query,
+        ..
+    } = fixture(database);
+    assert!(
+        store
+            .notice_refresh(&token, &query, now)
+            .unwrap()
+            .notices
+            .is_empty()
+    );
+
+    for (number, state, head, at) in [
+        (2, "closed", HEAD, now + 1),
+        (1, "open", HEAD, now + 2),
+        (
+            1,
+            "closed",
+            "cccccccccccccccccccccccccccccccccccccccc",
+            now + 3,
+        ),
+    ] {
+        store
+            .observe(
+                &repository,
+                "pull_request",
+                &number.to_string(),
+                &json!({"number":number,"state":state,"merged":false,
+                    "head_sha":head,"provider_number":number,
+                    "provider_base_repository_id":REPO_ID})
+                .to_string(),
+                at * 1000,
+            )
+            .unwrap();
+        assert!(
+            store
+                .notice_refresh(&token, &query, at)
+                .unwrap()
+                .notices
+                .is_empty(),
+            "unrelated, unchanged, and mismatched-head close observations stay quiet"
+        );
+    }
+
+    let prerequisite_id = match &store
+        .work_declarations_get(&token, &dependent.id, now + 4)
+        .unwrap()
+        .unwrap()
+        .declarations
+        .prerequisites[0]
+        .requirement
+    {
+        PrerequisiteRequirement::MergedPullRequest { work_id, .. } => work_id.clone(),
+        PrerequisiteRequirement::LegacyWork { .. } => unreachable!(),
+    };
+    let prerequisite = store
+        .work_get_scoped(
+            &WorkLifecycleReader::Token(&token),
+            &prerequisite_id,
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .work_checkpoint(
+            &token,
+            &WorkCheckpoint {
+                work_id: prerequisite.id.clone(),
+                operation_id: "handover-prerequisite".into(),
+                generation: prerequisite.generation,
+                session: prerequisite.lead_session.clone(),
+                expected_updated_seq: Some(prerequisite.updated_seq),
+                kind: CheckpointKind::Handover,
+                summary: "Synthetic authorized handover".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: prerequisite.depends_on,
+                related_work: prerequisite.related_work,
+                finished_paths: None,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let handover = store.notice_refresh(&token, &query, now + 4).unwrap();
+    assert_eq!(
+        handover.notices.len(),
+        1,
+        "the recorded Work handover is relevant"
+    );
+    let offer = store
+        .notice_offer(
+            &token,
+            &NoticeOfferRequest {
+                session: "dependent".into(),
+                incarnation: incarnation.clone(),
+                automatic: true,
+            },
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .notice_transport(
+            &token,
+            &NoticeTransportReport {
+                session: "dependent".into(),
+                incarnation: incarnation.clone(),
+                delivery_id: offer.delivery_id,
+                attempt_id: offer.attempt_id.unwrap(),
+                outcome: AttemptOutcome::Unknown,
+                observed_at: now + 4,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert!(
+        store
+            .notice_offer(
+                &token,
+                &NoticeOfferRequest {
+                    session: "dependent".into(),
+                    incarnation: incarnation.clone(),
+                    automatic: true,
+                },
+                now + 5,
+            )
+            .unwrap()
+            .is_none(),
+        "one transition version wakes the idle waiter at most once"
+    );
+
+    store
+        .observe(
+            &repository,
+            "pull_request",
+            "1",
+            &json!({"number":1,"state":"closed","merged":false,"head_sha":HEAD,
+                "provider_number":1,"provider_base_repository_id":REPO_ID})
+            .to_string(),
+            (now + 6) * 1000,
+        )
+        .unwrap();
+    let closed = store.notice_refresh(&token, &query, now + 6).unwrap();
+    assert_eq!(
+        closed.notices.len(),
+        1,
+        "the exact declared PR/head close is relevant"
+    );
+    assert_ne!(closed.notices[0].id, handover.notices[0].id);
+}
+
+#[test]
+fn sqlite_dependency_transitions_wake_once() {
+    let directory = tempfile::tempdir().unwrap();
+    dependency_transition_contract(&format!(
+        "sqlite://{}",
+        directory.path().join("hub.sqlite").display()
+    ));
+}
+
+#[test]
+fn postgres_dependency_transitions_wake_once() {
+    let Some(schema) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    dependency_transition_contract(&schema.url);
 }
 
 fn contract(database: &str) {
@@ -212,6 +393,7 @@ fn contract(database: &str) {
         incarnation,
         now,
         query,
+        ..
     } = fixture(database);
     assert!(
         store

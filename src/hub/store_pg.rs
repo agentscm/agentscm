@@ -1686,7 +1686,10 @@ fn pg_catchup_page(
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
-    let owner_notices = if subscriber == HUMAN_SUBSCRIBER || event_after != event_from {
+    let owner_notices = if subscriber == HUMAN_SUBSCRIBER
+        || event_after != event_from
+        || merge_after != merge_from
+    {
         Vec::new()
     } else {
         tx.query(

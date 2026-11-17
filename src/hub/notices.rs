@@ -496,6 +496,7 @@ pub struct NoticeAcknowledgement {
 pub fn dependency_fingerprint(
     declared: &WorkDeclarationsView,
     conditions: &[super::work_reconciliation::ConditionDisposition],
+    transitions: &[super::work_dependencies::DependencyTransition],
 ) -> String {
     let mut rows = declared
         .declarations
@@ -518,7 +519,12 @@ pub fn dependency_fingerprint(
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
-    digest(&(declared.generation, declared.declaration_seq, rows))
+    digest(&(
+        declared.generation,
+        declared.declaration_seq,
+        rows,
+        transitions,
+    ))
 }
 
 fn digest(value: &impl Serialize) -> String {

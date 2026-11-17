@@ -366,6 +366,13 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
         .store
         .owner_notice_put(&sender_token, &request("first"), now)
         .unwrap();
+    for number in [701, 702] {
+        let (merge, observed_at) = merge(number, now);
+        fixture
+            .store
+            .record_catchup_merge(&scope(REPOSITORY_ID), &merge, observed_at)
+            .unwrap();
+    }
     let page = fixture
         .store
         .work_catchup(
@@ -373,6 +380,7 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
             &CatchupQuery {
                 subscriber: "agent:notice-session".into(),
                 delivery_client: "notice-reader".into(),
+                limit: 1,
                 ..CatchupQuery::default()
             },
             now + 1,
@@ -394,12 +402,20 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
                 delivery_client: page.delivery_client.clone(),
                 ..CatchupQuery::default()
             },
-            now + 3,
+            now + 4,
         )
         .unwrap();
     assert_eq!(
         replay, page,
         "an open delivery keeps its immutable notice window"
+    );
+    let merge_continuation = fixture
+        .store
+        .work_catchup(&recipient_token, &continuation(&page, 1), now + 4)
+        .unwrap();
+    assert!(
+        merge_continuation.owner_notices.is_empty(),
+        "a merge-only continuation never leaks first-page notice pointers inserted meanwhile"
     );
 
     let listed = fixture
@@ -408,7 +424,7 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
             &WorkLifecycleReader::Token(&recipient_token),
             None,
             10,
-            now + 4,
+            now + 6,
         )
         .unwrap();
     assert_eq!(listed.notices.len(), 2);
@@ -434,7 +450,7 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
                 delivery_client: "owner-browser".into(),
                 ..CatchupQuery::default()
             },
-            now + 5,
+            now + 7,
         )
         .unwrap();
     assert!(human.owner_notices.is_empty());
@@ -456,7 +472,7 @@ fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
                     delivery_client: page.delivery_client.clone(),
                     ..CatchupQuery::default()
                 },
-                now + 6,
+                now + 8,
             )
             .unwrap();
         assert!(

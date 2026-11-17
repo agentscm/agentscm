@@ -1146,37 +1146,39 @@ fn sqlite_catchup_page(
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
-    let owner_notices = if subscriber == HUMAN_SUBSCRIBER || event_after != event_from {
-        Vec::new()
-    } else {
-        tx.prepare(
-            "SELECT snapshot FROM hub_owner_notices
+    let owner_notices =
+        if subscriber == HUMAN_SUBSCRIBER || event_after != event_from || merge_after != merge_from
+        {
+            Vec::new()
+        } else {
+            tx.prepare(
+                "SELECT snapshot FROM hub_owner_notices
              WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4
                AND json_extract(snapshot,'$.acknowledged_at') IS NULL
              ORDER BY id LIMIT ?5",
-        )?
-        .query_map(
-            params![
-                who.owner.id,
-                who.owner.identity.provider,
-                who.owner.identity.host,
-                who.repository_id,
-                MAX_CATCHUP_OWNER_NOTICES as i64
-            ],
-            |row| row.get::<_, String>(0),
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|snapshot| {
-            let notice: super::notices::OwnerNotice = json_value(&snapshot)?;
-            Ok(CatchupOwnerNotice {
-                id: notice.id,
-                source_kind: notice.source_kind,
-                created_at: notice.created_at,
+            )?
+            .query_map(
+                params![
+                    who.owner.id,
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    who.repository_id,
+                    MAX_CATCHUP_OWNER_NOTICES as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|snapshot| {
+                let notice: super::notices::OwnerNotice = json_value(&snapshot)?;
+                Ok(CatchupOwnerNotice {
+                    id: notice.id,
+                    source_kind: notice.source_kind,
+                    created_at: notice.created_at,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?
-    };
+            .collect::<Result<Vec<_>>>()?
+        };
     Ok(CatchupPage {
         subscriber: subscriber.to_owned(),
         delivery_client: delivery_client.to_owned(),
