@@ -791,7 +791,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
     );
     let catchup = json!(
         {"name": "agentscm_work_catchup",
-         "description": "Reads a durable return-to-work delivery of Work events and provider-confirmed merges at fixed high-waters. Omit cursors to start, continue with the returned delivery and all four cursors; reading never acknowledges it. Select subscriber human only when the owner asks.",
+         "description": "Reads a durable return-to-work delivery of Work events and provider-confirmed merges at fixed high-waters. For a fresh delivery omit delivery, event_after, event_through, merge_after and merge_through. To continue, supply all five fields from the same delivery, using next_event_after and next_merge_after for the after cursors and retaining the fixed through cursors; reading never acknowledges it. Select subscriber human only when the owner asks.",
          "annotations": {"readOnlyHint": true},
          "inputSchema": schema(json!({
              "subscriber": {"type": "string", "description": "Independent catch-up identity. Omit for this agent session; use human only for the owner's personal cross-device cursor."},
