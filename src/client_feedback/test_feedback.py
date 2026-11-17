@@ -91,8 +91,10 @@ class NativeFeedback(unittest.TestCase):
                 raw = self.invoke(["start", "--client", client], self.event(client, vscode))
                 reply = json.loads(raw)
                 text = (reply["additional_context"] if client == "cursor" else
-                        reply["additionalContext"] if client == "copilot" else
+                        reply["additionalContext"] if client == "copilot" and not vscode else
                         reply["hookSpecificOutput"]["additionalContext"])
+                if vscode:
+                    self.assertEqual(reply["hookSpecificOutput"]["hookEventName"], "SessionStart")
                 self.assertIn("Only the top-level agent", text)
                 self.assertNotIn("synthetic-token", text)
                 command = next(line.split(" <<", 1)[0] for line in text.splitlines()
@@ -124,6 +126,14 @@ class NativeFeedback(unittest.TestCase):
         raw = self.invoke(["start", "--client", "claude"], self.event("claude"),
                           PYTHONPATH=str(self.root), PYTHONHOME=str(self.root))
         self.assertIn("Optional AgentSCM feedback", json.loads(raw)["hookSpecificOutput"]["additionalContext"])
+
+    def test_feedback_connection_ignores_ambient_proxy(self):
+        proxy = f"http://127.0.0.1:{self.hub.server_port}"
+        raw = self.invoke(["start", "--client", "claude"], self.event("claude"),
+                          http_proxy=proxy, no_proxy="", NO_PROXY="")
+        self.assertIn("Optional AgentSCM feedback", json.loads(raw)["hookSpecificOutput"]["additionalContext"])
+        # The same listener acts as origin and proxy. A proxy request would carry an absolute URL.
+        self.assertEqual(self.hub.seen, [("/api/v1/agent-feedback/eligibility", None)])
 
     def test_missing_python_and_slow_collector_leave_the_host_running(self):
         self.assertEqual(self.invoke(["start", "--client", "claude"], self.event("claude"), PATH=""), "")

@@ -91,31 +91,6 @@ When it finishes:
 
 Undo it all with `npx agentscm uninstall`.
 
-### Hosted beta feedback
-
-On a Hub where you accepted beta enrollment, local Claude Code, Codex, Cursor, GitHub Copilot and
-Gemini CLI startup hooks can offer the parent agent an optional short product report after completed
-Work. The Hub checks current enrollment, access and the completed Work's lead before accepting it.
-Ordinary installation does not enroll you or turn on CLI telemetry. Other agents and Windows do not
-have this feedback adapter.
-
-Feedback needs Python 3.10 or later on `PATH`; it silently skips unavailable connections, known helpers and
-ineligible reporters, without changing task completion. It reads no transcripts, makes no model call
-and keeps no retry queue. Reports are not anonymous; omit secrets, personal data and customer details.
-Helpers without host markers are instructed to skip; this is not a security boundary.
-An installed hook is not live host qualification: verify delivery and one genuine accepted report on
-the selected host/model before relying on collection. Migrate separately installed feedback hooks
-before using the bundled adapter, preserving their other context hooks and immutable files used by
-active sessions, then restart your agents.
-
-Before downgrading to a release without this adapter, remove only the startup-hook entries whose
-commands invoke `feedback start --client` from Cursor's `.cursor/hooks.json`, Gemini's
-`.gemini/settings.json` and Copilot's `hooks/agentscm-client.json` in its user configuration directory
-(`COPILOT_HOME`, or `.copilot` under your home directory). Check any checkout-scoped copies too.
-Keep every other hook. Restore the prior Claude Code and Codex plugin bundles through their normal
-setup, then restart affected sessions; retain immutable bundles while an active session uses them.
-An older binary cannot execute these feedback commands or recognize them for removal.
-
 These options are shown in `agentscm quickstart --help`:
 
 | Flag | Meaning |
@@ -131,6 +106,14 @@ documented in the [setup guide](setup-guide.md#other-flags).
 
 To try agents against a Hub on this computer without a GitHub App or any forge sign-in, see
 [agent tokens for a local Hub without a forge](local-agent-token.md).
+
+### Hosted beta feedback
+
+On a Hub where you accepted beta enrollment, local Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI startup hooks can offer the parent agent an optional short product report after completed Work. The Hub checks current enrollment, access and the completed Work's lead before accepting it. Ordinary installation does not enroll you or turn on CLI telemetry. Other agents and Windows do not have this feedback adapter.
+
+Feedback needs Python 3.10 or later on `PATH`; it silently skips unavailable connections, known helpers and ineligible reporters, without changing task completion. It reads no transcripts, makes no model call and keeps no retry queue. Reports are not anonymous; omit secrets, personal data and customer details. Helpers without host markers are instructed to skip; this is not a security boundary. An installed hook is not live host qualification: verify delivery and one genuine accepted report on the selected host/model before relying on collection. Migrate separately installed feedback hooks before using the bundled adapter, preserving their other context hooks and immutable files used by active sessions, then restart your agents.
+
+Before downgrading to a release without this adapter, remove only the startup-hook entries whose commands invoke `feedback start --client` from Cursor's `.cursor/hooks.json`, Gemini's `.gemini/settings.json` and Copilot's `hooks/agentscm-client.json` in its user configuration directory (`COPILOT_HOME`, or `.copilot` under your home directory). Check any checkout-scoped copies too. Keep every other hook. Restore the prior Claude Code and Codex plugin bundles through their normal setup, then restart affected sessions; retain immutable bundles while an active session uses them. An older binary cannot execute these feedback commands or recognize them for removal.
 
 ### Share your local Hub over Tailscale
 

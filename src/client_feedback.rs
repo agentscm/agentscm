@@ -12,7 +12,8 @@ pub fn run(args: FeedbackArgs) {
     let Ok(program) = std::env::current_exe() else {
         return;
     };
-    let mut source = String::from("import os,sys,types\n");
+    let mut source =
+        String::from("import os,sys,types\nif sys.version_info < (3, 10): sys.exit(0)\n");
     for (name, contents) in [
         ("clients", include_str!("client_feedback/clients.py")),
         (

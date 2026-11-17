@@ -76,7 +76,9 @@ def call(connection, path, data=None, limit=MAX_REPLY):
     origin, token = connection
     req = urllib.request.Request(origin + path, data=data, headers={
         "Authorization": "Bearer " + token, "Accept": "application/json", "Content-Type": "application/json"})
-    with urllib.request.build_opener(NoRedirect).open(req, timeout=SECONDS) as reply:
+    # The connection identifies which Hub may receive this bearer token.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    with opener.open(req, timeout=SECONDS) as reply:
         require(reply.status == (200 if data is None else 202))
         raw = reply.read(limit + 1)
     require(len(raw) <= limit)

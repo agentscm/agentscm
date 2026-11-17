@@ -76,6 +76,7 @@ def normalize(client, raw, moment):
         value = {}
     return {"cwd": root, "session_id": session, "source": source, "tool_name": tool,
             "tool_input": value, "native_event": event, "client": client,
+            "copilot_cli": client == "copilot" and "sessionId" in raw,
             "hook_event_name": "SessionStart" if moment == "start" else "PreToolUse"}
 
 
@@ -83,7 +84,7 @@ def response(hook, text):
     client, event = hook["client"], hook["native_event"]
     if client == "cursor":
         return {"additional_context": text}
-    if client == "copilot":
+    if hook["copilot_cli"]:
         return {"additionalContext": text}
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
