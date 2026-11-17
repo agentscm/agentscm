@@ -5448,7 +5448,28 @@ fn checkout_and_user_scope_never_both_hold_an_agents_hooks() {
         user["mcpServers"]["agentscm"]["args"],
         json!(["--no-telemetry", "client", "mcp"])
     );
-    assert_eq!(user["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    let mut startup_commands: Vec<_> = user["hooks"]["SessionStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .map(|hook| {
+            hook["command"]
+                .as_str()
+                .unwrap()
+                .rsplit_once(" --no-telemetry ")
+                .unwrap()
+                .1
+        })
+        .collect();
+    startup_commands.sort_unstable();
+    assert_eq!(
+        startup_commands,
+        [
+            "feedback start --client gemini",
+            "hook gemini --client-connection",
+        ]
+    );
 
     let refused = setup(&["--checkout-only"]);
     assert!(!refused.status.success());
