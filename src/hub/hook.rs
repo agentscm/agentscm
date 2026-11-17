@@ -18,6 +18,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::{agent_name, unknown};
@@ -59,6 +60,9 @@ const MAX_ROOT_BYTES: usize = 1024;
 /// Sessions that were already told coordination is unknown; cleared when it grows past the bound.
 static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const MAX_NOTED: usize = 10_000;
+/// Partial releases a session was already told, as a digest of request and released set; cleared
+/// when it grows past the bound.
+static PARTIAL_SHOWN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Tools that change a file; names are compared lowercase.
 const EDIT_TOOLS: [&str; 8] = [
     "edit",
@@ -571,6 +575,7 @@ async fn hook(
                 };
                 // A subagent's context ends when it returns, so a request shown there is lost
                 // with it: point it at its lead instead, and never hold its edits for a reply.
+                let mut partial_keys = Vec::new();
                 if call.child {
                     let waiting = page.requests.iter().filter(open).count();
                     if waiting > 0 {
@@ -600,6 +605,30 @@ async fn hook(
                         // A prompt repeats every turn, so it carries only what this session must
                         // answer, and a requester's own request only while it has news the
                         // requester has not acknowledged.
+                        // A partial release shows once per released set, so a further release shows
+                        // again but an unchanged one does not repeat on every prompt. The set is
+                        // marked only once the text is kept (see `partial_keys` below).
+                        let partial = own
+                            && call.kind == Kind::Prompt
+                            && request.requested_paths == Some(RequestedPathsHold::Held)
+                            && !request.released_paths.is_empty()
+                            && {
+                                let key = format!(
+                                    "{}\0{session}\0{}\0{}",
+                                    principal.token_id,
+                                    request.id,
+                                    request.released_paths.join("\0")
+                                );
+                                let key = format!("{:x}", Sha256::digest(key));
+                                let new = !PARTIAL_SHOWN
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .contains(&key);
+                                if new {
+                                    partial_keys.push(key);
+                                }
+                                new
+                            };
                         let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
                             receipt.target_work_id.is_none()
                                 && receipt.agent.token == principal.token_id
@@ -612,6 +641,7 @@ async fn hook(
                             // ended intent), so it shows whether or not the requester acked.
                             && !(own
                                 && (released
+                                    || partial
                                     || (unacknowledged && !request.responses.is_empty())))
                         {
                             continue;
@@ -626,14 +656,30 @@ async fn hook(
                                         });
                                     format!(" Reply {}{note}.", response_kind_name(reply.kind))
                                 });
+                            let partial_paths = if request.requested_paths
+                                == Some(RequestedPathsHold::Held)
+                                && !request.released_paths.is_empty()
+                            {
+                                let listed = super::mcp::bounded_paths(&request.released_paths);
+                                let incomplete = if request.released_paths_complete {
+                                    ""
+                                } else {
+                                    " (more may be free)"
+                                };
+                                format!(
+                                    " {listed} from your request are free now{incomplete}; start on them alone with agentscm_start."
+                                )
+                            } else {
+                                String::new()
+                            };
                             let paths = if released {
                                 " The requested paths are released: retry agentscm_start."
                             } else {
-                                ""
+                                &partial_paths
                             };
                             outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         } else {
-                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline (release_paths frees finished files). Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
@@ -764,6 +810,16 @@ async fn hook(
                             }
                         }
                     }
+                }
+                // Marked only now that the text is kept: a failed delivery clears it, and the
+                // next prompt shows the release again.
+                if outcome.status != "unknown" && !partial_keys.is_empty() {
+                    let mut shown_set =
+                        PARTIAL_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
+                    if shown_set.len() > MAX_NOTED {
+                        shown_set.clear();
+                    }
+                    shown_set.extend(partial_keys);
                 }
             }
             failed if outcome.status != "unknown" => {
@@ -2761,6 +2817,7 @@ mod tests {
             updated_at: 1_000,
             created_seq: 1,
             updated_seq: 1,
+            finished_paths: Vec::new(),
         }
     }
 

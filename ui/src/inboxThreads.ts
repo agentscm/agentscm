@@ -169,7 +169,7 @@ function requestThread(r: CoordinationRequest, me: string | null, works: Map<str
   const responses = [...r.responses].sort((a, b) => a.seq - b.seq)
   for (const x of responses) {
     const viaPerson = x.via === 'hub' || x.via === 'slack'
-    rows.push(row({ key: `reply:${x.id}`, kind: 'agent', tone: me !== null && x.responder.login === me ? 'me' : '', agent: x.responder.agent, who: actor(x.responder, viaPerson, me), did: `${DID[x.kind]}${x.via === 'slack' ? ' · from Slack' : viaPerson ? ' · from the Hub' : ''}`, at: x.created_at, text: x.note ?? null, quote: !!x.note }))
+    rows.push(row({ key: `reply:${x.id}`, kind: 'agent', tone: me !== null && x.responder.login === me ? 'me' : '', agent: x.responder.agent, who: actor(x.responder, viaPerson, me), did: `${DID[x.kind]}${x.via === 'slack' ? ' · from Slack' : viaPerson ? ' · from the Hub' : ''}${x.released_paths.length ? ` · released ${x.released_paths.join(', ')}` : ''}`, at: x.created_at, text: x.note ?? null, quote: !!x.note }))
   }
   if (r.status === 'resolved') rows.push(notice('closed', 'closed the request', r.updated_at, 'The requesting agent resolved it.', 'ok'))
   if (r.status === 'withdrawn') rows.push(notice('closed', 'closed the request', r.updated_at, 'The proposal was withdrawn.'))

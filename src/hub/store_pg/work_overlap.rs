@@ -90,7 +90,9 @@ fn authorize_read(
             return Ok(());
         }
     }
-    Err(HubError::Unauthorized)
+    Err(HubError::invalid_or_changed(
+        crate::hub::coordination::CONSENTS_NOT_PARTY.into(),
+    ))
 }
 
 impl PgStore {
@@ -198,6 +200,7 @@ impl PgStore {
         text("session", session, 255)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let session = &session_name(&mut tx, token, Some(session), now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             let request = coordination_request_at(&mut tx, &who, request_id, i64::MAX, now)?
@@ -391,6 +394,7 @@ impl PgStore {
         if !preflight_only {
         session_lifecycle::check(&mut tx, token, &input.start.session, incarnation, now)?;
         }
+            let session = session_name(&mut tx, token, Some(&input.start.session), now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
@@ -405,7 +409,7 @@ impl PgStore {
             }
             let existing = resolve_work(&mut tx, &who, &input.start, now)?;
             let proposal = if let Some(item) = &existing {
-                if item.lead_token != who.token || item.lead_session != input.start.session {
+                if item.lead_token != who.token || item.lead_session != session {
                     return Err(HubError::Unauthorized);
                 }
                 CoordinationProposal {
@@ -443,7 +447,7 @@ impl PgStore {
                 &mut tx,
                 &who,
                 &input.consent_ids,
-                &input.start.session,
+                &session,
                 &proposal,
                 now,
             )?;

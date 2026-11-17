@@ -93,6 +93,47 @@ impl Db {
         }
     }
 
+    /// Runs a query and returns every column as text, with NULL as the empty string.
+    fn rows(&self, sql: &str) -> Vec<Vec<String>> {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .simple_query(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| match message {
+                    postgres::SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).unwrap_or("").to_owned())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let mut statement = connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            Ok(match row.get::<_, rusqlite::types::Value>(index)? {
+                                rusqlite::types::Value::Null => String::new(),
+                                rusqlite::types::Value::Integer(value) => value.to_string(),
+                                rusqlite::types::Value::Text(value) => value,
+                                other => format!("{other:?}"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+    }
+
     fn expire_token(&self, token: &str) {
         if self._pg.is_some() {
             postgres::Client::connect(&self.url, postgres::NoTls)
@@ -240,6 +281,7 @@ fn checkpoint(
         source_refs: Vec::new(),
         depends_on: Vec::new(),
         related_work: Vec::new(),
+        finished_paths: None,
     }
 }
 
@@ -295,6 +337,7 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
     let replayed_ack = store.coordination_ack(&incumbent, &ack, now + 5).unwrap();
     assert_eq!(replayed_ack.updated_seq, acknowledged.updated_seq);
     let reply = CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: "reply-operation".into(),
         target_work_id: request.targets[0].work_id.clone(),
@@ -652,6 +695,7 @@ fn response_projection_does_not_change_status(db: &Db) {
         .coordination_reply(
             &second_lead,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "second-only-reply".into(),
                 target_work_id: second_target.work_id.clone(),
@@ -669,6 +713,7 @@ fn response_projection_does_not_change_status(db: &Db) {
             .coordination_reply(
                 &first_lead,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: request.id.clone(),
                     operation_id: format!("first-repeat-{index}"),
                     target_work_id: first_target.work_id.clone(),
@@ -1415,6 +1460,7 @@ fn a_person_reply_through_the_hub_is_marked_and_delivered(db: &Db) {
         .unwrap();
     let target = request.targets[0].work_id.clone();
     let reply = |operation: &str, seq: i64, via_hub: bool| CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: operation.into(),
         target_work_id: target.clone(),
@@ -1754,6 +1800,7 @@ fn join_reply_outside_the_holders_scope_is_refused(db: &Db) {
         .coordination_request
         .unwrap();
     let reply = |kind, operation_id: &str| CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: operation_id.into(),
         target_work_id: request.targets[0].work_id.clone(),
@@ -2011,6 +2058,7 @@ fn responded_request_does_not_block_checkpoint_once_unheld(db: &Db) {
         .coordination_reply(
             &b,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline".into(),
                 target_work_id: target.id.clone(),
@@ -2261,6 +2309,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         .collect::<Vec<_>>();
     let responses = (0..128)
         .map(|index| CoordinationResponse {
+            released_paths: Vec::new(),
             id: format!("crp_{index:032x}"),
             operation_id: format!("op_{index:032x}"),
             target_work_id: format!("wrk_{:032x}", index % 100),
@@ -2298,10 +2347,17 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         updated_seq: 2,
         requester_unavailable: true,
         requested_paths: None,
+        released_paths: Vec::new(),
+        released_paths_complete: true,
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();
     assert!(encoded.len() < 2 * 1024 * 1024, "{} bytes", encoded.len());
+    // A partial acknowledgement page with none from the requester cannot say it has not seen.
+    assert_eq!(
+        request.requester_state(),
+        agentscm::hub::coordination::RequesterState::Unknown
+    );
 }
 
 fn finished_default_work_binds_no_hook_session(db: &Db) {
@@ -2398,6 +2454,7 @@ fn requester_sees_reply_and_release(db: &Db) {
         .coordination_reply(
             &holder,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline-operation".into(),
                 target_work_id: request.targets[0].work_id.clone(),
@@ -2466,6 +2523,297 @@ fn requester_sees_reply_and_release(db: &Db) {
 }
 
 parity_case!(requester_hold_state, requester_sees_reply_and_release);
+
+fn requester_reads_overlap_consents_through_a_session_alias(db: &Db) {
+    use agentscm::hub::work_overlap::WorkOverlapConsentRequest;
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(
+            &incumbent,
+            &start_scope("incumbent", "lead", WorkRole::Lead, None, &["src/a.rs"]),
+            now,
+        )
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(
+            &requester,
+            &start_scope("requester", "default", WorkRole::Lead, None, &["src/a.rs"]),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    store
+        .work_start(
+            &requester,
+            &start_scope("docs", "default", WorkRole::Lead, None, &["docs/**"]),
+            now + 1,
+        )
+        .unwrap();
+    // The first hook session after an unnamed start adopts it, so `native` stands for `default`.
+    store
+        .touch_session(
+            &requester,
+            &SessionCall {
+                session: Some("native".into()),
+                via: "hook:claude".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now + 2,
+        )
+        .unwrap();
+    let consent = WorkOverlapConsentRequest {
+        request_id: request.id.clone(),
+        target_work_id: target.id.clone(),
+        operation_id: "consent-1".into(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        target_generation: target.generation,
+        target_updated_seq: target.updated_seq,
+        paths: vec!["src/a.rs".into()],
+    };
+    let granted = store
+        .work_overlap_consent(&incumbent, &consent, now + 3)
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request.id, "native", now + 4)
+            .unwrap(),
+        vec![granted.clone()]
+    );
+    // Accepting the consent through the alias is the same requester session.
+    let started = store
+        .work_overlap_start(
+            &requester,
+            &agentscm::hub::work_overlap::WorkOverlapStart {
+                start: start_scope("requester", "native", WorkRole::Lead, None, &["src/a.rs"]),
+                consent_ids: vec![granted.consent.id.clone()],
+            },
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(started.item.lead_token, requester);
+}
+
+parity_case!(
+    requester_consent_alias,
+    requester_reads_overlap_consents_through_a_session_alias
+);
+
+fn requester_acts_through_a_session_alias(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap();
+    let request = store
+        .work_start(&requester, &start("requester", "default"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    store
+        .work_start(
+            &requester,
+            &start_scope("docs", "default", WorkRole::Lead, None, &["docs/**"]),
+            now + 1,
+        )
+        .unwrap();
+    // The first hook session after an unnamed start adopts it, so `native` stands for `default`.
+    store
+        .touch_session(
+            &requester,
+            &SessionCall {
+                session: Some("native".into()),
+                via: "hook:claude".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now + 2,
+        )
+        .unwrap();
+    let acknowledged = store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "native".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let resolve = CoordinationResolve {
+        request_id: request.id.clone(),
+        operation_id: "alias-resolve".into(),
+        session: "native".into(),
+        expected_updated_seq: acknowledged.updated_seq,
+    };
+    // The requester is a party, so the refusal is not the non-party one.
+    assert!(!matches!(
+        store.coordination_resolve(&requester, &resolve, now + 4),
+        Err(HubError::Rejected(rejection))
+            if rejection.message() == agentscm::hub::coordination::RESOLVE_NOT_PARTY
+    ));
+    let current = store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "native".into(),
+                expected_updated_seq: acknowledged.updated_seq,
+            },
+            now + 5,
+        )
+        .unwrap();
+    let withdrawn = store
+        .coordination_withdraw(
+            &requester,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "alias-withdraw".into(),
+                session: "native".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(withdrawn.status, CoordinationStatus::Withdrawn);
+}
+
+parity_case!(
+    requester_action_alias,
+    requester_acts_through_a_session_alias
+);
+
+fn requester_keeps_its_request_after_a_lead_credential_carries(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let replacement = token(&*store, 2, "replacement");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let started = store
+        .work_start(
+            &requester,
+            &start_scope(
+                "docs",
+                "requester-session",
+                WorkRole::Lead,
+                None,
+                &["docs/**"],
+            ),
+            now + 1,
+        )
+        .unwrap();
+    store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "requester-session".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 1,
+        )
+        .unwrap();
+    let carried = store
+        .work_checkpoint(
+            &replacement,
+            &checkpoint(
+                &started.item.id,
+                "carry",
+                "requester-session",
+                started.item.updated_seq,
+                CheckpointKind::Progress,
+                None,
+            ),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(carried.item.lead_token, replacement);
+    assert!(
+        store
+            .work_overlap_consents(&replacement, &request.id, "requester-session", now + 3)
+            .is_ok()
+    );
+    let seen = store
+        .coordination_inbox(
+            &incumbent,
+            &CoordinationInboxQuery {
+                session: Some("lead".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.id == request.id)
+        .unwrap();
+    assert!(matches!(
+        seen.requester_state(),
+        agentscm::hub::coordination::RequesterState::Seen { .. }
+    ));
+    let current = store
+        .coordination_ack(
+            &replacement,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "requester-session".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let withdrawn = store
+        .coordination_withdraw(
+            &replacement,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "carried-withdraw".into(),
+                session: "requester-session".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(withdrawn.status, CoordinationStatus::Withdrawn);
+}
+
+parity_case!(
+    requester_carried_credential,
+    requester_keeps_its_request_after_a_lead_credential_carries
+);
 
 fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
@@ -2561,10 +2909,13 @@ fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
             .unwrap(),
         vec![granted.clone()]
     );
-    assert!(matches!(
-        store.work_overlap_consents(&other, &request.id, "other", now + 4),
-        Err(HubError::Unauthorized)
-    ));
+    assert!(
+        matches!(
+            store.work_overlap_consents(&other, &request.id, "other", now + 4),
+            Err(HubError::Rejected(_))
+        ),
+        "a non-party gets a typed refusal"
+    );
     // Target consent by itself still grants no admission or reservation.
     assert!(
         !store
@@ -2663,6 +3014,7 @@ fn named_overlap_consent_lapses_and_decline_revokes(db: &Db) {
         .coordination_reply(
             &incumbent,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline".into(),
                 target_work_id: target.id.clone(),
@@ -3601,3 +3953,610 @@ parity_case!(
     pending_requester_lifecycle,
     pending_requester_lifecycle_requires_fresh_consent
 );
+
+const FILES: [&str; 4] = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"];
+
+fn holder_and_request(
+    store: &dyn Store,
+    holder_scope: &[&str],
+    requested: &[&str],
+) -> (String, String, String, CoordinationRequest, i64) {
+    let holder = token(store, 31, "holder");
+    let requester = token(store, 32, "requester");
+    let now = unix_now();
+    let work = store
+        .work_start(
+            &holder,
+            &start_scope("held", "lead", WorkRole::Lead, None, holder_scope),
+            now,
+        )
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(
+            &requester,
+            &start_scope("asked", "asker", WorkRole::Lead, None, requested),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    (holder, requester, work.id, request, now)
+}
+
+fn release_reply(
+    request: &CoordinationRequest,
+    kind: CoordinationResponseKind,
+    paths: &[&str],
+) -> CoordinationReply {
+    CoordinationReply {
+        release_paths: paths.iter().map(|path| (*path).into()).collect(),
+        request_id: request.id.clone(),
+        operation_id: "grant".into(),
+        target_work_id: request.targets[0].work_id.clone(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        kind,
+        note: Some("take a".into()),
+        via: agentscm::hub::handoff::Via::Agent,
+    }
+}
+
+fn grants_a_subset(db: &Db, kind: CoordinationResponseKind) {
+    let store = db.open();
+    let (holder, requester, work_id, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let reply = release_reply(&request, kind, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &reply, now + 2).unwrap();
+    assert_eq!(answered.responses.len(), 1);
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+    assert_eq!(answered.responses[0].kind, kind);
+    // The requester sees the same projection.
+    let seen = store
+        .coordination_list(&requester, &CoordinationListQuery::default(), now + 3)
+        .unwrap();
+    assert_eq!(
+        seen.requests[0].responses[0].released_paths,
+        vec!["src/a.rs"]
+    );
+    // A retry of the identical reply replays and does not release twice.
+    let replayed = store.coordination_reply(&holder, &reply, now + 4).unwrap();
+    assert_eq!(replayed.updated_seq, answered.updated_seq);
+    let transitions: Vec<_> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "work_transition")
+        .collect();
+    assert_eq!(transitions.len(), 1);
+    assert!(
+        transitions[0].data.contains(r#""kind":"lead""#),
+        "{}",
+        transitions[0].data
+    );
+    // The released file is free to the requester; the other requested file stays held.
+    let taken = store
+        .work_start(
+            &requester,
+            &start_scope("a-only", "asker2", WorkRole::Lead, None, &["src/a.rs"]),
+            now + 5,
+        )
+        .unwrap();
+    assert!(taken.conflict.is_none() && taken.created);
+    let still_held = store
+        .work_start(
+            &requester,
+            &start_scope("b-only", "asker3", WorkRole::Lead, None, &["src/b.rs"]),
+            now + 6,
+        )
+        .unwrap();
+    assert!(still_held.conflict.is_some());
+    // The holder keeps two files, its generation and its lease.
+    let held = db.rows(&format!(
+        "SELECT scope, generation, state FROM hub_work_items WHERE id = '{work_id}'"
+    ));
+    assert_eq!(held[0][0].matches("src/").count(), 2, "{held:?}");
+    assert!(!held[0][0].contains("src/a.rs"), "{held:?}");
+    assert_eq!(held[0][1], "1");
+    assert_eq!(
+        db.rows(&format!(
+            "SELECT reservation_basis FROM hub_work_items WHERE id = '{work_id}'"
+        ))[0][0],
+        "admitted"
+    );
+    assert_eq!(
+        db.rows("SELECT released_paths FROM hub_coordination_responses")[0][0],
+        r#"["src/a.rs"]"#
+    );
+}
+
+fn reply_release_refusals_record_nothing(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES, &["src/a.rs", "src/b.rs", "src/z.rs"]);
+    let refused = |reply: &CoordinationReply, who: &str| {
+        let error = store
+            .coordination_reply(who, reply, now + 2)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM hub_coordination_responses")[0][0],
+            "0"
+        );
+        error
+    };
+    let join = release_reply(&request, CoordinationResponseKind::Join, &["src/a.rs"]);
+    assert!(refused(&join, &holder).contains("not valid with join"));
+    let unrequested = release_reply(&request, CoordinationResponseKind::Decline, &["src/d.rs"]);
+    let error = refused(&unrequested, &holder);
+    assert!(
+        error.contains("did not ask for") && error.contains("src/d.rs"),
+        "{error}"
+    );
+    let foreign = release_reply(&request, CoordinationResponseKind::Decline, &["src/z.rs"]);
+    let error = refused(&foreign, &holder);
+    assert!(
+        error.contains("src/z.rs") && error.contains("scope"),
+        "{error}"
+    );
+    // A requester is not the target's lead.
+    let granted = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    assert!(matches!(
+        store.coordination_reply(&requester, &granted, now + 2),
+        Err(HubError::Unauthorized)
+    ));
+    assert_eq!(
+        db.rows("SELECT COUNT(*) FROM hub_work_items WHERE scope LIKE '%src/a.rs%'")[0][0],
+        "1"
+    );
+    // Releasing every entry is refused, naming the whole-hold release.
+    let third = token(&*store, 33, "third");
+    let all = store
+        .work_start(
+            &third,
+            &start_scope("all", "all-session", WorkRole::Lead, None, &FILES),
+            now + 3,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let everything = release_reply(&all, CoordinationResponseKind::Decline, &FILES);
+    let error = refused(&everything, &holder);
+    assert!(error.contains("use release"), "{error}");
+}
+
+fn decline_grants_a_subset(db: &Db) {
+    grants_a_subset(db, CoordinationResponseKind::Decline);
+}
+
+fn split_grants_a_subset(db: &Db) {
+    grants_a_subset(db, CoordinationResponseKind::ProposeSplit);
+}
+
+parity_case!(reply_grants_subset, decline_grants_a_subset);
+parity_case!(split_grants_subset, split_grants_a_subset);
+parity_case!(
+    reply_release_refusals,
+    reply_release_refusals_record_nothing
+);
+
+fn requester_sees_a_partial_release(db: &Db) {
+    use agentscm::hub::coordination::RequestedPathsHold;
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("asker".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    let before = read(now + 2);
+    assert_eq!(before.requested_paths, Some(RequestedPathsHold::Held));
+    assert!(before.released_paths.is_empty());
+    assert!(
+        !serde_json::to_string(&before)
+            .unwrap()
+            .contains("released_paths")
+    );
+
+    let first = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &first, now + 3).unwrap();
+    let partial = read(now + 4);
+    assert_eq!(partial.requested_paths, Some(RequestedPathsHold::Held));
+    assert_eq!(partial.released_paths, vec!["src/a.rs"]);
+
+    let mut second = release_reply(&request, CoordinationResponseKind::Decline, &["src/b.rs"]);
+    second.operation_id = "grant-b".into();
+    second.expected_updated_seq = answered.updated_seq;
+    store.coordination_reply(&holder, &second, now + 5).unwrap();
+    let all = read(now + 6);
+    assert_eq!(all.requested_paths, Some(RequestedPathsHold::Released));
+    assert!(all.released_paths.is_empty());
+}
+
+fn reply_release_through_a_session_alias_acts_as_the_lead(db: &Db) {
+    let store = db.open();
+    let holder = token(&*store, 34, "alias-holder");
+    let requester = token(&*store, 35, "alias-requester");
+    let now = unix_now();
+    // The default Work session is an alias of the first observed session.
+    store
+        .touch_session(
+            &holder,
+            &SessionCall {
+                session: None,
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now,
+        )
+        .unwrap();
+    store
+        .work_start(
+            &holder,
+            &start_scope("held", "default", WorkRole::Lead, None, &FILES[..3]),
+            now + 1,
+        )
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start_scope("asked", "asker", WorkRole::Lead, None, &FILES[..2]),
+            now + 2,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let mut reply = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    reply.session = "default".into();
+    let answered = store.coordination_reply(&holder, &reply, now + 3).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+    let events = store.events_after(0, 1000).unwrap();
+    let transition = events
+        .iter()
+        .find(|event| event.kind == "work_transition")
+        .unwrap();
+    assert!(
+        transition.data.contains(r#""kind":"lead""#),
+        "{}",
+        transition.data
+    );
+    // The catch-up history shows the partial grant on the response event.
+    let responded = events
+        .iter()
+        .find(|event| event.kind == "coordination_responded")
+        .unwrap();
+    assert!(
+        responded.data.contains(r#""released_paths":["src/a.rs"]"#),
+        "{}",
+        responded.data
+    );
+}
+
+parity_case!(
+    reply_release_session_alias,
+    reply_release_through_a_session_alias_acts_as_the_lead
+);
+
+fn requester_released_paths_skip_files_the_target_never_held(db: &Db) {
+    let store = db.open();
+    // The request also names src/c.rs, which the holder never held and nobody holds.
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..2], &FILES[..3]);
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("asker".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    assert!(read(now + 2).released_paths.is_empty());
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    store.coordination_reply(&holder, &grant, now + 3).unwrap();
+    assert_eq!(read(now + 4).released_paths, vec!["src/a.rs"]);
+}
+
+fn directory_entries_release_and_report_in_display_form(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) = holder_and_request(
+        &*store,
+        &["src/dir/**", "src/b.rs", "src/c.rs"],
+        &["src/dir/**", "src/b.rs"],
+    );
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/dir/**"]);
+    let answered = store.coordination_reply(&holder, &grant, now + 2).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/dir/**"]);
+    let seen = store
+        .coordination_inbox(
+            &requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .remove(0);
+    assert_eq!(seen.released_paths, vec!["src/dir/**"]);
+    assert_eq!(
+        db.rows("SELECT released_paths FROM hub_coordination_responses")[0][0],
+        r#"["src/dir/**"]"#
+    );
+}
+
+parity_case!(
+    requester_released_paths_held_only,
+    requester_released_paths_skip_files_the_target_never_held
+);
+parity_case!(
+    directory_release_display_form,
+    directory_entries_release_and_report_in_display_form
+);
+
+fn read_own_request(store: &dyn Store, requester: &str, at: i64) -> CoordinationRequest {
+    store
+        .coordination_inbox(
+            requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            at,
+        )
+        .unwrap()
+        .requests
+        .remove(0)
+}
+
+fn a_requested_directory_shows_the_files_released_under_it(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &["src/a.rs", "src/b.rs"], &["src/**"]);
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    store.coordination_reply(&holder, &grant, now + 2).unwrap();
+    let seen = read_own_request(&*store, &requester, now + 3);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert_eq!(seen.released_paths, vec!["src/a.rs"]);
+    assert!(seen.released_paths_complete);
+}
+
+fn many_release_events_leave_released_paths_incomplete(db: &Db) {
+    let store = db.open();
+    let files: Vec<String> = (0..67).map(|index| format!("src/f{index:02}.rs")).collect();
+    let scope: Vec<&str> = files.iter().map(String::as_str).collect();
+    let (holder, requester, _, request, now) = holder_and_request(&*store, &scope, &["src/**"]);
+    let mut seq = request.updated_seq;
+    for (index, file) in files.iter().take(65).enumerate() {
+        let mut grant = release_reply(&request, CoordinationResponseKind::Decline, &[file]);
+        grant.operation_id = format!("grant-{index}");
+        grant.expected_updated_seq = seq;
+        seq = store
+            .coordination_reply(&holder, &grant, now + 2 + index as i64)
+            .unwrap()
+            .updated_seq;
+    }
+    let seen = read_own_request(&*store, &requester, now + 100);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert!(seen.released_paths.is_empty());
+    assert!(!seen.released_paths_complete);
+    assert!(
+        serde_json::to_string(&seen)
+            .unwrap()
+            .contains(r#""released_paths_complete":false"#)
+    );
+}
+
+fn a_request_naming_many_paths_leaves_released_paths_incomplete(db: &Db) {
+    let store = db.open();
+    let files: Vec<String> = (0..33).map(|index| format!("src/f{index:02}.rs")).collect();
+    let scope: Vec<&str> = files.iter().map(String::as_str).collect();
+    let (_, requester, _, _, now) = holder_and_request(&*store, &scope[..2], &scope);
+    let seen = read_own_request(&*store, &requester, now + 2);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert!(seen.released_paths.is_empty());
+    assert!(!seen.released_paths_complete);
+}
+
+parity_case!(
+    requested_directory_partial_release,
+    a_requested_directory_shows_the_files_released_under_it
+);
+parity_case!(
+    release_event_bound_is_visible,
+    many_release_events_leave_released_paths_incomplete
+);
+parity_case!(
+    requested_path_bound_is_visible,
+    a_request_naming_many_paths_leaves_released_paths_incomplete
+);
+
+fn holder_sees_the_requesters_state(db: &Db) {
+    use agentscm::hub::coordination::RequesterState;
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let answered = store
+        .coordination_reply(
+            &holder,
+            &release_reply(&request, CoordinationResponseKind::Decline, &[]),
+            now + 2,
+        )
+        .unwrap();
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &holder,
+                &CoordinationInboxQuery {
+                    session: Some("lead".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    assert_eq!(read(now + 3).requester_state(), RequesterState::NotSeen);
+
+    store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "asker".into(),
+                expected_updated_seq: answered.updated_seq,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        read(now + 5).requester_state(),
+        RequesterState::Seen { at: now + 4 }
+    );
+}
+
+parity_case!(requester_partial_release, requester_sees_a_partial_release);
+parity_case!(
+    holder_sees_requester_state,
+    holder_sees_the_requesters_state
+);
+
+fn reply_release_accepts_a_file_under_a_requested_directory(db: &Db) {
+    let store = db.open();
+    let (holder, _, _, request, now) = holder_and_request(&*store, &FILES[..2], &["src/**"]);
+    let reply = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &reply, now + 2).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+}
+
+fn narrowing_checkpoint_tells_the_requester_which_files_were_dropped(db: &Db) {
+    let store = db.open();
+    let (holder, requester, work_id, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..3]);
+    let seq: i64 = db.rows(&format!(
+        "SELECT updated_seq FROM hub_work_items WHERE id = '{work_id}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    store
+        .work_checkpoint(
+            &holder,
+            &checkpoint(
+                &work_id,
+                "narrow",
+                "lead",
+                seq,
+                CheckpointKind::Progress,
+                Some(&["src/b.rs", "src/c.rs"]),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    let seen = store
+        .coordination_inbox(
+            &requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.id == request.id)
+        .unwrap();
+    assert_eq!(seen.released_paths, vec!["src/a.rs"]);
+}
+
+fn reopen_clears_finished_paths(db: &Db) {
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    let store = db.open();
+    let holder = token(&*store, 36, "finisher");
+    let now = unix_now();
+    let item = store
+        .work_start(
+            &holder,
+            &start_scope("held", "lead", WorkRole::Lead, None, &FILES[..2]),
+            now,
+        )
+        .unwrap()
+        .item;
+    let mut report = checkpoint(
+        &item.id,
+        "report",
+        "lead",
+        item.updated_seq,
+        CheckpointKind::Progress,
+        None,
+    );
+    report.finished_paths = Some(vec!["src/a.rs".into()]);
+    let item = store
+        .work_checkpoint(&holder, &report, now + 1)
+        .unwrap()
+        .item;
+    assert_eq!(item.finished_paths, vec!["src/a.rs"]);
+    let transition = |item: &agentscm::hub::work::WorkItem, op: &str, kind: &str| {
+        let request: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+            "work_id": item.id, "operation_id": op, "generation": item.generation,
+            "expected_updated_seq": item.updated_seq, "session": "lead",
+            "transition": kind, "reason": "synthetic"
+        }))
+        .unwrap();
+        store
+            .work_transition(
+                &WorkTransitionActor::Agent { token: &holder },
+                &request,
+                now + 2,
+            )
+            .unwrap()
+            .item
+    };
+    let done = transition(&item, "complete", "complete");
+    assert_eq!(done.finished_paths, vec!["src/a.rs"]);
+    assert!(
+        transition(&done, "reopen", "reopen")
+            .finished_paths
+            .is_empty()
+    );
+}
+
+parity_case!(
+    reply_release_under_requested_directory,
+    reply_release_accepts_a_file_under_a_requested_directory
+);
+parity_case!(
+    narrowing_reports_dropped_files,
+    narrowing_checkpoint_tells_the_requester_which_files_were_dropped
+);
+parity_case!(reopen_drops_finished_paths, reopen_clears_finished_paths);

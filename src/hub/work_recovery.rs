@@ -496,6 +496,8 @@ pub struct BatchTransitionItem {
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<super::work_transition::ParticipantRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1696,6 +1698,7 @@ pub fn apply_batch_with_transport(
             reason: entry.reason.clone(),
             superseded_by: entry.superseded_by.clone(),
             participants: entry.participants.clone(),
+            paths: entry.paths.clone(),
         };
         let item = match store.work_transition_with_transport(actor, &request, incarnation, now) {
             Ok(result) => {
@@ -1952,6 +1955,7 @@ fn repair_item(
             reason: format!("repair: {}", word(&finding.kind)),
             superseded_by: None,
             participants,
+            paths: Vec::new(),
         },
     })
 }
@@ -2151,6 +2155,7 @@ mod tests {
             updated_at: 10,
             created_seq: 1,
             updated_seq: 9,
+            finished_paths: Vec::new(),
         }
     }
 
@@ -2655,6 +2660,7 @@ mod tests {
             reason: "synthetic".to_owned(),
             superseded_by: None,
             participants: Vec::new(),
+            paths: Vec::new(),
         };
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("participants").is_none(), "{json}");

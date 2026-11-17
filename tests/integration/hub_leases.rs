@@ -308,6 +308,7 @@ fn checkpoint(work_id: &str, generation: i64, session: &str, seq: i64) -> WorkCh
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     }
 }
 
@@ -986,6 +987,7 @@ fn takeovers_by_other_owners_respect_their_share(db: &Db) {
         reason: "synthetic reason".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(
@@ -1022,6 +1024,7 @@ fn a_pause_or_retain_never_revives_a_lapsed_lease(db: &Db) {
         reason: "synthetic reason".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(&WorkTransitionActor::Agent { token: &alice.token }, &retain, after),

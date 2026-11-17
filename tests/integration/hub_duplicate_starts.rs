@@ -302,6 +302,7 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             T0 + 3,
         )

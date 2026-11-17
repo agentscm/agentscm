@@ -2644,6 +2644,7 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
                     reason: "synthetic reason".into(),
                     superseded_by: None,
                     participants: Vec::new(),
+                    paths: Vec::new(),
                 },
                 unix_now(),
             )

@@ -48,8 +48,9 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, RequestedPathsHold, helper_join_editable, join_uncovered,
-    parse_response_kind, parse_status, response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, MAX_RELEASE_EVENTS, MAX_RELEASED_PATHS, RequestedPathsHold,
+    helper_join_editable, join_uncovered, parse_response_kind, parse_status, response_kind_name,
+    status_name, with_released, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -2989,6 +2990,32 @@ fn carry_lead_credential(
              WHERE work = $1 AND token = $2 AND session = $3",
             &[&item.id, &who.token, &session],
         )?;
+        tx.execute(
+            "UPDATE hub_coordination_acknowledgements SET token = $1, agent = $2
+             WHERE token = $3 AND session = $4 AND target_work = ''
+               AND request IN (SELECT id FROM hub_coordination_requests
+                   WHERE requester_token = $3 AND requester_session = $4
+                     AND requester_owner = $5 AND status IN ('pending', 'responded'))",
+            &[
+                &who.token,
+                &who.agent,
+                &carried.previous_token,
+                &session,
+                &who.owner.id,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE hub_coordination_requests SET requester_token = $1, requester_agent = $2
+             WHERE requester_token = $3 AND requester_session = $4 AND requester_owner = $5
+               AND status IN ('pending', 'responded')",
+            &[
+                &who.token,
+                &who.agent,
+                &carried.previous_token,
+                &session,
+                &who.owner.id,
+            ],
+        )?;
         let updated = tx.execute(
             "UPDATE hub_work_participants SET token = $2, agent = $3, updated_at = $4
              WHERE work = $1 AND token = $5 AND session = $6 AND role = 'lead'",
@@ -3686,7 +3713,7 @@ fn coordination_request_at(
         .collect::<Vec<_>>();
     let response_rows = tx.query(
         "SELECT id, operation_id, target_work, token, agent, session, owner, login,
-                target_generation, kind, note, created_at, event_seq, via
+                target_generation, kind, note, created_at, event_seq, via, released_paths
          FROM hub_coordination_responses WHERE request = $1 AND event_seq <= $2
          ORDER BY CASE WHEN EXISTS (
              SELECT 1 FROM hub_coordination_targets t JOIN hub_work_items w ON w.id=t.work
@@ -3724,6 +3751,11 @@ fn coordination_request_at(
             kind: parse_response_kind(&kind)?,
             note: row.get(10),
             via: row.get(13),
+            released_paths: row
+                .get::<_, Option<String>>(14)
+                .map(|paths| json_value(&paths))
+                .transpose()?
+                .unwrap_or_default(),
             created_at: row.get(11),
             seq: row.get(12),
         });
@@ -3760,6 +3792,8 @@ fn coordination_request_at(
         updated_seq: row.get(17),
         requester_unavailable,
         requested_paths: None,
+        released_paths: Vec::new(),
+        released_paths_complete: true,
     }))
 }
 
@@ -4289,8 +4323,12 @@ fn coordination_page(
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
         if request.requester.token == who.token
             && Some(request.requester.session.as_str()) == session
+            && let Some((hold, released, released_complete)) =
+                requested_paths_hold(tx, who, &request, now)
         {
-            request.requested_paths = requested_paths_hold(tx, who, &request, now);
+            request.requested_paths = Some(hold);
+            request.released_paths = released;
+            request.released_paths_complete = released_complete;
         }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
@@ -4318,75 +4356,118 @@ fn coordination_page(
 }
 
 /// Whether the paths an open request asks for are still held by another lead's reservation or
-/// another token's live intent. Only the requester's own inbox asks, and a failed read (rolled
-/// back to its savepoint, so the transaction survives) says unknown rather than failing the page.
+/// another token's live intent, and while some are, which of them are not. Only the requester's
+/// own inbox asks, and a failed read (rolled back to its savepoint, so the transaction survives)
+/// says unknown rather than failing the page.
 fn requested_paths_hold(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     request: &CoordinationRequest,
     now: i64,
-) -> Option<RequestedPathsHold> {
+) -> Option<(RequestedPathsHold, Vec<String>, bool)> {
     if !matches!(
         request.status,
         CoordinationStatus::Pending | CoordinationStatus::Responded
     ) {
         return None;
     }
-    let mut read = || -> Result<bool> {
+    let mut read = || -> Result<(bool, Vec<String>, bool)> {
         tx.batch_execute("SAVEPOINT requested_paths")?;
         let scope = &request.proposal.scope;
-        let held_work = work_scope_overlaps(tx, who, scope, None, now)?
-            .iter()
-            .any(|overlap| {
-                request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
-                    && overlap.item.lead_token != who.token
-            });
-        let mut held = held_work;
-        if !held {
-            let keys = scope
+        let mut released = Vec::new();
+        let mut complete = scope.len() <= MAX_RELEASED_PATHS;
+        let held = scope_held(tx, who, request, scope, now)?;
+        if held && scope.len() <= MAX_RELEASED_PATHS {
+            let events: Vec<String> = tx
+                .query(
+                    "SELECT data FROM hub_events
+                     WHERE subject = $1 AND kind = 'coordination_target_released'
+                     ORDER BY seq DESC LIMIT $2",
+                    &[&request.id, &(MAX_RELEASE_EVENTS + 1)],
+                )?
                 .iter()
-                .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
-                .collect::<Vec<_>>();
-            let (points, ranges) = probe_set(&keys);
-            let rows = resolved_scope(
-                tx,
-                &who.owner.identity.host,
-                &who.repository,
-                who.repository_id,
-            )?;
-            let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id=p.intent
-                 WHERE p.repository_scope=$1 AND i.token<>$2 AND p.expires_at>$3";
-            if !points.is_empty() {
-                held = tx
-                    .query_opt(
-                        &format!("{live} AND p.key = ANY($4) LIMIT 1"),
-                        &[&rows, &who.token, &now, &points],
-                    )?
-                    .is_some();
+                .map(|row| row.get(0))
+                .collect();
+            // Past the bound the history is incomplete, so no path is reported released.
+            let mut candidates = if events.len() as i64 > MAX_RELEASE_EVENTS {
+                complete = false;
+                Vec::new()
+            } else {
+                super::coordination::held_candidates(scope, &events)
+            };
+            if candidates.len() > MAX_RELEASED_PATHS {
+                complete = false;
+                candidates.truncate(MAX_RELEASED_PATHS);
             }
-            for (start, end) in &ranges {
-                if held {
-                    break;
+            for spec in candidates {
+                if !scope_held(tx, who, request, std::slice::from_ref(&spec), now)? {
+                    released.push(super::coordination::display_spec(&spec));
                 }
-                held = tx
-                    .query_opt(
-                        &format!("{live} AND p.key >= $4 AND p.key < $5 LIMIT 1"),
-                        &[&rows, &who.token, &now, start, end],
-                    )?
-                    .is_some();
             }
+            released.sort();
         }
         tx.batch_execute("RELEASE requested_paths")?;
-        Ok(held)
+        Ok((held, released, complete))
     };
     Some(match read() {
-        Ok(true) => RequestedPathsHold::Held,
-        Ok(false) => RequestedPathsHold::Released,
+        Ok((true, released, complete)) => (RequestedPathsHold::Held, released, complete),
+        Ok((false, ..)) => (RequestedPathsHold::Released, Vec::new(), true),
         Err(_) => {
             let _ = tx.batch_execute("ROLLBACK TO requested_paths; RELEASE requested_paths");
-            RequestedPathsHold::Unknown
+            (RequestedPathsHold::Unknown, Vec::new(), true)
         }
     })
+}
+
+fn scope_held(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    request: &CoordinationRequest,
+    scope: &[String],
+    now: i64,
+) -> Result<bool> {
+    let held_work = work_scope_overlaps(tx, who, scope, None, now)?
+        .iter()
+        .any(|overlap| {
+            request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
+                && overlap.item.lead_token != who.token
+        });
+    let mut held = held_work;
+    if !held {
+        let keys = scope
+            .iter()
+            .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+            .collect::<Vec<_>>();
+        let (points, ranges) = probe_set(&keys);
+        let rows = resolved_scope(
+            tx,
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        )?;
+        let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id=p.intent
+             WHERE p.repository_scope=$1 AND i.token<>$2 AND p.expires_at>$3";
+        if !points.is_empty() {
+            held = tx
+                .query_opt(
+                    &format!("{live} AND p.key = ANY($4) LIMIT 1"),
+                    &[&rows, &who.token, &now, &points],
+                )?
+                .is_some();
+        }
+        for (start, end) in &ranges {
+            if held {
+                break;
+            }
+            held = tx
+                .query_opt(
+                    &format!("{live} AND p.key >= $4 AND p.key < $5 LIMIT 1"),
+                    &[&rows, &who.token, &now, start, end],
+                )?
+                .is_some();
+        }
+    }
+    Ok(held)
 }
 
 fn pickup_row(row: &postgres::Row) -> super::pickup::PickupRow {
@@ -4827,6 +4908,11 @@ fn start_overlap_in(
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
+        let previous_lead_owner = item
+            .participants
+            .iter()
+            .find(|participant| participant.role == WorkRole::Lead)
+            .map(|participant| participant.owner.clone());
         for participant in &mut item.participants {
             if participant.role == WorkRole::Lead {
                 participant.role = WorkRole::Helper;
@@ -4855,6 +4941,12 @@ fn start_overlap_in(
         item.lead_token = who.token.clone();
         item.lead_agent = who.agent.clone();
         item.lead_session = start.session.clone();
+        // The lead's own self-report survives only the same owner's same session resuming.
+        if previous_lead_session != start.session
+            || previous_lead_owner.as_deref() != Some(who.owner.id.as_str())
+        {
+            item.finished_paths.clear();
+        }
         item.generation += 1;
         item.state = WorkState::Active;
         item.claim_status = ClaimStatus::Active;
@@ -5030,6 +5122,7 @@ fn start_overlap_in(
             role: WorkRole::Lead,
         }],
         scope,
+        finished_paths: Vec::new(),
         branch: start.branch.clone(),
         worktree: start.worktree.clone(),
         next_action: start.next_action.clone(),
@@ -5907,9 +6000,33 @@ fn release_in(
     )?;
     if changed > 0 {
         tx.execute("DELETE FROM hub_intent_paths WHERE intent = $1", &[&intent])?;
+        lapse_unheld_asks(tx, intent, now)?;
         append(tx, &Event::intent_released(intent)?)?;
     }
     Ok(changed > 0)
+}
+
+/// Lapses the pending asks to the holder of `intent` for files that no live intent of that
+/// holder covers now, so a requester is told at its next call. An expiry has no write path, so
+/// `handoffs_in` still lapses those lazily.
+fn lapse_unheld_asks(tx: &mut postgres::Transaction<'_>, intent: &str, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2
+         WHERE state = 'pending' AND created_at > $3
+           AND (holder_intent = $1
+                OR EXISTS (SELECT 1 FROM hub_sessions s
+                           WHERE s.token = hub_handoffs.holder_token
+                             AND s.session = hub_handoffs.holder_session AND s.intent = $1))
+           AND NOT EXISTS (
+             SELECT 1 FROM hub_intent_paths p
+             WHERE p.key = hub_handoffs.path AND p.expires_at > $2
+               AND (p.intent = hub_handoffs.holder_intent
+                    OR p.intent = (SELECT s.intent FROM hub_sessions s
+                                   WHERE s.token = hub_handoffs.holder_token
+                                     AND s.session = hub_handoffs.holder_session)))",
+        &[&intent, &now, &cutoff(now)],
+    )?;
+    Ok(())
 }
 
 /// Whether the token's session is currently eligible on unfinished Work other than `work`: held
@@ -5989,48 +6106,425 @@ fn trim_session_intents(
         let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
             continue;
         };
-        let expires_at: i64 = tx
-            .query_one(
-                "SELECT expires_at FROM hub_intents WHERE id = $1",
-                &[&intent],
-            )?
-            .get(0);
-        // An expired intent holds nothing, so there is nothing to trim or announce.
-        if expires_at <= now {
-            continue;
-        }
-        let keys = tx
-            .query(
-                "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
-                &[&intent],
-            )?
-            .iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>();
-        let elsewhere = other_eligible_scopes(tx, &item.id, &token)?;
-        let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
-        if kept.len() == keys.len() {
-            continue;
-        }
-        if kept.is_empty() {
-            release_in(tx, &token, &intent, now)?;
-            continue;
-        }
-        let paths = display_all(&kept);
-        tx.execute(
-            "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
-            &[&intent, &serde_json::json!(paths).to_string(), &now],
-        )?;
-        tx.execute(
-            "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
-            &[&intent, &kept],
-        )?;
-        append(
-            tx,
-            &Event::intent_paths_changed(&intent, &paths, expires_at)?,
-        )?;
+        trim_intent(tx, item, &token, &intent, previous, now)?;
     }
     Ok(())
+}
+
+/// Trims one intent of `token` after `item`'s scope narrowed from `previous`.
+fn trim_intent(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    token: &str,
+    intent: &str,
+    previous: &[String],
+    now: i64,
+) -> Result<()> {
+    let expires_at: i64 = tx
+        .query_one(
+            "SELECT expires_at FROM hub_intents WHERE id = $1",
+            &[&intent],
+        )?
+        .get(0);
+    // An expired intent holds nothing, so there is nothing to trim or announce.
+    if expires_at <= now {
+        return Ok(());
+    }
+    let keys = tx
+        .query(
+            "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
+            &[&intent],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    let elsewhere = other_eligible_scopes(tx, &item.id, token)?;
+    let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
+    if kept.len() == keys.len() {
+        return Ok(());
+    }
+    if kept.is_empty() {
+        release_in(tx, token, intent, now)?;
+        return Ok(());
+    }
+    let paths = display_all(&kept);
+    tx.execute(
+        "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
+        &[&intent, &serde_json::json!(paths).to_string(), &now],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
+        &[&intent, &kept],
+    )?;
+    lapse_unheld_asks(tx, intent, now)?;
+    append(
+        tx,
+        &Event::intent_paths_changed(intent, &paths, expires_at)?,
+    )?;
+    Ok(())
+}
+
+/// The body of a work transition, run in the caller's transaction. The caller commits.
+fn work_transition_in(
+    tx: &mut postgres::Transaction<'_>,
+    actor: &WorkTransitionActor<'_>,
+    request: &WorkTransitionRequest,
+    now: i64,
+) -> Result<WorkTransitionResult> {
+    let who = match actor {
+        WorkTransitionActor::Agent { token } => work_who(tx, token, now)?,
+        WorkTransitionActor::Person {
+            user,
+            repository,
+            repository_id,
+            ..
+        }
+        | WorkTransitionActor::Policy {
+            owner: user,
+            repository,
+            repository_id,
+        } => {
+            if user.disabled {
+                return Err(HubError::Unauthorized);
+            }
+            work_transition::person_who(user, repository, *repository_id)
+        }
+    };
+    if who.read_only {
+        return Err(HubError::Unauthorized);
+    }
+    let via = match actor {
+        WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
+        WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+        WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
+    };
+    lock_work_capacity(tx, &who)?;
+    let scope = resolved_scope(
+        tx,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    )?;
+    lock_repository(tx, &scope)?;
+    let mut item = scoped_work(tx, &who, &request.work_id, now, true)?
+        .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+    let envelope = request.envelope(via, &who.owner.id)?;
+    if let Some(row) = tx.query_opt(
+        "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = $1 AND o.operation_id = $2",
+        &[&item.id, &request.operation_id],
+    )? {
+        let previous: String = row.get(0);
+        if previous != envelope {
+            return Err(HubError::Invalid(
+                "operation_id was already used for another request".into(),
+            ));
+        }
+        let snapshot: String = row.get(1);
+        let committed: WorkItem = json_value(&snapshot)?;
+        let event_seq: i64 = row.get(2);
+        return Ok(WorkTransitionResult {
+            holder_intents: None,
+            reclaimed: Vec::new(),
+            item,
+            receipt: Some(CheckpointReceipt {
+                work_id: request.work_id.clone(),
+                operation_id: request.operation_id.clone(),
+                generation: committed.generation,
+                event_seq,
+                replayed: true,
+            }),
+            conflict: None,
+        });
+    }
+    let acting = work_transition::classify(&item, &who, actor, request.session.as_deref())?
+        .ok_or(HubError::Unauthorized)?;
+    if matches!(actor, WorkTransitionActor::Policy { .. })
+                && request.transition == work_transition::WorkTransitionKind::Complete
+                && tx.execute(
+                    "INSERT INTO hub_work_merge_prompts (work, audience, delivered_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    &[&item.id, &super::merged_holds::HUB_COMPLETE, &now],
+                )? == 0
+            {
+                return Err(HubError::invalid_or_changed("The Hub already completed this Work once.".into()));
+            }
+    let columns_row = tx.query_one(
+        "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = $1",
+        &[&item.id],
+    )?;
+    let outcome_column: Option<String> = columns_row.get(0);
+    let basis_column: Option<String> = columns_row.get(1);
+    let held = basis_column.is_some();
+    let only_joins_since = item.updated_seq != request.expected_updated_seq
+                && !request.transition.needs_exact_seq()
+                && tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)
+                            AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1
+                                AND seq > $2 AND seq <= $3 AND kind <> 'work_joined')
+                    AND $2 >= COALESCE((SELECT MAX(r.event_floor_seq) FROM hub_work_retention r
+                        JOIN hub_work_items w ON w.id = $1 AND r.provider = w.provider
+                        AND r.host = w.host AND r.repository = w.repository
+                        AND r.repository_id IS NOT DISTINCT FROM w.repository_id), 0)",
+                        &[&item.id, &request.expected_updated_seq, &item.updated_seq],
+                    )?
+                    .get::<_, bool>(0);
+    work_transition::check(&item, held, &acting, request, only_joins_since)?;
+    if request.transition == work_transition::WorkTransitionKind::Retain
+        && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
+    {
+        return Err(HubError::lease_lapsed(lapsed_unheld_text(
+            &item.id,
+            item.generation,
+            renewed,
+            expired,
+            Unheld::Retain,
+        )));
+    }
+    if let Some(by) = &request.superseded_by {
+        relation_targets(tx, &who, std::slice::from_ref(by))?;
+    }
+    let mut lapsed = Vec::new();
+    if request.transition == work_transition::WorkTransitionKind::Reopen {
+        // Reopening is a fresh admission whatever the client checked beforehand.
+        lapsed = lapsed_overlapping(tx, &who, &item.scope, Some(&item.id), now)?;
+        let overlaps = work_scope_overlaps(tx, &who, &item.scope, Some(&item.id), now)?;
+        if let Some(first) = overlaps.first() {
+            let conflict = WorkStartConflict {
+                kind: WorkConflictKind::ScopeOverlap,
+                current_generation: first.item.generation,
+                overlaps,
+                operational: Vec::new(),
+            };
+            return Ok(WorkTransitionResult {
+                holder_intents: None,
+                reclaimed: Vec::new(),
+                item,
+                receipt: None,
+                conflict: Some(conflict),
+            });
+        }
+    }
+    let prior = work_transition::Prior {
+        state: item.state,
+        basis: basis_column
+            .as_deref()
+            .and_then(work_transition::ReservationBasis::from_column),
+        outcome: outcome_column
+            .as_deref()
+            .and_then(work_transition::TerminalOutcome::from_column),
+        generation: item.generation,
+        lead_token: item.lead_token.clone(),
+        lead_agent: item.lead_agent.clone(),
+        lead_session: item.lead_session.clone(),
+    };
+    let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+    let previous_scope = item.scope.clone();
+    let columns = work_transition::apply(&mut item, request, &acting, &prior, now)?;
+    let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
+    let seq = append(tx, &event)?;
+    item.updated_seq = seq;
+    let snapshot = save_work_version(tx, &item, seq)?;
+    // A prune or a partial release changes neither the outcome nor the reservation, so its
+    // lease is not reset.
+    if !matches!(
+        request.transition,
+        work_transition::WorkTransitionKind::PruneParticipants
+            | work_transition::WorkTransitionKind::ReleasePaths
+    ) {
+        set_work_reservation(
+            tx,
+            &item.id,
+            columns
+                .outcome
+                .map(work_transition::TerminalOutcome::column),
+            columns.basis.map(work_transition::ReservationBasis::column),
+            now,
+        )?;
+    }
+    let reclaimed = lapse_reservations(tx, &who, &lapsed, &item.id, now)?;
+    if request.superseded_by.is_some() {
+        replace_relations(tx, &who, &item.id, &item.depends_on, &item.related_work)?;
+    }
+    for removed in &columns.removed {
+        tx.execute(
+            "DELETE FROM hub_work_participants WHERE work = $1 AND token = $2 AND session = $3",
+            &[&item.id, &removed.token, &removed.session],
+        )?;
+        // The intent a pruned session holds for this Work goes with it, unless the
+        // session is still eligible on other Work.
+        if !session_eligible_elsewhere(tx, &item.id, &removed.token, &removed.session)? {
+            release_session_intent(tx, &removed.token, &removed.session, now)?;
+        }
+    }
+    if request.transition == work_transition::WorkTransitionKind::Reopen {
+        tx.execute(
+            "UPDATE hub_work_participants SET role = 'helper', updated_at = $2
+                     WHERE work = $1 AND role = 'lead'",
+            &[&item.id, &now],
+        )?;
+        tx.execute(
+                    "INSERT INTO hub_work_participants
+                        (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)
+                     ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
+                        owner = excluded.owner, agent = excluded.agent,
+                        generation = excluded.generation, updated_at = excluded.updated_at",
+                    &[
+                        &item.id,
+                        &item.lead_token,
+                        &acting.user_id,
+                        &item.lead_agent,
+                        &item.lead_session,
+                        &item.generation,
+                        &now,
+                    ],
+                )?;
+    }
+    if request.transition == work_transition::WorkTransitionKind::Reopen
+        && prior.lead_changed(&item)
+    {
+        // Open requests followed the old lead; they go back to waiting for the new one.
+        retarget_coordination_requests(
+            tx,
+            &who,
+            &item.id,
+            item.generation,
+            &item.lead_session,
+            now,
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO hub_work_checkpoint_ops (work, operation_id, request, event_seq)
+                 VALUES ($1, $2, $3, $4)",
+        &[&item.id, &request.operation_id, &envelope, &seq],
+    )?;
+    let mut delta = work_transition_payload_bytes(&snapshot, &event)?
+        .checked_sub(previous_item_bytes)
+        .and_then(|bytes| bytes.checked_add(work_payload_row_bytes(envelope.len()).ok()?))
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    if work_transition::releases_claims(request.transition) {
+        let cause = work_transition::ReleaseCause::transition(request, &acting);
+        delta = delta
+            .checked_add(release_work_holds(
+                tx,
+                &item,
+                &cause,
+                prior.basis.is_some(),
+                now,
+            )?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        record_work_payload_delta(tx, &who, delta, now)?;
+    } else if request.transition == work_transition::WorkTransitionKind::ReleasePaths {
+        let cause = work_transition::ReleaseCause::transition(request, &acting);
+        delta = delta
+            .checked_add(release_path_holds(
+                tx,
+                &item,
+                &previous_scope,
+                &request.released_keys()?,
+                &cause,
+                now,
+            )?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        // Cleanup of claims: its size is recorded without a quota check, as for a release.
+        record_work_payload_delta(tx, &who, delta, now)?;
+    } else {
+        adjust_work_payload_capacity(tx, &who, delta, now)?;
+    }
+    work_dependencies::changed(tx, &who, &item, now)?;
+    Ok(WorkTransitionResult {
+        holder_intents: None,
+        reclaimed,
+        receipt: Some(CheckpointReceipt {
+            work_id: item.id.clone(),
+            operation_id: request.operation_id.clone(),
+            generation: item.generation,
+            event_seq: seq,
+            replayed: false,
+        }),
+        item,
+        conflict: None,
+    })
+}
+
+/// Frees only the released paths of a partial release: from every participant session's intent
+/// and from the participants' tokens' session-less intents, then records the
+/// `coordination_target_released` event of each open request that targets the Work and asks for
+/// a released path. Returns the payload bytes the request events add.
+fn release_path_holds(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    previous: &[String],
+    released: &[String],
+    cause: &work_transition::ReleaseCause,
+    now: i64,
+) -> Result<i64> {
+    trim_session_intents(tx, item, previous, now)?;
+    let mut tokens: Vec<String> = work_transition::claim_sessions(item)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect();
+    tokens.dedup();
+    for token in tokens {
+        let intents = tx.query(
+            "SELECT i.id FROM hub_intents i
+             WHERE i.token = $1 AND i.released_at IS NULL AND i.expires_at > $2
+               AND NOT EXISTS (SELECT 1 FROM hub_sessions s WHERE s.intent = i.id)
+             ORDER BY i.id",
+            &[&token, &now],
+        )?;
+        for row in intents {
+            let intent: String = row.get(0);
+            trim_intent(tx, item, &token, &intent, previous, now)?;
+        }
+    }
+    note_released_requests(tx, item, released, cause, now)
+}
+
+/// Records the `coordination_target_released` event of each open request that targets the Work
+/// and asks for a released path. Returns the payload bytes the events add.
+fn note_released_requests(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    released: &[String],
+    cause: &work_transition::ReleaseCause,
+    now: i64,
+) -> Result<i64> {
+    let open = tx.query(
+        "SELECT r.id, r.status, r.proposed_work, r.proposed_scope
+         FROM hub_coordination_requests r
+         WHERE r.status IN ('pending', 'responded')
+           AND EXISTS (SELECT 1 FROM hub_coordination_targets t
+                       WHERE t.request = r.id AND t.work = $1)
+         ORDER BY r.id",
+        &[&item.id],
+    )?;
+    let mut delta = 0i64;
+    for row in open {
+        let id: String = row.get(0);
+        let status: String = row.get(1);
+        let proposed_work: Option<String> = row.get(2);
+        let proposed: Vec<String> = json_value(&row.get::<_, String>(3))?;
+        if scope_overlap_reasons(released, &proposed).is_empty() {
+            continue;
+        }
+        let event = work_transition::released_target_event(&id, item, cause)?;
+        let seq = append(tx, &event)?;
+        save_coordination_version(
+            tx,
+            &id,
+            parse_status(&status)?,
+            proposed_work.as_deref(),
+            now,
+            seq,
+        )?;
+        delta = delta
+            .checked_add(coordination_payload_bytes(&[""], &event)?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    }
+    Ok(delta)
 }
 
 /// Releases the token's live intents that no session holds and that cover part of `scope`.
@@ -7122,17 +7616,40 @@ fn handoffs_in(
          ORDER BY h.created_at, h.id LIMIT $4",
         &[&token, &session, &cutoff(now), &PER_TOUCH],
     )?;
+    // A request whose holder let go of the file is moot: lapse it so the requester is told once.
+    tx.execute(
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $4
+         WHERE requester_token = $1 AND requester_session = $2 AND state = 'pending'
+           AND created_at > $3
+           AND NOT EXISTS (
+             SELECT 1 FROM hub_intent_paths p
+             WHERE p.key = hub_handoffs.path AND p.expires_at > $4
+               AND (p.intent = hub_handoffs.holder_intent
+                    OR p.intent = (SELECT s.intent FROM hub_sessions s
+                                   WHERE s.token = hub_handoffs.holder_token
+                                     AND s.session = hub_handoffs.holder_session)))",
+        &[&token, &session, &cutoff(now), &now],
+    )?;
     let answers = tx.query(
         "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
-                h.answered_via_slack, h.holder_token, h.holder_session, hs.via
+                h.answered_via_slack, h.holder_token, h.holder_session, hs.via,
+                EXISTS (SELECT 1 FROM hub_intent_paths p
+                        WHERE (p.key = h.path
+                               OR (right(p.key, 1) = '/'
+                                   AND left(h.path, length(p.key)) = p.key))
+                          AND p.repository_scope = h.repository_scope
+                          AND p.expires_at > $4
+                          AND p.intent IS DISTINCT FROM (SELECT s.intent FROM hub_sessions s
+                                                         WHERE s.token = h.requester_token
+                                                           AND s.session = h.requester_session))
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
          LEFT JOIN hub_sessions hs
            ON hs.token = h.holder_token AND hs.session = h.holder_session
          WHERE h.requester_token = $1 AND h.requester_session = $2
-           AND h.state IN ('granted', 'declined') AND NOT h.requester_told
+           AND h.state IN ('granted', 'declined', 'lapsed') AND NOT h.requester_told
          ORDER BY h.decided_at, h.id LIMIT $3",
-        &[&token, &session, &PER_TOUCH],
+        &[&token, &session, &PER_TOUCH, &now],
     )?;
     let told = |tx: &mut postgres::Transaction<'_>, column: &str, rows: &[postgres::Row]| {
         let ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
@@ -7177,7 +7694,7 @@ fn handoffs_in(
             )
         })
         .chain(answers.iter().map(|row| {
-            let kind = answer_kind(row.get(1));
+            let kind = answer_kind(row.get(1), row.get(11));
             note(
                 kind,
                 row.get(2),
@@ -7192,11 +7709,13 @@ fn handoffs_in(
         .collect())
 }
 
-/// Ends a request without an answer.
-fn lapse(tx: &mut postgres::Transaction<'_>, request: &str, now: i64) -> Result<()> {
+/// Ends a request without an answer. `told` is true when the requester is gone, so no receipt
+/// is owed.
+fn lapse(tx: &mut postgres::Transaction<'_>, request: &str, now: i64, told: bool) -> Result<()> {
     tx.execute(
-        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2 WHERE id = $1",
-        &[&request, &now],
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2, requester_told = $3
+         WHERE id = $1",
+        &[&request, &now, &told],
     )?;
     Ok(())
 }
@@ -8046,6 +8565,13 @@ fn checkpoint_overlap_in(
             }
         }
     }
+    let finished = checkpoint.finished_after(
+        &item.finished_paths,
+        checkpoint
+            .normalized_scope()?
+            .as_ref()
+            .unwrap_or(&item.scope),
+    )?;
     let mut lapsed = Vec::new();
     if let Some(scope) = checkpoint.normalized_scope()? {
         // Work without a reservation claims nothing, so its scope change has nothing to check.
@@ -8117,6 +8643,7 @@ fn checkpoint_overlap_in(
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
     }
+    item.finished_paths = finished;
     if checkpoint.branch.is_some() {
         item.branch = checkpoint.branch.clone();
     }
@@ -8203,6 +8730,17 @@ fn checkpoint_overlap_in(
         && item.scope != previous_scope
     {
         trim_session_intents(tx, &item, &previous_scope, now)?;
+        // A requester is told which of the files it asked for the narrowing dropped.
+        let dropped: Vec<String> = previous_scope
+            .iter()
+            .filter(|key| !item.scope.contains(key))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            let cause = work_transition::ReleaseCause::narrowing(&who.owner.id, &dropped);
+            let noted = note_released_requests(tx, &item, &dropped, &cause, now)?;
+            record_work_payload_delta(tx, &who, noted, now)?;
+        }
     }
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
@@ -9703,7 +10241,7 @@ impl Store for PgStore {
             // Preserve this operation's unavailable decision even if an owner
             // is re-enabled concurrently: touch_in requires the lock above.
             if !requester_available {
-                lapse(&mut tx, &request.id, now)?;
+                lapse(&mut tx, &request.id, now, true)?;
                 tx.commit()?;
                 return Ok(Answered::NoRequest);
             }
@@ -9730,7 +10268,7 @@ impl Store for PgStore {
             };
             // A request for a file its holder let go of is moot.
             let Some(current) = current.filter(|held| still_holds(held, &key)) else {
-                lapse(&mut tx, &request.id, now)?;
+                lapse(&mut tx, &request.id, now, false)?;
                 tx.commit()?;
                 return Ok(Answered::NotHeld);
             };
@@ -9739,7 +10277,7 @@ impl Store for PgStore {
                     Ok(requester) => requester,
                     // The requester's token is gone: nobody to hand the file to.
                     Err(HubError::Unauthorized) => {
-                        lapse(&mut tx, &request.id, now)?;
+                        lapse(&mut tx, &request.id, now, true)?;
                         tx.commit()?;
                         return Ok(Answered::NoRequest);
                     }
@@ -9752,7 +10290,7 @@ impl Store for PgStore {
                     &request.requester_session,
                 )?
                 else {
-                    lapse(&mut tx, &request.id, now)?;
+                    lapse(&mut tx, &request.id, now, true)?;
                     tx.commit()?;
                     return Ok(Answered::NoRequest);
                 };
@@ -12168,264 +12706,13 @@ impl Store for PgStore {
         request.validate()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
-        if let Some((token, session, incarnation)) = guard {
-            let native_session = session_name(&mut tx, token, session, now)?;
-            session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
-        }
-            let who = match actor {
-                WorkTransitionActor::Agent { token } => work_who(&mut tx, token, now)?,
-                WorkTransitionActor::Person {
-                    user,
-                    repository,
-                    repository_id,
-                    ..
-                }
-                | WorkTransitionActor::Policy {
-                    owner: user,
-                    repository,
-                    repository_id,
-                } => {
-                    if user.disabled {
-                        return Err(HubError::Unauthorized);
-                    }
-                    work_transition::person_who(user, repository, *repository_id)
-                }
-            };
-            if who.read_only {
-                return Err(HubError::Unauthorized);
+            if let Some((token, session, incarnation)) = guard {
+                let native_session = session_name(&mut tx, token, session, now)?;
+                session_lifecycle::check(&mut tx, token, &native_session, incarnation, now)?;
             }
-            let via = match actor {
-                WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
-                WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
-                WorkTransitionActor::Policy { .. } => work_transition::ActorVia::Policy,
-            };
-            lock_work_capacity(&mut tx, &who)?;
-            let scope =
-                resolved_scope(&mut tx, &who.owner.identity.host, &who.repository, who.repository_id)?;
-            lock_repository(&mut tx, &scope)?;
-            let mut item = scoped_work(&mut tx, &who, &request.work_id, now, true)?
-                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
-            let envelope = request.envelope(via, &who.owner.id)?;
-            if let Some(row) = tx.query_opt(
-                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
-                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
-                 WHERE o.work = $1 AND o.operation_id = $2",
-                &[&item.id, &request.operation_id],
-            )? {
-                let previous: String = row.get(0);
-                if previous != envelope {
-                    return Err(HubError::Invalid(
-                        "operation_id was already used for another request".into(),
-                    ));
-                }
-                let snapshot: String = row.get(1);
-                let committed: WorkItem = json_value(&snapshot)?;
-                let event_seq: i64 = row.get(2);
-                tx.commit()?;
-                return Ok(WorkTransitionResult {
-                holder_intents: None,
-                    reclaimed: Vec::new(),
-                    item,
-                    receipt: Some(CheckpointReceipt {
-                        work_id: request.work_id.clone(),
-                        operation_id: request.operation_id.clone(),
-                        generation: committed.generation,
-                        event_seq,
-                        replayed: true,
-                    }),
-                    conflict: None,
-                });
-            }
-            let acting =
-                work_transition::classify(&item, &who, actor, request.session.as_deref())?
-                    .ok_or(HubError::Unauthorized)?;
-            if matches!(actor, WorkTransitionActor::Policy { .. })
-                && request.transition == work_transition::WorkTransitionKind::Complete
-                && tx.execute(
-                    "INSERT INTO hub_work_merge_prompts (work, audience, delivered_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                    &[&item.id, &super::merged_holds::HUB_COMPLETE, &now],
-                )? == 0
-            {
-                return Err(HubError::invalid_or_changed("The Hub already completed this Work once.".into()));
-            }
-            let columns_row = tx.query_one(
-                "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = $1",
-                &[&item.id],
-            )?;
-            let outcome_column: Option<String> = columns_row.get(0);
-            let basis_column: Option<String> = columns_row.get(1);
-            let held = basis_column.is_some();
-            let only_joins_since = item.updated_seq != request.expected_updated_seq
-                && request.transition != work_transition::WorkTransitionKind::PruneParticipants
-                && tx
-                    .query_one(
-                        "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)
-                            AND NOT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1
-                                AND seq > $2 AND seq <= $3 AND kind <> 'work_joined')
-                    AND $2 >= COALESCE((SELECT MAX(r.event_floor_seq) FROM hub_work_retention r
-                        JOIN hub_work_items w ON w.id = $1 AND r.provider = w.provider
-                        AND r.host = w.host AND r.repository = w.repository
-                        AND r.repository_id IS NOT DISTINCT FROM w.repository_id), 0)",
-                        &[&item.id, &request.expected_updated_seq, &item.updated_seq],
-                    )?
-                    .get::<_, bool>(0);
-            work_transition::check(&item, held, &acting, request, only_joins_since)?;
-            if request.transition == work_transition::WorkTransitionKind::Retain
-                && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
-            {
-                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id,item.generation, renewed, expired, Unheld::Retain)));
-            }
-            if let Some(by) = &request.superseded_by {
-                relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
-            }
-            let mut lapsed = Vec::new();
-            if request.transition == work_transition::WorkTransitionKind::Reopen {
-                // Reopening is a fresh admission whatever the client checked beforehand.
-                lapsed = lapsed_overlapping(&mut tx, &who, &item.scope, Some(&item.id), now)?;
-                let overlaps =
-                    work_scope_overlaps(&mut tx, &who, &item.scope, Some(&item.id), now)?;
-                if let Some(first) = overlaps.first() {
-                    let conflict = WorkStartConflict {
-                        kind: WorkConflictKind::ScopeOverlap,
-                        current_generation: first.item.generation,
-                        overlaps,
-                        operational: Vec::new(),
-                    };
-                    return Ok(WorkTransitionResult {
-                holder_intents: None,
-                        reclaimed: Vec::new(),
-                        item,
-                        receipt: None,
-                        conflict: Some(conflict),
-                    });
-                }
-            }
-            let prior = work_transition::Prior {
-                state: item.state,
-                basis: basis_column
-                    .as_deref()
-                    .and_then(work_transition::ReservationBasis::from_column),
-                outcome: outcome_column
-                    .as_deref()
-                    .and_then(work_transition::TerminalOutcome::from_column),
-                generation: item.generation,
-                lead_token: item.lead_token.clone(),
-                lead_agent: item.lead_agent.clone(),
-                lead_session: item.lead_session.clone(),
-            };
-            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
-            let columns = work_transition::apply(&mut item, request, &acting, &prior, now)?;
-            let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
-            let seq = append(&mut tx, &event)?;
-            item.updated_seq = seq;
-            let snapshot = save_work_version(&mut tx, &item, seq)?;
-            // A prune changes neither the outcome nor the reservation, so its lease is not reset.
-            if request.transition != work_transition::WorkTransitionKind::PruneParticipants {
-                set_work_reservation(
-                    &mut tx,
-                    &item.id,
-                    columns.outcome.map(work_transition::TerminalOutcome::column),
-                    columns.basis.map(work_transition::ReservationBasis::column),
-                    now,
-                )?;
-            }
-            let reclaimed = lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
-            if request.superseded_by.is_some() {
-                replace_relations(
-                    &mut tx,
-                    &who,
-                    &item.id,
-                    &item.depends_on,
-                    &item.related_work,
-                )?;
-            }
-            for removed in &columns.removed {
-                tx.execute(
-                    "DELETE FROM hub_work_participants WHERE work = $1 AND token = $2 AND session = $3",
-                    &[&item.id, &removed.token, &removed.session],
-                )?;
-                // The intent a pruned session holds for this Work goes with it, unless the
-                // session is still eligible on other Work.
-                if !session_eligible_elsewhere(&mut tx, &item.id, &removed.token, &removed.session)? {
-                    release_session_intent(&mut tx, &removed.token, &removed.session, now)?;
-                }
-            }
-            if request.transition == work_transition::WorkTransitionKind::Reopen {
-                tx.execute(
-                    "UPDATE hub_work_participants SET role = 'helper', updated_at = $2
-                     WHERE work = $1 AND role = 'lead'",
-                    &[&item.id, &now],
-                )?;
-                tx.execute(
-                    "INSERT INTO hub_work_participants
-                        (work, token, owner, agent, session, role, generation, created_at, updated_at)
-                     VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)
-                     ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
-                        owner = excluded.owner, agent = excluded.agent,
-                        generation = excluded.generation, updated_at = excluded.updated_at",
-                    &[
-                        &item.id,
-                        &item.lead_token,
-                        &acting.user_id,
-                        &item.lead_agent,
-                        &item.lead_session,
-                        &item.generation,
-                        &now,
-                    ],
-                )?;
-            }
-            if request.transition == work_transition::WorkTransitionKind::Reopen
-                && prior.lead_changed(&item)
-            {
-                // Open requests followed the old lead; they go back to waiting for the new one.
-                retarget_coordination_requests(
-                    &mut tx,
-                    &who,
-                    &item.id,
-                    item.generation,
-                    &item.lead_session,
-                    now,
-                )?;
-            }
-            tx.execute(
-                "INSERT INTO hub_work_checkpoint_ops (work, operation_id, request, event_seq)
-                 VALUES ($1, $2, $3, $4)",
-                &[&item.id, &request.operation_id, &envelope, &seq],
-            )?;
-            let mut delta = work_transition_payload_bytes(&snapshot, &event)?
-                .checked_sub(previous_item_bytes)
-                .and_then(|bytes| bytes.checked_add(work_payload_row_bytes(envelope.len()).ok()?))
-                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
-            if work_transition::releases_claims(request.transition) {
-                let cause = work_transition::ReleaseCause::transition(request, &acting);
-                delta = delta
-                    .checked_add(release_work_holds(
-                        &mut tx,
-                        &item,
-                        &cause,
-                        prior.basis.is_some(),
-                        now,
-                    )?)
-                    .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
-                record_work_payload_delta(&mut tx, &who, delta, now)?;
-            } else {
-                adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
-            }
-                work_dependencies::changed(&mut tx, &who, &item, now)?;
+            let result = work_transition_in(&mut tx, actor, request, now)?;
             tx.commit()?;
-            Ok(WorkTransitionResult {
-                holder_intents: None,
-                reclaimed,
-                receipt: Some(CheckpointReceipt {
-                    work_id: item.id.clone(),
-                    operation_id: request.operation_id.clone(),
-                    generation: item.generation,
-                    event_seq: seq,
-                    replayed: false,
-                }),
-                item,
-                conflict: None,
-            })
+            Ok(result)
         })
     }
 
@@ -15965,9 +16252,9 @@ impl Store for PgStore {
                 coordination_request_at(&mut tx, &who, &ack.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
             let (target, generation) = match &ack.target_work_id {
-                None if coordination_is_requester(&request, &who, &ack.session) => ("", 0),
+                None if coordination_is_requester(&request, &who, &native_session) => ("", 0),
                 Some(work) => {
-                    let target = coordination_target_for(&request, work, &who, &ack.session)
+                    let target = coordination_target_for(&request, work, &who, &native_session)
                         .ok_or(HubError::Unauthorized)?;
                     (target.work_id.as_str(), target.generation)
                 }
@@ -16155,7 +16442,7 @@ impl Store for PgStore {
             let request = coordination_request_at(&mut tx, &who, &reply.request_id, i64::MAX, now)?
                 .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
             let target =
-                coordination_target_for(&request, &reply.target_work_id, &who, &reply.session)
+                coordination_target_for(&request, &reply.target_work_id, &who, &native_session)
                     .ok_or(HubError::Unauthorized)?;
             if coordination_operation_replay(
                 &mut tx,
@@ -16194,14 +16481,73 @@ impl Store for PgStore {
                 return Err(who.capacity(CapacityLimit::CoordinationUpdates));
             }
             let response_id = new_id("crs")?;
+            let released: Vec<String> = if reply.release_paths.is_empty() {
+                Vec::new()
+            } else {
+                // No row lock here: the transition takes the repository lock before the row,
+                // and its exact updated_seq fence refuses a Work that changed in between.
+                let work = scoped_work(&mut tx, &who, &target.work_id, now, false)?
+                    .ok_or_else(|| HubError::Unavailable("target work is missing".into()))?;
+                let release = reply.release(
+                    &request.proposal.scope,
+                    &work.id,
+                    target.generation,
+                    work.updated_seq,
+                    &response_id,
+                    &native_session,
+                )?;
+                release.validate()?;
+                // The person who owns the lead answered through the Hub: record them, not the agent.
+                let actor = if reply.via == Via::Agent {
+                    WorkTransitionActor::Agent { token }
+                } else {
+                    let repository_id = match who.repository_id {
+                        Some(id) => id,
+                        None => tx
+                            .query_one(
+                                "SELECT repository_id FROM hub_work_items WHERE id = $1",
+                                &[&work.id],
+                            )?
+                            .get::<_, Option<i64>>(0)
+                            .ok_or(HubError::Unauthorized)?,
+                    };
+                    WorkTransitionActor::Person {
+                        user: &who.owner,
+                        repository: &who.repository,
+                        repository_id,
+                        is_admin: false,
+                    }
+                };
+                work_transition_in(&mut tx, &actor, &release, now).map_err(|error| {
+                    // The replier passed no updated_seq: the Work changed after the unlocked read.
+                    match error {
+                        HubError::Invalid(message)
+                            if message.starts_with("transition receipt expired") =>
+                        {
+                            HubError::Invalid(
+                                "the target Work changed while replying; send the reply again"
+                                    .into(),
+                            )
+                        }
+                        other => other,
+                    }
+                })?;
+                super::intent::display_all(&release.released_keys()?)
+            };
+            let released_paths = (!released.is_empty())
+                .then(|| json_string(&released))
+                .transpose()?;
             let event = coordination_event(
                 "coordination_responded",
                 &request.id,
                 now,
                 with_via(
-                    json!({"response_id": response_id, "target_work_id": target.work_id,
+                    with_released(
+                        json!({"response_id": response_id, "target_work_id": target.work_id,
                         "kind": response_kind_name(reply.kind), "token": who.token,
                         "session": reply.session, "generation": target.generation}),
+                        &released,
+                    ),
                     reply.via.tag(),
                 ),
             )?;
@@ -16209,8 +16555,8 @@ impl Store for PgStore {
             tx.execute(
                 "INSERT INTO hub_coordination_responses
                  (id,request,operation_id,target_work,token,agent,session,owner,login,
-                  target_generation,kind,note,created_at,event_seq,via)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+                  target_generation,kind,note,created_at,event_seq,via,released_paths)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
                 &[
                     &response_id,
                     &request.id,
@@ -16227,6 +16573,7 @@ impl Store for PgStore {
                     &now,
                     &seq,
                     &reply.via.tag(),
+                    &released_paths,
                 ],
             )?;
             tx.execute(
@@ -16291,9 +16638,9 @@ impl Store for PgStore {
             let request =
                 coordination_request_at(&mut tx, &who, &resolve.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
-            let authorized = coordination_is_requester(&request, &who, &resolve.session)
+            let authorized = coordination_is_requester(&request, &who, &native_session)
                 || request.targets.iter().any(|target| {
-                    target.lead.token == who.token && target.lead.session == resolve.session
+                    target.lead.token == who.token && target.lead.session == native_session
                 });
             if !authorized {
                 return Err(HubError::invalid_or_changed(
@@ -16455,9 +16802,9 @@ impl Store for PgStore {
             let request =
                 coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
-            let requester = coordination_is_requester(&request, &who, &withdraw.session);
+            let requester = coordination_is_requester(&request, &who, &native_session);
             let leads = |target: &CoordinationTarget| {
-                target.lead.token == who.token && target.lead.session == withdraw.session
+                target.lead.token == who.token && target.lead.session == native_session
             };
             let cleanup =
                 !requester && request.requester_unavailable && request.targets.iter().any(leads);

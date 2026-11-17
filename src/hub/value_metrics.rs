@@ -1957,6 +1957,7 @@ mod tests {
             updated_at: 90,
             created_seq: 1,
             updated_seq: 2,
+            finished_paths: Vec::new(),
         }
     }
     #[test]

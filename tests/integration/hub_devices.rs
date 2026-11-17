@@ -2311,6 +2311,36 @@ fn work(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
     }
 }
 
+/// A lead's Work that also holds `src/tax.rs`, so a reply can release the file asked for and
+/// leave it a Work.
+fn work_with_tax(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
+    let mut start = work(key, session);
+    start.scope.push("src/tax.rs".into());
+    start
+}
+
+/// The `work_transition` events whose data names the released file.
+fn release_transitions(env: &Env) -> usize {
+    env.store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "work_transition" && event.data.contains("release_paths"))
+        .count()
+}
+
+/// The recorded actor of the one partial release: the person who answered, not the lead agent.
+fn assert_released_by_person(env: &Env) {
+    let events = env.store.events_after(0, 1000).unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "work_transition" && event.data.contains("release_paths"))
+        .expect("a partial release");
+    let data: Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["actor"]["via"], "person", "{data}");
+    assert_eq!(data["actor"]["login"], "alice", "{data}");
+}
+
 const REPLY: &str = "/v1/hub/session/coordination/reply";
 const ANSWER: &str = "/v1/hub/session/handoff/answer";
 const ASK: &str = "/v1/hub/session/handoff/ask";
@@ -2324,7 +2354,7 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     let (asker, asker_secret) = agent_for(&env, &bob.id, "codex", false);
     let now = unix_now();
     env.store
-        .work_start(&lead, &work("billing", "alice-session"), now)
+        .work_start(&lead, &work_with_tax("billing", "alice-session"), now)
         .unwrap();
     let request = env
         .store
@@ -2336,7 +2366,7 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
         json!({"token": token, "request_id": request.id, "operation_id": operation,
             "target_work_id": request.targets[0].work_id, "session": "alice-session",
             "expected_updated_seq": request.updated_seq, "kind": "propose_split",
-            "note": "I take tax, you take rounding"})
+            "note": "I take tax, you take rounding", "release_paths": ["src/billing.rs"]})
     };
 
     // Signed out, a cookie without its CSRF token, and a computer's bearer session are refused.
@@ -2410,12 +2440,16 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     assert_eq!(response["responder"]["login"], "alice");
     assert_eq!(response["responder"]["agent"], "claude-code");
     assert_eq!(response["responder"]["token"], json!(lead));
+    assert_eq!(response["released_paths"], json!(["src/billing.rs"]));
+    assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     // A retry replays the same answer instead of adding a second.
     let (status, replay) = page_post(&env, &alice, true, REPLY, body(&lead, "f")).await;
     assert_eq!(
         (status, replay["responses"].as_array().unwrap().len()),
         (200, 1)
     );
+    assert_eq!(release_transitions(&env), 1);
 
     // The asking agent reads it in its inbox at its next touch, marked as a person's answer.
     let (status, inbox) = env
@@ -5791,7 +5825,7 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     let (asker, _) = agent_for(&env, &bob.id, "codex", false);
     let now = unix_now();
     env.store
-        .work_start(&lead, &work("billing", "alice-session"), now)
+        .work_start(&lead, &work_with_tax("billing", "alice-session"), now)
         .unwrap();
     let request = env
         .store
@@ -5802,7 +5836,8 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     let body = |token: &str| {
         json!({"token": token, "request_id": request.id, "operation_id": "slack-1",
             "target_work_id": request.targets[0].work_id, "session": "alice-session",
-            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null})
+            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null,
+            "release_paths": ["src/billing.rs"]})
     };
     let (status, refused) = env
         .call(
@@ -5823,6 +5858,12 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     assert_eq!(status, 200, "{answered}");
     assert_eq!(answered["responses"][0]["via"], "slack");
     assert_eq!(answered["responses"][0]["responder"]["login"], "alice");
+    assert_eq!(
+        answered["responses"][0]["released_paths"],
+        json!(["src/billing.rs"])
+    );
+    assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     let (status, replay) = env
         .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
         .await;

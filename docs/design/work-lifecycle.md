@@ -96,6 +96,7 @@ fencing and session resolution stay as they are. This is not a lease. A later re
 | supersede | unfinished | yes | yes | yes | `finished`, outcome `superseded`, reservation cleared; names another Work in the same repository |
 | reopen | finished | yes, agent only | yes, agent only | no | fresh admission, described below |
 | prune_participants | any state | no | yes | yes | removes the listed non-lead participants (`participants`: `token` and `session`, 1 to 100, no repeats); state, generation, lead, outcome and reservation (lease included) are unchanged; needs no reservation |
+| release_paths | unfinished, reservation held | yes | yes | no | releases the named paths and keeps the rest (`paths`, each an exact scope entry); state, generation, lead and lease are unchanged |
 
 Every other combination is refused with `HubError::Invalid` or, for an unauthorized actor,
 `Unauthorized`. `complete`, `abandon` and `supersede` bump the generation unless the actor is the
@@ -111,6 +112,25 @@ nothing is removed. The rows are deleted in the transaction of the transition, t
 each removed session is released unless that session is eligible on other Work, and the
 `work_transition` event names each removed participant by owner, agent and session, never by
 token. It is excluded from the operational projection's `remedies`, while recovery offers it as the `prune_participants` remedy and proposes it from the `participant_cap` finding. Its event is not a lifecycle or outcome change: outcome provenance and recent outcomes skip it.
+
+`release_paths` frees named paths while the Work keeps the rest, so a waiting start can take them
+without the whole Work being released. It is for the lead or the owner (an agent with a named
+session, or the owner as a person); an administrator and the repository policy may not request it.
+`paths` is required, deduplicated and sorted, and every entry must be an exact entry of the
+Work's current scope: a path only covered by a directory entry, or not in scope, refuses the whole
+request and the refusal names it. At least one entry must remain; to release everything use
+`release`. The scope shrinks in the transaction of the transition, with no generation, state,
+lead or lease change, and it requires the exact `expected_updated_seq` like
+`prune_participants`. Only the released paths leave the intents of the participant sessions and
+of the participants' tokens' session-less intents. Each open coordination request that targets the
+Work and asks for a released path gets the existing `coordination_target_released` event with a
+`paths` field; the status is unchanged. A checkpoint that narrows the scope records the same event with the paths it dropped, so a requester sees them as released too. The `work_transition` event records `released_paths`.
+Admission of a waiting start is unchanged: it reruns `work_scope_overlaps` over live reservations,
+so a released path is free to the next `agentscm_start`, and no queue holds it. A release only
+shrinks the caller's own scope, so it never moves a file another live Work holds. The overlap
+epoch trigger bumps `overlap_epoch` when the scope changes, so overlap consents on this Work are
+invalidated; this is deliberately conservative. Like `prune_participants` it is excluded from the
+operational projection's `remedies`, and its event is not a lifecycle or outcome change.
 
 Reopen requires a session, generation, `expected_updated_seq`, `operation_id` and reason, and always
 runs the overlap check whether or not the client ran preflight. On overlap it returns a conflict and

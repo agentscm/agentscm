@@ -243,6 +243,7 @@ impl Ctx {
                     source_refs: Vec::new(),
                     depends_on: work.depends_on.clone(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 unix_now(),
             )
@@ -1555,6 +1556,7 @@ fn durable_declarations(fixture: &StoreFixture) {
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     };
     ctx.store
         .work_checkpoint(ctx.token(), &checkpoint, unix_now())
@@ -2399,6 +2401,7 @@ fn reconciliation_actors(fixture: &StoreFixture) {
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         };
         std::thread::spawn(move || {
             barrier.wait();
@@ -2945,6 +2948,7 @@ fn dependency_routing_removal_and_legacy_checkpoint(fixture: &StoreFixture) {
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     };
     let carried = ctx
         .store
@@ -2998,6 +3002,7 @@ fn dependency_routing_removal_and_legacy_checkpoint(fixture: &StoreFixture) {
         source_refs: vec![],
         depends_on: vec![prerequisite.id.clone()],
         related_work: vec![],
+        finished_paths: None,
     };
     let mut clearing = checkpoint.clone();
     clearing.operation_id = "legacy-clear-hints".into();
@@ -3078,6 +3083,7 @@ fn dependency_fanout_does_not_block_cleanup(fixture: &StoreFixture) {
                     reason: "Keep the declared dependency while releasing scope".into(),
                     superseded_by: None,
                     participants: Vec::new(),
+                    paths: Vec::new(),
                 },
                 unix_now(),
             )

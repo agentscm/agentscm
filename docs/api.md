@@ -52,7 +52,7 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 
 | Route | Effect |
 |---|---|
-| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps) |
+| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps). The body may carry `release_paths` (see [standup](standup.md)) |
 | `POST /v1/hub/session/coordination/withdraw` | Close a request whose requesting agent is gone, for the agent that leads the target Work; recorded with `via: "hub"` |
 | `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent; through a connected app, recorded as `answered_via_slack` |
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
@@ -141,10 +141,10 @@ identity, permission, generation and `updated_seq` in its own transaction. See
 |---|---|---|
 | `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work, typed remedies (including `prune_participants`) and per-Work `findings` (`kind`, `evidence`, `complete`, optional `proposed` and `pull_request`; kinds `lapsed_hold`, `abandoned_session`, `orphaned_requests`, `contradictory_blocker`, `participant_cap` and `hidden_hold`, a live hold that a merged pull request hides, report-only and naming the pull request when the stage read shows it merged, and `no_pr_link`, report-only, for retained Work known to have no pull request link). `all_owners` is refused here |
 | `POST /v1/hub/standup/recovery/preview` | Agent or read-only bearer token | Body `work_id`, `remedy`, optional `session`, `scope` (handover) and `superseded_by` (supersede): effects, fences and the apply call |
-| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item. An item may carry `participants` (`token`, `session`) for `prune_participants` |
+| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item. An item may carry `participants` (`token`, `session`) for `prune_participants` or `paths` for `release_paths` |
 | `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's by `work_id` as a Hub administrator. Optional `all_owners: true`, for a Hub administrator only and not with `work_id`, pages every owner's unfinished Work; others get 400 "only a Hub administrator can inspect every owner's Work" |
 | `POST /v1/hub/session/work/recovery/preview` | Web sign-in with CSRF | The person's preview; `repository`, `work_id`, `remedy`, optional `scope` and `superseded_by` |
-| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items`; an item may carry `participants` for `prune_participants` |
+| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items`; an item may carry `participants` for `prune_participants` or `paths` for `release_paths` |
 
 MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
 `agentscm_work_transitions`.
@@ -445,6 +445,8 @@ work projections, whose usage totals count cache-read and cache-creation input b
 output. The last returns one work item's stored usage reports, at most 100 per page, without the
 session, author or reporter-supplied identifiers. See [work insights](work-insights.md) for
 pagination and evidence limits.
+
+The checkpoint body of `POST /v1/hub/standup/checkpoint` and MCP may carry `finished_paths` (exact scope entries the lead reports as done; see [standup](standup.md)); it is a self-report and the item shows it only when non-empty. An empty list clears the set; leaving the field out keeps it.
 
 `POST /v1/hub/standup/checkpoint` returns HTTP 409 with
 `{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the

@@ -710,6 +710,7 @@ fn a_reopened_or_resumed_work_is_not_completed_again(db_with: impl Fn() -> Db) {
                 reason: "more to do".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             at,
         )

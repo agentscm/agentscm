@@ -115,6 +115,9 @@ pub struct WorkTransitionRequest {
     /// otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<ParticipantRef>,
+    /// The scope entries to release; required for `release_paths` and refused otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 /// One participant of a Work, named the way the Work lists it. A session may be its native id or
@@ -170,6 +173,16 @@ impl WorkTransitionRequest {
             }
             _ => {}
         }
+        match (self.transition, self.paths.is_empty()) {
+            (WorkTransitionKind::ReleasePaths, true) => {
+                return Err(invalid("release_paths requires paths"));
+            }
+            (WorkTransitionKind::ReleasePaths, false) => {
+                self.released_keys()?;
+            }
+            (_, false) => return Err(invalid("paths is only valid for release_paths")),
+            _ => {}
+        }
         match (self.transition, self.participants.is_empty()) {
             (WorkTransitionKind::PruneParticipants, true) => {
                 return Err(invalid("prune_participants requires participants"));
@@ -199,6 +212,11 @@ impl WorkTransitionRequest {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The paths a `release_paths` names as sorted, deduplicated scope keys.
+    pub(super) fn released_keys(&self) -> Result<Vec<String>> {
+        super::work::normalized_scope(&self.paths)
     }
 
     /// The exact-retry identity: every request field and who asked, never the actor's role.
@@ -406,12 +424,13 @@ pub(super) fn apply(
     now: i64,
 ) -> Result<Columns> {
     use WorkTransitionKind::{
-        Abandon, Complete, PruneParticipants, Release, Reopen, Retain, Supersede,
+        Abandon, Complete, PruneParticipants, Release, ReleasePaths, Reopen, Retain, Supersede,
     };
     let lead = acting.kind == WorkActorKind::Lead;
     item.updated_at = now;
     Ok(match request.transition {
         Release => {
+            item.finished_paths.clear();
             item.generation += 1;
             if item.state == WorkState::Active {
                 item.state = WorkState::Paused;
@@ -427,6 +446,32 @@ pub(super) fn apply(
             basis: Some(ReservationBasis::Retained),
             removed: Vec::new(),
         },
+        ReleasePaths => {
+            let released = request.released_keys()?;
+            let absent: Vec<String> = released
+                .iter()
+                .filter(|key| !item.scope.contains(key))
+                .map(|key| super::intent::display(key))
+                .collect();
+            if !absent.is_empty() {
+                return Err(HubError::Invalid(format!(
+                    "release_paths names paths that are not exact entries of the Work's scope: {}",
+                    absent.join(", ")
+                )));
+            }
+            item.scope.retain(|key| !released.contains(key));
+            item.finished_paths.retain(|key| !released.contains(key));
+            if item.scope.is_empty() {
+                return Err(invalid(
+                    "release_paths would release the whole scope; use release instead",
+                ));
+            }
+            Columns {
+                outcome: prior.outcome,
+                basis: prior.basis,
+                removed: Vec::new(),
+            }
+        }
         PruneParticipants => {
             let names = |participant: &WorkParticipant, wanted: &ParticipantRef| {
                 participant.token == wanted.token
@@ -521,6 +566,7 @@ pub(super) fn apply(
             item.lead_token = token.clone();
             item.lead_agent = agent.clone();
             item.lead_session = session.clone();
+            item.finished_paths.clear();
             item.generation += 1;
             item.state = WorkState::Active;
             item.last_checkin_at = now;
@@ -570,6 +616,9 @@ pub(super) fn event(
             "basis": columns.basis,
             "superseded_by": request.superseded_by,
             "removed_participants": (!removed.is_empty()).then_some(removed),
+            "released_paths": (request.transition == WorkTransitionKind::ReleasePaths)
+                .then(|| request.released_keys().map(|keys| super::intent::display_all(&keys)))
+                .transpose()?,
             "lead": lead_acted_on,
             "generation": item.generation, "owner": item.owner,
             "repository": item.repository, "state": item.state,
@@ -583,6 +632,8 @@ pub(super) fn event(
 pub(super) struct ReleaseCause {
     transition: &'static str,
     actor: serde_json::Value,
+    /// The released paths of a partial release; empty for a whole one.
+    paths: Vec<String>,
 }
 
 impl ReleaseCause {
@@ -590,6 +641,10 @@ impl ReleaseCause {
         Self {
             transition: request.transition.as_str(),
             actor: json!({"kind": acting.kind, "id": acting.user_id, "via": acting.via}),
+            paths: request
+                .released_keys()
+                .map(|keys| super::intent::display_all(&keys))
+                .unwrap_or_default(),
         }
     }
 
@@ -598,6 +653,17 @@ impl ReleaseCause {
         Self {
             transition: "lapse",
             actor: json!({"kind": "lease"}),
+            paths: Vec::new(),
+        }
+    }
+
+    /// A checkpoint by the lead session of an agent token owned by `owner` that narrowed the
+    /// scope and dropped these keys.
+    pub(super) fn narrowing(owner: &str, dropped: &[String]) -> Self {
+        Self {
+            transition: "checkpoint",
+            actor: json!({"kind": WorkActorKind::Lead, "id": owner, "via": ActorVia::Agent}),
+            paths: super::intent::display_all(dropped),
         }
     }
 
@@ -606,6 +672,7 @@ impl ReleaseCause {
         Self {
             transition: "finish",
             actor: json!({"kind": WorkActorKind::Lead, "id": owner, "via": ActorVia::Agent}),
+            paths: Vec::new(),
         }
     }
 }
@@ -616,12 +683,12 @@ pub(super) fn released_target_event(
     item: &WorkItem,
     cause: &ReleaseCause,
 ) -> Result<Event> {
-    let mut event = Event::new(
-        "coordination_target_released",
-        request_id,
-        json!({"work_id": item.id, "transition": cause.transition,
-            "actor": cause.actor, "generation": item.generation}),
-    )?;
+    let mut data = json!({"work_id": item.id, "transition": cause.transition,
+        "actor": cause.actor, "generation": item.generation});
+    if !cause.paths.is_empty() {
+        data["paths"] = json!(cause.paths);
+    }
+    let mut event = Event::new("coordination_target_released", request_id, data)?;
     event.at = item.updated_at;
     Ok(event)
 }
@@ -700,6 +767,14 @@ pub(super) fn split_refusal(message: &str) -> (&str, Vec<String>) {
     match message.split_once(REFUSED_KEYS_MARK) {
         Some((text, keys)) => (text, serde_json::from_str(keys).unwrap_or_default()),
         None => (message, Vec::new()),
+    }
+}
+
+impl WorkTransitionKind {
+    /// Kinds that refuse the `only_joins_since` exception: the exact `expected_updated_seq` is
+    /// required, so a change after the plan was read is never overridden.
+    pub(super) fn needs_exact_seq(self) -> bool {
+        matches!(self, Self::PruneParticipants | Self::ReleasePaths)
     }
 }
 

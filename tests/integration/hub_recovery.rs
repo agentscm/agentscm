@@ -212,6 +212,7 @@ fn item(
         reason: "synthetic recovery".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     }
 }
 
@@ -546,6 +547,7 @@ fn a_partly_applied_batch_explains_each_item_and_retries_safely(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 1,
         )
@@ -768,6 +770,7 @@ fn lapsed_or_paused_work_is_not_reported_held(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 1,
         )
@@ -839,6 +842,7 @@ fn a_scoped_handover_frees_only_what_it_drops(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 2,
         )
@@ -1087,6 +1091,7 @@ fn a_non_join_change_after_the_observed_seq_still_refuses(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 3,
         )
@@ -1163,6 +1168,7 @@ fn prune_request(
                 session: (*session).into(),
             })
             .collect(),
+        paths: Vec::new(),
     }
 }
 
@@ -1203,6 +1209,7 @@ fn finish(store: &dyn Store, who: &Agent, work: &WorkItem, session: &str, now: i
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now,
         )
@@ -2373,6 +2380,7 @@ fn carry_lead_credential(
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     };
     let carried = store.work_checkpoint(&renewed.token, &carry, at).unwrap();
     assert_eq!(carried.item.lead_token, renewed.token);

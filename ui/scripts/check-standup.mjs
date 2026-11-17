@@ -272,6 +272,7 @@ assert.throws(() => decodeWorkItem({ ...item, scope: ['../outside'] }), InvalidS
 assert.throws(() => decodeWorkItem({ ...item, current: { ...item.current, source_refs: [{ kind: 'commit', oid: 'not-a-commit', path: null }] } }), InvalidStandupResponse)
 const withTransition = (transition) => decodeBriefing({ ...envelope, events: [{ ...envelope.events[0], kind: 'work_transition', transition }] }).events[0]
 assert.equal(withTransition('prune_participants').transition, 'prune_participants')
+assert.equal(withTransition('release_paths').transition, 'release_paths')
 assert.equal(withTransition('prune_all_the_things').transition, undefined, 'an unknown transition is dropped, not an error')
 assert.equal('transition' in decodeBriefing(envelope).events[0], false)
 assert.throws(() => decodeBriefing({ ...envelope, events: [{ ...envelope.events[0], seq: 13 }] }), InvalidStandupResponse)

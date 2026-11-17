@@ -96,6 +96,10 @@ pub struct CoordinationResponse {
     /// that ignores this field sees the same shape as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// The requested paths this reply released from the target Work's reservation; absent when
+    /// it released none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_paths: Vec<String>,
     pub created_at: i64,
     pub seq: i64,
 }
@@ -139,6 +143,113 @@ pub struct CoordinationRequest {
     /// settled request and for any other reader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_paths: Option<RequestedPathsHold>,
+    /// While `requested_paths` is `held`, the requested paths no longer held, sorted (empty
+    /// when the request names more than `MAX_RELEASED_PATHS`). Derived beside it, never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_paths: Vec<String>,
+    /// False when `released_paths` may be missing paths: the request names more than
+    /// `MAX_RELEASED_PATHS`, more than `MAX_RELEASE_EVENTS` releases were recorded, or more than
+    /// `MAX_RELEASED_PATHS` candidate paths were found and the list was cut. Left out of the
+    /// JSON when true.
+    #[serde(default = "complete_default", skip_serializing_if = "is_true")]
+    pub released_paths_complete: bool,
+}
+
+const fn complete_default() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// What a request's requester has done since the holder replied, as the holder reads it.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RequesterState {
+    NotSeen,
+    Seen {
+        at: i64,
+    },
+    /// The acknowledgements are a partial page and none of them is the requester's.
+    Unknown,
+}
+
+impl CoordinationRequest {
+    /// The requester's latest state: it acknowledged the newest reply (when
+    /// it did) or has not. Derived from the request's acknowledgements, never stored.
+    pub fn requester_state(&self) -> RequesterState {
+        let replied = self
+            .responses
+            .iter()
+            .map(|reply| reply.seq)
+            .max()
+            .unwrap_or(0);
+        match self
+            .acknowledgements
+            .iter()
+            .filter(|ack| {
+                ack.target_work_id.is_none()
+                    && ack.agent.token == self.requester.token
+                    && ack.through_seq >= replied
+            })
+            .map(|ack| ack.acknowledged_at)
+            .max()
+        {
+            Some(at) => RequesterState::Seen { at },
+            None if self.acknowledgements_complete => RequesterState::NotSeen,
+            None => RequesterState::Unknown,
+        }
+    }
+}
+
+/// The most release events read for one request; past it no path is reported released.
+pub const MAX_RELEASE_EVENTS: i64 = 64;
+
+/// The most requested paths probed one by one for a partial release.
+pub const MAX_RELEASED_PATHS: usize = 32;
+
+/// The requested paths a target Work actually held, read from its `coordination_target_released`
+/// events (`data` is each event's JSON): the requested path itself when an event's `paths`
+/// cover it or name none (a full release or end), or the released path when it lies under a
+/// requested directory. The target's scope is not recorded on the request, so a path the
+/// target never held is never a candidate. Sorted and without repeats; the caller bounds it.
+pub(super) fn held_candidates(scope: &[String], events: &[String]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for data in events {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let paths = data["paths"]
+            .as_array()
+            .map(|paths| paths.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for spec in scope {
+            let key = super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone());
+            if paths.is_empty() {
+                out.insert(spec.clone());
+            }
+            for path in &paths {
+                let released = super::intent::key_of(path);
+                if !super::intent::overlaps(&key, released) {
+                    continue;
+                }
+                // Under a requested directory only the released path was held, not the directory.
+                let under = key.ends_with('/') && released != key && released.starts_with(&key);
+                out.insert(if under {
+                    (*path).to_owned()
+                } else {
+                    spec.clone()
+                });
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// A requested path in the display form every released-paths list uses.
+pub(super) fn display_spec(spec: &str) -> String {
+    super::intent::display(&super::intent::spec_key(spec).unwrap_or_else(|_| spec.to_owned()))
 }
 
 /// Whether the paths a request asks for are still held.
@@ -226,6 +337,11 @@ pub struct CoordinationReply {
     pub expected_updated_seq: i64,
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
+    /// Requested paths to release from the target Work in the same step, keeping the rest of
+    /// its scope: each must be a path the request asked for and an exact scope entry of the
+    /// target. Not valid with `join`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_paths: Vec<String>,
     /// Set only by the person routes, never read from a request body: the person who owns the
     /// lead agent answered for it from the Hub's web pages (`via: "hub"` on the response) or
     /// through a connected app (`via: "slack"`). `Agent` when the agent answered itself.
@@ -347,10 +463,70 @@ impl CoordinationReply {
         if let Some(note) = &self.note {
             validate_note(note)?;
         }
+        if !self.release_paths.is_empty() {
+            if self.kind == CoordinationResponseKind::Join {
+                return Err(invalid(
+                    "release_paths is not valid with join: a join keeps the whole scope. Reply propose_split, handover or decline to release some requested files",
+                ));
+            }
+            super::work::normalized_scope(&self.release_paths)?;
+        }
         Ok(())
+    }
+
+    /// The release of the named paths from the target Work, run in the reply's transaction.
+    /// Refuses a path the request did not ask for; the transition refuses the rest.
+    pub(super) fn release(
+        &self,
+        requested: &[String],
+        work_id: &str,
+        generation: i64,
+        updated_seq: i64,
+        release_id: &str,
+        session: &str,
+    ) -> Result<super::work_transition::WorkTransitionRequest> {
+        // A proposal's scope holds index keys (`dir/`), which are not display specs.
+        let requested: Vec<String> = requested
+            .iter()
+            .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+            .collect();
+        let unrequested: Vec<String> = super::work::normalized_scope(&self.release_paths)?
+            .into_iter()
+            // A requested directory covers the files under it.
+            .filter(|key| {
+                !requested
+                    .iter()
+                    .any(|ask| key == ask || (ask.ends_with('/') && key.starts_with(ask.as_str())))
+            })
+            .map(|key| super::intent::display(&key))
+            .collect();
+        if !unrequested.is_empty() {
+            return Err(HubError::Invalid(format!(
+                "release_paths names paths this request did not ask for: {}",
+                unrequested.join(", ")
+            )));
+        }
+        Ok(super::work_transition::WorkTransitionRequest {
+            work_id: work_id.to_owned(),
+            operation_id: release_id.to_owned(),
+            generation,
+            expected_updated_seq: updated_seq,
+            // A person acts for the lead without a session; the agent acts in its own.
+            session: (self.via == Via::Agent).then(|| session.to_owned()),
+            transition: super::work_transition::WorkTransitionKind::ReleasePaths,
+            reason: format!(
+                "released by a reply to coordination request {}",
+                self.request_id
+            ),
+            superseded_by: None,
+            participants: Vec::new(),
+            paths: self.release_paths.clone(),
+        })
     }
 }
 
+/// Why a session that neither made a request nor leads one of its targets cannot read its overlap consents.
+pub const CONSENTS_NOT_PARTY: &str = "only the session that made this coordination request, or the session that leads one of its target Work items, can read its overlap consents, and the session in this call is neither. Pass the requester's session, or the session that leads a target Work item";
 /// Why a session that neither made a request nor leads one of its targets cannot resolve it.
 pub const RESOLVE_NOT_PARTY: &str = "only the session that made this coordination request, or the session that leads one of its target Work items, can resolve it, and the session in this call is neither. If you lead the target Work, pass the session that leads it. Otherwise answer with agentscm_coordination_reply (`agentscm work coordination-reply`) and leave resolving to the requester";
 
@@ -424,6 +600,15 @@ pub(super) fn invalid(message: &str) -> HubError {
 pub(super) fn with_via(mut data: serde_json::Value, via: Option<&str>) -> serde_json::Value {
     if let Some(via) = via {
         data["via"] = serde_json::json!(via);
+    }
+    data
+}
+
+/// Adds the display paths a reply released to its `coordination_responded` event data; skipped
+/// when it released none, so earlier events keep their bytes.
+pub(super) fn with_released(mut data: serde_json::Value, released: &[String]) -> serde_json::Value {
+    if !released.is_empty() {
+        data["released_paths"] = serde_json::json!(released);
     }
     data
 }

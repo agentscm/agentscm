@@ -563,6 +563,7 @@ pub fn release_settled(
                 ),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             };
             let actor = WorkTransitionActor::Policy {
                 owner: &owner,
@@ -774,6 +775,7 @@ fn complete_one(
             reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
             superseded_by: None,
             participants: Vec::new(),
+            paths: Vec::new(),
         };
         let actor = WorkTransitionActor::Policy {
             owner: &owner,

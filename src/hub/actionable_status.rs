@@ -2194,6 +2194,7 @@ mod tests {
                         reason: "Synthetic disposition".into(),
                         superseded_by: None,
                         participants: Vec::new(),
+                        paths: Vec::new(),
                     },
                     now,
                 )
@@ -2949,6 +2950,7 @@ mod tests {
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         };
         store
             .work_checkpoint(&principal.token_id, &checkpoint, now)
@@ -4543,6 +4545,7 @@ mod tests {
                         source_refs: vec![],
                         depends_on: vec![],
                         related_work: vec![],
+                        finished_paths: None,
                     },
                     now,
                 )
@@ -4823,6 +4826,7 @@ mod tests {
                             source_refs: vec![],
                             depends_on: vec![],
                             related_work: vec![],
+                            finished_paths: None,
                         },
                         now,
                     )
@@ -4955,6 +4959,7 @@ mod tests {
                 kind: crate::hub::coordination::CoordinationResponseKind::Decline,
                 note: None,
                 via: None,
+                released_paths: Vec::new(),
                 created_at: 100,
                 seq: 2,
             });
@@ -5905,6 +5910,7 @@ mod tests {
             .coordination_reply(
                 &a.token_id,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: current.id.clone(),
                     operation_id: "decline".into(),
                     target_work_id: target.id,

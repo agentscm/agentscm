@@ -671,6 +671,7 @@ fn compaction_delivery_guard(fixture: &Fixture) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             old + 1,
         )
@@ -1067,6 +1068,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 7,
         )
@@ -2306,6 +2308,7 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
                     }],
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 at,
             )
@@ -2478,6 +2481,7 @@ fn why_marks_cut_lists(fixture: &Fixture) {
                         source_refs: Vec::new(),
                         depends_on: Vec::new(),
                         related_work: Vec::new(),
+                        finished_paths: None,
                     },
                     now + n as i64,
                 )
@@ -2625,6 +2629,7 @@ fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
                     source_refs: Vec::new(),
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 now,
             )
@@ -3196,6 +3201,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 }],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now,
         )
@@ -3635,6 +3641,7 @@ fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
                 reason: "synthetic reason".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             now + 2,
         )
@@ -3892,6 +3899,7 @@ fn checkin(
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             at,
         )
@@ -4628,6 +4636,7 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
                 reason: "synthetic release".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )
@@ -4848,6 +4857,7 @@ fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
                 reason: "No more scope is reserved".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )

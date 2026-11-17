@@ -134,6 +134,11 @@ pub struct WorkCheckpoint {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub related_work: Vec<String>,
+    /// Scope entries the lead reports as finished; a self-report that changes no admission.
+    /// Replaces the stored set when present (an empty list clears it); absent keeps it. Each
+    /// must be an exact entry of the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -244,6 +249,9 @@ pub struct WorkItem {
     pub lead_session: String,
     pub participants: Vec<WorkParticipant>,
     pub scope: Vec<String>,
+    /// Scope entries the lead reports as finished; never authority, always within `scope`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finished_paths: Vec<String>,
     pub branch: Option<String>,
     pub worktree: Option<String>,
     pub next_action: Option<String>,
@@ -485,8 +493,11 @@ impl WorkEnded {
             return None;
         }
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
-        // Removing participants neither ends nor reopens the Work.
-        if v.get("transition")?.as_str()? == "prune_participants" {
+        // Removing participants or releasing some paths neither ends nor reopens the Work.
+        if matches!(
+            v.get("transition")?.as_str()?,
+            "prune_participants" | "release_paths"
+        ) {
             return None;
         }
         let actor = v.get("actor")?;
@@ -873,6 +884,7 @@ impl WorkCheckpoint {
             source_refs: Vec::new(),
             depends_on: item.depends_on.clone(),
             related_work: item.related_work.clone(),
+            finished_paths: None,
         }
     }
 
@@ -890,6 +902,9 @@ impl WorkCheckpoint {
         option_text("next_action", &self.next_action, MAX_TEXT_BYTES)?;
         if let Some(scope) = &self.scope {
             paths(scope)?;
+        }
+        if let Some(finished) = &self.finished_paths {
+            paths(finished)?;
         }
         if let Some(branch) = &self.branch {
             label("branch", branch)?;
@@ -919,6 +934,34 @@ impl WorkCheckpoint {
 
     pub(super) fn normalized_scope(&self) -> Result<Option<Vec<String>>> {
         self.scope.as_deref().map(paths).transpose()
+    }
+
+    /// The finished paths the Work has after this checkpoint, given the scope it will have: the
+    /// supplied set when there is one, else the previous set, minus paths the scope dropped.
+    pub(super) fn finished_after(
+        &self,
+        previous: &[String],
+        scope: &[String],
+    ) -> Result<Vec<String>> {
+        let mut finished = if let Some(supplied) = &self.finished_paths {
+            let supplied = paths(supplied)?;
+            let outside: Vec<_> = supplied
+                .iter()
+                .filter(|key| !scope.contains(key))
+                .map(|key| super::intent::display(key))
+                .collect();
+            if !outside.is_empty() {
+                return Err(invalid(&format!(
+                    "finished_paths names paths that are not exact entries of the Work's scope: {}",
+                    outside.join(", ")
+                )));
+            }
+            supplied
+        } else {
+            previous.to_vec()
+        };
+        finished.retain(|key| scope.contains(key));
+        Ok(finished)
     }
 }
 
