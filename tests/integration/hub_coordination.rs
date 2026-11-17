@@ -4351,49 +4351,6 @@ fn holder_sees_the_requesters_state(db: &Db) {
         read(now + 5).requester_state(),
         RequesterState::Seen { at: now + 4 }
     );
-
-    // The holder frees both files; the requester takes them and settles the request. The
-    // settled request has left the holder's inbox, so the requester's list shows its status.
-    let mut grant = release_reply(
-        &request,
-        CoordinationResponseKind::Decline,
-        &["src/a.rs", "src/b.rs"],
-    );
-    grant.operation_id = "grant-both".into();
-    grant.expected_updated_seq = read(now + 5).updated_seq;
-    store.coordination_reply(&holder, &grant, now + 5).unwrap();
-    store
-        .work_start(
-            &requester,
-            &start_scope("asked", "asker", WorkRole::Lead, None, &FILES[..2]),
-            now + 5,
-        )
-        .unwrap();
-    store
-        .coordination_resolve(
-            &requester,
-            &CoordinationResolve {
-                request_id: request.id.clone(),
-                operation_id: "resolve-asked".into(),
-                session: "asker".into(),
-                expected_updated_seq: read(now + 6).updated_seq,
-            },
-            now + 6,
-        )
-        .unwrap();
-    let settled = store
-        .coordination_list(
-            &requester,
-            &CoordinationListQuery {
-                active_only: false,
-                ..CoordinationListQuery::default()
-            },
-            now + 7,
-        )
-        .unwrap()
-        .requests
-        .remove(0);
-    assert_eq!(settled.requester_state(), RequesterState::Resolved);
 }
 
 parity_case!(requester_partial_release, requester_sees_a_partial_release);
@@ -4401,3 +4358,113 @@ parity_case!(
     holder_sees_requester_state,
     holder_sees_the_requesters_state
 );
+
+fn reply_release_accepts_a_file_under_a_requested_directory(db: &Db) {
+    let store = db.open();
+    let (holder, _, _, request, now) = holder_and_request(&*store, &FILES[..2], &["src/**"]);
+    let reply = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &reply, now + 2).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+}
+
+fn narrowing_checkpoint_tells_the_requester_which_files_were_dropped(db: &Db) {
+    let store = db.open();
+    let (holder, requester, work_id, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..3]);
+    let seq: i64 = db.rows(&format!(
+        "SELECT updated_seq FROM hub_work_items WHERE id = '{work_id}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    store
+        .work_checkpoint(
+            &holder,
+            &checkpoint(
+                &work_id,
+                "narrow",
+                "lead",
+                seq,
+                CheckpointKind::Progress,
+                Some(&["src/b.rs", "src/c.rs"]),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    let seen = store
+        .coordination_inbox(
+            &requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.id == request.id)
+        .unwrap();
+    assert_eq!(seen.released_paths, vec!["src/a.rs"]);
+}
+
+fn reopen_clears_finished_paths(db: &Db) {
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    let store = db.open();
+    let holder = token(&*store, 36, "finisher");
+    let now = unix_now();
+    let item = store
+        .work_start(
+            &holder,
+            &start_scope("held", "lead", WorkRole::Lead, None, &FILES[..2]),
+            now,
+        )
+        .unwrap()
+        .item;
+    let mut report = checkpoint(
+        &item.id,
+        "report",
+        "lead",
+        item.updated_seq,
+        CheckpointKind::Progress,
+        None,
+    );
+    report.finished_paths = Some(vec!["src/a.rs".into()]);
+    let item = store
+        .work_checkpoint(&holder, &report, now + 1)
+        .unwrap()
+        .item;
+    assert_eq!(item.finished_paths, vec!["src/a.rs"]);
+    let transition = |item: &agentscm::hub::work::WorkItem, op: &str, kind: &str| {
+        let request: WorkTransitionRequest = serde_json::from_value(serde_json::json!({
+            "work_id": item.id, "operation_id": op, "generation": item.generation,
+            "expected_updated_seq": item.updated_seq, "session": "lead",
+            "transition": kind, "reason": "synthetic"
+        }))
+        .unwrap();
+        store
+            .work_transition(
+                &WorkTransitionActor::Agent { token: &holder },
+                &request,
+                now + 2,
+            )
+            .unwrap()
+            .item
+    };
+    let done = transition(&item, "complete", "complete");
+    assert_eq!(done.finished_paths, vec!["src/a.rs"]);
+    assert!(
+        transition(&done, "reopen", "reopen")
+            .finished_paths
+            .is_empty()
+    );
+}
+
+parity_case!(
+    reply_release_under_requested_directory,
+    reply_release_accepts_a_file_under_a_requested_directory
+);
+parity_case!(
+    narrowing_reports_dropped_files,
+    narrowing_checkpoint_tells_the_requester_which_files_were_dropped
+);
+parity_case!(reopen_drops_finished_paths, reopen_clears_finished_paths);

@@ -157,21 +157,14 @@ pub enum RequesterState {
     Seen {
         at: i64,
     },
-    Resolved,
-    Withdrawn,
     /// The acknowledgements are a partial page and none of them is the requester's.
     Unknown,
 }
 
 impl CoordinationRequest {
-    /// The requester's latest state: it settled the request, acknowledged the newest reply (when
+    /// The requester's latest state: it acknowledged the newest reply (when
     /// it did) or has not. Derived from the request's acknowledgements, never stored.
     pub fn requester_state(&self) -> RequesterState {
-        match self.status {
-            CoordinationStatus::Resolved => return RequesterState::Resolved,
-            CoordinationStatus::Withdrawn => return RequesterState::Withdrawn,
-            _ => {}
-        }
         let replied = self
             .responses
             .iter()
@@ -195,6 +188,9 @@ impl CoordinationRequest {
         }
     }
 }
+
+/// The most release events read for one request; past it no path is reported released.
+pub const MAX_RELEASE_EVENTS: i64 = 64;
 
 /// The most requested paths probed one by one for a partial release.
 pub const MAX_RELEASED_PATHS: usize = 32;
@@ -479,7 +475,12 @@ impl CoordinationReply {
             .collect();
         let unrequested: Vec<String> = super::work::normalized_scope(&self.release_paths)?
             .into_iter()
-            .filter(|key| !requested.contains(key))
+            // A requested directory covers the files under it.
+            .filter(|key| {
+                !requested
+                    .iter()
+                    .any(|ask| key == ask || (ask.ends_with('/') && key.starts_with(ask.as_str())))
+            })
             .map(|key| super::intent::display(&key))
             .collect();
         if !unrequested.is_empty() {
@@ -493,7 +494,8 @@ impl CoordinationReply {
             operation_id: release_id.to_owned(),
             generation,
             expected_updated_seq: updated_seq,
-            session: Some(session.to_owned()),
+            // A person acts for the lead without a session; the agent acts in its own.
+            session: (self.via == Via::Agent).then(|| session.to_owned()),
             transition: super::work_transition::WorkTransitionKind::ReleasePaths,
             reason: format!(
                 "released by a reply to coordination request {}",

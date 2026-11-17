@@ -395,7 +395,7 @@ impl PgStore {
         session_lifecycle::check(&mut tx, token, &input.start.session, incarnation, now)?;
         }
             let session = session_name(&mut tx, token, Some(&input.start.session), now)?;
-        let who = work_who(&mut tx, token, now)?;
+            let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
             if who.read_only {

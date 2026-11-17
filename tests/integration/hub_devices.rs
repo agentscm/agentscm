@@ -2329,6 +2329,18 @@ fn release_transitions(env: &Env) -> usize {
         .count()
 }
 
+/// The recorded actor of the one partial release: the person who answered, not the lead agent.
+fn assert_released_by_person(env: &Env) {
+    let events = env.store.events_after(0, 1000).unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "work_transition" && event.data.contains("release_paths"))
+        .expect("a partial release");
+    let data: Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["actor"]["via"], "person", "{data}");
+    assert_eq!(data["actor"]["login"], "alice", "{data}");
+}
+
 const REPLY: &str = "/v1/hub/session/coordination/reply";
 const ANSWER: &str = "/v1/hub/session/handoff/answer";
 const ASK: &str = "/v1/hub/session/handoff/ask";
@@ -2430,6 +2442,7 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     assert_eq!(response["responder"]["token"], json!(lead));
     assert_eq!(response["released_paths"], json!(["src/billing.rs"]));
     assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     // A retry replays the same answer instead of adding a second.
     let (status, replay) = page_post(&env, &alice, true, REPLY, body(&lead, "f")).await;
     assert_eq!(
@@ -5850,6 +5863,7 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
         json!(["src/billing.rs"])
     );
     assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     let (status, replay) = env
         .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
         .await;

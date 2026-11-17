@@ -792,6 +792,83 @@ async fn exact_claims_acknowledgements_and_reconnects_remain_token_scoped() {
     assert_eq!(overview["overlaps_complete"], true);
 }
 
+/// Only the target that replied sees the requester's state; another target of the same request
+/// has said nothing, so it shows none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requester_state_shows_only_to_the_target_that_replied() {
+    let hub = Hub::start().await;
+    let first = hub.token(11, "first-lead", REPOSITORY, false).await;
+    let second = hub.token(11, "second-lead", REPOSITORY, false).await;
+    let requester = hub.token(11, "requester-agent", REPOSITORY, false).await;
+    let mut work_ids = Vec::new();
+    for (token, key, session, path) in [
+        (&first, "first-held", "first-session", "src/one.rs"),
+        (&second, "second-held", "second-session", "src/two.rs"),
+    ] {
+        let (status, held) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                token,
+                Some(start(key, key, session, &[path])),
+            )
+            .await;
+        assert_eq!(status, 200, "{held}");
+        work_ids.push(held["item"]["id"].as_str().unwrap().to_owned());
+    }
+    let (status, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "asked",
+                "Asked",
+                "requester-session",
+                &["src/one.rs", "src/two.rs"],
+            )),
+        )
+        .await;
+    assert_eq!(status, 200, "{refused}");
+    let request = &refused["coordination_request"];
+    assert_eq!(request["targets"].as_array().unwrap().len(), 2, "{request}");
+    let reply = hub
+        .mcp(
+            &first,
+            "agentscm_coordination_reply",
+            json!({"request_id": request["id"], "operation_id": "first-declines",
+                "target_work_id": work_ids[0], "session": "first-session",
+                "expected_updated_seq": request["updated_seq"], "kind": "decline"}),
+        )
+        .await;
+    assert_eq!(reply["isError"], false, "{reply}");
+    let notice = |view: &Value| {
+        view["_meta"]["agentscm"]["coordination_notifications"]["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["request_id"] == request["id"])
+            .unwrap()
+            .clone()
+    };
+    let replied = hub
+        .mcp(
+            &first,
+            "agentscm_status",
+            json!({"session": "first-session"}),
+        )
+        .await;
+    assert_eq!(notice(&replied)["requester"], json!({"state": "not_seen"}));
+    let silent = hub
+        .mcp(
+            &second,
+            "agentscm_status",
+            json!({"session": "second-session"}),
+        )
+        .await;
+    assert!(notice(&silent).get("requester").is_none(), "{silent}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution() {
     let hub = Hub::start().await;

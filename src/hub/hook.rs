@@ -660,13 +660,19 @@ async fn hook(
                                 == Some(RequestedPathsHold::Held)
                                 && !request.released_paths.is_empty()
                             {
-                                let listed = request
+                                let mut listed = request
                                     .released_paths
                                     .iter()
                                     .take(5)
                                     .map(|path| bounded_hook_text(path, 120))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
+                                    .collect::<Vec<_>>();
+                                if request.released_paths.len() > 5 {
+                                    listed.push(format!(
+                                        "and {} more",
+                                        request.released_paths.len() - 5
+                                    ));
+                                }
+                                let listed = listed.join(", ");
                                 format!(
                                     " {listed} from your request are free now; start on them alone with agentscm_start."
                                 )

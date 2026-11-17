@@ -2050,11 +2050,26 @@ async fn call(
             })
             .map(|request| request.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        Ok((page, own))
+        // Requests whose reply came from a target this reader leads.
+        let replied = page
+            .requests
+            .iter()
+            .filter(|request| {
+                request.responses.iter().any(|reply| {
+                    request.targets.iter().any(|target| {
+                        target.work_id == reply.target_work_id
+                            && target.lead.token == token
+                            && target.lead.session == session
+                    })
+                })
+            })
+            .map(|request| request.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok((page, own, replied))
     })
     .await;
     match inbox {
-        Ok((page, own)) if !page.requests.is_empty() || !page.complete => {
+        Ok((page, own, replied)) if !page.requests.is_empty() || !page.complete => {
             let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
                 .map(|request| {
@@ -2069,13 +2084,14 @@ async fn call(
                         notice["replies"] = json!(request.responses.iter().take(3).map(|reply| json!({
                             "kind":reply.kind,
                             "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
-                            "released_paths":(!reply.released_paths.is_empty()).then_some(&reply.released_paths),
+                            "released_paths":(!reply.released_paths.is_empty()).then(|| &reply.released_paths[..reply.released_paths.len().min(5)]),
+                            "released_paths_omitted":reply.released_paths.len().checked_sub(5).filter(|n| *n > 0),
                             "responder_agent":reply.responder.agent})).collect::<Vec<_>>());
                         notice["requested_paths"] = json!(request.requested_paths);
                         if !request.released_paths.is_empty() {
                             notice["released_paths"] = json!(request.released_paths);
                         }
-                    } else if !request.responses.is_empty() {
+                    } else if replied.contains(&request.id) {
                         notice["requester"] = json!(request.requester_state());
                     }
                     notice

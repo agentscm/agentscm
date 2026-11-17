@@ -566,6 +566,7 @@ pub(super) fn apply(
             item.lead_token = token.clone();
             item.lead_agent = agent.clone();
             item.lead_session = session.clone();
+            item.finished_paths.clear();
             item.generation += 1;
             item.state = WorkState::Active;
             item.last_checkin_at = now;
@@ -653,6 +654,16 @@ impl ReleaseCause {
             transition: "lapse",
             actor: json!({"kind": "lease"}),
             paths: Vec::new(),
+        }
+    }
+
+    /// A checkpoint by the lead session of an agent token owned by `owner` that narrowed the
+    /// scope and dropped these keys.
+    pub(super) fn narrowing(owner: &str, dropped: &[String]) -> Self {
+        Self {
+            transition: "checkpoint",
+            actor: json!({"kind": WorkActorKind::Lead, "id": owner, "via": ActorVia::Agent}),
+            paths: super::intent::display_all(dropped),
         }
     }
 

@@ -48,7 +48,7 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, MAX_RELEASED_PATHS, RequestedPathsHold,
+    MAX_PROJECTED_COORDINATION_UPDATES, MAX_RELEASE_EVENTS, MAX_RELEASED_PATHS, RequestedPathsHold,
     helper_join_editable, join_uncovered, parse_response_kind, parse_status, response_kind_name,
     status_name, with_released, with_via,
 };
@@ -4377,13 +4377,20 @@ fn requested_paths_hold(
             let events: Vec<String> = tx
                 .query(
                     "SELECT data FROM hub_events
-                     WHERE subject = $1 AND kind = 'coordination_target_released'",
-                    &[&request.id],
+                     WHERE subject = $1 AND kind = 'coordination_target_released'
+                     ORDER BY seq DESC LIMIT $2",
+                    &[&request.id, &(MAX_RELEASE_EVENTS + 1)],
                 )?
                 .iter()
                 .map(|row| row.get(0))
                 .collect();
-            for spec in super::coordination::held_candidates(scope, &events) {
+            // Past the bound the history is incomplete, so no path is reported released.
+            let candidates = if events.len() as i64 > MAX_RELEASE_EVENTS {
+                Vec::new()
+            } else {
+                super::coordination::held_candidates(scope, &events)
+            };
+            for spec in candidates {
                 if !scope_held(tx, who, request, std::slice::from_ref(&spec), now)? {
                     released.push(super::coordination::display_spec(&spec));
                 }
@@ -4920,6 +4927,7 @@ fn start_overlap_in(
         item.lead_token = who.token.clone();
         item.lead_agent = who.agent.clone();
         item.lead_session = start.session.clone();
+        item.finished_paths.clear();
         item.generation += 1;
         item.state = WorkState::Active;
         item.claim_status = ClaimStatus::Active;
@@ -6453,6 +6461,18 @@ fn release_path_holds(
             trim_intent(tx, item, &token, &intent, previous, now)?;
         }
     }
+    note_released_requests(tx, item, released, cause, now)
+}
+
+/// Records the `coordination_target_released` event of each open request that targets the Work
+/// and asks for a released path. Returns the payload bytes the events add.
+fn note_released_requests(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    released: &[String],
+    cause: &work_transition::ReleaseCause,
+    now: i64,
+) -> Result<i64> {
     let open = tx.query(
         "SELECT r.id, r.status, r.proposed_work, r.proposed_scope
          FROM hub_coordination_requests r
@@ -8527,7 +8547,7 @@ fn checkpoint_overlap_in(
         }
     }
     let finished = checkpoint.finished_after(
-        &item.finished_paths,
+        if carry { &[] } else { &item.finished_paths },
         checkpoint
             .normalized_scope()?
             .as_ref()
@@ -8691,6 +8711,17 @@ fn checkpoint_overlap_in(
         && item.scope != previous_scope
     {
         trim_session_intents(tx, &item, &previous_scope, now)?;
+        // A requester is told which of the files it asked for the narrowing dropped.
+        let dropped: Vec<String> = previous_scope
+            .iter()
+            .filter(|key| !item.scope.contains(key))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            let cause = work_transition::ReleaseCause::narrowing(&who.owner.id, &dropped);
+            let noted = note_released_requests(tx, &item, &dropped, &cause, now)?;
+            record_work_payload_delta(tx, &who, noted, now)?;
+        }
     }
     if checkpoint.kind == super::work::CheckpointKind::Finish {
         // The same cleanup as a terminal transition. It follows the quota check above and
@@ -16445,12 +16476,18 @@ impl Store for PgStore {
                     &native_session,
                 )?;
                 release.validate()?;
-                work_transition_in(
-                    &mut tx,
-                    &WorkTransitionActor::Agent { token },
-                    &release,
-                    now,
-                )?;
+                // The person who owns the lead answered through the Hub: record them, not the agent.
+                let actor = if reply.via == Via::Agent {
+                    WorkTransitionActor::Agent { token }
+                } else {
+                    WorkTransitionActor::Person {
+                        user: &who.owner,
+                        repository: &who.repository,
+                        repository_id: who.repository_id.ok_or(HubError::Unauthorized)?,
+                        is_admin: false,
+                    }
+                };
+                work_transition_in(&mut tx, &actor, &release, now)?;
                 super::intent::display_all(&release.released_keys()?)
             };
             let released_paths = (!released.is_empty())

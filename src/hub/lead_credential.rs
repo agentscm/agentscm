@@ -107,6 +107,7 @@ pub(super) fn apply_carry(
     }
     item.lead_token = token.to_owned();
     item.lead_agent = agent.to_owned();
+    item.finished_paths.clear();
     Carried {
         previous_agent,
         previous_token,
