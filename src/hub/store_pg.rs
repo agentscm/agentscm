@@ -16484,7 +16484,9 @@ impl Store for PgStore {
             let released: Vec<String> = if reply.release_paths.is_empty() {
                 Vec::new()
             } else {
-                let work = scoped_work(&mut tx, &who, &target.work_id, now, true)?
+                // No row lock here: the transition takes the repository lock before the row,
+                // and its exact updated_seq fence refuses a Work that changed in between.
+                let work = scoped_work(&mut tx, &who, &target.work_id, now, false)?
                     .ok_or_else(|| HubError::Unavailable("target work is missing".into()))?;
                 let release = reply.release(
                     &request.proposal.scope,
