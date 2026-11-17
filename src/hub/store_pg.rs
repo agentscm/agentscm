@@ -1440,6 +1440,55 @@ fn pg_backfill_catchup_publications(
     pg_refresh_publication_coverage(tx, &scope, now)
 }
 
+fn pg_catchup_source_coverage(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    repository: &str,
+    key: i64,
+) -> Result<Vec<CatchupSourceCoverage>> {
+    let mut source_coverage = vec![
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::TrackedPublication,
+            state: super::catchup::CatchupCoverageState::Incomplete,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::ForgePull,
+            state: super::catchup::CatchupCoverageState::Unavailable,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+    ];
+    for row in tx.query(
+        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 ORDER BY source",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &repository,
+            &key,
+        ],
+    )? {
+        let source = parse_source(row.get::<_, String>(0).as_str())?;
+        source_coverage.retain(|entry| entry.source != source);
+        source_coverage.push(CatchupSourceCoverage {
+            source,
+            state: parse_coverage(row.get::<_, String>(1).as_str())?,
+            checked_at: Some(row.get(2)),
+            unread_pages: row.get::<_, i64>(3) as u64,
+            deferred: row.get::<_, i64>(4) as u64,
+            window_from: row.get(5),
+        });
+    }
+    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    Ok(source_coverage)
+}
+
 fn pg_catchup_page(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
@@ -1646,46 +1695,7 @@ fn pg_catchup_page(
             ],
         )?
         .map_or(0, |r| r.get(0));
-    let mut source_coverage = vec![
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::TrackedPublication,
-            state: super::catchup::CatchupCoverageState::Incomplete,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::ForgePull,
-            state: super::catchup::CatchupCoverageState::Unavailable,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-    ];
-    for row in tx.query(
-        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
-        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 ORDER BY source",
-        &[
-            &who.owner.identity.provider,
-            &who.owner.identity.host,
-            &repository,
-            &key,
-        ],
-    )? {
-        let source = parse_source(row.get::<_, String>(0).as_str())?;
-        source_coverage.retain(|entry| entry.source != source);
-        source_coverage.push(CatchupSourceCoverage {
-            source,
-            state: parse_coverage(row.get::<_, String>(1).as_str())?,
-            checked_at: Some(row.get(2)),
-            unread_pages: row.get::<_, i64>(3) as u64,
-            deferred: row.get::<_, i64>(4) as u64,
-            window_from: row.get(5),
-        });
-    }
-    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    let source_coverage = pg_catchup_source_coverage(tx, who, &repository, key)?;
     let owner_notices = if subscriber == HUMAN_SUBSCRIBER
         || event_after != event_from
         || merge_after != merge_from
@@ -15479,7 +15489,9 @@ impl Store for PgStore {
               &who.owner.identity.host,&repository,&key,&query.delivery_client])?;
         let(delivery,event_from,event_through,merge_from,merge_through,is_new)=if let Some(row)=existing{let delivery:String=row.get(0);let page:String=row.get(1);
             tx.execute("UPDATE hub_catchup_deliveries SET updated_at=$2 WHERE id=$1",&[&delivery,&now])?;
-            tx.commit()?;return json_value(&page);
+            let mut page:CatchupPage=json_value(&page)?;
+            page.source_coverage=pg_catchup_source_coverage(&mut tx,&who,&repository,key)?;
+            tx.commit()?;return Ok(page);
         }else{
             let active_total:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1 AND provider=$2
                 AND host=$3 AND repository=$4 AND repository_key=$5 AND NOT acknowledged AND NOT superseded",

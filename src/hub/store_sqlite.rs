@@ -863,6 +863,70 @@ fn sqlite_catchup_merge(value: SqliteCatchupMergeRow) -> Result<CatchupMergeObse
 
 const CATCHUP_MERGE_COLUMNS: &str = "id,seq,source,source_id,occurred_at,observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete";
 
+fn sqlite_catchup_source_coverage(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    repository: &str,
+    repository_key: i64,
+) -> Result<Vec<CatchupSourceCoverage>> {
+    let mut source_coverage = vec![
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::TrackedPublication,
+            state: super::catchup::CatchupCoverageState::Incomplete,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::ForgePull,
+            state: super::catchup::CatchupCoverageState::Unavailable,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+    ];
+    let mut statement = tx.prepare(
+        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
+         WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                repository,
+                repository_key
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (source, state, checked_at, unread_pages, deferred, window_from) in rows {
+        let parsed_source = parse_source(&source)?;
+        source_coverage.retain(|entry| entry.source != parsed_source);
+        source_coverage.push(CatchupSourceCoverage {
+            source: parsed_source,
+            state: parse_coverage(&state)?,
+            checked_at: Some(checked_at),
+            unread_pages: unread_pages as u64,
+            deferred: deferred as u64,
+            window_from,
+        });
+    }
+    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    Ok(source_coverage)
+}
+
 fn sqlite_catchup_page(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -1091,61 +1155,7 @@ fn sqlite_catchup_page(
         )
         .optional()?
         .unwrap_or(0);
-    let mut source_coverage = vec![
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::TrackedPublication,
-            state: super::catchup::CatchupCoverageState::Incomplete,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::ForgePull,
-            state: super::catchup::CatchupCoverageState::Unavailable,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-    ];
-    let mut statement = tx.prepare(
-        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
-         WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source",
-    )?;
-    let rows = statement
-        .query_map(
-            params![
-                who.owner.identity.provider,
-                who.owner.identity.host,
-                repository,
-                repository_key
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            },
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (source, state, checked_at, unread_pages, deferred, window_from) in rows {
-        let parsed_source = parse_source(&source)?;
-        source_coverage.retain(|entry| entry.source != parsed_source);
-        source_coverage.push(CatchupSourceCoverage {
-            source: parsed_source,
-            state: parse_coverage(&state)?,
-            checked_at: Some(checked_at),
-            unread_pages: unread_pages as u64,
-            deferred: deferred as u64,
-            window_from,
-        });
-    }
-    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    let source_coverage = sqlite_catchup_source_coverage(tx, who, &repository, repository_key)?;
     let owner_notices =
         if subscriber == HUMAN_SUBSCRIBER || event_after != event_from || merge_after != merge_from
         {
@@ -16480,8 +16490,11 @@ impl Store for SqliteStore {
                     "UPDATE hub_catchup_deliveries SET updated_at=?2 WHERE id=?1",
                     params![delivery, now],
                 )?;
+                let mut page: CatchupPage = json_value(&page)?;
+                page.source_coverage =
+                    sqlite_catchup_source_coverage(&tx, &who, &repository, repository_key)?;
                 tx.commit()?;
-                return json_value(&page);
+                return Ok(page);
             } else {
                 let active_total: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=?1 AND provider=?2

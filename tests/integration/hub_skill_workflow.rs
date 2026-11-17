@@ -400,6 +400,8 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
             "agentscm_change_record",
             "agentscm_contribution_receipt",
             "agentscm_coordination_inbox",
+            "agentscm_owner_notice_list",
+            "agentscm_owner_notice_status",
             "agentscm_pr_context",
             "agentscm_promise_history",
             "agentscm_promise_show",
