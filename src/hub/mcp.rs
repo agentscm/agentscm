@@ -1160,7 +1160,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "summary": {"type": "string", "description": "One or two plain sentences a teammate can read: what happened and what is next. Give hashes, test counts and tool names only when they matter."},
              "next_action": {"type": "string"},
              "scope": {"type": "array", "items": {"type": "string"}, "description": "Narrowing releases dropped files."},
-             "finished_paths": {"type": "array", "items": {"type": "string"}, "description": "Done scope entries; others may ask for them."},
+             "finished_paths": {"type": "array", "items": {"type": "string"}, "description": "Done scope entries; others may ask for them. [] clears."},
              "branch": {"type": "string"}, "worktree": {"type": "string"},
              "resolve_blocker": {"type": "boolean", "default": false},
              "source_refs": {"type": "array", "items": {

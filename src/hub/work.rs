@@ -135,9 +135,10 @@ pub struct WorkCheckpoint {
     #[serde(default)]
     pub related_work: Vec<String>,
     /// Scope entries the lead reports as finished; a self-report that changes no admission.
-    /// Replaces the stored set when non-empty; each must be an exact entry of the scope.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub finished_paths: Vec<String>,
+    /// Replaces the stored set when present (an empty list clears it); absent keeps it. Each
+    /// must be an exact entry of the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -883,7 +884,7 @@ impl WorkCheckpoint {
             source_refs: Vec::new(),
             depends_on: item.depends_on.clone(),
             related_work: item.related_work.clone(),
-            finished_paths: Vec::new(),
+            finished_paths: None,
         }
     }
 
@@ -902,7 +903,9 @@ impl WorkCheckpoint {
         if let Some(scope) = &self.scope {
             paths(scope)?;
         }
-        paths(&self.finished_paths)?;
+        if let Some(finished) = &self.finished_paths {
+            paths(finished)?;
+        }
         if let Some(branch) = &self.branch {
             label("branch", branch)?;
             if !valid_ref_name(branch) {
@@ -940,10 +943,8 @@ impl WorkCheckpoint {
         previous: &[String],
         scope: &[String],
     ) -> Result<Vec<String>> {
-        let mut finished = if self.finished_paths.is_empty() {
-            previous.to_vec()
-        } else {
-            let supplied = paths(&self.finished_paths)?;
+        let mut finished = if let Some(supplied) = &self.finished_paths {
+            let supplied = paths(supplied)?;
             let outside: Vec<_> = supplied
                 .iter()
                 .filter(|key| !scope.contains(key))
@@ -956,6 +957,8 @@ impl WorkCheckpoint {
                 )));
             }
             supplied
+        } else {
+            previous.to_vec()
         };
         finished.retain(|key| scope.contains(key));
         Ok(finished)

@@ -986,7 +986,7 @@ fn checkpoint(
         source_refs: Vec::new(),
         depends_on: item.depends_on.clone(),
         related_work: item.related_work.clone(),
-        finished_paths: Vec::new(),
+        finished_paths: None,
     }
 }
 fn source_current(journal: &Journal, record: &TransferRecord) -> Result<()> {

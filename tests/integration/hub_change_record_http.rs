@@ -360,7 +360,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
                     .collect(),
                 depends_on: vec![],
                 related_work: vec![],
-                finished_paths: Vec::new(),
+                finished_paths: None,
             },
             unix_now(),
         )

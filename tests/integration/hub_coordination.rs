@@ -281,7 +281,7 @@ fn checkpoint(
         source_refs: Vec::new(),
         depends_on: Vec::new(),
         related_work: Vec::new(),
-        finished_paths: Vec::new(),
+        finished_paths: None,
     }
 }
 
@@ -4176,6 +4176,136 @@ fn requester_sees_a_partial_release(db: &Db) {
     assert_eq!(all.requested_paths, Some(RequestedPathsHold::Released));
     assert!(all.released_paths.is_empty());
 }
+
+fn reply_release_through_a_session_alias_acts_as_the_lead(db: &Db) {
+    let store = db.open();
+    let holder = token(&*store, 34, "alias-holder");
+    let requester = token(&*store, 35, "alias-requester");
+    let now = unix_now();
+    // The default Work session is an alias of the first observed session.
+    store
+        .touch_session(
+            &holder,
+            &SessionCall {
+                session: None,
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now,
+        )
+        .unwrap();
+    store
+        .work_start(
+            &holder,
+            &start_scope("held", "default", WorkRole::Lead, None, &FILES[..3]),
+            now + 1,
+        )
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start_scope("asked", "asker", WorkRole::Lead, None, &FILES[..2]),
+            now + 2,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let mut reply = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    reply.session = "default".into();
+    let answered = store.coordination_reply(&holder, &reply, now + 3).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+    let events = store.events_after(0, 1000).unwrap();
+    let transition = events
+        .iter()
+        .find(|event| event.kind == "work_transition")
+        .unwrap();
+    assert!(
+        transition.data.contains(r#""kind":"lead""#),
+        "{}",
+        transition.data
+    );
+    // The catch-up history shows the partial grant on the response event.
+    let responded = events
+        .iter()
+        .find(|event| event.kind == "coordination_responded")
+        .unwrap();
+    assert!(
+        responded.data.contains(r#""released_paths":["src/a.rs"]"#),
+        "{}",
+        responded.data
+    );
+}
+
+parity_case!(
+    reply_release_session_alias,
+    reply_release_through_a_session_alias_acts_as_the_lead
+);
+
+fn requester_released_paths_skip_files_the_target_never_held(db: &Db) {
+    let store = db.open();
+    // The request also names src/c.rs, which the holder never held and nobody holds.
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..2], &FILES[..3]);
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("asker".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    assert!(read(now + 2).released_paths.is_empty());
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    store.coordination_reply(&holder, &grant, now + 3).unwrap();
+    assert_eq!(read(now + 4).released_paths, vec!["src/a.rs"]);
+}
+
+fn directory_entries_release_and_report_in_display_form(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) = holder_and_request(
+        &*store,
+        &["src/dir/**", "src/b.rs", "src/c.rs"],
+        &["src/dir/**", "src/b.rs"],
+    );
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/dir/**"]);
+    let answered = store.coordination_reply(&holder, &grant, now + 2).unwrap();
+    assert_eq!(answered.responses[0].released_paths, vec!["src/dir/**"]);
+    let seen = store
+        .coordination_inbox(
+            &requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .remove(0);
+    assert_eq!(seen.released_paths, vec!["src/dir/**"]);
+    assert_eq!(
+        db.rows("SELECT released_paths FROM hub_coordination_responses")[0][0],
+        r#"["src/dir/**"]"#
+    );
+}
+
+parity_case!(
+    requester_released_paths_held_only,
+    requester_released_paths_skip_files_the_target_never_held
+);
+parity_case!(
+    directory_release_display_form,
+    directory_entries_release_and_report_in_display_form
+);
 
 fn holder_sees_the_requesters_state(db: &Db) {
     use agentscm::hub::coordination::RequesterState;

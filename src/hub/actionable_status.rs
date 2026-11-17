@@ -2950,7 +2950,7 @@ mod tests {
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
-            finished_paths: Vec::new(),
+            finished_paths: None,
         };
         store
             .work_checkpoint(&principal.token_id, &checkpoint, now)
@@ -4545,7 +4545,7 @@ mod tests {
                         source_refs: vec![],
                         depends_on: vec![],
                         related_work: vec![],
-                        finished_paths: Vec::new(),
+                        finished_paths: None,
                     },
                     now,
                 )
@@ -4826,7 +4826,7 @@ mod tests {
                             source_refs: vec![],
                             depends_on: vec![],
                             related_work: vec![],
-                            finished_paths: Vec::new(),
+                            finished_paths: None,
                         },
                         now,
                     )

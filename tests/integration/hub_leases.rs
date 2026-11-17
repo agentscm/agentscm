@@ -308,7 +308,7 @@ fn checkpoint(work_id: &str, generation: i64, session: &str, seq: i64) -> WorkCh
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
-        finished_paths: Vec::new(),
+        finished_paths: None,
     }
 }
 

@@ -48,7 +48,7 @@ use super::coordination::{
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, MAX_RELEASED_PATHS, RequestedPathsHold,
     helper_join_editable, join_uncovered, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_via,
+    status_name, with_released, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -4503,9 +4503,18 @@ fn requested_paths_hold(
         }
         let mut released = Vec::new();
         if scope.len() <= MAX_RELEASED_PATHS {
-            for spec in scope {
-                if !scope_held(tx, who, request, std::slice::from_ref(spec), now)? {
-                    released.push(spec.clone());
+            let events = {
+                let mut statement = tx.prepare(
+                    "SELECT data FROM hub_events
+                     WHERE subject = ?1 AND kind = 'coordination_target_released'",
+                )?;
+                statement
+                    .query_map([&request.id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for spec in super::coordination::held_candidates(scope, &events) {
+                if !scope_held(tx, who, request, std::slice::from_ref(&spec), now)? {
+                    released.push(super::coordination::display_spec(&spec));
                 }
             }
             released.sort();
@@ -17629,8 +17638,8 @@ impl Store for SqliteStore {
             return Err(who.capacity(CapacityLimit::CoordinationUpdates));
         }
         let response_id = new_id("crs")?;
-        let released_paths = if reply.release_paths.is_empty() {
-            None
+        let released: Vec<String> = if reply.release_paths.is_empty() {
+            Vec::new()
         } else {
             let work = scoped_work(&tx, &who, &target.work_id, now)?
                 .ok_or_else(|| HubError::Unavailable("target work is missing".into()))?;
@@ -17644,18 +17653,22 @@ impl Store for SqliteStore {
             )?;
             release.validate()?;
             work_transition_in(&tx, &WorkTransitionActor::Agent { token }, &release, now)?;
-            Some(json_string(&super::intent::display_all(
-                &release.released_keys()?,
-            ))?)
+            super::intent::display_all(&release.released_keys()?)
         };
+        let released_paths = (!released.is_empty())
+            .then(|| json_string(&released))
+            .transpose()?;
         let event = coordination_event(
             "coordination_responded",
             &request.id,
             now,
             with_via(
-                json!({"response_id": response_id, "target_work_id": target.work_id,
+                with_released(
+                    json!({"response_id": response_id, "target_work_id": target.work_id,
                     "kind": response_kind_name(reply.kind), "token": who.token,
                     "session": reply.session, "generation": target.generation}),
+                    &released,
+                ),
                 reply.via.tag(),
             ),
         )?;

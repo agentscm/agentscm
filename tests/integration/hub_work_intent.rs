@@ -154,7 +154,7 @@ fn contract(f: Fixture) {
                     source_refs: vec![],
                     depends_on: vec![],
                     related_work: vec![],
-                    finished_paths: Vec::new(),
+                    finished_paths: None,
                 },
                 now + 1,
             )
@@ -183,7 +183,7 @@ fn contract(f: Fixture) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
-                finished_paths: Vec::new(),
+                finished_paths: None,
             },
             now + 1,
         )

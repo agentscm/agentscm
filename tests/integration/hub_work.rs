@@ -571,7 +571,7 @@ fn checkpoint(
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
-        finished_paths: Vec::new(),
+        finished_paths: None,
     }
 }
 
@@ -2695,6 +2695,7 @@ conformance!(
     an_ask_lapses_when_release_paths_frees_the_file,
     release_paths_is_for_the_lead_and_the_owner_and_names_what_it_refuses,
     release_paths_never_takes_another_works_file,
+    release_paths_releases_a_directory_entry_exactly,
     finished_paths_follow_the_scope_and_never_change_admission,
 );
 
@@ -7406,6 +7407,35 @@ fn release_paths_never_takes_another_works_file(db: &Db) {
     ));
 }
 
+fn release_paths_releases_a_directory_entry_exactly(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let a = start_scope(
+        &*store,
+        &alice,
+        "a",
+        "s-a",
+        &["src/dir/**", "src/b.rs"],
+        now,
+    )
+    .item;
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&a, "rp", Some("s-a"), &["src/dir/**"]),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(released.item.scope, ["src/b.rs"]);
+    let bob = agent(&*store, 2);
+    assert!(
+        start_scope(&*store, &bob, "b", "s-b", &["src/dir/x.rs"], now + 2)
+            .conflict
+            .is_none()
+    );
+}
+
 fn finished_paths_follow_the_scope_and_never_change_admission(db: &Db) {
     let store = db.open();
     let now = unix_now();
@@ -7424,7 +7454,8 @@ fn finished_paths_follow_the_scope_and_never_change_admission(db: &Db) {
     let progress = |item: &agentscm::hub::work::WorkItem, op: &str, finished: &[&str]| {
         let mut request = checkpoint(&item.id, op, 1, "s-a", CheckpointKind::Progress, "p");
         request.expected_updated_seq = Some(item.updated_seq);
-        request.finished_paths = finished.iter().map(|path| (*path).to_owned()).collect();
+        request.finished_paths = (!finished.is_empty())
+            .then(|| finished.iter().map(|path| (*path).to_owned()).collect());
         request
     };
     // A path outside the scope is refused and names the path.
@@ -7474,6 +7505,23 @@ fn finished_paths_follow_the_scope_and_never_change_admission(db: &Db) {
         .unwrap()
         .item;
     assert_eq!(narrowed.finished_paths, ["src/b.rs"]);
+    // An empty list clears the set; absence (above) kept it.
+    let mut clear = progress(&narrowed, "clear", &[]);
+    clear.finished_paths = Some(Vec::new());
+    let cleared = store
+        .work_checkpoint(&alice.token, &clear, now + 7)
+        .unwrap()
+        .item;
+    assert!(cleared.finished_paths.is_empty());
+    let restored = store
+        .work_checkpoint(
+            &alice.token,
+            &progress(&cleared, "again", &["src/b.rs"]),
+            now + 7,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(restored.finished_paths, ["src/b.rs"]);
     // release_paths drops them too.
     let current = current_item(&*store, &alice, &a.id, now + 8);
     let released = store

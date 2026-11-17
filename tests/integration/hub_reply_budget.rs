@@ -140,7 +140,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
                         source_refs: Vec::new(),
                         depends_on: Vec::new(),
                         related_work: Vec::new(),
-                        finished_paths: Vec::new(),
+                        finished_paths: None,
                     },
                     now + 1,
                 )

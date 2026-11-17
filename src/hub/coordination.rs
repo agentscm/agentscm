@@ -199,6 +199,46 @@ impl CoordinationRequest {
 /// The most requested paths probed one by one for a partial release.
 pub const MAX_RELEASED_PATHS: usize = 32;
 
+/// The requested paths a target Work actually held, read from its `coordination_target_released`
+/// events (`data` is each event's JSON): a path some event's `paths` covers, or every path when
+/// an event names none (a full release or end). The target's scope is not recorded on the
+/// request, so a path the target never held is never a candidate.
+pub(super) fn held_candidates(scope: &[String], events: &[String]) -> Vec<String> {
+    let released: Vec<Vec<String>> = events
+        .iter()
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .map(|data| {
+            data["paths"]
+                .as_array()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|p| p.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    scope
+        .iter()
+        .filter(|spec| {
+            let key = super::intent::spec_key(spec).unwrap_or_else(|_| (*spec).clone());
+            released.iter().any(|paths| {
+                paths.is_empty()
+                    || paths
+                        .iter()
+                        .any(|p| super::intent::overlaps(&key, super::intent::key_of(p)))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// A requested path in the display form every released-paths list uses.
+pub(super) fn display_spec(spec: &str) -> String {
+    super::intent::display(&super::intent::spec_key(spec).unwrap_or_else(|_| spec.to_owned()))
+}
+
 /// Whether the paths a request asks for are still held.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -432,7 +472,11 @@ impl CoordinationReply {
         release_id: &str,
         session: &str,
     ) -> Result<super::work_transition::WorkTransitionRequest> {
-        let requested = super::work::normalized_scope(requested)?;
+        // A proposal's scope holds index keys (`dir/`), which are not display specs.
+        let requested: Vec<String> = requested
+            .iter()
+            .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+            .collect();
         let unrequested: Vec<String> = super::work::normalized_scope(&self.release_paths)?
             .into_iter()
             .filter(|key| !requested.contains(key))
@@ -536,6 +580,15 @@ pub(super) fn invalid(message: &str) -> HubError {
 pub(super) fn with_via(mut data: serde_json::Value, via: Option<&str>) -> serde_json::Value {
     if let Some(via) = via {
         data["via"] = serde_json::json!(via);
+    }
+    data
+}
+
+/// Adds the display paths a reply released to its `coordination_responded` event data; skipped
+/// when it released none, so earlier events keep their bytes.
+pub(super) fn with_released(mut data: serde_json::Value, released: &[String]) -> serde_json::Value {
+    if !released.is_empty() {
+        data["released_paths"] = serde_json::json!(released);
     }
     data
 }
