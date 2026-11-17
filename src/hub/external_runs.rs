@@ -128,14 +128,9 @@ async fn set_deploy_workflow(
         ));
     }
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "deploy_workflow",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "deploy_workflow")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden()
             .with_message("Only a repository admin or a Hub admin names the deploy workflow."));
