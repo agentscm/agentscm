@@ -311,7 +311,7 @@ fn contract(database: &str) {
         session: "dependent".into(),
         incarnation: incarnation.clone(),
         delivery_id: record.id.clone(),
-        work_id: dependent.id,
+        work_id: dependent.id.clone(),
         generation: dependent.generation,
         declaration_seq: declarations.declaration_seq,
         semantic_version: 3,
@@ -334,6 +334,34 @@ fn contract(database: &str) {
         reopened
             .dependency_notice_ack(&token, &wrong, now + 70)
             .is_err()
+    );
+
+    let expiring = reopened.notice_refresh(&token, &query, now + 901).unwrap();
+    let expiry = expiring
+        .notices
+        .iter()
+        .find(|notice| {
+            notice.source.kind == SourceKind::Operational
+                && notice.source.id == dependent.id
+                && notice.source.version.starts_with("reservation-expiring:")
+        })
+        .expect("a held reservation inside the warning window has one durable pointer");
+    let repeated = reopened.notice_refresh(&token, &query, now + 902).unwrap();
+    assert_eq!(
+        repeated
+            .notices
+            .iter()
+            .filter(|notice| notice.id == expiry.id)
+            .count(),
+        1,
+        "the same lease version is deduplicated"
+    );
+    assert!(
+        reopened
+            .notice_offer(&token, &ordinary, now + 1201)
+            .unwrap()
+            .is_none(),
+        "an observed expiration withdraws its warning instead of waking again"
     );
 
     let source = NoticeSource {
@@ -1511,6 +1539,40 @@ fn owner_mailbox_contract(database: &str) {
             .is_ok(),
         "the addressed recipient can read the exact notice"
     );
+    let first_incarnation = register(&*store, &recipient_token, "recipient-one");
+    let second_incarnation = register(&*store, &recipient_token, "recipient-two");
+    let refresh = |session: &str, incarnation: &str, at| {
+        store
+            .notice_refresh(
+                &recipient_token,
+                &DependencyRefresh {
+                    session: session.into(),
+                    incarnation: incarnation.into(),
+                    after: None,
+                    limit: 100,
+                },
+                at,
+            )
+            .unwrap()
+    };
+    let first_session = refresh("recipient-one", &first_incarnation, now);
+    let second_session = refresh("recipient-two", &second_incarnation, now);
+    let pointer = |page: &agentscm::hub::notices::NoticeRefreshPage| {
+        page.notices
+            .iter()
+            .find(|receipt| {
+                receipt.source.kind == SourceKind::OwnerNotice && receipt.source.id == created.id
+            })
+            .expect("owner notice is visible on the first startup refresh")
+            .id
+            .clone()
+    };
+    assert_ne!(pointer(&first_session), pointer(&second_session));
+    assert_eq!(
+        pointer(&first_session),
+        pointer(&refresh("recipient-one", &first_incarnation, now + 1)),
+        "one source version has one receipt per session"
+    );
     assert_eq!(
         store
             .owner_notice_put(&sender_token, &request, now + 1)
@@ -1615,6 +1677,26 @@ fn owner_mailbox_contract(database: &str) {
         .unwrap();
     assert_eq!(acknowledged.acknowledged_at, Some(now + 3));
     assert!(acknowledged.acted_at.is_none());
+    for (session, incarnation) in [
+        ("recipient-one", &first_incarnation),
+        ("recipient-two", &second_incarnation),
+    ] {
+        assert!(
+            store
+                .notice_offer(
+                    &recipient_token,
+                    &NoticeOfferRequest {
+                        session: session.into(),
+                        incarnation: incarnation.clone(),
+                        automatic: true,
+                    },
+                    now + 3,
+                )
+                .unwrap()
+                .is_none(),
+            "mailbox acknowledgement invalidates every session pointer without consuming it on observation"
+        );
+    }
     let acted = store
         .owner_notice_recipient_status(
             &reader,

@@ -307,6 +307,18 @@ fn current(
                 && view.incarnation == incarnation
         }));
     }
+    if receipt.source.kind == SourceKind::Operational
+        && let Some((generation, expires_at)) = receipt
+            .source
+            .version
+            .strip_prefix("reservation-expiring:")
+            .and_then(|value| value.split_once(':'))
+        && let (Ok(generation), Ok(expires_at)) =
+            (generation.parse::<i64>(), expires_at.parse::<i64>())
+    {
+        let row=tx.query_opt("SELECT generation=$2 AND reservation_basis IS NOT NULL AND reservation_expires_at=$3 AND reservation_expires_at>$4 FROM hub_work_items WHERE id=$1", &[&receipt.source.id,&generation,&expires_at,&now])?;
+        return Ok(row.is_some_and(|row| row.get(0)));
+    }
     if receipt.source.kind == SourceKind::Dependency {
         let value = tx.query_opt(
             "SELECT snapshot FROM hub_work_dependency_notices WHERE work=$1",
@@ -952,12 +964,20 @@ impl PgStore {
                 WHERE w.lead_token=$1 AND w.lead_session=$2 AND w.state IN ('active','blocked') AND w.id>$3 ORDER BY w.id LIMIT $4",
                 &[&token,&domain,&query.after.as_deref().unwrap_or(""),&((query.limit+1) as i64)])?
                 .iter().map(|row|row.get(0)).collect();
-            let page=refresh_items(&mut tx,&who,ids,query.limit,now)?;
+            let mut page=refresh_items(&mut tx,&who,ids,query.limit,now)?;
+            let rows=tx.query("SELECT id,snapshot,reservation_expires_at FROM hub_work_items WHERE lead_token=$1 AND lead_session=$2 AND state IN ('active','blocked') AND reservation_basis IS NOT NULL AND reservation_expires_at>$3 AND reservation_expires_at<=$4 ORDER BY id LIMIT 101", &[&token,&domain,&now,&now.saturating_add(RESERVATION_EXPIRY_NOTICE_SECS)])?;
+            if rows.len()>100{return Err(HubError::Unavailable("Reservation expiry notice coverage exceeds its bound.".into()));}
+            for row in rows {
+                let id:String=row.get(0); let item:WorkItem=json_value(&row.get::<_,String>(1))?; let expires_at:i64=row.get(2);
+                let receipt=record(&mut tx,&who,NoticeSource{kind:SourceKind::Operational,id,version:format!("reservation-expiring:{}:{expires_at}",item.generation)},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:Some(item.id),generation:Some(item.generation)},now)?;
+                page.notices.push(receipt);
+            }
             let rows=tx.query("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=$1 AND provider=$2 AND host=$3 AND repository_id IS NOT DISTINCT FROM $4 AND (snapshot::jsonb->>'acknowledged_at') IS NULL ORDER BY id LIMIT 101", &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?;
             if rows.len()>100{return Err(HubError::Unavailable("Owner notice refresh coverage exceeds its bound.".into()));}
             for row in rows {
                 let notice=owner_notice_row(row.get(0))?;
-                record(&mut tx,&who,NoticeSource{kind:SourceKind::OwnerNotice,id:notice.id,version:notice.created_at.to_string()},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:None,generation:None},now)?;
+                let receipt=record(&mut tx,&who,NoticeSource{kind:SourceKind::OwnerNotice,id:notice.id,version:notice.created_at.to_string()},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:None,generation:None},now)?;
+                page.notices.push(receipt);
             }
             tx.commit()?;
             Ok(page)

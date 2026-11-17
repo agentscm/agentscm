@@ -324,6 +324,18 @@ fn current(tx: &Transaction<'_>, who: &WorkWho, receipt: &NoticeReceipt, now: i6
                 && view.incarnation == incarnation
         }));
     }
+    if receipt.source.kind == SourceKind::Operational
+        && let Some((generation, expires_at)) = receipt
+            .source
+            .version
+            .strip_prefix("reservation-expiring:")
+            .and_then(|value| value.split_once(':'))
+        && let (Ok(generation), Ok(expires_at)) =
+            (generation.parse::<i64>(), expires_at.parse::<i64>())
+    {
+        let current = tx.query_row("SELECT generation=?2 AND reservation_basis IS NOT NULL AND reservation_expires_at=?3 AND reservation_expires_at>?4 FROM hub_work_items WHERE id=?1", params![receipt.source.id,generation,expires_at,now], |row| row.get::<_,bool>(0)).optional()?;
+        return Ok(current.unwrap_or(false));
+    }
     if receipt.source.kind == SourceKind::Dependency {
         let value = tx
             .query_row(
@@ -1026,7 +1038,36 @@ impl SqliteStore {
                 |row| row.get(0),
             )?
             .collect::<std::result::Result<Vec<String>, _>>()?;
-        let page = refresh_items(&tx, &who, ids, query.limit, now)?;
+        let mut page = refresh_items(&tx, &who, ids, query.limit, now)?;
+        let expiring = tx
+            .prepare("SELECT id, snapshot, reservation_expires_at FROM hub_work_items WHERE lead_token=?1 AND lead_session=?2 AND state IN ('active','blocked') AND reservation_basis IS NOT NULL AND reservation_expires_at>?3 AND reservation_expires_at<=?4 ORDER BY id LIMIT 101")?
+            .query_map(params![token,domain,now,now.saturating_add(RESERVATION_EXPIRY_NOTICE_SECS)], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        if expiring.len() > 100 {
+            return Err(HubError::Unavailable(
+                "Reservation expiry notice coverage exceeds its bound.".into(),
+            ));
+        }
+        for (id, snapshot, expires_at) in expiring {
+            let item: WorkItem = json_value(&snapshot)?;
+            let receipt = record(
+                &tx,
+                &who,
+                NoticeSource {
+                    kind: SourceKind::Operational,
+                    id,
+                    version: format!("reservation-expiring:{}:{expires_at}", item.generation),
+                },
+                NoticeRecipient {
+                    token: token.into(),
+                    session: domain.clone(),
+                    work_id: Some(item.id),
+                    generation: Some(item.generation),
+                },
+                now,
+            )?;
+            page.notices.push(receipt);
+        }
         let owner_notices = tx
             .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4 AND json_extract(snapshot,'$.acknowledged_at') IS NULL ORDER BY id LIMIT 101")?
             .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id], |row| row.get::<_,String>(0))?
@@ -1038,7 +1079,7 @@ impl SqliteStore {
         }
         for snapshot in owner_notices {
             let notice = owner_notice_row(snapshot)?;
-            record(
+            let receipt = record(
                 &tx,
                 &who,
                 NoticeSource {
@@ -1054,6 +1095,7 @@ impl SqliteStore {
                 },
                 now,
             )?;
+            page.notices.push(receipt);
         }
         tx.commit()?;
         Ok(page)
