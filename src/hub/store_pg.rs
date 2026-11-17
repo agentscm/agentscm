@@ -20,15 +20,15 @@ use super::catchup::{
     BranchMerge, BranchMergeRows, CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES,
     CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES, CATCHUP_DELIVERY_CAPACITY_BYTES,
     CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult, CatchupAckStatus,
-    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupPage,
-    CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupOwnerNotice,
+    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
     CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge, RecentMergeRow,
-    TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
-    repository_namespace, source_name, tracked_publication_merge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_OWNER_NOTICES, MAX_CATCHUP_PAGE_PAYLOAD_BYTES,
+    NewCatchupMerge, RecentMergeRow, TrackedPublicationMergeInput, coverage_name, parse_coverage,
+    parse_source, repository_namespace, source_name, tracked_publication_merge,
 };
 use super::change_record::{
     ConversationAudience, SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState,
@@ -1686,6 +1686,34 @@ fn pg_catchup_page(
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
+    let owner_notices = if subscriber == HUMAN_SUBSCRIBER || event_after != event_from {
+        Vec::new()
+    } else {
+        tx.query(
+            "SELECT snapshot FROM hub_owner_notices
+             WHERE recipient_owner=$1 AND provider=$2 AND host=$3
+               AND repository_id IS NOT DISTINCT FROM $4
+               AND (snapshot::jsonb->>'acknowledged_at') IS NULL
+             ORDER BY id LIMIT $5",
+            &[
+                &who.owner.id,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository_id,
+                &(MAX_CATCHUP_OWNER_NOTICES as i64),
+            ],
+        )?
+        .into_iter()
+        .map(|row| {
+            let notice: super::notices::OwnerNotice = json_value(row.get::<_, String>(0).as_str())?;
+            Ok(CatchupOwnerNotice {
+                id: notice.id,
+                source_kind: notice.source_kind,
+                created_at: notice.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+    };
     Ok(CatchupPage {
         subscriber: subscriber.to_owned(),
         delivery_client: delivery_client.to_owned(),
@@ -1709,6 +1737,7 @@ fn pg_catchup_page(
             merge_available_from: merge_floor,
         },
         source_coverage,
+        owner_notices,
         complete: next_event_after == event_through && next_merge_after == merge_through,
     })
 }
@@ -15438,15 +15467,16 @@ impl Store for PgStore {
               AND NOT acknowledged AND NOT superseded AND (event_from<>$9 OR merge_from<>$10)",
             &[&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
               &who.owner.identity.host,&repository,&key,&now,&cursors.0,&cursors.1])?;
-        let existing=tx.query_opt("SELECT id,event_from,event_through,merge_from,merge_through
+        let existing=tx.query_opt("SELECT id,page
             FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
               AND subscriber=$3 AND provider=$4 AND host=$5 AND repository=$6 AND repository_key=$7
               AND delivery_client=$8 AND NOT acknowledged AND NOT superseded
               ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE",
             &[&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
               &who.owner.identity.host,&repository,&key,&query.delivery_client])?;
-        let(delivery,event_from,event_through,merge_from,merge_through,is_new)=if let Some(row)=existing{
-            (row.get(0),row.get(1),row.get(2),row.get(3),row.get(4),false)
+        let(delivery,event_from,event_through,merge_from,merge_through,is_new)=if let Some(row)=existing{let delivery:String=row.get(0);let page:String=row.get(1);
+            tx.execute("UPDATE hub_catchup_deliveries SET updated_at=$2 WHERE id=$1",&[&delivery,&now])?;
+            tx.commit()?;return json_value(&page);
         }else{
             let active_total:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1 AND provider=$2
                 AND host=$3 AND repository=$4 AND repository_key=$5 AND NOT acknowledged AND NOT superseded",

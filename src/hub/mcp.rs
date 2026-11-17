@@ -341,6 +341,8 @@ struct CatchupArgs {
     merge_after: Option<i64>,
     merge_through: Option<i64>,
     limit: Option<usize>,
+    #[serde(default)]
+    wait_seconds: u64,
 }
 
 #[derive(Deserialize)]
@@ -755,7 +757,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
     );
     let catchup = json!(
         {"name": "agentscm_work_catchup",
-         "description": "Reads Work events and confirmed merges at fixed high-waters without acknowledging. Continue with delivery, event_after, event_through, merge_after and merge_through from the same delivery; omit all five for a fresh delivery. Use subscriber human only when the owner asks.",
+         "description": "Reads Work events, confirmed merges and safe pointers to this agent owner's pending addressed notices at fixed high-waters without acknowledging either Catch up or a notice. Continue with delivery, event_after, event_through, merge_after and merge_through from the same delivery; omit all five for a fresh delivery. A fresh agent delivery may wait up to 25 seconds for relevant data without waking the model. Use subscriber human only when the owner asks; human deliveries never include owner-notice pointers.",
          "annotations": {"readOnlyHint": true},
          "inputSchema": schema(json!({
              "subscriber": {"type": "string", "description": "Independent catch-up identity. Omit for this agent session; use human only for the owner's personal cross-device cursor."},
@@ -765,7 +767,8 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "event_through": {"type": "integer", "minimum": 0, "description": "Repeat the fixed event_through from the first page."},
              "merge_after": {"type": "integer", "minimum": 0, "description": "Use next_merge_after from the previous page."},
              "merge_through": {"type": "integer", "minimum": 0, "description": "Repeat the fixed merge_through from the first page."},
-             "limit": {"type": "integer", "minimum": 1, "maximum": super::catchup::MAX_CATCHUP_PAGE, "default": 20}
+             "limit": {"type": "integer", "minimum": 1, "maximum": super::catchup::MAX_CATCHUP_PAGE, "default": 20},
+             "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 0, "description": "Wait only on a fresh delivery; timeout returns the ordinary quiet page."}
          }), &[])}
     );
     let catchup_ack = json!(
@@ -3823,10 +3826,11 @@ async fn work_catchup(state: &HubState, principal: &Principal, arguments: Catchu
         merge_after,
         merge_through,
         limit,
+        wait_seconds,
     } = arguments;
     let store = state.store.clone();
     let token = principal.token_id.clone();
-    match blocking(state, move || {
+    let query = blocking(state, move || {
         let now = unix_now();
         let explicit_subscriber = subscriber.is_some();
         let subscriber = match subscriber {
@@ -3841,7 +3845,7 @@ async fn work_catchup(state: &HubState, principal: &Principal, arguments: Catchu
             None if !explicit_subscriber => subscriber.clone(),
             None => super::catchup::agent_subscriber(&format!("mcp:{subscriber}"))?,
         };
-        let query = CatchupQuery {
+        Ok(CatchupQuery {
             subscriber,
             delivery_client,
             delivery,
@@ -3850,11 +3854,15 @@ async fn work_catchup(state: &HubState, principal: &Principal, arguments: Catchu
             merge_after,
             merge_through,
             limit: limit.unwrap_or(20),
-        };
-        store.work_catchup(&token, &query, now)
+            wait_seconds,
+        })
     })
-    .await
-    {
+    .await;
+    let query = match query {
+        Ok(query) => query,
+        Err(error) => return hub_failure(&error),
+    };
+    match super::work_http::poll_catchup(state, principal, query).await {
         Ok(page) => structured(&shown(page, &principal.owner.id)),
         Err(error) => hub_failure(&error),
     }

@@ -12,6 +12,9 @@ use agentscm::hub::catchup::{
     CatchupPublicationRepair, CatchupQuery, CatchupRepositoryScope, CatchupSourceStatus,
     NewCatchupMerge,
 };
+use agentscm::hub::notices::{
+    NewOwnerNotice, OwnerNoticeRecipient, OwnerNoticeRoute, OwnerNoticeSourceKind,
+};
 use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
@@ -337,6 +340,141 @@ fn continuation(page: &agentscm::hub::catchup::CatchupPage, limit: usize) -> Cat
         merge_after: Some(page.next_merge_after),
         merge_through: Some(page.merge_through),
         limit,
+        wait_seconds: 0,
+    }
+}
+
+fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
+    let now = unix_now();
+    let sender = fixture.owner(80);
+    let recipient = fixture.owner(81);
+    let sender_token = fixture.token(&sender, "notice-sender", REPOSITORY_ID, false);
+    let recipient_token = fixture.token(&recipient, "notice-recipient", REPOSITORY_ID, false);
+    let request = |key: &str| NewOwnerNotice {
+        idempotency_key: key.into(),
+        source_kind: OwnerNoticeSourceKind::Addressed,
+        source_id: format!("source-{key}"),
+        recipient: OwnerNoticeRecipient {
+            owner: recipient.clone(),
+            provider: "github".into(),
+            host: "github.com".into(),
+        },
+        route: OwnerNoticeRoute::Private,
+        body: "Review the current notice on the Hub.".into(),
+    };
+    let first_notice = fixture
+        .store
+        .owner_notice_put(&sender_token, &request("first"), now)
+        .unwrap();
+    let page = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: "agent:notice-session".into(),
+                delivery_client: "notice-reader".into(),
+                ..CatchupQuery::default()
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(page.owner_notices.len(), 1);
+    assert_eq!(page.owner_notices[0].id, first_notice.id);
+
+    let second_notice = fixture
+        .store
+        .owner_notice_put(&sender_token, &request("second"), now + 2)
+        .unwrap();
+    let replay = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: page.subscriber.clone(),
+                delivery_client: page.delivery_client.clone(),
+                ..CatchupQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(
+        replay, page,
+        "an open delivery keeps its immutable notice window"
+    );
+
+    let listed = fixture
+        .store
+        .owner_notice_list(
+            &WorkLifecycleReader::Token(&recipient_token),
+            None,
+            10,
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(listed.notices.len(), 2);
+    assert!(
+        listed
+            .notices
+            .iter()
+            .all(|notice| notice.acknowledged_at.is_none())
+    );
+    assert!(
+        listed
+            .notices
+            .iter()
+            .any(|notice| notice.id == second_notice.id)
+    );
+
+    let human = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: "human".into(),
+                delivery_client: "owner-browser".into(),
+                ..CatchupQuery::default()
+            },
+            now + 5,
+        )
+        .unwrap();
+    assert!(human.owner_notices.is_empty());
+
+    if let Some(database) = &fixture.database {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .execute(
+                "UPDATE hub_catchup_deliveries SET page=json_remove(page,'$.owner_notices') WHERE id=?1",
+                [&page.delivery],
+            )
+            .unwrap();
+        let legacy = fixture
+            .store
+            .work_catchup(
+                &recipient_token,
+                &CatchupQuery {
+                    subscriber: page.subscriber.clone(),
+                    delivery_client: page.delivery_client.clone(),
+                    ..CatchupQuery::default()
+                },
+                now + 6,
+            )
+            .unwrap();
+        assert!(
+            legacy.owner_notices.is_empty(),
+            "old serialized pages still decode"
+        );
+    }
+}
+
+#[test]
+fn sqlite_owner_notice_pointers_are_frozen_and_do_not_acknowledge() {
+    owner_notice_pointers_are_frozen_and_do_not_acknowledge(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_owner_notice_pointers_are_frozen_and_do_not_acknowledge() {
+    if let Some(fixture) = Fixture::postgres() {
+        owner_notice_pointers_are_frozen_and_do_not_acknowledge(&fixture);
     }
 }
 

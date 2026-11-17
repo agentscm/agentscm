@@ -18,15 +18,15 @@ use super::catchup::{
     BranchMerge, BranchMergeRows, CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES,
     CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES, CATCHUP_DELIVERY_CAPACITY_BYTES,
     CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult, CatchupAckStatus,
-    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupPage,
-    CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupOwnerNotice,
+    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
     CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge, RecentMergeRow,
-    TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
-    repository_namespace, source_name, tracked_publication_merge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_OWNER_NOTICES, MAX_CATCHUP_PAGE_PAYLOAD_BYTES,
+    NewCatchupMerge, RecentMergeRow, TrackedPublicationMergeInput, coverage_name, parse_coverage,
+    parse_source, repository_namespace, source_name, tracked_publication_merge,
 };
 use super::change_record::{
     ConversationAudience, SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState,
@@ -1146,6 +1146,37 @@ fn sqlite_catchup_page(
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
+    let owner_notices = if subscriber == HUMAN_SUBSCRIBER || event_after != event_from {
+        Vec::new()
+    } else {
+        tx.prepare(
+            "SELECT snapshot FROM hub_owner_notices
+             WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4
+               AND json_extract(snapshot,'$.acknowledged_at') IS NULL
+             ORDER BY id LIMIT ?5",
+        )?
+        .query_map(
+            params![
+                who.owner.id,
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                who.repository_id,
+                MAX_CATCHUP_OWNER_NOTICES as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|snapshot| {
+            let notice: super::notices::OwnerNotice = json_value(&snapshot)?;
+            Ok(CatchupOwnerNotice {
+                id: notice.id,
+                source_kind: notice.source_kind,
+                created_at: notice.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+    };
     Ok(CatchupPage {
         subscriber: subscriber.to_owned(),
         delivery_client: delivery_client.to_owned(),
@@ -1169,6 +1200,7 @@ fn sqlite_catchup_page(
             merge_available_from: merge_floor,
         },
         source_coverage,
+        owner_notices,
         complete: next_event_after == event_through && next_merge_after == merge_through,
     })
 }
@@ -16420,9 +16452,9 @@ impl Store for SqliteStore {
             ],
         )?;
 
-        let existing: Option<(String, i64, i64, i64, i64)> = tx
+        let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT id,event_from,event_through,merge_from,merge_through
+                "SELECT id,page
              FROM hub_catchup_deliveries WHERE owner=?1 AND subscriber_token IS ?2
                AND subscriber=?3 AND provider=?4 AND host=?5 AND repository=?6
                AND repository_key=?7 AND delivery_client=?8 AND acknowledged=0 AND superseded=0
@@ -16437,20 +16469,17 @@ impl Store for SqliteStore {
                     repository_key,
                     query.delivery_client
                 ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let (delivery, event_from, event_through, merge_from, merge_through, is_new) =
-            if let Some(row) = existing {
-                (row.0, row.1, row.2, row.3, row.4, false)
+            if let Some((delivery, page)) = existing {
+                tx.execute(
+                    "UPDATE hub_catchup_deliveries SET updated_at=?2 WHERE id=?1",
+                    params![delivery, now],
+                )?;
+                tx.commit()?;
+                return json_value(&page);
             } else {
                 let active_total: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=?1 AND provider=?2

@@ -13,6 +13,8 @@ use super::work_lifecycle::WorkTransitionKind;
 use super::{HubError, Result};
 
 pub const MAX_CATCHUP_PAGE: usize = 50;
+pub const MAX_CATCHUP_WAIT_SECONDS: u64 = 25;
+pub const MAX_CATCHUP_OWNER_NOTICES: usize = 100;
 pub const CATCHUP_PREVIEW_LIMIT: usize = 20;
 pub const MAX_CATCHUP_PATHS: usize = 256;
 pub const HUMAN_SUBSCRIBER: &str = "human";
@@ -224,6 +226,16 @@ pub struct CatchupSourceCoverage {
     pub window_from: Option<i64>,
 }
 
+/// A non-consuming pointer to an owner-addressed notice. The body and routing details stay behind
+/// the owner-notice read so historical catch-up cannot expose them to another subscriber.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatchupOwnerNotice {
+    pub id: String,
+    pub source_kind: super::notices::OwnerNoticeSourceKind,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatchupQuery {
@@ -238,6 +250,10 @@ pub struct CatchupQuery {
     pub merge_through: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Handler-only long poll. Store reads remain immediate and side-effect free beyond the normal
+    /// immutable delivery creation.
+    #[serde(default)]
+    pub wait_seconds: u64,
 }
 
 impl Default for CatchupQuery {
@@ -251,6 +267,7 @@ impl Default for CatchupQuery {
             merge_after: None,
             merge_through: None,
             limit: default_limit(),
+            wait_seconds: 0,
         }
     }
 }
@@ -274,6 +291,10 @@ pub struct CatchupPage {
     pub merges: Vec<CatchupMergeObservation>,
     pub retention: CatchupRetention,
     pub source_coverage: Vec<CatchupSourceCoverage>,
+    /// Present only on the first page of an agent delivery. Reading these pointers does not create,
+    /// read, acknowledge or otherwise consume a notice receipt.
+    #[serde(default)]
+    pub owner_notices: Vec<CatchupOwnerNotice>,
     pub complete: bool,
 }
 
@@ -298,6 +319,8 @@ pub struct CatchupPreview {
     pub merges: Vec<CatchupMergeObservation>,
     pub retention: CatchupRetention,
     pub source_coverage: Vec<CatchupSourceCoverage>,
+    #[serde(default)]
+    pub owner_notices: Vec<CatchupOwnerNotice>,
     pub complete: bool,
 }
 
@@ -353,6 +376,13 @@ impl CatchupQuery {
         catchup_label("catch-up delivery client", &self.delivery_client)?;
         if !(1..=MAX_CATCHUP_PAGE).contains(&self.limit) {
             return Err(invalid("catch-up limit must be 1 to 50"));
+        }
+        if self.wait_seconds > MAX_CATCHUP_WAIT_SECONDS
+            || (self.wait_seconds > 0 && self.delivery.is_some())
+        {
+            return Err(invalid(
+                "wait_seconds must be 0..25 and is only valid for a fresh catch-up delivery",
+            ));
         }
         for cursor in [
             self.event_after,
@@ -419,6 +449,7 @@ impl CatchupPreview {
             merges: page.merges,
             retention: page.retention,
             source_coverage: page.source_coverage,
+            owner_notices: page.owner_notices,
             complete: page.complete,
         }
     }
