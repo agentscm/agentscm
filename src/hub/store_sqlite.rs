@@ -46,8 +46,9 @@ use super::coordination::{
     CoordinationStatus, CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
-    MAX_PROJECTED_COORDINATION_UPDATES, RequestedPathsHold, helper_join_editable, join_uncovered,
-    parse_response_kind, parse_status, response_kind_name, status_name, with_via,
+    MAX_PROJECTED_COORDINATION_UPDATES, MAX_RELEASED_PATHS, RequestedPathsHold,
+    helper_join_editable, join_uncovered, parse_response_kind, parse_status, response_kind_name,
+    status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -3909,6 +3910,7 @@ fn coordination_request_at(
         updated_seq,
         requester_unavailable,
         requested_paths: None,
+        released_paths: Vec::new(),
     }))
 }
 
@@ -4435,8 +4437,10 @@ fn coordination_page(
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
         if request.requester.token == who.token
             && Some(request.requester.session.as_str()) == session_name
+            && let Some((hold, released)) = requested_paths_hold(tx, who, &request, now)
         {
-            request.requested_paths = requested_paths_hold(tx, who, &request, now);
+            request.requested_paths = Some(hold);
+            request.released_paths = released;
         }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
@@ -4464,69 +4468,91 @@ fn coordination_page(
 }
 
 /// Whether the paths an open request asks for are still held by another lead's reservation or
-/// another token's live intent. Only the requester's own inbox asks, and a failed read says
-/// unknown rather than failing the page.
+/// another token's live intent, and while some are, which of them are not. Only the requester's
+/// own inbox asks, and a failed read says unknown rather than failing the page.
 fn requested_paths_hold(
     tx: &Transaction<'_>,
     who: &WorkWho,
     request: &CoordinationRequest,
     now: i64,
-) -> Option<RequestedPathsHold> {
+) -> Option<(RequestedPathsHold, Vec<String>)> {
     if !matches!(
         request.status,
         CoordinationStatus::Pending | CoordinationStatus::Responded
     ) {
         return None;
     }
-    let read = || -> Result<bool> {
+    let read = || -> Result<(bool, Vec<String>)> {
         let scope = &request.proposal.scope;
-        let held_work = work_scope_overlaps(tx, who, scope, None, now)?
-            .iter()
-            .any(|overlap| {
-                request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
-                    && overlap.item.lead_token != who.token
-            });
-        if held_work {
-            return Ok(true);
+        if !scope_held(tx, who, request, scope, now)? {
+            return Ok((false, Vec::new()));
         }
-        let keys = scope
-            .iter()
-            .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
-            .collect::<Vec<_>>();
-        let (points, ranges) = probe_set(&keys);
-        let rows = resolved_scope(
-            tx,
-            &who.owner.identity.host,
-            &who.repository,
-            who.repository_id,
-        )?;
-        let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
-             WHERE p.repository_scope = ?1 AND i.token <> ?2 AND p.expires_at > ?3";
-        if !points.is_empty()
-            && tx.query_row(
-                &format!("SELECT EXISTS ({live} AND p.key IN (SELECT value FROM json_each(?4)))"),
-                params![rows, who.token, now, json!(points).to_string()],
-                |row| row.get::<_, bool>(0),
-            )?
-        {
-            return Ok(true);
-        }
-        for (start, end) in ranges {
-            if tx.query_row(
-                &format!("SELECT EXISTS ({live} AND p.key >= ?4 AND p.key < ?5)"),
-                params![rows, who.token, now, start, end],
-                |row| row.get::<_, bool>(0),
-            )? {
-                return Ok(true);
+        let mut released = Vec::new();
+        if scope.len() <= MAX_RELEASED_PATHS {
+            for spec in scope {
+                if !scope_held(tx, who, request, std::slice::from_ref(spec), now)? {
+                    released.push(spec.clone());
+                }
             }
+            released.sort();
         }
-        Ok(false)
+        Ok((true, released))
     };
     Some(match read() {
-        Ok(true) => RequestedPathsHold::Held,
-        Ok(false) => RequestedPathsHold::Released,
-        Err(_) => RequestedPathsHold::Unknown,
+        Ok((true, released)) => (RequestedPathsHold::Held, released),
+        Ok((false, _)) => (RequestedPathsHold::Released, Vec::new()),
+        Err(_) => (RequestedPathsHold::Unknown, Vec::new()),
     })
+}
+
+fn scope_held(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    request: &CoordinationRequest,
+    scope: &[String],
+    now: i64,
+) -> Result<bool> {
+    let held_work = work_scope_overlaps(tx, who, scope, None, now)?
+        .iter()
+        .any(|overlap| {
+            request.proposal.work_id.as_deref() != Some(overlap.item.id.as_str())
+                && overlap.item.lead_token != who.token
+        });
+    if held_work {
+        return Ok(true);
+    }
+    let keys = scope
+        .iter()
+        .map(|spec| super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone()))
+        .collect::<Vec<_>>();
+    let (points, ranges) = probe_set(&keys);
+    let rows = resolved_scope(
+        tx,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    )?;
+    let live = "SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
+         WHERE p.repository_scope = ?1 AND i.token <> ?2 AND p.expires_at > ?3";
+    if !points.is_empty()
+        && tx.query_row(
+            &format!("SELECT EXISTS ({live} AND p.key IN (SELECT value FROM json_each(?4)))"),
+            params![rows, who.token, now, json!(points).to_string()],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(true);
+    }
+    for (start, end) in ranges {
+        if tx.query_row(
+            &format!("SELECT EXISTS ({live} AND p.key >= ?4 AND p.key < ?5)"),
+            params![rows, who.token, now, start, end],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn pickup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::pickup::PickupRow> {

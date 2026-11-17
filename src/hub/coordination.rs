@@ -143,7 +143,61 @@ pub struct CoordinationRequest {
     /// settled request and for any other reader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_paths: Option<RequestedPathsHold>,
+    /// While `requested_paths` is `held`, the requested paths no longer held, sorted (empty
+    /// when the request names more than `MAX_RELEASED_PATHS`). Derived beside it, never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_paths: Vec<String>,
 }
+
+/// What a request's requester has done since the holder replied, as the holder reads it.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RequesterState {
+    NotSeen,
+    Seen {
+        at: i64,
+    },
+    Resolved,
+    Withdrawn,
+    /// The acknowledgements are a partial page and none of them is the requester's.
+    Unknown,
+}
+
+impl CoordinationRequest {
+    /// The requester's latest state: it settled the request, acknowledged the newest reply (when
+    /// it did) or has not. Derived from the request's acknowledgements, never stored.
+    pub fn requester_state(&self) -> RequesterState {
+        match self.status {
+            CoordinationStatus::Resolved => return RequesterState::Resolved,
+            CoordinationStatus::Withdrawn => return RequesterState::Withdrawn,
+            _ => {}
+        }
+        let replied = self
+            .responses
+            .iter()
+            .map(|reply| reply.seq)
+            .max()
+            .unwrap_or(0);
+        match self
+            .acknowledgements
+            .iter()
+            .filter(|ack| {
+                ack.target_work_id.is_none()
+                    && ack.agent.token == self.requester.token
+                    && ack.through_seq >= replied
+            })
+            .map(|ack| ack.acknowledged_at)
+            .max()
+        {
+            Some(at) => RequesterState::Seen { at },
+            None if self.acknowledgements_complete => RequesterState::NotSeen,
+            None => RequesterState::Unknown,
+        }
+    }
+}
+
+/// The most requested paths probed one by one for a partial release.
+pub const MAX_RELEASED_PATHS: usize = 32;
 
 /// Whether the paths a request asks for are still held.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

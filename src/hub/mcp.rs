@@ -2072,6 +2072,11 @@ async fn call(
                             "released_paths":(!reply.released_paths.is_empty()).then_some(&reply.released_paths),
                             "responder_agent":reply.responder.agent})).collect::<Vec<_>>());
                         notice["requested_paths"] = json!(request.requested_paths);
+                        if !request.released_paths.is_empty() {
+                            notice["released_paths"] = json!(request.released_paths);
+                        }
+                    } else if !request.responses.is_empty() {
+                        notice["requester"] = json!(request.requester_state());
                     }
                     notice
                 }).collect::<Vec<_>>();
@@ -2087,7 +2092,7 @@ async fn call(
                     ""
                 };
                 let requester = if own_notice {
-                    " For your own requests (yours: true): a reply or requested_paths \"released\" is news. If the paths are released, retry agentscm_start. A join reply admits you only over the holder's declared scope. Resolve or withdraw the request once it is settled."
+                    " For your own requests (yours: true): a reply or requested_paths \"released\" is news. If the paths are released, retry agentscm_start; released_paths are free already, so start on them alone. A join reply admits you only over the holder's declared scope. Resolve or withdraw the request once it is settled."
                 } else {
                     ""
                 };

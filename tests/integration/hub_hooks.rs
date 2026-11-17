@@ -1552,6 +1552,123 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
     }
 }
 
+/// A partial release reaches the requester's prompt once per released set: an unchanged set
+/// stays quiet, and a further release shows again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_release_shows_once_per_released_set() {
+    use agentscm::hub::coordination::{
+        CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+    };
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let other = hub.agent();
+    let token_id = |secret: &str| {
+        hub.store
+            .authenticate(&agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    let (lead_token, other_token) = (token_id(&lead), token_id(&other));
+    let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
+    let start = |key: &str, session: &str| WorkStart {
+        issue_choice: None,
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        description: None,
+        session: session.into(),
+        role: WorkRole::Lead,
+        scope: files.iter().map(|path| (*path).into()).collect(),
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: Vec::new(),
+        related_work: Vec::new(),
+        takeover_generation: None,
+        preflight: None,
+    };
+    let session = "11111111-2222-3333-4444-555555555555";
+    let now = unix_now();
+    hub.store
+        .work_start(&lead_token, &start("hold-files", session), now)
+        .unwrap();
+    let request = hub
+        .store
+        .work_start(&other_token, &start("needs-files", "other-session"), now)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let prompt = json!({"hook_event_name":"UserPromptSubmit", "session_id":"other-session",
+        "cwd":"/work/acme-widgets", "prompt":"not read"});
+    let inbox = |token: &str, session: &str| {
+        hub.store
+            .coordination_inbox(
+                token,
+                &CoordinationInboxQuery {
+                    session: Some(session.into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    let release = |operation: &str, paths: &[&str]| {
+        let open = inbox(&lead_token, session);
+        hub.store
+            .coordination_reply(
+                &lead_token,
+                &CoordinationReply {
+                    release_paths: paths.iter().map(|path| (*path).into()).collect(),
+                    request_id: request.id.clone(),
+                    operation_id: operation.into(),
+                    target_work_id: open.targets[0].work_id.clone(),
+                    session: session.into(),
+                    expected_updated_seq: open.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: None,
+                    via: agentscm::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    let acknowledge = || {
+        hub.store
+            .coordination_ack(
+                &other_token,
+                &CoordinationAck {
+                    request_id: request.id.clone(),
+                    target_work_id: None,
+                    session: "other-session".into(),
+                    expected_updated_seq: inbox(&other_token, "other-session").updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    release("free-a", &["src/a.rs"]);
+    acknowledge();
+    let context = |answer: &Value| text_at(answer, CLAUDE_CONTEXT).to_owned();
+    let first = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        first.contains("src/a.rs from your request are free now"),
+        "{first}"
+    );
+    assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+    release("free-b", &["src/b.rs"]);
+    acknowledge();
+    let second = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        second.contains("src/a.rs, src/b.rs from your request are free now"),
+        "{second}"
+    );
+    assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+}
+
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy
 /// agent that only reads and runs commands keeps its hold. Another session renews nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

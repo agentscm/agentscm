@@ -2347,6 +2347,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         updated_seq: 2,
         requester_unavailable: true,
         requested_paths: None,
+        released_paths: Vec::new(),
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();
@@ -4076,4 +4077,142 @@ parity_case!(split_grants_subset, split_grants_a_subset);
 parity_case!(
     reply_release_refusals,
     reply_release_refusals_record_nothing
+);
+
+fn requester_sees_a_partial_release(db: &Db) {
+    use agentscm::hub::coordination::RequestedPathsHold;
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &requester,
+                &CoordinationInboxQuery {
+                    session: Some("asker".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    let before = read(now + 2);
+    assert_eq!(before.requested_paths, Some(RequestedPathsHold::Held));
+    assert!(before.released_paths.is_empty());
+    assert!(
+        !serde_json::to_string(&before)
+            .unwrap()
+            .contains("released_paths")
+    );
+
+    let first = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &first, now + 3).unwrap();
+    let partial = read(now + 4);
+    assert_eq!(partial.requested_paths, Some(RequestedPathsHold::Held));
+    assert_eq!(partial.released_paths, vec!["src/a.rs"]);
+
+    let mut second = release_reply(&request, CoordinationResponseKind::Decline, &["src/b.rs"]);
+    second.operation_id = "grant-b".into();
+    second.expected_updated_seq = answered.updated_seq;
+    store.coordination_reply(&holder, &second, now + 5).unwrap();
+    let all = read(now + 6);
+    assert_eq!(all.requested_paths, Some(RequestedPathsHold::Released));
+    assert!(all.released_paths.is_empty());
+}
+
+fn holder_sees_the_requesters_state(db: &Db) {
+    use agentscm::hub::coordination::RequesterState;
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let answered = store
+        .coordination_reply(
+            &holder,
+            &release_reply(&request, CoordinationResponseKind::Decline, &[]),
+            now + 2,
+        )
+        .unwrap();
+    let read = |at: i64| {
+        store
+            .coordination_inbox(
+                &holder,
+                &CoordinationInboxQuery {
+                    session: Some("lead".into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                at,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    assert_eq!(read(now + 3).requester_state(), RequesterState::NotSeen);
+
+    store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "asker".into(),
+                expected_updated_seq: answered.updated_seq,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        read(now + 5).requester_state(),
+        RequesterState::Seen { at: now + 4 }
+    );
+
+    // The holder frees both files; the requester takes them and settles the request. The
+    // settled request has left the holder's inbox, so the requester's list shows its status.
+    let mut grant = release_reply(
+        &request,
+        CoordinationResponseKind::Decline,
+        &["src/a.rs", "src/b.rs"],
+    );
+    grant.operation_id = "grant-both".into();
+    grant.expected_updated_seq = read(now + 5).updated_seq;
+    store.coordination_reply(&holder, &grant, now + 5).unwrap();
+    store
+        .work_start(
+            &requester,
+            &start_scope("asked", "asker", WorkRole::Lead, None, &FILES[..2]),
+            now + 5,
+        )
+        .unwrap();
+    store
+        .coordination_resolve(
+            &requester,
+            &CoordinationResolve {
+                request_id: request.id.clone(),
+                operation_id: "resolve-asked".into(),
+                session: "asker".into(),
+                expected_updated_seq: read(now + 6).updated_seq,
+            },
+            now + 6,
+        )
+        .unwrap();
+    let settled = store
+        .coordination_list(
+            &requester,
+            &CoordinationListQuery {
+                active_only: false,
+                ..CoordinationListQuery::default()
+            },
+            now + 7,
+        )
+        .unwrap()
+        .requests
+        .remove(0);
+    assert_eq!(settled.requester_state(), RequesterState::Resolved);
+}
+
+parity_case!(requester_partial_release, requester_sees_a_partial_release);
+parity_case!(
+    holder_sees_requester_state,
+    holder_sees_the_requesters_state
 );

@@ -987,6 +987,19 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
     let text = delivered["content"].to_string();
     assert!(text.contains("For your own requests"), "{text}");
 
+    // The lead's notice for a request it replied to says whether the requester has seen the reply.
+    let holder_view = hub
+        .mcp(&lead, "agentscm_status", json!({"session": "lead-session"}))
+        .await;
+    let held = holder_view["_meta"]["agentscm"]["coordination_notifications"]["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["request_id"] == request_id)
+        .unwrap()
+        .clone();
+    assert_eq!(held["requester"], json!({"state": "not_seen"}), "{held}");
+
     // A response is a report, not permission to close an overlap that still exists.
     let unresolved = hub
         .mcp(

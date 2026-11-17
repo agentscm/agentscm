@@ -59,6 +59,9 @@ const MAX_ROOT_BYTES: usize = 1024;
 /// Sessions that were already told coordination is unknown; cleared when it grows past the bound.
 static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const MAX_NOTED: usize = 10_000;
+/// Partial releases a session was already told, by request and released set; cleared when it
+/// grows past the bound.
+static PARTIAL_SHOWN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Tools that change a file; names are compared lowercase.
 const EDIT_TOOLS: [&str; 8] = [
     "edit",
@@ -600,6 +603,26 @@ async fn hook(
                         // A prompt repeats every turn, so it carries only what this session must
                         // answer, and a requester's own request only while it has news the
                         // requester has not acknowledged.
+                        // A partial release shows once per released set, so a further release shows
+                        // again but an unchanged one does not repeat on every prompt.
+                        let partial = own
+                            && call.kind == Kind::Prompt
+                            && !released
+                            && !request.released_paths.is_empty()
+                            && {
+                                let key = format!(
+                                    "{}\0{session}\0{}\0{}",
+                                    principal.token_id,
+                                    request.id,
+                                    request.released_paths.join("\0")
+                                );
+                                let mut shown_set =
+                                    PARTIAL_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
+                                if shown_set.len() > MAX_NOTED {
+                                    shown_set.clear();
+                                }
+                                shown_set.insert(key)
+                            };
                         let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
                             receipt.target_work_id.is_none()
                                 && receipt.agent.token == principal.token_id
@@ -612,6 +635,7 @@ async fn hook(
                             // ended intent), so it shows whether or not the requester acked.
                             && !(own
                                 && (released
+                                    || partial
                                     || (unacknowledged && !request.responses.is_empty())))
                         {
                             continue;
@@ -626,10 +650,27 @@ async fn hook(
                                         });
                                     format!(" Reply {}{note}.", response_kind_name(reply.kind))
                                 });
+                            let partial_paths = if request.requested_paths
+                                == Some(RequestedPathsHold::Held)
+                                && !request.released_paths.is_empty()
+                            {
+                                let listed = request
+                                    .released_paths
+                                    .iter()
+                                    .take(5)
+                                    .map(|path| bounded_hook_text(path, 120))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!(
+                                    " {listed} from your request are free now; start on them alone with agentscm_start."
+                                )
+                            } else {
+                                String::new()
+                            };
                             let paths = if released {
                                 " The requested paths are released: retry agentscm_start."
                             } else {
-                                ""
+                                &partial_paths
                             };
                             outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         } else {
