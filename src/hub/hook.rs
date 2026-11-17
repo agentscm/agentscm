@@ -1905,11 +1905,6 @@ impl Call {
                     }
                     head.push_str(notice.line());
                 }
-                let mut text = if head.is_empty() {
-                    listing
-                } else {
-                    format!("{head}\n{listing}")
-                };
                 let store = state.store.clone();
                 let setup = state.onboarding.clone();
                 let scope = principal.clone();
@@ -1940,30 +1935,16 @@ impl Call {
                 };
                 let (current_status, operator_context) =
                     tokio::join!(current_status, operator_context);
-                // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
-                text.push('\n');
-                match current_status {
-                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_start_text(&facts)),
-                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
-                }
-                if let Some(block) = super::context_source::render(&operator_context) {
-                    text.push('\n');
-                    text.push_str(&block);
-                }
-                text.push('\n');
-                text.push_str(&match briefing {
-                    Ok((briefing, overview, catchup)) => {
-                        let mut lines = vec![render_briefing(&briefing)];
-                        lines.extend(render_overview(&overview));
-                        lines.push(render_catchup(catchup.as_ref()));
-                        lines.push(COVERAGE.to_owned());
-                        lines.join("\n")
-                    }
-                    Err(_) => format!(
-                        "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
-                        unknown("shared work could not be listed")
-                    ),
-                });
+                let current_status = current_status.ok().and_then(std::result::Result::ok);
+                let mut text = render_start_summary(
+                    current_status.as_ref(),
+                    briefing.as_ref().ok().map(|(briefing, overview, catchup)| {
+                        (briefing, overview, catchup.as_ref())
+                    }),
+                    &head,
+                    &listing,
+                    &operator_context,
+                );
                 // A read-only token's MCP instructions name no write tool, so they carry no rules;
                 // the one rule a reader needs comes here for Claude Code, which gets no others.
                 if principal.read_only && self.agent == Agent::Claude {
@@ -2253,6 +2234,45 @@ const RULES_POINTER: &str = "The required AgentSCM rules open the agentscm MCP s
 
 /// Ends the start context: what an agent cannot see from it, and where to read the rest.
 const COVERAGE: &str = "AgentSCM coverage is partial: only declared Work is visible, and a reported finish does not prove tests, review or merge. agentscm_work_status, agentscm_work_briefing, agentscm_work_overview and agentscm_work_catchup have the full records.";
+
+/// Startup presentation only: retained events and delivery cursors are never filtered or
+/// acknowledged here. Live overlaps lead, so optional context cannot push them past the host cap.
+fn render_start_summary(
+    status: Option<&super::work_http::actionable_status::ActionableStatus>,
+    shared: Option<(&Briefing, &WorkOverview, Option<&CatchupPreview>)>,
+    session_notices: &str,
+    session_listing: &str,
+    operator_context: &[String],
+) -> String {
+    let mut lines = shared
+        .map(|(_, overview, _)| render_overview(overview))
+        .unwrap_or_default();
+    if !session_notices.is_empty() {
+        lines.push(session_notices.to_owned());
+    }
+    lines.push(match status {
+        Some(status) => super::work_http::actionable_status::render_start_text(status),
+        None => "Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status.".into(),
+    });
+    match shared {
+        Some((briefing, _, catchup)) => {
+            lines.push(render_briefing(briefing));
+            lines.push(render_catchup(catchup));
+        }
+        None => lines.push(format!(
+            "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
+            unknown("shared work could not be listed")
+        )),
+    }
+    lines.push(COVERAGE.to_owned());
+    if !session_listing.is_empty() {
+        lines.push(session_listing.to_owned());
+    }
+    if let Some(block) = super::context_source::render(operator_context) {
+        lines.push(block);
+    }
+    lines.join("\n")
+}
 
 /// Counts only: the actionable status above already names each unfinished Work.
 fn render_briefing(briefing: &Briefing) -> String {
@@ -3280,6 +3300,145 @@ mod tests {
             context.ends_with("agentscm_work_overview for it."),
             "{context}"
         );
+    }
+
+    #[test]
+    fn busy_startup_keeps_live_overlaps_and_rules_ahead_of_optional_context() {
+        use crate::hub::work::WorkEvent;
+        use crate::hub::work_http::actionable_status::{
+            ActionableStatus, RecipientKind, StatusReconciliation, StatusState,
+        };
+        use crate::hub::work_lifecycle::ReservationStatus;
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let mut stale = status.work[0].clone();
+        stale.title = "Old paused claim".into();
+        stale.state = StatusState::ReassessmentNeeded;
+        stale.freshness = ClaimStatus::Stale;
+        stale.needs_you = false;
+        stale.recipient.kind = RecipientKind::None;
+        stale.operational.reservation.status = ReservationStatus::Lapsed;
+        stale.reconciliation = Some(StatusReconciliation {
+            current: false,
+            declaration_seq: 1,
+            current_evidence_digest: None,
+            current_source_coverage: vec![crate::hub::work_reconciliation::SourceEvidence {
+                source: "forge_pull".into(),
+                state: "observed_only".into(),
+                checked_at_seconds: 100,
+                unread_pages: 0,
+                deferred: 0,
+            }],
+            stale_reasons: vec![],
+            digest: "synthetic".into(),
+        });
+        status.work = vec![stale; 40];
+        status.counts.reassessment_needed = 40;
+        let mut live = status.work[0].clone();
+        live.title = format!("Active work {}", "😀".repeat(2_000));
+        live.action = "😀".repeat(2_000);
+        live.state = StatusState::Active;
+        live.freshness = ClaimStatus::Active;
+        live.operational.reservation.status = ReservationStatus::Held;
+        status.work.extend(vec![live; 20]);
+        status.counts.active = 20;
+        status.counts.blocked = 0;
+        status.counts.awaiting_party = 0;
+        let old = overlap_side(
+            "Long-merged event detail",
+            WorkState::Finished,
+            ClaimStatus::Stale,
+        );
+        let briefing = Briefing {
+            planned_issues: Default::default(),
+            subscriber: None,
+            delivery: None,
+            from: 0,
+            through: 100,
+            after: 0,
+            work_after: None,
+            next_after: 100,
+            next_work_after: None,
+            next_work_done: true,
+            items: vec![old.clone(); 40],
+            events: vec![
+                WorkEvent {
+                    seq: 1,
+                    at: 1,
+                    kind: "work_checkpoint".into(),
+                    work_id: old.id.clone(),
+                    item: old,
+                    transition: None
+                };
+                20
+            ],
+            retention_gap: false,
+            complete: false,
+        };
+        let overview = WorkOverview {
+            planned_issues: Default::default(),
+            recent_since: 0,
+            until: 100,
+            current: vec![],
+            recent: vec![],
+            overlaps: vec![WorkOverlapPair {
+                agreed_paths: vec![],
+                left: overlap_side("LiveOne", WorkState::Active, ClaimStatus::Active),
+                right: overlap_side("LiveTwo", WorkState::Blocked, ClaimStatus::Active),
+                reasons: vec![],
+                reasons_complete: true,
+            }],
+            current_complete: false,
+            recent_complete: false,
+            overlaps_complete: true,
+            history_retention_gap: false,
+            settled_count: 0,
+        };
+        let before = (status.clone(), briefing.clone(), overview.clone());
+        let text = render_start_summary(
+            Some(&status),
+            Some((&briefing, &overview, None)),
+            "Important session recovery notice.",
+            &"Other session listing.\n".repeat(400),
+            &["😀".repeat(START_CONTEXT)],
+        );
+        for agent in [Agent::Claude, Agent::Codex] {
+            let call = Call::parse(
+                agent,
+                br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+                None,
+            );
+            let reply = call.render(&Outcome::advice(text.clone(), false));
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(context.encode_utf16().count() <= START_CONTEXT);
+            assert!(
+                context.contains("Needs coordination: LiveOne") && context.contains("LiveTwo"),
+                "{context}"
+            );
+            assert!(
+                context.contains("40 stale unassigned reassessment item(s) summarized"),
+                "{context}"
+            );
+            assert!(context.contains("Coverage incomplete"), "{context}");
+            assert!(
+                context.contains("Important session recovery notice."),
+                "{context}"
+            );
+            assert!(!context.contains("Old paused claim"));
+            assert!(!context.contains("Long-merged event detail"));
+            assert!(!context.contains("Provider source"));
+            assert!(!context.contains("checked 100"));
+            assert_eq!(
+                super::super::agent_rules::carries_all(context),
+                agent != Agent::Claude
+            );
+            if agent == Agent::Claude {
+                assert!(context.contains(RULES_POINTER));
+            }
+        }
+        assert_eq!((status, briefing, overview), before);
     }
 
     #[test]

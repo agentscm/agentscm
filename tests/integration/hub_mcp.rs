@@ -324,7 +324,19 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
     let target = &first["structuredContent"]["work"]["item"];
     let second=hub.tool_result(&b,"agentscm_start",json!({"request_key":"second","task":"Second behavior","session":"second","paths":["src/shared.rs"]})).await;
     let request = &second["structuredContent"]["work"]["coordination_request"];
-    let grant=hub.tool_result(&a,"agentscm_work_overlap_consent",json!({"request_id":request["id"],"target_work_id":target["id"],"operation_id":"grant","session":"first","expected_updated_seq":request["updated_seq"],"target_generation":target["generation"],"target_updated_seq":target["updated_seq"],"paths":["src/shared.rs"]})).await;
+    let overlap = second["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["kind"] == "propose_overlap")
+        .unwrap();
+    let mut grant_args = overlap["target_lead_recipes"][0]["arguments"].clone();
+    grant_args["session"] = json!("first");
+    grant_args["operation_id"] = json!("grant");
+    grant_args["target_updated_seq"] = target["updated_seq"].clone();
+    let grant = hub
+        .tool_result(&a, "agentscm_work_overlap_consent", grant_args)
+        .await;
     assert_eq!(grant["isError"], false, "{grant}");
     assert_eq!(grant["structuredContent"]["state"], "awaiting_requester");
     let envelope = json!({"start":{"request_key":"second","title":"Second behavior","session":"second","scope":["src/shared.rs"]},"consent_ids":[grant["structuredContent"]["id"]]});
@@ -2578,7 +2590,7 @@ async fn a_refused_start_says_a_quiet_leading_agent_cannot_answer_only_when_its_
     // It says when the request is raised to that lead's person if it is not acknowledged.
     assert!(
         said.contains(&format!(
-            "If the agent leading {work_id} has not acknowledged it by Unix "
+            "If the agent leading {work_id} has not acknowledged it within 10 minutes of this request,"
         )) && said.contains("it is raised to its person, user1, in the AgentSCM Hub's Needs you"),
         "{said}"
     );
@@ -4714,6 +4726,37 @@ async fn finished_paths_prompt_the_lead_and_the_refused_requester() {
         "{text}"
     );
 
+    let steps = refused["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap();
+    let subset = steps
+        .iter()
+        .find(|step| step["kind"] == "request_subset")
+        .unwrap();
+    assert_eq!(subset["call"]["arguments"]["paths"], json!(["src/a.rs"]));
+    assert_eq!(subset["call"]["arguments"]["request_key"], "second");
+    let retry = hub
+        .tool_result(&bob, "agentscm_start", subset["call"]["arguments"].clone())
+        .await;
+    assert_eq!(retry["isError"], true, "a subset remains held: {retry}");
+    assert!(retry["structuredContent"]["work"]["coordination_request"].is_object());
+    let overlap = steps
+        .iter()
+        .find(|step| step["kind"] == "propose_overlap")
+        .unwrap();
+    let read = hub
+        .tool_result(
+            &bob,
+            "agentscm_work_overlap_consents",
+            overlap["call"]["arguments"].clone(),
+        )
+        .await;
+    assert_eq!(read["isError"], false, "{read}");
+    assert!(
+        !json!(steps).to_string().contains("s-a"),
+        "another owner's session stays private"
+    );
+
     let seq = quiet["structuredContent"]["item"]["updated_seq"].clone();
     let prompted = hub
         .tool_result(&alice, "agentscm_work_checkpoint", report("two", &seq))
@@ -4774,6 +4817,19 @@ async fn a_requester_notice_shows_bounded_released_paths_and_the_several_files_h
         )
         .await;
     assert_eq!(first["isError"], false, "{first}");
+    serde_json::from_value::<agentscm::hub::coordination::CoordinationRequest>(
+        first["structuredContent"].clone(),
+    )
+    .unwrap();
+    let steps = first["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap();
+    assert!(steps.iter().any(|step| step["kind"] == "propose_overlap"));
+    assert!(steps.iter().any(|step| step["kind"] == "wait"));
+    assert!(
+        !steps.iter().any(|step| step["kind"] == "request_subset"),
+        "holder cannot start as requester"
+    );
     let second = hub
         .tool_result(
             &alice,
@@ -4811,4 +4867,123 @@ async fn a_requester_notice_shows_bounded_released_paths_and_the_several_files_h
         "{notice}"
     );
     assert!(notice.get("released_paths_complete").is_none(), "{notice}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_starts_give_applicable_exact_coordination_calls() {
+    let hub = Hub::start().await;
+    let (alice_token, alice) = hub.secret_with_id(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    for (index, paths, subset_expected) in [
+        (0, vec!["one/a.rs"], false),
+        (1, vec!["two/a.rs", "two/b.rs"], true),
+        (2, vec!["directory/**"], false),
+    ] {
+        let holder_session = format!("holder-{index}");
+        let requester_session = format!("requester-{index}");
+        if index == 2 {
+            // Durable Work supports directory scope; MCP's session intent accepts files only.
+            let request = serde_json::from_value(json!({
+                "request_key":format!("held-{index}"),"title":"Hold synthetic directory",
+                "session":holder_session,"scope":paths
+            }))
+            .unwrap();
+            let held = hub
+                .store
+                .work_start(&alice_token, &request, unix_now())
+                .unwrap();
+            assert!(held.conflict.is_none(), "{held:?}");
+        } else {
+            let held = hub
+                .tool_result(
+                    &alice,
+                    "agentscm_start",
+                    json!({
+                        "request_key":format!("held-{index}"),"task":"Hold synthetic files",
+                        "session":holder_session,"paths":paths
+                    }),
+                )
+                .await;
+            assert_eq!(held["isError"], false, "{held}");
+        }
+        let requested_paths = if index == 2 {
+            vec!["directory/a.rs"]
+        } else {
+            paths
+        };
+        let refused = hub
+            .tool_result(
+                &bob,
+                "agentscm_start",
+                json!({
+                    "request_key":format!("requested-{index}"),"task":"Change synthetic files",
+                    "session":requester_session,"paths":requested_paths,"branch":"fix/synthetic"
+                }),
+            )
+            .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let steps = refused["_meta"]["agentscm"]["coordination_remedies"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            steps.iter().any(|step| step["kind"] == "request_subset"),
+            subset_expected,
+            "{refused}"
+        );
+        for kind in ["propose_overlap", "wait"] {
+            let step = steps.iter().find(|step| step["kind"] == kind).unwrap();
+            let call = &step["call"];
+            assert_eq!(call["arguments"]["session"], requester_session);
+            let reply = hub
+                .tool_result(
+                    &bob,
+                    call["tool"].as_str().unwrap(),
+                    call["arguments"].clone(),
+                )
+                .await;
+            assert_eq!(reply["isError"], false, "{reply}");
+            if kind == "wait" {
+                serde_json::from_value::<agentscm::hub::coordination::CoordinationInbox>(
+                    reply["structuredContent"].clone(),
+                )
+                .unwrap();
+                assert!(
+                    reply["_meta"]["agentscm"]["coordination_remedies"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|step| step["kind"] == "propose_overlap")
+                );
+            }
+        }
+        let overlap = steps
+            .iter()
+            .find(|step| step["kind"] == "propose_overlap")
+            .unwrap();
+        assert!(
+            overlap["target_lead_recipes"][0]["arguments"]
+                .get("target_updated_seq")
+                .is_none()
+        );
+        assert!(
+            overlap["target_lead_recipes"][0]["caller_supplies"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("target_updated_seq"))
+        );
+        assert!(
+            overlap["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("alone gives no edit authority")
+        );
+        if subset_expected {
+            let subset = steps
+                .iter()
+                .find(|step| step["kind"] == "request_subset")
+                .unwrap();
+            assert_eq!(subset["call"]["arguments"]["branch"], "fix/synthetic");
+            assert_eq!(subset["call"]["arguments"]["paths"], json!(["two/a.rs"]));
+        }
+    }
 }
