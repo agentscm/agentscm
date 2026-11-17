@@ -1367,31 +1367,3 @@ async fn the_deploy_workflow_write_authorizes_the_tokens_stable_id_after_a_renam
         json!(".github/workflows/deploy.yml")
     );
 }
-
-#[test]
-fn equal_repository_ids_on_distinct_hosts_keep_deploy_workflows_separate() {
-    // Store-level: a two-host HTTP test needs a second fake forge.
-    assert_ne!(
-        deploy_key("github.com", REPO_ID),
-        deploy_key("ghe.example.invalid", REPO_ID)
-    );
-    let root = TempDir::new().unwrap();
-    let store = store::open(&format!(
-        "sqlite://{}",
-        root.path().join("hub.sqlite").display()
-    ))
-    .unwrap();
-    store
-        .set_setting(
-            &deploy_key("github.com", REPO_ID),
-            ".github/workflows/deploy.yml",
-            "usr_admin",
-        )
-        .unwrap();
-    assert!(
-        store
-            .get_setting(&deploy_key("ghe.example.invalid", REPO_ID))
-            .unwrap()
-            .is_none()
-    );
-}

@@ -1076,6 +1076,30 @@ mod tests {
     }
 
     #[test]
+    fn equal_repository_ids_on_distinct_hosts_keep_deploy_workflows_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let path = ".github/workflows/deploy.yml";
+        store
+            .set_setting(&deploy_workflow_key("github.com", 101), path, "usr_admin")
+            .unwrap();
+        assert_eq!(
+            deploy_workflow(&*store, "github.com", 101)
+                .unwrap()
+                .as_deref(),
+            Some(path)
+        );
+        assert_eq!(
+            deploy_workflow(&*store, "ghe.example.invalid", 101).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn strings_roundtrip() {
         for kind in [ExternalKind::Ci, ExternalKind::Deployment] {
             assert_eq!(ExternalKind::parse(kind.as_str()), Some(kind));
