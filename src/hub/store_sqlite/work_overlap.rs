@@ -399,6 +399,7 @@ impl SqliteStore {
         if !preflight_only {
             session_lifecycle::check(&tx, token, &input.start.session, incarnation, now)?;
         }
+        let session = session_name(&tx, token, Some(&input.start.session), now)?;
         let who = work_who(&tx, token, now)?;
         if who.read_only {
             return Err(HubError::Unauthorized);
@@ -411,7 +412,7 @@ impl SqliteStore {
         }
         let existing = resolve_work(&tx, &who, &input.start, now)?;
         let proposal = if let Some(item) = &existing {
-            if item.lead_token != who.token || item.lead_session != input.start.session {
+            if item.lead_token != who.token || item.lead_session != session {
                 return Err(HubError::Unauthorized);
             }
             CoordinationProposal {
@@ -445,14 +446,7 @@ impl SqliteStore {
         } else {
             proposal
         };
-        let consents = accepting(
-            &tx,
-            &who,
-            &input.consent_ids,
-            &input.start.session,
-            &proposal,
-            now,
-        )?;
+        let consents = accepting(&tx, &who, &input.consent_ids, &session, &proposal, now)?;
         if existing.is_some() && consents.iter().any(|c| c.accepted.is_none()) {
             return Err(contract::invalid(
                 "existing Work cannot bind a new initial-admission consent; use scope checkpoint acceptance",

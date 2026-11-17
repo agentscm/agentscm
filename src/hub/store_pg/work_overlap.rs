@@ -394,7 +394,8 @@ impl PgStore {
         if !preflight_only {
         session_lifecycle::check(&mut tx, token, &input.start.session, incarnation, now)?;
         }
-            let who = work_who(&mut tx, token, now)?;
+            let session = session_name(&mut tx, token, Some(&input.start.session), now)?;
+        let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             lock_repository(&mut tx, &who.repository)?;
             if who.read_only {
@@ -408,7 +409,7 @@ impl PgStore {
             }
             let existing = resolve_work(&mut tx, &who, &input.start, now)?;
             let proposal = if let Some(item) = &existing {
-                if item.lead_token != who.token || item.lead_session != input.start.session {
+                if item.lead_token != who.token || item.lead_session != session {
                     return Err(HubError::Unauthorized);
                 }
                 CoordinationProposal {
@@ -446,7 +447,7 @@ impl PgStore {
                 &mut tx,
                 &who,
                 &input.consent_ids,
-                &input.start.session,
+                &session,
                 &proposal,
                 now,
             )?;

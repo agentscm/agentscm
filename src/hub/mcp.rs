@@ -5058,9 +5058,9 @@ fn start_result(
             requested.extend(overlap.reasons.iter().map(|reason| &reason.your_path));
         }
         if hinted {
-            text.push_str(" Ask for those files alone (agentscm_ask or a coordination request) or propose an overlap agreement with agentscm_work_overlap_consent.");
+            text.push_str(" Request those files alone with agentscm_start (the coordination request it queues reaches the holder) or propose an overlap agreement with agentscm_work_overlap_consent.");
         } else if requested.len() >= 2 {
-            text.push_str("\nThe refusal covers several files: ask for a subset alone (agentscm_ask) or propose an overlap agreement with agentscm_work_overlap_consent.");
+            text.push_str("\nThe refusal covers several files: request a subset alone with agentscm_start (it queues a coordination request) or propose an overlap agreement with agentscm_work_overlap_consent.");
         }
     }
     if let Some(holders) = &work.holder_intents

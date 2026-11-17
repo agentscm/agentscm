@@ -2991,6 +2991,20 @@ fn carry_lead_credential(
             &[&item.id, &who.token, &session],
         )?;
         tx.execute(
+            "UPDATE hub_coordination_acknowledgements SET token = $1, agent = $2
+             WHERE token = $3 AND session = $4 AND target_work = ''
+               AND request IN (SELECT id FROM hub_coordination_requests
+                   WHERE requester_token = $3 AND requester_session = $4
+                     AND requester_owner = $5 AND status IN ('pending', 'responded'))",
+            &[
+                &who.token,
+                &who.agent,
+                &carried.previous_token,
+                &session,
+                &who.owner.id,
+            ],
+        )?;
+        tx.execute(
             "UPDATE hub_coordination_requests SET requester_token = $1, requester_agent = $2
              WHERE requester_token = $3 AND requester_session = $4 AND requester_owner = $5
                AND status IN ('pending', 'responded')",
@@ -16383,6 +16397,7 @@ impl Store for PgStore {
                     target.generation,
                     work.updated_seq,
                     &response_id,
+                    &native_session,
                 )?;
                 release.validate()?;
                 work_transition_in(

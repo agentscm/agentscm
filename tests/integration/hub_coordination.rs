@@ -2525,11 +2525,19 @@ fn requester_reads_overlap_consents_through_a_session_alias(db: &Db) {
     let requester = token(&*store, 2, "requester");
     let now = unix_now();
     let target = store
-        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .work_start(
+            &incumbent,
+            &start_scope("incumbent", "lead", WorkRole::Lead, None, &["src/a.rs"]),
+            now,
+        )
         .unwrap()
         .item;
     let request = store
-        .work_start(&requester, &start("requester", "default"), now + 1)
+        .work_start(
+            &requester,
+            &start_scope("requester", "default", WorkRole::Lead, None, &["src/a.rs"]),
+            now + 1,
+        )
         .unwrap()
         .coordination_request
         .unwrap();
@@ -2572,8 +2580,20 @@ fn requester_reads_overlap_consents_through_a_session_alias(db: &Db) {
         store
             .work_overlap_consents(&requester, &request.id, "native", now + 4)
             .unwrap(),
-        vec![granted]
+        vec![granted.clone()]
     );
+    // Accepting the consent through the alias is the same requester session.
+    let started = store
+        .work_overlap_start(
+            &requester,
+            &agentscm::hub::work_overlap::WorkOverlapStart {
+                start: start_scope("requester", "native", WorkRole::Lead, None, &["src/a.rs"]),
+                consent_ids: vec![granted.consent.id.clone()],
+            },
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(started.item.lead_token, requester);
 }
 
 parity_case!(
@@ -2705,6 +2725,18 @@ fn requester_keeps_its_request_after_a_lead_credential_carries(db: &Db) {
             now + 1,
         )
         .unwrap();
+    store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "requester-session".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 1,
+        )
+        .unwrap();
     let carried = store
         .work_checkpoint(
             &replacement,
@@ -2725,6 +2757,24 @@ fn requester_keeps_its_request_after_a_lead_credential_carries(db: &Db) {
             .work_overlap_consents(&replacement, &request.id, "requester-session", now + 3)
             .is_ok()
     );
+    let seen = store
+        .coordination_inbox(
+            &incumbent,
+            &CoordinationInboxQuery {
+                session: Some("lead".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 3,
+        )
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.id == request.id)
+        .unwrap();
+    assert!(matches!(
+        seen.requester_state(),
+        agentscm::hub::coordination::RequesterState::Seen { .. }
+    ));
     let current = store
         .coordination_ack(
             &replacement,
@@ -3966,13 +4016,18 @@ fn grants_a_subset(db: &Db, kind: CoordinationResponseKind) {
     // A retry of the identical reply replays and does not release twice.
     let replayed = store.coordination_reply(&holder, &reply, now + 4).unwrap();
     assert_eq!(replayed.updated_seq, answered.updated_seq);
-    let transitions = store
+    let transitions: Vec<_> = store
         .events_after(0, 1000)
         .unwrap()
         .into_iter()
         .filter(|event| event.kind == "work_transition")
-        .count();
-    assert_eq!(transitions, 1);
+        .collect();
+    assert_eq!(transitions.len(), 1);
+    assert!(
+        transitions[0].data.contains(r#""kind":"lead""#),
+        "{}",
+        transitions[0].data
+    );
     // The released file is free to the requester; the other requested file stays held.
     let taken = store
         .work_start(

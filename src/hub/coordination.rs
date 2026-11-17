@@ -430,6 +430,7 @@ impl CoordinationReply {
         generation: i64,
         updated_seq: i64,
         release_id: &str,
+        session: &str,
     ) -> Result<super::work_transition::WorkTransitionRequest> {
         let requested = super::work::normalized_scope(requested)?;
         let unrequested: Vec<String> = super::work::normalized_scope(&self.release_paths)?
@@ -448,7 +449,7 @@ impl CoordinationReply {
             operation_id: release_id.to_owned(),
             generation,
             expected_updated_seq: updated_seq,
-            session: Some(self.session.clone()),
+            session: Some(session.to_owned()),
             transition: super::work_transition::WorkTransitionKind::ReleasePaths,
             reason: format!(
                 "released by a reply to coordination request {}",

@@ -1704,7 +1704,7 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     // The holder is its MCP session: no hook kind, an 8-hex key, not the token's label.
     let key = asked
         .strip_prefix("AgentSCM: asked user1's agent session ")
-        .and_then(|rest| rest.strip_suffix(" for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. A coordination request is the recorded equivalent: its history is readable with agentscm_coordination_inbox."))
+        .and_then(|rest| rest.strip_suffix(" for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues."))
         .unwrap_or_else(|| panic!("{asked}"));
     assert!(
         key.len() == 8 && key.bytes().all(|b| b.is_ascii_hexdigit()),

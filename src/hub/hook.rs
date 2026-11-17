@@ -18,6 +18,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::{agent_name, unknown};
@@ -59,8 +60,8 @@ const MAX_ROOT_BYTES: usize = 1024;
 /// Sessions that were already told coordination is unknown; cleared when it grows past the bound.
 static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const MAX_NOTED: usize = 10_000;
-/// Partial releases a session was already told, by request and released set; cleared when it
-/// grows past the bound.
+/// Partial releases a session was already told, as a digest of request and released set; cleared
+/// when it grows past the bound.
 static PARTIAL_SHOWN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Tools that change a file; names are compared lowercase.
 const EDIT_TOOLS: [&str; 8] = [
@@ -621,7 +622,7 @@ async fn hook(
                                 if shown_set.len() > MAX_NOTED {
                                     shown_set.clear();
                                 }
-                                shown_set.insert(key)
+                                shown_set.insert(format!("{:x}", Sha256::digest(key)))
                             };
                         let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
                             receipt.target_work_id.is_none()

@@ -550,7 +550,7 @@ pub fn asked(asked: &Asked, path: &str) -> String {
     let path = sanitize(path, PATH_CHARS);
     match asked {
         Asked::Requested { holder } => format!(
-            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. A coordination request is the recorded equivalent: its history is readable with agentscm_coordination_inbox.",
+            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues.",
             holder_who(holder)
         ),
         Asked::NotHeld => {
@@ -1198,7 +1198,7 @@ mod tests {
                 },
                 "src/a.rs"
             ),
-            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. A coordination request is the recorded equivalent: its history is readable with agentscm_coordination_inbox."
+            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues."
         );
         let who = ("codex".to_owned(), "amy".to_owned());
         let session = SessionRef {

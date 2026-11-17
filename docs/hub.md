@@ -970,8 +970,10 @@ counter-offer.
   When the holder released the file (a release, `release_paths`, an ended session), the
   requester's next call is told once that the ask lapsed with no reply, that the file is
   free unless someone else took it, and to start on it with `agentscm_start`; this is
-  never reported as an acceptance. A coordination request is the recorded equivalent of
-  an ask: its history is readable with `agentscm_coordination_inbox`.
+  never reported as an acceptance. The same text is used when the holder's intent expired or
+  another session now holds the path. A lapsed ask is delivered once to a requester that is
+  still live. An ask does not appear in `agentscm_coordination_inbox`; for a recorded request
+  with history, use the coordination request `agentscm_start` queues.
   A session may have 3 open requests, and a holder 3 for one file; asking again
   for the same file only says it was already asked. A request whose requesting
   session has ended lapses when the holder answers yes. The same agent (one
