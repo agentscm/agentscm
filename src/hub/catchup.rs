@@ -378,8 +378,8 @@ impl CatchupQuery {
                 validate_id("catch-up delivery", delivery, "cup")?;
             }
             _ => {
-                return Err(invalid(
-                    "catch-up continuation requires delivery and every cursor",
+                return Err(HubError::reviewed(
+                    super::error_envelope::ErrorCode::CatchupContinuationIncomplete,
                 ));
             }
         }

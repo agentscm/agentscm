@@ -1287,6 +1287,54 @@ mod tests {
     use std::sync::mpsc;
 
     #[tokio::test]
+    async fn catchup_diagnosis_survives_packaged_stdio_http_bridge() {
+        use agentscm::hub::error_envelope::{ErrorCode, ErrorEnvelope};
+        let envelope = ErrorEnvelope::new(ErrorCode::CatchupContinuationIncomplete);
+        let body = json!({"jsonrpc":"2.0", "id":7, "result":envelope.mcp()}).to_string();
+        let (hub, received) = server(200, "application/json", &body);
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",",
+            "\"params\":{\"name\":\"agentscm_work_catchup\",\"arguments\":{\"session\":\"synthetic\",\"event_after\":88}}}\n"
+        );
+        let output = proxied(
+            input,
+            &saved(hub, "/checkout", "owner/repo"),
+            "private-token",
+        )
+        .await;
+        let reply: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["code"],
+            "catchup_continuation_incomplete"
+        );
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        for field in [
+            "delivery",
+            "event_after",
+            "event_through",
+            "merge_after",
+            "merge_through",
+        ] {
+            assert!(text.contains(field), "{text}");
+        }
+        assert!(text.contains("omit all five fields"));
+        assert!(!output.contains("private-token"));
+        assert!(
+            !reply["result"]["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("88")
+        );
+        let request = received.recv().unwrap();
+        assert!(request.contains("event_after"));
+        assert!(
+            !request.contains("event_through"),
+            "client must not invent cursors"
+        );
+    }
+
+    #[tokio::test]
     async fn inbox_long_poll_survives_ordinary_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap())

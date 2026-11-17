@@ -685,9 +685,12 @@ deliberately terse refusals and does not attach a reference.
 
 Registered codes:
 
+An incomplete catch-up continuation returns `catchup_continuation_incomplete`. Supply `delivery`, `event_after`, `event_through`, `merge_after` and `merge_through` together from the same delivery, or omit all five fields to start a fresh delivery. The error names fields without echoing their supplied values.
+
 | Code | HTTP | Retryable | Recovery action |
 | --- | ---: | --- | --- |
 | `invalid_request` | 400 | no | `provide_field` |
+| `catchup_continuation_incomplete` | 400 | no | `provide_field` |
 | `not_found` | 404 | no | `none` |
 | `read_only` | 403 | no | `ask_owner` |
 | `forbidden` | 403 | no | `ask_owner` |
