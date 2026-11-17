@@ -8944,6 +8944,24 @@ impl Store for SqliteStore {
     ) -> Result<OwnerNotice> {
         SqliteStore::owner_notice_delivered(self, token, id, proof, now)
     }
+    fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<super::notices::OwnerNoticeDeliveryClaim>> {
+        SqliteStore::owner_notice_delivery_claim(self, reader, id, channel, now)
+    }
+    fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &super::notices::OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_delivery_report(self, reader, id, report, now)
+    }
     fn owner_notice_list(
         &self,
         reader: &WorkLifecycleReader<'_>,

@@ -80,6 +80,45 @@ pub struct OwnerNoticeDeliveryProof {
     pub external_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticeDeliveryAttempt {
+    pub id: String,
+    pub channel: String,
+    pub outcome: AttemptOutcome,
+    pub created_at: i64,
+    pub reported_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticeDeliveryClaim {
+    pub notice: OwnerNotice,
+    pub attempt_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticeDeliveryReport {
+    pub attempt_id: String,
+    pub outcome: AttemptOutcome,
+    pub proof: Option<OwnerNoticeDeliveryProof>,
+}
+
+impl OwnerNoticeDeliveryReport {
+    pub fn validate(&self) -> Result<()> {
+        text("owner notice attempt id", &self.attempt_id, 255)?;
+        match (&self.outcome, &self.proof) {
+            (AttemptOutcome::TransportReported, Some(proof)) => proof.validate(),
+            (AttemptOutcome::ProvenNoDispatch | AttemptOutcome::Unknown, None) => Ok(()),
+            _ => Err(HubError::Invalid(
+                "Owner notice delivery report must prove delivery, no dispatch, or uncertainty."
+                    .into(),
+            )),
+        }
+    }
+}
+
 impl OwnerNoticeDeliveryProof {
     pub fn validate(&self) -> Result<()> {
         text("delivery channel", &self.channel, 32)?;
@@ -108,6 +147,8 @@ pub struct OwnerNotice {
     pub repository_id: Option<i64>,
     pub body: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub delivery_attempts: Vec<OwnerNoticeDeliveryAttempt>,
     pub delivered_at: Option<i64>,
     pub delivery: Option<OwnerNoticeDeliveryProof>,
     pub acknowledged_at: Option<i64>,
@@ -117,6 +158,15 @@ pub struct OwnerNotice {
 impl OwnerNotice {
     pub fn delivery_proven(&self) -> bool {
         self.delivered_at.is_some() && self.delivery.is_some()
+    }
+
+    pub fn delivery_eligible(&self) -> bool {
+        !self.delivery_proven()
+            && self.delivery_attempts.len() < MAX_ATTEMPTS
+            && self
+                .delivery_attempts
+                .iter()
+                .all(|attempt| matches!(attempt.outcome, AttemptOutcome::ProvenNoDispatch))
     }
 }
 

@@ -454,6 +454,7 @@ impl PgStore {
                 repository_id: Some(repository_id),
                 body: request.body.clone(),
                 created_at: now,
+                delivery_attempts: vec![],
                 delivered_at: None,
                 delivery: None,
                 acknowledged_at: None,
@@ -544,6 +545,7 @@ impl PgStore {
                 repository_id: Some(repository_id),
                 body: request.body.clone(),
                 created_at: now,
+                delivery_attempts: vec![],
                 delivered_at: None,
                 delivery: None,
                 acknowledged_at: None,
@@ -589,6 +591,84 @@ impl PgStore {
                     tx.execute("UPDATE hub_owner_notices SET snapshot=$2 WHERE id=$1", &[&id, &json_string(&notice)?])?;
                 }
             }
+            tx.commit()?;
+            Ok(notice)
+        })
+    }
+
+    pub(super) fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<OwnerNoticeDeliveryClaim>> {
+        text("owner notice id", id, 255)?;
+        text("owner notice delivery channel", channel, 32)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = owner_reader(&mut tx, reader, now)?;
+            let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+            lock_owner(&mut tx, &who.owner.id)?;
+            let row = tx.query_opt(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=$1 AND recipient_owner=$2 AND provider=$3 AND host=$4 AND repository_id=$5 FOR UPDATE",
+                &[&id, &who.owner.id, &who.owner.identity.provider, &who.owner.identity.host, &repository_id],
+            )?.ok_or(HubError::Unauthorized)?;
+            let mut notice = owner_notice_row(row.get(0))?;
+            if !notice.delivery_eligible() {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let attempt_id = new_id("ona")?;
+            notice.delivery_attempts.push(OwnerNoticeDeliveryAttempt {
+                id: attempt_id.clone(),
+                channel: channel.into(),
+                outcome: AttemptOutcome::PossiblyEnqueued,
+                created_at: now,
+                reported_at: None,
+            });
+            tx.execute("UPDATE hub_owner_notices SET snapshot=$2 WHERE id=$1", &[&id, &json_string(&notice)?])?;
+            tx.commit()?;
+            Ok(Some(OwnerNoticeDeliveryClaim { notice, attempt_id }))
+        })
+    }
+
+    pub(super) fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        report.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = owner_reader(&mut tx, reader, now)?;
+            lock_owner(&mut tx, &who.owner.id)?;
+            let row = tx.query_opt(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=$1 AND recipient_owner=$2 AND provider=$3 AND host=$4 AND repository_id=$5 FOR UPDATE",
+                &[&id, &who.owner.id, &who.owner.identity.provider, &who.owner.identity.host, &who.repository_id],
+            )?.ok_or(HubError::Unauthorized)?;
+            let mut notice = owner_notice_row(row.get(0))?;
+            let attempt = notice.delivery_attempts.iter_mut().find(|attempt| attempt.id == report.attempt_id)
+                .ok_or_else(|| HubError::invalid_or_changed("Owner notice delivery attempt changed.".into()))?;
+            if attempt.reported_at.is_some() {
+                let same = attempt.outcome == report.outcome
+                    && (report.proof.is_none() || notice.delivery.as_ref() == report.proof.as_ref());
+                if !same {
+                    return Err(HubError::invalid_or_changed("Owner notice delivery attempt already has another outcome.".into()));
+                }
+                tx.commit()?;
+                return Ok(notice);
+            }
+            attempt.outcome = report.outcome;
+            attempt.reported_at = Some(now);
+            if let Some(proof) = &report.proof {
+                notice.delivery = Some(proof.clone());
+                notice.delivered_at = Some(now);
+            }
+            tx.execute("UPDATE hub_owner_notices SET snapshot=$2 WHERE id=$1", &[&id, &json_string(&notice)?])?;
             tx.commit()?;
             Ok(notice)
         })

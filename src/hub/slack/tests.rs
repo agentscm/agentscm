@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::LocalBackend;
+use crate::hub::notices::NewOwnerNotice;
 use crate::hub::session::SessionCall;
 use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
 use crate::hub::work::WorkStart;
@@ -95,6 +96,14 @@ impl Fixture {
     }
 
     async fn configured(policy: Option<Value>, other_forge: bool) -> Self {
+        Self::configured_owner_channel(policy, other_forge, None).await
+    }
+
+    async fn configured_owner_channel(
+        policy: Option<Value>,
+        other_forge: bool,
+        owner_notice_channel: Option<&str>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -118,6 +127,9 @@ impl Fixture {
         };
         if let Some(policy) = policy {
             alice_binding["reminders"] = policy;
+        }
+        if let Some(channel) = owner_notice_channel {
+            alice_binding["owner_notice_channel"] = json!(channel);
         }
         private(&dir.path().join("signing"), "synthetic-signing-secret");
         private(&dir.path().join("bot"), "xoxb-synthetic");
@@ -455,6 +467,101 @@ fn old_handoff_body(holder: &str, headline: &str, guidance: &str) -> Value {
         json!({"type":"button","action_id":YES,"text":plain_text("Hand it over",30),"value":value}),
     );
     body
+}
+
+fn owner_invalidation(f: &Fixture, number: i64) -> crate::hub::notices::OwnerNotice {
+    let owner = f.owner(0);
+    f.store()
+        .owner_notice_invalidation_put(
+            REPO,
+            101,
+            &NewOwnerNotice {
+                idempotency_key: format!("validation-pr-{number}"),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: format!("pr:{number}:local-validation:policy:evidence:trusted"),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner,
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                body: format!("Private detail for pull request #{number}."),
+            },
+            unix_now(),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_invalidation_posts_one_restricted_channel_message_and_records_proof() {
+    let f = Fixture::configured_owner_channel(None, false, Some("CNOTICE")).await;
+    let notice = owner_invalidation(&f, 42);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"CNOTICE","ts":"123.456"})));
+    f.run().await;
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [json!({
+            "channel":"CNOTICE",
+            "text":"<@U1> Local validation for pull request #42 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "unfurl_links":false,
+            "unfurl_media":false
+        })]
+    );
+    assert!(!messages[0].to_string().contains("Private detail"));
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    let stored = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap()
+        .notices
+        .into_iter()
+        .find(|item| item.id == notice.id)
+        .unwrap();
+    assert!(stored.delivery_proven());
+    assert_eq!(stored.delivery.unwrap().external_id, "CNOTICE:123.456");
+    assert!(stored.acknowledged_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_invalidation_falls_back_to_one_direct_message_without_a_channel() {
+    let f = Fixture::new().await;
+    owner_invalidation(&f, 43);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D43","ts":"456.789"})));
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["channel"], "U1");
+    assert_eq!(
+        messages[0]["text"],
+        "Local validation for pull request #43 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>"
+    );
 }
 
 /// A handoff message as an earlier version sent it, still in Slack with its buttons: alice's

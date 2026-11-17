@@ -593,6 +593,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 repository_id: 101,
                 agent_token_file: directory.path().join("agent"),
+                owner_notice_channel: None,
                 reminders: Default::default(),
             }],
         };

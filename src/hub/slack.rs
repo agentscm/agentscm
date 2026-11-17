@@ -26,6 +26,9 @@ use tokio::sync::Semaphore;
 
 use super::advice::{agent_name, sanitize};
 use super::handoff::{Answered, Via};
+use super::notices::{
+    AttemptOutcome, OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeSourceKind,
+};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
 use super::store::{Principal, TokenDigest, agent_token_digest, unix_now};
@@ -92,6 +95,10 @@ pub struct BindingConfig {
     pub repository: String,
     pub repository_id: i64,
     pub agent_token_file: PathBuf,
+    /// Opt-in public destination for Hub-produced owner notices in this repository. Addressed
+    /// notes remain private unless a future sender-facing API explicitly requests otherwise.
+    #[serde(default)]
+    pub owner_notice_channel: Option<String>,
     #[serde(default)]
     pub reminders: ReminderPolicy,
 }
@@ -250,6 +257,13 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
             || !users.insert(binding.slack_user.clone())
             || binding.forge_user_id <= 0
             || binding.repository_id <= 0
+        {
+            return Err(invalid());
+        }
+        if binding
+            .owner_notice_channel
+            .as_deref()
+            .is_some_and(|channel| !slack_id(channel, 'C'))
         {
             return Err(invalid());
         }
@@ -599,7 +613,7 @@ impl Slack {
 
     /// Calls `method` once the bot token is verified as the configured installation's;
     /// `Err` is the retry delay in seconds, 0 for never.
-    async fn api(&self, method: &str, body: Value) -> std::result::Result<(), u64> {
+    async fn api_value(&self, method: &str, body: Value) -> std::result::Result<Value, u64> {
         // The configured signing secret is app-scoped, whereas bot tokens are team-scoped.
         let mut verified = self.verified_until.lock().await;
         if *verified <= unix_now() {
@@ -616,7 +630,11 @@ impl Slack {
             *verified = unix_now() + 60;
         }
         drop(verified);
-        self.api_data(method, body).await.map(|_| ())
+        self.api_data(method, body).await
+    }
+
+    async fn api(&self, method: &str, body: Value) -> std::result::Result<(), u64> {
+        self.api_value(method, body).await.map(|_| ())
     }
 
     /// Queues what is due: the status reminders and one message per wait. A sent message's row
@@ -708,8 +726,144 @@ impl Slack {
         Ok(Some((id, user, body, attempts)))
     }
 
+    fn next_owner_notice(
+        &self,
+        state: &HubState,
+    ) -> Result<Option<(Principal, String, String, Value)>> {
+        self.active()?;
+        let now = unix_now();
+        for binding in &self.bindings {
+            let principal = match self.principal(state, binding) {
+                Ok(principal) => principal,
+                Err(HubError::Unauthorized) => continue,
+                Err(error) => return Err(error),
+            };
+            let reader = super::work_transition::WorkLifecycleReader::Person {
+                owner: &principal.owner,
+                repository: &principal.repository,
+                repository_id: principal.repository_id.ok_or(HubError::Unauthorized)?,
+            };
+            let page = state.store.owner_notice_list(&reader, None, 100, now)?;
+            for notice in page.notices {
+                if notice.delivery_proven() || !notice.delivery_eligible() {
+                    continue;
+                }
+                let public = notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation;
+                let destination = if public {
+                    binding
+                        .config
+                        .owner_notice_channel
+                        .as_deref()
+                        .unwrap_or(&binding.config.slack_user)
+                } else {
+                    &binding.config.slack_user
+                };
+                let Some(claim) = state
+                    .store
+                    .owner_notice_delivery_claim(&reader, &notice.id, "slack", now)?
+                else {
+                    continue;
+                };
+                let link = self.link("home");
+                let text = if public {
+                    let number = notice
+                        .source_id
+                        .strip_prefix("pr:")
+                        .and_then(|rest| rest.split(':').next())
+                        .filter(|number| number.bytes().all(|byte| byte.is_ascii_digit()))
+                        .unwrap_or("unknown");
+                    if binding.config.owner_notice_channel.is_some() {
+                        format!(
+                            "<@{}> Local validation for pull request #{} must be refreshed. <{}|Open AgentSCM>",
+                            binding.config.slack_user, number, link
+                        )
+                    } else {
+                        format!(
+                            "Local validation for pull request #{} must be refreshed. <{}|Open AgentSCM>",
+                            number, link
+                        )
+                    }
+                } else {
+                    format!(
+                        "You have a private AgentSCM notice. <{}|Open AgentSCM>",
+                        link
+                    )
+                };
+                let body = json!({
+                    "channel": destination,
+                    "text": text,
+                    "unfurl_links": false,
+                    "unfurl_media": false,
+                });
+                return Ok(Some((principal, claim.notice.id, claim.attempt_id, body)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn deliver_owner_notice(self: &Arc<Self>, state: &HubState) -> Result<bool> {
+        let service = self.clone();
+        let context = state.clone();
+        let Some((principal, notice_id, attempt_id, body)) =
+            offload(move || service.next_owner_notice(&context)).await?
+        else {
+            return Ok(false);
+        };
+        let report = match self.api_value("chat.postMessage", body).await {
+            Ok(value) => {
+                let proof = value
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .zip(value.get("ts").and_then(Value::as_str))
+                    .map(|(channel, ts)| OwnerNoticeDeliveryProof {
+                        channel: "slack".into(),
+                        external_id: format!("{channel}:{ts}"),
+                    });
+                match proof {
+                    Some(proof) => OwnerNoticeDeliveryReport {
+                        attempt_id,
+                        outcome: AttemptOutcome::TransportReported,
+                        proof: Some(proof),
+                    },
+                    None => OwnerNoticeDeliveryReport {
+                        attempt_id,
+                        outcome: AttemptOutcome::Unknown,
+                        proof: None,
+                    },
+                }
+            }
+            Err(0) => OwnerNoticeDeliveryReport {
+                attempt_id,
+                outcome: AttemptOutcome::ProvenNoDispatch,
+                proof: None,
+            },
+            Err(_) => OwnerNoticeDeliveryReport {
+                attempt_id,
+                outcome: AttemptOutcome::Unknown,
+                proof: None,
+            },
+        };
+        let store = state.store.clone();
+        offload(move || {
+            let repository_id = principal.repository_id.ok_or(HubError::Unauthorized)?;
+            let reader = super::work_transition::WorkLifecycleReader::Person {
+                owner: &principal.owner,
+                repository: &principal.repository,
+                repository_id,
+            };
+            store.owner_notice_delivery_report(&reader, &notice_id, &report, unix_now())?;
+            Ok(true)
+        })
+        .await
+    }
+
     /// Sends the next due message; `false` when none was due.
     async fn deliver(self: &Arc<Self>, state: &HubState) -> Result<bool> {
+        match self.deliver_owner_notice(state).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(_) => eprintln!("Slack owner notice delivery unavailable"),
+        }
         match self.deliver_status(state).await {
             Ok(true) => return Ok(true),
             Ok(false) => {}

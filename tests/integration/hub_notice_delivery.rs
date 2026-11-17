@@ -8,8 +8,8 @@ use agentscm::hub::connection::NewConnection;
 use agentscm::hub::notices::{
     AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAttempt,
     NoticeOfferRequest, NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport,
-    OwnerNoticeDeliveryProof, OwnerNoticeRecipient, OwnerNoticeRecipientStatus,
-    OwnerNoticeSourceKind, SourceKind,
+    OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeRecipient,
+    OwnerNoticeRecipientStatus, OwnerNoticeSourceKind, SourceKind,
 };
 use agentscm::hub::session_lifecycle::LifecycleRegister;
 use agentscm::hub::store::{
@@ -1623,6 +1623,82 @@ fn owner_mailbox_contract(database: &str) {
             .owner_notice_invalidation_put(REPO, REPO_ID, &changed_automatic, now + 5)
             .is_err()
     );
+    let claim = store
+        .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 5)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 6)
+            .unwrap()
+            .is_none(),
+        "an atomic possibly-enqueued claim cannot be duplicated"
+    );
+    let uncertain = OwnerNoticeDeliveryReport {
+        attempt_id: claim.attempt_id,
+        outcome: AttemptOutcome::Unknown,
+        proof: None,
+    };
+    store
+        .owner_notice_delivery_report(&reader, &automatic_created.id, &uncertain, now + 6)
+        .unwrap();
+    assert!(
+        store
+            .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 60)
+            .unwrap()
+            .is_none(),
+        "uncertain transport is never blindly retried"
+    );
+
+    let retryable_request = NewOwnerNotice {
+        idempotency_key: "validation-pr-43-policy-v2".into(),
+        source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+        source_id: "pr:43:local-validation:policy:evidence:policy-v2".into(),
+        recipient: recipient_address.clone(),
+        body: "PR #43 has an attestation invalidated by a policy change.".into(),
+    };
+    let retryable = store
+        .owner_notice_invalidation_put(REPO, REPO_ID, &retryable_request, now + 6)
+        .unwrap();
+    let first = store
+        .owner_notice_delivery_claim(&reader, &retryable.id, "slack", now + 6)
+        .unwrap()
+        .unwrap();
+    store
+        .owner_notice_delivery_report(
+            &reader,
+            &retryable.id,
+            &OwnerNoticeDeliveryReport {
+                attempt_id: first.attempt_id,
+                outcome: AttemptOutcome::ProvenNoDispatch,
+                proof: None,
+            },
+            now + 7,
+        )
+        .unwrap();
+    let second = store
+        .owner_notice_delivery_claim(&reader, &retryable.id, "slack", now + 8)
+        .unwrap()
+        .unwrap();
+    let proof = OwnerNoticeDeliveryProof {
+        channel: "slack".into(),
+        external_id: "C1:123.456".into(),
+    };
+    let proven = store
+        .owner_notice_delivery_report(
+            &reader,
+            &retryable.id,
+            &OwnerNoticeDeliveryReport {
+                attempt_id: second.attempt_id,
+                outcome: AttemptOutcome::TransportReported,
+                proof: Some(proof.clone()),
+            },
+            now + 9,
+        )
+        .unwrap();
+    assert!(proven.delivery_proven());
+    assert_eq!(proven.delivery.as_ref(), Some(&proof));
+    assert!(proven.acknowledged_at.is_none());
 
     for index in 1..20 {
         store

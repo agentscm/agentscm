@@ -687,6 +687,23 @@ pub trait Store: Send + Sync {
         proof: &OwnerNoticeDeliveryProof,
         now: i64,
     ) -> Result<OwnerNotice>;
+    /// Atomically reserves one outbound transport attempt for the addressed owner's binding.
+    /// Only a proven no-dispatch result permits another claim; uncertainty is terminal for
+    /// automatic delivery so the Hub never blindly duplicates a possibly-sent message.
+    fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<super::notices::OwnerNoticeDeliveryClaim>>;
+    fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &super::notices::OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice>;
     /// Pure, deterministic recipient mailbox read through the existing repository-role gate.
     fn owner_notice_list(
         &self,
