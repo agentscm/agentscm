@@ -25,7 +25,8 @@ src/client_cli/computer.rs let value: Value = serde_json::from_str(&text).ok()?;
 # src/client_config.rs: connections.json
 src/client_config.rs serde_json::from_str(text).map_err(|_| invalid("connections.json is not valid"))?;
 
-# src/client_mcp.rs: JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged
+# src/client_mcp.rs: JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged; the outgoing request body selects a bounded inbox-wait timeout
+src/client_mcp.rs let wait = serde_json::from_slice::<Value>(body)
 src/client_mcp.rs let message = serde_json::from_slice(&line)?;
 src/client_mcp.rs let message = serde_json::from_slice::<Value>(&line).ok();
 src/client_mcp.rs let message: Value = match serde_json::from_slice(&line) {
