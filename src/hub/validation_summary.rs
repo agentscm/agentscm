@@ -1266,40 +1266,68 @@ fn produce_invalidation_notices(
     if owner.disabled {
         return Ok(());
     }
-    for invalidation in invalidations {
-        let source_id = format!(
-            "pr:{}:{}:{}:{}:{}",
+    let mut invalidations = invalidations.to_vec();
+    invalidations.sort_by(|a, b| {
+        (a.cause.label(), &a.requirement, &a.evidence, &a.trusted).cmp(&(
+            b.cause.label(),
+            &b.requirement,
+            &b.evidence,
+            &b.trusted,
+        ))
+    });
+    invalidations.dedup();
+    let transition = serde_json::to_vec(
+        &invalidations
+            .iter()
+            .map(|item| {
+                (
+                    item.cause.label(),
+                    &item.requirement,
+                    &item.evidence,
+                    &item.trusted,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| failed("validation invalidation identity unavailable"))?;
+    let source_id = format!("pr:{}:transition:{}", pull.number, digest(transition));
+    let mut causes = invalidations
+        .iter()
+        .map(|item| item.cause.label())
+        .collect::<Vec<_>>();
+    causes.sort_unstable();
+    causes.dedup();
+    let mut requirements = invalidations
+        .iter()
+        .map(|item| item.requirement.as_str())
+        .collect::<Vec<_>>();
+    requirements.sort_unstable();
+    requirements.dedup();
+    let request = NewOwnerNotice {
+        idempotency_key: digest(&source_id),
+        source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+        source_id,
+        recipient: OwnerNoticeRecipient {
+            owner: owner.id,
+            provider: identity.provider,
+            host: identity.host,
+        },
+        route: super::notices::OwnerNoticeRoute::RepositoryChannel,
+        body: format!(
+            "Pull request #{} has current-head local-validation attestations invalidated by a {} change ({}). Update from the base branch and submit new attestations.",
             pull.number,
-            invalidation.requirement,
-            invalidation.cause.label().replace(' ', "-"),
-            invalidation.evidence,
-            invalidation.trusted,
-        );
-        let request = NewOwnerNotice {
-            idempotency_key: digest(&source_id),
-            source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
-            source_id,
-            recipient: OwnerNoticeRecipient {
-                owner: owner.id.clone(),
-                provider: identity.provider.clone(),
-                host: identity.host.clone(),
-            },
-            route: super::notices::OwnerNoticeRoute::RepositoryChannel,
-            body: format!(
-                "Pull request #{} has a current-head local-validation attestation invalidated by a {} change. Update from the base branch and submit a new attestation.",
-                pull.number,
-                invalidation.cause.label(),
-            ),
-        };
-        store_call(|| {
-            hub.store.owner_notice_invalidation_put(
-                &repo.full_name,
-                repo.repository_id,
-                &request,
-                super::store::unix_now(),
-            )
-        })?;
-    }
+            causes.join(" and "),
+            requirements.join(", "),
+        ),
+    };
+    store_call(|| {
+        hub.store.owner_notice_invalidation_put(
+            &repo.full_name,
+            repo.repository_id,
+            &request,
+            super::store::unix_now(),
+        )
+    })?;
     Ok(())
 }
 

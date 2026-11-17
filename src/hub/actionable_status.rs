@@ -308,7 +308,11 @@ fn project_owner_notice(
             .iter_mut()
             .find(|action| {
                 action.kind == "failed_check"
-                    && action.action.contains(&format!("pull request #{number}"))
+                    && action
+                        .id
+                        .rsplit_once(':')
+                        .and_then(|(prefix, _)| prefix.rsplit_once(':'))
+                        .is_some_and(|(_, pull)| pull == number)
             })
             .map(|action| {
                 action.action = format!("{} {}", action.action, notice.body);
@@ -2025,6 +2029,37 @@ mod tests {
                 .ends_with("Update from the base branch and submit a new attestation.")
         );
         assert_ne!(actions[0].semantic_version.as_deref(), Some("check-v1"));
+
+        let mut near_match = actions;
+        project_owner_notice(
+            &mut near_match,
+            &principal,
+            crate::hub::notices::OwnerNotice {
+                id: "ont_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                idempotency_key: "validation-4".into(),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: "pr:4:transition:policy".into(),
+                sender_owner: "hub".into(),
+                sender_token: "hub:validation".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: principal.owner.id.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                repository: principal.repository.clone(),
+                repository_id: principal.repository_id,
+                body: "Pull request #4 needs a new attestation.".into(),
+                created_at: 101,
+                delivery_attempts: vec![],
+                delivered_at: None,
+                delivery: None,
+                acknowledged_at: None,
+                acted_at: None,
+            },
+        );
+        assert_eq!(near_match.len(), 2, "PR #4 must not fold into PR #42");
+        assert_eq!(near_match[1].kind, "owner_notice");
     }
 
     #[test]

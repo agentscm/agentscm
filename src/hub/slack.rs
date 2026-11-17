@@ -43,6 +43,12 @@ const MAX_ATTEMPTS: i64 = 8;
 /// The retry delay `api_data` reports for a server error or network failure; `retry_delay`
 /// grows it with each attempt, so an outage of Slack is waited out, not burned through.
 const TRANSIENT: u64 = 5;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiFailure {
+    Retry(u64),
+    ProvenNoDispatch,
+    Unknown,
+}
 /// The longest wait between two tries.
 const RETRY_CAP: i64 = 300;
 const SENDS_PER_PASS: usize = 20;
@@ -486,7 +492,8 @@ impl Slack {
         db.busy_timeout(Duration::from_millis(250))?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS installation (id INTEGER PRIMARY KEY CHECK(id=1), team TEXT NOT NULL, app TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);")?;
+            CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS owner_notice_cursors (binding TEXT PRIMARY KEY, after_id TEXT NOT NULL);")?;
         db.execute(
             "INSERT OR IGNORE INTO installation(id,team,app) VALUES(1,?1,?2)",
             params![config.team_id, config.app_id],
@@ -567,58 +574,66 @@ impl Slack {
         Ok(who)
     }
 
-    async fn api_data(&self, method: &str, body: Value) -> std::result::Result<Value, u64> {
+    async fn api_data(&self, method: &str, body: Value) -> std::result::Result<Value, ApiFailure> {
         let response = self
             .client
             .post(format!("{}{method}", self.api))
             .bearer_auth(&self.bot)
             .header("Content-Type", "application/json; charset=utf-8")
-            .body(serde_json::to_vec(&body).map_err(|_| 0u64)?)
+            .body(serde_json::to_vec(&body).map_err(|_| ApiFailure::ProvenNoDispatch)?)
             .send()
             .await
-            .map_err(|_| TRANSIENT)?;
+            .map_err(|_| ApiFailure::Unknown)?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Err(response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30)
-                .clamp(1, 300));
+            return Err(ApiFailure::Retry(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30)
+                    .clamp(1, 300),
+            ));
         }
         if !response.status().is_success() {
             return Err(if response.status().is_server_error() {
-                TRANSIENT
+                ApiFailure::Retry(TRANSIENT)
             } else {
-                0
+                ApiFailure::ProvenNoDispatch
             });
         }
         let mut response = response;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| TRANSIENT)? {
+        while let Some(chunk) = response.chunk().await.map_err(|_| ApiFailure::Unknown)? {
             if bytes.len() + chunk.len() > 512 * 1024 {
-                return Err(0);
+                return Err(ApiFailure::Unknown);
             }
             bytes.extend_from_slice(&chunk);
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| 0u64)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| ApiFailure::Unknown)?;
         if value.get("ok") == Some(&json!(true)) {
             Ok(value)
         } else {
             Err(match value.get("error").and_then(Value::as_str) {
-                Some("ratelimited" | "internal_error" | "fatal_error") => 30,
-                _ => 0,
+                Some("ratelimited" | "internal_error" | "fatal_error") => ApiFailure::Retry(30),
+                _ => ApiFailure::ProvenNoDispatch,
             })
         }
     }
 
-    /// Calls `method` once the bot token is verified as the configured installation's;
-    /// `Err` is the retry delay in seconds, 0 for never.
-    async fn api_value(&self, method: &str, body: Value) -> std::result::Result<Value, u64> {
+    /// Calls `method` once the bot token is verified as the configured installation's.
+    /// A failure says whether retry is safe, dispatch was disproven, or the result is unknown.
+    async fn api_value(&self, method: &str, body: Value) -> std::result::Result<Value, ApiFailure> {
         // The configured signing secret is app-scoped, whereas bot tokens are team-scoped.
         let mut verified = self.verified_until.lock().await;
         if *verified <= unix_now() {
-            let identity = self.api_data("auth.test", json!({})).await?;
+            let identity = match self.api_data("auth.test", json!({})).await {
+                Ok(identity) => identity,
+                Err(ApiFailure::Retry(delay)) => return Err(ApiFailure::Retry(delay)),
+                Err(ApiFailure::ProvenNoDispatch | ApiFailure::Unknown) => {
+                    return Err(ApiFailure::ProvenNoDispatch);
+                }
+            };
             if identity.get("team_id").and_then(Value::as_str) != Some(&self.team)
                 || identity.get("bot_id").and_then(Value::as_str) != Some(&self.expected_bot)
                 || identity
@@ -626,7 +641,7 @@ impl Slack {
                     .and_then(Value::as_str)
                     .is_some_and(|id| id != self.app)
             {
-                return Err(0);
+                return Err(ApiFailure::ProvenNoDispatch);
             }
             *verified = unix_now() + 60;
         }
@@ -635,7 +650,16 @@ impl Slack {
     }
 
     async fn api(&self, method: &str, body: Value) -> std::result::Result<(), u64> {
-        self.api_value(method, body).await.map(|_| ())
+        self.api_value(method, body)
+            .await
+            .map(|_| ())
+            .map_err(|failure| {
+                if let ApiFailure::Retry(delay) = failure {
+                    delay
+                } else {
+                    0
+                }
+            })
     }
 
     /// Queues what is due: the status reminders and one message per wait. A sent message's row
@@ -744,8 +768,30 @@ impl Slack {
                 repository: &principal.repository,
                 repository_id: principal.repository_id.ok_or(HubError::Unauthorized)?,
             };
-            let page = state.store.owner_notice_list(&reader, None, 100, now)?;
+            let binding_key = status::binding_key(binding);
+            let after: Option<String> = self
+                .database()?
+                .query_row(
+                    "SELECT after_id FROM owner_notice_cursors WHERE binding=?1",
+                    [&binding_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut page = state
+                .store
+                .owner_notice_list(&reader, after.as_deref(), 100, now)?;
+            if page.notices.is_empty() && after.is_some() {
+                self.database()?.execute(
+                    "DELETE FROM owner_notice_cursors WHERE binding=?1",
+                    [&binding_key],
+                )?;
+                page = state.store.owner_notice_list(&reader, None, 100, now)?;
+            }
             for notice in page.notices {
+                self.database()?.execute(
+                    "INSERT INTO owner_notice_cursors(binding,after_id) VALUES(?1,?2) ON CONFLICT(binding) DO UPDATE SET after_id=excluded.after_id",
+                    params![binding_key, notice.id],
+                )?;
                 if notice.delivery_proven() || !notice.delivery_eligible() {
                     continue;
                 }
@@ -839,12 +885,12 @@ impl Slack {
                     },
                 }
             }
-            Err(0) => OwnerNoticeDeliveryReport {
+            Err(ApiFailure::ProvenNoDispatch) => OwnerNoticeDeliveryReport {
                 attempt_id,
                 outcome: AttemptOutcome::ProvenNoDispatch,
                 proof: None,
             },
-            Err(_) => OwnerNoticeDeliveryReport {
+            Err(ApiFailure::Retry(_) | ApiFailure::Unknown) => OwnerNoticeDeliveryReport {
                 attempt_id,
                 outcome: AttemptOutcome::Unknown,
                 proof: None,

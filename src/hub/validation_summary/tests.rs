@@ -594,20 +594,13 @@ async fn trusted_transitions_notice_only_affected_current_attestations() {
         f.transition_trusted_config(cause);
         f.run().await.unwrap();
         let notices = f.notices();
-        let expected = if cause == InvalidationCause::Registry {
-            2
-        } else {
-            1
-        };
-        assert_eq!(notices.len(), expected, "{cause:?}");
+        assert_eq!(notices.len(), 1, "{cause:?}");
         assert!(notices[0].body.contains(cause.label()));
         assert!(notices[0].body.contains("Pull request #1"));
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.source_id.contains("local-validation/unit")),
-            "{cause:?}: {notices:?}"
-        );
+        assert!(notices[0].body.contains("local-validation/unit"));
+        if cause == InvalidationCause::Registry {
+            assert!(notices[0].body.contains("local-validation/static"));
+        }
 
         // Scoped transitions leave the other requirement valid; every replay is idempotent.
         f.run().await.unwrap();

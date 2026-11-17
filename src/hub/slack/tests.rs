@@ -12,6 +12,7 @@ mod waits;
 
 const REPO: &str = "acme/widgets";
 const PATH: &str = "src/widget.rs";
+type RawReplies = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
 
 struct Fixture {
     dir: TempDir,
@@ -19,6 +20,7 @@ struct Fixture {
     address: std::net::SocketAddr,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     replies: Arc<Mutex<Vec<(u16, Value)>>>,
+    raw_replies: RawReplies,
     auth_team: Arc<Mutex<String>>,
     /// How long the fake Slack takes to answer `chat.update`.
     update_delay: Arc<Mutex<Duration>>,
@@ -141,18 +143,25 @@ impl Fixture {
 
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let replies = Arc::new(Mutex::new(Vec::<(u16, Value)>::new()));
+        let raw_replies = Arc::new(Mutex::new(Vec::<(u16, Vec<u8>)>::new()));
         let auth_team = Arc::new(Mutex::new("T123".to_owned()));
         let update_delay = Arc::new(Mutex::new(Duration::ZERO));
-        let (capture, outcomes, team, delay) = (
+        let (capture, outcomes, raw_outcomes, team, delay) = (
             calls.clone(),
             replies.clone(),
+            raw_replies.clone(),
             auth_team.clone(),
             update_delay.clone(),
         );
         let fake = Router::new().route(
             "/api/{method}",
             post(move |OriginalUri(uri): OriginalUri, body: Bytes| {
-                let (capture, outcomes, team) = (capture.clone(), outcomes.clone(), team.clone());
+                let (capture, outcomes, raw_outcomes, team) = (
+                    capture.clone(),
+                    outcomes.clone(),
+                    raw_outcomes.clone(),
+                    team.clone(),
+                );
                 let delay = *delay.lock().unwrap();
                 async move {
                     if uri.path() == "/api/chat.update" {
@@ -162,19 +171,27 @@ impl Fixture {
                         let team = team.lock().unwrap().clone();
                         return (
                             StatusCode::OK,
-                            axum::Json(json!({"ok":true,"team_id":team,"bot_id":"B123"})),
+                            Bytes::from(
+                                serde_json::to_vec(
+                                    &json!({"ok":true,"team_id":team,"bot_id":"B123"}),
+                                )
+                                .unwrap(),
+                            ),
                         );
                     }
                     capture.lock().unwrap().push((
                         uri.path().to_owned(),
                         serde_json::from_slice(&body).unwrap(),
                     ));
-                    let (status, reply) = outcomes
-                        .lock()
-                        .unwrap()
-                        .pop()
-                        .unwrap_or((200, json!({"ok":true})));
-                    (StatusCode::from_u16(status).unwrap(), axum::Json(reply))
+                    let (status, reply) = raw_outcomes.lock().unwrap().pop().unwrap_or_else(|| {
+                        let (status, reply) = outcomes
+                            .lock()
+                            .unwrap()
+                            .pop()
+                            .unwrap_or((200, json!({"ok":true})));
+                        (status, serde_json::to_vec(&reply).unwrap())
+                    });
+                    (StatusCode::from_u16(status).unwrap(), Bytes::from(reply))
                 }
             }),
         );
@@ -198,6 +215,7 @@ impl Fixture {
             address,
             calls,
             replies,
+            raw_replies,
             auth_team,
             update_delay,
             alice,
@@ -538,6 +556,107 @@ async fn owner_invalidation_posts_one_restricted_channel_message_and_records_pro
     assert!(stored.delivery_proven());
     assert_eq!(stored.delivery.unwrap().external_id, "CNOTICE:123.456");
     assert!(stored.acknowledged_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_post_response_is_unknown_and_is_not_retried() {
+    let f = Fixture::new().await;
+    let notice = owner_invalidation(&f, 44);
+    f.raw_replies
+        .lock()
+        .unwrap()
+        .push((200, b"not-json".to_vec()));
+    f.run().await;
+    f.run().await;
+    let sent = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .count();
+    assert_eq!(sent, 1);
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    let stored = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap()
+        .notices
+        .into_iter()
+        .find(|item| item.id == notice.id)
+        .unwrap();
+    assert_eq!(stored.delivery_attempts.len(), 1);
+    assert_eq!(stored.delivery_attempts[0].outcome, AttemptOutcome::Unknown);
+    assert!(!stored.delivery_eligible());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_notice_delivery_continues_past_one_hundred_historical_records() {
+    let f = Fixture::new().await;
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    for number in 1..=101 {
+        let notice = owner_invalidation(&f, 1_000 + number);
+        let claim = f
+            .store()
+            .owner_notice_delivery_claim(&reader, &notice.id, "slack", unix_now())
+            .unwrap()
+            .unwrap();
+        f.store()
+            .owner_notice_delivery_report(
+                &reader,
+                &notice.id,
+                &OwnerNoticeDeliveryReport {
+                    attempt_id: claim.attempt_id,
+                    outcome: AttemptOutcome::Unknown,
+                    proof: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let eligible = owner_invalidation(&f, 2_000);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D1","ts":"2000.1"})));
+    for _ in 0..3 {
+        f.run().await;
+    }
+    let sent = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .count();
+    assert_eq!(sent, 1);
+    let first = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap();
+    let second = f
+        .store()
+        .owner_notice_list(&reader, first.next_after.as_deref(), 100, unix_now())
+        .unwrap();
+    let delivered = first
+        .notices
+        .into_iter()
+        .chain(second.notices)
+        .find(|notice| notice.id == eligible.id)
+        .expect("eligible notice is in the paged mailbox");
+    assert!(delivered.delivery_proven());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

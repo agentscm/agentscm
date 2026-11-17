@@ -1068,14 +1068,16 @@ impl SqliteStore {
             )?;
             page.notices.push(receipt);
         }
-        let owner_notices = tx
-            .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4 AND json_extract(snapshot,'$.acknowledged_at') IS NULL ORDER BY id LIMIT 101")?
-            .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id], |row| row.get::<_,String>(0))?
+        let owner_kind = json_string(&SourceKind::OwnerNotice)?;
+        let mut owner_notices = tx
+            .prepare("SELECT n.snapshot FROM hub_owner_notices n WHERE n.recipient_owner=?1 AND n.provider=?2 AND n.host=?3 AND n.repository_id IS ?4 AND json_extract(n.snapshot,'$.acknowledged_at') IS NULL AND NOT EXISTS (SELECT 1 FROM hub_notice_deliveries d WHERE d.token=?5 AND d.session=?6 AND d.source_kind=?7 AND d.source_id=n.id AND d.source_version=CAST(n.created_at AS TEXT)) ORDER BY n.id LIMIT 100")?
+            .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id,token,domain,owner_kind], |row| row.get::<_,String>(0))?
             .collect::<std::result::Result<Vec<_>,_>>()?;
-        if owner_notices.len() > 100 {
-            return Err(HubError::Unavailable(
-                "Owner notice refresh coverage exceeds its bound.".into(),
-            ));
+        if owner_notices.is_empty() {
+            owner_notices = tx
+                .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4 AND json_extract(snapshot,'$.acknowledged_at') IS NULL ORDER BY id LIMIT 100")?
+                .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id], |row| row.get::<_,String>(0))?
+                .collect::<std::result::Result<Vec<_>,_>>()?;
         }
         for snapshot in owner_notices {
             let notice = owner_notice_row(snapshot)?;

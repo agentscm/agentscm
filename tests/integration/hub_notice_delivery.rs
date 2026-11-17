@@ -1849,13 +1849,68 @@ fn owner_mailbox_contract(database: &str) {
                     idempotency_key: "over-rate-bound".into(),
                     source_kind: OwnerNoticeSourceKind::Addressed,
                     source_id: "pr-999-note".into(),
-                    recipient: recipient_address,
+                    recipient: recipient_address.clone(),
                     route: agentscm::hub::notices::OwnerNoticeRoute::Private,
                     body: "This send exceeds the bounded recipient window.".into(),
                 },
                 now + 5,
             )
             .is_err()
+    );
+
+    for index in 0..105 {
+        store
+            .owner_notice_invalidation_put(
+                REPO,
+                REPO_ID,
+                &NewOwnerNotice {
+                    idempotency_key: format!("bulk-refresh-{index}"),
+                    source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                    source_id: format!("bulk-refresh-{index}"),
+                    recipient: recipient_address.clone(),
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
+                    body: format!("Bulk refresh notice {index}."),
+                },
+                now + 10,
+            )
+            .unwrap();
+    }
+    let incarnation = register(&*store, &recipient_token, "bulk-refresh-session");
+    let query = DependencyRefresh {
+        session: "bulk-refresh-session".into(),
+        incarnation,
+        after: None,
+        limit: 100,
+    };
+    let first = store
+        .notice_refresh(&recipient_token, &query, now + 11)
+        .unwrap();
+    let first_owner = first
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert_eq!(first_owner, 100);
+    let second = store
+        .notice_refresh(&recipient_token, &query, now + 12)
+        .unwrap();
+    let second_owner = second
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert!(second_owner > 0 && second_owner < 100);
+    let third = store
+        .notice_refresh(&recipient_token, &query, now + 13)
+        .unwrap();
+    let third_owner = third
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert_eq!(
+        third_owner, 100,
+        "after backlog progress, refresh replays stable session receipts"
     );
 }
 

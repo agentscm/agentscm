@@ -36,6 +36,19 @@ fn lock_owner(tx: &mut postgres::Transaction<'_>, owner: &str) -> Result<()> {
     Ok(())
 }
 
+fn lock_owners(tx: &mut postgres::Transaction<'_>, first: &str, second: &str) -> Result<()> {
+    let (first, second) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    lock_owner(tx, first)?;
+    if second != first {
+        lock_owner(tx, second)?;
+    }
+    Ok(())
+}
+
 fn save(tx: &mut postgres::Transaction<'_>, receipt: &NoticeReceipt) -> Result<()> {
     tx.execute(
         "UPDATE hub_notice_deliveries SET snapshot=$2 WHERE id=$1",
@@ -515,8 +528,7 @@ impl PgStore {
                 return Err(HubError::Unauthorized);
             }
             // Serialize admission for this sender/recipient even before either unique key exists.
-            lock_owner(&mut tx, &who.owner.id)?;
-            lock_owner(&mut tx, &request.recipient.owner)?;
+            lock_owners(&mut tx, &who.owner.id, &request.recipient.owner)?;
             let digest = owner_notice_digest(request)?;
             if let Some(row) = tx.query_opt(
                 "SELECT request_digest,snapshot FROM hub_owner_notices WHERE sender_owner=$1 AND provider=$2 AND host=$3 AND repository_id=$4 AND idempotency_key=$5 FOR UPDATE",
@@ -972,8 +984,9 @@ impl PgStore {
                 let receipt=record(&mut tx,&who,NoticeSource{kind:SourceKind::Operational,id,version:format!("reservation-expiring:{}:{expires_at}",item.generation)},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:Some(item.id),generation:Some(item.generation)},now)?;
                 page.notices.push(receipt);
             }
-            let rows=tx.query("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=$1 AND provider=$2 AND host=$3 AND repository_id IS NOT DISTINCT FROM $4 AND (snapshot::jsonb->>'acknowledged_at') IS NULL ORDER BY id LIMIT 101", &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?;
-            if rows.len()>100{return Err(HubError::Unavailable("Owner notice refresh coverage exceeds its bound.".into()));}
+            let owner_kind=json_string(&SourceKind::OwnerNotice)?;
+            let mut rows=tx.query("SELECT n.snapshot FROM hub_owner_notices n WHERE n.recipient_owner=$1 AND n.provider=$2 AND n.host=$3 AND n.repository_id IS NOT DISTINCT FROM $4 AND (n.snapshot::jsonb->>'acknowledged_at') IS NULL AND NOT EXISTS (SELECT 1 FROM hub_notice_deliveries d WHERE d.token=$5 AND d.session=$6 AND d.source_kind=$7 AND d.source_id=n.id AND d.source_version=n.created_at::text) ORDER BY n.id LIMIT 100", &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id,&token,&domain,&owner_kind])?;
+            if rows.is_empty(){rows=tx.query("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=$1 AND provider=$2 AND host=$3 AND repository_id IS NOT DISTINCT FROM $4 AND (snapshot::jsonb->>'acknowledged_at') IS NULL ORDER BY id LIMIT 100", &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?;}
             for row in rows {
                 let notice=owner_notice_row(row.get(0))?;
                 let receipt=record(&mut tx,&who,NoticeSource{kind:SourceKind::OwnerNotice,id:notice.id,version:notice.created_at.to_string()},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:None,generation:None},now)?;
