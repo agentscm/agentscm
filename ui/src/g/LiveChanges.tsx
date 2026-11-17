@@ -1,5 +1,6 @@
 // G · Work over live data: every unfinished change by lifecycle step, and one change with its status, the six
 // lifecycle steps and how each is known, the evidence behind them, and the Hub's full record one click away.
+import { statusForWork, type StatusState } from '../actionableStatus.ts'
 import { useState } from 'react'
 import { Ago, Avatar, Box, Icon, Notice, PageHead, Pill, Reveal, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
@@ -20,30 +21,36 @@ import type { LiveProps } from './GLive.tsx'
 import { LiveLane, LiveTrack, useRuns } from './LiveNow.tsx'
 import { STEPS, dotTone, prFor, stateText, stepOf, toneOf } from './liveModel.ts'
 
-const FILTERS = [
-  { id: 'all', label: 'Every change', test: () => true },
-  { id: 'people', label: 'Waiting on people', test: (w: WorkItem) => w.state === 'blocked' || w.state === 'handover' || w.claim_status !== 'active' },
-  { id: 'moving', label: 'Moving', test: (w: WorkItem) => w.state === 'active' && w.claim_status === 'active' },
-  { id: 'paused', label: 'Paused', test: (w: WorkItem) => w.state === 'paused' },
-] as const
+const FILTERS: { id: 'all' | StatusState | 'unknown'; label: string }[] = [
+  { id: 'all', label: 'Every change' },
+  { id: 'active', label: 'Active' },
+  { id: 'awaiting_party', label: 'Awaiting a named party' },
+  { id: 'blocked', label: 'Blocked' },
+  { id: 'reassessment_needed', label: 'Reassessment needed' },
+  { id: 'retired', label: 'Retired' },
+  { id: 'unknown', label: 'Status unknown' },
+]
 
 export function LiveChanges({ live }: { live: LiveProps }) {
   const ov = live.overview.kind === 'ready' ? live.overview.value : null
   const runs = useRuns(live)
   const [f, setF] = useState<(typeof FILTERS)[number]['id']>('all')
   const all = ov?.current ?? []
-  const filter = FILTERS.find((x) => x.id === f) ?? FILTERS[0]
-  const waiting = all.filter(FILTERS[1].test).length
+  const shared = live.status?.kind === 'ready' ? live.status.value : null
+  const state = (w: WorkItem) => statusForWork(w, shared)?.state ?? 'unknown'
+  const selected = all.filter((w) => f === 'all' || state(w) === f)
+  const active = all.filter((w) => state(w) === 'active').length
+  const unknown = all.filter((w) => state(w) === 'unknown').length
   const finished = (ov?.recent ?? []).filter((o) => o.kind === 'completion')
   return (
     <>
-      <PageHead question="Where is each change?" answer={ov ? <>{plural(all.length, 'unfinished change')}.<br /><span className="g-quiet">{plural(waiting, 'waits', 'wait')} on people; the rest {all.length - waiting === 1 ? 'is' : 'are'} moving.</span></> : <>Reading the Hub…</>} />
+      <PageHead question="Where is each change?" answer={ov ? <>{plural(all.length, 'unfinished change')}.<br /><span className="g-quiet">{active} active{unknown > 0 ? `; ${unknown} with unknown shared status` : ''}.</span></> : <>Reading the Hub…</>} />
       {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-filters" role="group" aria-label="Show">
-        {FILTERS.map((x) => <button key={x.id} type="button" aria-pressed={f === x.id} className={f === x.id ? 'on' : ''} onClick={() => setF(x.id)}>{x.label}<span>{all.filter(x.test).length}</span></button>)}
+        {FILTERS.map((x) => <button key={x.id} type="button" aria-pressed={f === x.id} className={f === x.id ? 'on' : ''} onClick={() => setF(x.id)}>{x.label}{' '}<span>{all.filter((w) => x.id === 'all' || state(w) === x.id).length}</span></button>)}
       </div>
-      <Box icon="diagram-3" title="By lifecycle step" count={all.filter(filter.test).length}>
-        {ov ? <LiveTrack items={all.filter(filter.test)} ov={ov} live={live} runs={runs} /> : <Skeleton rows={3} />}
+      <Box icon="diagram-3" title="By lifecycle step" count={selected.length}>
+        {ov ? <LiveTrack items={selected} ov={ov} live={live} runs={runs} /> : <Skeleton rows={3} />}
       </Box>
       <div className="g-two">
         <Box icon="flag" title="Recently reported finished" count={finished.length} explain="Reported finished by the agent. That does not confirm review, verification or merge.">
@@ -89,16 +96,17 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
   const pulls = work.kind === 'ready' ? work.value.pull_requests : []
   const runList = runs.kind === 'ready' ? runs.value.runs : []
   const at = stepOf(item, pulls, runList, ov)
-  const tone = toneOf(item)
+  const status = statusForWork(item, live.status?.kind === 'ready' ? live.status.value : null)
+  const tone = toneOf(item, status)
   const l = lead(item)
   // Same sources and order as the classic record, so both name the same pull request.
   const pub = pubs.kind === 'ready' && pubs.value?.supported ? pubs.value.publications.find((x) => x.branch === branch) : undefined
   const open = prFor(item, pulls)
   const prNumber = pub?.pr.number ?? open?.number ?? runList.find((x) => x.branch === branch)?.pull_request ?? null
   const prUrl = pub?.pr.url ?? httpsOnly(open?.html_url)
-  const step = item.state === 'blocked' ? blockedStep(item) : item.state === 'handover' ? handoverStep(item) : item.claim_status !== 'active' ? quietStep(item, live.handoff.me) : null
+  const step = status?.state === 'active' ? null : item.state === 'blocked' ? blockedStep(item) : item.state === 'handover' ? handoverStep(item) : item.claim_status !== 'active' ? quietStep(item, live.handoff.me) : null
   const acts = useStepActions(step, { viewer: live.handoff.me, repo: live.handoff.repo, originUrl: live.handoff.originUrl })
-  const why = item.blocker?.summary ?? item.current?.summary ?? 'No progress report yet.'
+  const why = status?.action ?? item.blocker?.summary ?? item.current?.summary ?? 'No progress report yet.'
   return (
     <article className="g-work">
       <a href="#changes" className="px-link g-back"><Icon name="arrow-left" /> All changes</a>
@@ -111,11 +119,11 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
 
       <section className={`g-status tone-${dotTone(tone)}`} aria-live="polite">
         <span className={`g-ring big tone-${dotTone(tone)}`}><Icon name={STEPS[at]?.icon ?? 'circle'} /></span>
-        <div className="g-status-text"><b>{stateText(item)}</b><p>{why}</p>{item.next_action && <p className="small mb-0"><Icon name="arrow-right-short" /> Next: {item.next_action}</p>}</div>
+        <div className="g-status-text"><b>{stateText(item, status)}</b><p>{why}</p>{item.next_action && <p className="small mb-0"><Icon name="arrow-right-short" /> Next: {item.next_action}</p>}</div>
         {acts.primary && <div className="g-acts"><StepAction a={acts.primary} className="btn btn-primary g-cta" /></div>}
       </section>
 
-      <LiveLane at={at} tone={tone} holder={l.agent} label={`${item.title}: ${STEPS[at]?.label}`} note={stateText(item)} />
+      <LiveLane at={at} tone={tone} holder={l.agent} label={`${item.title}: ${STEPS[at]?.label}`} note={stateText(item, status)} />
 
       <div className="g-work-grid">
         <div className="g-col">

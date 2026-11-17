@@ -1,3 +1,4 @@
+import type { WorkItem } from './standup.ts'
 import { ApiError } from './api.ts'
 import { withTimeout } from './timeout.ts'
 
@@ -56,3 +57,9 @@ export const statusProvenance = (w: StatusWork): string => [
   ...(w.reconciliation?.current_source_coverage.map((p) => `${p.source}: ${p.state}; checked ${new Date(p.checked_at_seconds * 1000).toLocaleString()}.`) ?? ['Provider coverage unavailable.']),
   ...(w.reconciliation && !w.reconciliation.current ? ['No current reconciliation synthesis; retained reports are history.'] : []),
 ].join(' ')
+
+/** Apply a projection only to the exact Work version it describes; separately polled snapshots can differ. */
+export function statusForWork(item: WorkItem, shared: ActionableStatus | null | undefined): StatusWork | null {
+  const status = shared?.work.find((w) => w.work_id === item.id)
+  return status && status.generation === item.generation && status.updated_seq === item.updated_seq ? status : null
+}

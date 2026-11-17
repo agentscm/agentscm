@@ -1,5 +1,6 @@
 // Where each unfinished change stands, from what the Hub can see without opening it: an open pull request for its
 // branch, a skill gate run on its branch, or a declared-scope overlap. Same six steps as the change page's lifecycle.
+import { statusLabel, type StatusWork } from '../actionableStatus.ts'
 import { STATE } from '../pages/workParts.tsx'
 import type { RunView } from '../skills.ts'
 import type { WorkItem, WorkOverview } from '../standup.ts'
@@ -32,7 +33,8 @@ export function stepOf(item: WorkItem, pulls: PullRequest[], runs: RunView[], ov
 export type LaneTone = 'brand' | 'bad' | 'warn' | 'ok' | 'handover'
 
 /** Blocked is trouble; quiet, stale or paused is waiting; a handover is offered; everything else is moving. */
-export function toneOf(item: WorkItem): LaneTone {
+export function toneOf(item: WorkItem, status?: StatusWork | null): LaneTone {
+  if (status !== undefined) return status?.state === 'blocked' ? 'bad' : status?.state === 'active' ? 'brand' : status?.state === 'retired' ? 'ok' : 'warn'
   if (item.state === 'blocked') return 'bad'
   if (item.state === 'finished') return 'ok'
   if (item.claim_status !== 'active' || item.state === 'paused') return 'warn'
@@ -40,7 +42,8 @@ export function toneOf(item: WorkItem): LaneTone {
   return 'brand'
 }
 
-export function stateText(item: WorkItem): string {
+export function stateText(item: WorkItem, status?: StatusWork | null): string {
+  if (status !== undefined) return status ? statusLabel(status.state) : 'Shared status unknown'
   if (item.state !== 'finished' && item.claim_status !== 'active') return item.claim_status === 'stale' ? 'Quiet · still assigned' : 'Check-in unknown · still assigned'
   return STATE[item.state].label
 }
