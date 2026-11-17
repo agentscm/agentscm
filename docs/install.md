@@ -64,6 +64,8 @@ your GitHub login to make you the Hub administrator and signs you in through you
 does not ask more questions while it configures agents, though each agent host may show its own
 trust prompts. See the [guided setup](setup-guide.md) for the full flow.
 
+When you run quickstart in a checkout whose GitHub origin belongs to an organization, quickstart asks GitHub to confirm the organization and suggests it as the App owner. A configured App owner takes precedence, and you can change the owner on the setup page. If GitHub cannot confirm the organization, the page uses its configured or personal default.
+
 The managed native Hub serves setup, sign-in and coordination APIs without a dashboard.
 Browser controls for sending human messages and choosing their consent mode require a
 UI-enabled Hub, such as the container or an explicit `--features ui` source build. Connecting

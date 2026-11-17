@@ -2989,8 +2989,9 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
 /// The page that shows who will own the app and what it is called, then posts the
 /// manifest to GitHub when the person clicks Continue. The state in the URL is the
 /// capability. `owner` and `name` in the query replace the defaults for this view only
-/// (an empty `owner` means the signed-in personal account); they are checked as
-/// `begin_setup` checks them and the callback never reads them back.
+/// (an empty `owner` means the signed-in personal account). Quickstart's
+/// `suggested_owner` applies only without a configured or explicit owner.
+/// The callback never reads these parameters back.
 async fn setup_page(
     State(state): State<HubState>,
     Path(secret): Path<String>,
@@ -3010,6 +3011,11 @@ async fn setup_page(
     };
     if let Some(owner) = params.get("owner") {
         org = Some(owner.trim().to_owned()).filter(|owner| !owner.is_empty());
+    } else if org.is_none()
+        && let Some(owner) = params.get("suggested_owner")
+        && simple(owner, b"-", 39)
+    {
+        org = Some(owner.clone());
     }
     if let Some(chosen) = params
         .get("name")

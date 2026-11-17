@@ -1,6 +1,7 @@
 //! First-run GitHub App setup shared by native and Docker local Hub runtimes.
 use std::time::{Duration, Instant};
 
+use agentscm::hub::forge_http::Forge;
 use serde_json::Value;
 
 use super::detect::{capture, which};
@@ -44,6 +45,36 @@ fn login_ok(login: &str) -> bool {
         && login
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn bootstrap_origin_owner<'a>(base: &str, link: &str, repo: Option<&'a str>) -> Option<&'a str> {
+    let secret = link
+        .strip_prefix(base)?
+        .strip_prefix("/v1/hub/github/setup/")?;
+    if secret.len() < 32 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (owner, name) = repo?.split_once('/')?;
+    (login_ok(owner) && !name.is_empty() && !name.contains('/')).then_some(owner)
+}
+
+fn confirmed_organization<'a>(status: u16, body: &'a Value, owner: &str) -> Option<&'a str> {
+    if status != 200 || body["type"].as_str() != Some("Organization") {
+        return None;
+    }
+    body["login"]
+        .as_str()
+        .filter(|login| login_ok(login) && login.eq_ignore_ascii_case(owner))
+}
+
+async fn suggested_owner(base: &str, link: &str, repo: Option<&str>) -> Option<String> {
+    let owner = bootstrap_origin_owner(base, link, repo)?;
+    let (status, body) = Forge::new()
+        .ok()?
+        .get_json(&format!("https://api.github.com/orgs/{owner}"), None)
+        .await
+        .ok()?;
+    confirmed_organization(status, &body, owner).map(str::to_owned)
 }
 
 pub(crate) fn github_login(given: Option<&str>, ui: &Ui) -> Result<String, String> {
@@ -95,7 +126,10 @@ pub(crate) async fn finish(
         .ok()
         .filter(|link| link.starts_with(&format!("{url}/")) && !link.chars().any(char::is_control));
     connection = runtime.connection_ids()?;
-    if let Some(link) = link {
+    if let Some(mut link) = link {
+        if let Some(owner) = suggested_owner(&url, &link, repo).await {
+            link.push_str(&format!("?suggested_owner={owner}"));
+        }
         println!(
             "\nFirst run: the hub needs a GitHub App. Open this link (it works once, for 10 minutes):\n  {link}"
         );
@@ -185,5 +219,42 @@ mod tests {
         assert_eq!(connection_ids(listing), ["con_ab"]);
         assert!(login_ok("octo-cat"));
         assert!(!login_ok("") && !login_ok("octo cat"));
+    }
+
+    #[test]
+    fn organization_lookup_requires_a_bootstrap_link_and_valid_origin_owner() {
+        let base = "http://127.0.0.1:7332";
+        let link = format!("{base}/v1/hub/github/setup/{}", "ab".repeat(32));
+        assert_eq!(
+            bootstrap_origin_owner(base, &link, Some("octo-cat/widgets")),
+            Some("octo-cat")
+        );
+        for repo in [None, Some("o@cto/widgets"), Some("octo-cat"), Some("a/b/c")] {
+            assert_eq!(bootstrap_origin_owner(base, &link, repo), None);
+        }
+        for invalid in [
+            format!("{base}/setup"),
+            format!("{link}?owner=acme"),
+            link.replace("127.0.0.1", "localhost"),
+        ] {
+            assert_eq!(
+                bootstrap_origin_owner(base, &invalid, Some("octo-cat/widgets")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_matching_organization_response_suggests_an_owner() {
+        let org = serde_json::json!({"login": "Octo-Cat", "type": "Organization"});
+        let person = serde_json::json!({"login": "Octo-Cat", "type": "User"});
+        assert_eq!(
+            confirmed_organization(200, &org, "octo-cat"),
+            Some("Octo-Cat")
+        );
+        assert_eq!(confirmed_organization(404, &org, "octo-cat"), None);
+        assert_eq!(confirmed_organization(200, &org, "other"), None);
+        assert_eq!(confirmed_organization(200, &person, "octo-cat"), None);
+        assert_eq!(confirmed_organization(200, &Value::Null, "octo-cat"), None);
     }
 }

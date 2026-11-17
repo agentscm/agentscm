@@ -1004,7 +1004,12 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 .into(),
         );
     }
-    let repo = cx.found.remote.as_ref().map(|r| r.repo.clone());
+    let repo = cx
+        .found
+        .remote
+        .as_ref()
+        .filter(|remote| remote.forge == Forge::Github)
+        .map(|remote| remote.repo.as_str());
     let started = match runtime {
         HubRuntime::Docker => {
             if !cx.found.docker {
@@ -1023,7 +1028,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.github_login.as_deref(),
                 cx.tty,
                 &cx.home,
-                repo.as_deref(),
+                repo,
                 &mut cx.manifest,
                 &hub_local::Options {
                     runtime,
@@ -1071,7 +1076,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.github_login.as_deref(),
                 cx.tty,
                 &cx.home,
-                repo.as_deref(),
+                repo,
                 &mut cx.manifest,
                 &hub_native::Options {
                     executable: stable,

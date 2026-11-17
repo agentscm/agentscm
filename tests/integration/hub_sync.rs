@@ -662,6 +662,29 @@ async fn first_run_writes_a_one_time_setup_link_that_creates_the_app() {
     let (status, page) = env.raw(Method::GET, &setup, None, None).await;
     assert_eq!(status, 200);
     assert!(page.contains("agentscm-hub"), "{page}");
+    for (query, owner) in [
+        ("suggested_owner=origin-org", Some("origin-org")),
+        (
+            "suggested_owner=origin-org&owner=chosen-org",
+            Some("chosen-org"),
+        ),
+        ("suggested_owner=origin-org&owner=", None),
+        ("suggested_owner=invalid%2Fowner", None),
+    ] {
+        let (status, page) = env
+            .raw(Method::GET, &format!("{setup}?{query}"), None, None)
+            .await;
+        assert_eq!(status, 200);
+        if let Some(owner) = owner {
+            assert!(
+                page.contains(&format!("/organizations/{owner}/settings/apps/new?state=")),
+                "{page}"
+            );
+        } else {
+            assert!(page.contains("your personal GitHub account"), "{page}");
+            assert!(!page.contains("/organizations/"), "{page}");
+        }
+    }
     let callback = format!("/v1/hub/github/setup/callback?code=code-1&state={secret}");
     let (status, done) = env.raw(Method::GET, &callback, None, None).await;
     assert_eq!(status, 200, "{done}");
@@ -723,7 +746,10 @@ async fn first_run_link_only_without_users_connections_or_github_sign_in() {
     let (_, page) = env
         .raw(
             Method::GET,
-            &format!("/v1/hub/github/setup/{}", link.rsplit('/').next().unwrap()),
+            &format!(
+                "/v1/hub/github/setup/{}?suggested_owner=origin-org",
+                link.rsplit('/').next().unwrap()
+            ),
             None,
             None,
         )
