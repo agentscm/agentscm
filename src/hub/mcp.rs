@@ -120,7 +120,7 @@ struct McpQuery {
     tools: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StartArgs {
     issue_choice: Option<super::work_issues::WorkIssueChoice>,
@@ -149,7 +149,7 @@ struct StartArgs {
     new_work: bool,
     /// The native session ID of the session that started this one.
     started_by: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     detail: Detail,
 }
 
@@ -2618,7 +2618,7 @@ async fn call_inner(
                 state,
                 principal.token_id.clone(),
                 CoordinationInboxQuery {
-                    session: Some(session),
+                    session: Some(session.clone()),
                     after: args.after,
                     through: args.through,
                     limit: args.limit,
@@ -2641,7 +2641,33 @@ async fn call_inner(
                     })
                     .await;
                     match page {
-                        Ok(page) => structured(&shown(page, &principal.owner.id)),
+                        Ok(page) => {
+                            let steps = page
+                                .requests
+                                .iter()
+                                .filter(|request| {
+                                    !matches!(
+                                        request.status,
+                                        CoordinationStatus::Resolved
+                                            | CoordinationStatus::Withdrawn
+                                    )
+                                })
+                                .take(if principal.read_only { 0 } else { 3 })
+                                .flat_map(|request| {
+                                    coordination_steps(
+                                        request,
+                                        &session,
+                                        request.requester.token == principal.token_id
+                                            && request.requester.session == session,
+                                        None,
+                                        &request.released_paths,
+                                    )
+                                })
+                                .collect();
+                            let mut result = structured(&shown(page, &principal.owner.id));
+                            attach_coordination_steps(&mut result, steps);
+                            result
+                        }
                         Err(error) => work_failure(&error),
                     }
                 }
@@ -2721,7 +2747,23 @@ async fn call_inner(
             }
         };
         return Ok(match outcome {
-            Ok(request) => structured(&shown(request, &principal.owner.id)),
+            Ok(request) => {
+                let steps = native_session
+                    .map(|session| {
+                        coordination_steps(
+                            &request,
+                            session,
+                            request.requester.token == principal.token_id
+                                && request.requester.session == session,
+                            None,
+                            &request.released_paths,
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut result = structured(&shown(request, &principal.owner.id));
+                attach_coordination_steps(&mut result, steps);
+                result
+            }
             Err(HubError::Unauthorized) if name == "agentscm_coordination_reply" => refused_with(
                 "forbidden",
                 super::coordination_http::REPLY_ROLE_DENIED.into(),
@@ -4372,6 +4414,12 @@ async fn start(
     arguments: StartArgs,
     incarnation: Option<String>,
 ) -> Result<Value> {
+    let mut original_start = serde_json::to_value(&arguments)
+        .map_err(|_| HubError::Invalid("start arguments could not be rendered".into()))?;
+    original_start["detail"] = json!(match arguments.detail {
+        Detail::Compact => "compact",
+        Detail::Full => "full",
+    });
     let StartArgs {
         issue_choice,
         task,
@@ -4659,6 +4707,24 @@ async fn start(
             Ok(recovery)
         })
         .await;
+        let request = work.coordination_request.clone();
+        let preferred = work
+            .conflict
+            .as_ref()
+            .map(|conflict| {
+                conflict
+                    .overlaps
+                    .iter()
+                    .flat_map(|overlap| overlap.item.finished_paths.iter())
+                    .filter(|path| {
+                        request
+                            .as_ref()
+                            .is_some_and(|request| request.proposal.scope.contains(path))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut result = start_result(
             String::new(),
             briefing,
@@ -4668,6 +4734,18 @@ async fn start(
             &lead_live,
             detail,
         );
+        if let Some(request) = request {
+            attach_coordination_steps(
+                &mut result,
+                coordination_steps(
+                    &request,
+                    &request.requester.session,
+                    true,
+                    Some(&original_start),
+                    &preferred,
+                ),
+            );
+        }
         attach_recovery(&mut result, recovery, detail);
         return Ok(result);
     }
@@ -4978,10 +5056,10 @@ fn start_result(
     }
     text.push_str(&briefing_summary(&briefing));
     if let Some(context) = &work.context {
-        text.push_str(&format!("\nStartup recap: {} ongoing assignments, {} recent outcomes, {} overlaps in this bounded overview. Page them with agentscm_work_overview; coverage complete: current={}, recent={}, overlaps={}. Recent means Unix {} through {} and is independent of acknowledgement.",
+        text.push_str(&format!("\nStartup recap: {} ongoing assignments, {} recent outcomes, {} overlaps in this bounded overview. Page them with agentscm_work_overview; coverage complete: current={}, recent={}, overlaps={}. The recent window spans {} minutes and is independent of acknowledgement.",
             context.current.len(), context.recent.len(), context.overlaps.len(),
             context.current_complete, context.recent_complete, context.overlaps_complete,
-            context.recent_since, context.until));
+            (context.until - context.recent_since).max(0) / 60));
     }
     text.push('\n');
     text.push_str(&catchup_summary(catchup.as_ref()));
@@ -5012,7 +5090,7 @@ fn start_result(
             } else if request.requester.owner == target.lead.owner {
                 text.push_str(&format!("\nThe agent leading {} is your person's too, so the request is not raised in the AgentSCM Hub's Needs you: if it stays unanswered, ask your person in this session.", target.work_id));
             } else {
-                text.push_str(&format!("\nIf the agent leading {} has not acknowledged it by Unix {}, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, request.created_at + super::coordination::ACK_BOUND_SECS, super::advice::sanitize(&target.lead.login, 64)));
+                text.push_str(&format!("\nIf the agent leading {} has not acknowledged it within {} minutes of this request, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, super::coordination::ACK_BOUND_SECS / 60, super::advice::sanitize(&target.lead.login, 64)));
             }
         }
         text.push_str(
@@ -5049,9 +5127,9 @@ fn start_result(
             requested.extend(overlap.reasons.iter().map(|reason| &reason.your_path));
         }
         if hinted {
-            text.push_str(" Request those files alone with agentscm_start (the coordination request it queues reaches the holder) or propose an overlap agreement with agentscm_work_overlap_consent.");
+            text.push_str(" Request those files alone with agentscm_start; the target lead can propose an overlap agreement with agentscm_work_overlap_consent. See coordination_remedies for the calls and current-fence requirements.");
         } else if requested.len() >= 2 {
-            text.push_str("\nThe refusal covers several files: request a subset alone with agentscm_start (it queues a coordination request) or propose an overlap agreement with agentscm_work_overlap_consent.");
+            text.push_str("\nThe refusal covers several files: request a subset alone with agentscm_start or ask the target lead for an overlap agreement with agentscm_work_overlap_consent. See coordination_remedies for the calls.");
         }
     }
     if let Some(holders) = &work.holder_intents
@@ -5088,6 +5166,79 @@ fn start_result(
         "structuredContent": structured,
         "isError": claim_blocked
     })
+}
+
+/// Decision-time advice only. Calls still pass ordinary admission; no reply grants authority.
+/// Grant recipes omit facts not captured on a coordination request rather than inventing fences.
+fn coordination_steps(
+    request: &super::coordination::CoordinationRequest,
+    session: &str,
+    requester: bool,
+    original_start: Option<&Value>,
+    preferred: &[String],
+) -> Vec<Value> {
+    if matches!(
+        request.status,
+        CoordinationStatus::Resolved | CoordinationStatus::Withdrawn
+    ) {
+        return Vec::new();
+    }
+    let mut steps = Vec::new();
+    if requester {
+        let exact =
+            |path: &&String| super::intent::spec_key(path).is_ok_and(|key| !key.ends_with('/'));
+        let mut subset: Vec<_> = preferred.iter().filter(exact).take(5).cloned().collect();
+        if subset.is_empty() && request.proposal.scope.len() > 1 {
+            subset.extend(request.proposal.scope.iter().filter(exact).take(1).cloned());
+        }
+        // Existing Work cannot silently change scope through start; its lead must checkpoint it.
+        if !subset.is_empty()
+            && subset.len() < request.proposal.scope.len()
+            && request.proposal.work_id.is_none()
+        {
+            let mut arguments = original_start.cloned().unwrap_or_else(|| {
+                json!({
+                    "task": request.proposal.title, "source": request.proposal.source,
+                    "request_key": request.proposal.request_key, "session": session,
+                })
+            });
+            arguments["paths"] = json!(subset);
+            arguments["session"] = json!(session);
+            // Keep replies bounded; an unusually large original call needs a deliberate retry.
+            if arguments.to_string().len() <= 16_000 {
+                steps.push(json!({"kind":"request_subset", "instruction":"Request only these files; preserve any other original start options. This may still be refused and does not release the holder's files.",
+                    "call":{"tool":"agentscm_start","arguments":arguments}}));
+            }
+        }
+    }
+    let grants: Vec<_> = request.targets.iter().take(3).map(|target| {
+        let mut arguments = json!({"request_id":request.id,"expected_updated_seq":request.updated_seq,
+            "target_work_id":target.work_id,"target_generation":target.generation});
+        let paths: Vec<_> = request.proposal.scope.iter().filter(|path| super::intent::spec_key(path).is_ok_and(|key| !key.ends_with('/')))
+            .filter(|path| target.reasons.iter().any(|reason| &reason.your_path == *path))
+            .take(5).collect();
+        let mut supplies = vec!["target_updated_seq", "session", "operation_id"];
+        if paths.is_empty() { supplies.push("paths"); } else { arguments["paths"] = json!(paths); }
+        json!({"tool":"agentscm_work_overlap_consent", "arguments":arguments,
+            "caller_supplies":supplies,
+            "instruction":"Only the current target lead grants: read its current Work and request fences, use its own session, and choose exact named files (never a directory). Refresh changed fences before applying; unlisted paths remain contested."})
+    }).collect();
+    steps.push(json!({"kind":"propose_overlap", "instruction":"Ask the target lead for a compatible named-file agreement using the grant recipes. Read the consents, then explicitly accept current consent IDs with agentscm_work_overlap_start or agentscm_work_overlap_checkpoint. A grant or prose reply alone gives no edit authority.",
+        "call":{"tool":"agentscm_work_overlap_consents","arguments":{"request_id":request.id,"session":session}}, "target_lead_recipes":grants,
+        "target_lead_recipes_complete":request.targets.len() <= 3}));
+    steps.push(json!({"kind":"wait", "instruction":"Read receipts and replies before waiting. Missing replies do not promise lease expiry or permission to edit; page an incomplete inbox with its returned cursors.",
+        "call":{"tool":"agentscm_coordination_inbox","arguments":{"session":session,"limit":20,"wait_seconds":0}}}));
+    steps
+}
+
+fn attach_coordination_steps(result: &mut Value, steps: Vec<Value>) {
+    if steps.is_empty() {
+        return;
+    }
+    if let Some(content) = result["content"].as_array_mut() {
+        content.push(json!({"type":"text", "text":format!("Coordination remedies (advice, not edit authority): {}", json!(steps))}));
+    }
+    result["_meta"]["agentscm"]["coordination_remedies"] = json!(steps);
 }
 
 fn catchup_summary(page: Option<&CatchupPreview>) -> String {
