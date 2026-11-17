@@ -340,6 +340,19 @@ fn current(tx: &Transaction<'_>, who: &WorkWho, receipt: &NoticeReceipt, now: i6
             .transpose()
             .map(|value| value.unwrap_or(false));
     }
+    if receipt.source.kind == SourceKind::OwnerNotice {
+        let snapshot = tx
+            .query_row(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id IS ?5",
+                params![receipt.source.id, who.owner.id, who.owner.identity.provider, who.owner.identity.host, who.repository_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        return snapshot
+            .map(owner_notice_row)
+            .transpose()
+            .map(|notice| notice.is_some_and(|notice| notice.acknowledged_at.is_none()));
+    }
     Ok(true)
 }
 
@@ -1014,6 +1027,34 @@ impl SqliteStore {
             )?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         let page = refresh_items(&tx, &who, ids, query.limit, now)?;
+        let owner_notices = tx
+            .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4 AND json_extract(snapshot,'$.acknowledged_at') IS NULL ORDER BY id LIMIT 101")?
+            .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id], |row| row.get::<_,String>(0))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        if owner_notices.len() > 100 {
+            return Err(HubError::Unavailable(
+                "Owner notice refresh coverage exceeds its bound.".into(),
+            ));
+        }
+        for snapshot in owner_notices {
+            let notice = owner_notice_row(snapshot)?;
+            record(
+                &tx,
+                &who,
+                NoticeSource {
+                    kind: SourceKind::OwnerNotice,
+                    id: notice.id,
+                    version: notice.created_at.to_string(),
+                },
+                NoticeRecipient {
+                    token: token.into(),
+                    session: domain.clone(),
+                    work_id: None,
+                    generation: None,
+                },
+                now,
+            )?;
+        }
         tx.commit()?;
         Ok(page)
     }

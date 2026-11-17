@@ -320,6 +320,13 @@ fn current(
             .transpose()
             .map(|value| value.unwrap_or(false));
     }
+    if receipt.source.kind == SourceKind::OwnerNotice {
+        let row=tx.query_opt("SELECT snapshot FROM hub_owner_notices WHERE id=$1 AND recipient_owner=$2 AND provider=$3 AND host=$4 AND repository_id IS NOT DISTINCT FROM $5", &[&receipt.source.id,&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?;
+        return row
+            .map(|row| owner_notice_row(row.get(0)))
+            .transpose()
+            .map(|notice| notice.is_some_and(|notice| notice.acknowledged_at.is_none()));
+    }
     Ok(true)
 }
 
@@ -946,6 +953,12 @@ impl PgStore {
                 &[&token,&domain,&query.after.as_deref().unwrap_or(""),&((query.limit+1) as i64)])?
                 .iter().map(|row|row.get(0)).collect();
             let page=refresh_items(&mut tx,&who,ids,query.limit,now)?;
+            let rows=tx.query("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=$1 AND provider=$2 AND host=$3 AND repository_id IS NOT DISTINCT FROM $4 AND (snapshot::jsonb->>'acknowledged_at') IS NULL ORDER BY id LIMIT 101", &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?;
+            if rows.len()>100{return Err(HubError::Unavailable("Owner notice refresh coverage exceeds its bound.".into()));}
+            for row in rows {
+                let notice=owner_notice_row(row.get(0))?;
+                record(&mut tx,&who,NoticeSource{kind:SourceKind::OwnerNotice,id:notice.id,version:notice.created_at.to_string()},NoticeRecipient{token:token.into(),session:domain.clone(),work_id:None,generation:None},now)?;
+            }
             tx.commit()?;
             Ok(page)
         })
