@@ -2741,3 +2741,178 @@ async fn an_unnamed_start_bound_elsewhere_warns_and_its_fix_links_the_claim() {
         "{outside}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordination_http_reply_distinguishes_role_denial_from_bad_credentials() {
+    let hub = Hub::start().await;
+    let holder = hub.token(901, "holder", REPOSITORY, false).await;
+    let requester = hub.token(902, "requester", REPOSITORY, false).await;
+    let (_, held) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &holder,
+            Some(start(
+                "role-holder",
+                "Hold shared path",
+                "holder",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let work_id = &held["item"]["id"];
+    assert!(work_id.is_string(), "{held}");
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "role-requester",
+                "Request shared path",
+                "requester",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let request = &refused["coordination_request"];
+    assert!(request["id"].is_string(), "{refused}");
+    let mut reply = json!({"request_id":request["id"], "target_work_id":work_id,
+        "expected_updated_seq":request["updated_seq"], "operation_id":"role-reply",
+        "session":"requester", "kind":"propose_split", "note":"Split shared work"});
+    let path = "/v1/hub/standup/coordination/reply";
+    let (status, denied) = hub
+        .call(Method::POST, path, &requester, Some(reply.clone()))
+        .await;
+    assert_eq!(status, 403, "{denied}");
+    assert_eq!(denied["error"], "forbidden", "{denied}");
+    assert!(
+        denied["message"]
+            .as_str()
+            .unwrap()
+            .contains("current affected Work lead")
+    );
+    assert!(!denied.to_string().contains("hub login"));
+    let (status, invalid) = hub
+        .call(
+            Method::POST,
+            path,
+            "invalid-synthetic-token",
+            Some(reply.clone()),
+        )
+        .await;
+    assert_eq!(status, 401, "{invalid}");
+    assert_eq!(invalid["error"], "unauthorized", "{invalid}");
+    reply["session"] = json!("holder");
+    let (status, allowed) = hub.call(Method::POST, path, &holder, Some(reply)).await;
+    assert_eq!(status, 200, "{allowed}");
+    for (token, session) in [(&holder, "holder"), (&requester, "requester")] {
+        let (status, inbox) = hub
+            .call(
+                Method::GET,
+                &format!("/v1/hub/standup/inbox?session={session}"),
+                token,
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{inbox}");
+        assert!(
+            inbox["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == request["id"]
+                    && row["responses"][0]["operation_id"] == "role-reply"),
+            "{inbox}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordination_mcp_reply_distinguishes_role_denial_from_bad_credentials() {
+    let hub = Hub::start().await;
+    let holder = hub.token(901, "holder", REPOSITORY, false).await;
+    let requester = hub.token(902, "requester", REPOSITORY, false).await;
+    let (_, held) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &holder,
+            Some(start(
+                "role-holder",
+                "Hold shared path",
+                "holder",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let work_id = &held["item"]["id"];
+    assert!(work_id.is_string(), "{held}");
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "role-requester",
+                "Request shared path",
+                "requester",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let request = &refused["coordination_request"];
+    assert!(request["id"].is_string(), "{refused}");
+    let mut reply = json!({"request_id":request["id"], "target_work_id":work_id,
+        "expected_updated_seq":request["updated_seq"], "operation_id":"role-reply",
+        "session":"requester", "kind":"propose_split", "note":"Split shared work"});
+    let denied = hub
+        .mcp(&requester, "agentscm_coordination_reply", reply.clone())
+        .await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    let error = &denied["structuredContent"]["error"];
+    assert_eq!(error["code"], "forbidden", "{denied}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("current affected Work lead")
+    );
+    assert_eq!(error["recovery"]["action"], "ask_owner");
+    assert!(!denied.to_string().contains("hub login"));
+    let (status, invalid) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            "invalid-synthetic-token",
+            Some(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"agentscm_coordination_reply","arguments":reply}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 401, "{invalid}");
+    reply["session"] = json!("holder");
+    let allowed = hub.mcp(&holder, "agentscm_coordination_reply", reply).await;
+    assert_eq!(allowed["isError"], false, "{allowed}");
+    for (token, session) in [(&holder, "holder"), (&requester, "requester")] {
+        let read = hub
+            .mcp(
+                token,
+                "agentscm_coordination_inbox",
+                json!({"session":session}),
+            )
+            .await;
+        assert_eq!(read["isError"], false, "{read}");
+        let inbox = &read["structuredContent"];
+        assert!(
+            inbox["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == request["id"]
+                    && row["responses"][0]["operation_id"] == "role-reply"),
+            "{inbox}"
+        );
+    }
+}

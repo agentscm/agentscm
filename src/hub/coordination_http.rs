@@ -219,6 +219,8 @@ async fn ack(
     Ok(Json(result))
 }
 
+pub(super) const REPLY_ROLE_DENIED: &str = "Only the current affected Work lead can reply. As requester, read the coordination inbox for the lead's response, then resolve or withdraw your request when appropriate.";
+
 async fn reply(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
@@ -230,7 +232,11 @@ async fn reply(
             .coordination_reply(&principal.token_id, &request, unix_now())
             .map(|result| shown(result, &principal.owner.id))
     })
-    .await?;
+    .await
+    .map_err(|error| match error {
+        HubError::Unauthorized => ApiError::forbidden().with_message(REPLY_ROLE_DENIED),
+        other => other.into(),
+    })?;
     CHANGED.notify_waiters();
     Ok(Json(result))
 }
