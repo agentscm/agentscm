@@ -4,7 +4,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodeStatus, statusForWork, type ActionableStatus, type StatusState } from '../../src/actionableStatus.ts'
 import type { LiveProps } from '../../src/g/GLive.tsx'
-import { LiveChanges } from '../../src/g/LiveChanges.tsx'
+import { LiveChange, LiveChanges } from '../../src/g/LiveChanges.tsx'
 import type { WorkItem, WorkOverview } from '../../src/standup.ts'
 import type { Poll } from '../../src/usePoll.ts'
 
@@ -52,6 +52,25 @@ describe('shared Work status in G changes', () => {
       expect(container.querySelectorAll('.g-row')).toHaveLength(1)
       expect(container.querySelector('.px-status')?.textContent).toBe(label)
     }
+  })
+
+  it('labels cached shared states after a failed refresh in the change list', () => {
+    const w = item('one'), view = live([w], status([w]))
+    view.status = { kind: 'ready', value: status([w]), fetchedAt: 0, refreshError: 'offline', retry: () => {} }
+    const { container } = render(<LiveChanges live={view} />)
+    expect(screen.getByText('Showing the last shared status that loaded')).toBeTruthy()
+    expect(screen.getByText('Shared status could not refresh; these states may have changed.')).toBeTruthy()
+    expect(container.querySelector('.px-status')?.textContent).toBe('Active')
+  })
+
+  it('labels cached shared state after a failed refresh on the change detail', async () => {
+    const w = item('one'), view = live([w], status([w]))
+    view.status = { kind: 'ready', value: status([w]), fetchedAt: 0, refreshError: 'offline', retry: () => {} }
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => new Response(JSON.stringify(w), { status: String(input) === `/v1/hub/standup/work/${w.id}` ? 200 : 404 }))
+    const { container } = render(<LiveChange id={w.id} live={view} />)
+    expect(await screen.findByText('Showing the last shared status that loaded')).toBeTruthy()
+    expect(screen.getByText('Shared status could not refresh; this state may have changed.')).toBeTruthy()
+    expect(container.querySelector('.g-status-text > b')?.textContent).toBe('Active')
   })
 
   it('keeps unavailable, omitted and mismatched status unknown rather than using raw state', () => {

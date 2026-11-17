@@ -45,6 +45,7 @@ export function LiveChanges({ live }: { live: LiveProps }) {
   return (
     <>
       <PageHead question="Where is each change?" answer={ov ? <>{plural(all.length, 'unfinished change')}.<br /><span className="g-quiet">{active} active{unknown > 0 ? `; ${unknown} with unknown shared status` : ''}.</span></> : <>Reading the Hub…</>} />
+      {live.status?.kind === 'ready' && live.status.refreshError && <Notice title="Showing the last shared status that loaded">Shared status could not refresh; these states may have changed.</Notice>}
       {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-filters" role="group" aria-label="Show">
         {FILTERS.map((x) => <button key={x.id} type="button" aria-pressed={f === x.id} className={f === x.id ? 'on' : ''} onClick={() => setF(x.id)}>{x.label}{' '}<span>{all.filter((w) => x.id === 'all' || state(w) === x.id).length}</span></button>)}
@@ -117,6 +118,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
         </div>
       </header>
 
+      {live.status?.kind === 'ready' && live.status.refreshError && <Notice title="Showing the last shared status that loaded">Shared status could not refresh; this state may have changed.</Notice>}
       <section className={`g-status tone-${dotTone(tone)}`} aria-live="polite">
         <span className={`g-ring big tone-${dotTone(tone)}`}><Icon name={STEPS[at]?.icon ?? 'circle'} /></span>
         <div className="g-status-text"><b>{stateText(item, status)}</b><p>{why}</p>{item.next_action && <p className="small mb-0"><Icon name="arrow-right-short" /> Next: {item.next_action}</p>}</div>
