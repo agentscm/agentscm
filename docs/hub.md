@@ -1308,8 +1308,9 @@ separate. It copies each legacy row under the prefixes `conversation_sharing:rep
 when a legacy id matches no forge host or several, when the row's writer, or its person, is not a
 user on that host, or when the scoped key already holds a different value; it changes nothing in that
 case. To recover, stop the Hub and back up the database, find the offending rows in `hub_settings`
-under those prefixes, then either write the intended scoped key or archive or remove the legacy
-key, and restart. On SQLite the refusal appears as the raw error `CHECK constraint failed: Map
+under those prefixes, write the intended scoped key if the value should be kept, then archive
+(rename out of these prefixes) or delete each offending legacy key, and restart. Writing the scoped
+key alone does not clear a refusal. On SQLite the refusal appears as the raw error `CHECK constraint failed: Map
 legacy settings to one forge host before upgrading`.
 
 The `shared_conversations` migration changed during development: a dev or staging Hub that ran a
