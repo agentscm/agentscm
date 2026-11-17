@@ -2467,6 +2467,69 @@ fn requester_sees_reply_and_release(db: &Db) {
 
 parity_case!(requester_hold_state, requester_sees_reply_and_release);
 
+fn requester_reads_overlap_consents_through_a_session_alias(db: &Db) {
+    use agentscm::hub::work_overlap::WorkOverlapConsentRequest;
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    let target = store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(&requester, &start("requester", "default"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    store
+        .work_start(
+            &requester,
+            &start_scope("docs", "default", WorkRole::Lead, None, &["docs/**"]),
+            now + 1,
+        )
+        .unwrap();
+    // The first hook session after an unnamed start adopts it, so `native` stands for `default`.
+    store
+        .touch_session(
+            &requester,
+            &SessionCall {
+                session: Some("native".into()),
+                via: "hook:claude".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now + 2,
+        )
+        .unwrap();
+    let consent = WorkOverlapConsentRequest {
+        request_id: request.id.clone(),
+        target_work_id: target.id.clone(),
+        operation_id: "consent-1".into(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        target_generation: target.generation,
+        target_updated_seq: target.updated_seq,
+        paths: vec!["src/a.rs".into()],
+    };
+    let granted = store
+        .work_overlap_consent(&incumbent, &consent, now + 3)
+        .unwrap();
+    assert_eq!(
+        store
+            .work_overlap_consents(&requester, &request.id, "native", now + 4)
+            .unwrap(),
+        vec![granted]
+    );
+}
+
+parity_case!(
+    requester_consent_alias,
+    requester_reads_overlap_consents_through_a_session_alias
+);
+
 fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
     let store = db.open();
@@ -2561,10 +2624,13 @@ fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
             .unwrap(),
         vec![granted.clone()]
     );
-    assert!(matches!(
-        store.work_overlap_consents(&other, &request.id, "other", now + 4),
-        Err(HubError::Unauthorized)
-    ));
+    assert!(
+        matches!(
+            store.work_overlap_consents(&other, &request.id, "other", now + 4),
+            Err(HubError::Rejected(_))
+        ),
+        "a non-party gets a typed refusal"
+    );
     // Target consent by itself still grants no admission or reservation.
     assert!(
         !store

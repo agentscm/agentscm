@@ -85,7 +85,9 @@ fn authorize_read(
             return Ok(());
         }
     }
-    Err(HubError::Unauthorized)
+    Err(HubError::invalid_or_changed(
+        crate::hub::coordination::CONSENTS_NOT_PARTY.into(),
+    ))
 }
 
 impl SqliteStore {
@@ -205,6 +207,7 @@ impl SqliteStore {
         text("session", session, 255)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let session = &session_name(&tx, token, Some(session), now)?;
         let who = work_who(&tx, token, now)?;
         let request = coordination_request_at(&tx, &who, request_id, i64::MAX, now)?
             .ok_or_else(|| contract::invalid("unknown coordination request"))?;

@@ -90,7 +90,9 @@ fn authorize_read(
             return Ok(());
         }
     }
-    Err(HubError::Unauthorized)
+    Err(HubError::invalid_or_changed(
+        crate::hub::coordination::CONSENTS_NOT_PARTY.into(),
+    ))
 }
 
 impl PgStore {
@@ -198,6 +200,7 @@ impl PgStore {
         text("session", session, 255)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            let session = &session_name(&mut tx, token, Some(session), now)?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
             let request = coordination_request_at(&mut tx, &who, request_id, i64::MAX, now)?
