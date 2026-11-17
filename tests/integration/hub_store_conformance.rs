@@ -1262,6 +1262,35 @@ fn connections_and_repositories(db: &Db) {
         assert!(store.insert_connection(&bad, "x").is_err(), "{bad:?}");
     }
     assert_eq!(store.connection(&con.id).unwrap().unwrap(), con);
+    assert!(
+        store
+            .refresh_connection_app_slug(&con.id, 42, Some("agentscm-test"), "renamed-app")
+            .unwrap()
+    );
+    assert!(
+        store
+            .refresh_connection_app_slug(&con.id, 42, Some("agentscm-test"), "renamed-app")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .refresh_connection_app_slug(&con.id, 42, Some("agentscm-test"), "stale-response")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .refresh_connection_app_slug(&con.id, 43, Some("renamed-app"), "other-app")
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .connection(&con.id)
+            .unwrap()
+            .unwrap()
+            .app_slug
+            .as_deref(),
+        Some("renamed-app")
+    );
     assert_eq!(store.connection("con_unknown").unwrap(), None);
     assert_eq!(store.pat_connection("github.com").unwrap(), None);
     let token = store

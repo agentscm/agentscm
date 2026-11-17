@@ -342,6 +342,9 @@ pub struct FakeState {
     /// Valid manifest conversion codes; a conversion consumes one.
     pub manifest_codes: HashSet<String>,
     pub conversions: u32,
+    /// Override the authenticated App identity reported by GET /app.
+    pub app_id: Option<i64>,
+    pub app_slug: Option<String>,
     pub installations: Vec<Installation>,
     pub repos: BTreeMap<i64, Repo>,
     /// PAT to (login, id, readable repo ids).
@@ -401,6 +404,14 @@ pub struct FakeState {
 }
 
 impl FakeState {
+    fn app_slug(&self) -> &str {
+        self.app_slug.as_deref().unwrap_or(APP_SLUG)
+    }
+
+    fn app_bot_login(&self) -> String {
+        format!("{}[bot]", self.app_slug())
+    }
+
     /// Records a status as another account posted it (newest last, as the API would).
     pub fn push_status(&mut self, repo: i64, sha: &str, state: &str, context: &str, login: &str) {
         let status = json!({"state": state, "context": context, "description": "other"});
@@ -970,6 +981,7 @@ fn git_data(
             ) else {
                 return message(422, "Validation Failed: head invalid");
             };
+            let app_bot = state.app_bot_login();
             let repo = state.repos.get_mut(&id).unwrap();
             let number = repo.pulls.keys().max().copied().unwrap_or(0) + 1;
             let mut pull = Pull::new(number, head, &[]);
@@ -977,7 +989,7 @@ fn git_data(
             pull.body = body["body"].as_str().unwrap_or_default().to_owned();
             pull.base_ref = body["base"].as_str().unwrap_or("main").to_owned();
             pull.head_sha = head_sha;
-            pull.author_login = format!("{APP_SLUG}[bot]");
+            pull.author_login = app_bot;
             let created = pull_json(ctx, repo, &pull);
             repo.pulls.insert(number, pull);
             if std::mem::take(&mut state.lose_next_pull_reply) {
@@ -1077,6 +1089,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             return unauthorized();
         }
         return match (method, rest) {
+            (&Method::GET, []) => json_reply(
+                200,
+                json!({"id": state.app_id.unwrap_or(APP_ID), "slug": state.app_slug()}),
+            ),
             (&Method::GET, ["installations"]) => json_reply(
                 200,
                 state
@@ -1390,7 +1406,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         body: json_body()["body"].as_str().unwrap_or_default().to_string(),
                         author: match &who {
                             Who::Reader(login, ..) => login.clone(),
-                            Who::Installation(_) => format!("{APP_SLUG}[bot]"),
+                            Who::Installation(_) => state.app_bot_login(),
                         },
                         ..Comment::default()
                     };
@@ -1602,7 +1618,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     }
                     let creator = state.status_creator.clone().unwrap_or_else(|| match &who {
                         Who::Reader(login, ..) => login.clone(),
-                        Who::Installation(_) => format!("{APP_SLUG}[bot]"),
+                        Who::Installation(_) => state.app_bot_login(),
                     });
                     state
                         .repos

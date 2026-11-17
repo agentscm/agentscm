@@ -806,6 +806,12 @@ async fn refresh_connects_the_installations_repositories() {
                 .unwrap()
         };
         assert!(auth("/app/installations?").starts_with("Bearer ey"));
+        assert!(s.requests.iter().any(|r| {
+            r.path_and_query == "/app"
+                && r.auth
+                    .as_deref()
+                    .is_some_and(|auth| auth.starts_with("Bearer ey"))
+        }));
         assert!(auth("/installation/repositories").starts_with("Bearer ghs_"));
         assert!(auth("/repos/acme/widgets/pulls").starts_with("Bearer ghs_"));
         // One installation token served every read of the installation.
@@ -1796,6 +1802,43 @@ async fn failed_discovery_invalidates_previously_observed_catchup_coverage() {
             .unwrap()
             .contains(&json!("merge_coverage_unknown"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_refresh_rejects_invalid_identity_and_updates_the_connection_label() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    for app_id in [Some(fake_github::APP_ID + 1), Some(0), None] {
+        env.fake.with(|s| {
+            s.app_id = app_id;
+            s.app_slug = Some(
+                if app_id.is_some() {
+                    "renamed-app"
+                } else {
+                    "invalid slug"
+                }
+                .into(),
+            );
+        });
+        assert!(env.refresh(&connection).await.is_empty());
+        assert!(env.store.repositories(&connection).unwrap().is_empty());
+        assert_eq!(
+            env.store
+                .connection(&connection)
+                .unwrap()
+                .unwrap()
+                .app_slug
+                .as_deref(),
+            Some(fake_github::APP_SLUG)
+        );
+    }
+
+    env.fake.with(|s| s.app_slug = Some("renamed-app".into()));
+    assert_eq!(env.refresh(&connection).await.len(), 1);
+    let (status, listed) = env.get("/v1/hub/connections", Some(&env.admin)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["connections"][0]["label"], "GitHub App renamed-app");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
