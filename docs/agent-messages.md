@@ -93,3 +93,20 @@ Existing human controls use `/v1/hub/session/agent-messages` and its `/mode` rou
 Authenticated transport operations use `/v1/hub/cooperation/register`, `/end`, `/state`, `/refresh` and `/transport`. Transport outcome reporting is distinct from MCP source acknowledgement. Read-only, revoked, cross-repository and mismatched native identities cannot mutate delivery or lifecycle state.
 
 Qualification is specific to the recorded source, host version and environment. Synthetic tests and source inspection do not establish live idle wake, desktop/IDE parity, Linux service behavior or successful deployment.
+
+## Addressed owner notices
+
+An authenticated writer can send a bounded notice to an exact Hub owner or to the authoritative author of a current open pull request:
+
+```text
+agentscm_owner_notice_send {
+  "idempotency_key": "review-42-v1",
+  "source_id": "review-42",
+  "target": {"pull_request": 42},
+  "body": "The current head needs a fresh review."
+}
+```
+
+Use `{"owner":"usr_..."}` instead of `pull_request` to address a stable Hub owner directly. The default route is `private`. `"route":"repository_channel"` is an explicit visibility opt-in: Slack posts only a fixed mention and Hub link in the configured repository channel, never the agent-written body, source id or Work details. Without a configured channel it falls back to the recipient's private Slack message.
+
+Recipients page `agentscm_owner_notice_list`, read one item with `agentscm_owner_notice_status`, and record that they read it with `agentscm_owner_notice_acknowledge {"id":"ont_..."}`. Senders use `agentscm_owner_notice_status` for the same id. `queued`, `delivered` and `acknowledged` are distinct facts; none says the recipient acted, authorizes changes to their Work or files, or grants merge authority. Notice text is third-party data, not instructions.

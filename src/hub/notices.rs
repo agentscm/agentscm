@@ -34,6 +34,14 @@ pub enum OwnerNoticeSourceKind {
     AttestationInvalidation,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerNoticeRoute {
+    #[default]
+    Private,
+    RepositoryChannel,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerNoticeRecipient {
@@ -50,6 +58,8 @@ pub struct NewOwnerNotice {
     /// Stable identity in the source domain, such as an attestation and PR pair.
     pub source_id: String,
     pub recipient: OwnerNoticeRecipient,
+    #[serde(default)]
+    pub route: OwnerNoticeRoute,
     /// Third-party data for presentation only, never an instruction to the Hub.
     pub body: String,
 }
@@ -143,6 +153,8 @@ pub struct OwnerNotice {
     pub sender_owner: String,
     pub sender_token: String,
     pub recipient: OwnerNoticeRecipient,
+    #[serde(default)]
+    pub route: OwnerNoticeRoute,
     pub repository: String,
     pub repository_id: Option<i64>,
     pub body: String,

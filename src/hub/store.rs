@@ -712,6 +712,9 @@ pub trait Store: Send + Sync {
         limit: usize,
         now: i64,
     ) -> Result<OwnerNoticePage>;
+    /// Read one notice only as its sender or recipient. Unknown and unauthorized ids are
+    /// deliberately indistinguishable.
+    fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice>;
     /// Only the addressed owner may acknowledge or report action. Action implies acknowledgement,
     /// while neither state implies transport delivery.
     fn owner_notice_recipient_status(

@@ -484,6 +484,7 @@ fn owner_invalidation(f: &Fixture, number: i64) -> crate::hub::notices::OwnerNot
                     provider: "github".into(),
                     host: "github.com".into(),
                 },
+                route: crate::hub::notices::OwnerNoticeRoute::RepositoryChannel,
                 body: format!("Private detail for pull request #{number}."),
             },
             unix_now(),
@@ -561,6 +562,91 @@ async fn owner_invalidation_falls_back_to_one_direct_message_without_a_channel()
     assert_eq!(
         messages[0]["text"],
         "Local validation for pull request #43 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addressed_notice_uses_channel_only_by_opt_in_and_never_copies_its_text() {
+    let f = Fixture::configured_owner_channel(None, false, Some("CNOTICE")).await;
+    let notice = f
+        .store()
+        .owner_notice_put(
+            &f.bob,
+            &NewOwnerNotice {
+                idempotency_key: "addressed-channel-1".into(),
+                source_kind: OwnerNoticeSourceKind::Addressed,
+                source_id: "private-source-detail".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: f.owner(0),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::RepositoryChannel,
+                body: "Secret agent-written detail must stay on the Hub.".into(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"CNOTICE","ts":"789.012"})));
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [json!({
+            "channel":"CNOTICE",
+            "text":"<@U1> You have an AgentSCM repository notice. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "unfurl_links":false,
+            "unfurl_media":false
+        })]
+    );
+    let rendered = messages[0].to_string();
+    assert!(!rendered.contains(&notice.body));
+    assert!(!rendered.contains(&notice.source_id));
+
+    f.store()
+        .owner_notice_put(
+            &f.bob,
+            &NewOwnerNotice {
+                idempotency_key: "addressed-private-1".into(),
+                source_kind: OwnerNoticeSourceKind::Addressed,
+                source_id: "private-default".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: f.owner(0),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                body: "Another private detail.".into(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D1","ts":"789.013"})));
+    f.run().await;
+    let calls = f.calls.lock().unwrap();
+    let private = calls
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body)
+        .next_back()
+        .unwrap();
+    assert_eq!(private["channel"], "U1");
+    assert_eq!(
+        private["text"],
+        "You have a private AgentSCM notice. <https://hub.example.test/ui/#home|Open AgentSCM>"
     );
 }
 

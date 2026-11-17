@@ -47,6 +47,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
+        .merge(super::owner_notice_http::routes())
 }
 
 /// Run blocking store work off the async runtime, bounded process-wide: with

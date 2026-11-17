@@ -27,7 +27,8 @@ use tokio::sync::Semaphore;
 use super::advice::{agent_name, sanitize};
 use super::handoff::{Answered, Via};
 use super::notices::{
-    AttemptOutcome, OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeSourceKind,
+    AttemptOutcome, OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeRoute,
+    OwnerNoticeSourceKind,
 };
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
@@ -748,7 +749,8 @@ impl Slack {
                 if notice.delivery_proven() || !notice.delivery_eligible() {
                     continue;
                 }
-                let public = notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation;
+                let public = notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation
+                    || notice.route == OwnerNoticeRoute::RepositoryChannel;
                 let destination = if public {
                     binding
                         .config
@@ -765,7 +767,7 @@ impl Slack {
                     continue;
                 };
                 let link = self.link("home");
-                let text = if public {
+                let text = if notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation {
                     let number = notice
                         .source_id
                         .strip_prefix("pr:")
@@ -783,6 +785,11 @@ impl Slack {
                             number, link
                         )
                     }
+                } else if public {
+                    format!(
+                        "<@{}> You have an AgentSCM repository notice. <{}|Open AgentSCM>",
+                        binding.config.slack_user, link
+                    )
                 } else {
                     format!(
                         "You have a private AgentSCM notice. <{}|Open AgentSCM>",

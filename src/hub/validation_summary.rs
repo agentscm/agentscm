@@ -1284,6 +1284,7 @@ fn produce_invalidation_notices(
                 provider: identity.provider.clone(),
                 host: identity.host.clone(),
             },
+            route: super::notices::OwnerNoticeRoute::RepositoryChannel,
             body: format!(
                 "Pull request #{} has a current-head local-validation attestation invalidated by a {} change. Update from the base branch and submit a new attestation.",
                 pull.number,

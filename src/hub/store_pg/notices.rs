@@ -13,6 +13,7 @@ fn owner_notice_digest(notice: &NewOwnerNotice) -> Result<String> {
             notice.source_kind,
             &notice.source_id,
             &notice.recipient,
+            notice.route,
             &notice.body,
         ))?)
     ))
@@ -450,6 +451,7 @@ impl PgStore {
                 sender_owner: "hub".into(),
                 sender_token: "hub:validation".into(),
                 recipient: request.recipient.clone(),
+                route: request.route,
                 repository: repository.into(),
                 repository_id: Some(repository_id),
                 body: request.body.clone(),
@@ -541,6 +543,7 @@ impl PgStore {
                 sender_owner: who.owner.id.clone(),
                 sender_token: token.into(),
                 recipient: request.recipient.clone(),
+                route: request.route,
                 repository: who.repository,
                 repository_id: Some(repository_id),
                 body: request.body.clone(),
@@ -700,6 +703,22 @@ impl PgStore {
             let next_after = has_more.then(|| notices.last().expect("nonempty page").id.clone());
             tx.commit()?;
             Ok(OwnerNoticePage { notices, next_after })
+        })
+    }
+
+    pub(super) fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+            let row = tx.query_opt(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=$1 AND repository_id=$2 AND provider=$3 AND host=$4 AND (sender_owner=$5 OR recipient_owner=$5)",
+                &[&id, &repository_id, &who.owner.identity.provider, &who.owner.identity.host, &who.owner.id],
+            )?.ok_or(HubError::Unauthorized)?;
+            let notice = owner_notice_row(row.get(0))?;
+            tx.commit()?;
+            Ok(notice)
         })
     }
 

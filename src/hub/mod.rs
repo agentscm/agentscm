@@ -44,6 +44,7 @@ pub mod narrative;
 pub mod notices;
 pub mod onboarding;
 mod overlap_detail;
+pub mod owner_notice_http;
 mod permission_answer;
 pub mod pickup;
 #[cfg(unix)]

@@ -2005,6 +2005,7 @@ mod tests {
                     provider: "github".into(),
                     host: "github.com".into(),
                 },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
                 repository: principal.repository.clone(),
                 repository_id: principal.repository_id,
                 body: "Update from the base branch and submit a new attestation.".into(),

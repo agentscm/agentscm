@@ -8817,6 +8817,9 @@ impl Store for PgStore {
     ) -> Result<OwnerNoticePage> {
         PgStore::owner_notice_list(self, reader, after, limit, now)
     }
+    fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice> {
+        PgStore::owner_notice_get(self, token, id, now)
+    }
     fn owner_notice_recipient_status(
         &self,
         reader: &WorkLifecycleReader<'_>,

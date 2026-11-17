@@ -1493,11 +1493,24 @@ fn owner_mailbox_contract(database: &str) {
         source_kind: OwnerNoticeSourceKind::Addressed,
         source_id: "pr-42-note-1".into(),
         recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::Private,
         body: "PR #42 needs a fresh attestation.".into(),
     };
     let created = store
         .owner_notice_put(&sender_token, &request, now)
         .unwrap();
+    assert_eq!(
+        store
+            .owner_notice_get(&sender_token, &created.id, now)
+            .unwrap(),
+        created
+    );
+    assert!(
+        store
+            .owner_notice_get(&recipient_token, &created.id, now)
+            .is_ok(),
+        "the addressed recipient can read the exact notice"
+    );
     assert_eq!(
         store
             .owner_notice_put(&sender_token, &request, now + 1)
@@ -1544,6 +1557,22 @@ fn owner_mailbox_contract(database: &str) {
         repository: REPO,
         repository_id: REPO_ID,
     };
+    let (bystander_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &bystander.id,
+        "bystander-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    assert!(
+        store
+            .owner_notice_get(&bystander_token, &created.id, now)
+            .is_err(),
+        "an unrelated repository member cannot discover a notice by id"
+    );
     assert!(
         store
             .owner_notice_recipient_status(
@@ -1602,6 +1631,7 @@ fn owner_mailbox_contract(database: &str) {
         source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
         source_id: "pr:42:local-validation:policy:evidence:policy-v2".into(),
         recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::RepositoryChannel,
         body: "PR #42 has an attestation invalidated by a policy change.".into(),
     };
     let automatic_created = store
@@ -1655,6 +1685,7 @@ fn owner_mailbox_contract(database: &str) {
         source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
         source_id: "pr:43:local-validation:policy:evidence:policy-v2".into(),
         recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::RepositoryChannel,
         body: "PR #43 has an attestation invalidated by a policy change.".into(),
     };
     let retryable = store
@@ -1709,6 +1740,7 @@ fn owner_mailbox_contract(database: &str) {
                     source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
                     source_id: format!("pr-{}-digest-v2", 100 + index),
                     recipient: recipient_address.clone(),
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
                     body: format!("PR #{} has an obsolete attestation.", 100 + index),
                 },
                 now + 5,
@@ -1736,6 +1768,7 @@ fn owner_mailbox_contract(database: &str) {
                     source_kind: OwnerNoticeSourceKind::Addressed,
                     source_id: "pr-999-note".into(),
                     recipient: recipient_address,
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
                     body: "This send exceeds the bounded recipient window.".into(),
                 },
                 now + 5,
