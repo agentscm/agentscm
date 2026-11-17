@@ -329,7 +329,11 @@ fn own_command(value: &Value) -> bool {
         }
         if matches!(
             args,
-            "hook-wait copilot --notification" | "hook-wait copilot --end"
+            "hook-wait copilot --notification"
+                | "hook-wait copilot --end"
+                | "feedback start --client cursor"
+                | "feedback start --client copilot"
+                | "feedback start --client gemini"
         ) {
             return true;
         }
@@ -408,6 +412,7 @@ pub(crate) fn agentscm_hook(value: &Value) -> bool {
                 words
                     .iter()
                     .any(|word| matches!(*word, "hook" | "hook-wait"))
+                    || words.windows(2).any(|pair| pair == ["feedback", "start"])
                     || words
                         .windows(2)
                         .any(|pair| pair == ["change-capture", "hook-claude"])
@@ -491,6 +496,11 @@ const COPILOT_EVENTS: [(&str, u64); 9] = [
 
 fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Value>)>> {
     let command = command(agent, program)?;
+    let feedback = format!(
+        "{} --no-telemetry feedback start --client {}",
+        shell_quote(program_text(program)?),
+        agent.name()
+    );
     let nested = |timeout, name: Option<&str>| {
         let mut hook = json!({"type":"command", "command":command, "timeout":timeout});
         if let Some(name) = name {
@@ -527,7 +537,10 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
         Agent::Cursor => {
             let hook = |timeout| json!({"command":command,"timeout":timeout});
             vec![
-                ("sessionStart", vec![hook(5)]),
+                (
+                    "sessionStart",
+                    vec![hook(5), json!({"command":feedback,"timeout":3})],
+                ),
                 ("beforeSubmitPrompt", vec![hook(3)]),
                 ("preToolUse", vec![hook(5)]),
                 ("postToolUse", vec![hook(5)]),
@@ -551,6 +564,8 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
                     hooks.push(json!({"type":"command","command":format!("{wait} --notification"),"timeoutSec":crate::message_wait::MAX_LIFE.as_secs() + 300}));
                 } else if event == "sessionEnd" {
                     hooks.push(json!({"type":"command","command":format!("{wait} --end"),"timeoutSec":5}));
+                } else if event == "sessionStart" {
+                    hooks.push(json!({"type":"command","command":feedback,"timeoutSec":3}));
                 }
                 (event, hooks)
             }).collect()
@@ -559,7 +574,11 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             vec![
                 (
                     "SessionStart",
-                    vec![nested(5000, Some("AgentSCM session start"))],
+                    vec![
+                        nested(5000, Some("AgentSCM session start")),
+                        json!({"hooks":[{"type":"command","command":feedback,"timeout":3000,
+                            "name":"AgentSCM optional feedback"}]}),
+                    ],
                 ),
                 (
                     "BeforeTool",
@@ -2430,6 +2449,52 @@ mod tests {
                 "SessionEnd"
             ]
         );
+    }
+
+    #[test]
+    fn feedback_native_hooks_upgrade_once_and_remove_without_foreign_entries() {
+        let program = Path::new("/opt/agent's tools/agentscm");
+        for agent in [Agent::Cursor, Agent::Copilot, Agent::Gemini] {
+            let helper = json!({"command":"python3 /opt/feedback.py"});
+            let mut value = json!({"hooks":{"other":[helper.clone()]}});
+            add_hooks(&mut value, agent, program).unwrap();
+            let once = value.clone();
+            add_hooks(&mut value, agent, program).unwrap();
+            assert_eq!(value, once);
+            let text = value.to_string();
+            assert_eq!(text.matches(" feedback start --client ").count(), 1);
+            for (event, groups) in hook_groups(agent, program).unwrap() {
+                for group in groups {
+                    let hooks = group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or(vec![group]);
+                    for mut hook in hooks {
+                        if hook["command"].as_str().unwrap().contains(" feedback ") {
+                            assert_eq!(
+                                event,
+                                if agent == Agent::Gemini {
+                                    "SessionStart"
+                                } else {
+                                    "sessionStart"
+                                }
+                            );
+                            assert!(own_command(&hook));
+                            hook["command"] = json!(format!(
+                                "{} --unexpected",
+                                hook["command"].as_str().unwrap()
+                            ));
+                            assert!(!own_command(&hook));
+                            assert!(agentscm_hook(&hook));
+                        }
+                    }
+                }
+            }
+            let kept = without_ours(&text, &json!([]), FORM).unwrap();
+            assert_eq!(kept["hooks"]["other"], json!([helper]));
+            assert!(!kept.to_string().contains(" feedback start --client "));
+        }
     }
 
     #[test]
