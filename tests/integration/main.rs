@@ -57,6 +57,8 @@ mod cli;
 #[cfg(unix)]
 mod client_completion;
 #[cfg(unix)]
+mod client_feedback;
+#[cfg(unix)]
 mod client_replies;
 #[cfg(unix)]
 mod client_status;

@@ -47,7 +47,11 @@ class NativeFeedback(unittest.TestCase):
         self.home = Path(temp.name)
         self.root = self.home / "checkout's space"
         self.root.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        config = self.home / ".config/agentscm"
+        self.env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
+                    "XDG_CONFIG_HOME": str(config.parent), "GIT_CONFIG_NOSYSTEM": "1",
+                    "NO_PROXY": "127.0.0.1", "AGENTSCM_TELEMETRY": "off"}
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True, env=self.env, cwd=self.root)
         self.hub = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.hub.daemon_threads = True
         self.hub.enabled, self.hub.delay, self.hub.seen = True, 0, []
@@ -57,13 +61,10 @@ class NativeFeedback(unittest.TestCase):
         token = self.home / "token"
         token.write_text("synthetic-token")
         token.chmod(0o600)
-        config = self.home / ".config/agentscm"
         config.mkdir(parents=True)
         (config / "connections.json").write_text(json.dumps({"connections": [{
             "root": str(self.root), "hub": f"http://127.0.0.1:{self.hub.server_port}",
             "token_file": str(token)}]}))
-        self.env = {**os.environ, "HOME": str(self.home), "XDG_CONFIG_HOME": str(config.parent),
-                    "AGENTSCM_TELEMETRY": "off"}
 
     def invoke(self, args, body, **env):
         result = subprocess.run([BINARY, "--no-telemetry", "feedback", *args],
@@ -72,19 +73,22 @@ class NativeFeedback(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         return result.stdout
 
-    def event(self, client):
+    def event(self, client, vscode=False):
         value = {"hook_event_name": "SessionStart", "source": "startup",
                  "cwd": str(self.root), "session_id": "native-parent"}
         if client == "cursor":
-            value["hook_event_name"] = "sessionStart"
-        if client == "copilot":
-            value = {"source": "new", "cwd": str(self.root), "sessionId": "native-parent"}
+            value = {"hook_event_name": "sessionStart", "workspace_roots": [str(self.root)],
+                     "conversation_id": "native-parent"}
+        elif client == "copilot":
+            value = ({**value, "source": "new"} if vscode else
+                     {"source": "new", "cwd": str(self.root), "sessionId": "native-parent"})
         return value
 
     def test_five_native_clients_offer_the_same_bounded_report_protocol(self):
-        for client in ("claude", "codex", "cursor", "copilot", "gemini"):
-            with self.subTest(client=client):
-                raw = self.invoke(["start", "--client", client], self.event(client))
+        cases = [(client, False) for client in ("claude", "codex", "cursor", "copilot", "gemini")]
+        for client, vscode in [*cases, ("copilot", True)]:
+            with self.subTest(client=client, vscode=vscode):
+                raw = self.invoke(["start", "--client", client], self.event(client, vscode))
                 reply = json.loads(raw)
                 text = (reply["additional_context"] if client == "cursor" else
                         reply["additionalContext"] if client == "copilot" else
@@ -98,9 +102,10 @@ class NativeFeedback(unittest.TestCase):
                 result = subprocess.run(argv,
                     input=json.dumps({"surface": "completion", "friction": "none", "impact": "none",
                                       "experience": "as_expected", "observation": None, "idea": None}),
-                    text=True, capture_output=True, env=self.env, timeout=10)
+                    text=True, capture_output=True, env=self.env, cwd=self.root, timeout=10)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-                payload = self.hub.seen[-1][1]
+                path, payload = self.hub.seen[-1]
+                self.assertEqual(path, "/api/v1/agent-feedback")
                 self.assertEqual((payload["version"], payload["client"], payload["generation"]), (3, client, 7))
                 self.assertEqual(payload["session"], "native-parent")
 
@@ -127,6 +132,7 @@ class NativeFeedback(unittest.TestCase):
         start = time.monotonic()
         self.assertEqual(self.invoke(["start", "--client", "claude"], self.event("claude")), "")
         self.assertLess(time.monotonic() - start, 3.5)
+        self.assertEqual(self.hub.seen, [("/api/v1/agent-feedback/eligibility", None)])
 
 
 if __name__ == "__main__":
