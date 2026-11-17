@@ -662,6 +662,29 @@ async fn first_run_writes_a_one_time_setup_link_that_creates_the_app() {
     let (status, page) = env.raw(Method::GET, &setup, None, None).await;
     assert_eq!(status, 200);
     assert!(page.contains("agentscm-hub"), "{page}");
+    for (query, owner) in [
+        ("suggested_owner=origin-org", Some("origin-org")),
+        (
+            "suggested_owner=origin-org&owner=chosen-org",
+            Some("chosen-org"),
+        ),
+        ("suggested_owner=origin-org&owner=", None),
+        ("suggested_owner=invalid%2Fowner", None),
+    ] {
+        let (status, page) = env
+            .raw(Method::GET, &format!("{setup}?{query}"), None, None)
+            .await;
+        assert_eq!(status, 200);
+        if let Some(owner) = owner {
+            assert!(
+                page.contains(&format!("/organizations/{owner}/settings/apps/new?state=")),
+                "{page}"
+            );
+        } else {
+            assert!(page.contains("your personal GitHub account"), "{page}");
+            assert!(!page.contains("/organizations/"), "{page}");
+        }
+    }
     let callback = format!("/v1/hub/github/setup/callback?code=code-1&state={secret}");
     let (status, done) = env.raw(Method::GET, &callback, None, None).await;
     assert_eq!(status, 200, "{done}");
@@ -723,7 +746,10 @@ async fn first_run_link_only_without_users_connections_or_github_sign_in() {
     let (_, page) = env
         .raw(
             Method::GET,
-            &format!("/v1/hub/github/setup/{}", link.rsplit('/').next().unwrap()),
+            &format!(
+                "/v1/hub/github/setup/{}?suggested_owner=origin-org",
+                link.rsplit('/').next().unwrap()
+            ),
             None,
             None,
         )
@@ -806,6 +832,12 @@ async fn refresh_connects_the_installations_repositories() {
                 .unwrap()
         };
         assert!(auth("/app/installations?").starts_with("Bearer ey"));
+        assert!(s.requests.iter().any(|r| {
+            r.path_and_query == "/app"
+                && r.auth
+                    .as_deref()
+                    .is_some_and(|auth| auth.starts_with("Bearer ey"))
+        }));
         assert!(auth("/installation/repositories").starts_with("Bearer ghs_"));
         assert!(auth("/repos/acme/widgets/pulls").starts_with("Bearer ghs_"));
         // One installation token served every read of the installation.
@@ -1796,6 +1828,43 @@ async fn failed_discovery_invalidates_previously_observed_catchup_coverage() {
             .unwrap()
             .contains(&json!("merge_coverage_unknown"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_refresh_rejects_invalid_identity_and_updates_the_connection_label() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    for app_id in [Some(fake_github::APP_ID + 1), Some(0), None] {
+        env.fake.with(|s| {
+            s.app_id = app_id;
+            s.app_slug = Some(
+                if app_id.is_some() {
+                    "renamed-app"
+                } else {
+                    "invalid slug"
+                }
+                .into(),
+            );
+        });
+        assert!(env.refresh(&connection).await.is_empty());
+        assert!(env.store.repositories(&connection).unwrap().is_empty());
+        assert_eq!(
+            env.store
+                .connection(&connection)
+                .unwrap()
+                .unwrap()
+                .app_slug
+                .as_deref(),
+            Some(fake_github::APP_SLUG)
+        );
+    }
+
+    env.fake.with(|s| s.app_slug = Some("renamed-app".into()));
+    assert_eq!(env.refresh(&connection).await.len(), 1);
+    let (status, listed) = env.get("/v1/hub/connections", Some(&env.admin)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["connections"][0]["label"], "GitHub App renamed-app");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

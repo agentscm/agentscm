@@ -10804,6 +10804,29 @@ impl Store for PgStore {
         })
     }
 
+    fn refresh_connection_app_slug(
+        &self,
+        id: &str,
+        app_id: i64,
+        previous: Option<&str>,
+        slug: &str,
+    ) -> Result<bool> {
+        self.run(false, |client| {
+            let changed = client.execute(
+                "UPDATE hub_connections SET app_slug = $4
+                 WHERE id = $1 AND kind = 'app' AND app_id = $2
+                    AND app_slug IS NOT DISTINCT FROM $3 AND app_slug IS DISTINCT FROM $4",
+                &[&id, &app_id, &previous, &slug],
+            )?;
+            Ok(changed > 0
+                || connection_by_id(client, id)?.is_some_and(|current| {
+                    current.kind == "app"
+                        && current.app_id == Some(app_id)
+                        && current.app_slug.as_deref() == Some(slug)
+                }))
+        })
+    }
+
     fn set_connection_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<()> {
         validate_status(status, detail)?;
         self.run(false, |client| {

@@ -848,6 +848,14 @@ pub trait Store: Send + Sync {
     fn connection(&self, id: &str) -> Result<Option<Connection>>;
     /// The `pat` connection for `host`, if any.
     fn pat_connection(&self, host: &str) -> Result<Option<Connection>>;
+    /// Update an App slug from a verified read. True also covers an identical concurrent update.
+    fn refresh_connection_app_slug(
+        &self,
+        id: &str,
+        app_id: i64,
+        previous: Option<&str>,
+        slug: &str,
+    ) -> Result<bool>;
     /// `enabled` or `auth_failed`; an event only when status or detail changes.
     fn set_connection_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<()>;
     /// An event only when the flag changes; unknown connection is `Invalid`.

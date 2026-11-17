@@ -78,6 +78,24 @@ impl Fixture {
         exemptions: [Option<Vec<String>>; 2],
         changed_path: Option<&str>,
     ) -> Self {
+        Self::build(
+            key_expiry,
+            max_age_seconds,
+            revoked_at_ms,
+            exemptions,
+            changed_path,
+            false,
+        )
+        .await
+    }
+    async fn build(
+        key_expiry: u64,
+        max_age_seconds: u64,
+        revoked_at_ms: Option<u64>,
+        exemptions: [Option<Vec<String>>; 2],
+        changed_path: Option<&str>,
+        app: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -190,6 +208,13 @@ impl Fixture {
                 ("publisher".into(), 7, [42].into()),
             );
             s.pushers.insert("synthetic-token".into(), [42].into());
+            if app {
+                s.installations.push(fake::Installation {
+                    id: 99,
+                    account: "acme".into(),
+                    repos: vec![42],
+                });
+            }
         });
         let store = store::open(&format!(
             "sqlite://{}",
@@ -212,10 +237,10 @@ impl Fixture {
                     id: store::new_connection_id().unwrap(),
                     provider: "github".into(),
                     host: "github.com".into(),
-                    kind: "pat".into(),
-                    app_id: None,
-                    app_slug: None,
-                    acts_as: Some("publisher".into()),
+                    kind: if app { "app" } else { "pat" }.into(),
+                    app_id: app.then_some(fake::APP_ID),
+                    app_slug: app.then(|| fake::APP_SLUG.into()),
+                    acts_as: (!app).then(|| "publisher".into()),
                 },
                 &owner.id,
             )
@@ -240,9 +265,35 @@ impl Fixture {
             false,
         )
         .unwrap();
+        let secrets = root.path().join("secrets");
+        if app {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            crate::hub::sync::prepare_secrets_dir(&secrets, true).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .mode(0o600)
+                .write(true)
+                .create_new(true)
+                .open(secrets.join(format!("{}.json", conn.id)))
+                .unwrap();
+            write!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "app_id": fake::APP_ID,
+                    "slug": fake::APP_SLUG,
+                    "client_id": "synthetic",
+                    "client_secret": fake::CLIENT_SECRET,
+                    "webhook_secret": fake::WEBHOOK_SECRET,
+                    "pem": fake::private_pem(),
+                })
+            )
+            .unwrap();
+        }
         let config = crate::hub::sync::SyncConfig::from_lookup(
             "http://127.0.0.1:7332",
-            root.path().join("secrets"),
+            secrets,
             30,
             |name| match name {
                 "AGENTSCM_GITHUB_API_URL" => Some(forge.base.clone()),
@@ -255,6 +306,9 @@ impl Fixture {
             Arc::new(LocalBackend::open(root.path().join("objects")).unwrap()),
         )
         .with_sync(crate::hub::sync::Sync::new(config).unwrap());
+        if app {
+            crate::hub::sync::start(&hub).await.unwrap();
+        }
         Self {
             root,
             hub,
@@ -946,29 +1000,47 @@ async fn expiry_after_preparation_or_success_invalidates_and_releases() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn app_identity_owns_and_updates_one_summary() {
-    let mut f = Fixture::new().await;
-    f.conn.kind = "app".into();
-    f.conn.app_slug = Some(fake::APP_SLUG.into());
-    f.forge.with(|s| {
-        s.installations.push(fake::Installation {
-            id: 99,
-            account: "acme".into(),
-            repos: vec![42],
-        });
-        s.installation_tokens.insert("synthetic-token".into(), 99);
+async fn app_rename_updates_the_existing_validation_summary_on_poll() {
+    let f = Fixture::build(
+        i64::MAX as u64,
+        3600,
+        None,
+        [None, None],
+        Some("change"),
+        true,
+    )
+    .await;
+    let now = Fixture::now();
+    f.submit(0, now, false);
+    assert_eq!(crate::hub::sync::poll_once(&f.hub).await.unwrap().len(), 1);
+    let id = f.journal().comment_id.unwrap();
+    let original = f.forge.with(|s| {
+        let comment = &mut s.repos.get_mut(&42).unwrap().comments.get_mut(&1).unwrap()[0];
+        assert_eq!(comment.author, format!("{}[bot]", fake::APP_SLUG));
+        comment.author = "renamed-app[bot]".into();
+        s.app_slug = Some("renamed-app".into());
+        comment.body.clone()
     });
-    f.submit(0, Fixture::now(), false);
-    f.run().await.unwrap();
-    let id = f.journal().comment_id;
-    f.submit(1, Fixture::now(), false);
-    f.run().await.unwrap();
-    assert_eq!(f.journal().comment_id, id);
-    assert_eq!(f.counts().0, 1);
+    f.submit(1, now + 1, false);
+    assert_eq!(crate::hub::sync::poll_once(&f.hub).await.unwrap().len(), 1);
+    assert_eq!(f.journal().comment_id, Some(id));
+    let stored = f.hub.store.connection(&f.conn.id).unwrap().unwrap();
+    assert_eq!(stored.app_slug.as_deref(), Some("renamed-app"));
     f.forge.with(|s| {
-        assert_eq!(
-            s.repos[&42].comments[&1][0].author,
-            format!("{}[bot]", fake::APP_SLUG)
+        let repo = &s.repos[&42];
+        assert_eq!(repo.comments[&1].len(), 1);
+        assert_ne!(repo.comments[&1][0].body, original);
+        assert_eq!(repo.comments[&1][0].author, "renamed-app[bot]");
+        assert!(s.requests.iter().any(|request| {
+            request.method == "PATCH"
+                && request.path_and_query == format!("/repos/acme/widgets/issues/comments/{id}")
+        }));
+        assert!(
+            repo.statuses
+                .iter()
+                .rev()
+                .take(2)
+                .all(|(_, status)| status["state"] == "success")
         )
     });
 }
