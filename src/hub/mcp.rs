@@ -1050,8 +1050,8 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
     let coordination_mutations = json!([
         {"name":"agentscm_coordination_ack", "description":"Acknowledge that this session received a specific coordination request version. This is a receipt, not agreement or resolution. Omit target_work_id to acknowledge a response as the requester.",
          "inputSchema":schema(json!({"session":session,"request_id":{"type":"string"},"target_work_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1}}), &["session","request_id","expected_updated_seq"])},
-        {"name":"agentscm_coordination_reply", "description":"As the current affected lead, report a proposed split, join, handover or decline with a brief explanation. A reply does not itself change scope or resolve the request; make the agreed work change separately.",
-         "inputSchema":schema(json!({"session":session,"request_id":{"type":"string"},"operation_id":{"type":"string"},"target_work_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"kind":{"type":"string","enum":["propose_split","join","handover","decline"]},"note":{"type":"string","maxLength":500}}), &["session","request_id","operation_id","target_work_id","expected_updated_seq","kind"])},
+        {"name":"agentscm_coordination_reply", "description":"As the current affected lead, report a proposed split, join, handover or decline with a brief explanation. A reply does not resolve the request. release_paths frees those requested files from your Work; otherwise change scope separately.",
+         "inputSchema":schema(json!({"session":session,"request_id":{"type":"string"},"operation_id":{"type":"string"},"target_work_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"kind":{"type":"string","enum":["propose_split","join","handover","decline"]},"note":{"type":"string","maxLength":500},"release_paths":{"type":"array","items":{"type":"string"}}}), &["session","request_id","operation_id","target_work_id","expected_updated_seq","kind"])},
         {"name":"agentscm_coordination_resolve", "description":"Confirm resolution after the actual declared scopes or participation changed. The engine rejects resolution while an uncoordinated overlap remains.",
          "inputSchema":schema(json!({"session":session,"request_id":{"type":"string"},"operation_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1}}), &["session","request_id","operation_id","expected_updated_seq"])},
         {"name":"agentscm_coordination_withdraw", "description":"Explicitly withdraw your proposed work. A current affected lead may also withdraw an abandoned request only after its requester token is revoked or expired, or its owner is disabled. This is audited and does not release any assignment.",
@@ -2068,6 +2068,7 @@ async fn call(
                         notice["replies"] = json!(request.responses.iter().take(3).map(|reply| json!({
                             "kind":reply.kind,
                             "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
+                            "released_paths":(!reply.released_paths.is_empty()).then_some(&reply.released_paths),
                             "responder_agent":reply.responder.agent})).collect::<Vec<_>>());
                         notice["requested_paths"] = json!(request.requested_paths);
                     }

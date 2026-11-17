@@ -93,6 +93,47 @@ impl Db {
         }
     }
 
+    /// Runs a query and returns every column as text, with NULL as the empty string.
+    fn rows(&self, sql: &str) -> Vec<Vec<String>> {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .simple_query(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| match message {
+                    postgres::SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).unwrap_or("").to_owned())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let mut statement = connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            Ok(match row.get::<_, rusqlite::types::Value>(index)? {
+                                rusqlite::types::Value::Null => String::new(),
+                                rusqlite::types::Value::Integer(value) => value.to_string(),
+                                rusqlite::types::Value::Text(value) => value,
+                                other => format!("{other:?}"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+    }
+
     fn expire_token(&self, token: &str) {
         if self._pg.is_some() {
             postgres::Client::connect(&self.url, postgres::NoTls)
@@ -295,6 +336,7 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
     let replayed_ack = store.coordination_ack(&incumbent, &ack, now + 5).unwrap();
     assert_eq!(replayed_ack.updated_seq, acknowledged.updated_seq);
     let reply = CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: "reply-operation".into(),
         target_work_id: request.targets[0].work_id.clone(),
@@ -652,6 +694,7 @@ fn response_projection_does_not_change_status(db: &Db) {
         .coordination_reply(
             &second_lead,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "second-only-reply".into(),
                 target_work_id: second_target.work_id.clone(),
@@ -669,6 +712,7 @@ fn response_projection_does_not_change_status(db: &Db) {
             .coordination_reply(
                 &first_lead,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: request.id.clone(),
                     operation_id: format!("first-repeat-{index}"),
                     target_work_id: first_target.work_id.clone(),
@@ -1415,6 +1459,7 @@ fn a_person_reply_through_the_hub_is_marked_and_delivered(db: &Db) {
         .unwrap();
     let target = request.targets[0].work_id.clone();
     let reply = |operation: &str, seq: i64, via_hub: bool| CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: operation.into(),
         target_work_id: target.clone(),
@@ -1754,6 +1799,7 @@ fn join_reply_outside_the_holders_scope_is_refused(db: &Db) {
         .coordination_request
         .unwrap();
     let reply = |kind, operation_id: &str| CoordinationReply {
+        release_paths: Vec::new(),
         request_id: request.id.clone(),
         operation_id: operation_id.into(),
         target_work_id: request.targets[0].work_id.clone(),
@@ -2011,6 +2057,7 @@ fn responded_request_does_not_block_checkpoint_once_unheld(db: &Db) {
         .coordination_reply(
             &b,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline".into(),
                 target_work_id: target.id.clone(),
@@ -2261,6 +2308,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         .collect::<Vec<_>>();
     let responses = (0..128)
         .map(|index| CoordinationResponse {
+            released_paths: Vec::new(),
             id: format!("crp_{index:032x}"),
             operation_id: format!("op_{index:032x}"),
             target_work_id: format!("wrk_{:032x}", index % 100),
@@ -2398,6 +2446,7 @@ fn requester_sees_reply_and_release(db: &Db) {
         .coordination_reply(
             &holder,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline-operation".into(),
                 target_work_id: request.targets[0].work_id.clone(),
@@ -2907,6 +2956,7 @@ fn named_overlap_consent_lapses_and_decline_revokes(db: &Db) {
         .coordination_reply(
             &incumbent,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "decline".into(),
                 target_work_id: target.id.clone(),
@@ -3844,4 +3894,185 @@ fn pending_requester_lifecycle_requires_fresh_consent(db: &Db) {
 parity_case!(
     pending_requester_lifecycle,
     pending_requester_lifecycle_requires_fresh_consent
+);
+
+const FILES: [&str; 4] = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"];
+
+fn holder_and_request(
+    store: &dyn Store,
+    holder_scope: &[&str],
+    requested: &[&str],
+) -> (String, String, String, CoordinationRequest, i64) {
+    let holder = token(store, 31, "holder");
+    let requester = token(store, 32, "requester");
+    let now = unix_now();
+    let work = store
+        .work_start(
+            &holder,
+            &start_scope("held", "lead", WorkRole::Lead, None, holder_scope),
+            now,
+        )
+        .unwrap()
+        .item;
+    let request = store
+        .work_start(
+            &requester,
+            &start_scope("asked", "asker", WorkRole::Lead, None, requested),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    (holder, requester, work.id, request, now)
+}
+
+fn release_reply(
+    request: &CoordinationRequest,
+    kind: CoordinationResponseKind,
+    paths: &[&str],
+) -> CoordinationReply {
+    CoordinationReply {
+        release_paths: paths.iter().map(|path| (*path).into()).collect(),
+        request_id: request.id.clone(),
+        operation_id: "grant".into(),
+        target_work_id: request.targets[0].work_id.clone(),
+        session: "lead".into(),
+        expected_updated_seq: request.updated_seq,
+        kind,
+        note: Some("take a".into()),
+        via: agentscm::hub::handoff::Via::Agent,
+    }
+}
+
+fn grants_a_subset(db: &Db, kind: CoordinationResponseKind) {
+    let store = db.open();
+    let (holder, requester, work_id, request, now) =
+        holder_and_request(&*store, &FILES[..3], &FILES[..2]);
+    let reply = release_reply(&request, kind, &["src/a.rs"]);
+    let answered = store.coordination_reply(&holder, &reply, now + 2).unwrap();
+    assert_eq!(answered.responses.len(), 1);
+    assert_eq!(answered.responses[0].released_paths, vec!["src/a.rs"]);
+    assert_eq!(answered.responses[0].kind, kind);
+    // The requester sees the same projection.
+    let seen = store
+        .coordination_list(&requester, &CoordinationListQuery::default(), now + 3)
+        .unwrap();
+    assert_eq!(
+        seen.requests[0].responses[0].released_paths,
+        vec!["src/a.rs"]
+    );
+    // A retry of the identical reply replays and does not release twice.
+    let replayed = store.coordination_reply(&holder, &reply, now + 4).unwrap();
+    assert_eq!(replayed.updated_seq, answered.updated_seq);
+    let transitions = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "work_transition")
+        .count();
+    assert_eq!(transitions, 1);
+    // The released file is free to the requester; the other requested file stays held.
+    let taken = store
+        .work_start(
+            &requester,
+            &start_scope("a-only", "asker2", WorkRole::Lead, None, &["src/a.rs"]),
+            now + 5,
+        )
+        .unwrap();
+    assert!(taken.conflict.is_none() && taken.created);
+    let still_held = store
+        .work_start(
+            &requester,
+            &start_scope("b-only", "asker3", WorkRole::Lead, None, &["src/b.rs"]),
+            now + 6,
+        )
+        .unwrap();
+    assert!(still_held.conflict.is_some());
+    // The holder keeps two files, its generation and its lease.
+    let held = db.rows(&format!(
+        "SELECT scope, generation, state FROM hub_work_items WHERE id = '{work_id}'"
+    ));
+    assert_eq!(held[0][0].matches("src/").count(), 2, "{held:?}");
+    assert!(!held[0][0].contains("src/a.rs"), "{held:?}");
+    assert_eq!(held[0][1], "1");
+    assert_eq!(
+        db.rows(&format!(
+            "SELECT reservation_basis FROM hub_work_items WHERE id = '{work_id}'"
+        ))[0][0],
+        "admitted"
+    );
+    assert_eq!(
+        db.rows("SELECT released_paths FROM hub_coordination_responses")[0][0],
+        r#"["src/a.rs"]"#
+    );
+}
+
+fn reply_release_refusals_record_nothing(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &FILES, &["src/a.rs", "src/b.rs", "src/z.rs"]);
+    let refused = |reply: &CoordinationReply, who: &str| {
+        let error = store
+            .coordination_reply(who, reply, now + 2)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM hub_coordination_responses")[0][0],
+            "0"
+        );
+        error
+    };
+    let join = release_reply(&request, CoordinationResponseKind::Join, &["src/a.rs"]);
+    assert!(refused(&join, &holder).contains("not valid with join"));
+    let unrequested = release_reply(&request, CoordinationResponseKind::Decline, &["src/d.rs"]);
+    let error = refused(&unrequested, &holder);
+    assert!(
+        error.contains("did not ask for") && error.contains("src/d.rs"),
+        "{error}"
+    );
+    let foreign = release_reply(&request, CoordinationResponseKind::Decline, &["src/z.rs"]);
+    let error = refused(&foreign, &holder);
+    assert!(
+        error.contains("src/z.rs") && error.contains("scope"),
+        "{error}"
+    );
+    // A requester is not the target's lead.
+    let granted = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    assert!(matches!(
+        store.coordination_reply(&requester, &granted, now + 2),
+        Err(HubError::Unauthorized)
+    ));
+    assert_eq!(
+        db.rows("SELECT COUNT(*) FROM hub_work_items WHERE scope LIKE '%src/a.rs%'")[0][0],
+        "1"
+    );
+    // Releasing every entry is refused, naming the whole-hold release.
+    let third = token(&*store, 33, "third");
+    let all = store
+        .work_start(
+            &third,
+            &start_scope("all", "all-session", WorkRole::Lead, None, &FILES),
+            now + 3,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let everything = release_reply(&all, CoordinationResponseKind::Decline, &FILES);
+    let error = refused(&everything, &holder);
+    assert!(error.contains("use release"), "{error}");
+}
+
+fn decline_grants_a_subset(db: &Db) {
+    grants_a_subset(db, CoordinationResponseKind::Decline);
+}
+
+fn split_grants_a_subset(db: &Db) {
+    grants_a_subset(db, CoordinationResponseKind::ProposeSplit);
+}
+
+parity_case!(reply_grants_subset, decline_grants_a_subset);
+parity_case!(split_grants_subset, split_grants_a_subset);
+parity_case!(
+    reply_release_refusals,
+    reply_release_refusals_record_nothing
 );

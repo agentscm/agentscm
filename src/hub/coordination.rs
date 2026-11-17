@@ -96,6 +96,10 @@ pub struct CoordinationResponse {
     /// that ignores this field sees the same shape as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// The requested paths this reply released from the target Work's reservation; absent when
+    /// it released none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_paths: Vec<String>,
     pub created_at: i64,
     pub seq: i64,
 }
@@ -226,6 +230,11 @@ pub struct CoordinationReply {
     pub expected_updated_seq: i64,
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
+    /// Requested paths to release from the target Work in the same step, keeping the rest of
+    /// its scope: each must be a path the request asked for and an exact scope entry of the
+    /// target. Not valid with `join`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_paths: Vec<String>,
     /// Set only by the person routes, never read from a request body: the person who owns the
     /// lead agent answered for it from the Hub's web pages (`via: "hub"` on the response) or
     /// through a connected app (`via: "slack"`). `Agent` when the agent answered itself.
@@ -347,7 +356,54 @@ impl CoordinationReply {
         if let Some(note) = &self.note {
             validate_note(note)?;
         }
+        if !self.release_paths.is_empty() {
+            if self.kind == CoordinationResponseKind::Join {
+                return Err(invalid(
+                    "release_paths is not valid with join: a join keeps the whole scope. Reply propose_split, handover or decline to release some requested files",
+                ));
+            }
+            super::work::normalized_scope(&self.release_paths)?;
+        }
         Ok(())
+    }
+
+    /// The release of the named paths from the target Work, run in the reply's transaction.
+    /// Refuses a path the request did not ask for; the transition refuses the rest.
+    pub(super) fn release(
+        &self,
+        requested: &[String],
+        work_id: &str,
+        generation: i64,
+        updated_seq: i64,
+        release_id: &str,
+    ) -> Result<super::work_transition::WorkTransitionRequest> {
+        let requested = super::work::normalized_scope(requested)?;
+        let unrequested: Vec<String> = super::work::normalized_scope(&self.release_paths)?
+            .into_iter()
+            .filter(|key| !requested.contains(key))
+            .map(|key| super::intent::display(&key))
+            .collect();
+        if !unrequested.is_empty() {
+            return Err(HubError::Invalid(format!(
+                "release_paths names paths this request did not ask for: {}",
+                unrequested.join(", ")
+            )));
+        }
+        Ok(super::work_transition::WorkTransitionRequest {
+            work_id: work_id.to_owned(),
+            operation_id: release_id.to_owned(),
+            generation,
+            expected_updated_seq: updated_seq,
+            session: Some(self.session.clone()),
+            transition: super::work_transition::WorkTransitionKind::ReleasePaths,
+            reason: format!(
+                "released by a reply to coordination request {}",
+                self.request_id
+            ),
+            superseded_by: None,
+            participants: Vec::new(),
+            paths: self.release_paths.clone(),
+        })
     }
 }
 

@@ -4888,6 +4888,7 @@ fn responded_request_stays_responded_after_release(db: &Db) {
         .coordination_reply(
             &alice.token,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: first.id.clone(),
                 operation_id: "reply".into(),
                 target_work_id: item.id.clone(),
@@ -5706,6 +5707,7 @@ fn finish_checkpoint_cleans_up_like_a_terminal_transition(db: &Db) {
         .coordination_reply(
             &alice.token,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: answered.id.clone(),
                 operation_id: "reply".into(),
                 target_work_id: item.id.clone(),
@@ -6099,6 +6101,7 @@ fn resuming_released_work_retargets_requests_only_when_the_lead_changes(db: &Db)
         .coordination_reply(
             &alice.token,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "reply".into(),
                 target_work_id: item.id.clone(),
@@ -6194,6 +6197,7 @@ fn reopen_by_another_session_retargets_open_requests(db: &Db) {
         .coordination_reply(
             &alice.token,
             &CoordinationReply {
+                release_paths: Vec::new(),
                 request_id: request.id.clone(),
                 operation_id: "reply".into(),
                 target_work_id: item.id.clone(),

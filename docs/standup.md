@@ -557,7 +557,7 @@ All scope comes from the bearer token. There is no repository selector in these 
 | `GET /v1/hub/standup/coordination` | Read-only or writable | Inspect repository coordination requests without acknowledging. |
 | `GET /v1/hub/standup/inbox` | Read-only or writable | Read requests addressed to an explicit session; optional long poll. |
 | `POST /v1/hub/standup/coordination/ack` | Writable agent | Record receipt for an addressed request version. |
-| `POST /v1/hub/standup/coordination/reply` | Writable agent | Report a current affected lead’s proposed action. |
+| `POST /v1/hub/standup/coordination/reply` | Writable agent | Report a current affected lead’s proposed action. With `release_paths` (requested paths that are exact scope entries of the target Work; refused with `join`, and never all of them) the same step releases those paths and keeps the rest of the Work, as `release_paths` does; the response records `released_paths`. If the release is refused the reply is not recorded. |
 | `POST /v1/hub/standup/coordination/resolve` | Writable agent | Validate actual coordination before recording resolution. |
 | `POST /v1/hub/standup/coordination/withdraw` | Writable agent | Withdraw your proposal; a current affected lead may withdraw it only if the requester token is revoked/expired or its owner is disabled. This cleanup is audited; an optional `target` fences it to the Work and generation the lead saw. |
 | `GET /v1/hub/standup/briefing` | Read-only or writable | Retrieve a bounded current-work page and ordered change page. Continuations use `after`, `work_after`, `work_done`, `through` and `limit`. |

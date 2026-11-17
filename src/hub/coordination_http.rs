@@ -333,6 +333,8 @@ struct PersonReply {
     expected_updated_seq: i64,
     kind: CoordinationResponseKind,
     note: Option<String>,
+    #[serde(default)]
+    release_paths: Vec<String>,
 }
 
 /// The web sign-in (`via: "hub"`) or a connected app's credential (the app's `via`).
@@ -357,6 +359,7 @@ async fn person_reply(
             expected_updated_seq: body.expected_updated_seq,
             kind: body.kind,
             note: body.note,
+            release_paths: body.release_paths,
             via,
         };
         store

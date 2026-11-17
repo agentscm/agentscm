@@ -1467,6 +1467,7 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
             .coordination_reply(
                 &lead_token,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: request.clone(),
                     operation_id: "decline-widget".into(),
                     target_work_id: target,
