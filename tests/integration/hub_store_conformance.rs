@@ -3855,6 +3855,7 @@ fn repository_settings_scope_preserves_unambiguous_rows(db: &Db) {
         ("work_digest:repo:", "on"),
         ("skill_forge_status:repo:", "off"),
         ("merged_release:repo:", "on"),
+        ("deploy_workflow:repo:", ".github/workflows/deploy.yml"),
     ] {
         rows.push((format!("{prefix}101"), format!("{prefix}{scope}"), value));
     }

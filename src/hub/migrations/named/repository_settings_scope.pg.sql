@@ -13,7 +13,8 @@ WITH prefixes(prefix, per_person) AS (VALUES
     ('work_digest:repo:', 0),
     ('work_digest:opt_out:', 1),
     ('skill_forge_status:repo:', 0),
-    ('merged_release:repo:', 0)
+    ('merged_release:repo:', 0),
+    ('deploy_workflow:repo:', 0)
 ), matched AS (
     SELECT s.*, p.prefix, p.per_person, substr(s.key, length(p.prefix) + 1) AS suffix
     FROM hub_settings s JOIN prefixes p ON substr(s.key, 1, length(p.prefix)) = p.prefix

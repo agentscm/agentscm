@@ -23,7 +23,16 @@ const OTHER: &str = "2222222222222222222222222222222222222222";
 const EARLY: &str = "2023-11-14T22:13:20Z";
 const LATE: &str = "2023-11-14T22:15:00Z";
 
+/// The key `PUT .../deploy-workflow` stores a repository's workflow under.
+fn deploy_key(host: &str, id: i64) -> String {
+    format!(
+        "deploy_workflow:repo:{}",
+        store::repository_scope(host, "", Some(id))
+    )
+}
+
 struct Env {
+    host: String,
     fake: FakeGithub,
     state: HubState,
     store: Arc<dyn Store>,
@@ -75,6 +84,7 @@ impl Env {
         .with_sync(Sync::new(config).unwrap());
         sync::start(&state).await.unwrap();
         let host = fake.base.trim_start_matches("http://").to_owned();
+        let env_host = host.clone();
         let setup = store.clone();
         let (repo, token, secret) = tokio::task::spawn_blocking(move || {
             let connection = setup.pat_connection(&host).unwrap().unwrap().id;
@@ -99,6 +109,7 @@ impl Env {
         .await
         .unwrap();
         Self {
+            host: env_host,
             fake,
             state,
             store,
@@ -1107,7 +1118,7 @@ async fn a_deploy_workflow_run_is_a_workflow_deployment_without_the_opt_in() {
     // What `PUT .../deploy-workflow` stores once a repository admin names the workflow.
     env.store
         .set_setting(
-            &format!("deploy_workflow:repo:{REPO_ID}"),
+            &deploy_key(&env.host, REPO_ID),
             ".github/workflows/deploy.yml",
             "usr_admin",
         )
@@ -1200,7 +1211,7 @@ async fn the_deploy_workflow_setting_reads_validates_and_needs_an_admin() {
     assert_eq!(refused.status().as_u16(), 403);
     assert!(
         env.store
-            .get_setting(&format!("deploy_workflow:repo:{REPO_ID}"))
+            .get_setting(&deploy_key(&env.host, REPO_ID))
             .unwrap()
             .is_none()
     );
@@ -1319,11 +1330,7 @@ async fn the_deploy_workflow_write_authorizes_the_tokens_stable_id_after_a_renam
                 .as_u16()
         }
     };
-    let workflow_of = |id: i64| {
-        store
-            .get_setting(&format!("deploy_workflow:repo:{id}"))
-            .unwrap()
-    };
+    let workflow_of = |id: i64| store.get_setting(&deploy_key("github.com", id)).unwrap();
     let read = |secret: String| {
         let client = client.clone();
         let url = url.clone();
@@ -1358,5 +1365,33 @@ async fn the_deploy_workflow_write_authorizes_the_tokens_stable_id_after_a_renam
     assert_eq!(
         read(keeper_token).await,
         json!(".github/workflows/deploy.yml")
+    );
+}
+
+#[test]
+fn equal_repository_ids_on_distinct_hosts_keep_deploy_workflows_separate() {
+    // Store-level: a two-host HTTP test needs a second fake forge.
+    assert_ne!(
+        deploy_key("github.com", REPO_ID),
+        deploy_key("ghe.example.invalid", REPO_ID)
+    );
+    let root = TempDir::new().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        root.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    store
+        .set_setting(
+            &deploy_key("github.com", REPO_ID),
+            ".github/workflows/deploy.yml",
+            "usr_admin",
+        )
+        .unwrap();
+    assert!(
+        store
+            .get_setting(&deploy_key("ghe.example.invalid", REPO_ID))
+            .unwrap()
+            .is_none()
     );
 }
