@@ -691,14 +691,13 @@ impl FromRequestParts<HubState> for HumanSession {
         let secret = browser_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         let digest = super::store::browser_session_digest(secret)?;
         let csrf = csrf_token(secret)?;
-        // A request that changes something must also carry the token only the Hub's own page
-        // can read; a cookie alone, as another site's form would send, is refused.
+        // Changes require CSRF; an optional header on a read also binds it to this cookie.
         let reads = matches!(
             parts.method,
             axum::http::Method::GET | axum::http::Method::HEAD
         );
         let named = parts.headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
-        if !reads && named != Some(csrf.as_str()) {
+        if (!reads || parts.headers.contains_key(CSRF_HEADER)) && named != Some(csrf.as_str()) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "csrf").with_message(
                 "This change did not come from the Hub's own page; reload the page and try again",
             ));

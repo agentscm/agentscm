@@ -3017,6 +3017,86 @@ async fn a_web_sign_in_returns_to_the_hub_page_that_asked_and_nowhere_else() {
 }
 
 #[tokio::test]
+async fn browser_reads_bind_an_optional_csrf_header_to_the_current_cookie() {
+    let env = Env::start("github").await;
+    let alice = page(&env, ALICE).await;
+    let bob = page(&env, BOB).await;
+    let path = "/v1/hub/session/repositories";
+    for method in [Method::GET, Method::HEAD] {
+        for csrf in [None, Some(alice.csrf.as_str())] {
+            assert_eq!(
+                with_cookie(&env.hub, method.clone(), path, &alice.cookie, csrf)
+                    .await
+                    .0,
+                200
+            );
+        }
+        for csrf in [bob.csrf.as_str(), "wrong"] {
+            assert_eq!(
+                with_cookie(&env.hub, method.clone(), path, &alice.cookie, Some(csrf))
+                    .await
+                    .0,
+                403
+            );
+        }
+        let malformed = browser()
+            .request(method, format!("{}{path}", env.hub))
+            .header(
+                header::COOKIE,
+                format!("__Host-agentscm_session={}", alice.cookie),
+            )
+            .header(
+                "x-csrf-token",
+                axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), 403);
+    }
+    // Returning to Alice's cookie cannot make a request handled under Bob's cookie succeed.
+    let (status, body) =
+        with_cookie(&env.hub, Method::GET, path, &bob.cookie, Some(&alice.csrf)).await;
+    assert_eq!((status, body["error"].as_str()), (403, Some("csrf")));
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::GET,
+            path,
+            &alice.cookie,
+            Some(&alice.csrf)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &alice.cookie,
+            None
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &alice.cookie,
+            Some(&alice.csrf),
+        )
+        .await
+        .0,
+        204
+    );
+}
+
+#[tokio::test]
 async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
     let env = Env::start("github").await;
     let cookie = web_sign_in(&env, ALICE).await;
@@ -6224,6 +6304,83 @@ async fn an_embedders_grants_decide_who_signs_in_and_who_may_change_anything() {
         "{body}"
     );
     let (status, body) = whoami(&env, &alice_secret).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn file_handoff_reads_require_a_current_repository_grant() {
+    const OTHER: &str = "other/tools";
+    let mut env = Env::start("github").await;
+    env.connect_repo(OTHER, REPO_ID + 1, BOB);
+    let grants = Arc::new(Grants {
+        store: env.store.clone(),
+        people: Mutex::new(HashMap::from([
+            (ALICE, vec![(REPO, Level::Contribute)]),
+            (BOB, vec![(REPO, Level::Read), (OTHER, Level::Read)]),
+        ])),
+    });
+    env.access = Some(grants.clone());
+    env.hub = env.serve("").await;
+    let alice = page(&env, ALICE).await;
+    let bob = page(&env, BOB).await;
+    let (holder, _) = agent_for(&env, &alice.id, "holder", false);
+    let (requester, secret) = agent_for(&env, &bob.id, "requester", false);
+    let now = unix_now();
+    let file = "src/widgets.rs";
+    env.store
+        .touch_session(&holder, &hook_call("holder", &[file]), now)
+        .unwrap();
+    env.store
+        .touch_session(&requester, &hook_call("requester", &[]), now)
+        .unwrap();
+    env.store
+        .ask_handoff(
+            &requester,
+            Some("requester"),
+            file,
+            Some("finish widgets"),
+            now,
+        )
+        .unwrap();
+    let read = |page: &Page, repository: &str| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        let path = format!("/v1/hub/session/handoffs?repository={repository}");
+        async move { with_cookie(&hub, Method::GET, &path, &cookie, None).await }
+    };
+    for person in [&alice, &bob] {
+        let (status, body) = read(person, REPO).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["handoffs"][0]["path"], file, "{body}");
+    }
+    let (status, body) = read(&bob, OTHER).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["handoffs"].as_array().unwrap().is_empty());
+
+    // Losing one repository keeps the sign-in but ends reads of its retained handoffs.
+    grants
+        .people
+        .lock()
+        .unwrap()
+        .insert(BOB, vec![(OTHER, Level::Read)]);
+    let (status, body) = read(&bob, REPO).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+    let (status, body) = whoami(&env, &secret).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+    assert_eq!(read(&bob, OTHER).await.0, 200);
+    assert_eq!(read(&alice, REPO).await.0, 200);
+    let (status, body) = read(&alice, OTHER).await;
     assert_eq!(
         (status, body["error"].as_str()),
         (403, Some("insufficient_role")),

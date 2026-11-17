@@ -1788,7 +1788,11 @@ mod shared_bodies {
             let admin = user(&*store, 900, "hub-admin");
             // Uploads need the repository to share agent conversations.
             store
-                .set_setting("conversation_sharing:repo:77", "on", "test")
+                .set_setting(
+                    "conversation_sharing:repo:github.com/@repo-id:77",
+                    "on",
+                    "test",
+                )
                 .unwrap();
             let (owner_token, owner_secret) = token(&*store, &owner, "writer", false);
             let (_, sibling_secret) = token(&*store, &owner, "sibling", false);
@@ -1915,7 +1919,7 @@ mod shared_bodies {
         fn share(&self, on: bool) {
             self.store
                 .set_setting(
-                    "conversation_sharing:repo:77",
+                    "conversation_sharing:repo:github.com/@repo-id:77",
                     if on { "on" } else { "off" },
                     "test",
                 )
@@ -2554,14 +2558,20 @@ mod shared_bodies {
         // An unreadable choice opts the person out, also after re-enablement.
         f.store
             .set_setting(
-                &format!("conversation_sharing:opt_out:{}:77", f.owner),
+                &format!(
+                    "conversation_sharing:opt_out:{}:github.com/@repo-id:77",
+                    f.owner
+                ),
                 "invalid",
                 &f.owner,
             )
             .unwrap();
         f.store
             .set_setting(
-                &format!("conversation_sharing:notified:{}:77", f.owner),
+                &format!(
+                    "conversation_sharing:notified:{}:github.com/@repo-id:77",
+                    f.owner
+                ),
                 "1",
                 &f.owner,
             )

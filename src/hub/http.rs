@@ -614,8 +614,8 @@ async fn skill_workflow(
         return Err(ApiError::invalid());
     }
     let registry = state.skill_workflows.clone();
-    let repository = principal.repository;
-    let outcome = blocking(&state, move || Ok(registry.read(&repository, &run_id))).await?;
+    let scope = super::store::scope_of(&state, &principal).await?;
+    let outcome = blocking(&state, move || Ok(registry.read(&scope, &run_id))).await?;
     match outcome {
         Ok(envelope) => Ok(Json(envelope).into_response()),
         Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),
@@ -652,9 +652,9 @@ async fn skill_workflows(
     let before = query.before.as_deref().map(sequence_cursor).transpose()?;
     let search = super::store::search_text(query.q.as_deref())?;
     let registry = state.skill_workflows.clone();
-    let repository = principal.repository;
+    let scope = super::store::scope_of(&state, &principal).await?;
     let outcome = blocking(&state, move || {
-        Ok(registry.page(&repository, before, search.as_deref()))
+        Ok(registry.page(&scope, before, search.as_deref()))
     })
     .await?;
     match outcome {

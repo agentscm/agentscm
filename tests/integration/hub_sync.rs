@@ -3644,7 +3644,10 @@ async fn observed_skill_fixture(env: &Env) -> String {
 fn set_skill_status(env: &Env, value: &str) {
     env.store
         .set_setting(
-            &format!("skill_forge_status:repo:{REPO_ID}"),
+            &format!(
+                "skill_forge_status:repo:{}",
+                store::repository_scope(&env.host(), "", Some(REPO_ID))
+            ),
             value,
             "test-admin",
         )

@@ -1482,8 +1482,11 @@ async fn poll_issue_closures(
             })
             .map(|(item, _)| item.id.clone())
             .collect();
-        let releasing =
-            super::merged_holds::merged_release_enabled(store, store_repo.repository_id);
+        let releasing = super::merged_holds::merged_release_enabled(
+            store,
+            &store_repo.host,
+            store_repo.repository_id,
+        );
         let cursor = store
             .get_setting(&key)?
             .and_then(|v| v.parse::<u64>().ok())

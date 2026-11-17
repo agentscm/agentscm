@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::store::validate_repository;
+use super::connection::validate_repository_row;
+use super::store::{ForgeIdentity, repository_scope};
 use super::{HubError, Result};
 use crate::Error;
 use crate::authority::Authority;
@@ -16,7 +17,7 @@ use crate::skill_workflow_service::{self, SkillWorkflowProjection};
 use crate::store::Engine;
 
 pub const BINDINGS_ENV: &str = "AGENTSCM_WORKFLOW_BINDINGS_FILE";
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 const ENVELOPE_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BINDINGS: usize = 32;
@@ -47,6 +48,8 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct BindingConfig {
     hub_repository: String,
+    hub_host: String,
+    hub_repository_id: i64,
     native_repository: String,
     data_dir: String,
 }
@@ -155,6 +158,13 @@ impl SkillWorkflowRegistry {
 
     pub fn from_file(path: &Path) -> Result<Self> {
         let bytes = read_config(path)?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| HubError::Invalid("invalid workflow bindings configuration".into()))?;
+        if config.get("version").and_then(serde_json::Value::as_u64) == Some(1) {
+            return Err(HubError::Invalid(
+                "workflow bindings version 1 is no longer supported; migrate to version 2 with hub_host and hub_repository_id for every binding (docs/advanced/skill-workflow-hub.md), or unset AGENTSCM_WORKFLOW_BINDINGS_FILE to disable native workflow reads".into(),
+            ));
+        }
         let config: Config = serde_json::from_slice(&bytes)
             .map_err(|_| HubError::Invalid("invalid workflow bindings configuration".into()))?;
         if config.version != CONFIG_VERSION {
@@ -170,14 +180,26 @@ impl SkillWorkflowRegistry {
 
         let mut bindings = BTreeMap::new();
         for configured in config.bindings {
-            validate_repository(&configured.hub_repository)?;
+            validate_repository_row(configured.hub_repository_id, &configured.hub_repository)?;
+            // Reuse the forge identity's canonical host rules.
+            ForgeIdentity {
+                provider: "github".into(),
+                host: configured.hub_host.clone(),
+                user_id: 1,
+            }
+            .validate()?;
+            let scope = repository_scope(
+                &configured.hub_host,
+                &configured.hub_repository,
+                Some(configured.hub_repository_id),
+            );
             validate_native_repository(&configured.native_repository)?;
             if configured.data_dir.is_empty() || configured.data_dir.len() > MAX_DATA_DIR_BYTES {
                 return Err(HubError::Invalid(
                     "workflow binding data directory is invalid".into(),
                 ));
             }
-            if bindings.contains_key(&configured.hub_repository) {
+            if bindings.contains_key(&scope) {
                 return Err(HubError::Invalid(
                     "workflow bindings contain a duplicate hub repository".into(),
                 ));
@@ -198,7 +220,7 @@ impl SkillWorkflowRegistry {
             let engine = Engine::open(&data_dir).map_err(|_| invalid_native_store())?;
             drop(authority);
             bindings.insert(
-                configured.hub_repository,
+                scope,
                 Binding {
                     native_repository: configured.native_repository,
                     data_dir,
@@ -209,14 +231,14 @@ impl SkillWorkflowRegistry {
         Ok(Self { bindings })
     }
 
-    /// Reads only the binding selected by the authenticated hub repository.
+    /// Reads only the binding selected by the authenticated forge repository scope.
     pub fn read(
         &self,
-        hub_repository: &str,
+        scope: &str,
         run_id: &str,
     ) -> std::result::Result<SkillWorkflowEnvelope, ReadError> {
         skill_workflow_service::validate_run_id(run_id).map_err(|_| ReadError::InvalidRunId)?;
-        let (binding, _authority) = match self.current_binding(hub_repository) {
+        let (binding, _authority) = match self.current_binding(scope) {
             Ok(current) => current,
             Err(reason) => return Ok(SkillWorkflowEnvelope::unavailable(reason)),
         };
@@ -236,21 +258,18 @@ impl SkillWorkflowRegistry {
         Ok(SkillWorkflowEnvelope::available(projection))
     }
 
-    /// Lists recent runs only from the authenticated repository's operator binding.
-    pub fn list(
-        &self,
-        hub_repository: &str,
-    ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
-        self.page(hub_repository, None, None)
+    /// Lists recent runs only from the authenticated forge repository scope's operator binding.
+    pub fn list(&self, scope: &str) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
+        self.page(scope, None, None)
     }
 
     pub fn page(
         &self,
-        hub_repository: &str,
+        scope: &str,
         before: Option<i64>,
         search: Option<&str>,
     ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
-        let (binding, _authority) = match self.current_binding(hub_repository) {
+        let (binding, _authority) = match self.current_binding(scope) {
             Ok(current) => current,
             Err(reason) => return Ok(SkillWorkflowListEnvelope::unavailable(reason)),
         };
@@ -275,11 +294,11 @@ impl SkillWorkflowRegistry {
 
     fn current_binding(
         &self,
-        hub_repository: &str,
+        scope: &str,
     ) -> std::result::Result<(&Binding, Authority), &'static str> {
         let binding = self
             .bindings
-            .get(hub_repository)
+            .get(scope)
             .ok_or("native_workflow_not_configured")?;
         let authority = binding.open_current()?;
         Ok((binding, authority))

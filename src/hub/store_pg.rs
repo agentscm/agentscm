@@ -438,7 +438,15 @@ fn migrate(client: &mut Client) -> Result<()> {
         .collect();
     let applied_refs: Vec<&str> = applied_names.iter().map(String::as_str).collect();
     for migration in plan_named(NAMED_MIGRATIONS, &applied_refs)? {
-        tx.batch_execute(migration.postgres)?;
+        tx.batch_execute(migration.postgres).map_err(|error| {
+            if error.as_db_error().and_then(|detail| detail.constraint())
+                == Some("Map legacy settings to one forge host before upgrading")
+            {
+                HubError::Unavailable("repository settings migration refused: back up the database, map legacy settings to one forge host and stable repository ID, and archive the original keys before upgrading".into())
+            } else {
+                HubError::from(error)
+            }
+        })?;
         tx.execute(
             "INSERT INTO hub_named_migrations (name, applied_at) VALUES ($1, $2)",
             &[&migration.name, &unix_now()],
@@ -13938,6 +13946,9 @@ impl Store for PgStore {
             let opt_out_prefix = (audience == ConversationAudience::Sharing
                 && who.repository_id.is_some())
             .then_some(super::conversation_sharing::OPT_OUT_KEY_PREFIX);
+            let opt_out_scope = who.repository_id.map(|id| {
+                super::store::repository_scope(&who.owner.identity.host, "", Some(id))
+            });
             let rows = tx.query(
                 "WITH page AS (
                          SELECT o.work,b.digest,b.size_bytes,o.session_id,o.generation,o.event_id,o.sequence,
@@ -13954,7 +13965,7 @@ impl Store for PgStore {
                          AND earlier.digest=o.digest AND earlier.generation<o.generation))
                            AND ($6::boolean OR b.author=$7 OR ($8::text IS NOT NULL AND NOT EXISTS (
                                 SELECT 1 FROM hub_settings o
-                                 WHERE o.key = $8::text || b.author || ':' || $9::bigint::text
+                                 WHERE o.key = $8::text || b.author || ':' || $9::text
                                    AND o.value <> '0')))
                          ORDER BY o.session_id COLLATE \"C\",o.generation,o.sequence,o.digest COLLATE \"C\" LIMIT $5)
                      SELECT page.*, e.event, e.observed_at, s.identity FROM page
@@ -13974,7 +13985,7 @@ impl Store for PgStore {
                     // Set only for readers of a sharing repository: an author who opted out is
                     // left out, with what they shared before.
                     &opt_out_prefix,
-                    &who.repository_id,
+                    &opt_out_scope,
                     &after.as_ref().map(|after| after.1),
                 ],
             )?;
