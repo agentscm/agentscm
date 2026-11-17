@@ -509,14 +509,21 @@ async fn repository_switch_writes_authorize_the_tokens_stable_id_after_a_rename(
     use agentscm::hub::connection::NewConnection;
     use reqwest::Method;
 
-    struct Grants(Vec<Grant>);
+    struct Grants(Vec<(String, Grant)>);
     impl Access for Grants {
-        fn grants(&self, _: &store::User) -> agentscm::hub::Result<Option<Vec<Grant>>> {
-            Ok(Some(self.0.clone()))
+        fn grants(&self, user: &store::User) -> agentscm::hub::Result<Option<Vec<Grant>>> {
+            Ok(Some(
+                self.0
+                    .iter()
+                    .filter(|(id, _)| *id == user.id)
+                    .map(|(_, grant)| grant.clone())
+                    .collect(),
+            ))
         }
     }
     let db = Db::sqlite();
     let person = person(&*db.store, 1, "owner");
+    let keeper = self::person(&*db.store, 2, "keeper");
     let connection = db
         .store
         .insert_connection(
@@ -560,14 +567,27 @@ async fn repository_switch_writes_authorize_the_tokens_stable_id_after_a_rename(
     let objects = LocalBackend::open(db._dir.as_ref().unwrap().path().join("objects")).unwrap();
     let state =
         HubState::new(db.store.clone(), Arc::new(objects)).with_access(Arc::new(Grants(vec![
-            Grant {
-                repository: original,
-                level: Level::Contribute,
-            },
-            Grant {
-                repository: replacement,
-                level: Level::Administer,
-            },
+            (
+                person.reader.owner.id.clone(),
+                Grant {
+                    repository: original.clone(),
+                    level: Level::Contribute,
+                },
+            ),
+            (
+                person.reader.owner.id.clone(),
+                Grant {
+                    repository: replacement,
+                    level: Level::Administer,
+                },
+            ),
+            (
+                keeper.reader.owner.id.clone(),
+                Grant {
+                    repository: original,
+                    level: Level::Administer,
+                },
+            ),
         ])));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -599,6 +619,30 @@ async fn repository_switch_writes_authorize_the_tokens_stable_id_after_a_rename(
         assert_eq!(
             status, 403,
             "administering the reused name must not administer the original ID: {body}"
+        );
+        let (status, body) = call(&base, Method::GET, settings, &person.agent_secret, None).await;
+        assert_eq!(
+            (status, &body["enabled"]),
+            (200, &json!(false)),
+            "the refused write left the original's switch off: {body}"
+        );
+        let (status, body) = call(
+            &base,
+            Method::PUT,
+            settings,
+            &keeper.agent_secret,
+            Some(json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "administering the original ID under its old-name token is allowed: {body}"
+        );
+        let (status, body) = call(&base, Method::GET, settings, &keeper.agent_secret, None).await;
+        assert_eq!(
+            (status, &body["enabled"]),
+            (200, &json!(true)),
+            "the original's switch is on: {body}"
         );
     }
 }

@@ -165,14 +165,9 @@ async fn set_enabled(
     // A Hub admin changes any connected repository's switch, with or without a forge role;
     // anyone else needs the forge to say now that they administer the repository.
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "work_digest",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "work_digest")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden()
             .with_message("Only a repository admin or a Hub admin switches the digest on or off"));
@@ -255,14 +250,9 @@ async fn set_release(
     let repository_id = principal.repository_id.ok_or_else(no_repository_id)?;
     // The same standing as the digest switch: a Hub admin or a repository admin.
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "merged_release",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "merged_release")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden().with_message(
             "Only a repository admin or a Hub admin switches automatic release of merged Work on or off",
