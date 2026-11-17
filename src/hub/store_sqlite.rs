@@ -2963,6 +2963,18 @@ fn carry_lead_credential(
              WHERE work = ?1 AND token = ?2 AND session = ?3",
             params![item.id, who.token, session],
         )?;
+        tx.execute(
+            "UPDATE hub_coordination_requests SET requester_token = ?1, requester_agent = ?2
+             WHERE requester_token = ?3 AND requester_session = ?4 AND requester_owner = ?5
+               AND status IN ('pending', 'responded')",
+            params![
+                who.token,
+                who.agent,
+                carried.previous_token,
+                session,
+                who.owner.id
+            ],
+        )?;
         let updated = tx.execute(
             "UPDATE hub_work_participants SET token = ?2, agent = ?3, updated_at = ?4
              WHERE work = ?1 AND token = ?5 AND session = ?6 AND role = 'lead'",
@@ -17177,9 +17189,9 @@ impl Store for SqliteStore {
         let request = coordination_request_at(&tx, &who, &ack.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
         let (target, generation) = match &ack.target_work_id {
-            None if coordination_is_requester(&request, &who, &ack.session) => ("", 0),
+            None if coordination_is_requester(&request, &who, &native_session) => ("", 0),
             Some(work) => {
-                let target = coordination_target_for(&request, work, &who, &ack.session)
+                let target = coordination_target_for(&request, work, &who, &native_session)
                     .ok_or(HubError::Unauthorized)?;
                 (target.work_id.as_str(), target.generation)
             }
@@ -17363,8 +17375,9 @@ impl Store for SqliteStore {
         }
         let request = coordination_request_at(&tx, &who, &reply.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
-        let target = coordination_target_for(&request, &reply.target_work_id, &who, &reply.session)
-            .ok_or(HubError::Unauthorized)?;
+        let target =
+            coordination_target_for(&request, &reply.target_work_id, &who, &native_session)
+                .ok_or(HubError::Unauthorized)?;
         if coordination_operation_replay(&tx, &request.id, &reply.operation_id, "reply", &payload)?
         {
             tx.commit()?;
@@ -17491,9 +17504,9 @@ impl Store for SqliteStore {
         }
         let request = coordination_request_at(&tx, &who, &resolve.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
-        let authorized = coordination_is_requester(&request, &who, &resolve.session)
+        let authorized = coordination_is_requester(&request, &who, &native_session)
             || request.targets.iter().any(|target| {
-                target.lead.token == who.token && target.lead.session == resolve.session
+                target.lead.token == who.token && target.lead.session == native_session
             });
         if !authorized {
             return Err(HubError::invalid_or_changed(
@@ -17647,9 +17660,9 @@ impl Store for SqliteStore {
         }
         let request = coordination_request_at(&tx, &who, &withdraw.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
-        let requester = coordination_is_requester(&request, &who, &withdraw.session);
+        let requester = coordination_is_requester(&request, &who, &native_session);
         let leads = |target: &CoordinationTarget| {
-            target.lead.token == who.token && target.lead.session == withdraw.session
+            target.lead.token == who.token && target.lead.session == native_session
         };
         let cleanup =
             !requester && request.requester_unavailable && request.targets.iter().any(leads);

@@ -2530,6 +2530,184 @@ parity_case!(
     requester_reads_overlap_consents_through_a_session_alias
 );
 
+fn requester_acts_through_a_session_alias(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap();
+    let request = store
+        .work_start(&requester, &start("requester", "default"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    store
+        .work_start(
+            &requester,
+            &start_scope("docs", "default", WorkRole::Lead, None, &["docs/**"]),
+            now + 1,
+        )
+        .unwrap();
+    // The first hook session after an unnamed start adopts it, so `native` stands for `default`.
+    store
+        .touch_session(
+            &requester,
+            &SessionCall {
+                session: Some("native".into()),
+                via: "hook:claude".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            now + 2,
+        )
+        .unwrap();
+    let acknowledged = store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "native".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let resolve = CoordinationResolve {
+        request_id: request.id.clone(),
+        operation_id: "alias-resolve".into(),
+        session: "native".into(),
+        expected_updated_seq: acknowledged.updated_seq,
+    };
+    // The requester is a party, so the refusal is not the non-party one.
+    assert!(!matches!(
+        store.coordination_resolve(&requester, &resolve, now + 4),
+        Err(HubError::Rejected(rejection))
+            if rejection.message() == agentscm::hub::coordination::RESOLVE_NOT_PARTY
+    ));
+    let current = store
+        .coordination_ack(
+            &requester,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "native".into(),
+                expected_updated_seq: acknowledged.updated_seq,
+            },
+            now + 5,
+        )
+        .unwrap();
+    let withdrawn = store
+        .coordination_withdraw(
+            &requester,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "alias-withdraw".into(),
+                session: "native".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(withdrawn.status, CoordinationStatus::Withdrawn);
+}
+
+parity_case!(
+    requester_action_alias,
+    requester_acts_through_a_session_alias
+);
+
+fn requester_keeps_its_request_after_a_lead_credential_carries(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let replacement = token(&*store, 2, "replacement");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "lead"), now)
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let started = store
+        .work_start(
+            &requester,
+            &start_scope(
+                "docs",
+                "requester-session",
+                WorkRole::Lead,
+                None,
+                &["docs/**"],
+            ),
+            now + 1,
+        )
+        .unwrap();
+    let carried = store
+        .work_checkpoint(
+            &replacement,
+            &checkpoint(
+                &started.item.id,
+                "carry",
+                "requester-session",
+                started.item.updated_seq,
+                CheckpointKind::Progress,
+                None,
+            ),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(carried.item.lead_token, replacement);
+    assert!(
+        store
+            .work_overlap_consents(&replacement, &request.id, "requester-session", now + 3)
+            .is_ok()
+    );
+    let current = store
+        .coordination_ack(
+            &replacement,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: None,
+                session: "requester-session".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let withdrawn = store
+        .coordination_withdraw(
+            &replacement,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "carried-withdraw".into(),
+                session: "requester-session".into(),
+                expected_updated_seq: current.updated_seq,
+                target: None,
+                via_hub: false,
+            },
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(withdrawn.status, CoordinationStatus::Withdrawn);
+}
+
+parity_case!(
+    requester_carried_credential,
+    requester_keeps_its_request_after_a_lead_credential_carries
+);
+
 fn named_overlap_consent_is_fenced_and_not_an_admission(db: &Db) {
     use agentscm::hub::work_overlap::{WorkOverlapConsentRequest, WorkOverlapConsentState};
     let store = db.open();
