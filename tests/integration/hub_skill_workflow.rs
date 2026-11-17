@@ -130,6 +130,19 @@ impl Hub {
     }
 
     fn token(&self, repository: &str, read_only: bool) -> (String, Principal) {
+        self.bound_token(
+            repository,
+            if repository == HUB_REPOSITORY { 1 } else { 2 },
+            read_only,
+        )
+    }
+
+    fn bound_token(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        read_only: bool,
+    ) -> (String, Principal) {
         let user = self
             .store
             .upsert_user(
@@ -146,7 +159,7 @@ impl Hub {
             &user.id,
             "reader",
             repository,
-            1,
+            repository_id,
             600,
             read_only,
         )
@@ -170,6 +183,54 @@ impl Hub {
         let status = response.status().as_u16();
         let body = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
         (status, body)
+    }
+
+    async fn assert_workflow_visibility(&self, token: &str, availability: &str) {
+        for path in [
+            "/v1/hub/skill-workflows/run-1",
+            "/v1/hub/skill-workflows",
+            "/v1/hub/skill-workflows?q=review",
+        ] {
+            let (status, body) = self.get(path, token).await;
+            assert_eq!(status, 200, "{path}: {body}");
+            assert_eq!(body["availability"], availability, "{path}: {body}");
+            if availability == "unavailable" {
+                assert_eq!(body["reason"], "native_workflow_not_configured");
+                assert!(body.get("projection").is_none() && body.get("runs").is_none());
+            } else if path.ends_with("/run-1") {
+                assert_eq!(body["projection"]["run"]["run_id"], "run-1");
+            } else {
+                assert_eq!(body["runs"][0]["run_id"], "run-1");
+            }
+        }
+        for (name, arguments) in [
+            ("agentscm_workflow_status", json!({"run_id": "run-1"})),
+            ("agentscm_workflow_runs_list", json!({})),
+            ("agentscm_workflow_runs_list", json!({"q": "review"})),
+        ] {
+            let (status, body) = self
+                .rpc(
+                    "/mcp",
+                    token,
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments}}),
+                )
+                .await;
+            assert_eq!(status, 200, "{name}: {body}");
+            assert_eq!(body["result"]["isError"], false, "{name}: {body}");
+            let envelope: Value =
+                serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(envelope["availability"], availability, "{name}: {envelope}");
+            if availability == "unavailable" {
+                assert_eq!(envelope["reason"], "native_workflow_not_configured");
+                assert!(envelope.get("projection").is_none() && envelope.get("runs").is_none());
+            } else if name == "agentscm_workflow_status" {
+                assert_eq!(envelope["projection"]["run"]["run_id"], "run-1");
+            } else {
+                assert_eq!(envelope["runs"][0]["run_id"], "run-1");
+            }
+        }
     }
 
     async fn workflow_tool(&self, path: &str, token: &str, arguments: Value) -> Value {
@@ -213,9 +274,9 @@ fn registry(data_dir: &Path, native_repository: &str) -> SkillWorkflowRegistry {
     std::fs::write(
         &path,
         serde_json::to_vec(&json!({
-            "version": 1,
+            "version": 2,
             "bindings": [{
-                "hub_repository": HUB_REPOSITORY,
+                "hub_repository": HUB_REPOSITORY, "hub_host": "github.com", "hub_repository_id": 1,
                 "native_repository": native_repository,
                 "data_dir": data_dir,
             }]
@@ -551,6 +612,50 @@ async fn repository_scope_and_unconfigured_hubs_never_return_another_mapping() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_repository_name_on_another_forge_does_not_select_a_workflow_binding() {
+    let native = Native::initialized();
+    let hub = Hub::start(native.registry()).await;
+    let (own, _) = hub.token(HUB_REPOSITORY, true);
+    let (status, body) = hub.get("/v1/hub/skill-workflows/run-1", &own).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["availability"], "available", "{body}");
+    let other = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.com".into(),
+                user_id: 2,
+            },
+            "other",
+        )
+        .unwrap();
+    let (_, other, _) = mint_bound_agent_token(
+        &*hub.store,
+        &other.id,
+        "reader",
+        HUB_REPOSITORY,
+        1,
+        600,
+        true,
+    )
+    .unwrap();
+    hub.assert_workflow_visibility(other.expose(), "unavailable")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_bindings_follow_stable_ids_across_renames_and_reject_recreated_names() {
+    let native = Native::initialized();
+    let hub = Hub::start(native.registry()).await;
+    let (renamed, _) = hub.bound_token("acme/renamed", 1, true);
+    hub.assert_workflow_visibility(&renamed, "available").await;
+    let (recreated, _) = hub.bound_token(HUB_REPOSITORY, 2, true);
+    hub.assert_workflow_visibility(&recreated, "unavailable")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_http_and_mcp_requests_are_bounded_errors() {
     let native = Native::initialized();
     let hub = Hub::start(native.registry()).await;
@@ -645,9 +750,9 @@ async fn absent_journals_and_missing_configured_stores_are_never_initialized() {
     std::fs::write(
         &config,
         serde_json::to_vec(&json!({
-            "version": 1,
+            "version": 2,
             "bindings": [{
-                "hub_repository": HUB_REPOSITORY,
+                "hub_repository": HUB_REPOSITORY, "hub_host": "github.com", "hub_repository_id": 1,
                 "native_repository": "0".repeat(32),
                 "data_dir": missing,
             }]
@@ -666,25 +771,102 @@ fn binding_configuration_is_strict_bounded_and_unique() {
     let path = directory.path().join("bindings.json");
     let write = |value: Value| std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
-    write(json!({"version": 1, "bindings": [], "unknown": true}));
+    write(json!({"version": 2, "bindings": [], "unknown": true}));
     assert!(SkillWorkflowRegistry::from_file(&path).is_err());
     write(json!({
-        "version": 1,
+        "version": 2,
         "bindings": [
-            {"hub_repository": HUB_REPOSITORY, "native_repository": native.repository, "data_dir": native.dir.path()},
-            {"hub_repository": HUB_REPOSITORY, "native_repository": native.repository, "data_dir": native.dir.path()}
+            {"hub_repository": HUB_REPOSITORY, "hub_host": "github.com", "hub_repository_id": 1, "native_repository": native.repository, "data_dir": native.dir.path()},
+            {"hub_repository": HUB_REPOSITORY, "hub_host": "github.com", "hub_repository_id": 1, "native_repository": native.repository, "data_dir": native.dir.path()}
         ]
     }));
     assert!(SkillWorkflowRegistry::from_file(&path).is_err());
     write(json!({
-        "version": 1,
+        "version": 2,
         "bindings": [{
-            "hub_repository": HUB_REPOSITORY,
+            "hub_repository": HUB_REPOSITORY, "hub_host": "github.com", "hub_repository_id": 1,
             "native_repository": "A".repeat(32),
             "data_dir": native.dir.path()
         }]
     }));
     assert!(SkillWorkflowRegistry::from_file(&path).is_err());
+    let binding = json!({
+        "hub_repository": HUB_REPOSITORY,
+        "hub_host": "github.com",
+        "hub_repository_id": 1,
+        "native_repository": native.repository,
+        "data_dir": native.dir.path()
+    });
+    for (field, value) in [
+        ("hub_host", json!("")),
+        ("hub_host", json!("GitHub.com")),
+        ("hub_host", json!("https://github.com")),
+        ("hub_repository_id", json!(0)),
+        ("hub_repository_id", json!(-1)),
+        ("hub_repository_id", json!("1")),
+    ] {
+        let mut invalid = binding.clone();
+        invalid[field] = value;
+        write(json!({"version": 2, "bindings": [invalid]}));
+        assert!(SkillWorkflowRegistry::from_file(&path).is_err(), "{field}");
+    }
+    for field in ["hub_host", "hub_repository_id"] {
+        let mut missing = binding.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        write(json!({"version": 2, "bindings": [missing]}));
+        assert!(SkillWorkflowRegistry::from_file(&path).is_err(), "{field}");
+    }
+    let mut renamed = binding.clone();
+    renamed["hub_repository"] = json!("acme/renamed");
+    write(json!({"version": 2, "bindings": [binding, renamed]}));
+    assert!(
+        SkillWorkflowRegistry::from_file(&path).is_err(),
+        "a renamed identity is still a duplicate"
+    );
+    for (field, value) in [
+        ("hub_host", json!("gitlab.com")),
+        ("hub_repository_id", json!(2)),
+    ] {
+        let mut distinct = binding.clone();
+        distinct[field] = value;
+        write(json!({"version": 2, "bindings": [binding, distinct]}));
+        assert!(SkillWorkflowRegistry::from_file(&path).is_ok(), "{field}");
+    }
+    std::fs::write(&path, br#"{"version":2,"version":2,"bindings":[]}"#).unwrap();
+    assert!(SkillWorkflowRegistry::from_file(&path).is_err());
     std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
     assert!(SkillWorkflowRegistry::from_file(&path).is_err());
+}
+
+#[test]
+fn version_one_bindings_require_explicit_identity_migration() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("bindings.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({"version": 1, "bindings": [{
+            "hub_repository": HUB_REPOSITORY,
+            "native_repository": "0".repeat(32),
+            "data_dir": directory.path().join("missing-native")
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let error = SkillWorkflowRegistry::from_file(&path)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("migrate to version 2 with hub_host and hub_repository_id"),
+        "{error}"
+    );
+    assert!(
+        error.contains("docs/advanced/skill-workflow-hub.md"),
+        "{error}"
+    );
+    assert!(
+        error.contains("unset AGENTSCM_WORKFLOW_BINDINGS_FILE"),
+        "{error}"
+    );
+    assert!(!directory.path().join("missing-native").exists());
 }

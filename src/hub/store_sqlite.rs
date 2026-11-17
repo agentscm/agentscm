@@ -14142,6 +14142,9 @@ impl Store for SqliteStore {
         let opt_out_prefix = (audience == ConversationAudience::Sharing
             && who.repository_id.is_some())
         .then_some(super::conversation_sharing::OPT_OUT_KEY_PREFIX);
+        let opt_out_scope = who
+            .repository_id
+            .map(|id| super::store::repository_scope(&who.owner.identity.host, "", Some(id)));
         let mut statement = tx.prepare(
             "WITH page AS (
                  SELECT o.work,b.digest,b.size_bytes,o.session_id,o.generation,o.event_id,o.sequence,
@@ -14178,7 +14181,7 @@ impl Store for SqliteStore {
                     // Set only for readers of a sharing repository: an author who opted out is
                     // left out, with what they shared before.
                     opt_out_prefix,
-                    who.repository_id,
+                    opt_out_scope,
                     after.as_ref().map(|after| after.1)
                 ],
                 |row| {

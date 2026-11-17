@@ -1298,6 +1298,21 @@ at session start that sharing is on.
   `PUT .../conversation-sharing/me` with `{repository, opted_out}` sets the person's own choice;
   `PUT .../conversation-sharing/default` with `{enabled}` sets the Hub-wide default (Hub admins).
 
+The `repository_settings_scope` migration moves repository settings from keys that hold only the
+repository id to keys scoped by forge host and stable repository id, so equal ids on two hosts stay
+separate. It copies each legacy row under the prefixes `conversation_sharing:repo:`,
+`conversation_sharing:opt_out:`, `conversation_sharing:notified:`, `work_digest:repo:`,
+`work_digest:opt_out:`, `skill_forge_status:repo:`, `merged_release:repo:` and
+`deploy_workflow:repo:` to `<prefix>[<person>:]<host>/@repo-id:<id>` (the person part only for the
+`opt_out:` and `notified:` prefixes). The original rows stay. The migration refuses to start the Hub
+when a legacy id matches no forge host or several, when the row's writer, or its person, is not a
+user on that host, or when the scoped key already holds a different value; it changes nothing in that
+case. To recover, stop the Hub and back up the database, find the offending rows in `hub_settings`
+under those prefixes, write the intended scoped key if the value should be kept, then archive
+(rename out of these prefixes) or delete each offending legacy key, and restart. Writing the scoped
+key alone does not clear a refusal. On SQLite the refusal appears as the raw error `CHECK constraint failed: Map
+legacy settings to one forge host before upgrading`.
+
 The `shared_conversations` migration changed during development: a dev or staging Hub that ran a
 pre-release build of this branch must drop `hub_change_shared_bodies` and its named-migration record
 (or start fresh).

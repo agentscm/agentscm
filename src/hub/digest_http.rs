@@ -1,7 +1,7 @@
 //! The digest's read route and the two switches that decide who is sent it. Delivery is off for
 //! a repository until a repository admin (GitHub `admin`, GitLab maintainer or owner) or a Hub
 //! admin switches it on, and each person can switch their own off. Reading the digest needs
-//! neither switch. Values live in `hub_settings`, keyed by the forge's repository id so a rename
+//! neither switch. Values live in `hub_settings`, keyed by the forge host and stable repository id so a rename
 //! keeps them.
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
@@ -14,12 +14,18 @@ use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Principal, Store, unix_now};
 use super::{HubError, HubState, Result};
 
-fn repository_key(repository_id: i64) -> String {
-    format!("work_digest:repo:{repository_id}")
+fn repository_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "work_digest:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
-fn opt_out_key(user_id: &str, repository_id: i64) -> String {
-    format!("work_digest:opt_out:{user_id}:{repository_id}")
+fn opt_out_key(host: &str, user_id: &str, repository_id: i64) -> String {
+    format!(
+        "work_digest:opt_out:{user_id}:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// The digest switches as one person sees them. Readers ignore fields they do not know.
@@ -39,15 +45,18 @@ pub struct DigestSettings {
 /// before ids were kept) is never sent a digest, and an unreadable value reads as off.
 pub fn settings(
     store: &dyn Store,
+    host: &str,
     repository: &str,
     repository_id: Option<i64>,
     user_id: &str,
 ) -> Result<DigestSettings> {
     let (enabled, opted_out) = match repository_id {
         Some(id) => (
-            store.get_setting(&repository_key(id))?.as_deref() == Some("on"),
+            store.get_setting(&repository_key(host, id))?.as_deref() == Some("on"),
             !matches!(
-                store.get_setting(&opt_out_key(user_id, id))?.as_deref(),
+                store
+                    .get_setting(&opt_out_key(host, user_id, id))?
+                    .as_deref(),
                 None | Some("0")
             ),
         ),
@@ -64,23 +73,25 @@ pub fn settings(
 /// Switches the repository's digest on or off; the caller has checked that `actor` may.
 pub fn set_repository(
     store: &dyn Store,
+    host: &str,
     repository_id: i64,
     enabled: bool,
     actor: &str,
 ) -> Result<()> {
     let value = if enabled { "on" } else { "off" };
-    store.set_setting(&repository_key(repository_id), value, actor)
+    store.set_setting(&repository_key(host, repository_id), value, actor)
 }
 
 /// Records `user_id`'s own choice for one repository.
 pub fn set_opted_out(
     store: &dyn Store,
+    host: &str,
     user_id: &str,
     repository_id: i64,
     opted_out: bool,
 ) -> Result<()> {
     let value = if opted_out { "1" } else { "0" };
-    store.set_setting(&opt_out_key(user_id, repository_id), value, user_id)
+    store.set_setting(&opt_out_key(host, user_id, repository_id), value, user_id)
 }
 
 pub fn routes() -> Router<HubState> {
@@ -115,6 +126,7 @@ async fn read(
 fn view_of(store: &dyn Store, principal: &Principal) -> Result<DigestSettings> {
     settings(
         store,
+        &principal.owner.identity.host,
         &principal.repository,
         principal.repository_id,
         &principal.owner.id,
@@ -153,14 +165,9 @@ async fn set_enabled(
     // A Hub admin changes any connected repository's switch, with or without a forge role;
     // anyone else needs the forge to say now that they administer the repository.
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "work_digest",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "work_digest")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden()
             .with_message("Only a repository admin or a Hub admin switches the digest on or off"));
@@ -168,7 +175,13 @@ async fn set_enabled(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            set_repository(&*store, repository_id, body.enabled, &principal.owner.id)?;
+            set_repository(
+                &*store,
+                &principal.owner.identity.host,
+                repository_id,
+                body.enabled,
+                &principal.owner.id,
+            )?;
             view_of(&*store, &principal)
         })
         .await?,
@@ -190,7 +203,13 @@ async fn set_mine(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            set_opted_out(&*store, &principal.owner.id, repository_id, body.opted_out)?;
+            set_opted_out(
+                &*store,
+                &principal.owner.identity.host,
+                &principal.owner.id,
+                repository_id,
+                body.opted_out,
+            )?;
             view_of(&*store, &principal)
         })
         .await?,
@@ -207,9 +226,9 @@ pub struct MergedReleaseSettings {
 fn release_view_of(store: &dyn Store, principal: &Principal) -> MergedReleaseSettings {
     MergedReleaseSettings {
         repository: principal.repository.clone(),
-        enabled: principal
-            .repository_id
-            .is_some_and(|id| super::merged_holds::merged_release_enabled(store, id)),
+        enabled: principal.repository_id.is_some_and(|id| {
+            super::merged_holds::merged_release_enabled(store, &principal.owner.identity.host, id)
+        }),
     }
 }
 
@@ -231,14 +250,9 @@ async fn set_release(
     let repository_id = principal.repository_id.ok_or_else(no_repository_id)?;
     // The same standing as the digest switch: a Hub admin or a repository admin.
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "merged_release",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "merged_release")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden().with_message(
             "Only a repository admin or a Hub admin switches automatic release of merged Work on or off",
@@ -249,6 +263,7 @@ async fn set_release(
         blocking(&state, move || {
             super::merged_holds::set_merged_release(
                 &*store,
+                &principal.owner.identity.host,
                 repository_id,
                 body.enabled,
                 &principal.owner.id,
@@ -269,10 +284,11 @@ mod tests {
         let url = format!("sqlite://{}", dir.path().join("hub.db").display());
         let store = crate::hub::store::open(&url).unwrap();
         let store = &*store;
-        let of = |user: &str, id| settings(store, "o/r", id, user).unwrap();
+        let host = "github.com";
+        let of = |user: &str, id| settings(store, host, "o/r", id, user).unwrap();
         assert!(!of("usr_a", Some(7)).delivering, "off by default");
-        set_opted_out(store, "usr_b", 7, true).unwrap();
-        set_repository(store, 7, true, "usr_admin").unwrap();
+        set_opted_out(store, host, "usr_b", 7, true).unwrap();
+        set_repository(store, host, 7, true, "usr_admin").unwrap();
         assert!(of("usr_a", Some(7)).delivering);
         assert!(!of("usr_a", Some(8)).enabled, "per repository");
         assert!(!of("usr_a", None).enabled, "no forge id is never sent one");
@@ -281,16 +297,16 @@ mod tests {
             left.enabled && left.opted_out && !left.delivering,
             "per person"
         );
-        set_opted_out(store, "usr_b", 7, false).unwrap();
+        set_opted_out(store, host, "usr_b", 7, false).unwrap();
         assert!(of("usr_b", Some(7)).delivering);
         store
-            .set_setting(&opt_out_key("usr_b", 7), "unreadable", "usr_b")
+            .set_setting(&opt_out_key(host, "usr_b", 7), "unreadable", "usr_b")
             .unwrap();
         assert!(
             !of("usr_b", Some(7)).delivering,
             "unreadable is out, not in"
         );
-        set_repository(store, 7, false, "usr_admin").unwrap();
+        set_repository(store, host, 7, false, "usr_admin").unwrap();
         assert!(!of("usr_a", Some(7)).delivering);
     }
 }

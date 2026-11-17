@@ -429,15 +429,18 @@ fn work_facts_in(
     ))
 }
 
-fn release_key(repository_id: i64) -> String {
-    format!("merged_release:repo:{repository_id}")
+fn release_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "merged_release:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// Whether the repository opted in to releasing the hold of Work its merged pull request
 /// finished. Off unless the stored value is exactly `on`; a missing or unreadable value is off.
-pub fn merged_release_enabled(store: &dyn Store, repository_id: i64) -> bool {
+pub fn merged_release_enabled(store: &dyn Store, host: &str, repository_id: i64) -> bool {
     store
-        .get_setting(&release_key(repository_id))
+        .get_setting(&release_key(host, repository_id))
         .ok()
         .flatten()
         .as_deref()
@@ -448,12 +451,13 @@ pub fn merged_release_enabled(store: &dyn Store, repository_id: i64) -> bool {
 /// may.
 pub fn set_merged_release(
     store: &dyn Store,
+    host: &str,
     repository_id: i64,
     enabled: bool,
     actor: &str,
 ) -> super::Result<()> {
     let value = if enabled { "on" } else { "off" };
-    store.set_setting(&release_key(repository_id), value, actor)
+    store.set_setting(&release_key(host, repository_id), value, actor)
 }
 
 /// The audience under which a policy release is claimed, once per Work ever.
@@ -514,7 +518,7 @@ pub fn release_settled(
 ) -> super::Result<Vec<String>> {
     use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
     let mut released = Vec::new();
-    if read.is_empty() || !merged_release_enabled(store, repo.repository_id) {
+    if read.is_empty() || !merged_release_enabled(store, &repo.host, repo.repository_id) {
         return Ok(released);
     }
     // A closure this poll did not read again may be stale (the issue reopened), so only Work whose

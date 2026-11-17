@@ -1301,15 +1301,16 @@ pub(super) async fn observe_open_pull(
     let Some(pull) = ForgePull::read(repo, fields) else {
         return;
     };
-    let (store, scope, id) = (
+    let (store, scope, host, id) = (
         state.store.clone(),
         repo.repository_scope(),
+        repo.host.clone(),
         repo.repository_id,
     );
     let read = blocking(state, move || {
         Ok((
             adopted_names(&*store, &scope)?,
-            status_setting(&*store, id)?,
+            status_setting(&*store, &host, id)?,
         ))
     })
     .await;
@@ -1468,16 +1469,22 @@ pub(super) async fn observe_merge(
 
 // ---- the skill status setting -----------------------------------------------------------------
 
-/// Per repository, keyed by the forge's repository id so a rename keeps it, in `hub_settings`
+/// Per repository, keyed by the forge host and stable repository id so a rename keeps it, in `hub_settings`
 /// like conversation sharing. Off unless a repository admin or a Hub admin turns it on.
-fn status_key(repository_id: i64) -> String {
-    format!("skill_forge_status:repo:{repository_id}")
+fn status_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "skill_forge_status:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// `None` when it was never set: the Hub has never posted a skill status there.
-fn status_setting(store: &dyn Store, repository_id: i64) -> Result<Option<bool>> {
+fn status_setting(store: &dyn Store, host: &str, repository_id: i64) -> Result<Option<bool>> {
     Ok(
-        match store.get_setting(&status_key(repository_id))?.as_deref() {
+        match store
+            .get_setting(&status_key(host, repository_id))?
+            .as_deref()
+        {
             Some("on") => Some(true),
             Some(_) => Some(false),
             None => None,
@@ -1518,7 +1525,7 @@ async fn status_setting_route(
                 .repository_named(&host, &name)?
                 .map(|r| r.repository_id),
         };
-        id.map_or(Ok(None), |id| status_setting(&*store, id))
+        id.map_or(Ok(None), |id| status_setting(&*store, &host, id))
     })
     .await?;
     Ok(Json(
@@ -1531,10 +1538,10 @@ async fn session_status_setting(
     human: HumanSession,
     Query(query): Query<StatusSettingQuery>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (_, name, id, can_change, _) =
+    let (_, host, name, id, can_change, _) =
         super::conversation_sharing::session_scope(&state, &human, &query.repository, VIA).await?;
     let store = state.store.clone();
-    let enabled = blocking(&state, move || status_setting(&*store, id)).await?;
+    let enabled = blocking(&state, move || status_setting(&*store, &host, id)).await?;
     Ok(Json(
         json!({"repository": name, "enabled": enabled == Some(true),
         "can_change": can_change}),
@@ -1546,7 +1553,7 @@ async fn session_set_status_setting(
     human: HumanSession,
     JsonBody(body): JsonBody<SetStatusSetting>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (user, name, id, can_change, _) =
+    let (user, host, name, id, can_change, _) =
         super::conversation_sharing::session_scope(&state, &human, &body.repository, VIA).await?;
     if !can_change {
         return Err(ApiError::forbidden().with_message(
@@ -1556,7 +1563,7 @@ async fn session_set_status_setting(
     let store = state.store.clone();
     let value = if body.enabled { "on" } else { "off" };
     blocking(&state, move || {
-        store.set_setting(&status_key(id), value, &user)
+        store.set_setting(&status_key(&host, id), value, &user)
     })
     .await?;
     Ok(Json(
@@ -2126,6 +2133,22 @@ pub(super) async fn mcp_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_repository_ids_on_different_hosts_keep_forge_status_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            super::super::store::open(&format!("sqlite://{}", dir.path().join("hub.db").display()))
+                .unwrap();
+        store
+            .set_setting(&status_key("github.com", 7), "on", "admin")
+            .unwrap();
+        assert_eq!(
+            status_setting(&*store, "github.com", 7).unwrap(),
+            Some(true)
+        );
+        assert_eq!(status_setting(&*store, "gitlab.com", 7).unwrap(), None);
+    }
 
     #[test]
     fn only_a_forge_outage_keeps_the_last_definition() {

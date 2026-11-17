@@ -800,16 +800,15 @@ async fn person_handoffs(
     query: std::result::Result<Query<HandoffQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let user = human.web_user()?;
-    let (me, host) = (user.id.clone(), user.identity.host.clone());
+    let me = user.id.clone();
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    super::store::validate_repository(&query.repository)?;
+    let repo =
+        super::login::devices::read_check(&state, user, &query.repository, "handoffs").await?;
+    let scope = repo.repository_scope();
     let store = state.store.clone();
     let owner = me.clone();
     let rows = blocking(&state, move || {
-        // The rows are kept by the repository connected under the name on the person's host.
-        let scope = match store.repository_named(&host, &query.repository)? {
-            Some(repo) => repo.repository_scope(),
-            None => super::store::repository_scope(&host, &query.repository, None),
-        };
         store.handoffs_of_owner(&owner, &scope, unix_now(), PERSON_HANDOFFS)
     })
     .await

@@ -28,6 +28,7 @@ use super::super::store::{
     NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
     unix_now, validate_agent_name, validate_repository,
 };
+use super::super::sync::find_repository;
 use super::super::work::WorkOverviewQuery;
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, Login, random_hex, session_digest};
@@ -552,6 +553,36 @@ pub(in crate::hub) async fn mint_access(
         .map(|(repo, level)| (repo, level == Level::Administer))
 }
 
+/// [`mint_access`] for the repository the token was issued for, found by its stable forge id
+/// when the token has one, so a rename or a name another repository took cannot change which
+/// repository is judged.
+pub(in crate::hub) async fn token_access(
+    state: &HubState,
+    principal: &Principal,
+    via: &'static str,
+) -> ApiResult<(ConnectedRepository, bool)> {
+    let owner = &principal.owner;
+    let decision = access::decide(state, owner).await?;
+    admitted(state, owner, &decision, via).await?;
+    let (store, who) = (state.store.clone(), principal.clone());
+    let forge = super::forge_name(&owner.identity.provider);
+    let Some(repo) = blocking(state, move || {
+        find_repository(
+            &*store,
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        )
+    })
+    .await?
+    else {
+        return Err(refused_about("not_connected", &principal.repository, forge));
+    };
+    selected_level(state, owner, &decision, repo, via, forge)
+        .await
+        .map(|(repo, level)| (repo, level == Level::Administer))
+}
+
 /// [`mint_check`] at [`Level::Read`] for a page's poll, and for a person's own dismissals: a role
 /// answer kept within [`ROLE_CHECK_TTL_SECONDS`] that `owner` may contribute stands in for asking
 /// the forge again. The allow list is still checked on every call.
@@ -622,6 +653,18 @@ async fn decided_level(
             None => refused_about("not_connected", repository, forge),
         });
     };
+    selected_level(state, owner, decision, repo, via, forge).await
+}
+
+/// What `owner` may do on the already selected `repo`, refusing and recording as a mint does.
+async fn selected_level(
+    state: &HubState,
+    owner: &User,
+    decision: &Decision,
+    repo: ConnectedRepository,
+    via: &'static str,
+    forge: &'static str,
+) -> ApiResult<(ConnectedRepository, Level)> {
     let level = match repository_level(state, owner, &repo, decision).await {
         Ok(level) => level,
         Err(Denial::Role(role)) => {
