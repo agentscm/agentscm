@@ -3815,6 +3815,222 @@ fn repository_scope_backfill(db: &Db) {
     assert!(store.skill_adoption(&connected_scope).unwrap().is_some());
 }
 
+fn repository_settings_scope_preserves_unambiguous_rows(db: &Db) {
+    let store = db.open();
+    let owner = store.upsert_user(&identity(1), "owner").unwrap();
+    mint_bound_agent_token(&*store, &owner.id, "agent", REPO, 101, TTL, false).unwrap();
+    let scope = store::repository_scope("github.com", REPO, Some(101));
+    let mut rows = Vec::new();
+    for (prefix, value) in [
+        ("conversation_sharing:repo:", "off"),
+        ("work_digest:repo:", "on"),
+        ("skill_forge_status:repo:", "off"),
+        ("merged_release:repo:", "on"),
+    ] {
+        rows.push((format!("{prefix}101"), format!("{prefix}{scope}"), value));
+    }
+    for (prefix, value) in [
+        ("conversation_sharing:opt_out:", "1"),
+        ("conversation_sharing:notified:", "1"),
+        ("work_digest:opt_out:", "0"),
+    ] {
+        rows.push((
+            format!("{prefix}{}:101", owner.id),
+            format!("{prefix}{}:{scope}", owner.id),
+            value,
+        ));
+    }
+    for (old, _, value) in &rows {
+        store.set_setting(old, value, &owner.id).unwrap();
+    }
+    db.exec(
+        "UPDATE hub_settings SET updated_at=123 WHERE key <> 'conversation_sharing:default';
+        DELETE FROM hub_named_migrations WHERE name='repository_settings_scope';",
+    )
+    .unwrap();
+    drop(store);
+    for _ in 0..2 {
+        let store = db.open();
+        for (old, new, value) in &rows {
+            assert_eq!(
+                store.get_setting(old).unwrap().as_deref(),
+                Some(*value),
+                "original {old}"
+            );
+            assert_eq!(
+                store.get_setting(new).unwrap().as_deref(),
+                Some(*value),
+                "scoped {new}"
+            );
+            assert_eq!(db.count(&format!("SELECT COUNT(*) FROM hub_settings WHERE key='{new}' AND updated_at=123 AND updated_by='{}'", owner.id)), 1);
+        }
+        drop(store);
+        db.exec("DELETE FROM hub_named_migrations WHERE name='repository_settings_scope'")
+            .unwrap();
+    }
+    let _ = db.open();
+}
+
+fn repository_settings_scope_refuses_ambiguous_hosts_atomically(db: &Db) {
+    let store = db.open();
+    let mut owners = Vec::new();
+    for (provider, host, user_id, repository_id) in [
+        ("github", "github.com", 1, 101),
+        ("gitlab", "gitlab.com", 2, 101),
+        ("github", "github.com", 3, 202),
+    ] {
+        let owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: provider.into(),
+                    host: host.into(),
+                    user_id,
+                },
+                "owner",
+            )
+            .unwrap();
+        mint_bound_agent_token(&*store, &owner.id, "agent", REPO, repository_id, TTL, false)
+            .unwrap();
+        owners.push(owner.id);
+    }
+    store
+        .set_setting("conversation_sharing:repo:101", "off", &owners[0])
+        .unwrap();
+    store
+        .set_setting("work_digest:repo:202", "on", &owners[2])
+        .unwrap();
+    db.exec("DELETE FROM hub_named_migrations WHERE name='repository_settings_scope'")
+        .unwrap();
+    drop(store);
+    let error = store::open(&db.url)
+        .err()
+        .expect("ambiguous legacy ID must refuse");
+    assert!(
+        error
+            .to_string()
+            .to_lowercase()
+            .contains("map legacy settings to one forge host"),
+        "{error}"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM hub_settings WHERE key LIKE '%/@repo-id:%'"),
+        0,
+        "no partial copy of the unambiguous setting"
+    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_settings WHERE key='conversation_sharing:repo:101' AND value='off'"), 1);
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM hub_settings WHERE key='work_digest:repo:202' AND value='on'"
+        ),
+        1
+    );
+    assert!(
+        !db.named()
+            .iter()
+            .any(|name| name == "repository_settings_scope")
+    );
+}
+
+fn repository_settings_scope_refuses_unmapped_rows(db: &Db) {
+    let store = db.open();
+    let owner = store.upsert_user(&identity(1), "owner").unwrap();
+    store
+        .set_setting("conversation_sharing:repo:999", "off", &owner.id)
+        .unwrap();
+    db.exec("DELETE FROM hub_named_migrations WHERE name='repository_settings_scope'")
+        .unwrap();
+    drop(store);
+    let error = store::open(&db.url)
+        .err()
+        .expect("unmapped legacy ID must refuse");
+    assert!(
+        error
+            .to_string()
+            .to_lowercase()
+            .contains("map legacy settings to one forge host"),
+        "{error}"
+    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_settings WHERE key='conversation_sharing:repo:999' AND value='off'"), 1);
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM hub_settings WHERE key LIKE '%/@repo-id:%'"),
+        0
+    );
+}
+
+fn repository_settings_scope_refuses_unproven_writers(db: &Db) {
+    let store = db.open();
+    let owner = store.upsert_user(&identity(1), "owner").unwrap();
+    mint_bound_agent_token(&*store, &owner.id, "agent", REPO, 101, TTL, false).unwrap();
+    let foreign = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.com".into(),
+                user_id: 2,
+            },
+            "other",
+        )
+        .unwrap();
+    store
+        .set_setting("conversation_sharing:repo:101", "off", &foreign.id)
+        .unwrap();
+    db.exec("DELETE FROM hub_named_migrations WHERE name='repository_settings_scope'")
+        .unwrap();
+    drop(store);
+    for actor in [&foreign.id, "unknown"] {
+        db.exec(&format!(
+            "UPDATE hub_settings SET updated_by='{actor}' WHERE key='conversation_sharing:repo:101'"
+        ))
+        .unwrap();
+        let error = store::open(&db.url)
+            .err()
+            .expect("writer provenance must resolve");
+        assert!(
+            error
+                .to_string()
+                .to_lowercase()
+                .contains("map legacy settings to one forge host"),
+            "{error}"
+        );
+        assert_eq!(db.count("SELECT COUNT(*) FROM hub_settings WHERE key='conversation_sharing:repo:101' AND value='off'"), 1);
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM hub_settings WHERE key LIKE '%/@repo-id:%'"),
+            0
+        );
+    }
+}
+
+fn repository_settings_scope_refuses_conflicting_scoped_values(db: &Db) {
+    let store = db.open();
+    let owner = store.upsert_user(&identity(1), "owner").unwrap();
+    mint_bound_agent_token(&*store, &owner.id, "agent", REPO, 101, TTL, false).unwrap();
+    store
+        .set_setting("conversation_sharing:repo:101", "off", &owner.id)
+        .unwrap();
+    store
+        .set_setting(
+            "conversation_sharing:repo:github.com/@repo-id:101",
+            "on",
+            &owner.id,
+        )
+        .unwrap();
+    db.exec("DELETE FROM hub_named_migrations WHERE name='repository_settings_scope'")
+        .unwrap();
+    drop(store);
+    let error = store::open(&db.url)
+        .err()
+        .expect("a scoped value must not be overwritten");
+    assert!(
+        error
+            .to_string()
+            .to_lowercase()
+            .contains("map legacy settings to one forge host"),
+        "{error}"
+    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_settings WHERE key='conversation_sharing:repo:101' AND value='off'"), 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_settings WHERE key='conversation_sharing:repo:github.com/@repo-id:101' AND value='on'"), 1);
+}
+
 /// Three repositories named `acme/widgets`: one on github.com, one on gitlab.com with the same
 /// forge id, and one on github.com with another id (as after the first was renamed and its name
 /// reused). Each reads only its own intents, publications, skill rows and hook overhead.
@@ -4295,6 +4511,11 @@ conformance!(
     skill_adoption_and_evidence,
     same_name_repositories_stay_apart,
     repository_scope_backfill,
+    repository_settings_scope_preserves_unambiguous_rows,
+    repository_settings_scope_refuses_ambiguous_hosts_atomically,
+    repository_settings_scope_refuses_unmapped_rows,
+    repository_settings_scope_refuses_unproven_writers,
+    repository_settings_scope_refuses_conflicting_scoped_values,
     devices_and_refusals,
     browser_sessions,
     local_ci_enroll_read_list_and_advance,

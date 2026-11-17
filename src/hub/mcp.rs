@@ -3577,9 +3577,12 @@ async fn picker_call(
             Err(_) => return invalid_args(name, "before is not a valid cursor"),
         };
         let registry = state.skill_workflows.clone();
-        let repository = principal.repository.clone();
+        let scope = match super::store::scope_of(state, principal).await {
+            Ok(scope) => scope,
+            Err(error) => return hub_failure(&error),
+        };
         return match blocking(state, move || {
-            Ok(registry.page(&repository, before, search.as_deref()))
+            Ok(registry.page(&scope, before, search.as_deref()))
         })
         .await
         {
@@ -3644,9 +3647,12 @@ async fn picker_call(
 
 async fn workflow_status(state: &HubState, principal: &Principal, run_id: &str) -> Value {
     let registry = state.skill_workflows.clone();
-    let repository = principal.repository.clone();
+    let scope = match super::store::scope_of(state, principal).await {
+        Ok(scope) => scope,
+        Err(error) => return hub_failure(&error),
+    };
     let run_id = run_id.to_owned();
-    match blocking(state, move || Ok(registry.read(&repository, &run_id))).await {
+    match blocking(state, move || Ok(registry.read(&scope, &run_id))).await {
         Ok(Ok(envelope)) => match serde_json::to_string(&envelope) {
             Ok(text) => result(&text, false),
             Err(_) => refused("unavailable"),

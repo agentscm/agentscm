@@ -1963,10 +1963,10 @@ fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
             .len()
     };
     let opt_out = |user: &str, repository_id: i64| {
-        format!("conversation_sharing:opt_out:{user}:{repository_id}")
+        format!("conversation_sharing:opt_out:{user}:github.com/@repo-id:{repository_id}")
     };
     let notified = |user: &str, repository_id: i64| {
-        format!("conversation_sharing:notified:{user}:{repository_id}")
+        format!("conversation_sharing:notified:{user}:github.com/@repo-id:{repository_id}")
     };
     assert_eq!(listed(&reader_token, Own), 0);
     assert_eq!(listed(&reader_token, Sharing), 1, "shared by default");

@@ -297,15 +297,23 @@ fn delivery_switches_are_per_repository_and_per_person(db: &Db) {
     let store = &*db.store;
     let alice = person(store, 1, "alice");
     let view = |who: &Person| {
-        digest_http::settings(store, REPO, who.reader.repository_id, &who.reader.owner.id).unwrap()
+        digest_http::settings(
+            store,
+            "github.com",
+            REPO,
+            who.reader.repository_id,
+            &who.reader.owner.id,
+        )
+        .unwrap()
     };
     assert!(
         !view(&alice).enabled && !view(&alice).delivering,
         "off by default"
     );
-    digest_http::set_repository(store, REPO_ID, true, &alice.reader.owner.id).unwrap();
+    digest_http::set_repository(store, "github.com", REPO_ID, true, &alice.reader.owner.id)
+        .unwrap();
     assert!(view(&alice).delivering);
-    digest_http::set_opted_out(store, &alice.reader.owner.id, REPO_ID, true).unwrap();
+    digest_http::set_opted_out(store, "github.com", &alice.reader.owner.id, REPO_ID, true).unwrap();
     let mine = view(&alice);
     assert!(mine.enabled && mine.opted_out && !mine.delivering);
     assert!(view(&person(store, 2, "bob")).delivering, "per person");
@@ -446,4 +454,151 @@ async fn the_route_reads_without_slack_and_only_an_admin_switches_delivery_on() 
     let unknown = Some(json!({"opted_out": true, "enabled": true}));
     let path = format!("{SETTINGS}/me");
     assert_eq!(call(&base, Method::PUT, &path, alice, unknown).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_repository_ids_on_distinct_hosts_keep_digest_settings_separate() {
+    use reqwest::Method;
+    let db = Db::sqlite();
+    let admin = person(&*db.store, 900, "root");
+    let other = db
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.com".into(),
+                user_id: 1,
+            },
+            "other",
+        )
+        .unwrap();
+    let (_, other, _) =
+        mint_bound_agent_token(&*db.store, &other.id, "reader", REPO, REPO_ID, TTL, true).unwrap();
+    let base = serve(&db).await;
+    for settings in [
+        "/v1/hub/standup/digest/settings",
+        "/v1/hub/standup/merged-release/settings",
+    ] {
+        for secret in [admin.agent_secret.as_str(), other.expose()] {
+            let (status, body) = call(&base, Method::GET, settings, secret, None).await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["enabled"], false, "{body}");
+        }
+        let (status, body) = call(
+            &base,
+            Method::PUT,
+            settings,
+            &admin.agent_secret,
+            Some(json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enabled"], true, "{body}");
+        let (status, body) = call(&base, Method::GET, settings, other.expose(), None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["enabled"], false,
+            "another forge's repository keeps its own switch: {body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_switch_writes_authorize_the_tokens_stable_id_after_a_rename() {
+    use agentscm::hub::access::{Access, Grant, Level};
+    use agentscm::hub::connection::NewConnection;
+    use reqwest::Method;
+
+    struct Grants(Vec<Grant>);
+    impl Access for Grants {
+        fn grants(&self, _: &store::User) -> agentscm::hub::Result<Option<Vec<Grant>>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+    let db = Db::sqlite();
+    let person = person(&*db.store, 1, "owner");
+    let connection = db
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: store::new_connection_id().unwrap(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "embedded".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic-bot".into()),
+            },
+            &person.reader.owner.id,
+        )
+        .unwrap();
+    let original = db
+        .store
+        .upsert_repository(
+            &connection.id,
+            "github.com",
+            REPO_ID,
+            "acme/renamed",
+            None,
+            None,
+        )
+        .unwrap();
+    let replacement = db
+        .store
+        .upsert_repository(&connection.id, "github.com", REPO_ID + 1, REPO, None, None)
+        .unwrap();
+    let (_, replacement_token, _) = mint_bound_agent_token(
+        &*db.store,
+        &person.reader.owner.id,
+        "replacement",
+        REPO,
+        REPO_ID + 1,
+        TTL,
+        false,
+    )
+    .unwrap();
+    let objects = LocalBackend::open(db._dir.as_ref().unwrap().path().join("objects")).unwrap();
+    let state =
+        HubState::new(db.store.clone(), Arc::new(objects)).with_access(Arc::new(Grants(vec![
+            Grant {
+                repository: original,
+                level: Level::Contribute,
+            },
+            Grant {
+                repository: replacement,
+                level: Level::Administer,
+            },
+        ])));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router(state)).await });
+    for settings in [
+        "/v1/hub/standup/digest/settings",
+        "/v1/hub/standup/merged-release/settings",
+    ] {
+        let (status, body) = call(
+            &base,
+            Method::PUT,
+            settings,
+            replacement_token.expose(),
+            Some(json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the administered stable repository stays writable: {body}"
+        );
+        let (status, body) = call(
+            &base,
+            Method::PUT,
+            settings,
+            &person.agent_secret,
+            Some(json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "administering the reused name must not administer the original ID: {body}"
+        );
+    }
 }

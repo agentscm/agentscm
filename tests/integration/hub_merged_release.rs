@@ -273,7 +273,7 @@ fn release(db: &Db, w: &World) -> Vec<String> {
 
 fn an_issue_not_read_this_poll_is_not_released(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     let none = BTreeSet::new();
     let other = BTreeSet::from([8]);
     for read in [&none, &other] {
@@ -295,14 +295,14 @@ fn an_issue_not_read_this_poll_is_not_released(db: &Db) {
 
 fn off_by_default_keeps_the_hold(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    assert!(!merged_release_enabled(&*db.store, REPO_ID));
+    assert!(!merged_release_enabled(&*db.store, "github.com", REPO_ID));
     assert!(release(db, &w).is_empty());
     assert!(held(db, &w).0);
 }
 
 fn on_releases_a_settled_hold_once_and_never_completes(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     assert_eq!(release(db, &w), vec![w.work.clone()]);
     let (holds, item) = held(db, &w);
     assert!(!holds, "the hold is released");
@@ -338,8 +338,8 @@ fn on_releases_a_settled_hold_once_and_never_completes(db: &Db) {
     assert!(release(db, &w).is_empty());
     assert_eq!(db.store.latest_event_seq().unwrap(), before);
     // Turning it off again changes no stored Work.
-    set_merged_release(&*db.store, REPO_ID, false, &w.owner).unwrap();
-    assert!(!merged_release_enabled(&*db.store, REPO_ID));
+    set_merged_release(&*db.store, "github.com", REPO_ID, false, &w.owner).unwrap();
+    assert!(!merged_release_enabled(&*db.store, "github.com", REPO_ID));
 }
 
 fn other_facts_keep_the_hold(db_with: impl Fn() -> Db) {
@@ -366,7 +366,7 @@ fn other_facts_keep_the_hold(db_with: impl Fn() -> Db) {
     for (name, stored) in cases {
         let db = db_with();
         let w = world(&db, stored);
-        set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+        set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
         assert!(release(&db, &w).is_empty(), "{name}");
         assert!(held(&db, &w).0, "{name}: the hold is kept");
     }
@@ -376,7 +376,7 @@ fn other_facts_keep_the_hold(db_with: impl Fn() -> Db) {
 /// gives the claim back so a later run releases.
 fn a_refused_release_keeps_the_claim_only_when_the_hold_is_gone(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     let owner = db.store.user_by_id(&w.owner).unwrap().unwrap();
     let reader = WorkLifecycleReader::Person {
         owner: &owner,
@@ -454,7 +454,7 @@ fn merge_row(number: u64, branch: &str, same_repository: bool) -> NewCatchupMerg
 
 fn a_resumed_work_is_not_released_again(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     assert_eq!(release(db, &w), vec![w.work.clone()]);
     assert!(!held(db, &w).0);
     resume(db, &w);
@@ -466,7 +466,7 @@ fn a_resumed_work_is_not_released_again(db: &Db) {
 
 fn every_pull_request_must_be_merged(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     // A second pull request the Work declares (v2) that is not merged.
     let item = db
         .store
@@ -512,7 +512,7 @@ fn every_pull_request_must_be_merged(db: &Db) {
 
 fn another_open_pull_request_on_the_branch_blocks_an_explicit_link(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     let item = db
         .store
         .work_get(&w.token, &w.work, unix_now())
@@ -554,7 +554,7 @@ fn another_open_pull_request_on_the_branch_blocks_an_explicit_link(db: &Db) {
 
 fn a_limited_neighbour_does_not_block_a_clean_work(db: &Db) {
     let w = world(db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     // A second Work, on a branch whose merge history may be truncated: inference finds its one
     // merged pull request (60) but cannot rule out older ones.
     let other = db
@@ -733,7 +733,7 @@ fn a_reopened_or_resumed_work_is_not_completed_again(db_with: impl Fn() -> Db) {
     // A Work the opted-in policy released and its lead resumed keeps its hold, too.
     let db = db_with();
     let w = world(&db, Some(completed_by(41)));
-    set_merged_release(&*db.store, REPO_ID, true, &w.owner).unwrap();
+    set_merged_release(&*db.store, "github.com", REPO_ID, true, &w.owner).unwrap();
     assert_eq!(release(&db, &w), vec![w.work.clone()]);
     resume(&db, &w);
     assert!(complete(&db, &w, lapsed()).is_empty());
@@ -1104,11 +1104,11 @@ async fn only_an_admin_switches_the_release_on_and_it_reads_off_by_default() {
     let on = Some(json!({"enabled": true}));
     let (status, refusal) = call(Method::PUT, alice.secret.clone(), on.clone()).await;
     assert!((400..500).contains(&status), "{status}: {refusal}");
-    assert!(!merged_release_enabled(&*db.store, REPO_ID));
+    assert!(!merged_release_enabled(&*db.store, "github.com", REPO_ID));
     let (status, view) = call(Method::PUT, admin.clone(), on).await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(view["enabled"], true);
-    assert!(merged_release_enabled(&*db.store, REPO_ID));
+    assert!(merged_release_enabled(&*db.store, "github.com", REPO_ID));
     let (_, view) = call(Method::GET, alice.secret.clone(), None).await;
     assert_eq!(view["enabled"], true);
     let (status, view) = call(Method::PUT, admin, Some(json!({"enabled": false}))).await;
