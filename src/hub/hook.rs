@@ -4627,6 +4627,8 @@ mod tests {
                     hub.state.onboarding.epoch(),
                 )
                 .unwrap();
+            // The hook timestamps the wait itself and may cross a second boundary.
+            let now = unix_now();
             let ordinary_wait =
                 hub.state
                     .onboarding
