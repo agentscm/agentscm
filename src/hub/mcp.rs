@@ -5352,6 +5352,14 @@ mod tests {
                 if read_only {
                     assert!(!text.contains("agentscm_start"));
                     assert!(!text.contains("agentscm_work_overlap_consent"));
+                    for fact in [
+                        "agentscm_workflow_status",
+                        "Historical run state",
+                        "present applicability",
+                        "neither is an admission decision",
+                    ] {
+                        assert!(text.contains(fact), "{fact}");
+                    }
                 } else {
                     assert!(agent_rules::carries_all(text));
                     assert!(text.starts_with(&agent_rules::prose()));
