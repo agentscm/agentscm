@@ -2761,7 +2761,7 @@ fn finished_paths_survive_a_carry_and_a_resume_but_not_another_lead(db: &Db) {
     assert!(resumed.took_over, "{:?}", resumed.conflict);
     assert_eq!(resumed.item.finished_paths, ["src/"]);
     assert!(handed.generation < resumed.item.generation);
-    // A different lead session does not inherit the old lead's report.
+    // Another owner's session does not inherit the old lead's report, even under the same label.
     let handed = step(
         &replacement.token,
         "hand2",
@@ -2772,7 +2772,7 @@ fn finished_paths_survive_a_carry_and_a_resume_but_not_another_lead(db: &Db) {
     let taken = store
         .work_start(
             &successor.token,
-            &takeover(&started.id, "successor", Some(handed.generation)),
+            &takeover(&started.id, "live", Some(handed.generation)),
             now + 3,
         )
         .unwrap();

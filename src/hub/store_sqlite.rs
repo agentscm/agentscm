@@ -5039,6 +5039,11 @@ fn start_overlap_in(
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
+        let previous_lead_owner = item
+            .participants
+            .iter()
+            .find(|participant| participant.role == WorkRole::Lead)
+            .map(|participant| participant.owner.clone());
         for participant in &mut item.participants {
             if participant.role == WorkRole::Lead {
                 participant.role = WorkRole::Helper;
@@ -5067,7 +5072,10 @@ fn start_overlap_in(
         item.lead_token = who.token.clone();
         item.lead_agent = who.agent.clone();
         item.lead_session = start.session.clone();
-        if previous_lead_session != start.session {
+        // The lead's own self-report survives only the same owner's same session resuming.
+        if previous_lead_session != start.session
+            || previous_lead_owner.as_deref() != Some(who.owner.id.as_str())
+        {
             item.finished_paths.clear();
         }
         item.generation += 1;

@@ -148,8 +148,9 @@ pub struct CoordinationRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub released_paths: Vec<String>,
     /// False when `released_paths` may be missing paths: the request names more than
-    /// `MAX_RELEASED_PATHS`, or more than `MAX_RELEASE_EVENTS` releases were recorded. Left
-    /// out of the JSON when true.
+    /// `MAX_RELEASED_PATHS`, more than `MAX_RELEASE_EVENTS` releases were recorded, or more than
+    /// `MAX_RELEASED_PATHS` candidate paths were found and the list was cut. Left out of the
+    /// JSON when true.
     #[serde(default = "complete_default", skip_serializing_if = "is_true")]
     pub released_paths_complete: bool,
 }

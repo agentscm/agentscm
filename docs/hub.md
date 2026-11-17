@@ -974,8 +974,8 @@ counter-offer.
   call instead. The requester is told once, on its next call, that the ask lapsed with no
   reply; this is never reported as an acceptance. If no session holds the path then (a hold on a
   directory above it, such as `src/**`, counts as holding it), the
-  text says the file is free unless someone else took it and to start on it with
-  `agentscm_start`; if another session holds it, the text says the session asked no longer
+  text says the session asked no longer holds it and gave no reply, and that
+  `agentscm_start` tells the requester whether it is free now; if another session holds it, the text says the session asked no longer
   holds it and another does, and that `agentscm_start` names the current holder. A lapsed
   ask is delivered once to a requester that is still live. An ask does not appear in
   `agentscm_coordination_inbox`; for a recorded request with history, use the coordination
