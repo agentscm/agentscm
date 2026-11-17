@@ -1072,7 +1072,7 @@ const NOT_CONNECTED: &str = "This checkout is not connected to an AgentSCM Hub y
 const HUB_UNAVAILABLE: &str = "The AgentSCM Hub gave no usable answer when this session started. The tools are listed, and each call tries the Hub again; until it answers, a call says why it cannot run.";
 
 /// The server's own answer to `initialize` or `tools/list`, for when no Hub can give one; `None`
-/// for any other request. `why` opens the instructions, which a host reads only at `initialize`.
+/// for any other request. Required rules open the instructions, which a host reads only at `initialize`.
 fn local_result(message: &Value, why: &str) -> Option<Value> {
     match message["method"].as_str()? {
         "initialize" => Some(json!({
@@ -1080,7 +1080,7 @@ fn local_result(message: &Value, why: &str) -> Option<Value> {
             "capabilities": {"tools": {"listChanged": true}},
             "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
             // Initialize happens once, so a session that connects later keeps these.
-            "instructions": format!("{why} {}", agentscm::hub::agent_rules::prose()),
+            "instructions": format!("{} {why}", agentscm::hub::agent_rules::mcp_instructions(false, false)),
         })),
         "tools/list" => {
             let mut tools = agentscm::hub::mcp::agent_tools();
@@ -1281,6 +1281,24 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_initialize_keeps_rules_and_remedies_within_host_budgets() {
+        use agentscm::hub::agent_rules;
+        for why in [super::NOT_CONNECTED, super::HUB_UNAVAILABLE] {
+            let reply =
+                super::local_result(&serde_json::json!({"method":"initialize"}), why).unwrap();
+            let text = reply["instructions"].as_str().unwrap();
+            assert!(text.starts_with(&agent_rules::prose()));
+            assert!(agent_rules::carries_all(text));
+            assert!(text.contains("agentscm_work_overlap_consent"));
+            assert!(text.ends_with(why));
+            for (host, budget) in agent_rules::MCP_INSTRUCTION_BUDGETS {
+                let units = text.encode_utf16().count();
+                assert!(units <= budget, "{host}: {units}/{budget} UTF-16 units");
+            }
+        }
+    }
+
     use super::*;
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
@@ -2785,7 +2803,7 @@ mod tests {
             replies[0]["result"]["instructions"]
                 .as_str()
                 .unwrap()
-                .starts_with(HUB_UNAVAILABLE)
+                .contains(HUB_UNAVAILABLE)
         );
         assert_eq!(replies[1]["id"], 2);
         assert!(!replies[1]["result"]["tools"].as_array().unwrap().is_empty());
