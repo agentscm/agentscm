@@ -2722,6 +2722,10 @@ async fn call_inner(
         };
         return Ok(match outcome {
             Ok(request) => structured(&shown(request, &principal.owner.id)),
+            Err(HubError::Unauthorized) if name == "agentscm_coordination_reply" => refused_with(
+                "forbidden",
+                super::coordination_http::REPLY_ROLE_DENIED.into(),
+            ),
             Err(mut error) => {
                 error.show(Viewer(&principal.owner.id));
                 work_failure(&error)

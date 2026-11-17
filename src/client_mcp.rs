@@ -199,6 +199,20 @@ fn valid_reply(reply: &Value, id: &Value) -> bool {
         && (object.contains_key("result") ^ object.contains_key("error"))
 }
 
+/// Only a valid supported inbox wait extends the ordinary transport deadline.
+fn request_timeout(body: &[u8]) -> Duration {
+    let wait = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|request| {
+            (request["method"] == "tools/call"
+                && request["params"]["name"] == "agentscm_coordination_inbox")
+                .then(|| request["params"]["arguments"]["wait_seconds"].as_u64())
+                .flatten()
+                .filter(|wait| *wait <= 25)
+        });
+    Duration::from_secs(10 + wait.unwrap_or(0))
+}
+
 async fn forward(
     client: &reqwest::Client,
     url: &reqwest::Url,
@@ -210,6 +224,7 @@ async fn forward(
 ) -> Result<(u16, bool, Value)> {
     let request = client
         .post(url.clone())
+        .timeout(request_timeout(&body))
         .bearer_auth(token)
         .header(agentscm::hub::onboarding::CLIENT_HEADER, client_id)
         .header(CONTENT_TYPE, "application/json")
@@ -1270,6 +1285,115 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[tokio::test]
+    async fn inbox_long_poll_survives_ordinary_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+        });
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":11}}}))
+        .unwrap();
+        let result = forward(
+            &forge_http::client().unwrap(),
+            &url,
+            "synthetic",
+            body,
+            "test",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbox_wait_returns_populated_response_immediately() {
+        let (address, received) = server(
+            200,
+            "application/json",
+            r#"{"requests":[{"id":"synthetic"}]}"#,
+        );
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":25}}}))
+        .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward(
+                &forge_http::client().unwrap(),
+                &address.parse().unwrap(),
+                "synthetic",
+                body,
+                "test",
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.2["requests"][0]["id"], "synthetic");
+        assert!(received.recv().unwrap().contains("wait_seconds"));
+    }
+
+    #[tokio::test]
+    async fn inbox_wait_can_be_cancelled_and_unavailable_hub_still_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":25}}}))
+        .unwrap();
+        let http = forge_http::client().unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                forward(&http, &url, "synthetic", body.clone(), "test", false, None)
+            )
+            .await
+            .is_err()
+        );
+        drop(listener);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                forward(&http, &url, "synthetic", body, "test", false, None)
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inbox_wait_deadline_is_bounded_and_method_specific() {
+        for (method, name, wait, seconds) in [
+            ("tools/call", "agentscm_coordination_inbox", json!(25), 35),
+            ("tools/call", "agentscm_coordination_inbox", json!(10), 20),
+            ("tools/call", "agentscm_coordination_inbox", json!(26), 10),
+            ("tools/call", "agentscm_coordination_inbox", json!(-1), 10),
+            ("tools/call", "agentscm_coordination_inbox", json!("25"), 10),
+            ("tools/list", "agentscm_coordination_inbox", json!(25), 10),
+            ("tools/call", "agentscm_start", json!(25), 10),
+        ] {
+            let body = serde_json::to_vec(&json!({"method":method,"params":{
+                "name":name,"arguments":{"wait_seconds":wait}}}))
+            .unwrap();
+            assert_eq!(request_timeout(&body), Duration::from_secs(seconds));
+        }
+    }
 
     #[test]
     fn older_hub_bare_errors_are_upgraded_to_a_full_envelope() {
