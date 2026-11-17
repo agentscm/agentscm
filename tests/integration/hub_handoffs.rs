@@ -655,6 +655,59 @@ fn a_request_whose_requester_ended_lapses(db: &Db) {
     assert!(held_by(&*store, &bob, T0 + 6).is_empty());
 }
 
+/// A request whose holder released the file lapses and is told to the requester once, never as an
+/// acceptance.
+fn a_request_for_released_files_is_told_as_lapsed_once(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A, "src/b.rs"]);
+    let carol = agent(&*store, 3);
+    touch(&*store, &carol, "hc", &["src/c.rs"], T0);
+    assert!(matches!(
+        ask(&*store, &bob, "hb", "src/c.rs", T0 + 2),
+        Asked::Requested { .. }
+    ));
+    // A whole release, then the holder ending its session, both leave the asks unanswered.
+    let intent = live(&*store, T0 + 3)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 3)
+            .unwrap()
+    );
+    store.end_session(&carol.token, Some("hc"), T0 + 3).unwrap();
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert!(!told.handoffs.is_empty());
+    assert!(told.handoffs.iter().all(|note| note.kind == "lapse"));
+    assert!(told.handoffs.iter().all(|note| note.note.is_none()));
+    let lines = self::told(&told, T0 + 4);
+    assert!(
+        lines.contains("the holder released the files; no reply was given"),
+        "{lines}"
+    );
+    assert!(lines.contains("agentscm_start"), "{lines}");
+    assert!(!lines.contains("handed"), "{lines}");
+    assert!(events(&*store, "handoff_grant").is_empty());
+    // Told once.
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 5).handoffs.is_empty());
+    let owner = owner_of(&*store, 2);
+    let views = store
+        .handoffs_of_owner(
+            &owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 6,
+            10,
+        )
+        .unwrap();
+    assert!(!views.is_empty());
+    assert!(
+        views
+            .iter()
+            .all(|view| view.state == "lapsed" && view.requester_told)
+    );
+}
+
 fn handoffs_wait_for_a_reply_that_can_show_them(db: &Db) {
     let store = db.open();
     let (alice, bob) = refused(&*store, &[A]);
@@ -1331,6 +1384,7 @@ conformance!(
     concurrent_grants_and_touches_leave_one_owner,
     asking_needs_a_session_and_a_free_queue,
     a_request_whose_requester_ended_lapses,
+    a_request_for_released_files_is_told_as_lapsed_once,
     handoffs_wait_for_a_reply_that_can_show_them,
     pending_requests_follow_the_adopted_session,
     the_same_agent_is_not_a_holder_to_ask,

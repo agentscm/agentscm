@@ -122,7 +122,7 @@ pub enum Answered {
 }
 
 /// A handoff line for the touched session: `kind` is `request` (to the holder), `grant` or
-/// `decline` (to the requester); `agent` and `login` are the other side's.
+/// `decline` or `lapse` (to the requester); `agent` and `login` are the other side's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffNote {
     pub kind: &'static str,
@@ -312,6 +312,8 @@ pub(super) fn grant_call(session: &str, key: &str, via_json: Option<&str>) -> Se
 pub(super) fn answer_kind(state: &str) -> &'static str {
     if state == "granted" {
         "grant"
+    } else if state == "lapsed" {
+        "lapse"
     } else {
         "decline"
     }

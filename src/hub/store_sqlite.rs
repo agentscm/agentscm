@@ -7675,6 +7675,20 @@ fn handoffs_in(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // A request whose holder let go of the file is moot: lapse it so the requester is told once.
+    tx.execute(
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = ?4
+         WHERE requester_token = ?1 AND requester_session = ?2 AND state = 'pending'
+           AND created_at > ?3
+           AND NOT EXISTS (
+             SELECT 1 FROM hub_intent_paths p
+             WHERE p.key = hub_handoffs.path AND p.expires_at > ?4
+               AND (p.intent = hub_handoffs.holder_intent
+                    OR p.intent = (SELECT s.intent FROM hub_sessions s
+                                   WHERE s.token = hub_handoffs.holder_token
+                                     AND s.session = hub_handoffs.holder_session)))",
+        params![token, session, cutoff(now), now],
+    )?;
     let answers = tx
         .prepare_cached(
             "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
@@ -7684,7 +7698,7 @@ fn handoffs_in(
              LEFT JOIN hub_sessions hs
                ON hs.token = h.holder_token AND hs.session = h.holder_session
              WHERE h.requester_token = ?1 AND h.requester_session = ?2
-               AND h.state IN ('granted', 'declined') AND h.requester_told = 0
+               AND h.state IN ('granted', 'declined', 'lapsed') AND h.requester_told = 0
              ORDER BY h.decided_at, h.id LIMIT ?3",
         )?
         .query_map(params![token, session, PER_TOUCH], |row| {

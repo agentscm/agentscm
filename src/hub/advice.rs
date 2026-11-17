@@ -316,7 +316,7 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
     let declined = touched
         .handoffs
         .iter()
-        .any(|note| !matches!(note.kind, "request" | "grant"));
+        .any(|note| !matches!(note.kind, "request" | "grant" | "lapse"));
     fyi.retain(|path| !stop.contains(path));
     let mut out = Vec::new();
     if !agreed.is_empty() {
@@ -397,6 +397,10 @@ fn handoff_line(note: &HandoffNote) -> String {
             )
         }
         "grant" => format!("{who} handed {path} to this session; repeating the edit applies it."),
+        "lapse" => format!(
+            "your ask for {path} lapsed: the holder released the files; no reply was given. The \
+             files are free unless someone else took them; start on them with agentscm_start."
+        ),
         _ => {
             let about = note.reason.as_deref().map(|text| ascii(text, NOTE_CHARS));
             let about = about
@@ -546,7 +550,7 @@ pub fn asked(asked: &Asked, path: &str) -> String {
     let path = sanitize(path, PATH_CHARS);
     match asked {
         Asked::Requested { holder } => format!(
-            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too.",
+            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. A coordination request is the recorded equivalent: its history is readable with agentscm_coordination_inbox.",
             holder_who(holder)
         ),
         Asked::NotHeld => {
@@ -1194,7 +1198,7 @@ mod tests {
                 },
                 "src/a.rs"
             ),
-            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too."
+            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. A coordination request is the recorded equivalent: its history is readable with agentscm_coordination_inbox."
         );
         let who = ("codex".to_owned(), "amy".to_owned());
         let session = SessionRef {

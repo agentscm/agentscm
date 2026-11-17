@@ -967,6 +967,11 @@ counter-offer.
   refuse it, and files no handoff (HTTP outcome `reserved`). `agentscm_start` with that
   path files the coordination request to that lead instead.
 - A request lapses after 30 minutes, or when the holder no longer holds the file.
+  When the holder released the file (a release, `release_paths`, an ended session), the
+  requester's next call is told once that the ask lapsed with no reply, that the file is
+  free unless someone else took it, and to start on it with `agentscm_start`; this is
+  never reported as an acceptance. A coordination request is the recorded equivalent of
+  an ask: its history is readable with `agentscm_coordination_inbox`.
   A session may have 3 open requests, and a holder 3 for one file; asking again
   for the same file only says it was already asked. A request whose requesting
   session has ended lapses when the holder answers yes. The same agent (one
