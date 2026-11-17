@@ -61,6 +61,11 @@ fn metadata() -> Value {
 /// Seconds Codex gives the `PermissionRequest` hook; the hook is told the same.
 const PERMISSION_LIMIT: u64 = 600;
 
+fn feedback_hook(program: &str, client: &str) -> Value {
+    json!({"type":"command", "timeout":3,
+        "command":format!("{} --no-telemetry feedback start --client {client}", shell_quote(program))})
+}
+
 fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
     let command = format!(
         "{} --no-telemetry hook codex --client-connection",
@@ -82,7 +87,8 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         "command":format!("{} --no-telemetry hook-wait codex --end", shell_quote(program)),
         "timeout":3});
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5), wait.clone()]}],
+        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5), wait.clone()]},
+            {"hooks":[feedback_hook(program, "codex")]}],
         // Every tool call keeps this chat's hold live; the Hub checks only the edits.
         "PreToolUse":[{"hooks":[hook("AgentSCM: coordinate this tool call", 5)]}],
         "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
@@ -175,7 +181,8 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "command":format!("{} --no-telemetry hook-wait claude --end", shell_quote(program)), "timeout":5
     });
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
+        "SessionStart":[{"hooks":[hook(5), wait.clone()]},
+            {"hooks":[feedback_hook(program, "claude")]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
@@ -1213,6 +1220,13 @@ mod tests {
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let command = group["hooks"][0]["command"].as_str().unwrap();
+                if command.ends_with(" --no-telemetry feedback start --client codex") {
+                    assert_eq!(
+                        group["hooks"][0],
+                        feedback_hook("/opt/team's bin/agentscm", "codex")
+                    );
+                    continue;
+                }
                 assert_eq!(
                     command.trim_end_matches(" --hold-limit 600"),
                     "'/opt/team'\\''s bin/agentscm' --no-telemetry hook codex --client-connection"
@@ -1271,6 +1285,12 @@ mod tests {
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let hook = &group["hooks"][0];
+                if hook["command"]
+                    == "'/opt/old agentscm' --no-telemetry feedback start --client claude"
+                {
+                    assert_eq!(*hook, feedback_hook("/opt/old agentscm", "claude"));
+                    continue;
+                }
                 assert_eq!(
                     hook["command"],
                     "'/opt/old agentscm' --no-telemetry hook claude --client-connection"
@@ -1348,6 +1368,13 @@ mod tests {
                     let output = String::from_utf8(output.stdout).unwrap();
                     let args: Vec<_> = output.lines().collect();
                     assert_eq!(args[0], "--no-telemetry");
+                    if args[1] == "feedback" {
+                        assert_eq!(
+                            args,
+                            ["--no-telemetry", "feedback", "start", "--client", "claude"]
+                        );
+                        continue;
+                    }
                     assert_eq!(args[2], "claude");
                     if args[1] == "hook" {
                         assert_eq!(
@@ -1638,6 +1665,31 @@ mod tests {
         #[cfg(unix)]
         for event in agentscm::change_capture::codex::HOOK_EVENTS {
             assert!(codex.iter().any(|wired| wired == event), "{event}");
+        }
+    }
+
+    #[test]
+    fn feedback_is_wired_only_once_at_startup_in_both_native_plugins() {
+        for (engine, client) in [(Engine::Claude, "claude"), (Engine::Codex, "codex")] {
+            let files = package_files(engine, "/opt/agentscm");
+            let (_, bytes) = files
+                .iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap();
+            let hooks: Value = serde_json::from_slice(bytes).unwrap();
+            let mut count = 0;
+            for (event, groups) in hooks["hooks"].as_object().unwrap() {
+                for group in groups.as_array().unwrap() {
+                    for hook in group["hooks"].as_array().unwrap() {
+                        if hook["command"].as_str().unwrap().contains(" feedback ") {
+                            assert_eq!(event, "SessionStart");
+                            assert_eq!(*hook, feedback_hook("/opt/agentscm", client));
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(count, 1);
         }
     }
 }

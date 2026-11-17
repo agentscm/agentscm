@@ -45,6 +45,8 @@ mod change_capture_client;
 mod client_cli;
 mod client_config;
 mod client_cooperation;
+#[cfg(unix)]
+mod client_feedback;
 mod client_journal;
 mod client_mcp;
 #[cfg(unix)]
@@ -319,6 +321,10 @@ enum Command {
     /// the session with it (exit 2); exits 0 otherwise. `client setup` installs it.
     #[command(hide = true)]
     HookWait(message_wait::HookWaitArgs),
+    /// Run optional feedback only when the configured Hub admits the enrolled reporter.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Feedback(client_feedback::FeedbackArgs),
     /// Write this Git repository's shared agent instructions (AGENTS.md and the files that point
     /// each agent at it). Hooks and MCP come from `agentscm client setup` on each machine.
     InitRepo(init_cli::InitArgs),
@@ -1081,6 +1087,8 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::Walkthrough { command } => print_json(&walkthrough_cli::run(command)?),
         Command::Hook(args) => hook_cli::run(args).await,
         Command::HookWait(args) => message_wait::run(args).await,
+        #[cfg(unix)]
+        Command::Feedback(args) => client_feedback::run(args),
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Client { command } => client_cli::run(command).await?,
         #[cfg(unix)]
@@ -1606,6 +1614,10 @@ fn telemetry_feature(command: &Command) -> Option<telemetry::Feature> {
 }
 
 fn verified_install_command(command: &Command) -> bool {
+    #[cfg(unix)]
+    if matches!(command, Command::Feedback(_)) {
+        return false;
+    }
     !matches!(
         command,
         Command::Demo(_)
