@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 
 use agentscm::hub::HubError;
 use agentscm::hub::handoff::{Answered, Asked, HandoffView, SessionRef, Via};
-use agentscm::hub::intent::Intent;
+use agentscm::hub::intent::{Intent, NewIntent};
 use agentscm::hub::session::{
     HOLD_CAP_SECONDS, SESSION_REQUIRED, SessionCall, Touched, asked_holder,
 };
@@ -647,7 +647,8 @@ fn a_request_whose_requester_ended_lapses(db: &Db) {
     assert!(held_by(&*store, &bob, T0 + 4).is_empty());
     assert!(events(&*store, "handoff_grant").is_empty());
     // The request is closed, not left to be granted later.
-    touch(&*store, &bob, "hb", &[], T0 + 5);
+    // The returning requester is not told a holder released the file: alice still holds it.
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 5).handoffs.is_empty());
     assert_eq!(
         answer(&*store, &alice, None, A, true, T0 + 6),
         Answered::NoRequest
@@ -733,6 +734,50 @@ fn a_lapsed_ask_says_when_another_session_holds_the_file_now(db: &Db) {
         "{lines}"
     );
     assert!(!lines.contains("free"), "{lines}");
+}
+
+/// A directory hold by another session counts as holding the file when the lapse is told.
+fn a_lapsed_ask_says_held_when_a_directory_is_held_now(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let carol = agent(&*store, 3);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    let directory = NewIntent {
+        id: format!("int_{:032x}", 9),
+        task: "refactor".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec!["src/**".into()],
+        ttl_seconds: 600,
+    };
+    store
+        .announce_intent(&carol.token, &directory, T0 + 3)
+        .unwrap();
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert_eq!(told.handoffs.len(), 1);
+    assert_eq!(told.handoffs[0].kind, "lapse_held");
+}
+
+/// An ask past the hold cap keeps its expiry semantics: a late release does not lapse it.
+fn a_release_after_the_cap_does_not_lapse_an_expired_ask(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    let at = T0 + 1 + HOLD_CAP_SECONDS;
+    store.release_intent(&alice.token, &intent.id, at).unwrap();
+    assert!(touch(&*store, &bob, "hb", &[], at).handoffs.is_empty());
 }
 
 fn handoffs_wait_for_a_reply_that_can_show_them(db: &Db) {
@@ -1413,6 +1458,8 @@ conformance!(
     a_request_whose_requester_ended_lapses,
     a_request_for_released_files_is_told_as_lapsed_once,
     a_lapsed_ask_says_when_another_session_holds_the_file_now,
+    a_lapsed_ask_says_held_when_a_directory_is_held_now,
+    a_release_after_the_cap_does_not_lapse_an_expired_ask,
     handoffs_wait_for_a_reply_that_can_show_them,
     pending_requests_follow_the_adopted_session,
     the_same_agent_is_not_a_holder_to_ask,

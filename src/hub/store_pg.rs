@@ -5985,7 +5985,7 @@ fn release_in(
 fn lapse_unheld_asks(tx: &mut postgres::Transaction<'_>, intent: &str, now: i64) -> Result<()> {
     tx.execute(
         "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2
-         WHERE state = 'pending'
+         WHERE state = 'pending' AND created_at > $3
            AND (holder_intent = $1
                 OR EXISTS (SELECT 1 FROM hub_sessions s
                            WHERE s.token = hub_handoffs.holder_token
@@ -5997,7 +5997,7 @@ fn lapse_unheld_asks(tx: &mut postgres::Transaction<'_>, intent: &str, now: i64)
                     OR p.intent = (SELECT s.intent FROM hub_sessions s
                                    WHERE s.token = hub_handoffs.holder_token
                                      AND s.session = hub_handoffs.holder_session)))",
-        &[&intent, &now],
+        &[&intent, &now, &cutoff(now)],
     )?;
     Ok(())
 }
@@ -7595,7 +7595,10 @@ fn handoffs_in(
         "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
                 h.answered_via_slack, h.holder_token, h.holder_session, hs.via,
                 EXISTS (SELECT 1 FROM hub_intent_paths p
-                        WHERE p.key = h.path AND p.repository_scope = h.repository_scope
+                        WHERE (p.key = h.path
+                               OR (right(p.key, 1) = '/'
+                                   AND left(h.path, length(p.key)) = p.key))
+                          AND p.repository_scope = h.repository_scope
                           AND p.expires_at > $4
                           AND p.intent IS DISTINCT FROM (SELECT s.intent FROM hub_sessions s
                                                          WHERE s.token = h.requester_token
@@ -7667,11 +7670,13 @@ fn handoffs_in(
         .collect())
 }
 
-/// Ends a request without an answer.
-fn lapse(tx: &mut postgres::Transaction<'_>, request: &str, now: i64) -> Result<()> {
+/// Ends a request without an answer. `told` is true when the requester is gone, so no receipt
+/// is owed.
+fn lapse(tx: &mut postgres::Transaction<'_>, request: &str, now: i64, told: bool) -> Result<()> {
     tx.execute(
-        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2 WHERE id = $1",
-        &[&request, &now],
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2, requester_told = $3
+         WHERE id = $1",
+        &[&request, &now, &told],
     )?;
     Ok(())
 }
@@ -10186,7 +10191,7 @@ impl Store for PgStore {
             // Preserve this operation's unavailable decision even if an owner
             // is re-enabled concurrently: touch_in requires the lock above.
             if !requester_available {
-                lapse(&mut tx, &request.id, now)?;
+                lapse(&mut tx, &request.id, now, true)?;
                 tx.commit()?;
                 return Ok(Answered::NoRequest);
             }
@@ -10213,7 +10218,7 @@ impl Store for PgStore {
             };
             // A request for a file its holder let go of is moot.
             let Some(current) = current.filter(|held| still_holds(held, &key)) else {
-                lapse(&mut tx, &request.id, now)?;
+                lapse(&mut tx, &request.id, now, false)?;
                 tx.commit()?;
                 return Ok(Answered::NotHeld);
             };
@@ -10222,7 +10227,7 @@ impl Store for PgStore {
                     Ok(requester) => requester,
                     // The requester's token is gone: nobody to hand the file to.
                     Err(HubError::Unauthorized) => {
-                        lapse(&mut tx, &request.id, now)?;
+                        lapse(&mut tx, &request.id, now, true)?;
                         tx.commit()?;
                         return Ok(Answered::NoRequest);
                     }
@@ -10235,7 +10240,7 @@ impl Store for PgStore {
                     &request.requester_session,
                 )?
                 else {
-                    lapse(&mut tx, &request.id, now)?;
+                    lapse(&mut tx, &request.id, now, true)?;
                     tx.commit()?;
                     return Ok(Answered::NoRequest);
                 };

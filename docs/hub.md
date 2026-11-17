@@ -968,11 +968,12 @@ counter-offer.
   path files the coordination request to that lead instead.
 - A request lapses after 30 minutes, or when the holder no longer holds the file.
   When the holder releases the file (a release, `release_paths`, an ended session), the
-  Hub marks the pending ask `lapsed` in the same transaction, unless another live session
-  of the holder still holds the path, so both owners' handoff lists show it at once. An
+  Hub marks the pending ask `lapsed` in the same transaction, unless the asked session
+  still holds the path (for example through a renewed intent), so both owners' handoff lists show it at once. An
   expired intent has no write step, so the Hub lapses that ask at the requester's next
   call instead. The requester is told once, on its next call, that the ask lapsed with no
-  reply; this is never reported as an acceptance. If no session holds the path then, the
+  reply; this is never reported as an acceptance. If no session holds the path then (a hold on a
+  directory above it, such as `src/**`, counts as holding it), the
   text says the file is free unless someone else took it and to start on it with
   `agentscm_start`; if another session holds it, the text says the session asked no longer
   holds it and another does, and that `agentscm_start` names the current holder. A lapsed
