@@ -2698,7 +2698,42 @@ conformance!(
     release_paths_releases_a_directory_entry_exactly,
     finished_paths_follow_the_scope_and_never_change_admission,
     finished_paths_survive_a_carry_and_a_resume_but_not_another_lead,
+    finished_paths_clear_when_another_session_of_the_owner_takes_over,
 );
+
+fn finished_paths_clear_when_another_session_of_the_owner_takes_over(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("fin", "finished", "live"), now)
+        .unwrap()
+        .item;
+    let mut report = checkpoint(
+        &started.id,
+        "report",
+        1,
+        "live",
+        CheckpointKind::Handover,
+        "p",
+    );
+    report.expected_updated_seq = Some(started.updated_seq);
+    report.finished_paths = Some(vec!["src/**".into()]);
+    let handed = store
+        .work_checkpoint(&alice.token, &report, now + 1)
+        .unwrap()
+        .item;
+    assert_eq!(handed.finished_paths, ["src/"]);
+    let taken = store
+        .work_start(
+            &alice.token,
+            &takeover(&started.id, "other", Some(handed.generation)),
+            now + 2,
+        )
+        .unwrap();
+    assert!(taken.took_over, "{:?}", taken.conflict);
+    assert!(taken.item.finished_paths.is_empty());
+}
 
 fn finished_paths_survive_a_carry_and_a_resume_but_not_another_lead(db: &Db) {
     let store = db.open();

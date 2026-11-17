@@ -16518,7 +16518,20 @@ impl Store for PgStore {
                         is_admin: false,
                     }
                 };
-                work_transition_in(&mut tx, &actor, &release, now)?;
+                work_transition_in(&mut tx, &actor, &release, now).map_err(|error| {
+                    // The replier passed no updated_seq: the Work changed after the unlocked read.
+                    match error {
+                        HubError::Invalid(message)
+                            if message.starts_with("transition receipt expired") =>
+                        {
+                            HubError::Invalid(
+                                "the target Work changed while replying; send the reply again"
+                                    .into(),
+                            )
+                        }
+                        other => other,
+                    }
+                })?;
                 super::intent::display_all(&release.released_keys()?)
             };
             let released_paths = (!released.is_empty())
