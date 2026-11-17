@@ -77,8 +77,9 @@ use super::intent::{
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
 use super::notices::{
-    DependencyNoticeAck, DependencyRefresh, NoticeAcknowledgement, NoticeOffer, NoticeOfferRequest,
-    NoticeReceipt, NoticeRefreshPage, NoticeTransportReport,
+    DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAcknowledgement, NoticeOffer,
+    NoticeOfferRequest, NoticeReceipt, NoticeRefreshPage, NoticeTransportReport, OwnerNotice,
+    OwnerNoticeDeliveryProof, OwnerNoticePage, OwnerNoticeRecipientStatus,
 };
 use super::pickup::Pickup;
 use super::promise::{
@@ -8763,6 +8764,41 @@ fn checkpoint_overlap_in(
 }
 
 impl Store for PgStore {
+    fn owner_notice_put(
+        &self,
+        token: &str,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        PgStore::owner_notice_put(self, token, notice, now)
+    }
+    fn owner_notice_delivered(
+        &self,
+        token: &str,
+        id: &str,
+        proof: &OwnerNoticeDeliveryProof,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        PgStore::owner_notice_delivered(self, token, id, proof, now)
+    }
+    fn owner_notice_list(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<OwnerNoticePage> {
+        PgStore::owner_notice_list(self, reader, after, limit, now)
+    }
+    fn owner_notice_recipient_status(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        status: OwnerNoticeRecipientStatus,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        PgStore::owner_notice_recipient_status(self, reader, id, status, now)
+    }
     fn notice_message_receipts(
         &self,
         owner: &User,

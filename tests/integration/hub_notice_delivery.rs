@@ -6,8 +6,10 @@ use agentscm::hub::catchup::{
 };
 use agentscm::hub::connection::NewConnection;
 use agentscm::hub::notices::{
-    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NoticeAttempt, NoticeOfferRequest,
-    NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport, SourceKind,
+    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAttempt,
+    NoticeOfferRequest, NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport,
+    OwnerNoticeDeliveryProof, OwnerNoticeRecipient, OwnerNoticeRecipientStatus,
+    OwnerNoticeSourceKind, SourceKind,
 };
 use agentscm::hub::session_lifecycle::LifecycleRegister;
 use agentscm::hub::store::{
@@ -18,6 +20,7 @@ use agentscm::hub::work_links::WorkPrLinkTarget;
 use agentscm::hub::work_reconciliation::{
     PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations, WorkDeclarationsUpdate,
 };
+use agentscm::hub::work_transition::WorkLifecycleReader;
 use serde_json::json;
 
 const REPO: &str = "acme/widgets";
@@ -1425,4 +1428,232 @@ fn postgres_historical_message_receipt_projection() {
         return;
     };
     message_receipt_projection_contract(&schema.url);
+}
+
+fn owner_mailbox_contract(database: &str) {
+    let store = store::open(database).unwrap();
+    let sender = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 501,
+            },
+            "sender",
+        )
+        .unwrap();
+    let recipient = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 502,
+            },
+            "recipient",
+        )
+        .unwrap();
+    let bystander = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 503,
+            },
+            "bystander",
+        )
+        .unwrap();
+    let (sender_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &sender.id,
+        "sender-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (recipient_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &recipient.id,
+        "recipient-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let now = unix_now();
+    let recipient_address = OwnerNoticeRecipient {
+        owner: recipient.id.clone(),
+        provider: "github".into(),
+        host: "github.com".into(),
+    };
+    let request = NewOwnerNotice {
+        idempotency_key: "send-pr-42-v1".into(),
+        source_kind: OwnerNoticeSourceKind::Addressed,
+        source_id: "pr-42-note-1".into(),
+        recipient: recipient_address.clone(),
+        body: "PR #42 needs a fresh attestation.".into(),
+    };
+    let created = store
+        .owner_notice_put(&sender_token, &request, now)
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_notice_put(&sender_token, &request, now + 1)
+            .unwrap(),
+        created,
+        "exact retry returns the immutable original"
+    );
+    let mut changed = request.clone();
+    changed.body = "Changed body must not reuse the key.".into();
+    assert!(
+        store
+            .owner_notice_put(&sender_token, &changed, now + 1)
+            .is_err()
+    );
+    let mut same_source = request.clone();
+    same_source.idempotency_key = "another-key".into();
+    assert_eq!(
+        store
+            .owner_notice_put(&sender_token, &same_source, now + 1)
+            .unwrap(),
+        created,
+        "the recipient/source pair deduplicates an equivalent send"
+    );
+    changed.idempotency_key = "another-key".into();
+    assert!(
+        store
+            .owner_notice_put(&sender_token, &changed, now + 1)
+            .is_err(),
+        "the recipient/source pair is deduplicated independently of retries"
+    );
+
+    let reader = WorkLifecycleReader::Person {
+        owner: &recipient,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let page = store.owner_notice_list(&reader, None, 100, now).unwrap();
+    assert_eq!(page.notices.len(), 1);
+    assert_eq!(page.notices[0], created);
+    assert!(page.next_after.is_none());
+    assert!(!page.notices[0].delivery_proven());
+    let bystander_reader = WorkLifecycleReader::Person {
+        owner: &bystander,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    assert!(
+        store
+            .owner_notice_recipient_status(
+                &bystander_reader,
+                &created.id,
+                OwnerNoticeRecipientStatus::Acknowledged,
+                now + 2,
+            )
+            .is_err()
+    );
+    let proof = OwnerNoticeDeliveryProof {
+        channel: "slack_dm".into(),
+        external_id: "synthetic-message-1".into(),
+    };
+    assert!(
+        store
+            .owner_notice_delivered(&recipient_token, &created.id, &proof, now + 2)
+            .is_err(),
+        "the recipient cannot forge transport delivery"
+    );
+    let delivered = store
+        .owner_notice_delivered(&sender_token, &created.id, &proof, now + 2)
+        .unwrap();
+    assert!(delivered.delivery_proven());
+    assert!(delivered.acknowledged_at.is_none());
+    let mut conflicting = proof.clone();
+    conflicting.external_id = "another-message".into();
+    assert!(
+        store
+            .owner_notice_delivered(&sender_token, &created.id, &conflicting, now + 3)
+            .is_err()
+    );
+    let acknowledged = store
+        .owner_notice_recipient_status(
+            &reader,
+            &created.id,
+            OwnerNoticeRecipientStatus::Acknowledged,
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(acknowledged.acknowledged_at, Some(now + 3));
+    assert!(acknowledged.acted_at.is_none());
+    let acted = store
+        .owner_notice_recipient_status(
+            &reader,
+            &created.id,
+            OwnerNoticeRecipientStatus::Acted,
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(acted.acknowledged_at, Some(now + 3));
+    assert_eq!(acted.acted_at, Some(now + 4));
+
+    for index in 1..20 {
+        store
+            .owner_notice_put(
+                &sender_token,
+                &NewOwnerNotice {
+                    idempotency_key: format!("automatic-{index}"),
+                    source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                    source_id: format!("pr-{}-digest-v2", 100 + index),
+                    recipient: recipient_address.clone(),
+                    body: format!("PR #{} has an obsolete attestation.", 100 + index),
+                },
+                now + 5,
+            )
+            .unwrap();
+    }
+    let limited = store.owner_notice_list(&reader, None, 1, now + 5).unwrap();
+    assert_eq!(limited.notices.len(), 1);
+    assert!(limited.next_after.is_some());
+    let after = limited.next_after.as_deref().unwrap();
+    assert!(
+        store
+            .owner_notice_list(&reader, Some(after), 100, now + 5)
+            .unwrap()
+            .notices
+            .iter()
+            .all(|notice| notice.id.as_str() > after)
+    );
+    assert!(
+        store
+            .owner_notice_put(
+                &sender_token,
+                &NewOwnerNotice {
+                    idempotency_key: "over-rate-bound".into(),
+                    source_kind: OwnerNoticeSourceKind::Addressed,
+                    source_id: "pr-999-note".into(),
+                    recipient: recipient_address,
+                    body: "This send exceeds the bounded recipient window.".into(),
+                },
+                now + 5,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn sqlite_owner_mailbox_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    owner_mailbox_contract(&format!(
+        "sqlite://{}",
+        directory.path().join("hub.sqlite").display()
+    ));
+}
+
+#[test]
+fn postgres_owner_mailbox_contract() {
+    let Some(schema) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    owner_mailbox_contract(&schema.url);
 }

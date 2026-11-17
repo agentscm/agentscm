@@ -11,6 +11,10 @@ pub const MAX_PAGE: usize = 100;
 pub const ATTEMPT_SECS: i64 = 30;
 pub const MAX_ATTEMPTS: usize = 8;
 pub const FRAME: &str = "AgentSCM source notice";
+pub const MAX_OWNER_NOTICE_BODY_BYTES: usize = 2_000;
+pub const MAX_OWNER_NOTICE_PAGE: usize = 100;
+pub const OWNER_NOTICE_RATE_WINDOW_SECS: i64 = 60 * 60;
+pub const MAX_OWNER_NOTICES_PER_RECIPIENT_WINDOW: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +23,108 @@ pub enum SourceKind {
     Coordination,
     Dependency,
     Operational,
+}
+
+/// The durable source of an owner-addressed notice. These values describe why a
+/// notice exists; they do not grant authority over the recipient's work.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerNoticeSourceKind {
+    Addressed,
+    AttestationInvalidation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticeRecipient {
+    pub owner: String,
+    pub provider: String,
+    pub host: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NewOwnerNotice {
+    pub idempotency_key: String,
+    pub source_kind: OwnerNoticeSourceKind,
+    /// Stable identity in the source domain, such as an attestation and PR pair.
+    pub source_id: String,
+    pub recipient: OwnerNoticeRecipient,
+    /// Third-party data for presentation only, never an instruction to the Hub.
+    pub body: String,
+}
+
+impl NewOwnerNotice {
+    pub fn validate(&self) -> Result<()> {
+        text("idempotency_key", &self.idempotency_key, 255)?;
+        text("source_id", &self.source_id, 255)?;
+        text("recipient owner", &self.recipient.owner, 255)?;
+        text("recipient provider", &self.recipient.provider, 32)?;
+        text("recipient host", &self.recipient.host, 253)?;
+        if self.body.trim() != self.body
+            || self.body.is_empty()
+            || self.body.len() > MAX_OWNER_NOTICE_BODY_BYTES
+        {
+            return Err(HubError::Invalid(
+                "Notice body must be trimmed and at most 2000 bytes.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticeDeliveryProof {
+    pub channel: String,
+    pub external_id: String,
+}
+
+impl OwnerNoticeDeliveryProof {
+    pub fn validate(&self) -> Result<()> {
+        text("delivery channel", &self.channel, 32)?;
+        text("delivery external_id", &self.external_id, 255)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerNoticeRecipientStatus {
+    Acknowledged,
+    Acted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNotice {
+    pub id: String,
+    pub idempotency_key: String,
+    pub source_kind: OwnerNoticeSourceKind,
+    pub source_id: String,
+    pub sender_owner: String,
+    pub sender_token: String,
+    pub recipient: OwnerNoticeRecipient,
+    pub repository: String,
+    pub repository_id: Option<i64>,
+    pub body: String,
+    pub created_at: i64,
+    pub delivered_at: Option<i64>,
+    pub delivery: Option<OwnerNoticeDeliveryProof>,
+    pub acknowledged_at: Option<i64>,
+    pub acted_at: Option<i64>,
+}
+
+impl OwnerNotice {
+    pub fn delivery_proven(&self) -> bool {
+        self.delivered_at.is_some() && self.delivery.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerNoticePage {
+    pub notices: Vec<OwnerNotice>,
+    pub next_after: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

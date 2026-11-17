@@ -34,8 +34,9 @@ use super::insights::{
 };
 use super::intent::{Announced, Intent, NewIntent};
 use super::notices::{
-    DependencyNoticeAck, DependencyRefresh, NoticeAcknowledgement, NoticeOffer, NoticeOfferRequest,
-    NoticeReceipt, NoticeRefreshPage, NoticeTransportReport,
+    DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAcknowledgement, NoticeOffer,
+    NoticeOfferRequest, NoticeReceipt, NoticeRefreshPage, NoticeTransportReport, OwnerNotice,
+    OwnerNoticeDeliveryProof, OwnerNoticePage, OwnerNoticeRecipientStatus,
 };
 use super::pickup::Pickup;
 use super::promise::{
@@ -660,6 +661,40 @@ pub trait Store: Send + Sync {
         work_ids: &[String],
         now: i64,
     ) -> Result<Vec<String>>;
+    /// Create an immutable owner-recipient mailbox record. The authenticated token supplies the
+    /// sender and repository scope; the recipient is deliberately independent of token/session/Work.
+    fn owner_notice_put(
+        &self,
+        token: &str,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Delivery may only be reported by the creating token. It is distinct from recipient
+    /// acknowledgement and action, and requires a channel-specific durable proof identity.
+    fn owner_notice_delivered(
+        &self,
+        token: &str,
+        id: &str,
+        proof: &OwnerNoticeDeliveryProof,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Pure, deterministic recipient mailbox read through the existing repository-role gate.
+    fn owner_notice_list(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<OwnerNoticePage>;
+    /// Only the addressed owner may acknowledge or report action. Action implies acknowledgement,
+    /// while neither state implies transport delivery.
+    fn owner_notice_recipient_status(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        status: OwnerNoticeRecipientStatus,
+        now: i64,
+    ) -> Result<OwnerNotice>;
     /// `end_session`, and in the same transaction pause the active Work the session leads, with
     /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
     /// Work with no session row is still paused. If the pause fails nothing is written, so the
