@@ -967,13 +967,18 @@ counter-offer.
   refuse it, and files no handoff (HTTP outcome `reserved`). `agentscm_start` with that
   path files the coordination request to that lead instead.
 - A request lapses after 30 minutes, or when the holder no longer holds the file.
-  When the holder released the file (a release, `release_paths`, an ended session), the
-  requester's next call is told once that the ask lapsed with no reply, that the file is
-  free unless someone else took it, and to start on it with `agentscm_start`; this is
-  never reported as an acceptance. The same text is used when the holder's intent expired or
-  another session now holds the path. A lapsed ask is delivered once to a requester that is
-  still live. An ask does not appear in `agentscm_coordination_inbox`; for a recorded request
-  with history, use the coordination request `agentscm_start` queues.
+  When the holder releases the file (a release, `release_paths`, an ended session), the
+  Hub marks the pending ask `lapsed` in the same transaction, unless another live session
+  of the holder still holds the path, so both owners' handoff lists show it at once. An
+  expired intent has no write step, so the Hub lapses that ask at the requester's next
+  call instead. The requester is told once, on its next call, that the ask lapsed with no
+  reply; this is never reported as an acceptance. If no session holds the path then, the
+  text says the file is free unless someone else took it and to start on it with
+  `agentscm_start`; if another session holds it, the text says the session asked no longer
+  holds it and another does, and that `agentscm_start` names the current holder. A lapsed
+  ask is delivered once to a requester that is still live. An ask does not appear in
+  `agentscm_coordination_inbox`; for a recorded request with history, use the coordination
+  request `agentscm_start` queues.
   A session may have 3 open requests, and a holder 3 for one file; asking again
   for the same file only says it was already asked. A request whose requesting
   session has ended lapses when the holder answers yes. The same agent (one

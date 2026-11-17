@@ -575,6 +575,7 @@ async fn hook(
                 };
                 // A subagent's context ends when it returns, so a request shown there is lost
                 // with it: point it at its lead instead, and never hold its edits for a reply.
+                let mut partial_keys = Vec::new();
                 if call.child {
                     let waiting = page.requests.iter().filter(open).count();
                     if waiting > 0 {
@@ -605,10 +606,11 @@ async fn hook(
                         // answer, and a requester's own request only while it has news the
                         // requester has not acknowledged.
                         // A partial release shows once per released set, so a further release shows
-                        // again but an unchanged one does not repeat on every prompt.
+                        // again but an unchanged one does not repeat on every prompt. The set is
+                        // marked only once the text is kept (see `partial_keys` below).
                         let partial = own
                             && call.kind == Kind::Prompt
-                            && !released
+                            && request.requested_paths == Some(RequestedPathsHold::Held)
                             && !request.released_paths.is_empty()
                             && {
                                 let key = format!(
@@ -617,12 +619,15 @@ async fn hook(
                                     request.id,
                                     request.released_paths.join("\0")
                                 );
-                                let mut shown_set =
-                                    PARTIAL_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
-                                if shown_set.len() > MAX_NOTED {
-                                    shown_set.clear();
+                                let key = format!("{:x}", Sha256::digest(key));
+                                let new = !PARTIAL_SHOWN
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .contains(&key);
+                                if new {
+                                    partial_keys.push(key);
                                 }
-                                shown_set.insert(format!("{:x}", Sha256::digest(key)))
+                                new
                             };
                         let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
                             receipt.target_work_id.is_none()
@@ -806,6 +811,16 @@ async fn hook(
                             }
                         }
                     }
+                }
+                // Marked only now that the text is kept: a failed delivery clears it, and the
+                // next prompt shows the release again.
+                if outcome.status != "unknown" && !partial_keys.is_empty() {
+                    let mut shown_set =
+                        PARTIAL_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
+                    if shown_set.len() > MAX_NOTED {
+                        shown_set.clear();
+                    }
+                    shown_set.extend(partial_keys);
                 }
             }
             failed if outcome.status != "unknown" => {

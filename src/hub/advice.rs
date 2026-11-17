@@ -316,7 +316,7 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
     let declined = touched
         .handoffs
         .iter()
-        .any(|note| !matches!(note.kind, "request" | "grant" | "lapse"));
+        .any(|note| !matches!(note.kind, "request" | "grant" | "lapse" | "lapse_held"));
     fyi.retain(|path| !stop.contains(path));
     let mut out = Vec::new();
     if !agreed.is_empty() {
@@ -400,6 +400,10 @@ fn handoff_line(note: &HandoffNote) -> String {
         "lapse" => format!(
             "your ask for {path} lapsed: the holder released the files; no reply was given. The \
              files are free unless someone else took them; start on them with agentscm_start."
+        ),
+        "lapse_held" => format!(
+            "your ask for {path} lapsed: the session you asked no longer holds it, and another \
+             session does; agentscm_start names the current holder."
         ),
         _ => {
             let about = note.reason.as_deref().map(|text| ascii(text, NOTE_CHARS));

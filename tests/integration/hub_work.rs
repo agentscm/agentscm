@@ -2691,6 +2691,8 @@ conformance!(
     a_gap_in_the_clock_grants_one_lease_of_grace,
     lease_migration_starts_existing_reservations_now,
     release_one_of_three,
+    an_ask_lapses_when_its_work_releases_the_file,
+    an_ask_lapses_when_release_paths_frees_the_file,
     release_paths_is_for_the_lead_and_the_owner_and_names_what_it_refuses,
     release_paths_never_takes_another_works_file,
     finished_paths_follow_the_scope_and_never_change_admission,
@@ -7032,6 +7034,79 @@ fn release_paths_request(
     );
     request.paths = paths.iter().map(|path| (*path).to_owned()).collect();
     request
+}
+
+/// A legacy ask for a file the holder's Work releases lapses in the release's own transaction, so
+/// both owners see it as lapsed before the requester calls, and the requester is told once.
+fn assert_ask_lapses_at_release(
+    db: &Db,
+    release: impl Fn(&dyn Store, &Agent, &agentscm::hub::work::WorkItem, i64),
+) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let a = start_scope(&*store, &alice, "a", "s-a", &["src/a.rs", "src/b.rs"], now).item;
+    announce(&*store, &alice, "s-a", "src/a.rs", now + 1);
+    announce(&*store, &bob, "s-b", "src/z.rs", now + 1);
+    assert!(matches!(
+        store
+            .ask_handoff(&bob.token, Some("s-b"), "src/a.rs", None, now + 2)
+            .unwrap(),
+        agentscm::hub::handoff::Asked::Requested { .. }
+    ));
+    let scope = crate::repository_scope::github(REPO, Some(REPOSITORY_ID));
+    let state = |owner: &Agent, at: i64| {
+        let views = store
+            .handoffs_of_owner(&owner.owner, &scope, at, 10)
+            .unwrap();
+        assert_eq!(views.len(), 1);
+        (views[0].state, views[0].requester_told)
+    };
+    assert_eq!(state(&alice, now + 3), ("pending", false));
+    release(&*store, &alice, &a, now + 4);
+    // Before the requester touches the Hub, the holder's and the requester's views agree.
+    assert_eq!(state(&alice, now + 5), ("lapsed", false));
+    assert_eq!(state(&bob, now + 5), ("lapsed", false));
+    let touch = |at: i64| {
+        store
+            .touch_session(
+                &bob.token,
+                &agentscm::hub::session::SessionCall {
+                    session: Some("s-b".into()),
+                    via: "hook:claude".into(),
+                    task: None,
+                    paths: Vec::new(),
+                    deny: false,
+                    report: true,
+                },
+                at,
+            )
+            .unwrap()
+    };
+    let told = touch(now + 6);
+    assert_eq!(told.handoffs.len(), 1);
+    assert_eq!(told.handoffs[0].kind, "lapse");
+    assert_eq!(state(&bob, now + 7), ("lapsed", true));
+    assert!(touch(now + 8).handoffs.is_empty());
+}
+
+fn an_ask_lapses_when_its_work_releases_the_file(db: &Db) {
+    assert_ask_lapses_at_release(db, |store, alice, a, now| {
+        let release = transition_request(a, "rel", WorkTransitionKind::Release, Some("s-a"));
+        store
+            .work_transition(&by_agent(alice), &release, now)
+            .unwrap();
+    });
+}
+
+fn an_ask_lapses_when_release_paths_frees_the_file(db: &Db) {
+    assert_ask_lapses_at_release(db, |store, alice, a, now| {
+        let release = release_paths_request(a, "rp", Some("s-a"), &["src/a.rs"]);
+        store
+            .work_transition(&by_agent(alice), &release, now)
+            .unwrap();
+    });
 }
 
 fn release_one_of_three(db: &Db) {

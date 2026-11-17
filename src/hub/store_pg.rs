@@ -5964,9 +5964,33 @@ fn release_in(
     )?;
     if changed > 0 {
         tx.execute("DELETE FROM hub_intent_paths WHERE intent = $1", &[&intent])?;
+        lapse_unheld_asks(tx, intent, now)?;
         append(tx, &Event::intent_released(intent)?)?;
     }
     Ok(changed > 0)
+}
+
+/// Lapses the pending asks to the holder of `intent` for files that no live intent of that
+/// holder covers now, so a requester is told at its next call. An expiry has no write path, so
+/// `handoffs_in` still lapses those lazily.
+fn lapse_unheld_asks(tx: &mut postgres::Transaction<'_>, intent: &str, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = $2
+         WHERE state = 'pending'
+           AND (holder_intent = $1
+                OR EXISTS (SELECT 1 FROM hub_sessions s
+                           WHERE s.token = hub_handoffs.holder_token
+                             AND s.session = hub_handoffs.holder_session AND s.intent = $1))
+           AND NOT EXISTS (
+             SELECT 1 FROM hub_intent_paths p
+             WHERE p.key = hub_handoffs.path AND p.expires_at > $2
+               AND (p.intent = hub_handoffs.holder_intent
+                    OR p.intent = (SELECT s.intent FROM hub_sessions s
+                                   WHERE s.token = hub_handoffs.holder_token
+                                     AND s.session = hub_handoffs.holder_session)))",
+        &[&intent, &now],
+    )?;
+    Ok(())
 }
 
 /// Whether the token's session is currently eligible on unfinished Work other than `work`: held
@@ -6096,6 +6120,7 @@ fn trim_intent(
         "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
         &[&intent, &kept],
     )?;
+    lapse_unheld_asks(tx, intent, now)?;
     append(
         tx,
         &Event::intent_paths_changed(intent, &paths, expires_at)?,
@@ -7559,7 +7584,13 @@ fn handoffs_in(
     )?;
     let answers = tx.query(
         "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
-                h.answered_via_slack, h.holder_token, h.holder_session, hs.via
+                h.answered_via_slack, h.holder_token, h.holder_session, hs.via,
+                EXISTS (SELECT 1 FROM hub_intent_paths p
+                        WHERE p.key = h.path AND p.repository_scope = h.repository_scope
+                          AND p.expires_at > $4
+                          AND p.intent IS DISTINCT FROM (SELECT s.intent FROM hub_sessions s
+                                                         WHERE s.token = h.requester_token
+                                                           AND s.session = h.requester_session))
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
          LEFT JOIN hub_sessions hs
@@ -7567,7 +7598,7 @@ fn handoffs_in(
          WHERE h.requester_token = $1 AND h.requester_session = $2
            AND h.state IN ('granted', 'declined', 'lapsed') AND NOT h.requester_told
          ORDER BY h.decided_at, h.id LIMIT $3",
-        &[&token, &session, &PER_TOUCH],
+        &[&token, &session, &PER_TOUCH, &now],
     )?;
     let told = |tx: &mut postgres::Transaction<'_>, column: &str, rows: &[postgres::Row]| {
         let ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
@@ -7612,7 +7643,7 @@ fn handoffs_in(
             )
         })
         .chain(answers.iter().map(|row| {
-            let kind = answer_kind(row.get(1));
+            let kind = answer_kind(row.get(1), row.get(11));
             note(
                 kind,
                 row.get(2),

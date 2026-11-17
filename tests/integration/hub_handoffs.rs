@@ -467,11 +467,11 @@ fn only_the_holder_can_answer(db: &Db) {
     assert!(matches!(bad, Err(HubError::Invalid(_))));
     assert_eq!(held_by(&*store, &alice, T0 + 3), [A]);
     assert!(held_by(&*store, &bob, T0 + 3).is_empty());
-    // The holder lets go first: the answer says so and the request is closed.
+    // The holder lets go first: the release lapsed the request, so none is open to answer.
     store.end_session(&alice.token, Some("ha"), T0 + 4).unwrap();
     assert_eq!(
         answer(&*store, &alice, Some("ha"), A, true, T0 + 5),
-        Answered::NotHeld
+        Answered::NoRequest
     );
     assert_eq!(
         answer(&*store, &alice, None, A, true, T0 + 6),
@@ -706,6 +706,33 @@ fn a_request_for_released_files_is_told_as_lapsed_once(db: &Db) {
             .iter()
             .all(|view| view.state == "lapsed" && view.requester_told)
     );
+}
+
+/// When another session holds the file by the time the requester is told, the lapse says so and
+/// does not call the file free.
+fn a_lapsed_ask_says_when_another_session_holds_the_file_now(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let carol = agent(&*store, 3);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    touch(&*store, &carol, "hc", &[A], T0 + 3);
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert_eq!(told.handoffs.len(), 1);
+    assert_eq!(told.handoffs[0].kind, "lapse_held");
+    let lines = self::told(&told, T0 + 4);
+    assert!(
+        lines.contains("another session does; agentscm_start names the current holder"),
+        "{lines}"
+    );
+    assert!(!lines.contains("free"), "{lines}");
 }
 
 fn handoffs_wait_for_a_reply_that_can_show_them(db: &Db) {
@@ -1385,6 +1412,7 @@ conformance!(
     asking_needs_a_session_and_a_free_queue,
     a_request_whose_requester_ended_lapses,
     a_request_for_released_files_is_told_as_lapsed_once,
+    a_lapsed_ask_says_when_another_session_holds_the_file_now,
     handoffs_wait_for_a_reply_that_can_show_them,
     pending_requests_follow_the_adopted_session,
     the_same_agent_is_not_a_holder_to_ask,

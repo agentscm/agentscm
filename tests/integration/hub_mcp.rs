@@ -1651,6 +1651,53 @@ fn keyless(text: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ask_lapses_once_when_the_holder_releases_the_file() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let file = "src/billing.rs";
+    let token_of = |secret: &str| {
+        hub.store
+            .authenticate(&store::agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    for (secret, paths) in [(&alice, vec![file.to_owned()]), (&bob, vec![])] {
+        hub.store
+            .touch_session(
+                &token_of(secret),
+                &agentscm::hub::session::SessionCall {
+                    session: None,
+                    via: "mcp".into(),
+                    task: Some("work".into()),
+                    paths,
+                    deny: false,
+                    report: true,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let (asked, error) = hub
+        .tool(&bob, "/mcp", "agentscm_ask", json!({"path": file}))
+        .await;
+    assert!(!error, "{asked}");
+    hub.store
+        .end_session(&token_of(&alice), Some("default"), unix_now())
+        .unwrap();
+    let (status, _) = hub.tool(&bob, "/mcp", "agentscm_status", json!({})).await;
+    assert!(
+        status.contains(
+            "your ask for src/billing.rs lapsed: the holder released the files; no reply was given."
+        ),
+        "{status}"
+    );
+    let (again, _) = hub.tool(&bob, "/mcp", "agentscm_status", json!({})).await;
+    assert!(!again.contains("lapsed"), "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");

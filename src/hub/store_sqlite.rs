@@ -6041,9 +6041,33 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
     )?;
     if changed > 0 {
         tx.execute("DELETE FROM hub_intent_paths WHERE intent = ?1", [intent])?;
+        lapse_unheld_asks(tx, intent, now)?;
         append(tx, &Event::intent_released(intent)?)?;
     }
     Ok(changed > 0)
+}
+
+/// Lapses the pending asks to the holder of `intent` for files that no live intent of that
+/// holder covers now, so a requester is told at its next call. An expiry has no write path, so
+/// `handoffs_in` still lapses those lazily.
+fn lapse_unheld_asks(tx: &Transaction<'_>, intent: &str, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_handoffs SET state = 'lapsed', decided_at = ?2
+         WHERE state = 'pending'
+           AND (holder_intent = ?1
+                OR EXISTS (SELECT 1 FROM hub_sessions s
+                           WHERE s.token = hub_handoffs.holder_token
+                             AND s.session = hub_handoffs.holder_session AND s.intent = ?1))
+           AND NOT EXISTS (
+             SELECT 1 FROM hub_intent_paths p
+             WHERE p.key = hub_handoffs.path AND p.expires_at > ?2
+               AND (p.intent = hub_handoffs.holder_intent
+                    OR p.intent = (SELECT s.intent FROM hub_sessions s
+                                   WHERE s.token = hub_handoffs.holder_token
+                                     AND s.session = hub_handoffs.holder_session)))",
+        params![intent, now],
+    )?;
+    Ok(())
 }
 
 /// Releases the session's intent and deletes its row. False when it had none.
@@ -6204,6 +6228,7 @@ fn trim_intent(
              (SELECT value FROM json_each(?2))",
         params![intent, serde_json::json!(kept).to_string()],
     )?;
+    lapse_unheld_asks(tx, intent, now)?;
     append(
         tx,
         &Event::intent_paths_changed(intent, &paths, expires_at)?,
@@ -7706,7 +7731,13 @@ fn handoffs_in(
     let answers = tx
         .prepare_cached(
             "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
-                    h.answered_via_slack, h.holder_token, h.holder_session, hs.via
+                    h.answered_via_slack, h.holder_token, h.holder_session, hs.via,
+                    EXISTS (SELECT 1 FROM hub_intent_paths p
+                            WHERE p.key = h.path AND p.repository_scope = h.repository_scope
+                              AND p.expires_at > ?4
+                              AND p.intent IS NOT (SELECT s.intent FROM hub_sessions s
+                                                   WHERE s.token = h.requester_token
+                                                     AND s.session = h.requester_session))
              FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
              JOIN hub_users u ON u.id = t.owner
              LEFT JOIN hub_sessions hs
@@ -7715,11 +7746,11 @@ fn handoffs_in(
                AND h.state IN ('granted', 'declined', 'lapsed') AND h.requester_told = 0
              ORDER BY h.decided_at, h.id LIMIT ?3",
         )?
-        .query_map(params![token, session, PER_TOUCH], |row| {
+        .query_map(params![token, session, PER_TOUCH, now], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 HandoffNote {
-                    kind: answer_kind(&row.get::<_, String>(1)?),
+                    kind: answer_kind(&row.get::<_, String>(1)?, row.get(11)?),
                     path: row.get(2)?,
                     note: None,
                     reason: row.get(5)?,
