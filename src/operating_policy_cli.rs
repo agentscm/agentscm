@@ -547,6 +547,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                     }],
                     depends_on: vec![],
                     related_work: vec![],
+                    finished_paths: Vec::new(),
                 })
                 .await
                 .and_then(|recorded| {
@@ -838,6 +839,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                     oid: retained.dispatch.event.accepted_commit.clone(), path: None,
                 }] } else { vec![] },
                 depends_on: vec![], related_work: vec![],
+                finished_paths: Vec::new(),
             });
             let reserved = OperatingWork {
                 identity_commitment: binding.identity_commitment.clone(),

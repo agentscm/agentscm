@@ -430,6 +430,7 @@ pub(super) fn apply(
     item.updated_at = now;
     Ok(match request.transition {
         Release => {
+            item.finished_paths.clear();
             item.generation += 1;
             if item.state == WorkState::Active {
                 item.state = WorkState::Paused;
@@ -459,6 +460,7 @@ pub(super) fn apply(
                 )));
             }
             item.scope.retain(|key| !released.contains(key));
+            item.finished_paths.retain(|key| !released.contains(key));
             if item.scope.is_empty() {
                 return Err(invalid(
                     "release_paths would release the whole scope; use release instead",

@@ -446,6 +446,8 @@ output. The last returns one work item's stored usage reports, at most 100 per p
 session, author or reporter-supplied identifiers. See [work insights](work-insights.md) for
 pagination and evidence limits.
 
+The checkpoint body of `POST /v1/hub/standup/checkpoint` and MCP may carry `finished_paths` (exact scope entries the lead reports as done; see [standup](standup.md)); it is a self-report and the item shows it only when non-empty.
+
 `POST /v1/hub/standup/checkpoint` returns HTTP 409 with
 `{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the
 expected Work sequence is stale and retained history proves that the exact

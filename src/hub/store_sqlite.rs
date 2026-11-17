@@ -5176,6 +5176,7 @@ fn start_overlap_in(
         lead_session: start.session.clone(),
         participants: vec![participant],
         scope,
+        finished_paths: Vec::new(),
         branch: start.branch.clone(),
         worktree: start.worktree.clone(),
         next_action: start.next_action.clone(),
@@ -8578,6 +8579,13 @@ fn checkpoint_overlap_in(
             }
         }
     }
+    let finished = checkpoint.finished_after(
+        &item.finished_paths,
+        checkpoint
+            .normalized_scope()?
+            .as_ref()
+            .unwrap_or(&item.scope),
+    )?;
     let mut lapsed = Vec::new();
     if let Some(scope) = checkpoint.normalized_scope()? {
         // Work without a reservation claims nothing, so its scope change has nothing to check.
@@ -8649,6 +8657,7 @@ fn checkpoint_overlap_in(
     if let Some(scope) = checkpoint.normalized_scope()? {
         item.scope = scope;
     }
+    item.finished_paths = finished;
     if checkpoint.branch.is_some() {
         item.branch = checkpoint.branch.clone();
     }

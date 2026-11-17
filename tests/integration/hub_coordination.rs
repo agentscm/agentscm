@@ -281,6 +281,7 @@ fn checkpoint(
         source_refs: Vec::new(),
         depends_on: Vec::new(),
         related_work: Vec::new(),
+        finished_paths: Vec::new(),
     }
 }
 

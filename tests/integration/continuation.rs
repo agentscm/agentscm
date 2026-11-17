@@ -43,6 +43,7 @@ fn plan(root: &std::path::Path) -> TransferPlan {
         updated_at: 1,
         created_seq: 1,
         updated_seq: 1,
+        finished_paths: Vec::new(),
     };
     let mut plan = TransferPlan {
         id: String::new(),
@@ -946,6 +947,7 @@ fn cli_checks_record_actual_success_and_failure_and_recover_lost_receipt_without
                     source_refs: vec![],
                     depends_on: current.depends_on.clone(),
                     related_work: current.related_work.clone(),
+                    finished_paths: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -1168,6 +1170,7 @@ fn explicit_resolution_after_a_lost_reply_uses_the_current_boundary_without_repl
                     source_refs: vec![],
                     depends_on: current.depends_on.clone(),
                     related_work: current.related_work.clone(),
+                    finished_paths: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -1250,6 +1253,7 @@ fn resolution_observes_the_current_handover_and_rejects_changed_scope_branch_or_
                     source_refs: vec![],
                     depends_on: current.depends_on.clone(),
                     related_work: current.related_work.clone(),
+                    finished_paths: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -1481,6 +1485,7 @@ fn checkpoint_replay_cannot_adopt_narrowed_scope_or_a_later_external_executor() 
                         source_refs: vec![],
                         depends_on: vec![],
                         related_work: vec![],
+                        finished_paths: Vec::new(),
                     })
                     .unwrap(),
                 ),

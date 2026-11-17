@@ -2155,6 +2155,7 @@ mod tests {
             updated_at: 10,
             created_seq: 1,
             updated_seq: 9,
+            finished_paths: Vec::new(),
         }
     }
 

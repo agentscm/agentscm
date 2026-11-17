@@ -571,6 +571,7 @@ fn checkpoint(
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: Vec::new(),
     }
 }
 
@@ -2692,6 +2693,7 @@ conformance!(
     release_one_of_three,
     release_paths_is_for_the_lead_and_the_owner_and_names_what_it_refuses,
     release_paths_never_takes_another_works_file,
+    finished_paths_follow_the_scope_and_never_change_admission,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -7327,4 +7329,85 @@ fn release_paths_never_takes_another_works_file(db: &Db) {
         &["lib/x.rs"],
         now + 5,
     ));
+}
+
+fn finished_paths_follow_the_scope_and_never_change_admission(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let a = start_scope(
+        &*store,
+        &alice,
+        "a",
+        "s-a",
+        &["src/a.rs", "src/b.rs", "src/c.rs"],
+        now,
+    )
+    .item;
+    assert!(a.finished_paths.is_empty());
+    let progress = |item: &agentscm::hub::work::WorkItem, op: &str, finished: &[&str]| {
+        let mut request = checkpoint(&item.id, op, 1, "s-a", CheckpointKind::Progress, "p");
+        request.expected_updated_seq = Some(item.updated_seq);
+        request.finished_paths = finished.iter().map(|path| (*path).to_owned()).collect();
+        request
+    };
+    // A path outside the scope is refused and names the path.
+    let a1 = current_item(&*store, &alice, &a.id, now + 1);
+    assert_refused_naming(
+        store.work_checkpoint(&alice.token, &progress(&a1, "bad", &["src/z.rs"]), now + 2),
+        "src/z.rs",
+    );
+    // Reporting stores the set; a checkpoint without it keeps it; a new set replaces it.
+    let reported = store
+        .work_checkpoint(
+            &alice.token,
+            &progress(&a1, "one", &["src/a.rs", "src/b.rs"]),
+            now + 3,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(reported.finished_paths, ["src/a.rs", "src/b.rs"]);
+    let kept = store
+        .work_checkpoint(&alice.token, &progress(&reported, "two", &[]), now + 4)
+        .unwrap()
+        .item;
+    assert_eq!(kept.finished_paths, ["src/a.rs", "src/b.rs"]);
+    let replaced = store
+        .work_checkpoint(
+            &alice.token,
+            &progress(&kept, "three", &["src/b.rs", "src/c.rs"]),
+            now + 5,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(replaced.finished_paths, ["src/b.rs", "src/c.rs"]);
+    // It is a self-report: another Work is still refused a finished file.
+    assert_scope_overlap(&start_scope(
+        &*store,
+        &bob,
+        "b",
+        "s-b",
+        &["src/b.rs"],
+        now + 6,
+    ));
+    // Narrowing the scope drops the paths that left it.
+    let mut narrow = progress(&replaced, "four", &[]);
+    narrow.scope = Some(vec!["src/a.rs".into(), "src/b.rs".into()]);
+    let narrowed = store
+        .work_checkpoint(&alice.token, &narrow, now + 7)
+        .unwrap()
+        .item;
+    assert_eq!(narrowed.finished_paths, ["src/b.rs"]);
+    // release_paths drops them too.
+    let current = current_item(&*store, &alice, &a.id, now + 8);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&current, "rp", Some("s-a"), &["src/b.rs"]),
+            now + 9,
+        )
+        .unwrap();
+    assert_eq!(released.item.scope, ["src/a.rs"]);
+    assert!(released.item.finished_paths.is_empty());
 }

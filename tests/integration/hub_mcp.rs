@@ -4606,3 +4606,75 @@ async fn pr_overlap_skips_the_work_that_opened_the_pull_request() {
         .collect();
     assert_eq!(logins, ["user2"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finished_paths_prompt_the_lead_and_the_refused_requester() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let texts = |value: &Value| {
+        value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let first = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"request_key":"first","task":"First","session":"s-a","paths":["src/a.rs","src/b.rs"]}),
+        )
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let item = &first["structuredContent"]["work"]["item"];
+    let report = |op: &str, seq: &Value| {
+        json!({"work_id":item["id"],"operation_id":op,"generation":item["generation"],
+            "expected_updated_seq":seq,"session":"s-a","kind":"progress",
+            "summary":"a is done","finished_paths":["src/a.rs"]})
+    };
+    let quiet = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            report("one", &item["updated_seq"]),
+        )
+        .await;
+    assert_eq!(quiet["isError"], false, "{quiet}");
+    assert_eq!(
+        quiet["structuredContent"]["item"]["finished_paths"],
+        json!(["src/a.rs"])
+    );
+    assert!(!texts(&quiet).contains("finished file(s)"), "{quiet}");
+
+    let refused = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"request_key":"second","task":"Second","session":"s-b","paths":["src/a.rs","src/b.rs"]}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = texts(&refused);
+    assert!(
+        text.contains("reports these requested files as finished"),
+        "{text}"
+    );
+    assert!(
+        text.contains("src/a.rs") && text.contains("agentscm_work_overlap_consent"),
+        "{text}"
+    );
+
+    let seq = quiet["structuredContent"]["item"]["updated_seq"].clone();
+    let prompted = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", report("two", &seq))
+        .await;
+    let text = texts(&prompted);
+    assert!(
+        text.contains("1 finished file(s) are wanted by another Work: src/a.rs")
+            && text.contains("release_paths"),
+        "{text}"
+    );
+}

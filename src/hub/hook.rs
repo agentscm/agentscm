@@ -633,7 +633,7 @@ async fn hook(
                             };
                             outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         } else {
-                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline (release_paths frees finished files). Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
@@ -2761,6 +2761,7 @@ mod tests {
             updated_at: 1_000,
             created_seq: 1,
             updated_seq: 1,
+            finished_paths: Vec::new(),
         }
     }
 

@@ -1071,6 +1071,7 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: Vec::new(),
             },
             now + 5,
         )
@@ -1197,6 +1198,7 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: Vec::new(),
             },
             now + 11,
         )

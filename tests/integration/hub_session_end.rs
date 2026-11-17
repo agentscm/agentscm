@@ -243,6 +243,7 @@ fn checkpoint(item: &WorkItem, kind: CheckpointKind, operation_id: &str) -> Work
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: Vec::new(),
     }
 }
 

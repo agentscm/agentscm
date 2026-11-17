@@ -339,6 +339,7 @@ fn action_capture_receipt(db: &Db) {
                 }],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             290,
         )
@@ -503,6 +504,7 @@ fn action_capture_receipt(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             311,
         )
@@ -648,6 +650,7 @@ fn review_projection_acceptance_cases(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             706,
         )
@@ -885,6 +888,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             408,
         )
@@ -1030,6 +1034,7 @@ fn checkpoint(
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: Vec::new(),
     }
 }
 

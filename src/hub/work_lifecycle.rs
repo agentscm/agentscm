@@ -1181,6 +1181,7 @@ mod tests {
             updated_at: 10,
             created_seq: 1,
             updated_seq: 7,
+            finished_paths: Vec::new(),
         }
     }
 

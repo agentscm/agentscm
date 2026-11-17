@@ -671,6 +671,7 @@ fn compaction_delivery_guard(fixture: &Fixture) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: Vec::new(),
             },
             old + 1,
         )
@@ -1067,6 +1068,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             now + 7,
         )
@@ -2306,6 +2308,7 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
                     }],
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: Vec::new(),
                 },
                 at,
             )
@@ -2478,6 +2481,7 @@ fn why_marks_cut_lists(fixture: &Fixture) {
                         source_refs: Vec::new(),
                         depends_on: Vec::new(),
                         related_work: Vec::new(),
+                        finished_paths: Vec::new(),
                     },
                     now + n as i64,
                 )
@@ -2625,6 +2629,7 @@ fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
                     source_refs: Vec::new(),
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: Vec::new(),
                 },
                 now,
             )
@@ -3196,6 +3201,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 }],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: Vec::new(),
             },
             now,
         )
@@ -3893,6 +3899,7 @@ fn checkin(
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: Vec::new(),
             },
             at,
         )
