@@ -430,6 +430,8 @@ struct PersonTransition {
     superseded_by: Option<String>,
     #[serde(default)]
     participants: Vec<super::work_transition::ParticipantRef>,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 /// A signed-in person releases, retains or ends Work they own, or, as a Hub administrator,
@@ -465,6 +467,7 @@ async fn person_transition(
         reason: body.reason,
         superseded_by: body.superseded_by,
         participants: body.participants,
+        paths: body.paths,
     };
     let store = state.store.clone();
     let mut result = blocking(&state, move || {

@@ -485,8 +485,11 @@ impl WorkEnded {
             return None;
         }
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
-        // Removing participants neither ends nor reopens the Work.
-        if v.get("transition")?.as_str()? == "prune_participants" {
+        // Removing participants or releasing some paths neither ends nor reopens the Work.
+        if matches!(
+            v.get("transition")?.as_str()?,
+            "prune_participants" | "release_paths"
+        ) {
             return None;
         }
         let actor = v.get("actor")?;

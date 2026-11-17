@@ -95,7 +95,7 @@ export function currentLeadParticipant(item: WorkItem): WorkParticipant {
   return lead ?? fail('work.lead')
 }
 
-export type WorkTransitionKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants'
+export type WorkTransitionKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants' | 'release_paths'
 
 /** How a `work_transition` event reads in a feed; callers fall back to a generic label for an absent kind. */
 export const TRANSITION_LABEL: Readonly<Record<WorkTransitionKind, string>> = {
@@ -106,6 +106,7 @@ export const TRANSITION_LABEL: Readonly<Record<WorkTransitionKind, string>> = {
   supersede: 'Work superseded',
   reopen: 'Work reopened',
   prune_participants: 'Participants pruned',
+  release_paths: 'Paths released',
 }
 
 /** Leniently decodes a feed event's transition kind: anything unrecognised is undefined, never an error. */

@@ -2194,6 +2194,7 @@ mod tests {
                         reason: "Synthetic disposition".into(),
                         superseded_by: None,
                         participants: Vec::new(),
+                        paths: Vec::new(),
                     },
                     now,
                 )

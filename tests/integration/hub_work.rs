@@ -2689,6 +2689,9 @@ conformance!(
     every_basis_lapses_and_retain_is_capped,
     a_gap_in_the_clock_grants_one_lease_of_grace,
     lease_migration_starts_existing_reservations_now,
+    release_one_of_three,
+    release_paths_is_for_the_lead_and_the_owner_and_names_what_it_refuses,
+    release_paths_never_takes_another_works_file,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -4016,6 +4019,7 @@ fn transition_request(
         reason: "synthetic reason".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     }
 }
 
@@ -4214,7 +4218,9 @@ fn transition_matrix_covers_every_actor_and_kind(db: &Db) {
                     );
                 }
                 // Covered by the participant repair tests in hub_recovery.
-                WorkTransitionKind::PruneParticipants => unreachable!("not in the table"),
+                WorkTransitionKind::PruneParticipants | WorkTransitionKind::ReleasePaths => {
+                    unreachable!("not in the table")
+                }
             }
         }
     }
@@ -6396,6 +6402,7 @@ fn read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores(db: &Db)
         reason: "synthetic reason".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     };
     assert!(matches!(
         store.work_transition(&by_agent(&reader), &request, now),
@@ -6990,4 +6997,330 @@ fn issue_links_survive_compaction_with_correct_capacity(db: &Db) {
     );
     let (charged, aggregate) = db.work_usage_and_aggregate();
     assert_eq!(charged, aggregate);
+}
+
+fn start_scope(
+    store: &dyn Store,
+    who: &Agent,
+    key: &str,
+    session: &str,
+    scope: &[&str],
+    now: i64,
+) -> agentscm::hub::work::WorkStartResult {
+    let mut start = native_start(key, key, session);
+    start.scope = scope.iter().map(|path| (*path).to_owned()).collect();
+    store.work_start(&who.token, &start, now).unwrap()
+}
+
+fn release_paths_request(
+    item: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+    session: Option<&str>,
+    paths: &[&str],
+) -> WorkTransitionRequest {
+    let mut request = transition_request(
+        item,
+        operation_id,
+        WorkTransitionKind::ReleasePaths,
+        session,
+    );
+    request.paths = paths.iter().map(|path| (*path).to_owned()).collect();
+    request
+}
+
+fn release_one_of_three(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let a = start_scope(
+        &*store,
+        &alice,
+        "a",
+        "s-a",
+        &["src/a.rs", "src/b.rs", "src/c.rs"],
+        now,
+    )
+    .item;
+    announce(&*store, &alice, "s-a", "src/a.rs", now + 1);
+    store
+        .announce_intent(
+            &alice.token,
+            &plain_intent_of(1, &["src/a.rs", "src/b.rs"]),
+            now + 1,
+        )
+        .unwrap();
+    let wants_a = start_scope(&*store, &bob, "b", "s-b", &["src/a.rs"], now + 2);
+    assert_scope_overlap(&wants_a);
+    let wants_b = start_scope(&*store, &carol, "c", "s-c", &["src/b.rs"], now + 2);
+    assert_scope_overlap(&wants_b);
+    let (ask_a, ask_b) = (
+        wants_a.coordination_request.unwrap(),
+        wants_b.coordination_request.unwrap(),
+    );
+
+    let before = current_item(&*store, &alice, &a.id, now + 3);
+    let reservation = db.reservation(&a.id);
+    let lease = lease_of(db, &a.id);
+    let seq = store.latest_event_seq().unwrap();
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&before, "rp", Some("s-a"), &["src/a.rs"]),
+            now + 4,
+        )
+        .unwrap();
+    let after = released.item;
+    assert_eq!(after.scope, ["src/b.rs", "src/c.rs"]);
+    assert_eq!(
+        (after.state, after.generation, after.lead_session.as_str()),
+        (before.state, before.generation, "s-a")
+    );
+    assert_eq!(db.reservation(&a.id), reservation);
+    assert_eq!(
+        lease_of(db, &a.id),
+        lease,
+        "a partial release keeps the lease"
+    );
+    // Only the released path left the intents; the rest stay.
+    assert_eq!(live_keys(db), ["src/b.rs"]);
+    let events = store.events_after(seq, 1000).unwrap();
+    let transition: Vec<serde_json::Value> = events
+        .iter()
+        .filter(|event| event.kind == "work_transition")
+        .map(|event| serde_json::from_str(&event.data).unwrap())
+        .collect();
+    assert_eq!(transition.len(), 1);
+    assert_eq!(transition[0]["transition"], "release_paths");
+    assert_eq!(
+        transition[0]["released_paths"],
+        serde_json::json!(["src/a.rs"])
+    );
+    // Only the request that asked for the released path is told.
+    let told: Vec<(String, serde_json::Value)> = events
+        .iter()
+        .filter(|event| event.kind == "coordination_target_released")
+        .map(|event| {
+            (
+                event.subject.clone(),
+                serde_json::from_str(&event.data).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].0, ask_a.id);
+    assert_ne!(told[0].0, ask_b.id);
+    assert_eq!(told[0].1["paths"], serde_json::json!(["src/a.rs"]));
+    assert_eq!(told[0].1["transition"], "release_paths");
+
+    // The waiting start now takes the released path; the others stay reserved.
+    let taken = start_scope(&*store, &bob, "b", "s-b", &["src/a.rs"], now + 5);
+    assert!(taken.created, "{:?}", taken.conflict);
+    for path in ["src/b.rs", "src/c.rs"] {
+        let refused = start_scope(&*store, &carol, "c", "s-c", &[path], now + 6);
+        assert_scope_overlap(&refused);
+    }
+    let live = current_item(&*store, &alice, &a.id, now + 7);
+    assert_eq!(live.scope, ["src/b.rs", "src/c.rs"]);
+    assert_eq!(db.reservation(&a.id), reservation);
+
+    // An exact retry replays and changes nothing.
+    let replay = store
+        .work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&before, "rp", Some("s-a"), &["src/a.rs"]),
+            now + 8,
+        )
+        .unwrap();
+    assert!(replay.receipt.unwrap().replayed);
+}
+
+fn assert_refused_naming<T>(result: Result<T, HubError>, text: &str) {
+    match result {
+        Err(HubError::Invalid(actual)) => assert!(actual.contains(text), "{actual}"),
+        Err(HubError::Rejected(rejection)) => assert!(rejection.message().contains(text)),
+        _ => panic!("expected a refusal naming {text:?}"),
+    }
+}
+
+fn helper_join(work_id: &str, session: &str) -> WorkStart {
+    let mut start = join(work_id, session, WorkRole::Helper);
+    start.scope = vec!["src/a.rs".into()];
+    start
+}
+
+fn release_paths_is_for_the_lead_and_the_owner_and_names_what_it_refuses(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let a = start_scope(
+        &*store,
+        &alice,
+        "a",
+        "s-a",
+        &["src/a.rs", "src/b.rs", "lib/**"],
+        now,
+    )
+    .item;
+    store
+        .work_start(&bob.token, &helper_join(&a.id, "s-h"), now + 1)
+        .unwrap();
+    let a = current_item(&*store, &alice, &a.id, now + 2);
+    let request = |op: &str, session: Option<&str>, paths: &[&str]| {
+        release_paths_request(&a, op, session, paths)
+    };
+    let seq = store.latest_event_seq().unwrap();
+
+    // A helper of another owner has no standing; an administrator and the Hub's policy may not.
+    assert!(matches!(
+        store.work_transition(
+            &by_agent(&bob),
+            &request("h", Some("s-h"), &["src/a.rs"]),
+            now + 3
+        ),
+        Err(HubError::Unauthorized)
+    ));
+    assert_refused_naming(
+        store.work_transition(
+            &person(&admin, true),
+            &request("ad", None, &["src/a.rs"]),
+            now + 3,
+        ),
+        "may not request",
+    );
+    assert_refused_naming(
+        store.work_transition(
+            &WorkTransitionActor::Policy {
+                owner: &owner,
+                repository: REPO,
+                repository_id: REPOSITORY_ID,
+            },
+            &request("po", None, &["src/a.rs"]),
+            now + 3,
+        ),
+        "may not request",
+    );
+    // Refused paths are named; nothing changes.
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &request("x1", Some("s-a"), &["src/z.rs"]),
+            now + 3,
+        ),
+        "src/z.rs",
+    );
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &request("x2", Some("s-a"), &["src/a.rs", "lib/x.rs"]),
+            now + 3,
+        ),
+        "lib/x.rs",
+    );
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &request("x3", Some("s-a"), &["src/a.rs", "src/b.rs", "lib/**"]),
+            now + 3,
+        ),
+        "use release",
+    );
+    assert_refused_naming(
+        store.work_transition(&by_agent(&alice), &request("x4", Some("s-a"), &[]), now + 3),
+        "requires paths",
+    );
+    let mut stray = transition_request(&a, "x5", WorkTransitionKind::Release, Some("s-a"));
+    stray.paths = vec!["src/a.rs".into()];
+    assert_refused_naming(
+        store.work_transition(&by_agent(&alice), &stray, now + 3),
+        "only valid for release_paths",
+    );
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+
+    // A participant's join moves updated_seq, and the exact fence refuses the stale plan.
+    store
+        .work_start(&bob.token, &helper_join(&a.id, "s-h2"), now + 4)
+        .unwrap();
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &request("st", Some("s-a"), &["src/a.rs"]),
+            now + 5,
+        ),
+        "work changed",
+    );
+
+    // The owner acts through another token of its own or as a person; the lead as itself.
+    let a = current_item(&*store, &alice, &a.id, now + 6);
+    let by_owner_agent = store
+        .work_transition(
+            &by_agent(&alice_b),
+            &release_paths_request(&a, "o1", Some("s-other"), &["src/a.rs"]),
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(by_owner_agent.item.scope, ["lib/", "src/b.rs"]);
+    let a = current_item(&*store, &alice, &a.id, now + 7);
+    let by_person = store
+        .work_transition(
+            &person(&owner, false),
+            &release_paths_request(&a, "o2", None, &["lib/**"]),
+            now + 7,
+        )
+        .unwrap();
+    assert_eq!(by_person.item.scope, ["src/b.rs"]);
+    // One entry is left; releasing it is a whole release.
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&by_person.item, "o3", Some("s-a"), &["src/b.rs"]),
+            now + 8,
+        ),
+        "use release",
+    );
+}
+
+fn release_paths_never_takes_another_works_file(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let a = start_scope(&*store, &alice, "a", "s-a", &["src/a.rs", "src/b.rs"], now).item;
+    let b = start_scope(&*store, &bob, "b", "s-b", &["lib/x.rs"], now + 1).item;
+    let b_columns = (db.reservation(&b.id), lease_of(db, &b.id));
+    assert_refused_naming(
+        store.work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&a, "rp", Some("s-a"), &["lib/x.rs"]),
+            now + 2,
+        ),
+        "lib/x.rs",
+    );
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &release_paths_request(&a, "ok", Some("s-a"), &["src/a.rs"]),
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(released.item.scope, ["src/b.rs"]);
+    let b_after = current_item(&*store, &bob, &b.id, now + 4);
+    assert_eq!(b_after.scope, ["lib/x.rs"]);
+    assert_eq!((db.reservation(&b.id), lease_of(db, &b.id)), b_columns);
+    // Bob's file is still bob's: a third Work cannot take it.
+    let carol = agent(&*store, 3);
+    assert_scope_overlap(&start_scope(
+        &*store,
+        &carol,
+        "c",
+        "s-c",
+        &["lib/x.rs"],
+        now + 5,
+    ));
 }

@@ -6001,48 +6001,127 @@ fn trim_session_intents(
         let Some(intent) = session_row(tx, &token, &session)?.and_then(|row| row.intent) else {
             continue;
         };
-        let expires_at: i64 = tx
-            .query_one(
-                "SELECT expires_at FROM hub_intents WHERE id = $1",
-                &[&intent],
-            )?
-            .get(0);
-        // An expired intent holds nothing, so there is nothing to trim or announce.
-        if expires_at <= now {
-            continue;
-        }
-        let keys = tx
-            .query(
-                "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
-                &[&intent],
-            )?
-            .iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>();
-        let elsewhere = other_eligible_scopes(tx, &item.id, &token)?;
-        let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
-        if kept.len() == keys.len() {
-            continue;
-        }
-        if kept.is_empty() {
-            release_in(tx, &token, &intent, now)?;
-            continue;
-        }
-        let paths = display_all(&kept);
-        tx.execute(
-            "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
-            &[&intent, &serde_json::json!(paths).to_string(), &now],
-        )?;
-        tx.execute(
-            "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
-            &[&intent, &kept],
-        )?;
-        append(
-            tx,
-            &Event::intent_paths_changed(&intent, &paths, expires_at)?,
-        )?;
+        trim_intent(tx, item, &token, &intent, previous, now)?;
     }
     Ok(())
+}
+
+/// Trims one intent of `token` after `item`'s scope narrowed from `previous`.
+fn trim_intent(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    token: &str,
+    intent: &str,
+    previous: &[String],
+    now: i64,
+) -> Result<()> {
+    let expires_at: i64 = tx
+        .query_one(
+            "SELECT expires_at FROM hub_intents WHERE id = $1",
+            &[&intent],
+        )?
+        .get(0);
+    // An expired intent holds nothing, so there is nothing to trim or announce.
+    if expires_at <= now {
+        return Ok(());
+    }
+    let keys = tx
+        .query(
+            "SELECT key FROM hub_intent_paths WHERE intent = $1 ORDER BY key",
+            &[&intent],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    let elsewhere = other_eligible_scopes(tx, &item.id, token)?;
+    let kept = super::work::keys_kept_after_narrowing(&keys, previous, &item.scope, &elsewhere);
+    if kept.len() == keys.len() {
+        return Ok(());
+    }
+    if kept.is_empty() {
+        release_in(tx, token, intent, now)?;
+        return Ok(());
+    }
+    let paths = display_all(&kept);
+    tx.execute(
+        "UPDATE hub_intents SET paths = $2, updated_at = $3 WHERE id = $1",
+        &[&intent, &serde_json::json!(paths).to_string(), &now],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_intent_paths WHERE intent = $1 AND NOT (key = ANY($2))",
+        &[&intent, &kept],
+    )?;
+    append(
+        tx,
+        &Event::intent_paths_changed(intent, &paths, expires_at)?,
+    )?;
+    Ok(())
+}
+
+/// Frees only the released paths of a partial release: from every participant session's intent
+/// and from the participants' tokens' session-less intents, then records the
+/// `coordination_target_released` event of each open request that targets the Work and asks for
+/// a released path. Returns the payload bytes the request events add.
+fn release_path_holds(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    previous: &[String],
+    released: &[String],
+    cause: &work_transition::ReleaseCause,
+    now: i64,
+) -> Result<i64> {
+    trim_session_intents(tx, item, previous, now)?;
+    let mut tokens: Vec<String> = work_transition::claim_sessions(item)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect();
+    tokens.dedup();
+    for token in tokens {
+        let intents = tx.query(
+            "SELECT i.id FROM hub_intents i
+             WHERE i.token = $1 AND i.released_at IS NULL AND i.expires_at > $2
+               AND NOT EXISTS (SELECT 1 FROM hub_sessions s WHERE s.intent = i.id)
+             ORDER BY i.id",
+            &[&token, &now],
+        )?;
+        for row in intents {
+            let intent: String = row.get(0);
+            trim_intent(tx, item, &token, &intent, previous, now)?;
+        }
+    }
+    let open = tx.query(
+        "SELECT r.id, r.status, r.proposed_work, r.proposed_scope
+         FROM hub_coordination_requests r
+         WHERE r.status IN ('pending', 'responded')
+           AND EXISTS (SELECT 1 FROM hub_coordination_targets t
+                       WHERE t.request = r.id AND t.work = $1)
+         ORDER BY r.id",
+        &[&item.id],
+    )?;
+    let mut delta = 0i64;
+    for row in open {
+        let id: String = row.get(0);
+        let status: String = row.get(1);
+        let proposed_work: Option<String> = row.get(2);
+        let proposed: Vec<String> = json_value(&row.get::<_, String>(3))?;
+        if scope_overlap_reasons(released, &proposed).is_empty() {
+            continue;
+        }
+        let event = work_transition::released_target_event(&id, item, cause)?;
+        let seq = append(tx, &event)?;
+        save_coordination_version(
+            tx,
+            &id,
+            parse_status(&status)?,
+            proposed_work.as_deref(),
+            now,
+            seq,
+        )?;
+        delta = delta
+            .checked_add(coordination_payload_bytes(&[""], &event)?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    }
+    Ok(delta)
 }
 
 /// Releases the token's live intents that no session holds and that cover part of `scope`.
@@ -12268,7 +12347,7 @@ impl Store for PgStore {
             let basis_column: Option<String> = columns_row.get(1);
             let held = basis_column.is_some();
             let only_joins_since = item.updated_seq != request.expected_updated_seq
-                && request.transition != work_transition::WorkTransitionKind::PruneParticipants
+                && !request.transition.needs_exact_seq()
                 && tx
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM hub_events WHERE subject = $1 AND seq = $2 AND seq < $3)
@@ -12326,13 +12405,19 @@ impl Store for PgStore {
                 lead_session: item.lead_session.clone(),
             };
             let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            let previous_scope = item.scope.clone();
             let columns = work_transition::apply(&mut item, request, &acting, &prior, now)?;
             let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
             let seq = append(&mut tx, &event)?;
             item.updated_seq = seq;
             let snapshot = save_work_version(&mut tx, &item, seq)?;
-            // A prune changes neither the outcome nor the reservation, so its lease is not reset.
-            if request.transition != work_transition::WorkTransitionKind::PruneParticipants {
+            // A prune or a partial release changes neither the outcome nor the reservation, so its
+            // lease is not reset.
+            if !matches!(
+                request.transition,
+                work_transition::WorkTransitionKind::PruneParticipants
+                    | work_transition::WorkTransitionKind::ReleasePaths
+            ) {
                 set_work_reservation(
                     &mut tx,
                     &item.id,
@@ -12419,6 +12504,20 @@ impl Store for PgStore {
                         now,
                     )?)
                     .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+                record_work_payload_delta(&mut tx, &who, delta, now)?;
+            } else if request.transition == work_transition::WorkTransitionKind::ReleasePaths {
+                let cause = work_transition::ReleaseCause::transition(request, &acting);
+                delta = delta
+                    .checked_add(release_path_holds(
+                        &mut tx,
+                        &item,
+                        &previous_scope,
+                        &request.released_keys()?,
+                        &cause,
+                        now,
+                    )?)
+                    .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+                // Cleanup of claims: its size is recorded without a quota check, as for a release.
                 record_work_payload_delta(&mut tx, &who, delta, now)?;
             } else {
                 adjust_work_payload_capacity(&mut tx, &who, delta, now)?;

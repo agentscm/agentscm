@@ -4081,6 +4081,7 @@ async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
                 reason: "synthetic reason".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             unix_now(),
         )

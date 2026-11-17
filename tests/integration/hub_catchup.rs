@@ -3635,6 +3635,7 @@ fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
                 reason: "synthetic reason".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             now + 2,
         )
@@ -4628,6 +4629,7 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
                 reason: "synthetic release".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )
@@ -4848,6 +4850,7 @@ fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
                 reason: "No more scope is reserved".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )

@@ -1194,10 +1194,11 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "generation": {"type": "integer", "minimum": 1},
              "expected_updated_seq": {"type": "integer", "minimum": 1, "description": "Required compare-and-set fence from the last observed work item. An exact retained request returns its stored receipt before this fence is compared."},
              "session": {"type": "string"},
-             "transition": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "prune_participants"]},
+             "transition": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "prune_participants", "release_paths"]},
              "reason": {"type": "string", "maxLength": 500, "description": "Why, in one line; recorded with the transition."},
              "superseded_by": {"type": "string", "description": "The Work that replaces this one; required for supersede and refused otherwise."},
-             "participants": {"type": "array", "minItems": 1, "maxItems": 100, "items": participant_ref.clone()}
+             "participants": {"type": "array", "minItems": 1, "maxItems": 100, "items": participant_ref.clone()},
+             "paths": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}, "description": "release_paths: exact scope entries to free."}
          }), &["work_id", "operation_id", "generation", "expected_updated_seq", "session", "transition", "reason"])});
     let transitions = json!({"name": "agentscm_work_transitions",
          "description": "Applies up to 25 transitions in order, each in its own transaction with the same rules as agentscm_work_transition, and reports one outcome per item: applied, replayed (already applied; nothing changed now), conflict (a reopen overlapped; nothing changed), refused (with a code and how to retry) or unavailable (retry the same item with the same operation_id). Earlier items stay applied when a later one is refused. Retrying the whole batch unchanged is safe.",
@@ -1210,10 +1211,11 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
                      "operation_id": {"type": "string", "description": "Stable idempotency key for this item."},
                      "generation": {"type": "integer", "minimum": 1},
                      "expected_updated_seq": {"type": "integer", "minimum": 1},
-                     "transition": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "prune_participants"]},
+                     "transition": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen", "prune_participants", "release_paths"]},
                      "reason": {"type": "string", "maxLength": 500},
                      "superseded_by": {"type": "string"},
-                     "participants": {"type": "array", "minItems": 1, "maxItems": 100, "items": participant_ref.clone()}
+                     "participants": {"type": "array", "minItems": 1, "maxItems": 100, "items": participant_ref.clone()},
+                     "paths": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}}
                  },
                  "required": ["work_id", "operation_id", "generation", "expected_updated_seq", "transition", "reason"]}}
          }), &["session", "items"])});
@@ -1975,6 +1977,7 @@ async fn call(
             | "agentscm_work_overlap_start"
             | "agentscm_work_overlap_checkpoint"
             | "agentscm_work_checkpoint"
+            | "agentscm_work_transition"
             | "agentscm_coordination_ack"
             | "agentscm_coordination_reply"
             | "agentscm_coordination_resolve"
@@ -4228,6 +4231,7 @@ async fn complete_led(
             reason: done_reason(summary),
             superseded_by: None,
             participants: Vec::new(),
+            paths: Vec::new(),
         };
         let result = store.work_transition_with_transport(
             &WorkTransitionActor::Agent { token: &token },

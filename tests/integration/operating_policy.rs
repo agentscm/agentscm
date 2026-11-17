@@ -2192,6 +2192,7 @@ fn reopen_as_lead(
                 reason: "stage a lost recovery response".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             agentscm::hub::store::unix_now(),
         )
@@ -2313,6 +2314,7 @@ fn operator_rebinds_a_dispatch_after_reopen_or_release_and_recovery_continues() 
                 reason: "stage a release".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             now,
         )
@@ -2748,6 +2750,7 @@ fn lead_transition(
                 reason: "stage a recovery case".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             agentscm::hub::store::unix_now(),
         )

@@ -291,6 +291,9 @@ pub enum WorkTransitionKind {
     /// state, outcome or reservation, so a state never lists it among its operational remedies;
     /// recovery offers it when the participant list needs repair.
     PruneParticipants,
+    /// Releases named paths from the reservation and keeps the rest. It needs the paths, so a
+    /// state never lists it among its operational remedies.
+    ReleasePaths,
 }
 
 impl WorkTransitionKind {
@@ -299,7 +302,7 @@ impl WorkTransitionKind {
         serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
     }
 
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Release,
         Self::Retain,
         Self::Complete,
@@ -307,6 +310,7 @@ impl WorkTransitionKind {
         Self::Supersede,
         Self::Reopen,
         Self::PruneParticipants,
+        Self::ReleasePaths,
     ];
 
     pub(super) fn as_str(self) -> &'static str {
@@ -318,6 +322,7 @@ impl WorkTransitionKind {
             Self::Supersede => "supersede",
             Self::Reopen => "reopen",
             Self::PruneParticipants => "prune_participants",
+            Self::ReleasePaths => "release_paths",
         }
     }
 }
@@ -364,13 +369,13 @@ pub(super) fn decide_transition(
 ) -> Decision {
     use WorkActorKind::{Admin, Lead, Owner};
     use WorkTransitionKind::{
-        Abandon, Complete, PruneParticipants, Release, Reopen, Retain, Supersede,
+        Abandon, Complete, PruneParticipants, Release, ReleasePaths, Reopen, Retain, Supersede,
     };
     let authorized = match kind {
         _ if via == ActorVia::Policy => matches!(kind, Release | Complete),
         Release | Abandon | Supersede => true,
         PruneParticipants => actor != Lead,
-        Retain | Complete => actor != Admin,
+        Retain | Complete | ReleasePaths => actor != Admin,
         Reopen => actor != Admin && via == ActorVia::Agent,
     };
     // A lead is an agent session by definition; an administrator acts through a web sign-in.
@@ -387,7 +392,7 @@ pub(super) fn decide_transition(
         Reopen if !finished => Err(Refusal::WrongState),
         Reopen | PruneParticipants => Ok(()),
         _ if finished => Err(Refusal::WrongState),
-        Release | Retain if !reservation_held => Err(Refusal::NoReservation),
+        Release | Retain | ReleasePaths if !reservation_held => Err(Refusal::NoReservation),
         _ => Ok(()),
     }
 }
@@ -396,7 +401,12 @@ pub(super) fn decide_transition(
 pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTransitionKind> {
     let mut found: Vec<_> = WorkTransitionKind::ALL
         .into_iter()
-        .filter(|kind| *kind != WorkTransitionKind::PruneParticipants)
+        .filter(|kind| {
+            !matches!(
+                kind,
+                WorkTransitionKind::PruneParticipants | WorkTransitionKind::ReleasePaths
+            )
+        })
         .filter(|kind| {
             // Each kind is allowed to at least one actor in the matrix; probe with the actor
             // that is allowed most often so the answer depends only on state and reservation.
@@ -927,6 +937,7 @@ mod tests {
             WorkTransitionKind::Supersede => "YYYY",
             WorkTransitionKind::Reopen => "YY..",
             WorkTransitionKind::PruneParticipants => ".YYY",
+            WorkTransitionKind::ReleasePaths => "YYY.",
         };
         if row.as_bytes()[actor] == b'.' {
             return Err(Refusal::NotAuthorized);
@@ -935,9 +946,12 @@ mod tests {
             (WorkTransitionKind::Reopen | WorkTransitionKind::PruneParticipants, true) => Ok(()),
             (WorkTransitionKind::Reopen, false) => Err(Refusal::WrongState),
             (_, true) => Err(Refusal::WrongState),
-            (WorkTransitionKind::Release | WorkTransitionKind::Retain, false) if !held => {
-                Err(Refusal::NoReservation)
-            }
+            (
+                WorkTransitionKind::Release
+                | WorkTransitionKind::Retain
+                | WorkTransitionKind::ReleasePaths,
+                false,
+            ) if !held => Err(Refusal::NoReservation),
             _ => Ok(()),
         }
     }
@@ -960,7 +974,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 7 * 4 * 5 * 2);
+        assert_eq!(checked, 8 * 4 * 5 * 2);
     }
 
     #[test]
@@ -1100,6 +1114,7 @@ mod tests {
             json(&WorkTransitionKind::PruneParticipants),
             "\"prune_participants\""
         );
+        assert_eq!(json(&WorkTransitionKind::ReleasePaths), "\"release_paths\"");
         assert_eq!(json(&WorkActorKind::Admin), "\"admin\"");
         assert_eq!(json(&OutcomeProvenance::AgentReport), "\"agent_report\"");
         assert_eq!(

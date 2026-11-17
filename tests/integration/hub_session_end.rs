@@ -515,6 +515,7 @@ fn a_retained_reservation_stays_retained(db: &Db) {
                 reason: "keep the scope while away".into(),
                 superseded_by: None,
                 participants: Vec::new(),
+                paths: Vec::new(),
             },
             now + 2,
         )
@@ -944,6 +945,7 @@ fn observed_exit_preserves_blocked_report_and_retained_authority(db: &Db) {
                 reason: "keep deliberately".into(),
                 superseded_by: None,
                 participants: vec![],
+                paths: Vec::new(),
             },
             now + 21,
         )
@@ -1675,6 +1677,7 @@ fn batch_and_overlap_consent_keep_the_native_fence(db: &Db) {
             reason: "keep deliberately".into(),
             superseded_by: None,
             participants: vec![],
+            paths: Vec::new(),
         }],
     };
     let actor = WorkTransitionActor::Agent {
@@ -1731,6 +1734,7 @@ fn batch_and_overlap_consent_keep_the_native_fence(db: &Db) {
         reason: "provider confirmed completion".into(),
         superseded_by: None,
         participants: vec![],
+        paths: Vec::new(),
     };
     let Err(HubError::Rejected(rejection)) = store.work_transition_with_guard(
         &policy,

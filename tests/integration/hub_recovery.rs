@@ -212,6 +212,7 @@ fn item(
         reason: "synthetic recovery".into(),
         superseded_by: None,
         participants: Vec::new(),
+        paths: Vec::new(),
     }
 }
 
@@ -1163,6 +1164,7 @@ fn prune_request(
                 session: (*session).into(),
             })
             .collect(),
+        paths: Vec::new(),
     }
 }
 
