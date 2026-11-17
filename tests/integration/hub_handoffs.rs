@@ -49,6 +49,35 @@ impl Db {
     fn open(&self) -> Arc<dyn Store> {
         store::open(&self.url).unwrap()
     }
+
+    fn execute(&self, sql: &str) {
+        match &self._dir {
+            Some(dir) => rusqlite::Connection::open(dir.path().join("hub.sqlite"))
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap(),
+            None => postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap(),
+        }
+    }
+
+    fn untold_lapses(&self) -> i64 {
+        let sql = "SELECT count(*) FROM hub_handoffs
+                   WHERE state = 'lapsed' AND CAST(requester_told AS INTEGER) = 0";
+        match &self._dir {
+            Some(dir) => rusqlite::Connection::open(dir.path().join("hub.sqlite"))
+                .unwrap()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap(),
+            None => postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query_one(sql, &[])
+                .unwrap()
+                .get(0),
+        }
+    }
 }
 
 struct Agent {
@@ -656,6 +685,33 @@ fn a_request_whose_requester_ended_lapses(db: &Db) {
     assert!(held_by(&*store, &bob, T0 + 6).is_empty());
 }
 
+/// A lapsed ask recorded before lapses were reported is marked told when `handoff_lapse_untold`
+/// applies, so it is never delivered as a holder's release.
+fn the_lapse_migration_marks_old_lapsed_asks_told(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    assert!(!touch(&*store, &bob, "hb", &[], T0 + 3).handoffs.is_empty());
+    drop(store);
+    // The pre-migration boundary: a lapsed row nobody was told about and no migration marker.
+    db.execute(
+        "UPDATE hub_handoffs SET requester_told = FALSE WHERE state = 'lapsed';
+         DELETE FROM hub_named_migrations WHERE name = 'handoff_lapse_untold';",
+    );
+    assert!(db.untold_lapses() > 0);
+    let store = db.open();
+    assert_eq!(db.untold_lapses(), 0);
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 4).handoffs.is_empty());
+}
+
 /// A request whose holder released the file lapses and is told to the requester once, never as an
 /// acceptance.
 fn a_request_for_released_files_is_told_as_lapsed_once(db: &Db) {
@@ -684,7 +740,7 @@ fn a_request_for_released_files_is_told_as_lapsed_once(db: &Db) {
     assert!(told.handoffs.iter().all(|note| note.note.is_none()));
     let lines = self::told(&told, T0 + 4);
     assert!(
-        lines.contains("the holder released the files; no reply was given"),
+        lines.contains("the session you asked no longer holds it and gave no reply"),
         "{lines}"
     );
     assert!(lines.contains("agentscm_start"), "{lines}");
@@ -1457,6 +1513,7 @@ conformance!(
     asking_needs_a_session_and_a_free_queue,
     a_request_whose_requester_ended_lapses,
     a_request_for_released_files_is_told_as_lapsed_once,
+    the_lapse_migration_marks_old_lapsed_asks_told,
     a_lapsed_ask_says_when_another_session_holds_the_file_now,
     a_lapsed_ask_says_held_when_a_directory_is_held_now,
     a_release_after_the_cap_does_not_lapse_an_expired_ask,

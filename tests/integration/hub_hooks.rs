@@ -1570,7 +1570,9 @@ async fn a_partial_release_shows_once_per_released_set() {
             .token_id
     };
     let (lead_token, other_token) = (token_id(&lead), token_id(&other));
-    let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
+    let files = [
+        "src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs", "src/f.rs", "src/g.rs",
+    ];
     let start = |key: &str, session: &str| WorkStart {
         issue_choice: None,
         work_id: None,
@@ -1667,6 +1669,19 @@ async fn a_partial_release_shows_once_per_released_set() {
         "{second}"
     );
     assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+    // Past five paths the prompt counts the rest.
+    release(
+        "free-more",
+        &["src/c.rs", "src/d.rs", "src/e.rs", "src/f.rs"],
+    );
+    acknowledge();
+    let third = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        third.contains(
+            "src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs, and 1 more from your request"
+        ),
+        "{third}"
+    );
 }
 
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy

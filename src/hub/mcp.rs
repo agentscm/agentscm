@@ -1188,7 +1188,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
          "properties": {"token": {"type": "string"}, "session": {"type": "string"}},
          "required": ["token", "session"]});
     let transition = json!({"name": "agentscm_work_transition",
-         "description": "Releases (pauses, frees scope), retains, completes, abandons, supersedes or reopens one Work item, or prunes participants, fenced by generation and updated_seq. Release does not assert completion; the reason is recorded.",
+         "description": "Release, retain, complete, abandon, supersede, reopen, release_paths (named entries) or prune_participants on one Work, fenced by generation and updated_seq. Release does not assert completion; reason recorded.",
          "inputSchema": schema(json!({
              "work_id": {"type": "string"},
              "operation_id": {"type": "string", "description": "Stable idempotency key for this exact transition."},
@@ -2081,15 +2081,25 @@ async fn call(
                         "agent":target.lead.agent,"session":target.lead.session})).collect::<Vec<_>>() });
                     if own.contains(&request.id) {
                         notice["yours"] = json!(true);
-                        notice["replies"] = json!(request.responses.iter().take(3).map(|reply| json!({
-                            "kind":reply.kind,
-                            "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
-                            "released_paths":(!reply.released_paths.is_empty()).then(|| &reply.released_paths[..reply.released_paths.len().min(5)]),
-                            "released_paths_omitted":reply.released_paths.len().checked_sub(5).filter(|n| *n > 0),
-                            "responder_agent":reply.responder.agent})).collect::<Vec<_>>());
+                        notice["replies"] = json!(request.responses.iter().take(3).map(|reply| {
+                            let mut shown = json!({
+                                "kind":reply.kind,
+                                "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
+                                "responder_agent":reply.responder.agent});
+                            if !reply.released_paths.is_empty() {
+                                shown["released_paths"] = json!(&reply.released_paths[..reply.released_paths.len().min(5)]);
+                            }
+                            if let Some(omitted) = reply.released_paths.len().checked_sub(5).filter(|n| *n > 0) {
+                                shown["released_paths_omitted"] = json!(omitted);
+                            }
+                            shown
+                        }).collect::<Vec<_>>());
                         notice["requested_paths"] = json!(request.requested_paths);
                         if !request.released_paths.is_empty() {
                             notice["released_paths"] = json!(request.released_paths);
+                        }
+                        if !request.released_paths_complete {
+                            notice["released_paths_complete"] = json!(false);
                         }
                     } else if replied.contains(&request.id) {
                         notice["requester"] = json!(request.requester_state());
@@ -3893,7 +3903,7 @@ async fn work_checkpoint(
 }
 
 /// Up to five scope keys for display, then a count of the rest.
-fn bounded_paths(keys: &[String]) -> String {
+pub(super) fn bounded_paths(keys: &[String]) -> String {
     let mut shown: Vec<String> = keys
         .iter()
         .take(5)
@@ -3906,7 +3916,8 @@ fn bounded_paths(keys: &[String]) -> String {
 }
 
 /// The Work's finished paths that an open coordination request targeting it asks for. An
-/// unreadable inbox yields none: the prompt is a courtesy, never a gate.
+/// unreadable inbox yields none, and only the first 50 requests are read: the prompt is a
+/// best-effort courtesy, never a gate.
 fn wanted_finished_paths(
     store: &dyn super::store::Store,
     token: &str,

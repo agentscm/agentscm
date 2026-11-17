@@ -124,7 +124,7 @@ lead or lease change, and it requires the exact `expected_updated_seq` like
 `prune_participants`. Only the released paths leave the intents of the participant sessions and
 of the participants' tokens' session-less intents. Each open coordination request that targets the
 Work and asks for a released path gets the existing `coordination_target_released` event with a
-`paths` field; the status is unchanged. The `work_transition` event records `released_paths`.
+`paths` field; the status is unchanged. A checkpoint that narrows the scope records the same event with the paths it dropped, so a requester sees them as released too. The `work_transition` event records `released_paths`.
 Admission of a waiting start is unchanged: it reruns `work_scope_overlaps` over live reservations,
 so a released path is free to the next `agentscm_start`, and no queue holds it. A release only
 shrinks the caller's own scope, so it never moves a file another live Work holds. The overlap

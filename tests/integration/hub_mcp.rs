@@ -1689,7 +1689,7 @@ async fn an_ask_lapses_once_when_the_holder_releases_the_file() {
     let (status, _) = hub.tool(&bob, "/mcp", "agentscm_status", json!({})).await;
     assert!(
         status.contains(
-            "your ask for src/billing.rs lapsed: the holder released the files; no reply was given."
+            "your ask for src/billing.rs lapsed: the session you asked no longer holds it and gave no reply."
         ),
         "{status}"
     );
@@ -4724,4 +4724,91 @@ async fn finished_paths_prompt_the_lead_and_the_refused_requester() {
             && text.contains("release_paths"),
         "{text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requester_notice_shows_bounded_released_paths_and_the_several_files_hint() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let files: Vec<String> = (0..8).map(|index| format!("src/f{index}.rs")).collect();
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"request_key":"held","task":"Held","session":"s-a","paths":files}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let refused = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"request_key":"asked","task":"Asked","session":"s-b","paths":files}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    // Nothing is reported finished, so the refusal still hints at asking for a subset.
+    let text = refused["content"].to_string();
+    assert!(text.contains("The refusal covers several files"), "{text}");
+    assert!(!text.contains("reports these requested files"), "{text}");
+
+    let inbox = hub
+        .tool_result(
+            &bob,
+            "agentscm_coordination_inbox",
+            json!({"session":"s-b"}),
+        )
+        .await;
+    let request = inbox["structuredContent"]["requests"][0].clone();
+    let reply = |op: &str, seq: &Value, released: &[String]| {
+        json!({"request_id":request["id"],"operation_id":op,
+            "target_work_id":request["targets"][0]["work_id"],"session":"s-a",
+            "expected_updated_seq":seq,"kind":"decline","release_paths":released})
+    };
+    let first = hub
+        .tool_result(
+            &alice,
+            "agentscm_coordination_reply",
+            reply("one", &request["updated_seq"], &files[..6]),
+        )
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let second = hub
+        .tool_result(
+            &alice,
+            "agentscm_coordination_reply",
+            reply("two", &first["structuredContent"]["updated_seq"], &[]),
+        )
+        .await;
+    assert_eq!(second["isError"], false, "{second}");
+
+    let status = hub
+        .tool_result(&bob, "agentscm_status", json!({"session":"s-b"}))
+        .await;
+    let notice = status["_meta"]["agentscm"]["coordination_notifications"]["notices"][0].clone();
+    assert_eq!(notice["requested_paths"], "held", "{status}");
+    let replies = notice["replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 2, "{notice}");
+    let with = replies
+        .iter()
+        .find(|reply| reply.get("released_paths").is_some())
+        .unwrap();
+    assert_eq!(
+        with["released_paths"].as_array().unwrap().len(),
+        5,
+        "{notice}"
+    );
+    assert_eq!(with["released_paths_omitted"], 1, "{notice}");
+    let without = replies
+        .iter()
+        .find(|reply| reply.get("released_paths").is_none())
+        .unwrap();
+    assert!(without.get("released_paths_omitted").is_none(), "{notice}");
+    assert_eq!(
+        notice["released_paths"].as_array().unwrap().len(),
+        6,
+        "{notice}"
+    );
+    assert!(notice.get("released_paths_complete").is_none(), "{notice}");
 }

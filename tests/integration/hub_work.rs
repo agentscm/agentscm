@@ -2697,7 +2697,88 @@ conformance!(
     release_paths_never_takes_another_works_file,
     release_paths_releases_a_directory_entry_exactly,
     finished_paths_follow_the_scope_and_never_change_admission,
+    finished_paths_survive_a_carry_and_a_resume_but_not_another_lead,
 );
+
+fn finished_paths_survive_a_carry_and_a_resume_but_not_another_lead(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let replacement = another_token(&*store, &alice, "replacement");
+    let successor = agent(&*store, 2);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("fin", "finished", "live"), now)
+        .unwrap()
+        .item;
+    let step = |token: &str, op: &str, generation: i64, kind: CheckpointKind, seq: i64| {
+        let mut request = checkpoint(&started.id, op, generation, "live", kind, "step");
+        request.expected_updated_seq = Some(seq);
+        store
+            .work_checkpoint(token, &request, now + 1)
+            .unwrap()
+            .item
+    };
+    let mut report = checkpoint(
+        &started.id,
+        "report",
+        1,
+        "live",
+        CheckpointKind::Progress,
+        "p",
+    );
+    report.expected_updated_seq = Some(started.updated_seq);
+    report.finished_paths = Some(vec!["src/**".into()]);
+    let reported = store
+        .work_checkpoint(&alice.token, &report, now + 1)
+        .unwrap()
+        .item;
+    assert_eq!(reported.finished_paths, ["src/"]);
+    // The same session on a new token is still the lead: the report stays.
+    let carried = step(
+        &replacement.token,
+        "carry",
+        1,
+        CheckpointKind::Progress,
+        reported.updated_seq,
+    );
+    assert_eq!(carried.lead_token, replacement.token);
+    assert_eq!(carried.finished_paths, ["src/"]);
+    // The same session resuming its own handed-over Work keeps it too.
+    let handed = step(
+        &replacement.token,
+        "hand",
+        1,
+        CheckpointKind::Handover,
+        carried.updated_seq,
+    );
+    let resumed = store
+        .work_start(
+            &replacement.token,
+            &takeover(&started.id, "live", Some(1)),
+            now + 2,
+        )
+        .unwrap();
+    assert!(resumed.took_over, "{:?}", resumed.conflict);
+    assert_eq!(resumed.item.finished_paths, ["src/"]);
+    assert!(handed.generation < resumed.item.generation);
+    // A different lead session does not inherit the old lead's report.
+    let handed = step(
+        &replacement.token,
+        "hand2",
+        resumed.item.generation,
+        CheckpointKind::Handover,
+        resumed.item.updated_seq,
+    );
+    let taken = store
+        .work_start(
+            &successor.token,
+            &takeover(&started.id, "successor", Some(handed.generation)),
+            now + 3,
+        )
+        .unwrap();
+    assert!(taken.took_over, "{:?}", taken.conflict);
+    assert!(taken.item.finished_paths.is_empty());
+}
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
     WorkPrLinkUpdate {

@@ -398,8 +398,8 @@ fn handoff_line(note: &HandoffNote) -> String {
         }
         "grant" => format!("{who} handed {path} to this session; repeating the edit applies it."),
         "lapse" => format!(
-            "your ask for {path} lapsed: the holder released the files; no reply was given. The \
-             files are free unless someone else took them; start on them with agentscm_start."
+            "your ask for {path} lapsed: the session you asked no longer holds it and gave no \
+             reply. agentscm_start tells you whether it is free now."
         ),
         "lapse_held" => format!(
             "your ask for {path} lapsed: the session you asked no longer holds it, and another \

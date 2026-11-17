@@ -2348,10 +2348,16 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         requester_unavailable: true,
         requested_paths: None,
         released_paths: Vec::new(),
+        released_paths_complete: true,
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();
     assert!(encoded.len() < 2 * 1024 * 1024, "{} bytes", encoded.len());
+    // A partial acknowledgement page with none from the requester cannot say it has not seen.
+    assert_eq!(
+        request.requester_state(),
+        agentscm::hub::coordination::RequesterState::Unknown
+    );
 }
 
 fn finished_default_work_binds_no_hook_session(db: &Db) {
@@ -4305,6 +4311,92 @@ parity_case!(
 parity_case!(
     directory_release_display_form,
     directory_entries_release_and_report_in_display_form
+);
+
+fn read_own_request(store: &dyn Store, requester: &str, at: i64) -> CoordinationRequest {
+    store
+        .coordination_inbox(
+            requester,
+            &CoordinationInboxQuery {
+                session: Some("asker".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            at,
+        )
+        .unwrap()
+        .requests
+        .remove(0)
+}
+
+fn a_requested_directory_shows_the_files_released_under_it(db: &Db) {
+    let store = db.open();
+    let (holder, requester, _, request, now) =
+        holder_and_request(&*store, &["src/a.rs", "src/b.rs"], &["src/**"]);
+    let grant = release_reply(&request, CoordinationResponseKind::Decline, &["src/a.rs"]);
+    store.coordination_reply(&holder, &grant, now + 2).unwrap();
+    let seen = read_own_request(&*store, &requester, now + 3);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert_eq!(seen.released_paths, vec!["src/a.rs"]);
+    assert!(seen.released_paths_complete);
+}
+
+fn many_release_events_leave_released_paths_incomplete(db: &Db) {
+    let store = db.open();
+    let files: Vec<String> = (0..67).map(|index| format!("src/f{index:02}.rs")).collect();
+    let scope: Vec<&str> = files.iter().map(String::as_str).collect();
+    let (holder, requester, _, request, now) = holder_and_request(&*store, &scope, &["src/**"]);
+    let mut seq = request.updated_seq;
+    for (index, file) in files.iter().take(65).enumerate() {
+        let mut grant = release_reply(&request, CoordinationResponseKind::Decline, &[file]);
+        grant.operation_id = format!("grant-{index}");
+        grant.expected_updated_seq = seq;
+        seq = store
+            .coordination_reply(&holder, &grant, now + 2 + index as i64)
+            .unwrap()
+            .updated_seq;
+    }
+    let seen = read_own_request(&*store, &requester, now + 100);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert!(seen.released_paths.is_empty());
+    assert!(!seen.released_paths_complete);
+    assert!(
+        serde_json::to_string(&seen)
+            .unwrap()
+            .contains(r#""released_paths_complete":false"#)
+    );
+}
+
+fn a_request_naming_many_paths_leaves_released_paths_incomplete(db: &Db) {
+    let store = db.open();
+    let files: Vec<String> = (0..33).map(|index| format!("src/f{index:02}.rs")).collect();
+    let scope: Vec<&str> = files.iter().map(String::as_str).collect();
+    let (_, requester, _, _, now) = holder_and_request(&*store, &scope[..2], &scope);
+    let seen = read_own_request(&*store, &requester, now + 2);
+    assert_eq!(
+        seen.requested_paths,
+        Some(agentscm::hub::coordination::RequestedPathsHold::Held)
+    );
+    assert!(seen.released_paths.is_empty());
+    assert!(!seen.released_paths_complete);
+}
+
+parity_case!(
+    requested_directory_partial_release,
+    a_requested_directory_shows_the_files_released_under_it
+);
+parity_case!(
+    release_event_bound_is_visible,
+    many_release_events_leave_released_paths_incomplete
+);
+parity_case!(
+    requested_path_bound_is_visible,
+    a_request_naming_many_paths_leaves_released_paths_incomplete
 );
 
 fn holder_sees_the_requesters_state(db: &Db) {

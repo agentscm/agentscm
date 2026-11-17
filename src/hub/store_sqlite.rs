@@ -3925,6 +3925,7 @@ fn coordination_request_at(
         requester_unavailable,
         requested_paths: None,
         released_paths: Vec::new(),
+        released_paths_complete: true,
     }))
 }
 
@@ -4451,10 +4452,12 @@ fn coordination_page(
             .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
         if request.requester.token == who.token
             && Some(request.requester.session.as_str()) == session_name
-            && let Some((hold, released)) = requested_paths_hold(tx, who, &request, now)
+            && let Some((hold, released, released_complete)) =
+                requested_paths_hold(tx, who, &request, now)
         {
             request.requested_paths = Some(hold);
             request.released_paths = released;
+            request.released_paths_complete = released_complete;
         }
         let request_bytes = json_string(&request)?.len();
         if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
@@ -4489,19 +4492,20 @@ fn requested_paths_hold(
     who: &WorkWho,
     request: &CoordinationRequest,
     now: i64,
-) -> Option<(RequestedPathsHold, Vec<String>)> {
+) -> Option<(RequestedPathsHold, Vec<String>, bool)> {
     if !matches!(
         request.status,
         CoordinationStatus::Pending | CoordinationStatus::Responded
     ) {
         return None;
     }
-    let read = || -> Result<(bool, Vec<String>)> {
+    let read = || -> Result<(bool, Vec<String>, bool)> {
         let scope = &request.proposal.scope;
         if !scope_held(tx, who, request, scope, now)? {
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), true));
         }
         let mut released = Vec::new();
+        let mut complete = scope.len() <= MAX_RELEASED_PATHS;
         if scope.len() <= MAX_RELEASED_PATHS {
             let events = {
                 let mut statement = tx.prepare(
@@ -4516,11 +4520,16 @@ fn requested_paths_hold(
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
             // Past the bound the history is incomplete, so no path is reported released.
-            let candidates = if events.len() as i64 > MAX_RELEASE_EVENTS {
+            let mut candidates = if events.len() as i64 > MAX_RELEASE_EVENTS {
+                complete = false;
                 Vec::new()
             } else {
                 super::coordination::held_candidates(scope, &events)
             };
+            if candidates.len() > MAX_RELEASED_PATHS {
+                complete = false;
+                candidates.truncate(MAX_RELEASED_PATHS);
+            }
             for spec in candidates {
                 if !scope_held(tx, who, request, std::slice::from_ref(&spec), now)? {
                     released.push(super::coordination::display_spec(&spec));
@@ -4528,12 +4537,12 @@ fn requested_paths_hold(
             }
             released.sort();
         }
-        Ok((true, released))
+        Ok((true, released, complete))
     };
     Some(match read() {
-        Ok((true, released)) => (RequestedPathsHold::Held, released),
-        Ok((false, _)) => (RequestedPathsHold::Released, Vec::new()),
-        Err(_) => (RequestedPathsHold::Unknown, Vec::new()),
+        Ok((true, released, complete)) => (RequestedPathsHold::Held, released, complete),
+        Ok((false, ..)) => (RequestedPathsHold::Released, Vec::new(), true),
+        Err(_) => (RequestedPathsHold::Unknown, Vec::new(), true),
     })
 }
 
@@ -5058,7 +5067,9 @@ fn start_overlap_in(
         item.lead_token = who.token.clone();
         item.lead_agent = who.agent.clone();
         item.lead_session = start.session.clone();
-        item.finished_paths.clear();
+        if previous_lead_session != start.session {
+            item.finished_paths.clear();
+        }
         item.generation += 1;
         item.state = WorkState::Active;
         item.claim_status = ClaimStatus::Active;
@@ -8701,7 +8712,7 @@ fn checkpoint_overlap_in(
         }
     }
     let finished = checkpoint.finished_after(
-        if carry { &[] } else { &item.finished_paths },
+        &item.finished_paths,
         checkpoint
             .normalized_scope()?
             .as_ref()
@@ -17694,10 +17705,20 @@ impl Store for SqliteStore {
             let actor = if reply.via == Via::Agent {
                 WorkTransitionActor::Agent { token }
             } else {
+                let repository_id = match who.repository_id {
+                    Some(id) => id,
+                    None => tx
+                        .query_row(
+                            "SELECT repository_id FROM hub_work_items WHERE id = ?1",
+                            [&work.id],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )?
+                        .ok_or(HubError::Unauthorized)?,
+                };
                 WorkTransitionActor::Person {
                     user: &who.owner,
                     repository: &who.repository,
-                    repository_id: who.repository_id.ok_or(HubError::Unauthorized)?,
+                    repository_id,
                     is_admin: false,
                 }
             };

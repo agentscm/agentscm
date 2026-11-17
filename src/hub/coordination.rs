@@ -147,6 +147,19 @@ pub struct CoordinationRequest {
     /// when the request names more than `MAX_RELEASED_PATHS`). Derived beside it, never stored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub released_paths: Vec<String>,
+    /// False when `released_paths` may be missing paths: the request names more than
+    /// `MAX_RELEASED_PATHS`, or more than `MAX_RELEASE_EVENTS` releases were recorded. Left
+    /// out of the JSON when true.
+    #[serde(default = "complete_default", skip_serializing_if = "is_true")]
+    pub released_paths_complete: bool,
+}
+
+const fn complete_default() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// What a request's requester has done since the holder replied, as the holder reads it.
@@ -196,38 +209,41 @@ pub const MAX_RELEASE_EVENTS: i64 = 64;
 pub const MAX_RELEASED_PATHS: usize = 32;
 
 /// The requested paths a target Work actually held, read from its `coordination_target_released`
-/// events (`data` is each event's JSON): a path some event's `paths` covers, or every path when
-/// an event names none (a full release or end). The target's scope is not recorded on the
-/// request, so a path the target never held is never a candidate.
+/// events (`data` is each event's JSON): the requested path itself when an event's `paths`
+/// cover it or name none (a full release or end), or the released path when it lies under a
+/// requested directory. The target's scope is not recorded on the request, so a path the
+/// target never held is never a candidate. Sorted and without repeats; the caller bounds it.
 pub(super) fn held_candidates(scope: &[String], events: &[String]) -> Vec<String> {
-    let released: Vec<Vec<String>> = events
-        .iter()
-        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .map(|data| {
-            data["paths"]
-                .as_array()
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(|p| p.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-    scope
-        .iter()
-        .filter(|spec| {
-            let key = super::intent::spec_key(spec).unwrap_or_else(|_| (*spec).clone());
-            released.iter().any(|paths| {
-                paths.is_empty()
-                    || paths
-                        .iter()
-                        .any(|p| super::intent::overlaps(&key, super::intent::key_of(p)))
-            })
-        })
-        .cloned()
-        .collect()
+    let mut out = std::collections::BTreeSet::new();
+    for data in events {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let paths = data["paths"]
+            .as_array()
+            .map(|paths| paths.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for spec in scope {
+            let key = super::intent::spec_key(spec).unwrap_or_else(|_| spec.clone());
+            if paths.is_empty() {
+                out.insert(spec.clone());
+            }
+            for path in &paths {
+                let released = super::intent::key_of(path);
+                if !super::intent::overlaps(&key, released) {
+                    continue;
+                }
+                // Under a requested directory only the released path was held, not the directory.
+                let under = key.ends_with('/') && released != key && released.starts_with(&key);
+                out.insert(if under {
+                    (*path).to_owned()
+                } else {
+                    spec.clone()
+                });
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// A requested path in the display form every released-paths list uses.
@@ -508,8 +524,9 @@ impl CoordinationReply {
     }
 }
 
-/// Why a session that neither made a request nor leads one of its targets cannot resolve it.
+/// Why a session that neither made a request nor leads one of its targets cannot read its overlap consents.
 pub const CONSENTS_NOT_PARTY: &str = "only the session that made this coordination request, or the session that leads one of its target Work items, can read its overlap consents, and the session in this call is neither. Pass the requester's session, or the session that leads a target Work item";
+/// Why a session that neither made a request nor leads one of its targets cannot resolve it.
 pub const RESOLVE_NOT_PARTY: &str = "only the session that made this coordination request, or the session that leads one of its target Work items, can resolve it, and the session in this call is neither. If you lead the target Work, pass the session that leads it. Otherwise answer with agentscm_coordination_reply (`agentscm work coordination-reply`) and leave resolving to the requester";
 
 impl CoordinationResolve {
