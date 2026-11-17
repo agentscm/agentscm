@@ -6,6 +6,8 @@ use std::path::Path;
 
 use super::connection::{ConnectedRepository, Connection};
 use super::github::{Api, CommitStatus, Gh, GhError, PullHead, StatusState};
+use super::notices::{NewOwnerNotice, OwnerNoticeRecipient, OwnerNoticeSourceKind};
+use super::store::ForgeIdentity;
 use super::validation_evidence::{
     PublicationPhase, ValidationPublication, ValidationSnapshot, ValidationStatusSlot, read_bundle,
 };
@@ -13,7 +15,9 @@ use super::{HubState, Store};
 use crate::evidence::EvaluationClock;
 use crate::local_validation::checks::{self, LoadedCheck};
 use crate::local_validation::fetch::FetchContext;
-use crate::local_validation::{self as validation, Observed, Verdict, VerdictState};
+use crate::local_validation::{
+    self as validation, Observed, Outcome, ValidationRecord, Verdict, VerdictState,
+};
 use crate::policy::issuers::IssuerRegistrySnapshot;
 
 const CONFIG_DIR: &str = ".github/local-validation";
@@ -153,6 +157,114 @@ struct Plan {
     success_windows: Vec<(u64, u64)>,
     requires_inventory: bool,
     problem: Option<&'static str>,
+    invalidations: Vec<AttestationInvalidation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvalidationCause {
+    Policy,
+    Recipe,
+    Registry,
+}
+
+impl InvalidationCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Recipe => "recipe",
+            Self::Registry => "issuer registry",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttestationInvalidation {
+    cause: InvalidationCause,
+    requirement: String,
+    evidence: String,
+    trusted: String,
+}
+
+#[derive(Clone, Debug)]
+struct PullNoticeTarget {
+    number: i64,
+    draft: bool,
+    author_id: i64,
+}
+
+fn pull_notice_target(value: &serde_json::Value) -> Gh<PullNoticeTarget> {
+    let number = value["number"]
+        .as_i64()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| failed("malformed pull number"))?;
+    let draft = value["draft"]
+        .as_bool()
+        .ok_or_else(|| failed("pull draft state unavailable"))?;
+    let author_id = value["user"]["id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| failed("pull author identity unavailable"))?;
+    Ok(PullNoticeTarget {
+        number,
+        draft,
+        author_id,
+    })
+}
+
+fn proven_transition(
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    verdict: &Verdict,
+    observed: Observed<'_>,
+    policy: &validation::ValidationPolicy,
+    registry: &IssuerRegistrySnapshot,
+) -> Option<AttestationInvalidation> {
+    let mut cause = match (verdict.outcome, verdict.reason) {
+        (Outcome::StalePolicy, _) => InvalidationCause::Policy,
+        (Outcome::RegistryStale, _) => InvalidationCause::Registry,
+        (Outcome::Unverified, "recipe mismatch") => InvalidationCause::Recipe,
+        _ => return None,
+    };
+    let (envelope_bytes, record_bytes) = pairs
+        .iter()
+        .find(|(envelope, _)| digest(envelope) == verdict.envelope_sha256)?;
+    let envelope = crate::evidence::EvidenceEnvelope::from_slice(envelope_bytes).ok()?;
+    let record = ValidationRecord::from_slice(record_bytes).ok()?;
+    let artifact = envelope
+        .payload
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_id == "record")?;
+    if artifact.sha256 != digest(record_bytes)
+        || record.subject.repository != observed.repository
+        || record.subject.commit != observed.commit
+        || record.subject.tree != observed.tree
+        || record.context.merge_base != observed.merge_base
+        || record
+            .context
+            .base_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&record.context.base_ref)
+            != observed
+                .base_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(observed.base_ref)
+    {
+        return None;
+    }
+    if record.recipe_sha256 != policy.recipe_sha256 {
+        cause = InvalidationCause::Recipe;
+    }
+    let trusted = match cause {
+        InvalidationCause::Policy => policy.digest().ok()?,
+        InvalidationCause::Recipe => policy.recipe_sha256.clone(),
+        InvalidationCause::Registry => registry.digest().ok()?,
+    };
+    Some(AttestationInvalidation {
+        cause,
+        requirement: policy.requirement_id(),
+        evidence: verdict.envelope_sha256.clone(),
+        trusted,
+    })
 }
 impl Plan {
     fn source_decision(
@@ -288,6 +400,7 @@ fn evaluate(
             .as_ref()
             .err()
             .map(|_| "signed validation evidence unavailable"),
+        invalidations: Vec::new(),
     };
     let evaluated_at = clock();
     for check in trusted.checks {
@@ -360,6 +473,23 @@ fn evaluate(
             },
             evaluated_at,
         );
+        if let Some(invalidation) = proven_transition(
+            pairs,
+            &verdict,
+            Observed {
+                repository: &canonical,
+                commit: &head.head_sha,
+                tree: &observed.tree,
+                base_ref: &head.base_ref,
+                merge_base: &observed.merge_base,
+                required: &required,
+                selections: &selections,
+            },
+            &check.policy,
+            &trusted.registry,
+        ) {
+            plan.invalidations.push(invalidation);
+        }
         if verdict.state == VerdictState::Success
             || verdict
                 .constituents
@@ -534,23 +664,21 @@ pub(super) async fn reconcile_repo(
     }
     let api = hub.sync.api()?;
     let discovery = async {
-        let numbers = if let Some(number) = only {
-            vec![number]
-        } else {
-            let page = api.validation_open_pulls(token, &repo.full_name).await?;
-            if page.unread != 0 {
-                return Err(failed("open pull inventory incomplete"));
-            }
-            page.items
-                .iter()
-                .map(|p| {
-                    p["number"]
-                        .as_i64()
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| failed("malformed pull inventory"))
-                })
-                .collect::<Gh<Vec<_>>>()?
-        };
+        let page = api.validation_open_pulls(token, &repo.full_name).await?;
+        if page.unread != 0 {
+            return Err(failed("open pull inventory incomplete"));
+        }
+        let pulls = page
+            .items
+            .iter()
+            .map(pull_notice_target)
+            .collect::<Gh<Vec<_>>>()?;
+        let pulls = only.map_or(pulls.clone(), |number| {
+            pulls
+                .into_iter()
+                .filter(|pull| pull.number == number)
+                .collect()
+        });
         let identity = if conn.kind == "app" {
             format!(
                 "{}[bot]",
@@ -565,10 +693,10 @@ pub(super) async fn reconcile_repo(
             }
             login
         };
-        Ok::<_, GhError>((numbers, identity))
+        Ok::<_, GhError>((pulls, identity))
     }
     .await;
-    let (numbers, identity) = match discovery {
+    let (pulls, identity) = match discovery {
         Ok(discovery) => discovery,
         Err(error) => {
             if !matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
@@ -578,12 +706,12 @@ pub(super) async fn reconcile_repo(
         }
     };
     let mut failure = None;
-    for number in numbers {
-        if let Err(error) = reconcile_pull(hub, conn, repo, token, api, &identity, number).await {
+    for pull in pulls {
+        if let Err(error) = reconcile_pull(hub, conn, repo, token, api, &identity, &pull).await {
             if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
                 return Err(error);
             }
-            eprintln!("hub: validation pull {number}: {error:?}");
+            eprintln!("hub: validation pull {}: {error:?}", pull.number);
             failure.get_or_insert(error);
         }
     }
@@ -636,14 +764,14 @@ async fn reconcile_pull(
     token: &str,
     api: &Api,
     identity: &str,
-    number: i64,
+    pull: &PullNoticeTarget,
 ) -> Gh<()> {
-    let result = reconcile_pull_inner(hub, conn, repo, token, api, identity, number).await;
+    let result = reconcile_pull_inner(hub, conn, repo, token, api, identity, pull).await;
     if result.is_err() {
         // Discovery/setup/read errors cannot preserve earlier green statuses. This
         // path fences unsent preparations and reserves Idle journals; an ambiguous
         // Attempting write is untouched.
-        invalidate_idle(hub, conn, repo, token, api, number).await?;
+        invalidate_idle(hub, conn, repo, token, api, pull.number).await?;
     }
     result
 }
@@ -748,9 +876,10 @@ async fn reconcile_pull_inner(
     token: &str,
     api: &Api,
     identity: &str,
-    number: i64,
+    pull: &PullNoticeTarget,
 ) -> Gh<()> {
     use PublicationPhase::*;
+    let number = pull.number;
     let old = store_call(|| hub.store.validation_publication(&repo.id, number))?;
     let comments = api
         .validation_comments(token, &repo.full_name, number, MAX_COMMENTS)
@@ -885,6 +1014,7 @@ async fn reconcile_pull_inner(
                 success_windows: Vec::new(),
                 requires_inventory: false,
                 problem: None,
+                invalidations: Vec::new(),
             },
             Some("configuration, source or evidence unavailable"),
         ),
@@ -946,6 +1076,7 @@ async fn reconcile_pull_inner(
         {
             return invalidate_idle(hub, conn, repo, token, api, number).await;
         }
+        produce_invalidation_notices(hub, repo, pull, &plan.invalidations)?;
         return Ok(());
     }
     let mut slots = old
@@ -1110,6 +1241,63 @@ async fn reconcile_pull_inner(
     idle.comment_id = Some(id);
     if !cas(&*hub.store, &repo.id, number, Some(&next), &idle)? {
         return Err(failed("validation journal completion changed"));
+    }
+    produce_invalidation_notices(hub, repo, pull, &plan.invalidations)?;
+    Ok(())
+}
+
+fn produce_invalidation_notices(
+    hub: &HubState,
+    repo: &ConnectedRepository,
+    pull: &PullNoticeTarget,
+    invalidations: &[AttestationInvalidation],
+) -> Gh<()> {
+    if pull.draft || invalidations.is_empty() {
+        return Ok(());
+    }
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: pull.author_id,
+    };
+    let Some(owner) = store_call(|| hub.store.user_for_identity(&identity))? else {
+        return Ok(());
+    };
+    if owner.disabled {
+        return Ok(());
+    }
+    for invalidation in invalidations {
+        let source_id = format!(
+            "pr:{}:{}:{}:{}:{}",
+            pull.number,
+            invalidation.requirement,
+            invalidation.cause.label().replace(' ', "-"),
+            invalidation.evidence,
+            invalidation.trusted,
+        );
+        let request = NewOwnerNotice {
+            idempotency_key: digest(&source_id),
+            source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+            source_id,
+            recipient: OwnerNoticeRecipient {
+                owner: owner.id.clone(),
+                provider: identity.provider.clone(),
+                host: identity.host.clone(),
+            },
+            body: format!(
+                "Pull request #{} has a current-head local-validation attestation invalidated by a {} change. Update from the base branch and submit a new attestation.",
+                pull.number,
+                invalidation.cause.label(),
+            ),
+        };
+        store_call(|| {
+            hub.store.owner_notice_invalidation_put(
+                &repo.full_name,
+                repo.repository_id,
+                &request,
+                super::store::unix_now(),
+            )
+        })?;
     }
     Ok(())
 }

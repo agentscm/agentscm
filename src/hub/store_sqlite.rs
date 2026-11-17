@@ -8918,6 +8918,15 @@ fn checkpoint_overlap_in(
 }
 
 impl Store for SqliteStore {
+    fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_invalidation_put(self, repository, repository_id, notice, now)
+    }
     fn owner_notice_put(
         &self,
         token: &str,

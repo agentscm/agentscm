@@ -1597,6 +1597,33 @@ fn owner_mailbox_contract(database: &str) {
     assert_eq!(acted.acknowledged_at, Some(now + 3));
     assert_eq!(acted.acted_at, Some(now + 4));
 
+    let automatic = NewOwnerNotice {
+        idempotency_key: "validation-pr-42-policy-v2".into(),
+        source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+        source_id: "pr:42:local-validation:policy:evidence:policy-v2".into(),
+        recipient: recipient_address.clone(),
+        body: "PR #42 has an attestation invalidated by a policy change.".into(),
+    };
+    let automatic_created = store
+        .owner_notice_invalidation_put(REPO, REPO_ID, &automatic, now + 4)
+        .unwrap();
+    assert_eq!(automatic_created.sender_owner, "hub");
+    assert_eq!(automatic_created.sender_token, "hub:validation");
+    assert_eq!(
+        store
+            .owner_notice_invalidation_put(REPO, REPO_ID, &automatic, now + 5)
+            .unwrap(),
+        automatic_created,
+        "automatic producer retries deduplicate on the stable transition source"
+    );
+    let mut changed_automatic = automatic.clone();
+    changed_automatic.body.push_str(" changed");
+    assert!(
+        store
+            .owner_notice_invalidation_put(REPO, REPO_ID, &changed_automatic, now + 5)
+            .is_err()
+    );
+
     for index in 1..20 {
         store
             .owner_notice_put(

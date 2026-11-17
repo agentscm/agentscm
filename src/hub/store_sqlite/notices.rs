@@ -429,6 +429,68 @@ fn owner_reader(
 }
 
 impl SqliteStore {
+    pub(super) fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        request: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        request.validate()?;
+        if request.source_kind != OwnerNoticeSourceKind::AttestationInvalidation {
+            return Err(HubError::Invalid(
+                "Automatic owner notices must be attestation invalidations.".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recipient_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_users WHERE id=?1 AND provider=?2 AND host=?3 AND disabled=0)",
+                params![request.recipient.owner, request.recipient.provider, request.recipient.host],
+                |row| row.get(0),
+            )?;
+        if !recipient_exists {
+            return Err(HubError::Unauthorized);
+        }
+        let digest = owner_notice_digest(request)?;
+        if let Some((prior_digest, snapshot)) = tx.query_row(
+                "SELECT request_digest,snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id=?4 AND source_kind=?5 AND source_id=?6",
+                params![request.recipient.owner, request.recipient.provider, request.recipient.host, repository_id, json_string(&request.source_kind)?, request.source_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()? {
+                return if prior_digest == digest {
+                    owner_notice_row(snapshot)
+                } else {
+                    Err(HubError::invalid_or_changed(
+                        "Owner notice source already has another request.".into(),
+                    ))
+                };
+            }
+        let notice = OwnerNotice {
+            id: new_id("ont")?,
+            idempotency_key: request.idempotency_key.clone(),
+            source_kind: request.source_kind,
+            source_id: request.source_id.clone(),
+            sender_owner: "hub".into(),
+            sender_token: "hub:validation".into(),
+            recipient: request.recipient.clone(),
+            repository: repository.into(),
+            repository_id: Some(repository_id),
+            body: request.body.clone(),
+            created_at: now,
+            delivered_at: None,
+            delivery: None,
+            acknowledged_at: None,
+            acted_at: None,
+        };
+        tx.execute(
+                "INSERT INTO hub_owner_notices(id,idempotency_key,request_digest,sender_owner,sender_token,recipient_owner,provider,host,repository,repository_id,source_kind,source_id,created_at,snapshot) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![notice.id, notice.idempotency_key, digest, notice.sender_owner, notice.sender_token, notice.recipient.owner, notice.recipient.provider, notice.recipient.host, notice.repository, repository_id, json_string(&notice.source_kind)?, notice.source_id, now, json_string(&notice)?],
+            )?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
     pub(super) fn owner_notice_put(
         &self,
         token: &str,

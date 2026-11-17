@@ -669,6 +669,15 @@ pub trait Store: Send + Sync {
         notice: &NewOwnerNotice,
         now: i64,
     ) -> Result<OwnerNotice>;
+    /// Create a Hub-produced attestation invalidation notice. The recipient comes from the
+    /// forge's current pull-request author identity, independently of any active Work.
+    fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice>;
     /// Delivery may only be reported by the creating token. It is distinct from recipient
     /// acknowledgement and action, and requires a channel-specific durable proof identity.
     fn owner_notice_delivered(
