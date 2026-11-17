@@ -247,7 +247,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
       case 'workspace':
         return <WorkspacePage />
       case 'repositories':
-        return <RepositoriesPage auth={device.auth} web={web} token={token} current={data.whoami?.token.repository ?? null} overview={overview.kind === 'ready' ? overview.value : null} />
+        return <RepositoriesPage status={sharedStatus} auth={device.auth} web={web} token={token} current={data.whoami?.token.repository ?? null} overview={overview.kind === 'ready' ? overview.value : null} />
       case 'health':
         return <HealthPage health={data.health} />
       case 'computers':

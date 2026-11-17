@@ -90,6 +90,18 @@ describe('shared actionable status', () => {
     expect(screen.queryByText(/waiting for another agent/i)).toBeNull()
     expect(screen.getByText(/Coverage is incomplete/)).toBeTruthy()
   })
+  it('counts paused quiet Work as active in the production shared Dashboard headline', () => {
+    const status = decodeStatus(fixture)
+    status.work = [{ ...status.work[0]!, state: 'active', needs_you: false }]
+    status.actions = []
+    status.counts = { active: 1, awaiting_party: 0, blocked: 0, reassessment_needed: 0, retired: 0, held_reservations: 0, needs_you: 0 }
+    const w = status.work[0]!
+    const overview = { current: [{ id: w.work_id, generation: w.generation, updated_seq: w.updated_seq, state: 'paused', claim_status: 'stale', scope: [] }], recent: [], overlaps: [] } as unknown as WorkOverview
+    render(createElement(DashboardPage, { section: 'team', question: 'Status', token: 'synthetic', repo: 'acme/widgets', data: { whoami: null, failing: false } as unknown as HubData, d: null, overview: { kind: 'ready', value: overview, fetchedAt: 0, refreshError: null, retry: () => undefined }, status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
+    expect(document.querySelector('.answer-text')?.textContent).toContain('1 tasks: 1 active.')
+    expect(document.querySelector('.answer-text')?.textContent).not.toContain('paused')
+    expect(document.querySelector('.answer-text')?.textContent).not.toContain('awaiting review or blocked')
+  })
   it('sends failed checks and stopped gates to their pages and counts them in the badge', () => {
     const status = decodeStatus(fixture)
     const base = status.actions[0]!

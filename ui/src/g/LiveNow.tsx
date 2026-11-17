@@ -1,5 +1,6 @@
 // G · Now over live data: what needs you (the dashboard's own needs and next steps), every unfinished change as a
 // lane, who is working, the process that applies, connections and recent outcomes.
+import { statusForWork } from '../actionableStatus.ts'
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import { Ago, Avatar, Box, Empty, Icon, Notice, PageHead, Reveal, Skeleton } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
@@ -113,7 +114,11 @@ function LiveNeedCard({ n, i, ov, d, live }: { n: Need; i: number; ov: WorkOverv
 export function LiveTrack({ items, ov, live, runs }: { items: WorkItem[]; ov: WorkOverview; live: LiveProps; runs: RunView[] }) {
   const pulls = live.data.work?.pull_requests ?? []
   const [sel, setSel] = useState<number | null>(null)
-  const placed = items.map((w) => ({ w, at: stepOf(w, pulls, runs, ov), tone: toneOf(w) }))
+  const shared = live.status?.kind === 'ready' ? live.status.value : null
+  const placed = items.map((w) => {
+    const status = statusForWork(w, shared)
+    return { w, status, at: stepOf(w, pulls, runs, ov), tone: toneOf(w, status) }
+  })
   const rows = placed.filter((x) => sel === null || x.at === sel)
   if (items.length === 0) return <Empty icon="inbox" title="No unfinished change">A lane appears when an agent claims work with <code>agentscm_start</code>.</Empty>
   return (
@@ -133,17 +138,17 @@ export function LiveTrack({ items, ov, live, runs }: { items: WorkItem[]; ov: Wo
           })}
         </div>
       </div>
-      {rows.map(({ w, at, tone }, i) => {
+      {rows.map(({ w, status, at, tone }, i) => {
         const pr = prFor(w, pulls)
         const l = lead(w)
         return (
           <a key={w.id} href={workHref(w.id)} className="px-track-row g-row" style={{ viewTransitionName: `g-w-${w.id}`, '--i': i } as CSSProperties}>
             <span className="px-track-task">
               <span className="px-track-title">{w.title}</span>
-              <span className="px-status"><span className={`px-dot tone-${dotTone(tone)}`} aria-hidden="true" />{stateText(w)}</span>
+              <span className="px-status"><span className={`px-dot tone-${dotTone(tone)}`} aria-hidden="true" />{stateText(w, status)}</span>
               <span className="px-track-meta">{who(l.login, l.agent)}{pr ? ` · PR #${pr.number}` : w.branch ? ` · ${w.branch}` : ''} · <Ago at={w.updated_at} /></span>
             </span>
-            <LiveLane key={`${w.id}-${at}-${tone}`} at={at} tone={tone} holder={l.agent} label={`${w.title}: ${STEPS[at]?.label}, ${stateText(w)}`} />
+            <LiveLane key={`${w.id}-${at}-${tone}`} at={at} tone={tone} holder={l.agent} label={`${w.title}: ${STEPS[at]?.label}, ${stateText(w, status)}`} />
           </a>
         )
       })}
