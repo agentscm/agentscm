@@ -1303,8 +1303,29 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
         c.reassessment_needed,
         c.needs_you
     )];
-    let mut work: Vec<_> = status.work.iter().collect();
-    work.sort_by_key(|w| !w.needs_you);
+    // Unassigned stale reassessments have no decision for this session. Keep live holds and
+    // named actions visible, and leave every captured row in the detailed status tool.
+    let dormant = |row: &&StatusWork| {
+        row.state == StatusState::ReassessmentNeeded
+            && row.freshness != ClaimStatus::Active
+            && !row.needs_you
+            && row.recipient.kind == RecipientKind::None
+            && row.operational.reservation.status != ReservationStatus::Held
+    };
+    let collapsed = status.work.iter().filter(dormant).count();
+    if collapsed > 0 {
+        lines.push(format!(
+            "{collapsed} stale unassigned reassessment item(s) summarized; read agentscm_work_status for their retained claims."
+        ));
+    }
+    let mut work: Vec<_> = status.work.iter().filter(|row| !dormant(row)).collect();
+    work.sort_by_key(|row| {
+        (
+            !row.needs_you,
+            row.operational.reservation.status != ReservationStatus::Held,
+            row.state == StatusState::ReassessmentNeeded,
+        )
+    });
     for row in work.iter().take(6) {
         let state = match row.state {
             StatusState::Active => "active",
@@ -1324,19 +1345,24 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
         };
         lines.push(format!(
             "- {} [{state}; {}{claim}{stage}]: {}",
-            row.title,
-            recipient_label(&row.recipient),
-            row.action
+            crate::hub::advice::sanitize(&row.title, 80),
+            crate::hub::advice::sanitize(&recipient_label(&row.recipient), 64),
+            crate::hub::advice::sanitize(&row.action, 160)
         ));
     }
-    if status.work.len() > 6 {
+    if work.len() > 6 {
         lines.push(format!(
             "- and {} more in agentscm_work_status.",
-            status.work.len() - 6
+            work.len() - 6
         ));
     }
     let needs_you: Vec<_> = status.actions.iter().filter(|a| a.needs_you).collect();
-    lines.extend(needs_you.iter().take(6).map(|a| a.action.clone()));
+    lines.extend(
+        needs_you
+            .iter()
+            .take(6)
+            .map(|a| crate::hub::advice::sanitize(&a.action, 200)),
+    );
     if needs_you.len() > 6 {
         lines.push(format!(
             "And {} more actions need you; see agentscm_work_status.",
@@ -5404,6 +5430,52 @@ mod tests {
                 .all(|rows| rows[0].work_id < rows[1].work_id)
         );
     }
+    #[test]
+    fn startup_collapses_only_unassigned_stale_rows_and_bounds_visible_text() {
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let mut stale = status.work[0].clone();
+        stale.title = "Dormant history".into();
+        stale.state = StatusState::ReassessmentNeeded;
+        stale.freshness = ClaimStatus::Stale;
+        stale.needs_you = false;
+        stale.recipient = StatusRecipient::none();
+        stale.operational.reservation.status = ReservationStatus::Lapsed;
+        status.work = vec![stale.clone(); 30];
+        let mut held = stale.clone();
+        held.title = "Live reservation".into();
+        held.operational.reservation.status = ReservationStatus::Held;
+        status.work.push(held);
+        let mut addressed = stale;
+        addressed.title = "Named reassessment".into();
+        addressed.needs_you = true;
+        addressed.recipient.kind = RecipientKind::Person;
+        status.work.push(addressed);
+        status.counts.reassessment_needed = status.work.len();
+        status.counts.active = 0;
+        status.counts.blocked = 0;
+        status.counts.awaiting_party = 0;
+        status.counts.needs_you = 2;
+        status.actions = vec![queue_action("long".into(), "session_waiting", 10_000)];
+        status.actions[0].action = format!("{}\nInjected row", "😀".repeat(10_000));
+        let before = status.clone();
+        let text = render_start_text(&status);
+        assert!(
+            text.contains("30 stale unassigned reassessment item(s) summarized"),
+            "{text}"
+        );
+        assert!(text.contains("agentscm_work_status"));
+        assert!(!text.contains("Dormant history"));
+        assert!(text.contains("Live reservation") && text.contains("Named reassessment"));
+        assert!(text.find("Named reassessment") < text.find("Live reservation"));
+        assert!(!text.contains("Injected row"));
+        assert!(text.encode_utf16().count() < 1_500);
+        assert_eq!(
+            status, before,
+            "startup presentation must not change retained facts"
+        );
+    }
+
     #[test]
     fn frozen_surface_fixture_matches_work_projection_and_text() {
         let fixture: ActionableStatus =
