@@ -81,6 +81,9 @@ src/promise_cli.rs serde_json::from_slice(&bytes).map_err(|_| invalid("promise i
 # src/publish_cli.rs: the manifest this client built, checked before it is sent
 src/publish_cli.rs serde_json::from_value::<Manifest>(manifest.clone())?
 
+# src/quickstart/hub_setup.rs: the local GitHub App credentials file
+src/quickstart/hub_setup.rs .and_then(|text| serde_json::from_str(&text).ok())
+
 # src/skill_cli.rs: a command-line argument, the caller's detail file
 src/skill_cli.rs Some(serde_json::from_slice(&bytes)?)
 src/skill_cli.rs let kind: EvidenceKind = serde_json::from_value(json!(args.kind))
