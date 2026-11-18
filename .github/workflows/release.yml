@@ -24,6 +24,22 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # Hub container end-to-end on the exact tagged commit: both profiles (SQLite, PostgreSQL/S3).
+  # Release-only, so routine pull requests skip its cold image build (#365). The GitHub release waits for it.
+  hub-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: .github/hub-e2e.sh local-release "$RUNNER_TEMP/hub-e2e"
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hub-e2e-evidence
+          path: ${{ runner.temp }}/hub-e2e
+
   image-platform:
     # Each runnable child is built and fully exercised on matching native hardware before it is pushed.
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
@@ -311,7 +327,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [image, attest]
+    needs: [image, attest, hub-e2e]
     # Only the public repository publishes: the image name, the attestation and the docs assume it.
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
@@ -411,3 +427,23 @@ jobs:
           dist_tag=latest
           case "$TAG" in *-*) dist_tag=next ;; esac
           npm publish --provenance --access public --ignore-scripts --tag "$dist_tag"
+
+  # Settles the `Release v<version>` tracking issue (docs/releasing.md) once npm has the package.
+  close-tracking-issue:
+    needs: npm
+    if: ${{ !contains(github.ref_name, '-dry') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          issues=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"Release $TAG\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"Release $TAG\") | .number")
+          for issue in $issues; do
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Published by $RUN."
+          done
