@@ -36,7 +36,7 @@ jobs:
       - run: npm ci --ignore-scripts
         working-directory: docs-site
       - if: github.event_name != 'push'
-        run: npm audit --audit-level=low
+        run: node scripts/check-audit.mjs
         working-directory: docs-site
       - run: npm run build
         working-directory: docs-site
