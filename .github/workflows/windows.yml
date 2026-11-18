@@ -1,7 +1,7 @@
 name: Windows
 
 on:
-  # Pull requests run only the `check` job; the full build and tests stay nightly and manual (the release PR dispatches them).
+  # Pull requests run the `check` job, and the full build and tests too when they change src/client*. Those also run nightly and on dispatch.
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -42,8 +42,29 @@ jobs:
       # The `#[cfg(test)]` unit-test modules in src/, which `cargo test` compiles in the `windows` job.
       - run: cargo check --locked --profile test --lib --bin agentscm
 
+  # Client code has Windows-only paths that type checking cannot catch (#636), so its pull requests run the full tests.
+  changes:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      client: ${{ steps.diff.outputs.client }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only | grep -q '^src/client'; then
+            echo client=true >> "$GITHUB_OUTPUT"
+          fi
+
   windows:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.client == 'true') }}
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:
