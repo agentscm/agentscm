@@ -513,15 +513,24 @@ fn observe_questions(
             snapshot.pending.push(PendingQuestion { id, asks, since });
         }
     } else if item["type"] == "UserMessage" {
-        for text in item["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|block| block["text"].as_str())
-        {
-            let text = text.trim();
-            const OPEN: &str = "<send_user_message_question_reply>";
-            const CLOSE: &str = "</send_user_message_question_reply>";
+        const OPEN: &str = "<send_user_message_question_reply>";
+        const CLOSE: &str = "</send_user_message_question_reply>";
+        let texts = || {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str())
+                .map(str::trim)
+        };
+        if !texts().any(|text| text.starts_with(OPEN)) {
+            // A person who types in the session has seen what it asked, and hosts such as T3 Code
+            // answer with a plain message that quotes the question rather than the structured
+            // reply. The limit: a host notification sent as a plain user message also clears it.
+            snapshot.pending.clear();
+            return;
+        }
+        for text in texts() {
             if !text.starts_with(OPEN) {
                 continue;
             }

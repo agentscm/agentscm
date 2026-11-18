@@ -42,7 +42,8 @@ const MAX_OWNER_ROWS: usize = 256;
 /// The setting a stopping Hub leaves its waits in, for the process that starts next.
 const SAVED_KEY: &str = "hub.session_waiting.saved.v1";
 /// Ordinary waits in a saved list older than this are not believed: too much went unheard
-/// while the Hub was down. Explicit unanswered questions are retained until resolved.
+/// while the Hub was down. Explicit unanswered questions are believed for as long as they are
+/// listed, at most a day.
 const SAVED_MAX_AGE_SECONDS: i64 = 10 * 60;
 /// The longest excerpt of what a wait asks that is kept, in characters.
 const MAX_ASKS_CHARS: usize = 500;
@@ -368,17 +369,17 @@ struct Row {
     person: bool,
     /// The host said a dialog is on screen for this wait.
     noticed: bool,
-    /// An async question remains outstanding until a native reply or explicit session clear.
-    explicit_question: bool,
     /// Native question coverage is unknown, from an unreliable source or an unreadable
     /// saved clear marker. Only an authoritative snapshot or clear establishes its state.
+    /// It is the one wait exempt from the day limit: a known async question is listed for at
+    /// most a day like every other wait, but expiring unknown coverage would be a silent clear.
     uncertain: bool,
 }
 
 impl Row {
     fn current(&self, now: i64) -> bool {
         self.since <= now
-            && (self.explicit_question || now - self.since < self.reason.keep_seconds())
+            && (self.uncertain || now - self.since < self.reason.keep_seconds())
             && (self.person || self.principal.expires_at > now)
     }
 }
@@ -739,7 +740,6 @@ impl Waiting {
                     .or(said),
                 person,
                 noticed,
-                explicit_question: false,
                 uncertain: false,
             },
         );
@@ -874,7 +874,13 @@ impl Waiting {
                 self.lost_before(now + 1);
                 return Err(HubError::Busy);
             }
-            let pending = snapshot.pending.iter().collect::<Vec<_>>();
+            // A question a day old is no longer listed, so re-sending it admits no row and counts
+            // toward no limit. The offset and floor are recorded as for any accepted snapshot.
+            let pending = snapshot
+                .pending
+                .iter()
+                .filter(|question| now - question.since < MAX_AGE_SECONDS)
+                .collect::<Vec<_>>();
             let replacing = |(owner, source, question): &RowKey, row: &Row| {
                 owner == kept_by
                     && source == native
@@ -937,7 +943,6 @@ impl Waiting {
                             .filter(|text| !text.is_empty()),
                         person: kept_by == principal.owner.id,
                         noticed: false,
-                        explicit_question: true,
                         uncertain: false,
                     },
                 );
@@ -1040,7 +1045,6 @@ impl Waiting {
                     asks: None,
                     person: kept_by == principal.owner.id,
                     noticed: false,
-                    explicit_question: true,
                     uncertain: true,
                 },
             );
@@ -1097,8 +1101,8 @@ impl Waiting {
     }
 
     /// Takes the waits the previous Hub process left when it stopped. The list is taken once,
-    /// so a Hub that later dies without saving does not start from an old one, and it is
-    /// ordinary waits are believed only while fresh; explicit questions survive a long shutdown.
+    /// so a Hub that later dies without saving does not start from an old one. Ordinary
+    /// waits are believed only while fresh; explicit questions are believed until a day old.
     /// Without a list, the waits reported to the previous process are
     /// gone: a session that has not called since reads as not known to wait, never as quiet.
     /// With a list, what was reported while no Hub ran is still missing: a session that was at
@@ -1219,7 +1223,6 @@ impl Waiting {
                 asks: None,
                 person: row.person,
                 noticed: row.noticed,
-                explicit_question: row.question.is_some(),
                 uncertain,
             };
             if wait.current(now) {
@@ -1427,8 +1430,9 @@ impl Waiting {
     /// whichever of the person's tokens leads the Work: the Work takes a renewed token only at
     /// the session's next Work call, and the wait at its next report. Unlike `owned` it has no grace: the Work waits from the moment
     /// its session stops, and only the notice to its person is held back. With no wait on record
-    /// the answer stays unknown until fresh evidence: a missing explicit question can remain
-    /// unanswered indefinitely, so elapsed time cannot establish that the session is not waiting.
+    /// the answer stays unknown until fresh evidence: a question row that is missing or has
+    /// unknown coverage is not aged out, so elapsed time cannot establish that the session is not
+    /// waiting. A known question is still capped at 24 hours.
     pub(super) fn lead(
         &self,
         owner: &str,
@@ -1690,7 +1694,7 @@ mod tests {
         database
             .execute("DELETE FROM hub_settings WHERE key = ?1", [&key])
             .unwrap();
-        let later = 1_110 + 3 * MAX_AGE_SECONDS;
+        let later = 1_110 + MAX_AGE_SECONDS / 4;
         let restarted = Waiting::default();
         restarted.restore(&*store, later);
         assert_eq!(restarted.3.lock().unwrap().len(), 2);
@@ -1747,6 +1751,38 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_question_survives_restore_past_a_day_until_a_snapshot() {
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let (_directory, store) = question_store();
+        let waiting = Waiting::default();
+        let mut mine = principal("tok_a", "usr_me", "acme/widgets");
+        mine.expires_at = i64::MAX;
+        waiting
+            .questions(&*store, &mine, NATIVE, NATIVE, &questions(100, []), 1_000)
+            .unwrap();
+        waiting
+            .questions_unavailable(&*store, &mine, NATIVE, NATIVE, 1_010)
+            .unwrap();
+        waiting.save(&*store, 1_020).unwrap();
+        let later = 1_020 + 3 * MAX_AGE_SECONDS;
+        let restored = Waiting::default();
+        restored.restore(&*store, later);
+        assert!(!restored.owned(&*store, &mine, later).complete);
+        assert_eq!(
+            restored.lead(&mine.owner.id, &mine.token_id, NATIVE, later, later),
+            LeadWait::Unknown
+        );
+        restored
+            .questions(&*store, &mine, NATIVE, NATIVE, &questions(100, []), later)
+            .unwrap();
+        assert!(restored.owned(&*store, &mine, later).complete);
+        assert_ne!(
+            restored.lead(&mine.owner.id, &mine.token_id, NATIVE, later, later),
+            LeadWait::Unknown
+        );
+    }
+
+    #[test]
     fn unavailable_question_coverage_survives_restart_without_replacing_known_questions() {
         const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
         let (_directory, store) = question_store();
@@ -1770,7 +1806,7 @@ mod tests {
                 .all(|row| row.uncertain && row.asks.is_none())
         );
         waiting.save(&*store, 1_020).unwrap();
-        let later = 1_020 + 3 * MAX_AGE_SECONDS;
+        let later = 1_020 + MAX_AGE_SECONDS / 4;
         let restored = Waiting::default();
         restored.restore(&*store, later);
         assert!(!restored.owned(&*store, &mine, later).complete);
@@ -1902,7 +1938,7 @@ mod tests {
         );
         assert!(!waiting.owned(&*store, &two, 1_100).complete);
         waiting.save(&*store, 1_100).unwrap();
-        let later = 1_101 + 3 * MAX_AGE_SECONDS;
+        let later = 1_101 + MAX_AGE_SECONDS / 4;
         let restarted = Waiting::default();
         restarted.restore(&*store, later);
         // Even without a memory slot or a wait row, fresh activity cannot prove complete coverage.
@@ -2015,7 +2051,7 @@ mod tests {
         waiting
             .questions(&*store, &two, NATIVE, NATIVE, &questions(100, []), 1_000)
             .unwrap();
-        let refused_at = 1_010 + 3 * MAX_AGE_SECONDS;
+        let refused_at = 1_010 + MAX_AGE_SECONDS / 4;
         assert!(matches!(
             waiting.questions(
                 &*store,
@@ -2054,7 +2090,7 @@ mod tests {
             assert!(!waiting.owned(&*store, &two, refused_at + 90).complete);
         }
         waiting.save(&*store, refused_at + 90).unwrap();
-        let later = refused_at + 90 + 3 * MAX_AGE_SECONDS;
+        let later = refused_at + 90 + MAX_AGE_SECONDS / 4;
         let restored = Waiting::default();
         restored.restore(&*store, later);
         for offset in [50, 100] {
@@ -2229,7 +2265,7 @@ mod tests {
         assert_eq!(waiting.4.lock().unwrap().sources.get(&key), Some(&200));
         waiting.save(&*store, 1_020).unwrap();
         let restored = Waiting::default();
-        let later = 1_030 + 3 * MAX_AGE_SECONDS;
+        let later = 1_030 + MAX_AGE_SECONDS / 4;
         restored.restore(&*store, later);
         database
             .execute_batch("DROP TRIGGER reject_coverage;")
@@ -2623,8 +2659,9 @@ mod tests {
             .unwrap();
         assert!(waiting.owned(&*store, &mine, 1_059).waits.is_empty());
         assert_eq!(waiting.owned(&*store, &mine, 1_060).waits.len(), 2);
-        // Accepted async tool output, subsequent tools, an unrelated user screenshot, a
-        // reconnect and an ordinary session end cannot answer either native question.
+        // Accepted async tool output, subsequent tools, Hub prompt and clear hooks (which only
+        // remove non-question rows), a reconnect and an ordinary session end cannot answer
+        // either native question.
         waiting.clear(owner, NATIVE, None, false);
         waiting.clear(owner, NATIVE, Some("helper"), false);
         waiting.clear(owner, NATIVE, None, true);
@@ -2857,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_native_questions_do_not_expire_before_their_matched_reply() {
+    fn explicit_native_questions_are_listed_for_a_day_or_until_their_matched_reply() {
         let (_directory, store) = question_store();
         let waiting = Waiting::default();
         let mut mine = principal("tok_a", "usr_me", "acme/widgets");
@@ -2867,7 +2904,21 @@ mod tests {
         waiting
             .questions(&*store, &mine, NATIVE, NATIVE, &before, 1_000)
             .unwrap();
-        let later = 1_000 + 3 * MAX_AGE_SECONDS;
+        // Like every other wait, a known question is listed for a day and not a second more.
+        assert_eq!(
+            waiting
+                .owned(&*store, &mine, 1_000 + MAX_AGE_SECONDS - 1)
+                .waits
+                .len(),
+            2
+        );
+        assert!(
+            waiting
+                .owned(&*store, &mine, 1_000 + MAX_AGE_SECONDS)
+                .waits
+                .is_empty()
+        );
+        let later = 1_000 + MAX_AGE_SECONDS / 2;
         assert_eq!(waiting.owned(&*store, &mine, later).waits.len(), 2);
         waiting.save(&*store, later).unwrap();
         let restored = Waiting::default();
@@ -2889,7 +2940,7 @@ mod tests {
             .questions(&*store, &mine, NATIVE, NATIVE, &questions(50, []), later)
             .unwrap();
         assert_eq!(waiting.owned(&*store, &mine, later).waits.len(), 2);
-        // A new Hub can first learn an old but still outstanding native question too.
+        // A new Hub can first learn a question that is under a day old.
         let restarted = Waiting::default();
         restarted
             .questions(&*store, &mine, NATIVE, NATIVE, &before, later)
@@ -2906,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_questions_survive_long_hub_downtime_until_their_matched_reply() {
+    fn explicit_questions_survive_hub_downtime_within_a_day() {
         let (_directory, store) = question_store();
         let waiting = Waiting::default();
         let mut mine = principal("tok_a", "usr_me", "acme/widgets");
@@ -2928,7 +2979,9 @@ mod tests {
             )
             .unwrap();
         waiting.save(&*store, 1_010).unwrap();
-        let later = 1_010 + 3 * MAX_AGE_SECONDS;
+        // Far longer than ordinary waits are believed, still under a day.
+        let later = 1_010 + MAX_AGE_SECONDS / 2;
+        assert!(later - 1_010 > SAVED_MAX_AGE_SECONDS);
         let restored = Waiting::default();
         restored.restore(&*store, later);
         let remaining = restored.owned(&*store, &mine, later).waits;
@@ -2942,6 +2995,43 @@ mod tests {
             .questions(&*store, &mine, NATIVE, NATIVE, &questions(200, []), later)
             .unwrap();
         assert!(restored.owned(&*store, &mine, later).waits.is_empty());
+        // After a day the question is gone, as every other wait is.
+        let expired = Waiting::default();
+        expired.restore(&*store, 1_000 + MAX_AGE_SECONDS);
+        assert!(
+            expired
+                .owned(&*store, &mine, 1_000 + MAX_AGE_SECONDS)
+                .waits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_does_not_readmit_a_question_a_day_old() {
+        let (_directory, store) = question_store();
+        let waiting = Waiting::default();
+        let mut mine = principal("tok_a", "usr_me", "acme/widgets");
+        mine.expires_at = i64::MAX;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let now = 1_000 + MAX_AGE_SECONDS;
+        let mut other = questions(100, [0]);
+        other.pending[0].since = now - GRACE_SECONDS;
+        waiting
+            .questions(&*store, &mine, "other", "other", &other, now)
+            .unwrap();
+        // Old questions that would exceed the limit if admitted, and one that is current.
+        let mut snapshot = questions(100, 0..MAX_OWNER_ROWS);
+        snapshot.pending.last_mut().unwrap().since = now - GRACE_SECONDS;
+        waiting
+            .questions(&*store, &mine, NATIVE, NATIVE, &snapshot, now)
+            .unwrap();
+        assert_eq!(waiting.owned(&*store, &mine, now).waits.len(), 2);
+        assert_eq!(waiting.0.lock().unwrap().len(), 2);
+        // The offset is recorded as for any accepted snapshot, so an older one is still stale.
+        waiting
+            .questions(&*store, &mine, NATIVE, NATIVE, &questions(50, [0]), now)
+            .unwrap();
+        assert_eq!(waiting.owned(&*store, &mine, now).waits.len(), 2);
     }
 
     #[test]
