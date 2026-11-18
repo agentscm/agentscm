@@ -2,6 +2,16 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.6.1](https://github.com/agentscm/agentscm/compare/v0.6.0...v0.6.1) - 2026-11-18
+
+### Fixed
+
+- *(hub)* Clear a Codex async question when its person replies ([#644](https://github.com/agentscm/agentscm/pull/644))
+
+### Other
+
+- *(release)* Run Hub e2e before publishing and close the tracking issue ([#643](https://github.com/agentscm/agentscm/pull/643))
+
 ## [0.6.0](https://github.com/agentscm/agentscm/compare/v0.5.0...v0.6.0) - 2026-11-18
 
 ### Added
