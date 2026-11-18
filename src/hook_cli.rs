@@ -3990,10 +3990,7 @@ mod tests {
         append(
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_question","output":"{\"accepted\":true}"}}),
         );
-        append(item(
-            json!({"type":"UserMessage","id":"unrelated","content":[{"type":"Text","text":"Here is a screenshot"}]}),
-        ));
-        // Continued native work and a normal user prompt also flow through the real hooks.
+        // Continued native work and hook events also flow through the real hooks.
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"] {
             client
                 .post(format!(

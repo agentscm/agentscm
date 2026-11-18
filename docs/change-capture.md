@@ -915,9 +915,10 @@ visible history after an explicit Work start even when a conversational hook is 
 does not prove native edit-hook verification.
 
 Codex asynchronous questions are read independently of conversation sharing. The human alert keeps
-pending question IDs and timestamps, without question or answer text, until the exact native answer
-or an explicit clear is observed. Unrelated tool calls, replies and session stops do not dismiss
-them. Unreliable scans report unavailable coverage without answering known questions. Scoped
+pending question IDs and timestamps, without question or answer text, until a message from the
+person in that session or an explicit clear is observed. Codex's structured reply still clears only
+the question it names, and a host notification delivered as a user message also clears them.
+Unrelated tool calls and session stops do not dismiss them. Unreliable scans report unavailable coverage without answering known questions. Scoped
 coverage remains unavailable across restarts until reliable evidence or a verified clear resolves
 that source. Pending questions have an active capacity bound; dismissing a status item does not
 answer its native question.

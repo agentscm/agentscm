@@ -6793,7 +6793,7 @@ fn codex_rollout_and_native_tools_share_phases_in_both_orders_without_losing_act
 }
 
 #[test]
-fn codex_question_reader_keeps_unanswered_questions_across_unrelated_activity() {
+fn codex_question_reader_clears_questions_on_any_reply_from_the_person() {
     use std::io::Write;
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("history.jsonl");
@@ -6807,27 +6807,48 @@ fn codex_question_reader_keeps_unanswered_questions_across_unrelated_activity() 
     assert_eq!(first.snapshot.pending.len(), 1);
     assert_eq!(first.snapshot.pending[0].asks, None);
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    // A plain message that quotes the question and adds an answer clears it.
     file.write_all(
-        codex_history_message(2, "UserMessage", "unrelated", "continue the task").as_bytes(),
+        codex_history_message(
+            2,
+            "UserMessage",
+            "plain_reply",
+            "> PRIVATE_QUESTION_TITLE\n\nYes, continue the task",
+        )
+        .as_bytes(),
     )
     .unwrap();
-    assert_eq!(
-        codex::poll_questions(&path, CODEX_SESSION, &mut cursor)
-            .unwrap()
-            .snapshot
-            .pending
-            .len(),
-        1
-    );
-    let answer =
-        serde_json::json!([{"questionItemId":first.snapshot.pending[0].id,"answer":"Yes"}]);
+    let plain = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(plain.complete && plain.reliable);
+    assert!(plain.snapshot.pending.is_empty());
+    // A structured reply clears only the question it names.
+    file.write_all(codex_history_line(3, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_two",
+        "content":[],"delivery":"async","questions":[{"title":"First","options":["Yes","No"]},{"title":"Second","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let two = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(two.snapshot.pending.len(), 2);
+    let answer = serde_json::json!([{"questionItemId":two.snapshot.pending[0].id,"answer":"Yes"}]);
     let text =
         format!("<send_user_message_question_reply>{answer}</send_user_message_question_reply>");
-    file.write_all(codex_history_message(3, "UserMessage", "answer", &text).as_bytes())
+    file.write_all(codex_history_message(4, "UserMessage", "answer", &text).as_bytes())
         .unwrap();
     let answered = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
     assert!(answered.complete && answered.reliable);
-    assert!(answered.snapshot.pending.is_empty());
+    assert_eq!(answered.snapshot.pending.len(), 1);
+    assert_eq!(answered.snapshot.pending[0].id, two.snapshot.pending[1].id);
+    // A question asked after a user message stays pending; the next message clears both.
+    file.write_all(codex_history_line(5, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_later",
+        "content":[],"delivery":"async","questions":[{"title":"Later","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let later = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(later.snapshot.pending.len(), 2);
+    file.write_all(codex_history_message(6, "UserMessage", "any", "carry on").as_bytes())
+        .unwrap();
+    let cleared = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(cleared.complete && cleared.reliable);
+    assert!(cleared.snapshot.pending.is_empty());
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
     let captured = codex::capture_rollout(
         &path,
@@ -6842,7 +6863,7 @@ fn codex_question_reader_keeps_unanswered_questions_across_unrelated_activity() 
         &bodies,
         b"send_user_message_question_reply"
     ));
-    file.write_all(codex_history_line(4, "event_msg", serde_json::json!({
+    file.write_all(codex_history_line(7, "event_msg", serde_json::json!({
         "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_null",
         "questions":[{"title":"Another question","options":["Yes","No"]}]}
     })).as_bytes()).unwrap();
@@ -6851,7 +6872,7 @@ fn codex_question_reader_keeps_unanswered_questions_across_unrelated_activity() 
         serde_json::json!([{"questionItemId":pending.snapshot.pending[0].id,"answer":null}]);
     file.write_all(
         codex_history_message(
-            5,
+            8,
             "UserMessage",
             "invalid_answer",
             &format!(
