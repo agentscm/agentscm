@@ -56,7 +56,17 @@ jobs:
       - name: Tag the merged release candidate
         env:
           GIT_TOKEN: ${{ steps.token.outputs.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
+          # The merge queue pushes main before GitHub records the PR as merged, and release-plz
+          # reads that record. Wait for it on a release commit, or the tag is skipped (#636).
+          if git log -1 --format=%s "$GITHUB_SHA" | grep -q '^chore: Prepare release'; then
+            for _ in $(seq 30); do
+              merged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '[.[] | select(.merged_at != null)] | length')
+              [ "$merged" -gt 0 ] && break
+              sleep 10
+            done
+          fi
           release-plz release --config release-plz.toml
           # Tags created through the API are not added to the local checkout.
           git fetch --tags origin
