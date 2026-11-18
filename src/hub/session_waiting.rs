@@ -1430,8 +1430,9 @@ impl Waiting {
     /// whichever of the person's tokens leads the Work: the Work takes a renewed token only at
     /// the session's next Work call, and the wait at its next report. Unlike `owned` it has no grace: the Work waits from the moment
     /// its session stops, and only the notice to its person is held back. With no wait on record
-    /// the answer stays unknown until fresh evidence: a missing explicit question can remain
-    /// unanswered indefinitely, so elapsed time cannot establish that the session is not waiting.
+    /// the answer stays unknown until fresh evidence: a question row that is missing or has
+    /// unknown coverage is not aged out, so elapsed time cannot establish that the session is not
+    /// waiting. A known question is still capped at 24 hours.
     pub(super) fn lead(
         &self,
         owner: &str,
@@ -1746,6 +1747,38 @@ mod tests {
         assert_eq!(
             restarted.lead(&one.owner.id, &one.token_id, NATIVE, later, later),
             LeadWait::Waiting(WaitReason::Question)
+        );
+    }
+
+    #[test]
+    fn uncertain_question_survives_restore_past_a_day_until_a_snapshot() {
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let (_directory, store) = question_store();
+        let waiting = Waiting::default();
+        let mut mine = principal("tok_a", "usr_me", "acme/widgets");
+        mine.expires_at = i64::MAX;
+        waiting
+            .questions(&*store, &mine, NATIVE, NATIVE, &questions(100, []), 1_000)
+            .unwrap();
+        waiting
+            .questions_unavailable(&*store, &mine, NATIVE, NATIVE, 1_010)
+            .unwrap();
+        waiting.save(&*store, 1_020).unwrap();
+        let later = 1_020 + 3 * MAX_AGE_SECONDS;
+        let restored = Waiting::default();
+        restored.restore(&*store, later);
+        assert!(!restored.owned(&*store, &mine, later).complete);
+        assert_eq!(
+            restored.lead(&mine.owner.id, &mine.token_id, NATIVE, later, later),
+            LeadWait::Unknown
+        );
+        restored
+            .questions(&*store, &mine, NATIVE, NATIVE, &questions(100, []), later)
+            .unwrap();
+        assert!(restored.owned(&*store, &mine, later).complete);
+        assert_ne!(
+            restored.lead(&mine.owner.id, &mine.token_id, NATIVE, later, later),
+            LeadWait::Unknown
         );
     }
 
@@ -2626,8 +2659,9 @@ mod tests {
             .unwrap();
         assert!(waiting.owned(&*store, &mine, 1_059).waits.is_empty());
         assert_eq!(waiting.owned(&*store, &mine, 1_060).waits.len(), 2);
-        // Accepted async tool output, subsequent tools, an unrelated user screenshot, a
-        // reconnect and an ordinary session end cannot answer either native question.
+        // Accepted async tool output, subsequent tools, Hub prompt and clear hooks (which only
+        // remove non-question rows), a reconnect and an ordinary session end cannot answer
+        // either native question.
         waiting.clear(owner, NATIVE, None, false);
         waiting.clear(owner, NATIVE, Some("helper"), false);
         waiting.clear(owner, NATIVE, None, true);

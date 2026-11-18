@@ -6863,7 +6863,60 @@ fn codex_question_reader_clears_questions_on_any_reply_from_the_person() {
         &bodies,
         b"send_user_message_question_reply"
     ));
-    file.write_all(codex_history_line(7, "event_msg", serde_json::json!({
+    // A structured reply beside a plain-text block still clears only the question it names.
+    file.write_all(codex_history_line(9, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_pair",
+        "content":[],"delivery":"async","questions":[{"title":"Alpha","options":["Yes","No"]},{"title":"Beta","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let pair = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(pair.snapshot.pending.len(), 2);
+    let named = serde_json::json!([{"questionItemId":pair.snapshot.pending[1].id,"answer":"No"}]);
+    file.write_all(
+        codex_history_line(10, "event_msg", serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,"turn_id":"turn_1",
+            "item":{"type":"UserMessage","id":"mixed","phase":"commentary","content":[
+                {"type":"Text","text":format!("<send_user_message_question_reply>{named}</send_user_message_question_reply>")},
+                {"type":"Text","text":"plain note without a quote"}
+            ]}
+        })).as_bytes(),
+    )
+    .unwrap();
+    let mixed = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(mixed.complete && mixed.reliable);
+    assert_eq!(mixed.snapshot.pending.len(), 1);
+    assert!(
+        mixed
+            .snapshot
+            .pending
+            .iter()
+            .all(|q| q.id != pair.snapshot.pending[1].id)
+    );
+    // A message with no text blocks, or no content at all, still clears every pending question.
+    for (ordinal, content) in [
+        (
+            11,
+            serde_json::json!([{"type":"Image","url":"synthetic://image"}]),
+        ),
+        (12, serde_json::json!([])),
+    ] {
+        let still = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+        assert!(!still.snapshot.pending.is_empty());
+        file.write_all(
+            codex_history_line(ordinal, "event_msg", serde_json::json!({
+                "type":"item_completed","thread_id":CODEX_SESSION,"turn_id":"turn_1",
+                "item":{"type":"UserMessage","id":format!("bare_{ordinal}"),"phase":"commentary","content":content}
+            })).as_bytes(),
+        )
+        .unwrap();
+        let bare = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+        assert!(bare.complete && bare.reliable);
+        assert!(bare.snapshot.pending.is_empty());
+        file.write_all(codex_history_line(ordinal + 10, "event_msg", serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":format!("again_{ordinal}"),
+            "content":[],"delivery":"async","questions":[{"title":"Again","options":["Yes","No"]}]}
+        })).as_bytes()).unwrap();
+    }
+    file.write_all(codex_history_line(40, "event_msg", serde_json::json!({
         "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_null",
         "questions":[{"title":"Another question","options":["Yes","No"]}]}
     })).as_bytes()).unwrap();
@@ -6872,7 +6925,7 @@ fn codex_question_reader_clears_questions_on_any_reply_from_the_person() {
         serde_json::json!([{"questionItemId":pending.snapshot.pending[0].id,"answer":null}]);
     file.write_all(
         codex_history_message(
-            8,
+            41,
             "UserMessage",
             "invalid_answer",
             &format!(
@@ -6885,7 +6938,7 @@ fn codex_question_reader_clears_questions_on_any_reply_from_the_person() {
     let invalid = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
     assert!(invalid.complete);
     assert!(!invalid.reliable);
-    assert_eq!(invalid.snapshot.pending.len(), 1);
+    assert_eq!(invalid.snapshot.pending.len(), 2);
 }
 
 #[test]
