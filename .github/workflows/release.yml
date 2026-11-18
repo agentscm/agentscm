@@ -434,7 +434,7 @@ jobs:
   # Settles the `Release v<version>` tracking issue (docs/releasing.md) once npm has the package.
   close-tracking-issue:
     needs: npm
-    if: ${{ !contains(github.ref_name, '-dry') }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -445,6 +445,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          case "$TAG" in *-dry*) echo "dry-run tag $TAG: leaving the tracking issue open"; exit 0 ;; esac
           issues=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"Release $TAG\" in:title" \
             --json number,title --jq ".[] | select(.title == \"Release $TAG\") | .number")
           for issue in $issues; do
