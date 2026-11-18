@@ -2032,6 +2032,7 @@ mod tests {
                 merge_available_from: 0,
             },
             source_coverage: vec![],
+            owner_notices: vec![],
             complete: true,
         };
         f.deliveries = vec![ValueDelivery {

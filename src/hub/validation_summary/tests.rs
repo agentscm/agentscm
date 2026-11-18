@@ -2,8 +2,9 @@
 use super::*;
 use crate::backend::LocalBackend;
 use crate::hub::connection::NewConnection;
-use crate::hub::store::{self, ForgeIdentity, mint_bound_agent_token};
+use crate::hub::store::{self, ForgeIdentity, User, mint_bound_agent_token};
 use crate::hub::validation_evidence::{ValidationSummaryConfig, persist_bundle};
+use crate::hub::work_transition::WorkLifecycleReader;
 use crate::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
 use crate::local_validation::fetch::HostedTestTransport;
 use crate::local_validation::*;
@@ -23,6 +24,7 @@ struct Fixture {
     repo: ConnectedRepository,
     forge: fake::FakeGithub,
     agent: String,
+    pull_owner: User,
     source: std::path::PathBuf,
     remote: std::path::PathBuf,
     base: String,
@@ -231,6 +233,16 @@ impl Fixture {
                 "publisher",
             )
             .unwrap();
+        let pull_owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                "octocat",
+            )
+            .unwrap();
         let conn = store
             .insert_connection(
                 &NewConnection {
@@ -316,6 +328,7 @@ impl Fixture {
             repo,
             forge,
             agent,
+            pull_owner,
             source,
             remote,
             base,
@@ -484,6 +497,163 @@ impl Fixture {
                 .head_sha = self.head.clone()
         });
     }
+
+    fn notices(&self) -> Vec<crate::hub::notices::OwnerNotice> {
+        self.hub
+            .store
+            .owner_notice_list(
+                &WorkLifecycleReader::Person {
+                    owner: &self.pull_owner,
+                    repository: &self.repo.full_name,
+                    repository_id: self.repo.repository_id,
+                },
+                None,
+                100,
+                super::super::store::unix_now(),
+            )
+            .unwrap()
+            .notices
+    }
+
+    fn transition_trusted_config(&mut self, cause: InvalidationCause) {
+        git(&self.source, &["checkout", "-q", &self.base]);
+        match cause {
+            InvalidationCause::Policy => {
+                self.policies[0].epoch += 1;
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("policy.json"),
+                    serde_json::to_vec(&self.policies[0]).unwrap(),
+                )
+                .unwrap();
+            }
+            InvalidationCause::Recipe => {
+                self.recipe.commands[0].timeout_secs += 1;
+                self.policies[0].recipe_sha256 = self.recipe.sha256().unwrap();
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("recipe.json"),
+                    serde_json::to_vec(&self.recipe).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("policy.json"),
+                    serde_json::to_vec(&self.policies[0]).unwrap(),
+                )
+                .unwrap();
+            }
+            InvalidationCause::Registry => {
+                self.registry.epoch += 1;
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("registry.json"),
+                    serde_json::to_vec(&self.registry).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        git(&self.source, &["add", CONFIG_DIR]);
+        git(
+            &self.source,
+            &["commit", "-qm", "trusted config transition"],
+        );
+        self.base = git(&self.source, &["rev-parse", "HEAD"]);
+        git(
+            &self.source,
+            &[
+                "push",
+                self.remote.to_str().unwrap(),
+                &format!("{}:refs/heads/main", self.base),
+            ],
+        );
+        self.forge.with(|s| {
+            s.repos
+                .get_mut(&42)
+                .unwrap()
+                .branches
+                .iter_mut()
+                .find(|branch| branch.name == "main")
+                .unwrap()
+                .sha = self.base.clone();
+        });
+        git(&self.source, &["checkout", "-q", &self.head]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_transitions_notice_only_affected_current_attestations() {
+    for cause in [
+        InvalidationCause::Policy,
+        InvalidationCause::Recipe,
+        InvalidationCause::Registry,
+    ] {
+        let mut f = Fixture::new().await;
+        let now = Fixture::now();
+        f.submit(0, now, false);
+        f.submit(1, now + 1, false);
+        f.run().await.unwrap();
+        assert!(f.notices().is_empty());
+
+        f.transition_trusted_config(cause);
+        f.run().await.unwrap();
+        let notices = f.notices();
+        assert_eq!(notices.len(), 1, "{cause:?}");
+        assert!(notices[0].body.contains(cause.label()));
+        assert!(notices[0].body.contains("Pull request #1"));
+        assert!(notices[0].body.contains("local-validation/unit"));
+        if cause == InvalidationCause::Registry {
+            assert!(notices[0].body.contains("local-validation/static"));
+        }
+
+        // Scoped transitions leave the other requirement valid; every replay is idempotent.
+        f.run().await.unwrap();
+        assert_eq!(f.notices(), notices, "{cause:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_invalidation_is_deferred_until_current_inventory_reports_ready() {
+    let mut f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    f.forge.with(|s| {
+        s.repos
+            .get_mut(&42)
+            .unwrap()
+            .pulls
+            .get_mut(&1)
+            .unwrap()
+            .draft = true;
+    });
+    f.transition_trusted_config(InvalidationCause::Policy);
+    f.run().await.unwrap();
+    assert!(f.notices().is_empty());
+
+    f.forge.with(|s| {
+        s.repos
+            .get_mut(&42)
+            .unwrap()
+            .pulls
+            .get_mut(&1)
+            .unwrap()
+            .draft = false;
+    });
+    f.run().await.unwrap();
+    assert_eq!(f.notices().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_or_unavailable_evidence_never_becomes_an_invalidation_notice() {
+    {
+        let mut stale = Fixture::new().await;
+        stale.submit(0, Fixture::now(), false);
+        stale.advance();
+        stale.run().await.unwrap();
+        assert!(stale.notices().is_empty());
+    }
+
+    let unavailable = Fixture::new().await;
+    unavailable.submit(0, Fixture::now(), false);
+    fs::remove_dir_all(unavailable.root.path().join("objects")).unwrap();
+    unavailable.run().await.unwrap();
+    assert!(unavailable.notices().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

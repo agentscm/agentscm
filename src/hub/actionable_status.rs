@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hub::coordination::{
     ACK_BOUND_SECS, CoordinationInbox, CoordinationListQuery, CoordinationStatus,
 };
+use crate::hub::notices::OwnerNoticeSourceKind;
 use crate::hub::onboarding::Observations;
 use crate::hub::session_waiting::{LeadWait, WaitReason};
 use crate::hub::store::{Principal, Store, owner_session, session_ancestors, session_key};
@@ -254,6 +255,94 @@ fn pause_asks_person(item: &WorkItem) -> bool {
                 || named.contains("owner")
                 || (!person.is_empty() && named.contains(&person))
         })
+}
+
+fn owner_notice_actions(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    principal: &Principal,
+    actions: &mut Vec<StatusAction>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut after = None;
+    let mut limits = Vec::new();
+    loop {
+        let page = match store.owner_notice_list(reader, after.as_deref(), 100, now) {
+            Ok(page) => page,
+            Err(_) => {
+                limits.push("owner_notices_unavailable".into());
+                break;
+            }
+        };
+        for notice in page
+            .notices
+            .into_iter()
+            .filter(|notice| notice.acknowledged_at.is_none() && notice.acted_at.is_none())
+        {
+            project_owner_notice(actions, principal, notice);
+        }
+        let Some(next) = page.next_after else {
+            break;
+        };
+        if after.is_some() {
+            limits.push("owner_notices_truncated".into());
+            break;
+        }
+        after = Some(next);
+    }
+    Ok(limits)
+}
+
+fn project_owner_notice(
+    actions: &mut Vec<StatusAction>,
+    principal: &Principal,
+    notice: crate::hub::notices::OwnerNotice,
+) {
+    let pull = (notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation)
+        .then(|| notice.source_id.strip_prefix("pr:"))
+        .flatten()
+        .and_then(|rest| rest.split(':').next())
+        .filter(|number| number.bytes().all(|byte| byte.is_ascii_digit()));
+    let folded = pull.is_some_and(|number| {
+        actions
+            .iter_mut()
+            .find(|action| {
+                action.kind == "failed_check"
+                    && action
+                        .id
+                        .rsplit_once(':')
+                        .and_then(|(prefix, _)| prefix.rsplit_once(':'))
+                        .is_some_and(|(_, pull)| pull == number)
+            })
+            .map(|action| {
+                action.action = format!("{} {}", action.action, notice.body);
+                action.semantic_version = Some(identity(&[
+                    action.semantic_version.as_deref().unwrap_or(""),
+                    &notice.id,
+                ]));
+            })
+            .is_some()
+    });
+    if folded {
+        return;
+    }
+    actions.push(StatusAction {
+        id: format!("owner_notice:{}", notice.id),
+        kind: "owner_notice".into(),
+        work_ids: vec![],
+        recipients: vec![StatusRecipient {
+            kind: RecipientKind::Person,
+            owner: Some(principal.owner.id.clone()),
+            login: Some(principal.owner.login.clone()),
+            agent: None,
+        }],
+        needs_you: true,
+        action: notice.body,
+        updated_seq: 0,
+        semantic_version: Some(notice.id),
+        session: None,
+        limits: vec![],
+    });
 }
 
 /// A report is routed to its named lead/owner, never to every reader of the repository. `wait`
@@ -858,6 +947,13 @@ fn read_scoped(
         checks::read(store, principal, &items, now)?;
     actions.extend(checks);
     limits.extend(check_limits);
+    limits.extend(owner_notice_actions(
+        store,
+        reader,
+        principal,
+        &mut actions,
+        now,
+    )?);
     let (dependency_actions, dependency_limits) =
         dependency_actions(store, reader, &items, &principal.owner.id, now)?;
     actions.extend(dependency_actions);
@@ -1863,6 +1959,107 @@ mod tests {
             session: None,
             limits: vec![],
         }
+    }
+
+    #[test]
+    fn invalidation_notice_folds_into_the_matching_failed_check_only() {
+        let principal = Principal {
+            token_id: "tok_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            name: "reader".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(101),
+            expires_at: 1_000,
+            read_only: true,
+            owner: crate::hub::store::User {
+                id: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                identity: ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: "alice".into(),
+                name: None,
+                disabled: false,
+            },
+        };
+        let mut actions = vec![StatusAction {
+            id: "check:repo:42:agentscm/local-validation".into(),
+            kind: "failed_check".into(),
+            work_ids: vec![],
+            recipients: vec![],
+            needs_you: true,
+            action: "Required check agentscm/local-validation reports failure on pull request #42; fix or rerun it before merging.".into(),
+            updated_seq: 0,
+            semantic_version: Some("check-v1".into()),
+            session: None,
+            limits: vec![],
+        }];
+        project_owner_notice(
+            &mut actions,
+            &principal,
+            crate::hub::notices::OwnerNotice {
+                id: "ont_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                idempotency_key: "validation-42".into(),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: "pr:42:local-validation:policy:evidence:trusted".into(),
+                sender_owner: "hub".into(),
+                sender_token: "hub:validation".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: principal.owner.id.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                repository: principal.repository.clone(),
+                repository_id: principal.repository_id,
+                body: "Update from the base branch and submit a new attestation.".into(),
+                created_at: 100,
+                delivery_attempts: vec![],
+                delivered_at: None,
+                delivery: None,
+                acknowledged_at: None,
+                acted_at: None,
+            },
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "failed_check");
+        assert!(
+            actions[0]
+                .action
+                .ends_with("Update from the base branch and submit a new attestation.")
+        );
+        assert_ne!(actions[0].semantic_version.as_deref(), Some("check-v1"));
+
+        let mut near_match = actions;
+        project_owner_notice(
+            &mut near_match,
+            &principal,
+            crate::hub::notices::OwnerNotice {
+                id: "ont_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                idempotency_key: "validation-4".into(),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: "pr:4:transition:policy".into(),
+                sender_owner: "hub".into(),
+                sender_token: "hub:validation".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: principal.owner.id.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                repository: principal.repository.clone(),
+                repository_id: principal.repository_id,
+                body: "Pull request #4 needs a new attestation.".into(),
+                created_at: 101,
+                delivery_attempts: vec![],
+                delivered_at: None,
+                delivery: None,
+                acknowledged_at: None,
+                acted_at: None,
+            },
+        );
+        assert_eq!(near_match.len(), 2, "PR #4 must not fold into PR #42");
+        assert_eq!(near_match[1].kind, "owner_notice");
     }
 
     #[test]

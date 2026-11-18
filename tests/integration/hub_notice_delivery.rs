@@ -6,18 +6,21 @@ use agentscm::hub::catchup::{
 };
 use agentscm::hub::connection::NewConnection;
 use agentscm::hub::notices::{
-    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NoticeAttempt, NoticeOfferRequest,
-    NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport, SourceKind,
+    AttemptOutcome, DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAttempt,
+    NoticeOfferRequest, NoticeReceipt, NoticeRecipient, NoticeSource, NoticeTransportReport,
+    OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeRecipient,
+    OwnerNoticeRecipientStatus, OwnerNoticeSourceKind, SourceKind,
 };
 use agentscm::hub::session_lifecycle::LifecycleRegister;
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, User, mint_bound_agent_token, new_connection_id, unix_now,
 };
-use agentscm::hub::work::{WorkItem, WorkRole, WorkStart};
+use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, WorkStart};
 use agentscm::hub::work_links::WorkPrLinkTarget;
 use agentscm::hub::work_reconciliation::{
     PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations, WorkDeclarationsUpdate,
 };
+use agentscm::hub::work_transition::WorkLifecycleReader;
 use serde_json::json;
 
 const REPO: &str = "acme/widgets";
@@ -181,6 +184,7 @@ fn fixture(database: &str) -> Fixture {
     };
     Fixture {
         store,
+        repository: repo.id,
         owner,
         token,
         dependent,
@@ -192,12 +196,192 @@ fn fixture(database: &str) -> Fixture {
 
 struct Fixture {
     store: std::sync::Arc<dyn Store>,
+    repository: String,
     owner: User,
     token: String,
     dependent: WorkItem,
     incarnation: String,
     now: i64,
     query: DependencyRefresh,
+}
+
+fn dependency_transition_contract(database: &str) {
+    let Fixture {
+        store,
+        repository,
+        token,
+        dependent,
+        incarnation,
+        now,
+        query,
+        ..
+    } = fixture(database);
+    assert!(
+        store
+            .notice_refresh(&token, &query, now)
+            .unwrap()
+            .notices
+            .is_empty()
+    );
+
+    for (number, state, head, at) in [
+        (2, "closed", HEAD, now + 1),
+        (1, "open", HEAD, now + 2),
+        (
+            1,
+            "closed",
+            "cccccccccccccccccccccccccccccccccccccccc",
+            now + 3,
+        ),
+    ] {
+        store
+            .observe(
+                &repository,
+                "pull_request",
+                &number.to_string(),
+                &json!({"number":number,"state":state,"merged":false,
+                    "head_sha":head,"provider_number":number,
+                    "provider_base_repository_id":REPO_ID})
+                .to_string(),
+                at * 1000,
+            )
+            .unwrap();
+        assert!(
+            store
+                .notice_refresh(&token, &query, at)
+                .unwrap()
+                .notices
+                .is_empty(),
+            "unrelated, unchanged, and mismatched-head close observations stay quiet"
+        );
+    }
+
+    let prerequisite_id = match &store
+        .work_declarations_get(&token, &dependent.id, now + 4)
+        .unwrap()
+        .unwrap()
+        .declarations
+        .prerequisites[0]
+        .requirement
+    {
+        PrerequisiteRequirement::MergedPullRequest { work_id, .. } => work_id.clone(),
+        PrerequisiteRequirement::LegacyWork { .. } => unreachable!(),
+    };
+    let prerequisite = store
+        .work_get_scoped(
+            &WorkLifecycleReader::Token(&token),
+            &prerequisite_id,
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .work_checkpoint(
+            &token,
+            &WorkCheckpoint {
+                work_id: prerequisite.id.clone(),
+                operation_id: "handover-prerequisite".into(),
+                generation: prerequisite.generation,
+                session: prerequisite.lead_session.clone(),
+                expected_updated_seq: Some(prerequisite.updated_seq),
+                kind: CheckpointKind::Handover,
+                summary: "Synthetic authorized handover".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![],
+                depends_on: prerequisite.depends_on,
+                related_work: prerequisite.related_work,
+                finished_paths: None,
+            },
+            now + 4,
+        )
+        .unwrap();
+    let handover = store.notice_refresh(&token, &query, now + 4).unwrap();
+    assert_eq!(
+        handover.notices.len(),
+        1,
+        "the recorded Work handover is relevant"
+    );
+    let offer = store
+        .notice_offer(
+            &token,
+            &NoticeOfferRequest {
+                session: "dependent".into(),
+                incarnation: incarnation.clone(),
+                automatic: true,
+            },
+            now + 4,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .notice_transport(
+            &token,
+            &NoticeTransportReport {
+                session: "dependent".into(),
+                incarnation: incarnation.clone(),
+                delivery_id: offer.delivery_id,
+                attempt_id: offer.attempt_id.unwrap(),
+                outcome: AttemptOutcome::Unknown,
+                observed_at: now + 4,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert!(
+        store
+            .notice_offer(
+                &token,
+                &NoticeOfferRequest {
+                    session: "dependent".into(),
+                    incarnation: incarnation.clone(),
+                    automatic: true,
+                },
+                now + 5,
+            )
+            .unwrap()
+            .is_none(),
+        "one transition version wakes the idle waiter at most once"
+    );
+
+    store
+        .observe(
+            &repository,
+            "pull_request",
+            "1",
+            &json!({"number":1,"state":"closed","merged":false,"head_sha":HEAD,
+                "provider_number":1,"provider_base_repository_id":REPO_ID})
+            .to_string(),
+            (now + 6) * 1000,
+        )
+        .unwrap();
+    let closed = store.notice_refresh(&token, &query, now + 6).unwrap();
+    assert_eq!(
+        closed.notices.len(),
+        1,
+        "the exact declared PR/head close is relevant"
+    );
+    assert_ne!(closed.notices[0].id, handover.notices[0].id);
+}
+
+#[test]
+fn sqlite_dependency_transitions_wake_once() {
+    let directory = tempfile::tempdir().unwrap();
+    dependency_transition_contract(&format!(
+        "sqlite://{}",
+        directory.path().join("hub.sqlite").display()
+    ));
+}
+
+#[test]
+fn postgres_dependency_transitions_wake_once() {
+    let Some(schema) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    dependency_transition_contract(&schema.url);
 }
 
 fn contract(database: &str) {
@@ -209,6 +393,7 @@ fn contract(database: &str) {
         incarnation,
         now,
         query,
+        ..
     } = fixture(database);
     assert!(
         store
@@ -308,7 +493,7 @@ fn contract(database: &str) {
         session: "dependent".into(),
         incarnation: incarnation.clone(),
         delivery_id: record.id.clone(),
-        work_id: dependent.id,
+        work_id: dependent.id.clone(),
         generation: dependent.generation,
         declaration_seq: declarations.declaration_seq,
         semantic_version: 3,
@@ -331,6 +516,34 @@ fn contract(database: &str) {
         reopened
             .dependency_notice_ack(&token, &wrong, now + 70)
             .is_err()
+    );
+
+    let expiring = reopened.notice_refresh(&token, &query, now + 901).unwrap();
+    let expiry = expiring
+        .notices
+        .iter()
+        .find(|notice| {
+            notice.source.kind == SourceKind::Operational
+                && notice.source.id == dependent.id
+                && notice.source.version.starts_with("reservation-expiring:")
+        })
+        .expect("a held reservation inside the warning window has one durable pointer");
+    let repeated = reopened.notice_refresh(&token, &query, now + 902).unwrap();
+    assert_eq!(
+        repeated
+            .notices
+            .iter()
+            .filter(|notice| notice.id == expiry.id)
+            .count(),
+        1,
+        "the same lease version is deduplicated"
+    );
+    assert!(
+        reopened
+            .notice_offer(&token, &ordinary, now + 1201)
+            .unwrap()
+            .is_none(),
+        "an observed expiration withdraws its warning instead of waking again"
     );
 
     let source = NoticeSource {
@@ -1425,4 +1638,477 @@ fn postgres_historical_message_receipt_projection() {
         return;
     };
     message_receipt_projection_contract(&schema.url);
+}
+
+fn owner_mailbox_contract(database: &str) {
+    let store = store::open(database).unwrap();
+    let sender = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 501,
+            },
+            "sender",
+        )
+        .unwrap();
+    let recipient = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 502,
+            },
+            "recipient",
+        )
+        .unwrap();
+    let bystander = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 503,
+            },
+            "bystander",
+        )
+        .unwrap();
+    let (sender_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &sender.id,
+        "sender-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (recipient_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &recipient.id,
+        "recipient-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let now = unix_now();
+    let recipient_address = OwnerNoticeRecipient {
+        owner: recipient.id.clone(),
+        provider: "github".into(),
+        host: "github.com".into(),
+    };
+    let request = NewOwnerNotice {
+        idempotency_key: "send-pr-42-v1".into(),
+        source_kind: OwnerNoticeSourceKind::Addressed,
+        source_id: "pr-42-note-1".into(),
+        recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::Private,
+        body: "PR #42 needs a fresh attestation.".into(),
+    };
+    let created = store
+        .owner_notice_put(&sender_token, &request, now)
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_notice_get(&sender_token, &created.id, now)
+            .unwrap(),
+        created
+    );
+    assert!(
+        store
+            .owner_notice_get(&recipient_token, &created.id, now)
+            .is_ok(),
+        "the addressed recipient can read the exact notice"
+    );
+    let first_incarnation = register(&*store, &recipient_token, "recipient-one");
+    let second_incarnation = register(&*store, &recipient_token, "recipient-two");
+    let refresh = |session: &str, incarnation: &str, at| {
+        store
+            .notice_refresh(
+                &recipient_token,
+                &DependencyRefresh {
+                    session: session.into(),
+                    incarnation: incarnation.into(),
+                    after: None,
+                    limit: 100,
+                },
+                at,
+            )
+            .unwrap()
+    };
+    let first_session = refresh("recipient-one", &first_incarnation, now);
+    let second_session = refresh("recipient-two", &second_incarnation, now);
+    let pointer = |page: &agentscm::hub::notices::NoticeRefreshPage| {
+        page.notices
+            .iter()
+            .find(|receipt| {
+                receipt.source.kind == SourceKind::OwnerNotice && receipt.source.id == created.id
+            })
+            .expect("owner notice is visible on the first startup refresh")
+            .id
+            .clone()
+    };
+    assert_ne!(pointer(&first_session), pointer(&second_session));
+    assert_eq!(
+        pointer(&first_session),
+        pointer(&refresh("recipient-one", &first_incarnation, now + 1)),
+        "one source version has one receipt per session"
+    );
+    assert_eq!(
+        store
+            .owner_notice_put(&sender_token, &request, now + 1)
+            .unwrap(),
+        created,
+        "exact retry returns the immutable original"
+    );
+    let mut changed = request.clone();
+    changed.body = "Changed body must not reuse the key.".into();
+    assert!(
+        store
+            .owner_notice_put(&sender_token, &changed, now + 1)
+            .is_err()
+    );
+    let mut same_source = request.clone();
+    same_source.idempotency_key = "another-key".into();
+    assert_eq!(
+        store
+            .owner_notice_put(&sender_token, &same_source, now + 1)
+            .unwrap(),
+        created,
+        "the recipient/source pair deduplicates an equivalent send"
+    );
+    changed.idempotency_key = "another-key".into();
+    assert!(
+        store
+            .owner_notice_put(&sender_token, &changed, now + 1)
+            .is_err(),
+        "the recipient/source pair is deduplicated independently of retries"
+    );
+
+    let reader = WorkLifecycleReader::Person {
+        owner: &recipient,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let page = store.owner_notice_list(&reader, None, 100, now).unwrap();
+    assert_eq!(page.notices.len(), 1);
+    assert_eq!(page.notices[0], created);
+    assert!(page.next_after.is_none());
+    assert!(!page.notices[0].delivery_proven());
+    let bystander_reader = WorkLifecycleReader::Person {
+        owner: &bystander,
+        repository: REPO,
+        repository_id: REPO_ID,
+    };
+    let (bystander_token, _, _) = mint_bound_agent_token(
+        &*store,
+        &bystander.id,
+        "bystander-agent",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    assert!(
+        store
+            .owner_notice_get(&bystander_token, &created.id, now)
+            .is_err(),
+        "an unrelated repository member cannot discover a notice by id"
+    );
+    assert!(
+        store
+            .owner_notice_recipient_status(
+                &bystander_reader,
+                &created.id,
+                OwnerNoticeRecipientStatus::Acknowledged,
+                now + 2,
+            )
+            .is_err()
+    );
+    let proof = OwnerNoticeDeliveryProof {
+        channel: "slack_dm".into(),
+        external_id: "synthetic-message-1".into(),
+    };
+    assert!(
+        store
+            .owner_notice_delivered(&recipient_token, &created.id, &proof, now + 2)
+            .is_err(),
+        "the recipient cannot forge transport delivery"
+    );
+    let delivered = store
+        .owner_notice_delivered(&sender_token, &created.id, &proof, now + 2)
+        .unwrap();
+    assert!(delivered.delivery_proven());
+    assert!(delivered.acknowledged_at.is_none());
+    let mut conflicting = proof.clone();
+    conflicting.external_id = "another-message".into();
+    assert!(
+        store
+            .owner_notice_delivered(&sender_token, &created.id, &conflicting, now + 3)
+            .is_err()
+    );
+    let acknowledged = store
+        .owner_notice_recipient_status(
+            &reader,
+            &created.id,
+            OwnerNoticeRecipientStatus::Acknowledged,
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(acknowledged.acknowledged_at, Some(now + 3));
+    assert!(acknowledged.acted_at.is_none());
+    for (session, incarnation) in [
+        ("recipient-one", &first_incarnation),
+        ("recipient-two", &second_incarnation),
+    ] {
+        assert!(
+            store
+                .notice_offer(
+                    &recipient_token,
+                    &NoticeOfferRequest {
+                        session: session.into(),
+                        incarnation: incarnation.clone(),
+                        automatic: true,
+                    },
+                    now + 3,
+                )
+                .unwrap()
+                .is_none(),
+            "mailbox acknowledgement invalidates every session pointer without consuming it on observation"
+        );
+    }
+    let acted = store
+        .owner_notice_recipient_status(
+            &reader,
+            &created.id,
+            OwnerNoticeRecipientStatus::Acted,
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(acted.acknowledged_at, Some(now + 3));
+    assert_eq!(acted.acted_at, Some(now + 4));
+
+    let automatic = NewOwnerNotice {
+        idempotency_key: "validation-pr-42-policy-v2".into(),
+        source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+        source_id: "pr:42:local-validation:policy:evidence:policy-v2".into(),
+        recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::RepositoryChannel,
+        body: "PR #42 has an attestation invalidated by a policy change.".into(),
+    };
+    let automatic_created = store
+        .owner_notice_invalidation_put(REPO, REPO_ID, &automatic, now + 4)
+        .unwrap();
+    assert_eq!(automatic_created.sender_owner, "hub");
+    assert_eq!(automatic_created.sender_token, "hub:validation");
+    assert_eq!(
+        store
+            .owner_notice_invalidation_put(REPO, REPO_ID, &automatic, now + 5)
+            .unwrap(),
+        automatic_created,
+        "automatic producer retries deduplicate on the stable transition source"
+    );
+    let mut changed_automatic = automatic.clone();
+    changed_automatic.body.push_str(" changed");
+    assert!(
+        store
+            .owner_notice_invalidation_put(REPO, REPO_ID, &changed_automatic, now + 5)
+            .is_err()
+    );
+    let claim = store
+        .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 5)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 6)
+            .unwrap()
+            .is_none(),
+        "an atomic possibly-enqueued claim cannot be duplicated"
+    );
+    let uncertain = OwnerNoticeDeliveryReport {
+        attempt_id: claim.attempt_id,
+        outcome: AttemptOutcome::Unknown,
+        proof: None,
+    };
+    store
+        .owner_notice_delivery_report(&reader, &automatic_created.id, &uncertain, now + 6)
+        .unwrap();
+    assert!(
+        store
+            .owner_notice_delivery_claim(&reader, &automatic_created.id, "slack", now + 60)
+            .unwrap()
+            .is_none(),
+        "uncertain transport is never blindly retried"
+    );
+
+    let retryable_request = NewOwnerNotice {
+        idempotency_key: "validation-pr-43-policy-v2".into(),
+        source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+        source_id: "pr:43:local-validation:policy:evidence:policy-v2".into(),
+        recipient: recipient_address.clone(),
+        route: agentscm::hub::notices::OwnerNoticeRoute::RepositoryChannel,
+        body: "PR #43 has an attestation invalidated by a policy change.".into(),
+    };
+    let retryable = store
+        .owner_notice_invalidation_put(REPO, REPO_ID, &retryable_request, now + 6)
+        .unwrap();
+    let first = store
+        .owner_notice_delivery_claim(&reader, &retryable.id, "slack", now + 6)
+        .unwrap()
+        .unwrap();
+    store
+        .owner_notice_delivery_report(
+            &reader,
+            &retryable.id,
+            &OwnerNoticeDeliveryReport {
+                attempt_id: first.attempt_id,
+                outcome: AttemptOutcome::ProvenNoDispatch,
+                proof: None,
+            },
+            now + 7,
+        )
+        .unwrap();
+    let second = store
+        .owner_notice_delivery_claim(&reader, &retryable.id, "slack", now + 8)
+        .unwrap()
+        .unwrap();
+    let proof = OwnerNoticeDeliveryProof {
+        channel: "slack".into(),
+        external_id: "C1:123.456".into(),
+    };
+    let proven = store
+        .owner_notice_delivery_report(
+            &reader,
+            &retryable.id,
+            &OwnerNoticeDeliveryReport {
+                attempt_id: second.attempt_id,
+                outcome: AttemptOutcome::TransportReported,
+                proof: Some(proof.clone()),
+            },
+            now + 9,
+        )
+        .unwrap();
+    assert!(proven.delivery_proven());
+    assert_eq!(proven.delivery.as_ref(), Some(&proof));
+    assert!(proven.acknowledged_at.is_none());
+
+    for index in 1..20 {
+        store
+            .owner_notice_put(
+                &sender_token,
+                &NewOwnerNotice {
+                    idempotency_key: format!("automatic-{index}"),
+                    source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                    source_id: format!("pr-{}-digest-v2", 100 + index),
+                    recipient: recipient_address.clone(),
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
+                    body: format!("PR #{} has an obsolete attestation.", 100 + index),
+                },
+                now + 5,
+            )
+            .unwrap();
+    }
+    let limited = store.owner_notice_list(&reader, None, 1, now + 5).unwrap();
+    assert_eq!(limited.notices.len(), 1);
+    assert!(limited.next_after.is_some());
+    let after = limited.next_after.as_deref().unwrap();
+    assert!(
+        store
+            .owner_notice_list(&reader, Some(after), 100, now + 5)
+            .unwrap()
+            .notices
+            .iter()
+            .all(|notice| notice.id.as_str() > after)
+    );
+    assert!(
+        store
+            .owner_notice_put(
+                &sender_token,
+                &NewOwnerNotice {
+                    idempotency_key: "over-rate-bound".into(),
+                    source_kind: OwnerNoticeSourceKind::Addressed,
+                    source_id: "pr-999-note".into(),
+                    recipient: recipient_address.clone(),
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
+                    body: "This send exceeds the bounded recipient window.".into(),
+                },
+                now + 5,
+            )
+            .is_err()
+    );
+
+    for index in 0..105 {
+        store
+            .owner_notice_invalidation_put(
+                REPO,
+                REPO_ID,
+                &NewOwnerNotice {
+                    idempotency_key: format!("bulk-refresh-{index}"),
+                    source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                    source_id: format!("bulk-refresh-{index}"),
+                    recipient: recipient_address.clone(),
+                    route: agentscm::hub::notices::OwnerNoticeRoute::Private,
+                    body: format!("Bulk refresh notice {index}."),
+                },
+                now + 10,
+            )
+            .unwrap();
+    }
+    let incarnation = register(&*store, &recipient_token, "bulk-refresh-session");
+    let query = DependencyRefresh {
+        session: "bulk-refresh-session".into(),
+        incarnation,
+        after: None,
+        limit: 100,
+    };
+    let first = store
+        .notice_refresh(&recipient_token, &query, now + 11)
+        .unwrap();
+    let first_owner = first
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert_eq!(first_owner, 100);
+    let second = store
+        .notice_refresh(&recipient_token, &query, now + 12)
+        .unwrap();
+    let second_owner = second
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert!(second_owner > 0 && second_owner < 100);
+    let third = store
+        .notice_refresh(&recipient_token, &query, now + 13)
+        .unwrap();
+    let third_owner = third
+        .notices
+        .iter()
+        .filter(|receipt| receipt.source.kind == SourceKind::OwnerNotice)
+        .count();
+    assert_eq!(
+        third_owner, 100,
+        "after backlog progress, refresh replays stable session receipts"
+    );
+}
+
+#[test]
+fn sqlite_owner_mailbox_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    owner_mailbox_contract(&format!(
+        "sqlite://{}",
+        directory.path().join("hub.sqlite").display()
+    ));
+}
+
+#[test]
+fn postgres_owner_mailbox_contract() {
+    let Some(schema) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    owner_mailbox_contract(&schema.url);
 }

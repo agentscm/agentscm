@@ -150,6 +150,146 @@ impl Hub {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addressed_owner_notice_http_and_mcp_keep_status_and_authority_separate() {
+    let hub = Hub::start().await;
+    let sender = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9701,
+            },
+            "sender",
+        )
+        .unwrap();
+    let recipient = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9702,
+            },
+            "recipient",
+        )
+        .unwrap();
+    let stranger = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9703,
+            },
+            "stranger",
+        )
+        .unwrap();
+    let (_, sender_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &sender.id,
+        "sender-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (_, recipient_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &recipient.id,
+        "recipient-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (_, stranger_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &stranger.id,
+        "stranger-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let body = json!({
+        "idempotency_key":"mcp-owner-note-1",
+        "source_id":"review-note-1",
+        "target":{"owner":recipient.id},
+        "body":"Please review the current pull request state.",
+        "route":"private"
+    });
+    let sent = hub
+        .client
+        .post(format!("{}/v1/hub/owner-notices", hub.base))
+        .bearer_auth(sender_secret.expose())
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), 200);
+    let sent: Value = serde_json::from_str(&sent.text().await.unwrap()).unwrap();
+    assert_eq!(sent["queued"], true);
+    assert_eq!(sent["delivered"], false);
+    assert_eq!(sent["acknowledged"], false);
+    assert!(
+        sent.get("acted_at").is_none(),
+        "action is not part of sender status: {sent}"
+    );
+    let id = sent["id"].as_str().unwrap();
+
+    let listed = hub
+        .tool_result(
+            recipient_secret.expose(),
+            "agentscm_owner_notice_list",
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        listed["structuredContent"]["notices"][0]["id"], id,
+        "{listed}"
+    );
+    assert_eq!(
+        listed["structuredContent"]["notices"][0]["body"],
+        body["body"]
+    );
+
+    let refused = hub
+        .tool_result(
+            stranger_secret.expose(),
+            "agentscm_owner_notice_status",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+
+    let acknowledged = hub
+        .tool_result(
+            recipient_secret.expose(),
+            "agentscm_owner_notice_acknowledge",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(acknowledged["structuredContent"]["acknowledged"], true);
+    assert_eq!(acknowledged["structuredContent"]["delivered"], false);
+    assert!(acknowledged["structuredContent"].get("acted_at").is_none());
+
+    let sender_status = hub
+        .tool_result(
+            sender_secret.expose(),
+            "agentscm_owner_notice_status",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(sender_status["structuredContent"]["acknowledged"], true);
+    assert_eq!(sender_status["structuredContent"]["delivered"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_native_calls_do_not_publish_mcp_reach_or_deliver_messages() {
     use agentscm::hub::agent_messages;
     use agentscm::hub::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
@@ -1034,6 +1174,10 @@ async fn protocol_basics() {
             "agentscm_work_transitions",
             "agentscm_work_recovery",
             "agentscm_work_recovery_preview",
+            "agentscm_owner_notice_list",
+            "agentscm_owner_notice_status",
+            "agentscm_owner_notice_send",
+            "agentscm_owner_notice_acknowledge",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -3535,7 +3679,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 47] = [
+    const CORE: [&str; 51] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -3550,6 +3694,10 @@ async fn default_tool_list_cost() {
         "agentscm_done",
         "agentscm_handoff",
         "agentscm_hub_message",
+        "agentscm_owner_notice_acknowledge",
+        "agentscm_owner_notice_list",
+        "agentscm_owner_notice_send",
+        "agentscm_owner_notice_status",
         "agentscm_pr_context",
         "agentscm_setup_status",
         "agentscm_show_overview",
@@ -3593,7 +3741,7 @@ async fn default_tool_list_cost() {
     names.sort_unstable();
     assert_eq!(names, CORE);
     assert!(
-        chars <= 18_100,
+        chars <= 18_800,
         "default descriptions grew to {chars} characters"
     );
 }

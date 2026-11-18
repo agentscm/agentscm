@@ -1214,7 +1214,7 @@ pub fn select_pairs<E: AsRef<[u8]>, R: AsRef<[u8]>>(
                 let key = (issued(), verdict.envelope_sha256.clone());
                 if lifecycle.is_none() || key > lifecycle_key {
                     lifecycle_key = key;
-                    lifecycle = Some(verdict.outcome);
+                    lifecycle = Some(verdict.clone());
                 }
             }
             if verdict.state == VerdictState::Error {
@@ -1228,12 +1228,16 @@ pub fn select_pairs<E: AsRef<[u8]>, R: AsRef<[u8]>>(
             |i| format!("last ignored: {i}"),
         );
         match lifecycle {
-            Some(outcome) => Verdict::new(
-                VerdictState::Pending,
-                outcome,
-                outcome.lifecycle_reason().unwrap_or_default(),
-                detail,
-            ),
+            Some(verdict) => {
+                let mut pending = Verdict::new(
+                    VerdictState::Pending,
+                    verdict.outcome,
+                    verdict.outcome.lifecycle_reason().unwrap_or_default(),
+                    detail,
+                );
+                pending.envelope_sha256 = verdict.envelope_sha256;
+                pending
+            }
             None => Verdict::new(
                 VerdictState::Pending,
                 Outcome::Missing,

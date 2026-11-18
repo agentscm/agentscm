@@ -18,15 +18,15 @@ use super::catchup::{
     BranchMerge, BranchMergeRows, CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES,
     CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES, CATCHUP_DELIVERY_CAPACITY_BYTES,
     CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult, CatchupAckStatus,
-    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupPage,
-    CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource, CatchupOwnerNotice,
+    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
     CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge, RecentMergeRow,
-    TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
-    repository_namespace, source_name, tracked_publication_merge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_OWNER_NOTICES, MAX_CATCHUP_PAGE_PAYLOAD_BYTES,
+    NewCatchupMerge, RecentMergeRow, TrackedPublicationMergeInput, coverage_name, parse_coverage,
+    parse_source, repository_namespace, source_name, tracked_publication_merge,
 };
 use super::change_record::{
     ConversationAudience, SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState,
@@ -75,8 +75,9 @@ use super::intent::{
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
 use super::notices::{
-    DependencyNoticeAck, DependencyRefresh, NoticeAcknowledgement, NoticeOffer, NoticeOfferRequest,
-    NoticeReceipt, NoticeRefreshPage, NoticeTransportReport,
+    DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAcknowledgement, NoticeOffer,
+    NoticeOfferRequest, NoticeReceipt, NoticeRefreshPage, NoticeTransportReport, OwnerNotice,
+    OwnerNoticeDeliveryProof, OwnerNoticePage, OwnerNoticeRecipientStatus,
 };
 use super::pickup::Pickup;
 use super::promise::{
@@ -862,6 +863,70 @@ fn sqlite_catchup_merge(value: SqliteCatchupMergeRow) -> Result<CatchupMergeObse
 
 const CATCHUP_MERGE_COLUMNS: &str = "id,seq,source,source_id,occurred_at,observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete";
 
+fn sqlite_catchup_source_coverage(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    repository: &str,
+    repository_key: i64,
+) -> Result<Vec<CatchupSourceCoverage>> {
+    let mut source_coverage = vec![
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::TrackedPublication,
+            state: super::catchup::CatchupCoverageState::Incomplete,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::ForgePull,
+            state: super::catchup::CatchupCoverageState::Unavailable,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+            window_from: None,
+        },
+    ];
+    let mut statement = tx.prepare(
+        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
+         WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                repository,
+                repository_key
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (source, state, checked_at, unread_pages, deferred, window_from) in rows {
+        let parsed_source = parse_source(&source)?;
+        source_coverage.retain(|entry| entry.source != parsed_source);
+        source_coverage.push(CatchupSourceCoverage {
+            source: parsed_source,
+            state: parse_coverage(&state)?,
+            checked_at: Some(checked_at),
+            unread_pages: unread_pages as u64,
+            deferred: deferred as u64,
+            window_from,
+        });
+    }
+    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    Ok(source_coverage)
+}
+
 fn sqlite_catchup_page(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -1090,61 +1155,40 @@ fn sqlite_catchup_page(
         )
         .optional()?
         .unwrap_or(0);
-    let mut source_coverage = vec![
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::TrackedPublication,
-            state: super::catchup::CatchupCoverageState::Incomplete,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-        CatchupSourceCoverage {
-            source: CatchupMergeSource::ForgePull,
-            state: super::catchup::CatchupCoverageState::Unavailable,
-            checked_at: None,
-            unread_pages: 0,
-            deferred: 0,
-            window_from: None,
-        },
-    ];
-    let mut statement = tx.prepare(
-        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
-         WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source",
-    )?;
-    let rows = statement
-        .query_map(
-            params![
-                who.owner.identity.provider,
-                who.owner.identity.host,
-                repository,
-                repository_key
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            },
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (source, state, checked_at, unread_pages, deferred, window_from) in rows {
-        let parsed_source = parse_source(&source)?;
-        source_coverage.retain(|entry| entry.source != parsed_source);
-        source_coverage.push(CatchupSourceCoverage {
-            source: parsed_source,
-            state: parse_coverage(&state)?,
-            checked_at: Some(checked_at),
-            unread_pages: unread_pages as u64,
-            deferred: deferred as u64,
-            window_from,
-        });
-    }
-    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    let source_coverage = sqlite_catchup_source_coverage(tx, who, &repository, repository_key)?;
+    let owner_notices =
+        if subscriber == HUMAN_SUBSCRIBER || event_after != event_from || merge_after != merge_from
+        {
+            Vec::new()
+        } else {
+            tx.prepare(
+                "SELECT snapshot FROM hub_owner_notices
+             WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4
+               AND json_extract(snapshot,'$.acknowledged_at') IS NULL
+             ORDER BY id LIMIT ?5",
+            )?
+            .query_map(
+                params![
+                    who.owner.id,
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    who.repository_id,
+                    MAX_CATCHUP_OWNER_NOTICES as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|snapshot| {
+                let notice: super::notices::OwnerNotice = json_value(&snapshot)?;
+                Ok(CatchupOwnerNotice {
+                    id: notice.id,
+                    source_kind: notice.source_kind,
+                    created_at: notice.created_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+        };
     Ok(CatchupPage {
         subscriber: subscriber.to_owned(),
         delivery_client: delivery_client.to_owned(),
@@ -1168,6 +1212,7 @@ fn sqlite_catchup_page(
             merge_available_from: merge_floor,
         },
         source_coverage,
+        owner_notices,
         complete: next_event_after == event_through && next_merge_after == merge_through,
     })
 }
@@ -8917,6 +8962,71 @@ fn checkpoint_overlap_in(
 }
 
 impl Store for SqliteStore {
+    fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_invalidation_put(self, repository, repository_id, notice, now)
+    }
+    fn owner_notice_put(
+        &self,
+        token: &str,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_put(self, token, notice, now)
+    }
+    fn owner_notice_delivered(
+        &self,
+        token: &str,
+        id: &str,
+        proof: &OwnerNoticeDeliveryProof,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_delivered(self, token, id, proof, now)
+    }
+    fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<super::notices::OwnerNoticeDeliveryClaim>> {
+        SqliteStore::owner_notice_delivery_claim(self, reader, id, channel, now)
+    }
+    fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &super::notices::OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_delivery_report(self, reader, id, report, now)
+    }
+    fn owner_notice_list(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<OwnerNoticePage> {
+        SqliteStore::owner_notice_list(self, reader, after, limit, now)
+    }
+    fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_get(self, token, id, now)
+    }
+    fn owner_notice_recipient_status(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        status: OwnerNoticeRecipientStatus,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        SqliteStore::owner_notice_recipient_status(self, reader, id, status, now)
+    }
     fn notice_message_receipts(
         &self,
         owner: &User,
@@ -16357,9 +16467,9 @@ impl Store for SqliteStore {
             ],
         )?;
 
-        let existing: Option<(String, i64, i64, i64, i64)> = tx
+        let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT id,event_from,event_through,merge_from,merge_through
+                "SELECT id,page
              FROM hub_catchup_deliveries WHERE owner=?1 AND subscriber_token IS ?2
                AND subscriber=?3 AND provider=?4 AND host=?5 AND repository=?6
                AND repository_key=?7 AND delivery_client=?8 AND acknowledged=0 AND superseded=0
@@ -16374,20 +16484,20 @@ impl Store for SqliteStore {
                     repository_key,
                     query.delivery_client
                 ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let (delivery, event_from, event_through, merge_from, merge_through, is_new) =
-            if let Some(row) = existing {
-                (row.0, row.1, row.2, row.3, row.4, false)
+            if let Some((delivery, page)) = existing {
+                tx.execute(
+                    "UPDATE hub_catchup_deliveries SET updated_at=?2 WHERE id=?1",
+                    params![delivery, now],
+                )?;
+                let mut page: CatchupPage = json_value(&page)?;
+                page.source_coverage =
+                    sqlite_catchup_source_coverage(&tx, &who, &repository, repository_key)?;
+                tx.commit()?;
+                return Ok(page);
             } else {
                 let active_total: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=?1 AND provider=?2

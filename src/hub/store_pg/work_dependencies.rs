@@ -128,6 +128,7 @@ pub(super) fn refresh(
         return Ok(());
     }
     let mut prerequisites = Vec::new();
+    let mut transitions = Vec::new();
     let mut recipients = vec![id.to_owned()];
     let mut targets = declared.declarations.targets();
     targets.sort();
@@ -145,7 +146,36 @@ pub(super) fn refresh(
     recipients.dedup();
     let evidence = reconciliation_evidence(tx, who, &declared, now)?;
     let conditions = declarations::prerequisite_dispositions(&declared, &evidence);
-    let semantic_fingerprint = crate::hub::notices::dependency_fingerprint(&declared, &conditions);
+    for condition in &declared.declarations.prerequisites {
+        let work_id = condition.requirement.work_id();
+        if let Some(other) = scoped_work(tx, who, work_id, now, false)?
+            && other.state == WorkState::Handover
+        {
+            transitions.push(DependencyTransition::WorkHandover {
+                condition_id: condition.id.clone(),
+                work_id: work_id.to_owned(),
+                generation: other.generation,
+                updated_seq: other.updated_seq,
+            });
+        }
+        if let PrerequisiteRequirement::MergedPullRequest { target, .. } = &condition.requirement
+            && evidence.pulls.iter().any(|pull| {
+                pull.target == *target
+                    && pull.observed_state == "closed_unmerged"
+                    && pull.observed_head.as_deref() == Some(target.head_sha.as_str())
+            })
+        {
+            transitions.push(DependencyTransition::PullRequestClosed {
+                condition_id: condition.id.clone(),
+                work_id: work_id.to_owned(),
+                repository_id: target.repository_id,
+                number: target.number,
+                head_sha: target.head_sha.clone(),
+            });
+        }
+    }
+    let semantic_fingerprint =
+        crate::hub::notices::dependency_fingerprint(&declared, &conditions, &transitions);
     let semantic_version = match &previous_record {
         Some(previous)
             if previous.generation == item.generation
@@ -167,6 +197,7 @@ pub(super) fn refresh(
         conditions,
         notification_fanout_complete: fanout_complete,
         prerequisites,
+        transitions,
         recipients,
     };
     // Current projections retain fresh evidence; polling-only changes do not append notice events.

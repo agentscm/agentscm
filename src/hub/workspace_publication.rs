@@ -1592,13 +1592,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn publication_past_its_bound_names_the_follow_up_for_work_that_finishes() {
         let dir = tempfile::tempdir().unwrap();
-        let finished = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let release = finish.clone();
         let done = finished.clone();
         let slow = move || {
+            let release = release.clone();
             let done = done.clone();
             detached(async move {
-                tokio::time::sleep(Duration::from_secs(150)).await;
-                done.store(true, Ordering::Release);
+                release.notified().await;
+                done.notify_one();
                 Ok(())
             })
         };
@@ -1618,8 +1621,13 @@ mod tests {
             assert_eq!(status, 202);
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, json!({"state":"still_running","follow_up":follow_up}));
-            // The first request's work outlived its 202 and finished during the second.
-            assert_eq!(finished.load(Ordering::Acquire), path == "/x/publication");
+            // The first request's detached work must survive its 202.
+            if path == "/x/publication/branch" {
+                finish.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), finished.notified())
+                    .await
+                    .expect("detached publication finishes after its response");
+            }
         }
     }
 

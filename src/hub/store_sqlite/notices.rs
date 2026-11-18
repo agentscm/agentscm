@@ -4,6 +4,24 @@ use crate::hub::agent_messages::{Message, MessageReceipt, ReceiptCoverage};
 use crate::hub::intent::text;
 use crate::hub::notices::*;
 use crate::hub::work_dependencies::DependencyNoticeRecord;
+use sha2::{Digest, Sha256};
+
+fn owner_notice_digest(notice: &NewOwnerNotice) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(json_string(&(
+            notice.source_kind,
+            &notice.source_id,
+            &notice.recipient,
+            notice.route,
+            &notice.body,
+        ))?)
+    ))
+}
+
+fn owner_notice_row(value: String) -> Result<OwnerNotice> {
+    json_value(&value)
+}
 
 fn kind(source: &NoticeSource) -> Result<String> {
     json_string(&source.kind)
@@ -306,6 +324,18 @@ fn current(tx: &Transaction<'_>, who: &WorkWho, receipt: &NoticeReceipt, now: i6
                 && view.incarnation == incarnation
         }));
     }
+    if receipt.source.kind == SourceKind::Operational
+        && let Some((generation, expires_at)) = receipt
+            .source
+            .version
+            .strip_prefix("reservation-expiring:")
+            .and_then(|value| value.split_once(':'))
+        && let (Ok(generation), Ok(expires_at)) =
+            (generation.parse::<i64>(), expires_at.parse::<i64>())
+    {
+        let current = tx.query_row("SELECT generation=?2 AND reservation_basis IS NOT NULL AND reservation_expires_at=?3 AND reservation_expires_at>?4 FROM hub_work_items WHERE id=?1", params![receipt.source.id,generation,expires_at,now], |row| row.get::<_,bool>(0)).optional()?;
+        return Ok(current.unwrap_or(false));
+    }
     if receipt.source.kind == SourceKind::Dependency {
         let value = tx
             .query_row(
@@ -321,6 +351,19 @@ fn current(tx: &Transaction<'_>, who: &WorkWho, receipt: &NoticeReceipt, now: i6
             })
             .transpose()
             .map(|value| value.unwrap_or(false));
+    }
+    if receipt.source.kind == SourceKind::OwnerNotice {
+        let snapshot = tx
+            .query_row(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id IS ?5",
+                params![receipt.source.id, who.owner.id, who.owner.identity.provider, who.owner.identity.host, who.repository_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        return snapshot
+            .map(owner_notice_row)
+            .transpose()
+            .map(|notice| notice.is_some_and(|notice| notice.acknowledged_at.is_none()));
     }
     Ok(true)
 }
@@ -412,6 +455,386 @@ fn owner_reader(
 }
 
 impl SqliteStore {
+    pub(super) fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        request: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        request.validate()?;
+        if request.source_kind != OwnerNoticeSourceKind::AttestationInvalidation {
+            return Err(HubError::Invalid(
+                "Automatic owner notices must be attestation invalidations.".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recipient_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_users WHERE id=?1 AND provider=?2 AND host=?3 AND disabled=0)",
+                params![request.recipient.owner, request.recipient.provider, request.recipient.host],
+                |row| row.get(0),
+            )?;
+        if !recipient_exists {
+            return Err(HubError::Unauthorized);
+        }
+        let digest = owner_notice_digest(request)?;
+        if let Some((prior_digest, snapshot)) = tx.query_row(
+                "SELECT request_digest,snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id=?4 AND source_kind=?5 AND source_id=?6",
+                params![request.recipient.owner, request.recipient.provider, request.recipient.host, repository_id, json_string(&request.source_kind)?, request.source_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()? {
+                return if prior_digest == digest {
+                    owner_notice_row(snapshot)
+                } else {
+                    Err(HubError::invalid_or_changed(
+                        "Owner notice source already has another request.".into(),
+                    ))
+                };
+            }
+        let notice = OwnerNotice {
+            id: new_id("ont")?,
+            idempotency_key: request.idempotency_key.clone(),
+            source_kind: request.source_kind,
+            source_id: request.source_id.clone(),
+            sender_owner: "hub".into(),
+            sender_token: "hub:validation".into(),
+            recipient: request.recipient.clone(),
+            route: request.route,
+            repository: repository.into(),
+            repository_id: Some(repository_id),
+            body: request.body.clone(),
+            created_at: now,
+            delivery_attempts: vec![],
+            delivered_at: None,
+            delivery: None,
+            acknowledged_at: None,
+            acted_at: None,
+        };
+        tx.execute(
+                "INSERT INTO hub_owner_notices(id,idempotency_key,request_digest,sender_owner,sender_token,recipient_owner,provider,host,repository,repository_id,source_kind,source_id,created_at,snapshot) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![notice.id, notice.idempotency_key, digest, notice.sender_owner, notice.sender_token, notice.recipient.owner, notice.recipient.provider, notice.recipient.host, notice.repository, repository_id, json_string(&notice.source_kind)?, notice.source_id, now, json_string(&notice)?],
+            )?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    pub(super) fn owner_notice_put(
+        &self,
+        token: &str,
+        request: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        request.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+        if who.read_only
+            || request.recipient.provider != who.owner.identity.provider
+            || request.recipient.host != who.owner.identity.host
+        {
+            return Err(HubError::Unauthorized);
+        }
+        let recipient_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_users WHERE id=?1 AND provider=?2 AND host=?3 AND NOT disabled)",
+            params![request.recipient.owner, request.recipient.provider, request.recipient.host],
+            |row| row.get(0),
+        )?;
+        if !recipient_exists {
+            return Err(HubError::Unauthorized);
+        }
+        let digest = owner_notice_digest(request)?;
+        let prior = tx
+            .query_row(
+                "SELECT request_digest,snapshot FROM hub_owner_notices WHERE sender_owner=?1 AND provider=?2 AND host=?3 AND repository_id=?4 AND idempotency_key=?5",
+                params![who.owner.id, who.owner.identity.provider, who.owner.identity.host, repository_id, request.idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((prior_digest, snapshot)) = prior {
+            return if prior_digest == digest {
+                owner_notice_row(snapshot)
+            } else {
+                Err(HubError::invalid_or_changed(
+                    "Owner notice idempotency key already has another request.".into(),
+                ))
+            };
+        }
+        let prior_source = tx
+            .query_row(
+                "SELECT request_digest,snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id=?4 AND source_kind=?5 AND source_id=?6",
+                params![request.recipient.owner, request.recipient.provider, request.recipient.host, repository_id, json_string(&request.source_kind)?, request.source_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((prior_digest, snapshot)) = prior_source {
+            return if prior_digest == digest {
+                owner_notice_row(snapshot)
+            } else {
+                Err(HubError::invalid_or_changed(
+                    "Owner notice source already has another request.".into(),
+                ))
+            };
+        }
+        let recent: i64 = tx.query_row(
+            "SELECT count(*) FROM hub_owner_notices WHERE sender_token=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id=?5 AND created_at>=?6",
+            params![token, request.recipient.owner, request.recipient.provider, request.recipient.host, repository_id, now.saturating_sub(OWNER_NOTICE_RATE_WINDOW_SECS)],
+            |row| row.get(0),
+        )?;
+        if recent >= MAX_OWNER_NOTICES_PER_RECIPIENT_WINDOW as i64 {
+            return Err(HubError::Unavailable(
+                "Owner notice recipient rate limit reached.".into(),
+            ));
+        }
+        let notice = OwnerNotice {
+            id: new_id("ont")?,
+            idempotency_key: request.idempotency_key.clone(),
+            source_kind: request.source_kind,
+            source_id: request.source_id.clone(),
+            sender_owner: who.owner.id.clone(),
+            sender_token: token.into(),
+            recipient: request.recipient.clone(),
+            route: request.route,
+            repository: who.repository,
+            repository_id: Some(repository_id),
+            body: request.body.clone(),
+            created_at: now,
+            delivery_attempts: vec![],
+            delivered_at: None,
+            delivery: None,
+            acknowledged_at: None,
+            acted_at: None,
+        };
+        tx.execute(
+            "INSERT INTO hub_owner_notices(id,idempotency_key,request_digest,sender_owner,sender_token,recipient_owner,provider,host,repository,repository_id,source_kind,source_id,created_at,snapshot) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![notice.id, notice.idempotency_key, digest, notice.sender_owner, token, notice.recipient.owner, notice.recipient.provider, notice.recipient.host, notice.repository, repository_id, json_string(&notice.source_kind)?, notice.source_id, now, json_string(&notice)?],
+        )?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    pub(super) fn owner_notice_delivered(
+        &self,
+        token: &str,
+        id: &str,
+        proof: &OwnerNoticeDeliveryProof,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        proof.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let snapshot: String = tx
+            .query_row(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND sender_token=?2 AND repository_id=?3",
+                params![id, token, who.repository_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(HubError::Unauthorized)?;
+        let mut notice = owner_notice_row(snapshot)?;
+        match (&notice.delivery, notice.delivered_at) {
+            (Some(existing), Some(_)) if existing == proof => {}
+            (Some(_), Some(_)) => {
+                return Err(HubError::invalid_or_changed(
+                    "Owner notice already has another delivery proof.".into(),
+                ));
+            }
+            _ => {
+                notice.delivery = Some(proof.clone());
+                notice.delivered_at = Some(now);
+                tx.execute(
+                    "UPDATE hub_owner_notices SET snapshot=?2 WHERE id=?1",
+                    params![id, json_string(&notice)?],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    pub(super) fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<OwnerNoticeDeliveryClaim>> {
+        text("owner notice id", id, 255)?;
+        text("owner notice delivery channel", channel, 32)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = owner_reader(&tx, reader, now)?;
+        let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+        let snapshot = tx
+            .query_row(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id=?5",
+                params![id, who.owner.id, who.owner.identity.provider, who.owner.identity.host, repository_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(HubError::Unauthorized)?;
+        let mut notice = owner_notice_row(snapshot)?;
+        if !notice.delivery_eligible() {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let attempt_id = new_id("ona")?;
+        notice.delivery_attempts.push(OwnerNoticeDeliveryAttempt {
+            id: attempt_id.clone(),
+            channel: channel.into(),
+            outcome: AttemptOutcome::PossiblyEnqueued,
+            created_at: now,
+            reported_at: None,
+        });
+        tx.execute(
+            "UPDATE hub_owner_notices SET snapshot=?2 WHERE id=?1",
+            params![id, json_string(&notice)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(OwnerNoticeDeliveryClaim { notice, attempt_id }))
+    }
+
+    pub(super) fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        report.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = owner_reader(&tx, reader, now)?;
+        let snapshot = tx.query_row(
+            "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id=?5",
+            params![id, who.owner.id, who.owner.identity.provider, who.owner.identity.host, who.repository_id],
+            |row| row.get::<_, String>(0),
+        ).optional()?.ok_or(HubError::Unauthorized)?;
+        let mut notice = owner_notice_row(snapshot)?;
+        let attempt = notice
+            .delivery_attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == report.attempt_id)
+            .ok_or_else(|| {
+                HubError::invalid_or_changed("Owner notice delivery attempt changed.".into())
+            })?;
+        if attempt.reported_at.is_some() {
+            let same = attempt.outcome == report.outcome
+                && (report.proof.is_none() || notice.delivery.as_ref() == report.proof.as_ref());
+            if !same {
+                return Err(HubError::invalid_or_changed(
+                    "Owner notice delivery attempt already has another outcome.".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(notice);
+        }
+        attempt.outcome = report.outcome;
+        attempt.reported_at = Some(now);
+        if let Some(proof) = &report.proof {
+            notice.delivery = Some(proof.clone());
+            notice.delivered_at = Some(now);
+        }
+        tx.execute(
+            "UPDATE hub_owner_notices SET snapshot=?2 WHERE id=?1",
+            params![id, json_string(&notice)?],
+        )?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    pub(super) fn owner_notice_list(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<OwnerNoticePage> {
+        if !(1..=MAX_OWNER_NOTICE_PAGE).contains(&limit) {
+            return Err(HubError::Invalid(
+                "Owner notice limit must be 1-100.".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = owner_reader(&tx, reader, now)?;
+        let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+        let mut values = tx
+            .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id=?4 AND id>?5 ORDER BY id LIMIT ?6")?
+            .query_map(params![who.owner.id, who.owner.identity.provider, who.owner.identity.host, repository_id, after.unwrap_or(""), (limit + 1) as i64], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = values.len() > limit;
+        values.truncate(limit);
+        let notices = values
+            .into_iter()
+            .map(owner_notice_row)
+            .collect::<Result<Vec<_>>>()?;
+        let next_after = has_more.then(|| notices.last().expect("nonempty page").id.clone());
+        tx.commit()?;
+        Ok(OwnerNoticePage {
+            notices,
+            next_after,
+        })
+    }
+
+    pub(super) fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
+        let snapshot = tx.query_row(
+            "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND repository_id=?2 AND provider=?3 AND host=?4 AND (sender_owner=?5 OR recipient_owner=?5)",
+            params![id, repository_id, who.owner.identity.provider, who.owner.identity.host, who.owner.id],
+            |row| row.get::<_, String>(0),
+        ).optional()?.ok_or(HubError::Unauthorized)?;
+        let notice = owner_notice_row(snapshot)?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    pub(super) fn owner_notice_recipient_status(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        status: OwnerNoticeRecipientStatus,
+        now: i64,
+    ) -> Result<OwnerNotice> {
+        text("owner notice id", id, 255)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = owner_reader(&tx, reader, now)?;
+        let snapshot: String = tx
+            .query_row(
+                "SELECT snapshot FROM hub_owner_notices WHERE id=?1 AND recipient_owner=?2 AND provider=?3 AND host=?4 AND repository_id=?5",
+                params![id, who.owner.id, who.owner.identity.provider, who.owner.identity.host, who.repository_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(HubError::Unauthorized)?;
+        let mut notice = owner_notice_row(snapshot)?;
+        match status {
+            OwnerNoticeRecipientStatus::Acknowledged => notice.acknowledged_at.get_or_insert(now),
+            OwnerNoticeRecipientStatus::Acted => {
+                notice.acknowledged_at.get_or_insert(now);
+                notice.acted_at.get_or_insert(now)
+            }
+        };
+        tx.execute(
+            "UPDATE hub_owner_notices SET snapshot=?2 WHERE id=?1",
+            params![id, json_string(&notice)?],
+        )?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
     pub(super) fn notice_message_receipts(
         &self,
         owner: &User,
@@ -615,7 +1038,67 @@ impl SqliteStore {
                 |row| row.get(0),
             )?
             .collect::<std::result::Result<Vec<String>, _>>()?;
-        let page = refresh_items(&tx, &who, ids, query.limit, now)?;
+        let mut page = refresh_items(&tx, &who, ids, query.limit, now)?;
+        let expiring = tx
+            .prepare("SELECT id, snapshot, reservation_expires_at FROM hub_work_items WHERE lead_token=?1 AND lead_session=?2 AND state IN ('active','blocked') AND reservation_basis IS NOT NULL AND reservation_expires_at>?3 AND reservation_expires_at<=?4 ORDER BY id LIMIT 101")?
+            .query_map(params![token,domain,now,now.saturating_add(RESERVATION_EXPIRY_NOTICE_SECS)], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        if expiring.len() > 100 {
+            return Err(HubError::Unavailable(
+                "Reservation expiry notice coverage exceeds its bound.".into(),
+            ));
+        }
+        for (id, snapshot, expires_at) in expiring {
+            let item: WorkItem = json_value(&snapshot)?;
+            let receipt = record(
+                &tx,
+                &who,
+                NoticeSource {
+                    kind: SourceKind::Operational,
+                    id,
+                    version: format!("reservation-expiring:{}:{expires_at}", item.generation),
+                },
+                NoticeRecipient {
+                    token: token.into(),
+                    session: domain.clone(),
+                    work_id: Some(item.id),
+                    generation: Some(item.generation),
+                },
+                now,
+            )?;
+            page.notices.push(receipt);
+        }
+        let owner_kind = json_string(&SourceKind::OwnerNotice)?;
+        let mut owner_notices = tx
+            .prepare("SELECT n.snapshot FROM hub_owner_notices n WHERE n.recipient_owner=?1 AND n.provider=?2 AND n.host=?3 AND n.repository_id IS ?4 AND json_extract(n.snapshot,'$.acknowledged_at') IS NULL AND NOT EXISTS (SELECT 1 FROM hub_notice_deliveries d WHERE d.token=?5 AND d.session=?6 AND d.source_kind=?7 AND d.source_id=n.id AND d.source_version=CAST(n.created_at AS TEXT)) ORDER BY n.id LIMIT 100")?
+            .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id,token,domain,owner_kind], |row| row.get::<_,String>(0))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        if owner_notices.is_empty() {
+            owner_notices = tx
+                .prepare("SELECT snapshot FROM hub_owner_notices WHERE recipient_owner=?1 AND provider=?2 AND host=?3 AND repository_id IS ?4 AND json_extract(snapshot,'$.acknowledged_at') IS NULL ORDER BY id LIMIT 100")?
+                .query_map(params![who.owner.id,who.owner.identity.provider,who.owner.identity.host,who.repository_id], |row| row.get::<_,String>(0))?
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+        }
+        for snapshot in owner_notices {
+            let notice = owner_notice_row(snapshot)?;
+            let receipt = record(
+                &tx,
+                &who,
+                NoticeSource {
+                    kind: SourceKind::OwnerNotice,
+                    id: notice.id,
+                    version: notice.created_at.to_string(),
+                },
+                NoticeRecipient {
+                    token: token.into(),
+                    session: domain.clone(),
+                    work_id: None,
+                    generation: None,
+                },
+                now,
+            )?;
+            page.notices.push(receipt);
+        }
         tx.commit()?;
         Ok(page)
     }

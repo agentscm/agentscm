@@ -4,8 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
+use agentscm::hub::notices::{
+    NewOwnerNotice, OwnerNoticeRecipient, OwnerNoticeRoute, OwnerNoticeSourceKind,
+};
 use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
-use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
+use agentscm::hub::store::{
+    self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
+};
 use agentscm::hub::{HubState, router};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -66,6 +71,24 @@ impl Hub {
         (token, secret.expose().to_owned())
     }
 
+    fn bound_token(&self, user_id: i64, name: &str, repository: &str) -> (String, String, String) {
+        let owner = self
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id,
+                },
+                &format!("user{user_id}"),
+            )
+            .unwrap();
+        let (token, secret, _) =
+            mint_bound_agent_token(&*self.store, &owner.id, name, repository, 42, 3600, false)
+                .unwrap();
+        (token, secret.expose().to_owned(), owner.id)
+    }
+
     async fn call(
         &self,
         method: Method,
@@ -101,6 +124,112 @@ impl Hub {
             .await;
         response["result"].clone()
     }
+}
+
+fn addressed_notice(recipient: &str, key: &str) -> NewOwnerNotice {
+    NewOwnerNotice {
+        idempotency_key: key.into(),
+        source_kind: OwnerNoticeSourceKind::Addressed,
+        source_id: format!("source-{key}"),
+        recipient: OwnerNoticeRecipient {
+            owner: recipient.into(),
+            provider: "github".into(),
+            host: "github.com".into(),
+        },
+        route: OwnerNoticeRoute::Private,
+        body: "Read the current notice on the Hub.".into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_catchup_wait_times_out_quietly() {
+    let hub = Hub::start().await;
+    let (_, secret, _) = hub.bound_token(20, "quiet-reader", REPOSITORY);
+    let started = std::time::Instant::now();
+    let (status, page) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/catchup?subscriber=agent%3Aquiet&delivery_client=http-quiet&wait_seconds=1",
+            Some(&secret),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(800));
+    assert!(page["owner_notices"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_catchup_wait_returns_a_relevant_notice_without_acknowledging_it() {
+    let hub = Hub::start().await;
+    let (sender, _, _) = hub.bound_token(21, "notice-sender", REPOSITORY);
+    let (_, recipient_secret, recipient) = hub.bound_token(22, "notice-reader", REPOSITORY);
+    let started = std::time::Instant::now();
+    let wait = hub.mcp(
+        &recipient_secret,
+        "agentscm_work_catchup",
+        json!({"subscriber":"agent:waiting","delivery_client":"mcp-wait",
+            "wait_seconds":3}),
+    );
+    let create = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "the notice is created only after the concurrent wait has started"
+        );
+        hub.store
+            .owner_notice_put(
+                &sender,
+                &addressed_notice(&recipient, "wait-delivery"),
+                unix_now(),
+            )
+            .unwrap()
+    };
+    let (page, notice) = tokio::join!(wait, create);
+    assert_eq!(page["isError"], false, "{page}");
+    assert_eq!(
+        page["structuredContent"]["owner_notices"][0]["id"],
+        notice.id
+    );
+    let current = hub
+        .store
+        .owner_notice_get(&sender, &notice.id, unix_now())
+        .unwrap();
+    assert!(current.acknowledged_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_surfaces_pending_owner_notice_without_consuming_it() {
+    let hub = Hub::start().await;
+    let (sender, _, _) = hub.bound_token(23, "startup-sender", REPOSITORY);
+    let (_, recipient_secret, recipient) = hub.bound_token(24, "startup-reader", REPOSITORY);
+    let notice = hub
+        .store
+        .owner_notice_put(
+            &sender,
+            &addressed_notice(&recipient, "startup-delivery"),
+            unix_now(),
+        )
+        .unwrap();
+    let startup = hub
+        .mcp(
+            &recipient_secret,
+            "agentscm_start",
+            json!({"task":"Read startup notice","request_key":"startup-notice",
+                "session":"startup-notice-session"}),
+        )
+        .await;
+    assert_eq!(startup["isError"], false, "{startup}");
+    assert_eq!(
+        startup["structuredContent"]["actionable_status"]["needs_you"][0]["action_id"],
+        format!("owner_notice:{}", notice.id),
+        "{startup}"
+    );
+    let current = hub
+        .store
+        .owner_notice_get(&sender, &notice.id, unix_now())
+        .unwrap();
+    assert!(current.acknowledged_at.is_none());
 }
 
 fn merged_publication(store: &dyn Store, token: &str, now: i64) -> String {
