@@ -5589,6 +5589,8 @@ mod tests {
         }
     }
 
+    // The native journal that records lifecycle intent exists only on Unix.
+    #[cfg(unix)]
     #[test]
     fn failed_session_end_cleanup_retains_the_lifecycle_intent_and_route() {
         let config = tempfile::tempdir().unwrap();

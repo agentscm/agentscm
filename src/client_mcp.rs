@@ -1432,9 +1432,10 @@ mod tests {
             .is_err()
         );
         drop(listener);
+        // Windows retries a refused localhost connect for about two seconds before failing.
         assert!(
             tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(10),
                 forward(&http, &url, "synthetic", body, "test", false, None)
             )
             .await
