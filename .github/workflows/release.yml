@@ -27,13 +27,16 @@ jobs:
   # Hub container end-to-end on the exact tagged commit: both profiles (SQLite, PostgreSQL/S3).
   # Release-only, so routine pull requests skip its cold image build (#365). The GitHub release waits for it.
   hub-e2e:
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 135
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Bounded below the job so the evidence still uploads: build and each profile have 40-minute budgets.
       - run: .github/hub-e2e.sh local-release "$RUNNER_TEMP/hub-e2e"
+        timeout-minutes: 125
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
