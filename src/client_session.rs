@@ -253,7 +253,7 @@ pub(crate) fn directory(config: &Path) -> PathBuf {
     config.join("agentscm").join("agent-hosts")
 }
 
-// Native lifecycle records exist on Unix. Keep legacy routing available on other platforms.
+// The journal lock needs Unix permissions; other platforms run these writes unlocked.
 fn records_locked<T>(
     config: &Path,
     run: impl FnOnce() -> std::io::Result<T>,
