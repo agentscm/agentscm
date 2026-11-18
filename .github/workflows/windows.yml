@@ -58,7 +58,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          if gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only | grep -q '^src/client'; then
+          files=$(gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only)
+          if grep -q '^src/client' <<< "$files"; then
             echo client=true >> "$GITHUB_OUTPUT"
           fi
 
