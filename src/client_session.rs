@@ -253,7 +253,7 @@ pub(crate) fn directory(config: &Path) -> PathBuf {
     config.join("agentscm").join("agent-hosts")
 }
 
-// The journal lock needs Unix permissions; other platforms run these writes unlocked.
+// Native lifecycle records exist on Unix. Keep legacy routing available on other platforms.
 fn records_locked<T>(
     config: &Path,
     run: impl FnOnce() -> std::io::Result<T>,
@@ -694,7 +694,7 @@ fn record_event_for(
     {
         return Err(std::io::Error::other("invalid native session event"));
     }
-    records_locked(config, || {
+    crate::client_journal::locked(config, || {
         let directory = directory(config);
         let prior = records(&directory).into_iter().find(|record| {
             record.pid == process.pid
@@ -886,7 +886,7 @@ pub(crate) fn context(
 }
 
 pub(crate) fn save_context(config: &Path, context: &SessionContext) -> std::io::Result<()> {
-    records_locked(config, || save_context_under_lock(config, context))
+    crate::client_journal::locked(config, || save_context_under_lock(config, context))
 }
 
 fn save_context_under_lock(config: &Path, context: &SessionContext) -> std::io::Result<()> {
@@ -958,7 +958,7 @@ pub(crate) fn save_end_context(
     fence: &CleanupFence,
     context: &SessionContext,
 ) -> std::io::Result<Option<SessionContext>> {
-    records_locked(config, || {
+    crate::client_journal::locked(config, || {
         if cleanup_hosts(config, &fence.session) != fence.hosts
             || !fence.contexts.iter().any(|original| {
                 original.session == context.session
@@ -1000,7 +1000,7 @@ pub(crate) fn begin_context(
     expected_nonce: Option<&str>,
     context: &SessionContext,
 ) -> std::io::Result<()> {
-    records_locked(config, || {
+    crate::client_journal::locked(config, || {
         let previous = self::context(config, &context.session, &context.hub, &context.repo)?;
         if previous
             .as_ref()

@@ -5589,10 +5589,12 @@ mod tests {
         }
     }
 
+    // The native journal that records lifecycle intent exists only on Unix.
+    #[cfg(unix)]
     #[test]
     fn failed_session_end_cleanup_retains_the_lifecycle_intent_and_route() {
         let config = tempfile::tempdir().unwrap();
-        let context:crate::client_session::SessionContext=serde_json::from_value(json!({"session":"s-1","start_nonce":"nonce","incarnation":"inc","agent":"codex","hub":"https://hub.example.test","repo":"acme/widgets","root":config.path(),"protocol":1,"registered":true,"observed_at":10,"host":null,"credential_id":"token-id","binding_id":"binding"})).unwrap();
+        let context:crate::client_session::SessionContext=serde_json::from_value(json!({"session":"s-1","start_nonce":"nonce","incarnation":"inc","agent":"codex","hub":"https://hub.example.test","repo":"acme/widgets","root":"/synthetic/repo","protocol":1,"registered":true,"observed_at":10,"host":null,"credential_id":"token-id","binding_id":"binding"})).unwrap();
         crate::client_session::save_context(config.path(), &context).unwrap();
         let event = json!({"hook_event_name":"SessionEnd","session_id":"s-1"});
         let fence = crate::client_session::cleanup_fence(config.path(), "s-1").unwrap();
