@@ -2,6 +2,47 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.6.0](https://github.com/agentscm/agentscm/compare/v0.5.0...v0.6.0) - 2026-11-18
+
+### Added
+
+- *(client)* Bundle enrolled beta feedback hooks ([#634](https://github.com/agentscm/agentscm/pull/634))
+- *(hub)* Release some of a Work's reserved files ([#626](https://github.com/agentscm/agentscm/pull/626))
+- *(hub)* expose historical message delivery receipts ([#614](https://github.com/agentscm/agentscm/pull/614))
+- add headless native session cooperation ([#609](https://github.com/agentscm/agentscm/pull/609))
+- *(hub)* Close the recovery repair gaps left by #316 ([#612](https://github.com/agentscm/agentscm/pull/612))
+- *(client)* Set up Droid, Qwen Code, Junie CLI and Crush natively ([#602](https://github.com/agentscm/agentscm/pull/602))
+
+### Fixed
+
+- *(hub)* Authorize settings writes by the token's stable repository ID ([#632](https://github.com/agentscm/agentscm/pull/632))
+- *(hub)* Keep GitHub App identity current after rename ([#629](https://github.com/agentscm/agentscm/pull/629))
+- *(ui)* Show open pull request Work consistently ([#628](https://github.com/agentscm/agentscm/pull/628))
+- Keep coordination guidance within startup budgets ([#627](https://github.com/agentscm/agentscm/pull/627))
+- *(hub)* Explain incomplete catchup continuation fields ([#625](https://github.com/agentscm/agentscm/pull/625))
+- *(mcp)* Allow supported coordination inbox waits ([#622](https://github.com/agentscm/agentscm/pull/622))
+- *(hooks)* keep lead leases live during delegated calls ([#615](https://github.com/agentscm/agentscm/pull/615))
+- *(capture)* reap completed delivery workers ([#613](https://github.com/agentscm/agentscm/pull/613))
+- *(hub)* avoid slow occurrence migration joins ([#610](https://github.com/agentscm/agentscm/pull/610))
+- Background Claude message hooks in print mode ([#601](https://github.com/agentscm/agentscm/pull/601))
+- *(capture)* retain parent context and capture native agent hooks ([#603](https://github.com/agentscm/agentscm/pull/603))
+- *(hub)* Say why agentscm_setup_status refused a call ([#607](https://github.com/agentscm/agentscm/pull/607))
+- *(hub)* Tell every context-carrying hook that a hold lapsed ([#606](https://github.com/agentscm/agentscm/pull/606))
+- *(hook)* Answer before the host's hook timeout ([#605](https://github.com/agentscm/agentscm/pull/605))
+- *(hook)* Cut the session start context to what an agent acts on ([#600](https://github.com/agentscm/agentscm/pull/600))
+- *(hub)* Read quiet Work with an open pull request as waiting on it ([#599](https://github.com/agentscm/agentscm/pull/599))
+- *(client)* Report the Hub build on refusals and test the #314 matrix ([#595](https://github.com/agentscm/agentscm/pull/595))
+- *(docs)* Pin Astro 7.4.7 past two new security advisories ([#596](https://github.com/agentscm/agentscm/pull/596))
+- *(docs)* Render Mermaid diagrams and wrap long code in tables ([#593](https://github.com/agentscm/agentscm/pull/593))
+- *(hub)* Reuse recent role answers for repository lists and page polls ([#591](https://github.com/agentscm/agentscm/pull/591))
+
+### Other
+
+- Correct what the intents page says about other agent hosts ([#608](https://github.com/agentscm/agentscm/pull/608))
+- Fail when an agent-name gate changes without the register ([#604](https://github.com/agentscm/agentscm/pull/604))
+- Say the Hub completes Work whose pull request merged ([#594](https://github.com/agentscm/agentscm/pull/594))
+- Correct outdated statements and rewrite the Start here pages ([#590](https://github.com/agentscm/agentscm/pull/590))
+
 ## [0.5.0](https://github.com/agentscm/agentscm/compare/v0.4.0...v0.5.0) - 2026-11-13
 
 ### Added
