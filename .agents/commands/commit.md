@@ -9,16 +9,7 @@ Commit the intended working-tree changes with a factual message. If `$ARGUMENTS`
 3. Do not commit on `main`. If the current branch is `main`, create a focused feature branch whose name describes the intended changes. If the current branch is unrelated to the changes or has already merged, stop and ask where the work belongs rather than moving commits or stashing changes automatically.
 4. Check `git log HEAD..origin/main --oneline`. If upstream has advanced, report it; do not rebase, and do not merge `main` unless GitHub reports a conflict.
 5. Review the diff and distinguish the intended changes from unrelated user work. Stage only the intended paths. Never use `git add -A` without first establishing that every changed and untracked path belongs to this commit.
-6. Run checks appropriate to the staged changes. Always run both `git diff --check` and `git diff --cached --check` so unstaged and staged changes are covered. For Rust, manifest, toolchain, or build-related changes, run:
-
-   ```sh
-   cargo fmt --check
-   cargo clippy --all-targets --locked -- -D warnings
-   ```
-
-   and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite locally; the hosted pull request checks run it on every push to the pull request, as in step 11 of `.agents/commands/pr.md`.
-
-   When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Hub container end-to-end runs only in the Release workflow, on the tagged commit before publication (see [releasing](../../docs/releasing.md#hub-release-qualification)); run `.github/hub-e2e.sh local-release EVIDENCE_DIR` only to reproduce a failure. Routine PR validation does not run it; a green PR does not establish Hub end-to-end coverage. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+6. Run the [pre-push checks](../../AGENTS.md#pre-push-checks) for staged changes. Also run `git diff --cached --check`.
 
    Applicable reviews remain required. Runner or test-configuration changes still need a full nextest run and doctests, which the hosted checks run on every pull request.
 

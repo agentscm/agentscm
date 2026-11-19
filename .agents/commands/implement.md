@@ -1,6 +1,6 @@
-# Implement an Issue End to End
+# Implement an Issue
 
-Implement a GitHub issue through a reviewed, validated, open pull request with as little human intervention as possible. `$ARGUMENTS` must contain an issue number, `#number`, or issue URL. If it does not, ask for the issue and stop.
+Implement a GitHub issue through a reviewed, validated, open pull request. `$ARGUMENTS` must contain an issue number, `#number`, or issue URL. If it does not, ask for the issue and stop.
 
 Invoking this issue-to-PR command authorizes creating a feature branch, editing files, running local checks, making focused commits, pushing the feature branch, and opening its pull request. This supplies the explicit approval required by `.agents/commands/pr.md`; do not stop for a second approval at the PR gate. Never merge or enable auto-merge.
 
@@ -17,21 +17,20 @@ First reclaim disk from finished work. Earlier runs' PRs merge after their sessi
 
 The first removes only clean worktrees whose PR is merged or closed, and keeps the branches; `git worktree lock <path>` protects one. The second runs `cargo clean` in the main and current checkout when its `target` exceeds `AGENTSCM_TARGET_LIMIT_GB` GiB (default 30), because Cargo never prunes stale artifacts. Report what each removed or cleaned in one line and do not investigate what it kept. If either fails, say so in one line and continue.
 
-1. Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`.
-2. Resolve the issue with:
+1. Resolve the issue with:
 
    ```sh
    gh issue view <issue> --json number,title,body,labels,comments,state,closedByPullRequestsReferences
    ```
 
-3. Use the returned issue number as the canonical number. Stop if the issue is closed or already has a closing pull request. If it references earlier work, inspect those exact issues, PRs, or commits; do not rely on loose search matches.
-4. Derive a short kebab-case slug from the issue title and choose `fix`, `feat`, `refactor`, or `chore` from the requested behavior.
+2. Use the returned issue number as the canonical number. Stop if the issue is closed or already has a closing pull request. If it references earlier work, inspect those exact issues, PRs, or commits; do not rely on loose search matches.
+3. Derive a short kebab-case slug from the issue title and choose `fix`, `feat`, `refactor`, or `chore` from the requested behavior.
 
 ## Phase 2: Reconnaissance
 
 Launch one fresh read-only subagent on a high-capability model, with the full issue title, body, relevant comments, repository root, and these instructions:
 
-> Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`. Inspect the repository thoroughly but do not edit files. Open every file needed to support a claim; do not infer behavior from filenames or the issue alone. Check relevant history when claiming that a regression or refactor caused the problem. Recount file lists and numeric claims from the issue. Mark unverified claims in place.
+> Inspect the repository thoroughly but do not edit files. Open every file needed to support a claim; do not infer behavior from filenames or the issue alone. Check relevant history when claiming that a regression or refactor caused the problem. Recount file lists and numeric claims from the issue. Mark unverified claims in place.
 >
 > Return: (1) files that must change with `path:line` anchors; (2) the closest existing patterns to mirror; (3) a two-to-five-phase implementation order whose phases are independently testable and committable; (4) existing and new tests; (5) affected interfaces and evidence boundaries; (6) structural questions; (7) applicable repository rules and likely pitfalls; (8) synthetic checks an agent can run; and (9) checks that genuinely require the user or unavailable external state.
 >
@@ -61,18 +60,7 @@ Propagate corrected reconnaissance to every later phase. If a late structural fo
 
 ## Phase 5: Whole-branch pre-push checks
 
-Run the pre-push checks for the whole branch:
-
-Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite locally; the hosted pull request checks run it on the pushed head (step 11 of `.agents/commands/pr.md`).
-
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Hub container end-to-end runs only in the Release workflow, on the tagged commit before publication (see [releasing](../../docs/releasing.md#hub-release-qualification)); run `.github/hub-e2e.sh local-release EVIDENCE_DIR` only to reproduce a failure. Routine PR validation does not run it; a green PR does not establish Hub end-to-end coverage. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+Run the [pre-push checks](../../AGENTS.md#pre-push-checks) for the whole branch.
 
 Applicable reviews remain required. Runner or test-configuration changes require the full nextest suite and doctests, which the hosted checks run on every pull request.
 
@@ -86,7 +74,7 @@ Launch a fresh reviewer on a high-capability model, that did not implement any p
 
 Verify each finding against the current code. Delegate every valid, actionable fix to a fresh correction subagent on a fast, cost-efficient model, then rerun the focused checks and repeat independent review. If a coding correction fails, route its retry to a fresh correction subagent on a high-capability model. Stop if the same correction fails twice. A review pass count is not a reason to stop while every remaining finding is an actionable fix. Continue correction, validation, and independent review until no material findings remain.
 
-Resolve a truly structural ambiguity with the user only when repository conventions and the documented issue contract do not provide a safe answer. Otherwise choose the most consistent option, record the assumption, and continue without human intervention. Stop only when the same correction fails twice, a structural fork cannot be resolved without materially changing the requested contract, or required external state or authority is unavailable.
+Resolve a truly structural ambiguity with the user only when repository conventions and the documented issue contract do not provide a safe answer. Stop only when the same correction fails twice, a structural fork cannot be resolved without materially changing the requested contract, or required external state or authority is unavailable.
 
 ## Phase 7: Exercise observable behavior
 
@@ -116,4 +104,4 @@ Confirm the branch is clean and summarize:
 - evidence obtained in each evidence class;
 - remaining limitations or user-only verification.
 
-Follow `.agents/commands/pr.md`, push the feature branch, open its pull request, read its hosted checks as step 11 requires, and report the URL. Write the title and body before the last push; do not edit them after it, and if you must, follow `pr.md` step 11 (`gh pr update-branch <PR#>` afterwards). Do not merge `main` into the branch unless GitHub reports a conflict. If a hosted check fails because of the branch, the failure first appears after review: send it back through the Phase 5 correction limits and the Phase 6 independent review, then push the new head and read its hosted checks. A failure shown to be unrelated to the change follows the evidence rule in `pr.md` step 11. Once the hosted checks are green and the PR's one review is recorded, report it ready to queue. Do not run the signed attestation for every PR; it is optional evidence, worth running only in the cases `pr.md` step 11 names. The `/implement` invocation already authorizes this phase. Never merge or enable auto-merge.
+Follow `.agents/commands/pr.md`, push the feature branch, open its pull request, read its hosted checks as step 11 requires, and report the URL. Do not merge `main` into the branch unless GitHub reports a conflict. If a hosted check fails because of the branch, the failure first appears after review: send it back through the Phase 5 correction limits and the Phase 6 independent review, then push the new head and read its hosted checks. A failure shown to be unrelated to the change follows the evidence rule in `pr.md` step 11. Once the hosted checks are green and the PR's one review is recorded, report it ready to queue. Do not run the signed attestation for every PR; it is optional evidence, worth running only in the cases `pr.md` step 11 names. The `/implement` invocation already authorizes this phase. Never merge or enable auto-merge.
