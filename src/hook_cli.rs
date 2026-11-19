@@ -97,10 +97,10 @@ pub async fn run(args: HookArgs) {
 }
 
 /// A host that dropped a hook's argv must not turn CLI usage (exit 2) into a tool refusal.
-pub(crate) fn missing_arguments() -> bool {
+pub(crate) fn missing_arguments_reply() -> Option<Value> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        return false;
+        return None;
     }
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new()
@@ -108,7 +108,7 @@ pub(crate) fn missing_arguments() -> bool {
         .spawn(move || {
             let hook = read_stdin()
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-                .is_some_and(|payload| {
+                .filter(|payload| {
                     let named = payload["hook_event_name"].as_str().is_some_and(|event| {
                         !event.is_empty()
                             && event.len() <= 64
@@ -118,16 +118,29 @@ pub(crate) fn missing_arguments() -> bool {
                         && payload["toolName"].as_str().is_some()
                         && payload.get("toolArgs").is_some();
                     (named || copilot_tool) && session_of(&payload).is_some()
+                })
+                .map(|payload| {
+                    // Older Claude Code plugins used a separate args field that some
+                    // hosts dropped. Give those sessions the same setup remedy.
+                    if cfg!(unix)
+                        && payload["hook_event_name"] == "SessionStart"
+                        && std::env::var_os("CLAUDE_PROJECT_DIR").is_some_and(|dir| !dir.is_empty())
+                    {
+                        json!({"systemMessage": "AgentSCM: Claude Code did not pass the hook arguments. Run `agentscm client setup --agent claude`, then restart Claude Code."})
+                    } else {
+                        json!({})
+                    }
                 });
             let _ = send.send(hook);
         })
         .is_err()
     {
-        return false;
+        return None;
     }
     receive
         .recv_timeout(Duration::from_millis(200))
-        .unwrap_or(false)
+        .ok()
+        .flatten()
 }
 
 /// Never returns: prints the agent's reply and exits 0.

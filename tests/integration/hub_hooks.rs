@@ -168,19 +168,21 @@ fn claude_startup_warns_about_an_older_plugin_without_a_hub_connection() {
     let current_bundle = format!("{release}+agentscm.0123456789abcdef");
     let registry_with = |id: &str, scope: &str, version: &str| json!({"version": 2, "plugins": {(id): [{"scope": scope, "version": version}]}});
     let old = registry_with(plugin_id, "user", "0.0.0").to_string();
-    let hook = |event: &str, flags: &[&str]| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
-            .args(["--no-telemetry", "hook", "claude"])
-            .args(flags)
+    let run_hook = |event: &str, args: &[&str], from_claude: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(args)
             .env_clear()
             .env("HOME", dir.path())
             .env("CLAUDE_CONFIG_DIR", "claude-config")
             .current_dir(dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if from_claude {
+            command.env("CLAUDE_PROJECT_DIR", dir.path());
+        }
+        let mut child = command.spawn().unwrap();
         let payload = json!({
             "hook_event_name": event,
             "session_id": "synthetic-session",
@@ -195,6 +197,13 @@ fn claude_startup_warns_about_an_older_plugin_without_a_hub_connection() {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success(), "{output:?}");
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let hook = |event: &str, flags: &[&str]| {
+        let args = ["--no-telemetry", "hook", "claude"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .collect::<Vec<_>>();
+        run_hook(event, &args, true)
     };
     let setup = "agentscm client setup --agent claude";
     let baseline = hook("SessionStart", &["--client-connection"]);
@@ -211,6 +220,13 @@ fn claude_startup_warns_about_an_older_plugin_without_a_hub_connection() {
     assert!(context.contains("no client connection"), "{output}");
     assert_eq!(output["hookSpecificOutput"], baseline["hookSpecificOutput"]);
     assert_eq!(fs::read_to_string(&registry).unwrap(), old);
+    let legacy = run_hook("SessionStart", &[], true);
+    assert!(
+        legacy["systemMessage"].as_str().unwrap().contains(setup),
+        "{legacy}"
+    );
+    assert_eq!(run_hook("SessionStart", &[], false), json!({}));
+    assert_eq!(run_hook("UserPromptSubmit", &[], true), json!({}));
     for output in [
         hook("UserPromptSubmit", &["--client-connection"]),
         hook("SessionStart", &[]),
