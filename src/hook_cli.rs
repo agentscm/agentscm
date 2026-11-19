@@ -117,7 +117,7 @@ pub(crate) fn missing_arguments_reply() -> Option<Value> {
                     let copilot_tool = payload["sessionId"].as_str().is_some()
                         && payload["toolName"].as_str().is_some()
                         && payload.get("toolArgs").is_some();
-                    (named || copilot_tool) && session_of(&payload).is_some()
+                    (named || copilot_tool) && session_of(payload).is_some()
                 })
                 .map(|payload| {
                     // Older Claude Code plugins used a separate args field that some
