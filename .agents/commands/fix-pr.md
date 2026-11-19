@@ -48,18 +48,7 @@ Present a compact table with source, file and line when available, summary, deci
 
 ### 4. Fix and validate
 
-Make focused changes and add or update deterministic synthetic tests when appropriate. Before each push, run:
-
-Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite locally; the hosted pull request checks run it on every push (step 11 of `.agents/commands/pr.md`).
-
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Hub container end-to-end runs only in the Release workflow, on the tagged commit before publication (see [releasing](../../docs/releasing.md#hub-release-qualification)); run `.github/hub-e2e.sh local-release EVIDENCE_DIR` only to reproduce a failure. Routine PR validation does not run it; a green PR does not establish Hub end-to-end coverage. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+Make focused changes and add or update deterministic synthetic tests when appropriate. Run the [pre-push checks](../../AGENTS.md#pre-push-checks) before each push.
 
 All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete check as successful verification. Applicable reviews remain required.
 
@@ -72,7 +61,7 @@ git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
 
-A new head is ready to queue once its hosted checks are green (`gh pr checks <PR#>`), as in step 11 of `.agents/commands/pr.md`; report it as not ready until then. Do not run the signed attestation for each fix round: it is optional evidence, worth running only in the cases that step names. If a hosted check fails because of the branch, treat the failure as a new item to fix in this step and push again. After two hosted-check failures caused by the change on successive heads, stop and report instead of looping. A failure shown to be unrelated to the change may be rerun on the same head without a push, under the evidence rule in that step. Do not edit the PR title or body after the last push; if you must, run `gh pr update-branch <PR#>` afterwards (the one allowed merge of `main`; if GitHub reports the branch is already up to date, push the next real change instead of editing).
+A new head is ready to queue once its hosted checks are green (`gh pr checks <PR#>`), as in step 11 of `.agents/commands/pr.md`; report it as not ready until then. Do not run the signed attestation for each fix round: it is optional evidence, worth running only in the cases that step names. If a hosted check fails because of the branch, treat the failure as a new item to fix in this step and push again. After two hosted-check failures caused by the change on successive heads, stop and report instead of looping. A failure shown to be unrelated to the change may be rerun on the same head without a push, under the evidence rule in that step.
 
 If nothing changed, do not create an empty commit.
 

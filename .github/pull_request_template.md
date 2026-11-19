@@ -6,7 +6,7 @@
 
 <!-- Commands run and results. State anything you did not run. -->
 
-<!-- The hosted pull request checks are the remaining validation; say so here, so the body needs no edit after the last push. The signed local attestation (tools/attest-pr.sh) is optional: if you ran one, give its envelope SHA-256 and the agentscm/local-validation status. -->
+<!-- List pending hosted checks. The signed local attestation (tools/attest-pr.sh) is optional: if you ran one, give its envelope SHA-256 and the agentscm/local-validation status. -->
 
 ## Limits
 

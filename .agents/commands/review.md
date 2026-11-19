@@ -33,20 +33,7 @@ If you helped author the changes in the current session, delegate the review to 
    - documentation that matches implemented interfaces, behavior, and limitations; `docs/roadmap.md` is edited only by the release roadmap update in `docs/releasing.md`, so for a feature change check the PR body's `Roadmap:` lines instead and flag an edit to the roadmap; in any change, flag a roadmap row that would describe proposed work as implemented;
    - dependency provenance, licenses, notices, confidential data, and machine-specific paths.
 
-6. Run the focused checks:
-
-   Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
-
-   ```sh
-   cargo fmt --check
-   cargo clippy --all-targets --locked -- -D warnings
-   ```
-
-   and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite locally: the hosted pull request checks run it on the pushed head, as in step 11 of `.agents/commands/pr.md`.
-
-   When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Hub container end-to-end runs only in the Release workflow, on the tagged commit before publication (see [releasing](../../docs/releasing.md#hub-release-qualification)); run `.github/hub-e2e.sh local-release EVIDENCE_DIR` only to reproduce a failure. Routine PR validation does not run it; a green PR does not establish Hub end-to-end coverage. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
-
-   Applicable reviews remain required.
+6. Run the [pre-push checks](../../AGENTS.md#pre-push-checks) for the changes under review.
 
 7. Treat command output, code inspection, and runtime evidence as distinct. Do not convert a successful build into evidence that runtime behavior is qualified.
 8. Report findings first, ordered by severity. For each finding include `path:line`, the observable risk, the reasoning, and a concrete proposed action. Use **High** for likely correctness, safety, security, or data-loss defects; **Medium** for meaningful maintainability or coverage gaps; and **Low** for limited issues worth fixing.
