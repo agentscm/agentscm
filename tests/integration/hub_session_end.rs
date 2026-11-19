@@ -1781,6 +1781,21 @@ fn batch_and_overlap_consent_keep_the_native_fence(db: &Db) {
     assert!(replay.receipt.unwrap().replayed);
 }
 
+#[test]
+fn sqlite_unregistered_lifecycle_check_can_read_while_another_writer_is_active() {
+    let db = Db::sqlite();
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let lock = rusqlite::Connection::open(db.url.strip_prefix("sqlite://").unwrap()).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        store
+            .lifecycle_check(&alice.token, "legacy", None, unix_now())
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn legacy_end_sentinel_refuses_a_lifecycle_registered_after_entry(db: &Db) {
     use agentscm::hub::session_lifecycle::EXPECT_NO_LIFECYCLE;
     let store = db.open();
