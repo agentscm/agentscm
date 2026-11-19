@@ -513,7 +513,13 @@ fn json_stdout() -> Result<std::fs::File> {
 
 #[cfg(unix)]
 fn json_report(cx: &Cx<'_>) -> serde_json::Value {
-    let installed: Vec<_> = cx.live.installed.iter().map(|agent| agent.name()).collect();
+    let mut installed = Vec::new();
+    for agent in &cx.live.installed {
+        let name = agent.name();
+        if !installed.contains(&name) {
+            installed.push(name);
+        }
+    }
     let skipped: Vec<_> = cx
         .args
         .agent

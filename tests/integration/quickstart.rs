@@ -3887,7 +3887,7 @@ fn quickstart_json_reports_user_install_even_when_checkout_has_no_origin() {
     let repo = TempDir::new().unwrap();
     machine.git(repo.path(), &["init", "-q", "-b", "main"]);
     let token = hub.token_file(machine.home.path());
-    let args = quick(&hub.url, &token, &["--only", "claude", "--json"]);
+    let mut args = quick(&hub.url, &token, &["--only", "claude", "--json"]);
 
     let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
     assert!(machine.claude_plugin_installed());
@@ -3897,6 +3897,7 @@ fn quickstart_json_reports_user_install_even_when_checkout_has_no_origin() {
     assert_eq!(report["checkout"]["status"], "skipped");
 
     machine.git(repo.path(), &["remote", "add", "origin", REMOTE]);
+    args.extend(["--only", "claude"]);
     let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
     assert_eq!(machine.connections()[0]["repo"], REPO);
     assert_eq!(report["agents"]["installed"], json!(["claude"]));
