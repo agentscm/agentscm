@@ -19,6 +19,24 @@ Instructions for AI coding agents and the people running them. The human rules a
 - For `ui/` changes, run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`.
 - Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` changes, or a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` when `compose.yaml` changes. Hub container end-to-end runs on the release tag. Use `.github/hub-e2e.sh local-release EVIDENCE_DIR` only to reproduce a failure. See [release qualification](docs/releasing.md#hub-release-qualification).
 
+## Size every change by tier
+
+A change takes the highest tier any rule below gives it. `/implement` proposes one and stops where it says.
+
+| Tier | Changed lines | Before code |
+|---|---|---|
+| S | under 200 | nothing |
+| M | under 800 | the tier stated in the issue |
+| L | 800 or more, or anything new or sensitive | a plan one maintainer approved in the issue; another maintainer reviews it when they can, and that does not block the work |
+
+Count added plus deleted lines outside tests, lockfiles and generated snapshots. Docs count.
+
+**New:** a crate, package or top-level directory; a runtime dependency; an MCP tool, CLI command or subcommand, HTTP route, hook event or skill; a database table, or a config key or environment variable a user or operator sets; a workflow or required check. Adding a field, flag or test to something that exists is not new.
+
+**Sensitive:** sign-in, tokens and access; migrations, and anything that deletes or rewrites stored records; CI, release and packaging; secrets and rate limits; the edit hook and agent rules (`AGENTS.md`, `.agents/`); licenses and notices. A typo or wording fix there that changes no rule or behavior doesn't make it L.
+
+If a change grows past its tier, stop and ask: split the work, move it up a tier, or drop it.
+
 ## Commands
 
 Workflow commands live in `.agents/commands/`: `implement` (issue to reviewed PR), `commit`, `review`, `pr`, `fix-pr` and `handoff`. `.claude/commands` is a symlink to that directory and `CLAUDE.md` is a symlink to this file, so Claude Code and other agents read the same instructions. Follow the matching file when asked to run one of these workflows.
