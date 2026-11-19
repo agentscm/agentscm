@@ -17,6 +17,8 @@ pub struct PluginArgs {
 
 use crate::client_setup::SKILL;
 
+const CLAUDE_PLUGIN_ID: &str = "agentscm@agentscm-claude-client";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
     Codex,
@@ -612,6 +614,47 @@ pub(crate) fn claude_config_dir(root: &Path) -> Result<PathBuf> {
     })
 }
 
+/// The installed Claude bundle's release is strictly older than the executing binary's release.
+/// An absent or unfamiliar registry does not establish which bundle is installed.
+pub(crate) fn claude_plugin_is_older(root: &Path) -> Option<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+    let registry = claude_config_dir(root)
+        .ok()?
+        .join("plugins/installed_plugins.json");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(registry)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_REGISTRY_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_REGISTRY_BYTES {
+        return None;
+    }
+    let registry: Value = serde_json::from_slice(&bytes).ok()?;
+    if registry["version"] != 2 {
+        return None;
+    }
+    let [installed] = registry["plugins"][CLAUDE_PLUGIN_ID].as_array()?.as_slice() else {
+        return None;
+    };
+    if installed["scope"] != "user" {
+        return None;
+    }
+    let installed = semver::Version::parse(installed["version"].as_str()?).ok()?;
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    Some(installed.cmp_precedence(&running).is_lt())
+}
+
 fn check_existing_claude_hooks(root: &Path) -> Result<()> {
     let config = claude_config_dir(root)?;
     for path in [
@@ -667,15 +710,15 @@ fn is_agentscm_plugin(plugin: &Value) -> bool {
 }
 
 fn claude_plugin(plugins: &[Value]) -> Result<Option<&Value>> {
-    let mut ours = plugins.iter().filter(|plugin| {
-        plugin["id"] == "agentscm@agentscm-claude-client" && plugin["scope"] == "user"
-    });
+    let mut ours = plugins
+        .iter()
+        .filter(|plugin| plugin["id"] == CLAUDE_PLUGIN_ID && plugin["scope"] == "user");
     let installed = ours.next();
     if ours.next().is_some()
         || plugins.iter().any(|plugin| {
             plugin["enabled"] == true
                 && is_agentscm_plugin(plugin)
-                && !(plugin["id"] == "agentscm@agentscm-claude-client" && plugin["scope"] == "user")
+                && !(plugin["id"] == CLAUDE_PLUGIN_ID && plugin["scope"] == "user")
         })
     {
         return Err(invalid(

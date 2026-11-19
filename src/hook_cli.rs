@@ -326,6 +326,12 @@ async fn hook(
         } else {
             CAPTURE_BUDGET
         };
+    #[cfg(unix)]
+    let plugin_check =
+        (agent == "claude" && client_connection && session_start && !destination_args).then(|| {
+            let root = cwd_of(&payload);
+            tokio::task::spawn_blocking(move || crate::client_plugin::claude_plugin_is_older(&root))
+        });
     let host_session = host_session(agent, &payload, budget);
     #[cfg(unix)]
     let wants_capture = client_connection
@@ -405,6 +411,27 @@ async fn hook(
             }
         }
         None => reply,
+    };
+    #[cfg(unix)]
+    let reply = {
+        let mut reply = reply;
+        if let Some(check) = plugin_check
+            && matches!(
+                tokio::time::timeout_at(budget.into(), check).await,
+                Ok(Ok(Some(true)))
+            )
+            && let Some(fields) = reply.as_object_mut()
+        {
+            let note = "AgentSCM: the installed Claude Code plugin is older than this binary. Run `agentscm client setup --agent claude`, then restart Claude Code.";
+            let message = match fields.get("systemMessage").and_then(Value::as_str) {
+                Some(existing) if !existing.is_empty() => format!("{note}\n\n{existing}"),
+                _ => note.to_owned(),
+            };
+            let fitted =
+                agentscm::hub::hook::fit_context(&message, agentscm::hub::hook::CONTEXT_LIMIT);
+            fields.insert("systemMessage".into(), json!(fitted));
+        }
+        reply
     };
     // The record is written beside the Hub call; the process must not exit before it is.
     if let Some(recording) = host_session {
