@@ -154,6 +154,100 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_startup_warns_about_an_older_plugin_without_a_hub_connection() {
+    use std::process::{Command, Stdio};
+
+    let dir = TempDir::new().unwrap();
+    let plugins = dir.path().join("claude-config/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    let registry = plugins.join("installed_plugins.json");
+    let plugin_id = "agentscm@agentscm-claude-client";
+    let release = env!("CARGO_PKG_VERSION").split('+').next().unwrap();
+    let current_bundle = format!("{release}+agentscm.0123456789abcdef");
+    let registry_with = |id: &str, scope: &str, version: &str| json!({"version": 2, "plugins": {(id): [{"scope": scope, "version": version}]}});
+    let old = registry_with(plugin_id, "user", "0.0.0").to_string();
+    let run_hook = |event: &str, args: &[&str], from_claude: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(args)
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("CLAUDE_CONFIG_DIR", "claude-config")
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if from_claude {
+            command.env("CLAUDE_PROJECT_DIR", dir.path());
+        }
+        let mut child = command.spawn().unwrap();
+        let payload = json!({
+            "hook_event_name": event,
+            "session_id": "synthetic-session",
+            "cwd": dir.path(),
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let hook = |event: &str, flags: &[&str]| {
+        let args = ["--no-telemetry", "hook", "claude"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .collect::<Vec<_>>();
+        run_hook(event, &args, true)
+    };
+    let setup = "agentscm client setup --agent claude";
+    let baseline = hook("SessionStart", &["--client-connection"]);
+    assert!(baseline.get("systemMessage").is_none(), "{baseline}");
+    fs::write(&registry, &old).unwrap();
+    let output = hook("SessionStart", &["--client-connection"]);
+    let context = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        output["systemMessage"].as_str().unwrap().contains(setup),
+        "{output}"
+    );
+    assert!(context.contains("no client connection"), "{output}");
+    assert_eq!(output["hookSpecificOutput"], baseline["hookSpecificOutput"]);
+    assert_eq!(fs::read_to_string(&registry).unwrap(), old);
+    let legacy = run_hook("SessionStart", &[], true);
+    assert!(
+        legacy["systemMessage"].as_str().unwrap().contains(setup),
+        "{legacy}"
+    );
+    assert_eq!(run_hook("SessionStart", &[], false), json!({}));
+    assert_eq!(run_hook("UserPromptSubmit", &[], true), json!({}));
+    for output in [
+        hook("UserPromptSubmit", &["--client-connection"]),
+        hook("SessionStart", &[]),
+    ] {
+        assert!(!output.to_string().contains(setup), "{output}");
+    }
+
+    for contents in [
+        registry_with(plugin_id, "user", &current_bundle).to_string(),
+        registry_with(plugin_id, "user", "9999.0.0").to_string(),
+        registry_with(plugin_id, "user", "unknown").to_string(),
+        registry_with(plugin_id, "project", "0.0.0").to_string(),
+        registry_with("agentscm@other-marketplace", "user", "0.0.0").to_string(),
+        "{".to_owned(),
+    ] {
+        fs::write(&registry, &contents).unwrap();
+        let output = hook("SessionStart", &["--client-connection"]);
+        assert!(!output.to_string().contains(setup), "{contents}: {output}");
+    }
+}
+
 // #295 root cause: a SessionStart from a later session, after another hook session had
 // adopted the durable `default` Work, got `Invalid("durable default work is already bound to
 // another hook session")`, which the hook route reported as "invalid hook payload". #344 removed

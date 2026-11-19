@@ -878,12 +878,12 @@ fn main() {
     if std::env::args_os()
         .skip(1)
         .all(|arg| arg == "--no-telemetry")
-        && hook_cli::missing_arguments()
+        && let Some(reply) = hook_cli::missing_arguments_reply()
     {
         eprintln!(
             "AgentSCM: coordination unknown (hook command arguments are missing); update the installed hooks"
         );
-        println!("{{}}");
+        println!("{reply}");
         std::process::exit(0);
     }
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").

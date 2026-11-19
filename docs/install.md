@@ -174,6 +174,14 @@ These docs follow the `main` branch, so a command described here may not be in a
 yet. Use the documentation at the matching release tag, or
 [build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
 
+Replacing the AgentSCM executable alone leaves installed plugins and agent configuration in place. A full quickstart refreshes the integrations it sets up. To refresh one agent on macOS or Linux, run `agentscm client setup --agent AGENT` in a connected checkout, using one of these names:
+
+- Claude Code (`claude`), Codex (`codex`), Cursor (`cursor`)
+- GitHub Copilot (`copilot`), Gemini CLI (`gemini`), Factory Droid (`droid`)
+- Qwen Code (`qwen`), Junie CLI (`junie`), Crush (`crush`)
+
+Fully quit and reopen the agent after setup and follow any host trust prompts. On macOS and Linux, the Claude Code startup hook can detect an older user-scope AgentSCM plugin in Claude Code's local registry and display the setup command as a warning.
+
 The installed `agentscm client mcp` proxy hosts a local hook relay with its own HTTPS pool,
 without another daemon or setup step. Restart agent MCP sessions after upgrading to regain
 pooling; see [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for matching rules and limits.

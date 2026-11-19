@@ -97,10 +97,10 @@ pub async fn run(args: HookArgs) {
 }
 
 /// A host that dropped a hook's argv must not turn CLI usage (exit 2) into a tool refusal.
-pub(crate) fn missing_arguments() -> bool {
+pub(crate) fn missing_arguments_reply() -> Option<Value> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        return false;
+        return None;
     }
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new()
@@ -108,7 +108,7 @@ pub(crate) fn missing_arguments() -> bool {
         .spawn(move || {
             let hook = read_stdin()
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-                .is_some_and(|payload| {
+                .filter(|payload| {
                     let named = payload["hook_event_name"].as_str().is_some_and(|event| {
                         !event.is_empty()
                             && event.len() <= 64
@@ -117,17 +117,30 @@ pub(crate) fn missing_arguments() -> bool {
                     let copilot_tool = payload["sessionId"].as_str().is_some()
                         && payload["toolName"].as_str().is_some()
                         && payload.get("toolArgs").is_some();
-                    (named || copilot_tool) && session_of(&payload).is_some()
+                    (named || copilot_tool) && session_of(payload).is_some()
+                })
+                .map(|payload| {
+                    // Older Claude Code plugins used a separate args field that some
+                    // hosts dropped. Give those sessions the same setup remedy.
+                    if cfg!(unix)
+                        && payload["hook_event_name"] == "SessionStart"
+                        && std::env::var_os("CLAUDE_PROJECT_DIR").is_some_and(|dir| !dir.is_empty())
+                    {
+                        json!({"systemMessage": "AgentSCM: Claude Code did not pass the hook arguments. Run `agentscm client setup --agent claude`, then restart Claude Code."})
+                    } else {
+                        json!({})
+                    }
                 });
             let _ = send.send(hook);
         })
         .is_err()
     {
-        return false;
+        return None;
     }
     receive
         .recv_timeout(Duration::from_millis(200))
-        .unwrap_or(false)
+        .ok()
+        .flatten()
 }
 
 /// Never returns: prints the agent's reply and exits 0.
@@ -326,6 +339,12 @@ async fn hook(
         } else {
             CAPTURE_BUDGET
         };
+    #[cfg(unix)]
+    let plugin_check =
+        (agent == "claude" && client_connection && session_start && !destination_args).then(|| {
+            let root = cwd_of(&payload);
+            tokio::task::spawn_blocking(move || crate::client_plugin::claude_plugin_is_older(&root))
+        });
     let host_session = host_session(agent, &payload, budget);
     #[cfg(unix)]
     let wants_capture = client_connection
@@ -405,6 +424,27 @@ async fn hook(
             }
         }
         None => reply,
+    };
+    #[cfg(unix)]
+    let reply = {
+        let mut reply = reply;
+        if let Some(check) = plugin_check
+            && matches!(
+                tokio::time::timeout_at(budget.into(), check).await,
+                Ok(Ok(Some(true)))
+            )
+            && let Some(fields) = reply.as_object_mut()
+        {
+            let note = "AgentSCM: the installed Claude Code plugin is older than this binary. Run `agentscm client setup --agent claude`, then restart Claude Code.";
+            let message = match fields.get("systemMessage").and_then(Value::as_str) {
+                Some(existing) if !existing.is_empty() => format!("{note}\n\n{existing}"),
+                _ => note.to_owned(),
+            };
+            let fitted =
+                agentscm::hub::hook::fit_context(&message, agentscm::hub::hook::CONTEXT_LIMIT);
+            fields.insert("systemMessage".into(), json!(fitted));
+        }
+        reply
     };
     // The record is written beside the Hub call; the process must not exit before it is.
     if let Some(recording) = host_session {
