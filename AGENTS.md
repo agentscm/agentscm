@@ -6,6 +6,12 @@ Instructions for AI coding agents and the people running them. The human rules a
 
 Read README.md, CONTRIBUTING.md, STYLE.md, docs/README.md (the index) and docs/architecture.md before changing code. `docs/spec/agentic-scm.md` is the draft specification; `docs/roadmap.md` says what is implemented and what is only proposed. Never describe a proposed capability as implemented. Do not edit `docs/roadmap.md` in a feature PR; record its effect as `Roadmap:` lines in the PR body (see CONTRIBUTING.md).
 
+### While writing cross-platform code and tests
+
+- When a shared hook or client calls a platform-specific module, trace the call on both sides of its `#[cfg]`. Keep shared helpers available to both builds. Match tests to the supported behavior: the native journal is Unix-only, but hook coordination also runs on Windows. See [#465](https://github.com/agentscm/agentscm/pull/465) and [#639](https://github.com/agentscm/agentscm/pull/639).
+- Build filesystem fixtures with a temporary directory and `Path::join`. When testing how a client interprets an absolute path, supply a path that is absolute on the target platform. A leading slash alone does not supply a Windows drive or share. See [#588](https://github.com/agentscm/agentscm/pull/588).
+- For cancellation, retries and lock contention, make the test establish the state it asserts. A refused localhost connection can take seconds on Windows. For SQLite contention, hold the competing writer through the assertion so a timeout and subsequent unlock cannot make the test pass by accident. See [#639](https://github.com/agentscm/agentscm/pull/639) and [#653](https://github.com/agentscm/agentscm/pull/653).
+
 ## Commands
 
 ```sh
