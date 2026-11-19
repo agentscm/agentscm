@@ -377,6 +377,16 @@ impl SqliteStore {
         incarnation: Option<&str>,
         now: i64,
     ) -> Result<Option<LifecycleView>> {
+        // An unregistered native session has no qualification to downgrade. Its
+        // hook must still invalidate readiness while coordination writes are busy.
+        if incarnation.is_none()
+            && self
+                .lifecycle_domain_get_impl(token, session, now)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        // Recheck registered sessions under the writer lock before changing qualification.
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = check(&tx, token, session, incarnation, now)?;
