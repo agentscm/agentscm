@@ -423,6 +423,8 @@ agentscm uninstall                      # asks first; --yes, --remove-hub-data
 
 Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--dry-run` (print every file and setting it would write, then stop), `--json` (one JSON object on stdout; progress on stderr). `--no-collisions` and `--tray` are accepted for older scripts and do nothing.
 
+In the quickstart JSON report, `agents.installed` lists the agents set up for all projects. An explicitly requested agent appears in `agents.skipped` if its setup did not succeed. The separate `checkout.status` describes the checkout setup step in this run. It is `connected` when the step succeeds, `skipped` when quickstart continues after a checkout setup error (for example, a missing origin), and `not_attempted` when the step never runs.
+
 ### Client status
 
 ```sh

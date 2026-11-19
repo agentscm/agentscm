@@ -328,6 +328,17 @@ async fn wait_healthy(url: &str, limit: Duration) -> bool {
 
 // ---- the flow ----
 
+/// Outcome of this run's checkout setup step. A previous connection can survive a skipped step.
+#[cfg(unix)]
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckoutStatus {
+    #[default]
+    NotAttempted,
+    Connected,
+    Skipped,
+}
+
 /// What is true about live warnings when the run ends.
 #[derive(Default)]
 struct Live {
@@ -335,6 +346,8 @@ struct Live {
     hub_up: bool,
     /// The repository this checkout is connected to.
     repo: Option<String>,
+    #[cfg(unix)]
+    checkout_status: CheckoutStatus,
     /// Agents set up in this checkout.
     agents: Vec<String>,
     /// Agents set up for all projects, connected or not.
@@ -498,25 +511,21 @@ fn json_stdout() -> Result<std::fs::File> {
     }
 }
 
-fn requested_agents(args: &QuickstartArgs) -> Vec<String> {
-    #[cfg(unix)]
-    return args
+#[cfg(unix)]
+fn json_report(cx: &Cx<'_>) -> serde_json::Value {
+    let mut installed = Vec::new();
+    for agent in &cx.live.installed {
+        let name = agent.name();
+        if !installed.contains(&name) {
+            installed.push(name);
+        }
+    }
+    let skipped: Vec<_> = cx
+        .args
         .agent
         .iter()
-        .map(|agent| agent.name().to_owned())
-        .collect();
-    #[cfg(not(unix))]
-    return {
-        let _ = args;
-        Vec::new()
-    };
-}
-
-fn json_report(cx: &Cx<'_>) -> serde_json::Value {
-    let installed = &cx.live.agents;
-    let skipped: Vec<String> = requested_agents(cx.args)
-        .into_iter()
-        .filter(|agent| !installed.contains(agent))
+        .filter(|agent| !cx.live.installed.contains(agent))
+        .map(|agent| agent.name())
         .collect();
     let needs_user: Vec<&str> = [
         cx.live.pending_local.as_deref(),
@@ -528,6 +537,7 @@ fn json_report(cx: &Cx<'_>) -> serde_json::Value {
     .collect();
     serde_json::json!({
         "agents": { "installed": installed, "skipped": skipped, "needs_user": needs_user },
+        "checkout": { "status": cx.live.checkout_status },
         "hub": cx.live.hub,
         "hub_up": cx.live.hub_up,
         "signed_in": cx.live.hub.as_deref().is_some_and(|hub| hub_cli::has_session(Some(hub)).unwrap_or(false)),
@@ -1347,6 +1357,9 @@ async fn connect_checkout(
     if let Err(error) = result {
         println!("This checkout isn't connected yet: {}.", short(&error));
         cx.live.agents.clear();
+        cx.live.checkout_status = CheckoutStatus::Skipped;
+    } else {
+        cx.live.checkout_status = CheckoutStatus::Connected;
     }
 }
 

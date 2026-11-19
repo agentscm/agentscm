@@ -3882,6 +3882,51 @@ fn feed(machine: &Machine, cwd: &Path, args: &[&str], input: &str) -> Output {
 }
 
 #[test]
+fn quickstart_json_reports_user_install_even_when_checkout_has_no_origin() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = TempDir::new().unwrap();
+    machine.git(repo.path(), &["init", "-q", "-b", "main"]);
+    let token = hub.token_file(machine.home.path());
+    let mut args = quick(&hub.url, &token, &["--only", "claude", "--json"]);
+
+    let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
+    assert!(machine.claude_plugin_installed());
+    assert!(machine.connections().is_empty());
+    assert_eq!(report["agents"]["installed"], json!(["claude"]));
+    assert_eq!(report["agents"]["skipped"], json!([]));
+    assert_eq!(report["checkout"]["status"], "skipped");
+
+    machine.git(repo.path(), &["remote", "add", "origin", REMOTE]);
+    args.extend(["--only", "claude"]);
+    let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
+    assert_eq!(machine.connections()[0]["repo"], REPO);
+    assert_eq!(report["agents"]["installed"], json!(["claude"]));
+    assert_eq!(report["checkout"]["status"], "connected");
+}
+
+#[test]
+fn quickstart_json_reports_checkout_not_attempted_when_hub_is_skipped() {
+    let machine = Machine::new().with_claude();
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "skip",
+            "--only",
+            "claude",
+            "--json",
+        ],
+    );
+    let report: Value = serde_json::from_str(&ok(&output)).unwrap();
+    assert_eq!(report["agents"]["installed"], json!([]));
+    assert_eq!(report["agents"]["skipped"], json!(["claude"]));
+    assert_eq!(report["checkout"]["status"], "not_attempted");
+}
+
+#[test]
 fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_page_sees_it() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
