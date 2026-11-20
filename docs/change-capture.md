@@ -28,7 +28,7 @@ hook capture does not call a model or send content to a provider. Capture record
 Codex, Cursor, Copilot and Gemini CLI sessions, within each host's visible hook contract. See the
 [Codex adapter](#codex-adapter) and [other native hooks](#other-native-hooks) for their limits.
 
-Capture has three modes per checkout, and `metadata-only` is the default:
+Capture has three modes per checkout. A checkout you configure yourself defaults to `metadata-only`; a connected checkout of a repository whose Hub shares agent conversations (on by default on a new Hub, see [the repository setting](#the-repository-setting)) follows it in `shared-conversation` mode unless its person opts out:
 
 | Mode | Bodies kept locally | Bodies sent to the Hub |
 |---|---|---|
