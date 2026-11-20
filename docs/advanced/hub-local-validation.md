@@ -32,11 +32,10 @@ For example, after the existing `run` step writes its JSON result to `$result_fi
 envelope=$(jq -er .envelope_sha256 "$result_file")
 "$bin" local-validation submit \
   --state-dir "$state" --attestation "$envelope" \
-  --hub-url "$hub_url" --repository-id "$hub_repository_id" \
-  --proposal "$pr" --token-file "$hub_token_file"
+  --hub-url "$hub_url" --proposal "$pr" --token-file "$hub_token_file"
 ```
 
-The Hub token file must be absolute and owner-private and contain a writable repository agent token for the exact connected repository. It is distinct from the signing key and GitHub cleanup token. Repeat `--attestation` to upload several retained requirements together, up to 32 entries. The command retains a canonical bundle and pending destination record before transport, then a matching durable receipt. Retry the same command after an uncertain submission; identical canonical bytes for the same repository and proposal return the same receipt/generation. The receipt means `received_unverified`, never that validation passed. A failed validation can be retained and submitted as evidence of failure; each wrapper should preserve its chosen command exit behavior.
+The Hub token file must be absolute and owner-private and contain a writable repository agent token for the exact connected repository. The token selects the repository: the command asks the Hub (`GET /v1/hub/whoami`) for the `rep_` ID it connected for the token's repository, so nothing stores that ID. A `rep_` ID belongs to one Hub, and a repository moved to another Hub gets a new one. The command fails before uploading, and names the cause, when the Hub does not accept the token (revoked, expired or from another Hub), when the token is read-only or has no forge repository id, when this Hub has not connected the token's repository or it was renamed after the token was minted, or when the Hub predates this lookup. It is distinct from the signing key and GitHub cleanup token. Repeat `--attestation` to upload several retained requirements together, up to 32 entries. The command retains a canonical bundle and pending destination record before transport, then a matching durable receipt. Retry the same command after an uncertain submission; identical canonical bytes for the same repository and proposal return the same receipt/generation. The receipt means `received_unverified`, never that validation passed. A failed validation can be retained and submitted as evidence of failure; each wrapper should preserve its chosen command exit behavior.
 
 ## Archive and clean up legacy comments
 
@@ -48,8 +47,10 @@ Archive without deletion first, using an absolute owner-private state directory 
 agentscm local-validation migrate \
   --state-dir "$migration_state" --github-repo acme/widget --proposal 123 \
   --github-token-file "$github_token_file" --hub-token-file "$hub_token_file" \
-  --hub-url "$hub_url" --repository-id "$hub_repository_id"
+  --hub-url "$hub_url"
 ```
+
+The Hub token file selects the repository, as for `submit`.
 
 The command reads the canonical GitHub repository and pins its default-branch commit before fetching `.github/local-validation/registry.json` (override with `--registry-path` for a different trusted relative path). It discovers the complete bounded PR comment inventory before doing cleanup. It parses legacy v1 carriers, checks exact envelope/record commitments, verifies the signature and current issuer trust against that pinned registry, checks the local-validation requirement identity and issuer's allowed check kind, and checks canonical repository binding. It archives valid historical or expired evidence unchanged; migration never sets a passing status or certifies that historical source is current. The Hub verifier must independently assess the current head, context and complete requirement set.
 

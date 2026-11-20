@@ -572,7 +572,7 @@ async fn view_settings(
 async fn whoami(
     State(state): State<HubState>,
     Reader(principal): Reader,
-) -> Json<serde_json::Value> {
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let (hub, repository) = (
         state.clone(),
         super::work::WorkRepositoryScope::of(&principal),
@@ -584,8 +584,24 @@ async fn whoami(
     .await
     .inspect_err(super::error_envelope::log_internal)
     .ok();
+    // The `rep_` row a token bound to a forge repository id acts on, as validation evidence
+    // routes require; null when the token has no id, this Hub has not connected it, or the
+    // repository was renamed since the token was minted (those routes then refuse the token).
+    let (store, host, id, name) = (
+        state.store.clone(),
+        principal.owner.identity.host.clone(),
+        principal.repository_id,
+        principal.repository.clone(),
+    );
+    let connected = match id {
+        Some(id) => blocking(&state, move || store.repository_by_id(&host, id))
+            .await?
+            .filter(|repository| repository.full_name == name)
+            .map(|repository| repository.id),
+        None => None,
+    };
     let owner = principal.owner;
-    Json(json!({
+    Ok(Json(json!({
         "shared_conversation_retention_days": retention_days,
         "cooperation_protocol": super::notices::PROTOCOL,
         "token": {
@@ -593,6 +609,7 @@ async fn whoami(
             "name": principal.name,
             "repository": principal.repository,
             "repository_id": principal.repository_id,
+            "connected_repository": connected,
             "expires_at": principal.expires_at,
             "read_only": principal.read_only,
         },
@@ -602,7 +619,7 @@ async fn whoami(
             "user_id": owner.identity.user_id,
             "login": owner.login,
         },
-    }))
+    })))
 }
 
 async fn skill_workflow(

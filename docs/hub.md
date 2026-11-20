@@ -566,7 +566,10 @@ start; until then they stop working (401 `sign_in_required`).
   for the token's repository (`hub serve --shared-conversation-retention-days`, 1 to 3650, unless
   a program that embeds the Hub sets it per repository, where 0 means it keeps none). The field is additive: a Hub
   that predates it omits it, and clients then say the retention is not known instead of naming a
-  number. Every authentication failure returns the same 401 body.
+  number. `token.connected_repository` is the `rep_` ID of the repository row this Hub connected
+  for the token's forge repository, which validation evidence routes take, or `null` when the token
+  has no forge repository id, this Hub has not connected that repository, or the repository was
+  renamed after the token was minted. A `rep_` ID belongs to one Hub. Every authentication failure returns the same 401 body.
 - `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes
   that token only (204). `agentscm client remove` and `uninstall` use it, so undoing a setup needs no
   sign-in. A revoked or unknown token gets 401.
