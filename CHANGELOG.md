@@ -2,6 +2,18 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.7.0](https://github.com/agentscm/agentscm/compare/v0.6.1...v0.7.0) - 2026-11-20
+
+### Added
+
+- *(local-validation)* Resolve the Hub repository from the agent token ([#663](https://github.com/agentscm/agentscm/pull/663))
+
+### Other
+
+- *(readme)* Add npm download badges ([#659](https://github.com/agentscm/agentscm/pull/659))
+- Rewrite /implement to propose a tier and stop where it says ([#658](https://github.com/agentscm/agentscm/pull/658))
+- Consolidate pre-push checks and trim obsolete agent guidance ([#657](https://github.com/agentscm/agentscm/pull/657))
+
 ## [0.6.1](https://github.com/agentscm/agentscm/compare/v0.6.0...v0.6.1) - 2026-11-19
 
 ### Fixed
