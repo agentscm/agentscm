@@ -585,15 +585,18 @@ async fn whoami(
     .inspect_err(super::error_envelope::log_internal)
     .ok();
     // The `rep_` row a token bound to a forge repository id acts on, as validation evidence
-    // routes require; null when the token has no id or this Hub has not connected it.
-    let (store, host, id) = (
+    // routes require; null when the token has no id, this Hub has not connected it, or the
+    // repository was renamed since the token was minted (those routes then refuse the token).
+    let (store, host, id, name) = (
         state.store.clone(),
         principal.owner.identity.host.clone(),
         principal.repository_id,
+        principal.repository.clone(),
     );
     let connected = match id {
         Some(id) => blocking(&state, move || store.repository_by_id(&host, id))
             .await?
+            .filter(|repository| repository.full_name == name)
             .map(|repository| repository.id),
         None => None,
     };

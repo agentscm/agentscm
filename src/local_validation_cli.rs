@@ -761,6 +761,11 @@ async fn post(args: PostArgs) -> Result<i32> {
 /// the Hub returns the original receipt, and no forge publication is attempted here.
 async fn submit(args: SubmitArgs) -> Result<i32> {
     use agentscm::hub::forge_http;
+    // Local refusals come before the token leaves the machine.
+    private_state_dir(&args.state_dir)?;
+    if !args.token_file.is_absolute() {
+        return Err(Error::Invalid("--token-file must be absolute".into()));
+    }
     let base = forge_http::check_base_url(&args.hub_url)
         .map_err(|_| Error::Invalid("invalid Hub URL".into()))?;
     let client =
@@ -802,13 +807,22 @@ async fn hub_repository(client: &reqwest::Client, base: &str, token: &str) -> Re
             "the Hub token is read-only; submission needs a writable agent token".into(),
         ));
     }
+    // Hub text reaches the terminal: name the repository only when it is a plain owner/name.
     let name = token["repository"]
         .as_str()
+        .filter(|name| check_github_repo(name).is_ok())
         .unwrap_or("the token's repository");
-    match token["connected_repository"].as_str() {
-        Some(id) if is_repository_id(id) => Ok(id.to_owned()),
+    match token.get("connected_repository") {
+        Some(serde_json::Value::String(id)) if is_repository_id(id) => Ok(id.clone()),
+        None => Err(Error::Invalid(
+            "this Hub predates repository lookup by token; upgrade the Hub".into(),
+        )),
+        _ if token["repository_id"].is_null() => Err(Error::Invalid(format!(
+            "the token for {name} has no forge repository id; mint a new repository token"
+        ))),
         _ => Err(Error::Invalid(format!(
-            "{name} is not a repository connected to this Hub"
+            "{name} is not a repository connected to this Hub, or it was renamed after the \
+             token was minted"
         ))),
     }
 }

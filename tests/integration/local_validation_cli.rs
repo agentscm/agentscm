@@ -1014,8 +1014,8 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
 }
 
 fn whoami_body(connected: Option<&str>) -> Value {
-    serde_json::json!({"token": {"repository": "acme/widget", "read_only": false,
-        "connected_repository": connected}})
+    serde_json::json!({"token": {"repository": "acme/widget", "repository_id": 100,
+        "read_only": false, "connected_repository": connected}})
 }
 
 fn whoami_reply(body: &Value) -> Vec<u8> {
@@ -1038,6 +1038,15 @@ fn hub_submit_names_why_the_hub_has_no_repository_for_the_token() {
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
     let mut read_only = whoami_body(Some(&format!("rep_{}", "1".repeat(32))));
     read_only["token"]["read_only"] = true.into();
+    let mut no_id = whoami_body(None);
+    no_id["token"]["repository_id"] = Value::Null;
+    let mut old_hub = whoami_body(None);
+    old_hub["token"]
+        .as_object_mut()
+        .unwrap()
+        .remove("connected_repository");
+    let mut hostile = whoami_body(None);
+    hostile["token"]["repository"] = "acme/\u{1b}[31mwidget".into();
     let unauthorized = b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_vec();
     for (reply, cause) in [
         (unauthorized, "revoked, expired or from another Hub"),
@@ -1046,6 +1055,12 @@ fn hub_submit_names_why_the_hub_has_no_repository_for_the_token() {
             "acme/widget is not a repository connected to this Hub",
         ),
         (whoami_reply(&read_only), "read-only"),
+        (whoami_reply(&no_id), "has no forge repository id"),
+        (whoami_reply(&old_hub), "upgrade the Hub"),
+        (
+            whoami_reply(&hostile),
+            "the token's repository is not a repository connected",
+        ),
     ] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1075,7 +1090,15 @@ fn hub_submit_names_why_the_hub_has_no_repository_for_the_token() {
         assert!(!out.status.success());
         assert!(stderr.contains(cause), "{stderr}");
         assert!(!stderr.contains("synthetic-hub-secret"));
+        assert!(!stderr.contains('\u{1b}'));
     }
+    // Nothing was retained for a submission the Hub could not place.
+    assert!(!fs::read_dir(f.state()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".hub.pending.json")
+    }));
 }
 
 #[derive(Clone)]

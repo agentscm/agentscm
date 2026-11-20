@@ -212,6 +212,11 @@ async fn whoami_names_the_connected_repository_row() {
     assert_eq!(body["token"]["repository_id"], 100);
     assert_eq!(body["token"]["connected_repository"], json!(row.id));
     assert!(row.id.starts_with("rep_"));
+    // After a rename the evidence routes refuse the token, so whoami names no row.
+    hub.store
+        .upsert_repository(&connection, "github.com", 100, "acme/gadgets", None, None)
+        .unwrap();
+    assert!(whoami(unconnected.expose())["token"]["connected_repository"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
