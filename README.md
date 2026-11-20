@@ -23,9 +23,7 @@ not require migrating your repository.
 [Install](docs/install.md) · [Supported agents](docs/agents.md) ·
 [Documentation](docs/README.md) · [Releases](https://github.com/agentscm/agentscm/releases)
 
-[![npm downloads per week](https://img.shields.io/npm/dw/agentscm?label=downloads%2Fweek)](https://npm-stat.com/charts.html?package=agentscm)
-[![npm downloads per month](https://img.shields.io/npm/dm/agentscm?label=downloads%2Fmonth)](https://npm-stat.com/charts.html?package=agentscm)
-[![npm downloads in the last 18 months](https://img.shields.io/npm/d18m/agentscm?label=downloads%2F18%20months)](https://npm-stat.com/charts.html?package=agentscm)
+[![npm downloads per week](https://img.shields.io/npm/dw/agentscm?label=npm)](https://npm-stat.com/charts.html?package=agentscm) [![npm downloads per month](https://img.shields.io/npm/dm/agentscm?label=npm)](https://npm-stat.com/charts.html?package=agentscm) [![npm downloads in the last 18 months](https://img.shields.io/npm/d18m/agentscm?label=npm%2018mo)](https://npm-stat.com/charts.html?package=agentscm)
 
 ## Quickstart
 
