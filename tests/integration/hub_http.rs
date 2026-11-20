@@ -150,6 +150,7 @@ async fn whoami_attributes_the_owner() {
         assert_eq!(body["token"]["name"], "builder");
         assert_eq!(body["token"]["repository"], "acme/widgets");
         assert!(body["token"]["repository_id"].is_null());
+        assert!(body["token"]["connected_repository"].is_null());
         assert_eq!(
             body["owner"],
             json!({"provider": "github", "host": "github.com", "user_id": 42, "login": "alice"})
@@ -159,6 +160,58 @@ async fn whoami_attributes_the_owner() {
         assert_eq!(body.as_object().unwrap().len(), 4);
     }
     assert!(owner.starts_with("usr_"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whoami_names_the_connected_repository_row() {
+    use agentscm::hub::{connection::NewConnection, store::mint_bound_agent_token};
+    let hub = Hub::start().await;
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 7,
+    };
+    let owner = hub.store.upsert_user(&identity, "alice").unwrap().id;
+    let (_, unconnected, _) = mint_bound_agent_token(
+        &*hub.store,
+        &owner,
+        "builder",
+        "acme/widgets",
+        100,
+        3600,
+        false,
+    )
+    .unwrap();
+    let whoami = |secret: &str| -> Value {
+        let (status, _, body) = hub.get("/v1/hub/whoami", Some(&format!("Bearer {secret}")));
+        assert_eq!(status, 200);
+        serde_json::from_str(&body).unwrap()
+    };
+    assert!(whoami(unconnected.expose())["token"]["connected_repository"].is_null());
+    let connection = hub
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_11111111111111111111111111111111".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            "test",
+        )
+        .unwrap()
+        .id;
+    let row = hub
+        .store
+        .upsert_repository(&connection, "github.com", 100, "acme/widgets", None, None)
+        .unwrap();
+    let body = whoami(unconnected.expose());
+    assert_eq!(body["token"]["repository_id"], 100);
+    assert_eq!(body["token"]["connected_repository"], json!(row.id));
+    assert!(row.id.starts_with("rep_"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
