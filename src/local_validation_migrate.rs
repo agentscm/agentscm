@@ -21,8 +21,6 @@ pub struct MigrateArgs {
     hub_token_file: PathBuf,
     #[arg(long)]
     hub_url: String,
-    #[arg(long)]
-    repository_id: String,
     /// Trusted registry relative to the default-branch root, read at its pinned commit.
     #[arg(long, default_value = ".github/local-validation/registry.json")]
     registry_path: String,
@@ -123,6 +121,13 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
             "registry path must be relative and normal".into(),
         ));
     }
+    let base = forge_http::check_base_url(&args.hub_url)
+        .map_err(|_| Error::Invalid("invalid Hub URL".into()))?;
+    let hub_token = read_token(&args.hub_token_file)?;
+    let client =
+        forge_http::client().map_err(|_| Error::Invalid("could not create Hub client".into()))?;
+    // Resolve the Hub repository before any GitHub read, so a wrong Hub fails first.
+    let repository = hub_repository(&client, &base, &hub_token).await?;
     let token = read_token(&args.github_token_file)?;
     let api = Api::new(&api_base, "https://github.com")
         .map_err(|_| Error::Invalid("could not create GitHub client".into()))?;
@@ -181,13 +186,8 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
         validate_pair(&envelope, &record, &registry, clock)?;
         legacy.push((id, author, body, envelope, record));
     }
-    let base = forge_http::check_base_url(&args.hub_url)
-        .map_err(|_| Error::Invalid("invalid Hub URL".into()))?;
-    let hub_token = read_token(&args.hub_token_file)?;
-    let client =
-        forge_http::client().map_err(|_| Error::Invalid("could not create Hub client".into()))?;
     let destination =
-        json!({"hub_url": base, "repository_id": args.repository_id, "proposal": args.proposal});
+        json!({"hub_url": base, "repository_id": repository, "proposal": args.proposal});
     let destination_digest = agentscm::store::digest(&serde_json::to_vec(&destination)?);
     // Archive ALL eligible comments and confirm every readback before deleting ANY.
     let mut archived = Vec::new();
@@ -195,20 +195,22 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
         let sha = envelope_sha256(envelope);
         retain_submission(&args.state_dir, &format!("{sha}.record.json"), record)?;
         retain_submission(&args.state_dir, &format!("{sha}.envelope.json"), envelope)?;
-        let receipt = submit_retained(SubmitArgs {
-            state_dir: args.state_dir.clone(),
-            attestation: vec![sha],
-            hub_url: base.to_string(),
-            repository_id: args.repository_id.clone(),
-            proposal: args.proposal,
-            token_file: args.hub_token_file.clone(),
-        })
+        let receipt = submit_retained(
+            SubmitArgs {
+                state_dir: args.state_dir.clone(),
+                attestation: vec![sha],
+                hub_url: base.to_string(),
+                proposal: args.proposal,
+                token_file: args.hub_token_file.clone(),
+            },
+            &repository,
+        )
         .await?;
         let (status, value) = forge_http::send(
             client
                 .get(format!(
                     "{base}/v1/hub/repos/{}/validation-evidence/{}/{}",
-                    args.repository_id, args.proposal, receipt.generation
+                    repository, args.proposal, receipt.generation
                 ))
                 .bearer_auth(&hub_token),
             MAX_BUNDLE_BYTES,

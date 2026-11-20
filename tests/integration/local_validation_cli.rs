@@ -941,12 +941,21 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let repo = format!("rep_{}", "1".repeat(32));
-    // Drop the response after reading the complete request, twice: each retry must submit
-    // the exact same body and retain a retryable pending journal without exposing secrets.
+    // Answer the token's repository, then drop the submission after reading the complete
+    // request, twice: each retry must submit the exact same body to the resolved repository
+    // and retain a retryable pending journal without exposing secrets.
     let server = std::thread::spawn(move || {
-        use std::io::Read;
+        use std::io::{Read, Write};
         let mut bodies = Vec::new();
         for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            assert!(request[..n].starts_with(b"GET /v1/hub/whoami "));
+            stream
+                .write_all(&whoami_reply(&whoami_body(Some(&repo))))
+                .unwrap();
+            drop(stream);
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -967,6 +976,9 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
                         })
                         .unwrap();
                     if request.len() >= end + 4 + len {
+                        assert!(headers.starts_with(&format!(
+                            "POST /v1/hub/repos/{repo}/validation-evidence/1 "
+                        )));
                         bodies.push(request[end + 4..].to_vec());
                         break;
                     }
@@ -984,8 +996,6 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
             &sha,
             "--hub-url",
             &base,
-            "--repository-id",
-            &repo,
             "--proposal",
             "1",
             "--token-file",
@@ -1001,6 +1011,71 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".pending.json"))
         .count();
     assert_eq!(pending, 1);
+}
+
+fn whoami_body(connected: Option<&str>) -> Value {
+    serde_json::json!({"token": {"repository": "acme/widget", "read_only": false,
+        "connected_repository": connected}})
+}
+
+fn whoami_reply(body: &Value) -> Vec<u8> {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+fn hub_submit_names_why_the_hub_has_no_repository_for_the_token() {
+    use std::io::{Read, Write};
+    let f = ok_fixture();
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let token = f.root().join("hub-token");
+    fs::write(&token, "synthetic-hub-secret").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut read_only = whoami_body(Some(&format!("rep_{}", "1".repeat(32))));
+    read_only["token"]["read_only"] = true.into();
+    let unauthorized = b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_vec();
+    for (reply, cause) in [
+        (unauthorized, "revoked, expired or from another Hub"),
+        (
+            whoami_reply(&whoami_body(None)),
+            "acme/widget is not a repository connected to this Hub",
+        ),
+        (whoami_reply(&read_only), "read-only"),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // One connection only: nothing is submitted once the repository is unknown.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            assert!(request[..n].starts_with(b"GET /v1/hub/whoami "));
+            stream.write_all(&reply).unwrap();
+        });
+        let out = f.cli(&[
+            "submit",
+            "--state-dir",
+            f.state().to_str().unwrap(),
+            "--attestation",
+            &sha,
+            "--hub-url",
+            &base,
+            "--proposal",
+            "1",
+            "--token-file",
+            token.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(stderr.contains(cause), "{stderr}");
+        assert!(!stderr.contains("synthetic-hub-secret"));
+    }
 }
 
 #[derive(Clone)]
@@ -1028,6 +1103,9 @@ async fn migration_reply(
     let mut s = fake.state.lock().unwrap();
     let path = uri.path();
     let mut status = 200;
+    if path == "/v1/hub/whoami" {
+        return axum::Json(whoami_body(Some(&format!("rep_{}", "1".repeat(32))))).into_response();
+    }
     let value = if path == "/repos/acme/widget" {
         json!({"full_name":"acme/widget", "default_branch":"main"})
     } else if path == "/repos/acme/widget/git/ref/heads/main" {
@@ -1221,8 +1299,6 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
                 token_path.to_str().unwrap(),
                 "--hub-url",
                 &base,
-                "--repository-id",
-                &format!("rep_{}", "1".repeat(32)),
                 "--api-url",
                 &base,
                 "--delete-legacy",

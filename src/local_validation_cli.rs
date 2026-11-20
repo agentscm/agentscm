@@ -101,12 +101,10 @@ pub struct SubmitArgs {
     attestation: Vec<String>,
     #[arg(long)]
     hub_url: String,
-    /// Connected Hub repository id (rep_...).
-    #[arg(long)]
-    repository_id: String,
     #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
     proposal: i64,
-    /// Absolute owner-private file containing a writable repository agent token.
+    /// Absolute owner-private file containing a writable repository agent token; it selects
+    /// the repository.
     #[arg(long)]
     token_file: PathBuf,
 }
@@ -762,13 +760,70 @@ async fn post(args: PostArgs) -> Result<i32> {
 /// Pending is retained before transport. Lost responses retry the same canonical bundle;
 /// the Hub returns the original receipt, and no forge publication is attempted here.
 async fn submit(args: SubmitArgs) -> Result<i32> {
-    let receipt = submit_retained(args).await?;
+    use agentscm::hub::forge_http;
+    let base = forge_http::check_base_url(&args.hub_url)
+        .map_err(|_| Error::Invalid("invalid Hub URL".into()))?;
+    let client =
+        forge_http::client().map_err(|_| Error::Invalid("could not create Hub client".into()))?;
+    let repository = hub_repository(&client, &base, &read_token(&args.token_file)?).await?;
+    let receipt = submit_retained(args, &repository).await?;
     println!("{}", serde_json::to_string(&receipt)?);
     Ok(0)
 }
 
+/// The `rep_` ID the Hub connected for the token's repository. It belongs to that one Hub, so
+/// it is read from the Hub each time instead of being stored.
+async fn hub_repository(client: &reqwest::Client, base: &str, token: &str) -> Result<String> {
+    let (status, who) = agentscm::hub::forge_http::send(
+        client
+            .get(format!("{base}/v1/hub/whoami"))
+            .bearer_auth(token),
+        16 * 1024,
+    )
+    .await
+    .map_err(|_| Error::Invalid("Hub unavailable; could not read the token's repository".into()))?;
+    match status {
+        200 => {}
+        401 => {
+            return Err(Error::Invalid(
+                "this Hub does not accept the token: it is revoked, expired or from another Hub"
+                    .into(),
+            ));
+        }
+        status => {
+            return Err(Error::Invalid(format!(
+                "Hub refused the token identity check (HTTP {status})"
+            )));
+        }
+    }
+    let token = &who["token"];
+    if token["read_only"] != json!(false) {
+        return Err(Error::Invalid(
+            "the Hub token is read-only; submission needs a writable agent token".into(),
+        ));
+    }
+    let name = token["repository"]
+        .as_str()
+        .unwrap_or("the token's repository");
+    match token["connected_repository"].as_str() {
+        Some(id) if is_repository_id(id) => Ok(id.to_owned()),
+        _ => Err(Error::Invalid(format!(
+            "{name} is not a repository connected to this Hub"
+        ))),
+    }
+}
+
+fn is_repository_id(id: &str) -> bool {
+    id.len() == 36
+        && id.starts_with("rep_")
+        && id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 async fn submit_retained(
     args: SubmitArgs,
+    repository: &str,
 ) -> Result<agentscm::hub::validation_evidence::ValidationEvidenceReceipt> {
     use agentscm::hub::forge_http;
     use agentscm::hub::validation_evidence::ValidationEvidenceReceipt;
@@ -777,12 +832,7 @@ async fn submit_retained(
     if !args.token_file.is_absolute() {
         return Err(Error::Invalid("--token-file must be absolute".into()));
     }
-    if args.repository_id.len() != 36
-        || !args.repository_id.starts_with("rep_")
-        || !args.repository_id[4..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !is_repository_id(repository) {
         return Err(Error::Invalid("invalid Hub repository id".into()));
     }
     let base = forge_http::check_base_url(&args.hub_url)
@@ -805,16 +855,15 @@ async fn submit_retained(
     .to_bytes()?;
     let digest = agentscm::store::digest(&bytes);
     // Include destination in the local receipt identity: evidence may be sent to multiple Hubs.
-    let destination = agentscm::store::digest(
-        format!("{base}/{}/{}", args.repository_id, args.proposal).as_bytes(),
-    );
+    let destination =
+        agentscm::store::digest(format!("{base}/{}/{}", repository, args.proposal).as_bytes());
     let name = format!("{digest}.{destination}.hub");
     retain_submission(&args.state_dir, &format!("{name}.bundle.json"), &bytes)?;
     retain_submission(
         &args.state_dir,
         &format!("{name}.pending.json"),
         &serde_json::to_vec(&json!({
-            "bundle_sha256": digest, "repository": args.repository_id, "proposal": args.proposal,
+            "bundle_sha256": digest, "repository": repository, "proposal": args.proposal,
             "state": "pending", "destination_sha256": destination
         }))?,
     )?;
@@ -824,7 +873,7 @@ async fn submit_retained(
         client
             .post(format!(
                 "{base}/v1/hub/repos/{}/validation-evidence/{}",
-                args.repository_id, args.proposal
+                repository, args.proposal
             ))
             .bearer_auth(token)
             .header("content-type", "application/json")
@@ -845,7 +894,7 @@ async fn submit_retained(
     let receipt: ValidationEvidenceReceipt = agentscm::hub::reply::decode(&body).map_err(|_| {
         Error::Invalid("invalid Hub submission receipt; retry retained submission".into())
     })?;
-    if receipt.repository != args.repository_id
+    if receipt.repository != repository
         || receipt.proposal != args.proposal
         || receipt.bundle_sha256 != digest
         || receipt.generation <= 0
