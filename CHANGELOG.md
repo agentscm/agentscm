@@ -2,6 +2,16 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.7.1](https://github.com/agentscm/agentscm/compare/v0.7.0...v0.7.1) - 2026-11-21
+
+### Fixed
+
+- *(hub)* Follow a renamed or moved GitLab project by its id ([#561](https://github.com/agentscm/agentscm/pull/561))
+
+### Other
+
+- say which checkouts default to metadata-only capture ([#660](https://github.com/agentscm/agentscm/pull/660))
+
 ## [0.7.0](https://github.com/agentscm/agentscm/compare/v0.6.1...v0.7.0) - 2026-11-20
 
 ### Added
