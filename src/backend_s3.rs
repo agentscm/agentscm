@@ -1,4 +1,5 @@
-//! S3-compatible [`ImmutableBackend`]: path-style requests signed with SigV4.
+//! S3-compatible [`ImmutableBackend`]: path-style requests signed with SigV4, with configured
+//! keys or, when none are set, the ambient role credentials of [`crate::aws_credentials`].
 //! Objects are written once with a conditional PUT and deleted only for
 //! shared-conversation bodies after a database tombstone. Callers
 //! must be blocking threads (as with the sync Postgres client), never async tasks.
@@ -13,6 +14,7 @@ use reqwest::{Client, Method, Response, Url, redirect};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder, Runtime};
 
+use crate::aws_credentials::Ambient;
 use crate::backend::{
     ImmutableBackend, ObjectKey, ObjectMetadata, PutOutcome, range_end, validate_identifier,
 };
@@ -30,6 +32,8 @@ pub struct S3Config {
     pub region: String,
     pub bucket: String,
     pub prefix: String,
+    /// Both keys empty means ambient role credentials (environment, container or instance
+    /// role); setting only one is invalid.
     pub access_key_id: String,
     pub secret_access_key: String,
 }
@@ -48,6 +52,10 @@ impl fmt::Debug for S3Config {
 }
 
 impl S3Config {
+    pub fn is_ambient(&self) -> bool {
+        self.access_key_id.is_empty() && self.secret_access_key.is_empty()
+    }
+
     /// Errors name the field, never its value.
     pub fn validate(&self) -> Result<()> {
         let bad = |what: &str| Err(Error::Invalid(format!("S3 {what}")));
@@ -85,12 +93,13 @@ impl S3Config {
                  '.', '-' or '_'",
             );
         }
-        if self.access_key_id.is_empty()
-            || !self
-                .access_key_id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-'))
-            || self.secret_access_key.is_empty()
+        if !self.is_ambient()
+            && (self.access_key_id.is_empty()
+                || !self
+                    .access_key_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-'))
+                || self.secret_access_key.is_empty())
         {
             return bad(
                 "credentials need a non-empty secret and a key id of A-Z, a-z, 0-9, '.', '_', '+' or '-'",
@@ -132,6 +141,8 @@ pub struct S3Backend {
     base: String,
     host: String,
     client: Client,
+    /// Present when the configuration has no keys.
+    ambient: Option<Ambient>,
     runtime: Option<Runtime>,
 }
 
@@ -154,11 +165,13 @@ impl S3Backend {
                     .build()
             })
             .map_err(|_| Error::Io(std::io::Error::other("object store client setup failed")))?;
+        let ambient = config.is_ambient().then(|| Ambient::new(client.clone()));
         Ok(Self {
             config,
             base,
             host,
             client,
+            ambient,
             runtime: Some(runtime),
         })
     }
@@ -228,12 +241,31 @@ impl S3Backend {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let signed = sign(
-            &self.config,
+        let role;
+        let (key_id, secret, token) = match &self.ambient {
+            Some(source) => {
+                role = source.credentials().await?;
+                (
+                    role.access_key_id.as_str(),
+                    role.secret_access_key.as_str(),
+                    role.session_token.as_deref(),
+                )
+            }
+            None => (
+                self.config.access_key_id.as_str(),
+                self.config.secret_access_key.as_str(),
+                None,
+            ),
+        };
+        let mut headers = extra.to_vec();
+        headers.extend(token.map(|token| ("x-amz-security-token", token)));
+        let signed = sign_with(
+            &self.config.region,
+            (key_id, secret),
             method.as_str(),
             &self.host,
             path,
-            extra,
+            &headers,
             &payload_sha256,
             now,
         );
@@ -244,7 +276,7 @@ impl S3Backend {
             .header("x-amz-content-sha256", payload_sha256)
             .header("authorization", signed.authorization)
             .body(body);
-        for (name, value) in extra {
+        for (name, value) in &headers {
             request = request.header(*name, *value);
         }
         request.send().await.map_err(transport)
@@ -599,6 +631,31 @@ pub fn sign(
     payload_sha256: &str,
     unix_seconds: u64,
 ) -> Signed {
+    sign_with(
+        &config.region,
+        (&config.access_key_id, &config.secret_access_key),
+        method,
+        host,
+        path,
+        extra,
+        payload_sha256,
+        unix_seconds,
+    )
+}
+
+/// [`sign`] for explicit `(access key id, secret)` keys; the caller adds `x-amz-security-token`
+/// to `extra` for temporary keys.
+#[allow(clippy::too_many_arguments)] // The SigV4 inputs; a struct would only rename them.
+fn sign_with(
+    region: &str,
+    (access_key_id, secret_access_key): (&str, &str),
+    method: &str,
+    host: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    payload_sha256: &str,
+    unix_seconds: u64,
+) -> Signed {
     let amz_date = format_date(unix_seconds);
     let day = &amz_date[..8];
     let mut headers: Vec<(String, &str)> = vec![
@@ -629,16 +686,16 @@ pub fn sign(
     // The empty line is the (always empty) canonical query string.
     let canonical =
         format!("{method}\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_sha256}");
-    let scope = format!("{day}/{}/s3/aws4_request", config.region);
+    let scope = format!("{day}/{region}/s3/aws4_request");
     let to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         digest(canonical.as_bytes())
     );
     let mut key = hmac_sha256(
-        format!("AWS4{}", config.secret_access_key).as_bytes(),
+        format!("AWS4{secret_access_key}").as_bytes(),
         day.as_bytes(),
     );
-    for part in [config.region.as_str(), "s3", "aws4_request"] {
+    for part in [region, "s3", "aws4_request"] {
         key = hmac_sha256(&key, part.as_bytes());
     }
     let signature: String = hmac_sha256(&key, to_sign.as_bytes())
@@ -647,8 +704,7 @@ pub fn sign(
         .collect();
     Signed {
         authorization: format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            config.access_key_id
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
         ),
         amz_date,
     }
@@ -709,6 +765,54 @@ mod tests {
     }
 
     #[test]
+    fn role_credentials_are_signed_with_their_session_token() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let length = stream.read(&mut buffer).unwrap();
+            let reply = b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n";
+            stream.write_all(reply).unwrap();
+            String::from_utf8_lossy(&buffer[..length]).to_ascii_lowercase()
+        });
+        let mut keyless = config(&endpoint);
+        keyless.access_key_id.clear();
+        keyless.secret_access_key.clear();
+        assert!(keyless.is_ambient() && keyless.validate().is_ok());
+        let mut backend = S3Backend::open(keyless).unwrap();
+        backend.ambient = Some(Ambient::with(
+            Client::builder().no_proxy().build().unwrap(),
+            Box::new(|name| match name {
+                "AWS_ACCESS_KEY_ID" => Some("ASIATEMPORARY".into()),
+                "AWS_SECRET_ACCESS_KEY" => Some("temporary-secret".into()),
+                "AWS_SESSION_TOKEN" => Some("session-token-value".into()),
+                _ => None,
+            }),
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+        ));
+        let key = ObjectKey::new(
+            "team",
+            "repository",
+            crate::backend::SOURCE_PROFILE_V1,
+            digest(b"x"),
+        )
+        .unwrap();
+        backend.delete_incarnation(&key, "v1").unwrap();
+        let request = server.join().unwrap();
+        assert!(request.contains("x-amz-security-token: session-token-value"));
+        let authorization = request
+            .lines()
+            .find(|line| line.starts_with("authorization:"))
+            .unwrap();
+        assert!(authorization.contains("credential=asiatemporary/"));
+        assert!(authorization.contains("x-amz-security-token"));
+        assert!(!authorization.contains("temporary-secret"));
+    }
+
+    #[test]
     fn dates_format_in_utc() {
         assert_eq!(format_date(0), "19700101T000000Z");
         assert_eq!(format_date(1_369_353_600), "20130524T000000Z");
@@ -755,6 +859,7 @@ mod tests {
         let mut bad = config("https://s3.example.com");
         bad.secret_access_key = String::new();
         assert!(bad.validate().is_err());
+        assert!(!bad.is_ambient());
         assert!(!format!("{:?}", config("https://s3.example.com")).contains("wJalr"));
     }
 }

@@ -58,16 +58,30 @@ selects an S3-compatible store instead; the bucket must already exist.
 - `AGENTSCM_S3_ACCESS_KEY_ID`, and exactly one of
   `AGENTSCM_S3_SECRET_ACCESS_KEY_FILE` (preferred; same file rules as the
   sign-in secrets) or `AGENTSCM_S3_SECRET_ACCESS_KEY`. Credentials never come
-  from a flag and are not logged; startup prints only `objects: s3` or
-  `objects: local`.
-- `AGENTSCM_S3_REGION` (default `us-east-1`) and `AGENTSCM_S3_ENDPOINT`
+  from a flag and are not logged; startup prints only `objects: s3` (with
+  `(role credentials)` when no keys are set) or `objects: local`.
+- Set none of the three key variables to use the AWS role the process runs
+  with instead of configured keys. The Hub looks, in order, at the standard
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`
+  environment variables; at the container credential endpoint named by
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` (ECS task roles and EKS Pod Identity;
+  the full URI must be loopback or the agent's link-local address, and
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN` or `..._FILE` is sent as its
+  authorization); and at the EC2 instance metadata service (IMDSv2, skipped
+  when `AWS_EC2_METADATA_DISABLED=true`). Temporary keys are renewed five
+  minutes before they expire. Setting only one of the key id and secret is an
+  error.
+- `AGENTSCM_S3_REGION` (default `us-east-1`; with role credentials, `AWS_REGION`
+  when it is set) and `AGENTSCM_S3_ENDPOINT`
   (default `https://s3.<region>.amazonaws.com`): `https://`, or `http://` only
   for a loopback IP, with no path, credentials, query or fragment.
 
 Limits:
 
-- Path-style addressing only; static access keys only (no session tokens or
-  instance roles).
+- Path-style addressing only. Role credentials come from the environment, the
+  container endpoint or the instance metadata service; shared AWS profile files,
+  SSO and web-identity (EKS service account) exchange are not read.
 - One PUT per object, up to the existing object size limit; no multipart.
 - Exact put-if-absent needs conditional PUT (`If-None-Match: *`): AWS S3,
   Cloudflare R2 and versitygw support it. A server that ignores the header
