@@ -44,6 +44,12 @@ pub(super) fn last_refusal(repo: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+/// The HTTP status of a strict reply's error text (`"403 from repos"`) when it is definite.
+fn definite_refusal(message: &str) -> Option<u16> {
+    let status = message.split(' ').next()?.parse().ok()?;
+    matches!(status, 403 | 404 | 422).then_some(status)
+}
+
 /// Records a definite refusal so an admin sees it without Hub logs, and returns the error.
 fn refused(repo: &str, reason: &str, context: Option<&str>, status: u16) -> GhError {
     REFUSALS
@@ -1277,13 +1283,23 @@ async fn reconcile_pull_inner(
             id
         }
         None => {
-            // A 403 here, after every status was accepted, is the comment permission.
+            // A definite refusal (usually a missing comment permission, or a locked
+            // conversation). Real GitHub sends a permission 403 with rate-limit headers, which
+            // arrives as `Failed`; without them it is `Auth`.
             match api
                 .create_comment(token, &repo.full_name, number, &rendered)
                 .await
             {
-                Err(GhError::Auth(message)) if message.starts_with("403") => {
-                    return Err(refused(&repo.id, "validation_comment_refused", None, 403));
+                Err(GhError::Auth(message) | GhError::Failed(message))
+                    if definite_refusal(&message).is_some() =>
+                {
+                    let status = definite_refusal(&message).unwrap_or_default();
+                    return Err(refused(
+                        &repo.id,
+                        "validation_comment_refused",
+                        None,
+                        status,
+                    ));
                 }
                 other => other?,
             }
@@ -1295,6 +1311,14 @@ async fn reconcile_pull_inner(
     idle.comment_id = Some(id);
     if !cas(&*hub.store, &repo.id, number, Some(&next), &idle)? {
         return Err(failed("validation journal completion changed"));
+    }
+    // Published, so an older refusal no longer describes this repository.
+    if let Some(refusals) = REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        refusals.remove(&repo.id);
     }
     produce_invalidation_notices(hub, repo, pull, &plan.invalidations)?;
     Ok(())

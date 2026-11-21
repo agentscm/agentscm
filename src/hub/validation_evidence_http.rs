@@ -10,20 +10,21 @@ use super::validation_evidence::{
 };
 use super::{HubError, HubState};
 use crate::local_validation::bundle::{MAX_BUNDLE_BYTES, ValidationBundleV1};
+use axum::http::StatusCode;
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     routing::{get, post},
 };
+use serde::Deserialize;
+use serde_json::{Value, json};
+
 /// The forge check module is Unix-only; elsewhere the binding is not compared.
 #[cfg(not(unix))]
 fn ruleset_requirement(_: &Value, _: &str, _: Option<i64>) -> &'static str {
     "unknown"
 }
-use axum::http::StatusCode;
-use serde::Deserialize;
-use serde_json::{Value, json};
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -81,7 +82,8 @@ async fn configure(
                         .unwrap_or("the connected App"),
                     row.full_name
                 ))
-                .with_field("publisher", publisher),
+                .with_field("publisher", publisher)
+                .with_field("last_refusal", last_refusal(&row.id).into()),
         );
     }
     let config = ValidationSummaryConfig {
@@ -94,13 +96,19 @@ async fn configure(
     blocking(&state, move || store.configure_validation_summary(&stored)).await?;
     let mut reply = serde_json::to_value(&config).map_err(|_| ApiError::invalid())?;
     reply["publisher"] = publisher;
-    // The publication controller is Unix-only, so elsewhere nothing has been refused.
-    #[cfg(unix)]
-    let last_refusal = super::validation_summary::last_refusal(&row.id);
-    #[cfg(not(unix))]
-    let last_refusal: Option<Value> = None;
-    reply["last_refusal"] = last_refusal.into();
+    reply["last_refusal"] = last_refusal(&row.id).into();
     Ok(Json(reply))
+}
+
+/// The publication controller is Unix-only, so elsewhere nothing has been refused.
+fn last_refusal(repo: &str) -> Option<Value> {
+    #[cfg(unix)]
+    return super::validation_summary::last_refusal(repo);
+    #[cfg(not(unix))]
+    {
+        let _ = repo;
+        None
+    }
 }
 
 /// What GitHub says the connected credential may publish, read with existing credentials only.
@@ -114,6 +122,10 @@ async fn publisher(state: &HubState, conn: &Connection, row: &ConnectedRepositor
     let mut out = json!({"connection": conn.id, "kind": conn.kind, "app_id": conn.app_id,
         "identity": identity, "permissions": "not_inspected", "required_contexts": "unknown",
         "classic_protection": "not_read", "warnings": []});
+    // Only canonical GitHub, as publication requires: never send another forge's token here.
+    if conn.provider != "github" || !state.sync.matches_forge(conn) {
+        return out;
+    }
     let Ok(api) = state.sync.api() else {
         return out;
     };

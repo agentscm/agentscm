@@ -5455,6 +5455,7 @@ async fn enabling_validation_summaries_names_the_app_and_refuses_a_read_only_one
             .unwrap()
             .contains("statuses: write")
     );
+    assert_eq!(refused["last_refusal"], Value::Null);
     assert_eq!(env.store.validation_summary_config(&repo.id).unwrap(), None);
 
     // With statuses granted it enables, and still warns about the rest.

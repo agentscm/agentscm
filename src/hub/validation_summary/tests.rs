@@ -746,13 +746,24 @@ async fn refused_status_is_recorded_with_its_context_for_admins() {
     let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
     assert_eq!(refusal["status"], 403);
     assert_eq!(refusal["context"], context.as_str());
-    assert!(
-        refusal["reason"]
-            .as_str()
-            .is_some_and(|r| r.starts_with("validation_") && r.ends_with("_refused")),
+    // The first write of a new attempt is the pending invalidation of its status slots.
+    assert_eq!(
+        refusal["reason"], "validation_invalidation_refused",
         "{refusal}"
     );
     assert_eq!(f.counts().0, 0, "no summary comment after a refused status");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_comment_with_rate_limit_headers_is_recorded() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.forge.with(|s| s.reject_comments = Some(403));
+    assert!(f.run().await.is_err());
+    let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
+    assert_eq!(refusal["reason"], "validation_comment_refused", "{refusal}");
+    assert_eq!(refusal["status"], 403);
+    assert_eq!(refusal["context"], serde_json::Value::Null);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
