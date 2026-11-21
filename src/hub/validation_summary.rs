@@ -29,6 +29,38 @@ const MAX_VERIFICATION_BYTES: usize = 64 * 1024 * 1024;
 fn failed(message: &str) -> GhError {
     GhError::Failed(message.into())
 }
+
+// ponytail: in memory per process, like merge-queue readiness; persist it if restarts hide too much.
+static REFUSALS: std::sync::Mutex<Option<HashMap<String, serde_json::Value>>> =
+    std::sync::Mutex::new(None);
+
+/// The last definite GitHub refusal of a validation status or comment for `repo` in this process.
+pub(super) fn last_refusal(repo: &str) -> Option<serde_json::Value> {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()?
+        .get(repo)
+        .cloned()
+}
+
+/// Records a definite refusal so an admin sees it without Hub logs, and returns the error.
+fn refused(repo: &str, reason: &str, context: Option<&str>, status: u16) -> GhError {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            repo.to_owned(),
+            serde_json::json!({"reason": reason, "context": context, "status": status,
+                "at": super::store::unix_now()}),
+        );
+    let message = match context {
+        Some(context) => format!("{reason}: GitHub replied {status} for status context {context}"),
+        None => format!("{reason}: GitHub replied {status}"),
+    };
+    GhError::Failed(message)
+}
 fn digest(bytes: impl AsRef<[u8]>) -> String {
     crate::store::digest(bytes.as_ref())
 }
@@ -1140,7 +1172,14 @@ async fn reconcile_pull_inner(
         )?;
         api.post_commit_status(token, &repo.full_name, &status)
             .await?
-            .map_err(|_| failed("validation invalidation refused"))?;
+            .map_err(|code| {
+                refused(
+                    &repo.id,
+                    "validation_invalidation_refused",
+                    Some(&slot.context),
+                    code,
+                )
+            })?;
     }
     for (slot, result, reason) in &plan.statuses {
         // Changed evidence cannot release this Attempting owner; no other controller can
@@ -1189,7 +1228,14 @@ async fn reconcile_pull_inner(
         )?;
         api.post_commit_status(token, &repo.full_name, &status)
             .await?
-            .map_err(|_| failed("validation verdict refused"))?;
+            .map_err(|code| {
+                refused(
+                    &repo.id,
+                    "validation_status_refused",
+                    Some(&slot.context),
+                    code,
+                )
+            })?;
     }
     let current = async {
         let current = api
@@ -1231,8 +1277,16 @@ async fn reconcile_pull_inner(
             id
         }
         None => {
-            api.create_comment(token, &repo.full_name, number, &rendered)
-                .await?
+            // A 403 here, after every status was accepted, is the comment permission.
+            match api
+                .create_comment(token, &repo.full_name, number, &rendered)
+                .await
+            {
+                Err(GhError::Auth(message)) if message.starts_with("403") => {
+                    return Err(refused(&repo.id, "validation_comment_refused", None, 403));
+                }
+                other => other?,
+            }
         }
     };
     let mut idle = next.clone();
@@ -1350,7 +1404,14 @@ async fn abort_attempt(
         )?;
         api.post_commit_status(token, &repo.full_name, &status)
             .await?
-            .map_err(|_| failed("validation invalidation refused"))?;
+            .map_err(|code| {
+                refused(
+                    &repo.id,
+                    "validation_invalidation_refused",
+                    Some(&slot.context),
+                    code,
+                )
+            })?;
     }
     let mut idle = attempt.clone();
     idle.revision += 1;

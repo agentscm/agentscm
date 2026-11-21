@@ -734,6 +734,28 @@ async fn uncertain_status_never_retries_or_creates_comment() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_status_is_recorded_with_its_context_for_admins() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    let context = f.policies[0].status_context();
+    f.forge.with(|s| {
+        s.reject_status_contexts.insert(context.clone(), 403);
+    });
+    let error = format!("{:?}", f.run().await.unwrap_err());
+    assert!(error.contains(&context), "{error}");
+    let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
+    assert_eq!(refusal["status"], 403);
+    assert_eq!(refusal["context"], context.as_str());
+    assert!(
+        refusal["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("validation_") && r.ends_with("_refused")),
+        "{refusal}"
+    );
+    assert_eq!(f.counts().0, 0, "no summary comment after a refused status");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_marker_is_never_adopted_and_wrong_signature_cannot_pass() {
     let f = Fixture::new().await;
     f.submit(0, Fixture::now(), true);

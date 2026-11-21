@@ -5417,3 +5417,69 @@ async fn merged_tombstones_keep_raw_provider_identity_before_qualifying_publicat
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabling_validation_summaries_names_the_app_and_refuses_a_read_only_one() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    env.poll().await;
+    let repo = env.repo();
+    env.fake.with(|state| {
+        state.installation_permissions =
+            Some(json!({"statuses": "read", "pull_requests": "read", "contents": "read"}));
+        state.repos.get_mut(&REPO_ID).unwrap().rules = Some(json!([
+            {"type": "required_status_checks", "parameters": {"required_status_checks": [
+                {"context": "agentscm/validation", "integration_id": 99}]}}]));
+    });
+    let path = format!("/v1/hub/admin/repos/{}/validation-summary", repo.id);
+    let admin = env.admin.clone();
+    let (status, refused) = env
+        .post(&path, Some(&admin), json!({"enabled": true}))
+        .await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["error"], "forge_permission_missing", "{refused}");
+    let publisher = &refused["publisher"];
+    assert!(
+        publisher["identity"].as_str().unwrap().ends_with("[bot]"),
+        "{refused}"
+    );
+    assert_eq!(publisher["permissions"]["statuses"], "read");
+    assert_eq!(
+        publisher["required_contexts"]["agentscm/validation"],
+        "required_from_another_source"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("statuses: write")
+    );
+    assert_eq!(env.store.validation_summary_config(&repo.id).unwrap(), None);
+
+    // With statuses granted it enables, and still warns about the rest.
+    env.fake.with(|state| {
+        state.installation_permissions =
+            Some(json!({"statuses": "write", "pull_requests": "read", "contents": "read"}));
+    });
+    let (status, enabled) = env
+        .post(&path, Some(&admin), json!({"enabled": true}))
+        .await;
+    assert_eq!(status, 200, "{enabled}");
+    assert_eq!(enabled["enabled"], true);
+    assert_eq!(enabled["last_refusal"], Value::Null);
+    assert_eq!(
+        enabled["publisher"]["warnings"],
+        json!([
+            "comment_permission_missing",
+            "required_context_bound_to_another_source"
+        ])
+    );
+    assert!(
+        env.store
+            .validation_summary_config(&repo.id)
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+}
