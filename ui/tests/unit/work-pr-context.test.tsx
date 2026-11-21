@@ -24,6 +24,14 @@ describe('explicit Work PR relationship', () => {
     expect(screen.queryByText(/Prior checkpoint text/)).toBeNull()
     expect(screen.getByText('PR evidence or prerequisites changed').closest('li')?.className).not.toContain('tone-ok')
   })
+  it('names the transition kind of a Work transition and falls back to a generic label', () => {
+    const changed = { ...item, state: 'active', lead_agent: 'codex', title: 'Fixture Work' } as WorkItem
+    const { unmount } = render(<WorkUpdate event={{ seq: 17, at: 1_793_387_000, kind: 'work_transition', work_id: item.id, item: changed, transition: 'prune_participants' }} />)
+    expect(screen.getByText('Participants pruned')).toBeTruthy()
+    unmount()
+    render(<WorkUpdate event={{ seq: 18, at: 1_793_387_000, kind: 'work_transition', work_id: item.id, item: changed }} />)
+    expect(screen.getByText('Outcome, reservation or participants changed')).toBeTruthy()
+  })
   it('renders issue links as metadata without repeating a completion report', () => {
     const changed = { ...item, state: 'finished', lead_agent: 'codex', title: 'Fixture Work', current: { summary: 'Prior checkpoint text' } } as WorkItem
     render(<WorkUpdate event={{ seq: 16, at: 1_793_387_000, kind: 'work_issue_link', work_id: item.id, item: changed }} />)

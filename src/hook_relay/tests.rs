@@ -30,6 +30,7 @@ fn address_in(scratch: &tempfile::TempDir, hub: &str) -> Address {
 
 fn request() -> HookRequest {
     HookRequest {
+        native: None,
         agent: "claude".into(),
         repo: Some("acme/widgets".into()),
         token: "synthetic-token".into(),

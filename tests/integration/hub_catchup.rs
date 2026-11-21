@@ -12,6 +12,9 @@ use agentscm::hub::catchup::{
     CatchupPublicationRepair, CatchupQuery, CatchupRepositoryScope, CatchupSourceStatus,
     NewCatchupMerge,
 };
+use agentscm::hub::notices::{
+    NewOwnerNotice, OwnerNoticeRecipient, OwnerNoticeRoute, OwnerNoticeSourceKind,
+};
 use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
@@ -140,6 +143,21 @@ impl Fixture {
         Client::connect(&self._pg.as_ref().unwrap().url, NoTls)
             .unwrap()
             .query_one("SELECT COUNT(*) FROM hub_catchup_publication_failures", &[])
+            .unwrap()
+            .get(0)
+    }
+
+    fn request_repository(&self, id: &str) -> String {
+        const SQL: &str = "SELECT repository FROM hub_coordination_requests WHERE id=";
+        if let Some(database) = &self.database {
+            return rusqlite::Connection::open(database)
+                .unwrap()
+                .query_row(&format!("{SQL}'{id}'"), [], |row| row.get(0))
+                .unwrap();
+        }
+        Client::connect(&self._pg.as_ref().unwrap().url, NoTls)
+            .unwrap()
+            .query_one(&format!("{SQL}'{id}'"), &[])
             .unwrap()
             .get(0)
     }
@@ -322,6 +340,157 @@ fn continuation(page: &agentscm::hub::catchup::CatchupPage, limit: usize) -> Cat
         merge_after: Some(page.next_merge_after),
         merge_through: Some(page.merge_through),
         limit,
+        wait_seconds: 0,
+    }
+}
+
+fn owner_notice_pointers_are_frozen_and_do_not_acknowledge(fixture: &Fixture) {
+    let now = unix_now();
+    let sender = fixture.owner(80);
+    let recipient = fixture.owner(81);
+    let sender_token = fixture.token(&sender, "notice-sender", REPOSITORY_ID, false);
+    let recipient_token = fixture.token(&recipient, "notice-recipient", REPOSITORY_ID, false);
+    let request = |key: &str| NewOwnerNotice {
+        idempotency_key: key.into(),
+        source_kind: OwnerNoticeSourceKind::Addressed,
+        source_id: format!("source-{key}"),
+        recipient: OwnerNoticeRecipient {
+            owner: recipient.clone(),
+            provider: "github".into(),
+            host: "github.com".into(),
+        },
+        route: OwnerNoticeRoute::Private,
+        body: "Review the current notice on the Hub.".into(),
+    };
+    let first_notice = fixture
+        .store
+        .owner_notice_put(&sender_token, &request("first"), now)
+        .unwrap();
+    for number in [701, 702] {
+        let (merge, observed_at) = merge(number, now);
+        fixture
+            .store
+            .record_catchup_merge(&scope(REPOSITORY_ID), &merge, observed_at)
+            .unwrap();
+    }
+    let page = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: "agent:notice-session".into(),
+                delivery_client: "notice-reader".into(),
+                limit: 1,
+                ..CatchupQuery::default()
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(page.owner_notices.len(), 1);
+    assert_eq!(page.owner_notices[0].id, first_notice.id);
+
+    let second_notice = fixture
+        .store
+        .owner_notice_put(&sender_token, &request("second"), now + 2)
+        .unwrap();
+    let replay = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: page.subscriber.clone(),
+                delivery_client: page.delivery_client.clone(),
+                ..CatchupQuery::default()
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        replay, page,
+        "an open delivery keeps its immutable notice window"
+    );
+    let merge_continuation = fixture
+        .store
+        .work_catchup(&recipient_token, &continuation(&page, 1), now + 4)
+        .unwrap();
+    assert!(
+        merge_continuation.owner_notices.is_empty(),
+        "a merge-only continuation never leaks first-page notice pointers inserted meanwhile"
+    );
+
+    let listed = fixture
+        .store
+        .owner_notice_list(
+            &WorkLifecycleReader::Token(&recipient_token),
+            None,
+            10,
+            now + 6,
+        )
+        .unwrap();
+    assert_eq!(listed.notices.len(), 2);
+    assert!(
+        listed
+            .notices
+            .iter()
+            .all(|notice| notice.acknowledged_at.is_none())
+    );
+    assert!(
+        listed
+            .notices
+            .iter()
+            .any(|notice| notice.id == second_notice.id)
+    );
+
+    let human = fixture
+        .store
+        .work_catchup(
+            &recipient_token,
+            &CatchupQuery {
+                subscriber: "human".into(),
+                delivery_client: "owner-browser".into(),
+                ..CatchupQuery::default()
+            },
+            now + 7,
+        )
+        .unwrap();
+    assert!(human.owner_notices.is_empty());
+
+    if let Some(database) = &fixture.database {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .execute(
+                "UPDATE hub_catchup_deliveries SET page=json_remove(page,'$.owner_notices') WHERE id=?1",
+                [&page.delivery],
+            )
+            .unwrap();
+        let legacy = fixture
+            .store
+            .work_catchup(
+                &recipient_token,
+                &CatchupQuery {
+                    subscriber: page.subscriber.clone(),
+                    delivery_client: page.delivery_client.clone(),
+                    ..CatchupQuery::default()
+                },
+                now + 8,
+            )
+            .unwrap();
+        assert!(
+            legacy.owner_notices.is_empty(),
+            "old serialized pages still decode"
+        );
+    }
+}
+
+#[test]
+fn sqlite_owner_notice_pointers_are_frozen_and_do_not_acknowledge() {
+    owner_notice_pointers_are_frozen_and_do_not_acknowledge(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_owner_notice_pointers_are_frozen_and_do_not_acknowledge() {
+    if let Some(fixture) = Fixture::postgres() {
+        owner_notice_pointers_are_frozen_and_do_not_acknowledge(&fixture);
     }
 }
 
@@ -656,6 +825,7 @@ fn compaction_delivery_guard(fixture: &Fixture) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             old + 1,
         )
@@ -1052,6 +1222,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now + 7,
         )
@@ -1419,7 +1590,10 @@ fn failed_publication_projection_can_be_repaired(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(252)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1458,7 +1632,10 @@ fn failed_publication_projection_can_be_repaired(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(252)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1662,7 +1839,10 @@ fn publication_repair_accepts_canonical_forge_observation(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(257)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1687,7 +1867,10 @@ fn publication_repair_accepts_canonical_forge_observation(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(257)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1760,7 +1943,10 @@ fn strict_publication_repair_rolls_back_projection_failure(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(256)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -1792,7 +1978,10 @@ fn strict_publication_repair_rolls_back_projection_failure(fixture: &Fixture) {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(256)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -2008,7 +2197,10 @@ fn postgres_projection_sql_failure_isolated_by_savepoint_and_retryable() {
     assert_eq!(
         fixture
             .store
-            .publication(REPOSITORY, &publication)
+            .publication(
+                &crate::repository_scope::github(REPOSITORY, Some(254)),
+                &publication
+            )
             .unwrap()
             .unwrap()
             .merge_commit
@@ -2099,8 +2291,8 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
         .execute(
             "INSERT INTO hub_publications
                 (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,
-                 branch_state,pr_number,merge_commit,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,'merged',?9,?10,?11,?11)",
+                 branch_state,pr_number,merge_commit,created_at,updated_at,repository_scope)
+             VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,'merged',?9,?10,?11,?11,?12)",
             rusqlite::params![
                 "pub_00000000000000000000000000000001",
                 REPOSITORY,
@@ -2113,6 +2305,7 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
                 301,
                 format!("{:040x}", 3),
                 now - 100,
+                crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
             ],
         )
         .unwrap();
@@ -2269,6 +2462,7 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
                     }],
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 at,
             )
@@ -2441,6 +2635,7 @@ fn why_marks_cut_lists(fixture: &Fixture) {
                         source_refs: Vec::new(),
                         depends_on: Vec::new(),
                         related_work: Vec::new(),
+                        finished_paths: None,
                     },
                     now + n as i64,
                 )
@@ -2588,6 +2783,7 @@ fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
                     source_refs: Vec::new(),
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 now,
             )
@@ -3159,6 +3355,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 }],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             now,
         )
@@ -3441,6 +3638,338 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
     );
 }
 
+// Recording a rename moves the Work to the new name in the same transaction, so its owner can
+// release it by person route. A collision leaves the Work under the old name and the rename stands.
+fn rename_repairs_work_namespace(fixture: &Fixture, collision: bool) {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let now = unix_now();
+    let old = "acme/before-rename";
+    let new = "acme/after-rename";
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 851,
+            },
+            "user-851",
+        )
+        .unwrap();
+    let old_token = fixture.token_for_repository(&user.id, "before", old, 851, false);
+    let new_token = fixture.token_for_repository(&user.id, "after", new, 851, false);
+    let start = |key: &str, path: &str| WorkStart {
+        issue_choice: None,
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        description: None,
+        session: format!("session-{key}"),
+        role: WorkRole::Lead,
+        scope: vec![path.into()],
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: vec![],
+        related_work: vec![],
+        takeover_generation: None,
+        preflight: None,
+    };
+    let work = fixture
+        .store
+        .work_start(&old_token, &start("retained", "src/retained.rs"), now)
+        .unwrap()
+        .item;
+    let blocked = fixture
+        .store
+        .work_start(&old_token, &start("proposal", "src/retained.rs"), now)
+        .unwrap();
+    let request_id = blocked.coordination_request.unwrap().id;
+    if collision {
+        fixture
+            .store
+            .work_start(&new_token, &start("retained", "src/collision.rs"), now)
+            .unwrap();
+    }
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85100000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, old, None, None)
+        .unwrap();
+    let before_rename = fixture.store.latest_event_seq().unwrap();
+    let renamed = fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, new, None, None)
+        .unwrap();
+    assert_eq!(renamed.full_name, new, "the rename commits either way");
+    let rename_events = fixture.events("repository_renamed");
+    assert_eq!(rename_events.len(), 1);
+    assert_eq!(
+        rename_events[0]["work_repair"],
+        if collision { "skipped" } else { "applied" }
+    );
+    assert_eq!(
+        rename_events[0]
+            .get("work_repair_reason")
+            .and_then(|v| v.as_str()),
+        collision.then_some("conflict")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .repository_by_id("github.com", 851)
+            .unwrap()
+            .unwrap()
+            .full_name,
+        new
+    );
+    let moved = fixture.store.work_get(&new_token, &work.id, now + 1);
+    if collision {
+        assert!(moved.unwrap().is_none(), "a collision leaves the Work");
+        assert!(
+            fixture
+                .store
+                .work_get(&old_token, &work.id, now + 1)
+                .is_err()
+        );
+        // The coordination request stayed under the old name too.
+        assert_eq!(fixture.request_repository(&request_id), old);
+        let new_inbox = fixture
+            .store
+            .coordination_list(&new_token, &Default::default(), now + 1)
+            .unwrap();
+        assert!(new_inbox.requests.iter().all(|r| r.id != request_id));
+        // Only the rename was appended: the rolled-back repair left no checkpoint events.
+        let appended: Vec<String> = fixture
+            .store
+            .events_after(before_rename, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(appended, ["repository_renamed"]);
+        return;
+    }
+    let moved = moved.unwrap().unwrap();
+    assert_eq!(moved.repository, new);
+    let inbox = fixture
+        .store
+        .coordination_list(&new_token, &Default::default(), now + 1)
+        .unwrap();
+    let request = inbox.requests.iter().find(|r| r.id == request_id).unwrap();
+    assert_eq!(request.targets[0].work_id, work.id);
+    let released = fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Person {
+                user: &user,
+                repository: new,
+                repository_id: 851,
+                is_admin: false,
+            },
+            &WorkTransitionRequest {
+                work_id: work.id.clone(),
+                operation_id: "person-release".into(),
+                generation: moved.generation,
+                expected_updated_seq: moved.updated_seq,
+                session: None,
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(released.item.repository, new);
+    // The same rename recorded again changes nothing.
+    let before = fixture.store.latest_event_seq().unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 851, new, None, None)
+        .unwrap();
+    assert_eq!(fixture.store.latest_event_seq().unwrap(), before);
+}
+
+// A repository with more Work than the online ceiling is renamed without the repair; the event
+// says so and the Work stays under the old name for `work repair-repository`.
+fn rename_over_the_online_ceiling_skips_the_repair(fixture: &Fixture) {
+    use agentscm::hub::connection::NewConnection;
+    let now = unix_now();
+    let (old, new) = ("acme/big-before", "acme/big-after");
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 852,
+            },
+            "user-852",
+        )
+        .unwrap();
+    let old_token = fixture.token_for_repository(&user.id, "big", old, 852, false);
+    let new_token = fixture.token_for_repository(&user.id, "bigger", new, 852, false);
+    let mut first = None;
+    for n in 0..501 {
+        let item = fixture
+            .store
+            .work_start(
+                &old_token,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("bulk-{n}")),
+                    title: format!("bulk {n}"),
+                    description: None,
+                    session: format!("session-bulk-{n}"),
+                    role: WorkRole::Lead,
+                    scope: vec![],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                now,
+            )
+            .unwrap()
+            .item;
+        first.get_or_insert(item.id);
+    }
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85200000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 852, old, None, None)
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 852, new, None, None)
+        .unwrap();
+    let events = fixture.events("repository_renamed");
+    assert_eq!(events[0]["work_repair"], "skipped");
+    assert_eq!(events[0]["work_repair_reason"], "too_many");
+    assert!(
+        fixture
+            .store
+            .work_get(&new_token, &first.unwrap(), now + 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_rename_over_the_online_ceiling_skips_the_repair() {
+    rename_over_the_online_ceiling_skips_the_repair(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_rename_over_the_online_ceiling_skips_the_repair() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_over_the_online_ceiling_skips_the_repair(&fixture);
+    }
+}
+
+// A rename of a repository with no Work under the old name records `none` and moves nothing.
+fn rename_without_work_records_none(fixture: &Fixture) {
+    use agentscm::hub::connection::NewConnection;
+    let user = fixture
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 853,
+            },
+            "user-853",
+        )
+        .unwrap();
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_85300000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &user.id,
+        )
+        .unwrap();
+    for name in ["acme/empty-before", "acme/empty-after"] {
+        fixture
+            .store
+            .upsert_repository(&connection.id, "github.com", 853, name, None, None)
+            .unwrap();
+    }
+    let events = fixture.events("repository_renamed");
+    assert_eq!(events[0]["work_repair"], "none");
+    assert!(events[0].get("work_repair_reason").is_none());
+}
+
+#[test]
+fn sqlite_rename_without_work_records_none() {
+    rename_without_work_records_none(&Fixture::sqlite());
+}
+#[test]
+fn postgres_rename_without_work_records_none() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_without_work_records_none(&fixture);
+    }
+}
+
+#[test]
+fn sqlite_rename_repairs_work_namespace() {
+    rename_repairs_work_namespace(&Fixture::sqlite(), false);
+    rename_repairs_work_namespace(&Fixture::sqlite(), true);
+}
+#[test]
+fn postgres_rename_repairs_work_namespace() {
+    if let Some(fixture) = Fixture::postgres() {
+        rename_repairs_work_namespace(&fixture, false);
+        rename_repairs_work_namespace(&Fixture::postgres().unwrap(), true);
+    }
+}
+
 #[test]
 fn sqlite_repository_namespace_repair() {
     repository_namespace_repair(&Fixture::sqlite(), false);
@@ -3524,6 +4053,7 @@ fn checkin(
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             at,
         )
@@ -4259,6 +4789,8 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic release".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )
@@ -4478,6 +5010,8 @@ fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
                 transition: WorkTransitionKind::Release,
                 reason: "No more scope is reserved".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             t0 + 10,
         )

@@ -842,17 +842,12 @@ async fn native_partial_delivery_can_be_continued_through_mcp() {
         !text.contains(forged_title),
         "forge titles must not enter automatic hook instructions"
     );
-    assert!(text.contains("AgentSCM catch-up preview"), "{text}");
-    assert!(text.contains("pull:7"), "{text}");
-    assert!(text.contains(&"a".repeat(40)), "{text}");
-    assert!(text.contains(&"b".repeat(40)), "{text}");
-    assert!(
-        text.contains("automatic preview creates no delivery or acknowledgement"),
-        "{text}"
-    );
+    // Counts only: commit hashes are the catch-up tool's to deliver.
+    assert!(text.contains("merged pull request(s)"), "{text}");
+    assert!(!text.contains(&"a".repeat(40)), "{text}");
     let instruction = text
         .lines()
-        .find(|line| line.contains("this exact JSON"))
+        .find(|line| line.contains("read them with agentscm_work_catchup {"))
         .expect(text);
     let arguments: Value =
         serde_json::from_str(&instruction[instruction.find('{').unwrap()..]).unwrap();
@@ -1016,7 +1011,11 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
     assert!(
         fixture
             .store
-            .live_intents(REPOSITORY, now + 3, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 3,
+                100
+            )
             .unwrap()
             .is_empty()
     );
@@ -1072,6 +1071,7 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             now + 5,
         )
@@ -1198,6 +1198,7 @@ fn explicit_preflight_overlap_coordinates_without_claiming(fixture: &StoreFixtur
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             now + 11,
         )

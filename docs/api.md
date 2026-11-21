@@ -52,7 +52,7 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 
 | Route | Effect |
 |---|---|
-| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps) |
+| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps). The body may carry `release_paths` (see [standup](standup.md)) |
 | `POST /v1/hub/session/coordination/withdraw` | Close a request whose requesting agent is gone, for the agent that leads the target Work; recorded with `via: "hub"` |
 | `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent; through a connected app, recorded as `answered_via_slack` |
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
@@ -139,12 +139,12 @@ identity, permission, generation and `updated_seq` in its own transaction. See
 
 | Route | Caller | Effect |
 |---|---|---|
-| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work and typed remedies |
+| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work, typed remedies (including `prune_participants`) and per-Work `findings` (`kind`, `evidence`, `complete`, optional `proposed` and `pull_request`; kinds `lapsed_hold`, `abandoned_session`, `orphaned_requests`, `contradictory_blocker`, `participant_cap` and `hidden_hold`, a live hold that a merged pull request hides, report-only and naming the pull request when the stage read shows it merged, and `no_pr_link`, report-only, for retained Work known to have no pull request link). `all_owners` is refused here |
 | `POST /v1/hub/standup/recovery/preview` | Agent or read-only bearer token | Body `work_id`, `remedy`, optional `session`, `scope` (handover) and `superseded_by` (supersede): effects, fences and the apply call |
-| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item |
-| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's as a Hub administrator |
+| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item. An item may carry `participants` (`token`, `session`) for `prune_participants` or `paths` for `release_paths` |
+| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's by `work_id` as a Hub administrator. Optional `all_owners: true`, for a Hub administrator only and not with `work_id`, pages every owner's unfinished Work; others get 400 "only a Hub administrator can inspect every owner's Work" |
 | `POST /v1/hub/session/work/recovery/preview` | Web sign-in with CSRF | The person's preview; `repository`, `work_id`, `remedy`, optional `scope` and `superseded_by` |
-| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items` |
+| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items`; an item may carry `participants` for `prune_participants` or `paths` for `release_paths` |
 
 MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
 `agentscm_work_transitions`.
@@ -350,8 +350,8 @@ the UI and the MCP text.
 keeps at most 256 evidence records. Refusals are 409 with `{error, message}`: `not_adopted` (the
 skill is not an `adopted` pin), `stale_head`, `not_independent`, `unknown_gate` and `run_full`;
 malformed evidence is 400. Adoption is read from `agentscm-skills.lock.json` on the default branch of
-a connected repository about every five minutes (GitHub only reads are exercised by tests; GitLab
-reads the file through its raw-file API and accepts JSON files only). A missing or invalid file there
+a connected repository about every five minutes (GitHub and GitLab both read the file as its exact bytes; GitLab
+through its repository files API). A missing or invalid file there
 clears the forge adoption.
 
 MCP tools: `agentscm_skill_list {repo}` (catalog with when to follow each skill, prerequisites,
@@ -445,6 +445,8 @@ work projections, whose usage totals count cache-read and cache-creation input b
 output. The last returns one work item's stored usage reports, at most 100 per page, without the
 session, author or reporter-supplied identifiers. See [work insights](work-insights.md) for
 pagination and evidence limits.
+
+The checkpoint body of `POST /v1/hub/standup/checkpoint` and MCP may carry `finished_paths` (exact scope entries the lead reports as done; see [standup](standup.md)); it is a self-report and the item shows it only when non-empty. An empty list clears the set; leaving the field out keeps it.
 
 `POST /v1/hub/standup/checkpoint` returns HTTP 409 with
 `{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the
@@ -656,7 +658,7 @@ other fields are additive, so a client that reads only `error` keeps working.
 | `retry_after_seconds` | Present only when `retryable` and the Hub knows a wait. |
 | `recovery` | `{action, command?}`. `action` is one of `retry`, `wait`, `sign_in`, `renew_credential`, `reconnect`, `provide_field`, `start_session`, `inspect_work`, `ask_owner`, `update_client`, `contact_operator`, `none`. `command` is a fixed command such as `agentscm client renew`, never built from caller text. |
 | `fields` | For input problems: `{name, problem, hint}` where `name` is a request field name and `problem` is `missing`, `unknown`, `wrong_type`, `invalid`, `too_long` or `conflict`. A value the caller sent is never echoed. |
-| `correlation_id` | `cor_` plus 32 hex characters, generated by the Hub for this failure, also sent as the `x-agentscm-correlation-id` response header. The Hub's single diagnostic log line for the failure carries the same `ref`, so an operator can find the server-side cause. It is never taken from the caller and never derived from a token, session or user. If the operating system cannot supply entropy the field is omitted. |
+| `correlation_id` | `cor_` plus 32 hex characters, generated by the Hub for this failure, also sent as the `x-agentscm-correlation-id` response header. When the Hub logs a diagnostic line for the failure, that line carries the same `ref`, so an operator can find the server-side cause. Every failure mapped from an internal Hub error is logged once, by the code that first built its envelope (mapping a rejection that already carries an envelope logs nothing more); a failure raised directly from a registered code is logged only when its status is 500 or higher, so a 4xx such as a bad request or a refused credential has a `ref` but no log line. It is never taken from the caller and never derived from a token, session or user. If the operating system cannot supply entropy the field is omitted. |
 
 Per-code keys that already existed (`current_seq` on `work_checkpoint_sequence_conflict`, the
 `overlaps`, `preflight` and `coordination_request` payloads, `limit` on `work_storage_capacity`)
@@ -685,9 +687,12 @@ deliberately terse refusals and does not attach a reference.
 
 Registered codes:
 
+An incomplete catch-up continuation returns `catchup_continuation_incomplete`. Supply `delivery`, `event_after`, `event_through`, `merge_after` and `merge_through` together from the same delivery, or omit all five fields to start a fresh delivery. The error names fields without echoing their supplied values.
+
 | Code | HTTP | Retryable | Recovery action |
 | --- | ---: | --- | --- |
 | `invalid_request` | 400 | no | `provide_field` |
+| `catchup_continuation_incomplete` | 400 | no | `provide_field` |
 | `not_found` | 404 | no | `none` |
 | `read_only` | 403 | no | `ask_owner` |
 | `forbidden` | 403 | no | `ask_owner` |

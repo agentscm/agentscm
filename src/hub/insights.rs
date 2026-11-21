@@ -1041,6 +1041,7 @@ mod tests {
             updated_at: last.at,
             created_seq: 1,
             updated_seq: last.seq,
+            finished_paths: Vec::new(),
         };
         InsightInput {
             item,

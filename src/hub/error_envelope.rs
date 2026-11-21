@@ -109,6 +109,7 @@ macro_rules! error_codes {
 }
 
 error_codes! {
+    CatchupContinuationIncomplete => ("catchup_continuation_incomplete", 400, false, ProvideField, "Catch-up continuation requires delivery, event_after, event_through, merge_after and merge_through together from the same delivery. For a fresh delivery, omit all five fields."),
     InvalidRequest => ("invalid_request", 400, false, ProvideField, "The Hub rejected an invalid request; check the required fields and send a corrected request."),
     NotFound => ("not_found", 404, false, None, "The resource was not found; check the requested identifier."),
     ReadOnly => ("read_only", 403, false, AskOwner, "This credential is read-only; use an authorized agent credential for changes."),
@@ -861,6 +862,55 @@ fn sanitized_value(value: &Value, clean: fn(&str) -> String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn catchup_partial_tuples_keep_actionable_diagnosis_through_http_and_mcp() {
+        use super::super::catchup::CatchupQuery;
+        use axum::response::IntoResponse;
+        for mask in 0..32 {
+            let query = CatchupQuery {
+                delivery: (mask & 1 != 0).then(|| format!("cup_{}", "a".repeat(32))),
+                event_after: (mask & 2 != 0).then_some(88),
+                event_through: (mask & 4 != 0).then_some(99),
+                merge_after: (mask & 8 != 0).then_some(0),
+                merge_through: (mask & 16 != 0).then_some(0),
+                ..CatchupQuery::default()
+            };
+            if mask == 0 || mask == 31 {
+                query.validate().unwrap();
+                continue;
+            }
+            let error = query.validate().unwrap_err();
+            let envelope = from_hub_error(&error);
+            assert_eq!(envelope.code, "catchup_continuation_incomplete");
+            assert!(!envelope.retryable);
+            let response = super::super::http::ApiError::from(error).into_response();
+            assert_eq!(response.status(), 400);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let decoded = decode(400, &body);
+            let mcp = decoded.mcp();
+            for message in [
+                decoded.message.as_str(),
+                mcp["content"][0]["text"].as_str().unwrap(),
+            ] {
+                for field in [
+                    "delivery",
+                    "event_after",
+                    "event_through",
+                    "merge_after",
+                    "merge_through",
+                ] {
+                    assert!(message.contains(field), "{message}");
+                }
+                assert!(message.contains("omit all five fields"));
+                assert!(!message.contains(&"a".repeat(32)));
+                assert!(!decoded.message.contains("88"));
+            }
+        }
+    }
+
     #[test]
     fn every_registered_code_is_documented_in_the_api_reference() {
         let docs = include_str!("../../docs/api.md");

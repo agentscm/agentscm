@@ -1,16 +1,21 @@
-//! The Hub UI at `/ui/`: read-only status tokens and opt-in workspace sessions. The local service
-//! (`agentscm serve --front-door`) serves the same page for this computer's repositories.
+//! Optional Hub dashboard assets and the minimal headless sign-in landing page.
+#[cfg(feature = "ui")]
 use std::sync::LazyLock;
 
 use axum::Router;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::header;
+#[cfg(feature = "ui")]
+use axum::http::{HeaderMap, StatusCode};
+#[cfg(feature = "ui")]
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+#[cfg(feature = "ui")]
 use sha2::{Digest, Sha256};
 
 // `'unsafe-inline'` for styles only: React sets inline `style` attributes, which `style-src` governs.
 // Fonts and images are inlined into app.css as `data:` URIs, hence `font-src` and `img-src` allow `data:`.
 // `manifest-src` lets the browser fetch /ui/manifest.webmanifest, which makes the page installable as an app.
+#[cfg(feature = "ui")]
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
     img-src 'self' data:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; \
     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -33,12 +38,7 @@ const ICON_192: &[u8] =
 const ICON_512: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/icon-512.png"));
 
-#[cfg(not(feature = "ui"))]
-const INDEX: &[u8] = b"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-    <title>AgentSCM</title></head><body><p>This hub was built without the status page. \
-    Release binaries and the container image include it. From source, run `npm ci &amp;&amp; npm run build` \
-    in ui/, then `cargo build --features ui`.</p></body></html>";
-
+#[cfg(feature = "ui")]
 static INDEX_TAG: LazyLock<String> = LazyLock::new(|| tag(INDEX));
 #[cfg(feature = "ui")]
 static SCRIPT_TAG: LazyLock<String> = LazyLock::new(|| tag(SCRIPT));
@@ -51,7 +51,36 @@ static ICON_192_TAG: LazyLock<String> = LazyLock::new(|| tag(ICON_192));
 #[cfg(feature = "ui")]
 static ICON_512_TAG: LazyLock<String> = LazyLock::new(|| tag(ICON_512));
 
-/// The page's routes. They hold no state, so the local service mounts the same page.
+/// Authentication still has a valid browser destination on a headless Hub.
+pub const fn landing() -> &'static str {
+    if cfg!(feature = "ui") {
+        "/ui/"
+    } else {
+        "/auth/complete/"
+    }
+}
+
+#[cfg(not(feature = "ui"))]
+pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new().route(
+        "/auth/complete/",
+        get(|| async {
+            (
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::CONTENT_SECURITY_POLICY, "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    (header::REFERRER_POLICY, "no-referrer"),
+                ],
+                "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>AgentSCM sign-in</title><h1>Return to AgentSCM</h1><p>Return to your terminal or application for the sign-in result. You can close this window.</p></html>",
+            )
+        }),
+    )
+}
+
+/// Dashboard routes exist only in UI-enabled server builds.
+#[cfg(feature = "ui")]
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     let router = Router::new()
         .route(
@@ -114,11 +143,13 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 }
 
 /// A strong validator: the asset's SHA-256, which changes exactly when the embedded bytes do.
+#[cfg(feature = "ui")]
 fn tag(body: &[u8]) -> String {
     format!("\"{}\"", super::store::lower_hex_of(&Sha256::digest(body)))
 }
 
 /// `no-cache` still lets a browser keep the asset; it revalidates and gets 304 while it is current.
+#[cfg(feature = "ui")]
 fn asset(
     headers: &HeaderMap,
     content_type: &'static str,
@@ -141,6 +172,7 @@ fn asset(
     (status, [(header::ETAG, tag)], secured(content_type, body)).into_response()
 }
 
+#[cfg(feature = "ui")]
 fn secured(content_type: &'static str, body: impl IntoResponse) -> impl IntoResponse {
     (
         [
@@ -154,7 +186,7 @@ fn secured(content_type: &'static str, body: impl IntoResponse) -> impl IntoResp
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 mod tests {
     use super::*;
     use tower_service::Service;

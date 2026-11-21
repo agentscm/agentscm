@@ -662,6 +662,29 @@ async fn first_run_writes_a_one_time_setup_link_that_creates_the_app() {
     let (status, page) = env.raw(Method::GET, &setup, None, None).await;
     assert_eq!(status, 200);
     assert!(page.contains("agentscm-hub"), "{page}");
+    for (query, owner) in [
+        ("suggested_owner=origin-org", Some("origin-org")),
+        (
+            "suggested_owner=origin-org&owner=chosen-org",
+            Some("chosen-org"),
+        ),
+        ("suggested_owner=origin-org&owner=", None),
+        ("suggested_owner=invalid%2Fowner", None),
+    ] {
+        let (status, page) = env
+            .raw(Method::GET, &format!("{setup}?{query}"), None, None)
+            .await;
+        assert_eq!(status, 200);
+        if let Some(owner) = owner {
+            assert!(
+                page.contains(&format!("/organizations/{owner}/settings/apps/new?state=")),
+                "{page}"
+            );
+        } else {
+            assert!(page.contains("your personal GitHub account"), "{page}");
+            assert!(!page.contains("/organizations/"), "{page}");
+        }
+    }
     let callback = format!("/v1/hub/github/setup/callback?code=code-1&state={secret}");
     let (status, done) = env.raw(Method::GET, &callback, None, None).await;
     assert_eq!(status, 200, "{done}");
@@ -723,7 +746,10 @@ async fn first_run_link_only_without_users_connections_or_github_sign_in() {
     let (_, page) = env
         .raw(
             Method::GET,
-            &format!("/v1/hub/github/setup/{}", link.rsplit('/').next().unwrap()),
+            &format!(
+                "/v1/hub/github/setup/{}?suggested_owner=origin-org",
+                link.rsplit('/').next().unwrap()
+            ),
             None,
             None,
         )
@@ -806,6 +832,12 @@ async fn refresh_connects_the_installations_repositories() {
                 .unwrap()
         };
         assert!(auth("/app/installations?").starts_with("Bearer ey"));
+        assert!(s.requests.iter().any(|r| {
+            r.path_and_query == "/app"
+                && r.auth
+                    .as_deref()
+                    .is_some_and(|auth| auth.starts_with("Bearer ey"))
+        }));
         assert!(auth("/installation/repositories").starts_with("Bearer ghs_"));
         assert!(auth("/repos/acme/widgets/pulls").starts_with("Bearer ghs_"));
         // One installation token served every read of the installation.
@@ -1799,6 +1831,43 @@ async fn failed_discovery_invalidates_previously_observed_catchup_coverage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_refresh_rejects_invalid_identity_and_updates_the_connection_label() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    for app_id in [Some(fake_github::APP_ID + 1), Some(0), None] {
+        env.fake.with(|s| {
+            s.app_id = app_id;
+            s.app_slug = Some(
+                if app_id.is_some() {
+                    "renamed-app"
+                } else {
+                    "invalid slug"
+                }
+                .into(),
+            );
+        });
+        assert!(env.refresh(&connection).await.is_empty());
+        assert!(env.store.repositories(&connection).unwrap().is_empty());
+        assert_eq!(
+            env.store
+                .connection(&connection)
+                .unwrap()
+                .unwrap()
+                .app_slug
+                .as_deref(),
+            Some(fake_github::APP_SLUG)
+        );
+    }
+
+    env.fake.with(|s| s.app_slug = Some("renamed-app".into()));
+    assert_eq!(env.refresh(&connection).await.len(), 1);
+    let (status, listed) = env.get("/v1/hub/connections", Some(&env.admin)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["connections"][0]["label"], "GitHub App renamed-app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     let env = Env::start().await;
     let connection = env.connect_app().await;
@@ -2643,6 +2712,8 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
                     transition: WorkTransitionKind::Release,
                     reason: "synthetic reason".into(),
                     superseded_by: None,
+                    participants: Vec::new(),
+                    paths: Vec::new(),
                 },
                 unix_now(),
             )
@@ -2673,18 +2744,14 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
     let reply = env.announce(&bound, 1, &["src/a.rs"], None).await;
     assert_eq!(reply["pull_requests"][0]["number"], 5);
 
-    // The guard still finds the token's released Work by repository id: a path in its scope is
-    // refused for the renamed repository's token, and the response says why.
+    // Recording the rename moved the token's released Work to the new name, so it no longer
+    // guards the old name, which another repository now holds.
     let body = json!({"intent_id": format!("int_{:032x}", 2), "task": "rework billing",
         "branch": null, "paths": ["lib/b.rs"], "ttl_s": 3600});
-    let (status, refused) = env
+    let (status, accepted) = env
         .post("/v1/hub/repos/acme%2Fwidgets/intents", Some(&bound), body)
         .await;
-    assert_eq!(status, 400, "{refused}");
-    assert!(
-        refused["message"].as_str().unwrap().contains(&started.id),
-        "{refused}"
-    );
+    assert_eq!(status, 200, "{accepted}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3372,6 +3439,7 @@ async fn a_repository_skill_needs_the_forge_and_survives_a_failed_read() {
     env.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&lock).unwrap(),
             default_branch: Some("main".into()),
@@ -3576,7 +3644,10 @@ async fn observed_skill_fixture(env: &Env) -> String {
 fn set_skill_status(env: &Env, value: &str) {
     env.store
         .set_setting(
-            &format!("skill_forge_status:repo:{REPO_ID}"),
+            &format!(
+                "skill_forge_status:repo:{}",
+                store::repository_scope(&env.host(), "", Some(REPO_ID))
+            ),
             value,
             "test-admin",
         )
@@ -3803,7 +3874,9 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
     set_skill_status(&env, "on");
     env.poll().await;
     assert_eq!(last(&env)["state"], "success");
-    env.store.skill_adoption_clear(REPO, None).unwrap();
+    env.store
+        .skill_adoption_clear(&crate::repository_scope::connected(&*env.store, REPO), None)
+        .unwrap();
     env.poll().await;
     assert_eq!(last(&env)["state"], "error");
 
@@ -3818,6 +3891,7 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
         }
         SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&SkillLock {
                 version: 1,
@@ -4169,6 +4243,7 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
     env.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope(&env.host(), REPO, Some(REPO_ID)),
             source: "default_branch".into(),
             lock_json: serde_json::to_string(&lock).unwrap(),
             default_branch: Some("main".into()),

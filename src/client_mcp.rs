@@ -2,7 +2,7 @@
 //! connection is its default; a tool call that names another connected checkout goes to that
 //! repository's connection instead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Map, Value, json};
 
+use agentscm::hub::cooperation::{INCARNATION_HEADER, NativeMetadata, SESSION_HEADER};
 use agentscm::hub::forge_http::{self, send_full};
 use agentscm::{Error, Result};
 
 use crate::client_cli::read_token;
 use crate::client_config::{
-    AGENTS, Connection, canonical_root, connection_for_checkout, is_current_in, load, relative,
+    Connection, canonical_root, connection_for_checkout, is_current_in, load, relative,
 };
 use crate::client_session::{self, Process, Recorded};
 use crate::hub_cli::map_hub_error;
@@ -198,6 +199,20 @@ fn valid_reply(reply: &Value, id: &Value) -> bool {
         && (object.contains_key("result") ^ object.contains_key("error"))
 }
 
+/// Only a valid supported inbox wait extends the ordinary transport deadline.
+fn request_timeout(body: &[u8]) -> Duration {
+    let wait = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|request| {
+            (request["method"] == "tools/call"
+                && request["params"]["name"] == "agentscm_coordination_inbox")
+                .then(|| request["params"]["arguments"]["wait_seconds"].as_u64())
+                .flatten()
+                .filter(|wait| *wait <= 25)
+        });
+    Duration::from_secs(10 + wait.unwrap_or(0))
+}
+
 async fn forward(
     client: &reqwest::Client,
     url: &reqwest::Url,
@@ -205,13 +220,21 @@ async fn forward(
     body: Vec<u8>,
     client_id: &str,
     report_completion: bool,
+    native: Option<&NativeMetadata>,
 ) -> Result<(u16, bool, Value)> {
     let request = client
         .post(url.clone())
+        .timeout(request_timeout(&body))
         .bearer_auth(token)
         .header(agentscm::hub::onboarding::CLIENT_HEADER, client_id)
         .header(CONTENT_TYPE, "application/json")
         .body(body);
+    let request = match native {
+        Some(native) => request
+            .header(INCARNATION_HEADER, &native.incarnation)
+            .header(SESSION_HEADER, &native.session),
+        None => request,
+    };
     let request = crate::client_config::with_completion_reporting(request, report_completion);
     let reply = send_full(request, RESPONSE_BYTES)
         .await
@@ -444,10 +467,14 @@ fn open(connection: &Connection, checkout: &Path) -> std::result::Result<String,
 
 /// Whether an MCP client's name is one of the agents that run AgentSCM hooks. A client that
 /// never said its name counts too: only a client known to have no hooks gets a made-up session.
+/// Qwen Code names itself after the server entry, which setup calls `agentscm`.
 fn hooked(client: Option<&str>) -> bool {
     client.is_none_or(|name| {
         let name = name.to_ascii_lowercase();
-        AGENTS.iter().any(|agent| name.contains(agent))
+        // Whole words, so a short name such as `droid` does not match "Android Studio".
+        let mut words = name.split(|c: char| !c.is_ascii_alphanumeric());
+        words.any(|word| agentscm::clients::find(word).is_some())
+            || name == "agentscm"
             || name.contains("visual studio code")
             || name.contains("vscode")
     })
@@ -484,6 +511,54 @@ struct Sent<'a> {
 }
 
 /// What the server knows about the agent it serves, apart from its default connection.
+type NativeKey = (String, String, PathBuf);
+
+fn native_key(connection: &Connection) -> NativeKey {
+    (
+        connection.hub.clone(),
+        connection.repo.to_ascii_lowercase(),
+        connection.root.clone(),
+    )
+}
+
+/// An existing MCP process cannot adopt a resumed chat's newer incarnation, even from local files.
+fn pin_native(
+    bindings: &mut HashMap<NativeKey, Option<NativeMetadata>>,
+    key: NativeKey,
+    observed: impl FnOnce() -> Option<NativeMetadata>,
+) -> Option<NativeMetadata> {
+    bindings.entry(key).or_insert_with(observed).clone()
+}
+
+/// Discovery can precede SessionStart. Only an actual ancestor association, established
+/// hookless session, or first session-bearing call freezes a legacy/current binding.
+fn pin_recorded_native(
+    bindings: &mut HashMap<NativeKey, Option<NativeMetadata>>,
+    key: NativeKey,
+    recorded: Recorded,
+    established_legacy: bool,
+    observed: impl FnOnce(String) -> Option<NativeMetadata>,
+) -> Option<NativeMetadata> {
+    if let Some(bound) = bindings.get(&key).cloned() {
+        if let (Some(previous), Recorded::One(session)) = (&bound, recorded)
+            && let Some(current) = observed(session)
+            && (previous.session != current.session || previous.incarnation != current.incarnation)
+        {
+            // A genuine successor in the same ancestor host keeps calls usable, but this
+            // surviving MCP process never adopts the successor's qualified identity.
+            bindings.insert(key, None);
+            return None;
+        }
+        return bound;
+    }
+    match recorded {
+        Recorded::One(session) => pin_native(bindings, key, || observed(session)),
+        Recorded::Several => pin_native(bindings, key, || None),
+        Recorded::None if established_legacy => pin_native(bindings, key, || None),
+        Recorded::None => None,
+    }
+}
+
 struct Client {
     http: reqwest::Client,
     /// Where the server started. Relative paths are read against it.
@@ -494,11 +569,17 @@ struct Client {
     ancestors: Option<Vec<Process>>,
     /// The session of a client without hooks, made once so it is the same for every call.
     own_session: Option<String>,
+    /// Captured outside model arguments once per routed native association; None stays legacy.
+    native_bindings: HashMap<NativeKey, Option<NativeMetadata>>,
+    /// The actual forwarded credential, including while discovery awaits SessionStart.
+    native_credentials: HashMap<NativeKey, String>,
     /// The tools that take `session`, from the last `tools/list`.
     session_tools: HashSet<String>,
     /// The server answered `initialize` or `tools/list` itself because the Hub did not; the
     /// next Hub reply announces the tools changed so the host lists the Hub's own.
     answered_locally: bool,
+    #[cfg(unix)]
+    capture_tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 impl Client {
@@ -509,9 +590,13 @@ impl Client {
             name: None,
             ancestors: None,
             own_session: None,
+            native_bindings: HashMap::new(),
+            native_credentials: HashMap::new(),
             // Opt-in tools are unlisted by default but still callable by name, so they get a session too.
             session_tools: session_tools(&agentscm::hub::mcp::session_agent_tools()),
             answered_locally: false,
+            #[cfg(unix)]
+            capture_tasks: std::collections::HashMap::new(),
         })
     }
 
@@ -534,6 +619,69 @@ impl Client {
                 )
             }
         }
+    }
+
+    fn native_metadata(
+        &mut self,
+        connection: &Connection,
+        token: &str,
+        session_call: bool,
+    ) -> Option<NativeMetadata> {
+        let key = native_key(connection);
+        let credential = crate::client_config::onboarding_client(&connection.root, token);
+        if let Some(previous) = self
+            .native_credentials
+            .insert(key.clone(), credential.clone())
+            && previous != credential
+        {
+            // A permitted managed renewal keeps ordinary calls working, but cannot transfer
+            // the previous credential's incarnation or adopt a successor native start.
+            self.native_bindings.insert(key.clone(), None);
+        }
+        if matches!(self.native_bindings.get(&key), Some(None)) {
+            return None;
+        }
+        // Only the recorded native ancestor association supplies transport identity.
+        let config = crate::hub_cli::config_dir().ok();
+        let ancestors = self.ancestors.get_or_insert_with(client_session::ancestors);
+        let recorded = config.as_ref().map_or(Recorded::None, |config| {
+            client_session::recorded(config, ancestors)
+        });
+        pin_recorded_native(
+            &mut self.native_bindings,
+            key,
+            recorded,
+            self.own_session.is_some() || session_call,
+            |session| {
+                let context = client_session::context(
+                    config.as_ref()?,
+                    &session,
+                    &connection.hub,
+                    &connection.repo,
+                )
+                .ok()??;
+                let now = agentscm::hub::store::unix_now();
+                // Match the token selected for this request, never a second token-file read.
+                // Capability freshness matches the native negotiation's five-minute bound.
+                if context.root != connection.root
+                    || context.repo != connection.repo
+                    || context.binding_id != credential
+                    || context.credential_id
+                        != connection.owned_token_id.as_deref().unwrap_or(&credential)
+                    || context.terminal
+                    || context.revoked
+                    || !context.registered
+                    || context.protocol != 1
+                    || !(0..=300).contains(&now.saturating_sub(context.protocol_checked_at))
+                {
+                    return None;
+                }
+                Some(NativeMetadata {
+                    session,
+                    incarnation: context.incarnation?,
+                })
+            },
+        )
     }
 
     /// Completes a tool call: routes it, and names its session when it names none. Returns the
@@ -634,6 +782,12 @@ impl Client {
                 Err(reason) => return refuse(id.as_ref(), &reason, writer),
             }
         }
+        // The tool contract says this call bears a session; its model-supplied value is
+        // never transport identity. Discovery without a native record remains pending.
+        let session_call = method == "tools/call"
+            && message["params"]["name"]
+                .as_str()
+                .is_some_and(|name| self.session_tools.contains(name));
         let reply = match (&elsewhere, default) {
             (Some((connection, checkout)), _) => {
                 let token = match open(connection, checkout) {
@@ -644,14 +798,25 @@ impl Client {
                     connection,
                     token: &token,
                 };
-                exchange(&self.http, &sent, body, id.clone(), writer).await?
+                let native = self.native_metadata(sent.connection, sent.token, session_call);
+                exchange(&self.http, &sent, body, id.clone(), native.as_ref(), writer).await?
             }
             // A host drops a server whose `initialize` fails and never retries it, so while the
             // Hub cannot answer, the server answers `initialize` and `tools/list` itself and each
             // tool call reports the outage. Every request is sent again, so it recovers by itself.
             (None, Some(default)) if local_result(&message, HUB_UNAVAILABLE).is_some() => {
+                let native = self.native_metadata(default.connection, default.token, session_call);
                 let mut failed = Vec::new();
-                match exchange(&self.http, default, body, id.clone(), &mut failed).await? {
+                match exchange(
+                    &self.http,
+                    default,
+                    body,
+                    id.clone(),
+                    native.as_ref(),
+                    &mut failed,
+                )
+                .await?
+                {
                     Some(reply) => Some(reply),
                     None => {
                         self.answered_locally = true;
@@ -668,7 +833,16 @@ impl Client {
                 }
             }
             (None, Some(default)) => {
-                exchange(&self.http, default, body, id.clone(), writer).await?
+                let native = self.native_metadata(default.connection, default.token, session_call);
+                exchange(
+                    &self.http,
+                    default,
+                    body,
+                    id.clone(),
+                    native.as_ref(),
+                    writer,
+                )
+                .await?
             }
             (None, None) => return refuse(id.as_ref(), STILL_CONNECTING, writer),
         };
@@ -697,12 +871,103 @@ impl Client {
                 checkout.display()
             )}));
         }
+        #[cfg(unix)]
+        if method == "tools/call"
+            && let Some(session) = message
+                .pointer("/params/arguments/session")
+                .and_then(Value::as_str)
+            && let Ok(config) = crate::hub_cli::config_dir()
+        {
+            if let Some((connection, checkout)) = elsewhere
+                .as_ref()
+                .map(|(connection, checkout)| (connection, checkout.as_path()))
+                .or_else(|| default.map(|sent| (sent.connection, self.start.as_path())))
+                && let Some(association) = successful_capture_start(
+                    &message,
+                    &reply,
+                    connection,
+                    checkout,
+                    self.name.as_deref(),
+                )
+                && client_session::record_capture(&config, &association).is_err()
+            {
+                eprintln!("AgentSCM capture: the explicit Work association could not be retained");
+            }
+            self.capture_tasks.retain(|_, task| !task.is_finished());
+            if self.capture_tasks.len() < 32
+                && !self.capture_tasks.contains_key(session)
+                && !client_session::capture_associations(&config, session).is_empty()
+            {
+                let session = session.to_owned();
+                let task = tokio::spawn(crate::change_capture_cli::watch_session(
+                    config,
+                    session.clone(),
+                ));
+                self.capture_tasks.insert(session, task);
+            }
+        }
         write_json(writer, &reply)?;
         if announce {
             write_json(writer, &TOOLS_CHANGED)?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+impl Drop for Client {
+    fn drop(&mut self) {
+        for task in self.capture_tasks.values() {
+            task.abort();
+        }
+    }
+}
+
+/// Only a successful explicit start authorizes this session's history to follow the Work.
+#[cfg(unix)]
+fn successful_capture_start(
+    message: &Value,
+    reply: &Value,
+    connection: &Connection,
+    checkout: &Path,
+    client: Option<&str>,
+) -> Option<client_session::CaptureAssociation> {
+    let name = client?.to_ascii_lowercase();
+    let harness = if name.contains("claude") {
+        agentscm::change_record::AgentHarnessV1::ClaudeCode
+    } else if name.contains("codex") {
+        agentscm::change_record::AgentHarnessV1::Codex
+    } else {
+        return None;
+    };
+    if message.pointer("/params/name")?.as_str()? != "agentscm_start"
+        || reply.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+        || reply
+            .pointer("/result/structuredContent/claim_acquired")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let item = reply.pointer("/result/structuredContent/work/item")?;
+    let native = message.pointer("/params/arguments/session")?.as_str()?;
+    let checkout = message
+        .pointer("/params/arguments/worktree")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| is_current_in(connection, path))
+        .unwrap_or_else(|| checkout.to_path_buf());
+    Some(client_session::CaptureAssociation {
+        session: native.to_owned(),
+        harness,
+        hub: connection.hub.clone(),
+        repo: connection.repo.clone(),
+        checkout,
+        work_id: item.get("id")?.as_str()?.to_owned(),
+        generation: item.get("generation")?.as_i64()?,
+        native_start_verified: false,
+    })
 }
 
 /// Answers locally until `find` sees a connection. `tools/list` already names every tool, so an
@@ -807,7 +1072,7 @@ const NOT_CONNECTED: &str = "This checkout is not connected to an AgentSCM Hub y
 const HUB_UNAVAILABLE: &str = "The AgentSCM Hub gave no usable answer when this session started. The tools are listed, and each call tries the Hub again; until it answers, a call says why it cannot run.";
 
 /// The server's own answer to `initialize` or `tools/list`, for when no Hub can give one; `None`
-/// for any other request. `why` opens the instructions, which a host reads only at `initialize`.
+/// for any other request. Required rules open the instructions, which a host reads only at `initialize`.
 fn local_result(message: &Value, why: &str) -> Option<Value> {
     match message["method"].as_str()? {
         "initialize" => Some(json!({
@@ -815,7 +1080,7 @@ fn local_result(message: &Value, why: &str) -> Option<Value> {
             "capabilities": {"tools": {"listChanged": true}},
             "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
             // Initialize happens once, so a session that connects later keeps these.
-            "instructions": format!("{why} {}", agentscm::hub::agent_rules::prose()),
+            "instructions": format!("{} {why}", agentscm::hub::agent_rules::mcp_instructions(false, false)),
         })),
         "tools/list" => {
             let mut tools = agentscm::hub::mcp::agent_tools();
@@ -835,6 +1100,23 @@ enum Waited<T> {
     Elsewhere(Vec<u8>),
 }
 
+/// Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused start's
+/// conflict, coordination and recovery payload, reach the agent unchanged.
+fn upgrade_reply(mut reply: Value) -> Value {
+    let bare_error = &reply["result"]["structuredContent"]["error"];
+    if reply["result"]["isError"] == true
+        && bare_error.is_object()
+        && bare_error["recovery"].is_null()
+    {
+        reply["result"] = agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
+    } else if reply["error"].is_object() {
+        let error = agentscm::hub::error_envelope::decode(400, &reply);
+        let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
+        reply["error"] = json!({"code":code,"message":error.render(),"data":error});
+    }
+    reply
+}
+
 /// Forwards one request. A well-formed reply is returned for the caller to finish and write;
 /// every other outcome is reported to the client here.
 async fn exchange(
@@ -842,6 +1124,7 @@ async fn exchange(
     sent: &Sent<'_>,
     body: Vec<u8>,
     id: Option<Value>,
+    native: Option<&NativeMetadata>,
     writer: &mut impl Write,
 ) -> Result<Option<Value>> {
     let &Sent { connection, token } = sent;
@@ -853,27 +1136,14 @@ async fn exchange(
         body,
         &client_id,
         connection.report_completion,
+        native,
     )
     .await;
     match (id, forwarded) {
         (None, Ok((202 | 204, _, _))) => {}
         (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
         (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
-            let mut reply = reply;
-            // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
-            // start's conflict, coordination and recovery payload, reach the agent unchanged.
-            let bare_error = &reply["result"]["structuredContent"]["error"];
-            if reply["result"]["isError"] == true
-                && bare_error.is_object()
-                && bare_error["recovery"].is_null()
-            {
-                reply["result"] =
-                    agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
-            } else if reply["error"].is_object() {
-                let error = agentscm::hub::error_envelope::decode(400, &reply);
-                let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
-                reply["error"] = json!({"code":code,"message":error.render(),"data":error});
-            }
+            let reply = upgrade_reply(reply);
             return Ok(Some(reply));
         }
         (Some(id), Ok((status @ (401 | 403), _, reply))) => {
@@ -1011,10 +1281,246 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_initialize_keeps_rules_and_remedies_within_host_budgets() {
+        use agentscm::hub::agent_rules;
+        for why in [super::NOT_CONNECTED, super::HUB_UNAVAILABLE] {
+            let reply =
+                super::local_result(&serde_json::json!({"method":"initialize"}), why).unwrap();
+            let text = reply["instructions"].as_str().unwrap();
+            assert!(text.starts_with(&agent_rules::prose()));
+            assert!(agent_rules::carries_all(text));
+            assert!(text.contains("agentscm_work_overlap_consent"));
+            assert!(text.ends_with(why));
+            for (host, budget) in agent_rules::MCP_INSTRUCTION_BUDGETS {
+                let units = text.encode_utf16().count();
+                assert!(units <= budget, "{host}: {units}/{budget} UTF-16 units");
+            }
+        }
+    }
+
     use super::*;
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[tokio::test]
+    async fn catchup_diagnosis_survives_packaged_stdio_http_bridge() {
+        use agentscm::hub::error_envelope::{ErrorCode, ErrorEnvelope};
+        let envelope = ErrorEnvelope::new(ErrorCode::CatchupContinuationIncomplete);
+        let body = json!({"jsonrpc":"2.0", "id":7, "result":envelope.mcp()}).to_string();
+        let (hub, received) = server(200, "application/json", &body);
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",",
+            "\"params\":{\"name\":\"agentscm_work_catchup\",\"arguments\":{\"session\":\"synthetic\",\"event_after\":88}}}\n"
+        );
+        let output = proxied(
+            input,
+            &saved(hub, "/checkout", "owner/repo"),
+            "private-token",
+        )
+        .await;
+        let reply: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["code"],
+            "catchup_continuation_incomplete"
+        );
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        for field in [
+            "delivery",
+            "event_after",
+            "event_through",
+            "merge_after",
+            "merge_through",
+        ] {
+            assert!(text.contains(field), "{text}");
+        }
+        assert!(text.contains("omit all five fields"));
+        assert!(!output.contains("private-token"));
+        assert!(
+            !reply["result"]["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("88")
+        );
+        let request = received.recv().unwrap();
+        assert!(request.contains("event_after"));
+        assert!(
+            !request.contains("event_through"),
+            "client must not invent cursors"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_long_poll_survives_ordinary_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+        });
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":11}}}))
+        .unwrap();
+        let result = forward(
+            &forge_http::client().unwrap(),
+            &url,
+            "synthetic",
+            body,
+            "test",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbox_wait_returns_populated_response_immediately() {
+        let (address, received) = server(
+            200,
+            "application/json",
+            r#"{"requests":[{"id":"synthetic"}]}"#,
+        );
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":25}}}))
+        .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward(
+                &forge_http::client().unwrap(),
+                &address.parse().unwrap(),
+                "synthetic",
+                body,
+                "test",
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.2["requests"][0]["id"], "synthetic");
+        assert!(received.recv().unwrap().contains("wait_seconds"));
+    }
+
+    #[tokio::test]
+    async fn inbox_wait_can_be_cancelled_and_unavailable_hub_still_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{
+            "name":"agentscm_coordination_inbox","arguments":{"wait_seconds":25}}}))
+        .unwrap();
+        let http = forge_http::client().unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                forward(&http, &url, "synthetic", body.clone(), "test", false, None)
+            )
+            .await
+            .is_err()
+        );
+        drop(listener);
+        // Windows retries a refused localhost connect for about two seconds before failing.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                forward(&http, &url, "synthetic", body, "test", false, None)
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inbox_wait_deadline_is_bounded_and_method_specific() {
+        for (method, name, wait, seconds) in [
+            ("tools/call", "agentscm_coordination_inbox", json!(25), 35),
+            ("tools/call", "agentscm_coordination_inbox", json!(10), 20),
+            ("tools/call", "agentscm_coordination_inbox", json!(26), 10),
+            ("tools/call", "agentscm_coordination_inbox", json!(-1), 10),
+            ("tools/call", "agentscm_coordination_inbox", json!("25"), 10),
+            ("tools/list", "agentscm_coordination_inbox", json!(25), 10),
+            ("tools/call", "agentscm_start", json!(25), 10),
+        ] {
+            let body = serde_json::to_vec(&json!({"method":method,"params":{
+                "name":name,"arguments":{"wait_seconds":wait}}}))
+            .unwrap();
+            assert_eq!(request_timeout(&body), Duration::from_secs(seconds));
+        }
+    }
+
+    #[test]
+    fn older_hub_bare_errors_are_upgraded_to_a_full_envelope() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/hub_errors/mcp-baseline.json"
+        ))
+        .unwrap();
+        for bare in [
+            json!({"kind":"busy"}),
+            json!({"code":"busy","message":"hub busy"}),
+            fixture["structuredContent"]["error"].clone(),
+        ] {
+            let reply = json!({"jsonrpc":"2.0","id":1,"result":{"isError":true,"structuredContent":{"error":bare}}});
+            let upgraded = upgrade_reply(reply);
+            let error = &upgraded["result"]["structuredContent"]["error"];
+            assert_eq!(error["code"], "busy");
+            assert!(error["recovery"]["action"].is_string());
+            let message = error["message"].as_str().unwrap();
+            assert!(!message.is_empty());
+            assert_eq!(upgraded["result"]["isError"], true);
+            assert_eq!(upgraded["id"], 1);
+        }
+    }
+
+    #[test]
+    fn current_envelopes_and_successes_pass_unchanged() {
+        let current = agentscm::hub::error_envelope::ErrorEnvelope::local(
+            agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+        )
+        .mcp();
+        let conflict = json!({"isError":true,"structuredContent":{"error":{
+            "code":"work_conflict","recovery":null,"overlaps":[{"path":"a.rs"}]}}});
+        let refused = json!({"isError":true,"structuredContent":{"error":{
+            "code":"work_conflict","recovery":{"action":"ask_owner"},"coordination_request":{"id":"x"}}}});
+        let success =
+            json!({"content":[{"type":"text","text":"ok"}],"structuredContent":{"work_id":"w"}});
+        for result in [current, refused, success] {
+            let reply = json!({"jsonrpc":"2.0","id":2,"result":result});
+            assert_eq!(upgrade_reply(reply.clone()), reply);
+        }
+        // A bare payload with no `recovery` is the older shape and is upgraded, not preserved.
+        let reply = json!({"jsonrpc":"2.0","id":2,"result":conflict});
+        assert_ne!(upgrade_reply(reply.clone()), reply);
+    }
+
+    #[test]
+    fn json_rpc_errors_keep_their_numeric_code_and_gain_an_envelope() {
+        let reply = json!({"jsonrpc":"2.0","id":3,"error":{"code":-32001,"message":"refused","data":{"error":"read_only"}}});
+        let upgraded = upgrade_reply(reply);
+        let error = &upgraded["error"];
+        assert_eq!(error["code"], -32001);
+        assert_eq!(error["data"]["error"], "read_only");
+        let message = error["message"].as_str().unwrap();
+        assert_ne!(message, "refused");
+        assert_eq!(
+            message,
+            agentscm::hub::error_envelope::decode(400, &upgraded).render()
+        );
+        assert!(error["data"]["recovery"]["action"].is_string());
+    }
 
     fn saved(hub: String, root: &str, repo: &str) -> Connection {
         Connection {
@@ -1307,6 +1813,11 @@ mod tests {
         })
         .collect();
         std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::set_permissions(
+            config.join("agentscm"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(
             config.join("agentscm").join("connections.json"),
             json!({"version": 1, "connections": connections}).to_string(),
@@ -1453,6 +1964,11 @@ mod tests {
             })
             .collect();
         std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::set_permissions(
+            config.join("agentscm"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(
             config.join("agentscm").join("connections.json"),
             json!({"version": 1, "connections": connections}).to_string(),
@@ -1646,6 +2162,107 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn only_a_successful_explicit_start_creates_a_capture_association() {
+        let connection = saved("https://hub.example".into(), "/checkout", "org/repo");
+        let message = json!({"params":{"name":"agentscm_start", "arguments":{"session":"native"}}});
+        let reply = json!({"result":{"isError":false,"structuredContent":{"claim_acquired":true,
+            "work":{"item":{"id":"wrk_one","generation":3}}}}});
+        let association = successful_capture_start(
+            &message,
+            &reply,
+            &connection,
+            Path::new("/checkout"),
+            Some("codex"),
+        )
+        .unwrap();
+        assert_eq!(association.session, "native");
+        assert_eq!(
+            (association.work_id.as_str(), association.generation),
+            ("wrk_one", 3)
+        );
+        for pointer in [
+            "/result/isError",
+            "/result/structuredContent/claim_acquired",
+        ] {
+            let mut refused = reply.clone();
+            *refused.pointer_mut(pointer).unwrap() = json!(pointer.ends_with("isError"));
+            assert!(
+                successful_capture_start(
+                    &message,
+                    &refused,
+                    &connection,
+                    Path::new("/checkout"),
+                    Some("codex")
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            successful_capture_start(&message, &reply, &connection, Path::new("/checkout"), None)
+                .is_none()
+        );
+        assert!(
+            successful_capture_start(
+                &message,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("plain editor")
+            )
+            .is_none()
+        );
+        assert_eq!(
+            successful_capture_start(
+                &message,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("claude-code")
+            )
+            .unwrap()
+            .harness,
+            agentscm::change_record::AgentHarnessV1::ClaudeCode
+        );
+        let mut read = message.clone();
+        read["params"]["name"] = json!("agentscm_work_status");
+        assert!(
+            successful_capture_start(
+                &read,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("codex")
+            )
+            .is_none()
+        );
+        let mut unnamed = message;
+        unnamed["params"]["arguments"] = json!({});
+        assert!(
+            successful_capture_start(
+                &unnamed,
+                &reply,
+                &connection,
+                Path::new("/checkout"),
+                Some("codex")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn every_natively_wired_agent_counts_as_hooked() {
+        for name in agentscm::clients::names() {
+            assert!(hooked(Some(name)), "{name}");
+        }
+        // Qwen Code names its MCP client after the server entry.
+        assert!(hooked(Some("agentscm")) && hooked(Some("Crush")) && hooked(None));
+        assert!(!hooked(Some("plain-editor")) && !hooked(Some("agentscm-proxy")));
+        assert!(hooked(Some("claude-code")) && hooked(Some("GitHub Copilot Chat")));
+        assert!(!hooked(Some("Android Studio")) && !hooked(Some("crushed-ice")));
+    }
+
     #[test]
     fn root_selection_is_exact() {
         let connections = vec![
@@ -1696,6 +2313,380 @@ mod tests {
             }
             assert!(listener.accept().is_err());
         }
+    }
+
+    #[test]
+    fn discovery_before_the_start_hook_leaves_the_native_binding_pending() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        let key = native_key(&connection);
+        let mut bindings = HashMap::new();
+        // initialize/tools/list before SessionStart has no native association yet.
+        for _ in 0..2 {
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::None,
+                    false,
+                    |_| panic!("discovery has no native identity"),
+                )
+                .is_none()
+            );
+            assert!(!bindings.contains_key(&key));
+        }
+        let current = pin_recorded_native(
+            &mut bindings,
+            key.clone(),
+            Recorded::One("native".into()),
+            false,
+            |session| {
+                Some(NativeMetadata {
+                    session,
+                    incarnation: "first".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(current.session, "native");
+        assert_eq!(current.incarnation, "first");
+        assert_eq!(
+            pin_recorded_native(
+                &mut bindings,
+                key,
+                Recorded::One("native".into()),
+                false,
+                |session| Some(NativeMetadata {
+                    session,
+                    incarnation: "first".into()
+                }),
+            )
+            .unwrap()
+            .incarnation,
+            "first"
+        );
+    }
+
+    #[test]
+    fn surviving_native_client_downgrades_on_clear_or_compaction_without_adopting_successor() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        for next_session in ["native", "cleared-chat"] {
+            let key = native_key(&connection);
+            let mut bindings = HashMap::new();
+            let initial = pin_recorded_native(
+                &mut bindings,
+                key.clone(),
+                Recorded::One("native".into()),
+                true,
+                |session| {
+                    Some(NativeMetadata {
+                        session,
+                        incarnation: "first".into(),
+                    })
+                },
+            );
+            assert_eq!(initial.unwrap().incarnation, "first");
+            // Unavailable state is not evidence of a new start.
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::One("native".into()),
+                    true,
+                    |_| None
+                )
+                .is_some()
+            );
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key.clone(),
+                    Recorded::One(next_session.into()),
+                    true,
+                    |session| Some(NativeMetadata {
+                        session,
+                        incarnation: "successor".into()
+                    })
+                )
+                .is_none()
+            );
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key,
+                    Recorded::One(next_session.into()),
+                    true,
+                    |_| panic!("the old process remains legacy")
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn established_legacy_or_ambiguous_native_bindings_never_upgrade() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        for (recorded, established) in [
+            (Recorded::None, true), // Hookless own session or first session-bearing call.
+            (Recorded::Several, false),
+            (Recorded::One("native".into()), false), // Associated legacy hook.
+        ] {
+            let key = native_key(&connection);
+            let mut bindings = HashMap::new();
+            assert!(
+                pin_recorded_native(&mut bindings, key.clone(), recorded, established, |_| None,)
+                    .is_none()
+            );
+            assert!(bindings.contains_key(&key));
+            assert!(
+                pin_recorded_native(
+                    &mut bindings,
+                    key,
+                    Recorded::One("native".into()),
+                    false,
+                    |_| panic!("an established legacy binding cannot adopt a new incarnation"),
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn native_binding_pins_incarnation_and_legacy_without_model_identity() {
+        let connection = saved("http://127.0.0.1".into(), "/checkout", "acme/widgets");
+        let key = native_key(&connection);
+        let mut bindings = HashMap::new();
+        let first = pin_native(&mut bindings, key.clone(), || {
+            Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "old".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(first.incarnation, "old");
+        let resumed = pin_native(&mut bindings, key.clone(), || {
+            Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "new".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(resumed.incarnation, "old");
+        let mut legacy = HashMap::new();
+        assert!(pin_native(&mut legacy, key.clone(), || None).is_none());
+        assert!(
+            pin_native(&mut legacy, key, || Some(NativeMetadata {
+                session: "caller-claimed".into(),
+                incarnation: "new".into()
+            }))
+            .is_none()
+        );
+        let other = saved("http://127.0.0.2".into(), "/checkout", "acme/widgets");
+        assert_eq!(
+            pin_native(&mut bindings, native_key(&other), || Some(NativeMetadata {
+                session: "native".into(),
+                incarnation: "other-hub".into()
+            }))
+            .unwrap()
+            .incarnation,
+            "other-hub"
+        );
+    }
+
+    #[cfg(unix)]
+    fn native_context(connection: &Connection, token: &str) -> client_session::SessionContext {
+        let binding = crate::client_config::onboarding_client(&connection.root, token);
+        let now = agentscm::hub::store::unix_now();
+        client_session::SessionContext {
+            session: "native-renewal".into(),
+            start_nonce: "original-start".into(),
+            incarnation: Some("original-incarnation".into()),
+            agent: "codex".into(),
+            hub: connection.hub.clone(),
+            repo: connection.repo.clone(),
+            root: connection.root.clone(),
+            protocol: 1,
+            protocol_checked_at: now,
+            terminal: false,
+            registered: true,
+            qualification: None,
+            exit_ineligible: false,
+            revoked: false,
+            exit_observed_at: None,
+            explicit_end_requested: false,
+            observed_at: now,
+            host: None,
+            registration_host: None,
+            credential_id: connection
+                .owned_token_id
+                .clone()
+                .unwrap_or_else(|| binding.clone()),
+            binding_id: binding,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_renewal_keeps_next_calls_without_transferring_native_identity() {
+        crate::client_config::in_isolated_config_home(|config| {
+            use std::os::unix::fs::PermissionsExt;
+            let answer =
+                r#"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+            let (hub, requests) = servers(&[(200, "application/json", answer); 3]);
+            let (_dir, [root, _, _]) = checkouts(config, [&hub, &hub]);
+            let mut connection = selected(&root, &load().unwrap()).unwrap();
+            connection.owned_token_id = Some("tok_original".into());
+            connection.owned_token_expires_at = Some(agentscm::hub::store::unix_now() + 3600);
+            connection.token_file =
+                crate::client_config::owned_token_path(&connection, "tok_original").unwrap();
+            crate::hub_cli::write_private(&connection.token_file, "token-widgets").unwrap();
+            let save_connection = |saved: &Connection| {
+                std::fs::write(
+                    config.join("agentscm/connections.json"),
+                    json!({"version":1,"connections":[saved]}).to_string(),
+                )
+                .unwrap();
+            };
+            save_connection(&connection);
+            load().unwrap();
+            let context = native_context(&connection, "token-widgets");
+            client_session::save_context(config, &context).unwrap();
+            let host = Process {
+                pid: 300,
+                started: "synthetic-native-start".into(),
+                name: "codex".into(),
+            };
+            client_session::record_under(
+                &client_session::directory(config),
+                &host,
+                &context.session,
+            )
+            .unwrap();
+            let mut client = client(&root);
+            client.name = Some("codex".into());
+            client.ancestors = Some(vec![host]);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let input = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agentscm_status","arguments":{}}}
+"#;
+            let mut verified = None;
+            for step in 0..3 {
+                if step == 1 {
+                    // Model the actual managed connection replacement, retaining the old token
+                    // file so a second read through the process's old Connection would be wrong.
+                    let token_file =
+                        crate::client_config::owned_token_path(&connection, "tok_renewed").unwrap();
+                    std::fs::write(&token_file, "renewed-token").unwrap();
+                    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    save_connection(&Connection {
+                        token_file,
+                        owned_token_id: Some("tok_renewed".into()),
+                        owned_token_expires_at: Some(agentscm::hub::store::unix_now() + 7200),
+                        ..connection.clone()
+                    });
+                    load().unwrap();
+                } else if step == 2 {
+                    let renewed = selected(&root, &load().unwrap()).unwrap();
+                    let successor = client_session::SessionContext {
+                        start_nonce: "successor-start".into(),
+                        incarnation: Some("successor-incarnation".into()),
+                        ..native_context(&renewed, "renewed-token")
+                    };
+                    client_session::begin_context(config, Some(&context.start_nonce), &successor)
+                        .unwrap();
+                }
+                let mut reader = Cursor::new(input.as_bytes());
+                let mut output = Vec::new();
+                runtime
+                    .block_on(serve(
+                        &connection,
+                        "token-widgets",
+                        None,
+                        &mut reader,
+                        &mut output,
+                        || current_token(&connection, &root, "token-widgets", &mut verified),
+                        &mut client,
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output).unwrap()["result"]["content"][0]["text"],
+                    "ok"
+                );
+                let request = requests.recv().unwrap().to_ascii_lowercase();
+                if step == 0 {
+                    assert!(request.contains("authorization: bearer token-widgets"));
+                    assert!(request.contains("x-agentscm-incarnation: original-incarnation"));
+                } else {
+                    assert!(request.contains("authorization: bearer renewed-token"));
+                    assert!(!request.contains("x-agentscm-session:"));
+                    assert!(!request.contains("x-agentscm-incarnation:"));
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_native_metadata_matches_the_sent_token_not_a_token_file_reread() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let (_dir, [root, _, _]) = checkouts(config, ["https://hub.example"; 2]);
+            let connection = selected(&root, &load().unwrap()).unwrap();
+            let context = native_context(&connection, "token-widgets");
+            client_session::save_context(config, &context).unwrap();
+            let host = Process {
+                pid: 300,
+                started: "synthetic-native-start".into(),
+                name: "codex".into(),
+            };
+            client_session::record_under(
+                &client_session::directory(config),
+                &host,
+                &context.session,
+            )
+            .unwrap();
+            let mut client = client(&root);
+            client.ancestors = Some(vec![host]);
+            assert!(
+                client
+                    .native_metadata(&connection, "renewed-token", true)
+                    .is_none()
+            );
+            // Even returning to the old credential cannot upgrade this established legacy route.
+            assert!(
+                client
+                    .native_metadata(&connection, "token-widgets", true)
+                    .is_none()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn transport_headers_use_pinned_context_not_tool_arguments() {
+        let (hub, request) = server(
+            200,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":7,"result":{"content":[]}}"#,
+        );
+        let connection = saved(hub, "/checkout", "acme/widgets");
+        let mut client = client(Path::new("/checkout"));
+        client.native_bindings.insert(
+            native_key(&connection),
+            Some(NativeMetadata {
+                session: "actual-native".into(),
+                incarnation: "pinned-incarnation".into(),
+            }),
+        );
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"agentscm_status\",\"arguments\":{\"session\":\"model-claimed\"}}}\n";
+        let _ = proxied_as(input, &connection, "private-token", &mut client).await;
+        let request = request.recv().unwrap().to_ascii_lowercase();
+        assert!(request.contains("x-agentscm-session: actual-native"));
+        assert!(request.contains("x-agentscm-incarnation: pinned-incarnation"));
+        assert!(
+            request.contains("model-claimed"),
+            "domain args stay separate; Hub rejects an identity mismatch"
+        );
     }
 
     #[tokio::test]
@@ -1813,7 +2804,7 @@ mod tests {
             replies[0]["result"]["instructions"]
                 .as_str()
                 .unwrap()
-                .starts_with(HUB_UNAVAILABLE)
+                .contains(HUB_UNAVAILABLE)
         );
         assert_eq!(replies[1]["id"], 2);
         assert!(!replies[1]["result"]["tools"].as_array().unwrap().is_empty());

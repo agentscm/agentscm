@@ -77,6 +77,9 @@ pub struct SetupArgs {
     bot_token_file: PathBuf,
     #[arg(long)]
     agent_token_file: PathBuf,
+    /// Optional channel ID for owner-attestation invalidation notices.
+    #[arg(long)]
+    owner_notice_channel: Option<String>,
 }
 
 fn invalid(message: &str) -> Error {
@@ -144,6 +147,7 @@ fn binding(
     repo: &str,
     slack_user: String,
     token_file: PathBuf,
+    owner_notice_channel: Option<String>,
 ) -> Result<BindingConfig> {
     let token = &who["token"];
     let owner = &who["owner"];
@@ -178,6 +182,7 @@ fn binding(
         repository: repo.into(),
         repository_id: repository.unwrap(),
         agent_token_file: token_file,
+        owner_notice_channel,
         reminders: Default::default(),
     })
 }
@@ -187,7 +192,13 @@ async fn configure(args: SetupArgs) -> Result<Value> {
     let credential =
         setup::read_agent_token(&args.agent_token_file).map_err(crate::hub_cli::map_hub_error)?;
     let who = identity(&client()?, &origin, &credential).await?;
-    let binding = binding(&who, &args.repo, args.slack_user, args.agent_token_file)?;
+    let binding = binding(
+        &who,
+        &args.repo,
+        args.slack_user,
+        args.agent_token_file,
+        args.owner_notice_channel,
+    )?;
     let config = SlackConfig {
         version: 1,
         app_id: args.app_id,
@@ -230,6 +241,7 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
             &expected.repository,
             expected.slack_user.clone(),
             expected.agent_token_file.clone(),
+            expected.owner_notice_channel.clone(),
         )?;
         if actual != *expected {
             return Err(invalid(
@@ -408,10 +420,12 @@ mod tests {
             "acme/widgets",
             "U123".into(),
             "/private/token".into(),
+            Some("CNOTICE".into()),
         )
         .unwrap();
         assert_eq!(actual.repository_id, 101);
         assert_eq!(actual.forge_user_id, 42);
+        assert_eq!(actual.owner_notice_channel.as_deref(), Some("CNOTICE"));
         for (field, value) in [
             ("read_only", json!(false)),
             ("repository", json!("other/repo")),
@@ -426,6 +440,7 @@ mod tests {
                     "acme/widgets",
                     "U123".into(),
                     "/private/token".into(),
+                    None,
                 )
                 .is_err()
             );

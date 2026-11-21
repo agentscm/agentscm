@@ -302,6 +302,7 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             T0 + 3,
         )
@@ -413,13 +414,14 @@ fn a_token_at_its_cap_keeps_its_newest_rows_and_reads_partial(db: &Db) {
     let rows: Vec<String> = (0..MAX_ROWS_PER_TOKEN)
         .map(|n| {
             format!(
-                "INSERT INTO hub_duplicate_starts
-                     (repository, token, session, owner, holder_work, holder_owner, observed_at)
-                 VALUES ('{REPO}', '{}', 's{n}', '{}', 'wrk_old{n}', '{}', {});",
+                "INSERT INTO hub_duplicate_starts (repository, token, session, owner, holder_work,
+                     holder_owner, observed_at, repository_scope)
+                 VALUES ('{REPO}', '{}', 's{n}', '{}', 'wrk_old{n}', '{}', {}, '{}');",
                 bob.token,
                 bob.owner,
                 alice.owner,
-                T0 + n
+                T0 + n,
+                crate::repository_scope::github(REPO, None)
             )
         })
         .collect();

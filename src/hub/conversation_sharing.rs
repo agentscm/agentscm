@@ -1,11 +1,12 @@
 //! Whether agent conversations in a repository are shared with the Hub. A repository setting,
 //! changed by a repository admin (GitHub `admin`, GitLab maintainer or owner) or a Hub admin,
-//! falls back to a Hub-wide default that only Hub admins change. The default is off. Repository
-//! enablement permits sharing, but each person must also affirmatively opt in before their sessions
-//! upload or repository readers see their retained bodies. The one-time session notice is separate
-//! from that consent. Connected checkouts follow the answer: the client reads it at session start
-//! and on hook calls, and the Hub refuses uploads while it says no. Values live in `hub_settings`,
-//! keyed by the forge's repository id so a rename keeps them.
+//! falls back to a Hub-wide default that only Hub admins change. The default is on until a Hub
+//! admin sets it; a Hub that had people before the default became on keeps off (the
+//! `conversation_sharing_default` migration records it). Each person can opt their own sessions
+//! out, which also hides what they shared before, and is told once in their agent's session
+//! context that sharing is on. Connected checkouts follow the answer: the client reads it at
+//! session start and on hook calls, and the Hub refuses uploads while it says no. Values live in
+//! `hub_settings`, keyed by the forge host and stable repository id so a rename keeps them.
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
@@ -19,28 +20,32 @@ use super::{HubState, Result};
 
 const HUB_DEFAULT_KEY: &str = "conversation_sharing:default";
 
-fn repository_key(repository_id: i64) -> String {
-    format!("conversation_sharing:repo:{repository_id}")
+fn repository_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "conversation_sharing:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
-/// What a person's choice key starts with. The store query that lists shared bodies reads the
-/// setting itself: the key is this, the user id, `:` and the repository id. Only the exact value
-/// `0`, written by the existing explicit opt-in operation, is affirmative consent.
+/// What a person's opt-out key starts with. The store query that lists shared bodies reads the
+/// setting itself: the key is this, the user id, `:` and the canonical repository scope, and any value but
+/// `0` opts out, as in [`person`].
 pub(super) const OPT_OUT_KEY_PREFIX: &str = "conversation_sharing:opt_out:";
 
 /// A person's own choice for one repository, each under its own key so the session-start
 /// notice and an opt-out never overwrite each other.
-fn person_key(choice: &str, user_id: &str, repository_id: i64) -> String {
-    format!("conversation_sharing:{choice}:{user_id}:{repository_id}")
+fn person_key(host: &str, choice: &str, user_id: &str, repository_id: i64) -> String {
+    format!(
+        "conversation_sharing:{choice}:{user_id}:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// A person's own choices for one repository.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Person {
     opted_out: bool,
-    /// The existing explicit opt-in writes `opt_out=0`; absence or an invalid value is not consent.
-    consented: bool,
-    /// Their agent has shown the one-time notice about sharing.
+    /// Their agent has shown the one-time notice that sharing is on.
     notified: bool,
 }
 
@@ -54,10 +59,10 @@ pub struct Sharing {
     pub source: &'static str,
     pub hub_default: bool,
     pub opted_out: bool,
-    /// Whether this person affirmatively opted in for this repository.
+    /// Not `opted_out`. Kept for clients that require it before they share.
     pub consented: bool,
     pub notified: bool,
-    /// `enabled` and `consented`: this person's sessions upload conversation bodies.
+    /// `enabled` and not `opted_out`: this person's sessions upload conversation bodies.
     pub sharing: bool,
     /// Web sign-in only: whether this person may change the repository setting.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,30 +80,42 @@ fn flag(store: &dyn Store, key: &str) -> Result<Option<bool>> {
     })
 }
 
-/// The Hub-wide default is off unless a Hub admin explicitly turns it on.
+/// The Hub-wide default: on unless a Hub admin, or the migration for a Hub that already had
+/// people, set it off.
 fn hub_default(store: &dyn Store) -> Result<bool> {
-    Ok(flag(store, HUB_DEFAULT_KEY)?.unwrap_or(false))
+    Ok(flag(store, HUB_DEFAULT_KEY)?.unwrap_or(true))
 }
 
-/// Only the existing explicit opt-in representation is consent. Absence and unreadable values
-/// deny sharing without being presented as an explicit opt-out.
-fn person(store: &dyn Store, user_id: &str, repository_id: i64) -> Result<Person> {
-    let opt_out = store.get_setting(&person_key("opt_out", user_id, repository_id))?;
-    let notified = store.get_setting(&person_key("notified", user_id, repository_id))?;
+/// An unreadable value opts the person out rather than in.
+fn person(store: &dyn Store, host: &str, user_id: &str, repository_id: i64) -> Result<Person> {
+    let choice = |name| -> Result<bool> {
+        Ok(
+            match store
+                .get_setting(&person_key(host, name, user_id, repository_id))?
+                .as_deref()
+            {
+                None | Some("0") => false,
+                Some(_) => true,
+            },
+        )
+    };
     Ok(Person {
-        opted_out: opt_out.as_deref().is_some_and(|value| value != "0"),
-        consented: opt_out.as_deref() == Some("0"),
-        notified: notified.as_deref().is_some_and(|value| value != "0"),
+        opted_out: choice("opt_out")?,
+        notified: choice("notified")?,
     })
 }
 
 /// The repository's effective setting. A token without a forge repository id (minted before ids
 /// were kept) never shares.
-pub(super) fn repository_shares(store: &dyn Store, repository_id: Option<i64>) -> Result<bool> {
+pub(super) fn repository_shares(
+    store: &dyn Store,
+    host: &str,
+    repository_id: Option<i64>,
+) -> Result<bool> {
     let Some(id) = repository_id else {
         return Ok(false);
     };
-    Ok(match flag(store, &repository_key(id))? {
+    Ok(match flag(store, &repository_key(host, id))? {
         Some(enabled) => enabled,
         None => hub_default(store)?,
     })
@@ -107,29 +124,32 @@ pub(super) fn repository_shares(store: &dyn Store, repository_id: Option<i64>) -
 /// Whether `user_id`'s sessions in the repository may upload conversation bodies now.
 pub(super) fn person_shares(
     store: &dyn Store,
+    host: &str,
     user_id: &str,
     repository_id: Option<i64>,
 ) -> Result<bool> {
     let Some(id) = repository_id else {
         return Ok(false);
     };
-    Ok(repository_shares(store, repository_id)? && person(store, user_id, id)?.consented)
+    Ok(repository_shares(store, host, repository_id)?
+        && !person(store, host, user_id, id)?.opted_out)
 }
 
 fn view(
     store: &dyn Store,
+    host: &str,
     repository: &str,
     repository_id: Option<i64>,
     user_id: &str,
 ) -> Result<Sharing> {
     let hub_default = hub_default(store)?;
     let own = match repository_id {
-        Some(id) => flag(store, &repository_key(id))?,
+        Some(id) => flag(store, &repository_key(host, id))?,
         None => None,
     };
     let enabled = repository_id.is_some() && own.unwrap_or(hub_default);
     let mine = match repository_id {
-        Some(id) => person(store, user_id, id)?,
+        Some(id) => person(store, host, user_id, id)?,
         None => Person::default(),
     };
     Ok(Sharing {
@@ -142,9 +162,9 @@ fn view(
         },
         hub_default,
         opted_out: mine.opted_out,
-        consented: mine.consented,
+        consented: !mine.opted_out,
         notified: mine.notified,
-        sharing: enabled && mine.consented,
+        sharing: enabled && !mine.opted_out,
         can_change: None,
         can_change_hub_default: None,
     })
@@ -152,13 +172,14 @@ fn view(
 
 fn update_person(
     store: &dyn Store,
+    host: &str,
     user_id: &str,
     repository_id: i64,
     change: &PersonChange,
 ) -> Result<()> {
     for (name, value) in [("opt_out", change.opted_out), ("notified", change.notified)] {
         if let Some(value) = value {
-            let key = person_key(name, user_id, repository_id);
+            let key = person_key(host, name, user_id, repository_id);
             store.set_setting(&key, if value { "1" } else { "0" }, user_id)?;
         }
     }
@@ -215,6 +236,7 @@ async fn token_view(
     let sharing = blocking(&state, move || {
         view(
             &*store,
+            &principal.owner.identity.host,
             &principal.repository,
             principal.repository_id,
             &principal.owner.id,
@@ -238,9 +260,16 @@ async fn token_person(
     };
     let store = state.store.clone();
     let sharing = blocking(&state, move || {
-        update_person(&*store, &principal.owner.id, repository_id, &change)?;
+        update_person(
+            &*store,
+            &principal.owner.identity.host,
+            &principal.owner.id,
+            repository_id,
+            &change,
+        )?;
         view(
             &*store,
+            &principal.owner.identity.host,
             &principal.repository,
             principal.repository_id,
             &principal.owner.id,
@@ -257,14 +286,14 @@ struct RepositoryQuery {
 }
 
 /// The signed-in person, a repository they can read now, and who may change what:
-/// `(user id, full name, repository id, repository or Hub admin, Hub admin)`. `via` names the
+/// `(user id, host, full name, repository id, repository or Hub admin, Hub admin)`. `via` names the
 /// setting the read is for.
 pub(super) async fn session_scope(
     state: &HubState,
     human: &HumanSession,
     repository: &str,
     via: &'static str,
-) -> std::result::Result<(String, String, i64, bool, bool), ApiError> {
+) -> std::result::Result<(String, String, String, i64, bool, bool), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
     let hub_admin = state.login.is_admin_user(&user);
@@ -276,13 +305,21 @@ pub(super) async fn session_scope(
             repository.to_owned(),
         );
         if let Some(repo) = blocking(state, move || store.repository_named(&host, &named)).await? {
-            return Ok((user.id, repo.full_name, repo.repository_id, true, true));
+            return Ok((
+                user.id,
+                repo.host,
+                repo.full_name,
+                repo.repository_id,
+                true,
+                true,
+            ));
         }
     }
     let (repo, repository_admin) =
         super::login::devices::mint_access(state, &user, repository, via).await?;
     Ok((
         user.id,
+        repo.host,
         repo.full_name,
         repo.repository_id,
         repository_admin || hub_admin,
@@ -296,10 +333,11 @@ async fn session_view(
     query: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Sharing>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
-    let (user, name, id, can_change, hub_admin) =
+    let (user, host, name, id, can_change, hub_admin) =
         session_scope(&state, &human, &query.repository, "conversation_sharing").await?;
     let store = state.store.clone();
-    let mut sharing = blocking(&state, move || view(&*store, &name, Some(id), &user)).await?;
+    let mut sharing =
+        blocking(&state, move || view(&*store, &host, &name, Some(id), &user)).await?;
     sharing.can_change = Some(can_change);
     sharing.can_change_hub_default = Some(hub_admin);
     Ok(Json(sharing))
@@ -318,7 +356,7 @@ async fn session_set(
     human: HumanSession,
     JsonBody(body): JsonBody<SetRepository>,
 ) -> std::result::Result<Json<Sharing>, ApiError> {
-    let (user, name, id, can_change, hub_admin) =
+    let (user, host, name, id, can_change, hub_admin) =
         session_scope(&state, &human, &body.repository, "conversation_sharing").await?;
     if !can_change {
         return Err(ApiError::forbidden()
@@ -326,8 +364,8 @@ async fn session_set(
     }
     let store = state.store.clone();
     let mut sharing = blocking(&state, move || {
-        store.set_setting(&repository_key(id), on_off(body.enabled), &user)?;
-        view(&*store, &name, Some(id), &user)
+        store.set_setting(&repository_key(&host, id), on_off(body.enabled), &user)?;
+        view(&*store, &host, &name, Some(id), &user)
     })
     .await?;
     sharing.can_change = Some(true);
@@ -347,7 +385,7 @@ async fn session_person(
     human: HumanSession,
     JsonBody(body): JsonBody<SetPerson>,
 ) -> std::result::Result<Json<Sharing>, ApiError> {
-    let (user, name, id, can_change, hub_admin) =
+    let (user, host, name, id, can_change, hub_admin) =
         session_scope(&state, &human, &body.repository, "conversation_sharing").await?;
     let store = state.store.clone();
     let change = PersonChange {
@@ -355,8 +393,8 @@ async fn session_person(
         notified: None,
     };
     let mut sharing = blocking(&state, move || {
-        update_person(&*store, &user, id, &change)?;
-        view(&*store, &name, Some(id), &user)
+        update_person(&*store, &host, &user, id, &change)?;
+        view(&*store, &host, &name, Some(id), &user)
     })
     .await?;
     sharing.can_change = Some(can_change);
@@ -400,73 +438,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repository_enablement_and_affirmative_person_consent_are_both_required() {
+    fn equal_repository_ids_on_different_hosts_keep_sharing_choices_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::hub::store::open(&format!("sqlite://{}", dir.path().join("hub.db").display()))
+                .unwrap();
+        let store = &*store;
+        store.set_setting(HUB_DEFAULT_KEY, "off", "admin").unwrap();
+        store
+            .set_setting(&repository_key("github.com", 7), "on", "admin")
+            .unwrap();
+        assert!(repository_shares(store, "github.com", Some(7)).unwrap());
+        assert!(!repository_shares(store, "gitlab.com", Some(7)).unwrap());
+        update_person(
+            store,
+            "github.com",
+            "usr_a",
+            7,
+            &PersonChange {
+                opted_out: Some(true),
+                notified: None,
+            },
+        )
+        .unwrap();
+        assert!(person(store, "github.com", "usr_a", 7).unwrap().opted_out);
+        assert!(!person(store, "gitlab.com", "usr_b", 7).unwrap().opted_out);
+    }
+
+    #[test]
+    fn sharing_is_on_by_default_and_people_opt_out() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}", dir.path().join("hub.db").display());
         let store = crate::hub::store::open(&url).unwrap();
         let store = &*store;
+        let host = "github.com";
         assert!(
-            !repository_shares(store, Some(7)).unwrap(),
-            "off by default"
+            repository_shares(store, host, Some(7)).unwrap(),
+            "on by default"
         );
-        assert!(!view(store, "o/r", Some(7), "usr_a").unwrap().hub_default);
-        store.set_setting(HUB_DEFAULT_KEY, "on", "admin").unwrap();
-        assert!(repository_shares(store, Some(7)).unwrap());
-        assert!(!person_shares(store, "usr_a", Some(7)).unwrap());
-        store.set_setting(HUB_DEFAULT_KEY, "off", "admin").unwrap();
-        assert!(!repository_shares(store, Some(7)).unwrap());
-        assert!(!view(store, "o/r", Some(7), "usr_a").unwrap().sharing);
-        store.set_setting(HUB_DEFAULT_KEY, "on", "admin").unwrap();
-        assert!(repository_shares(store, Some(7)).unwrap());
         assert!(
-            !repository_shares(store, None).unwrap(),
+            view(store, host, "o/r", Some(7), "usr_a")
+                .unwrap()
+                .hub_default
+        );
+        assert!(
+            person_shares(store, host, "usr_a", Some(7)).unwrap(),
+            "no opt-in needed"
+        );
+        let mine = view(store, host, "o/r", Some(7), "usr_a").unwrap();
+        assert!(mine.sharing && mine.consented && !mine.opted_out);
+        store.set_setting(HUB_DEFAULT_KEY, "off", "admin").unwrap();
+        assert!(!repository_shares(store, host, Some(7)).unwrap());
+        assert!(!view(store, host, "o/r", Some(7), "usr_a").unwrap().sharing);
+        store.set_setting(HUB_DEFAULT_KEY, "on", "admin").unwrap();
+        assert!(repository_shares(store, host, Some(7)).unwrap());
+        assert!(
+            !repository_shares(store, host, None).unwrap(),
             "no forge id never shares"
         );
         store
-            .set_setting(&repository_key(7), "off", "admin")
+            .set_setting(&repository_key(host, 7), "off", "admin")
             .unwrap();
-        assert!(!repository_shares(store, Some(7)).unwrap());
+        assert!(!repository_shares(store, host, Some(7)).unwrap());
         assert_eq!(
-            view(store, "o/r", Some(7), "usr_a").unwrap().source,
+            view(store, host, "o/r", Some(7), "usr_a").unwrap().source,
             "repository"
         );
         store
-            .set_setting(&repository_key(7), "default", "admin")
+            .set_setting(&repository_key(host, 7), "default", "admin")
             .unwrap();
-        assert!(!person_shares(store, "usr_a", Some(7)).unwrap());
-        let consent = PersonChange {
-            opted_out: Some(false),
-            notified: None,
-        };
-        update_person(store, "usr_a", 7, &consent).unwrap();
-        assert!(person_shares(store, "usr_a", Some(7)).unwrap());
+        assert!(person_shares(store, host, "usr_a", Some(7)).unwrap());
         let out = PersonChange {
             opted_out: Some(true),
             notified: None,
         };
-        update_person(store, "usr_a", 7, &out).unwrap();
-        assert!(!person_shares(store, "usr_a", Some(7)).unwrap());
+        update_person(store, host, "usr_a", 7, &out).unwrap();
+        assert!(!person_shares(store, host, "usr_a", Some(7)).unwrap());
         // The listing query builds the same key from the prefix.
         assert_eq!(
-            person_key("opt_out", "usr_a", 7),
-            format!("{OPT_OUT_KEY_PREFIX}usr_a:7")
+            person_key(host, "opt_out", "usr_a", 7),
+            format!("{OPT_OUT_KEY_PREFIX}usr_a:github.com/@repo-id:7")
         );
         assert!(
-            !person_shares(store, "usr_b", Some(7)).unwrap(),
+            person_shares(store, host, "usr_b", Some(7)).unwrap(),
             "per person"
         );
         store
-            .set_setting(&person_key("opt_out", "usr_b", 7), "invalid", "usr_b")
+            .set_setting(&person_key(host, "opt_out", "usr_b", 7), "invalid", "usr_b")
             .unwrap();
-        assert!(!person_shares(store, "usr_b", Some(7)).unwrap());
+        assert!(
+            !person_shares(store, host, "usr_b", Some(7)).unwrap(),
+            "an unreadable value opts out"
+        );
         let told = PersonChange {
             opted_out: None,
             notified: Some(true),
         };
-        update_person(store, "usr_a", 7, &told).unwrap();
-        let mine = view(store, "o/r", Some(7), "usr_a").unwrap();
+        update_person(store, host, "usr_a", 7, &told).unwrap();
+        let mine = view(store, host, "o/r", Some(7), "usr_a").unwrap();
         assert!(
             mine.enabled && mine.opted_out && !mine.consented && mine.notified && !mine.sharing
         );
+        let back = PersonChange {
+            opted_out: Some(false),
+            notified: None,
+        };
+        update_person(store, host, "usr_a", 7, &back).unwrap();
+        assert!(person_shares(store, host, "usr_a", Some(7)).unwrap());
     }
 }

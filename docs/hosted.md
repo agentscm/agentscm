@@ -128,7 +128,7 @@ A passing `check` proves only the local binding. See [Verify trust and behavior]
 
 ## 7. Known breakages and limits
 
-- Hub sessions live in memory, so a restart signs everyone out. Revoked or expired tokens do not release their intents.
+- Revoked or expired tokens do not release their intents. (Browser sign-ins and computer credentials are stored in the Hub's database, so a restart does not sign anyone out.)
 - Nothing is locked. Intents and collision warnings are advice. Only edit and write tool calls are announced before they run. Shell writes are not announced; Claude Code and Codex hooks can report afterwards which files a shell call changed (see [shell-call observation](agents.md#shell-call-observation)).
 - GitHub and GitLab sync and GitHub publishing have been tested only against in-process fakes, not live forges. `agentscm hub publish` cannot create GitLab merge requests; attached-worktree candidate merge requests are tested only against a fake GitLab.
 - Schemas may change between alpha releases without migration. Back up before upgrading, and use the same `agentscm` version on the hub and clients. SQLite backup is cold: stop the hub first ([backup](hub.md#running-in-containers)).

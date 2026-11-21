@@ -1,119 +1,52 @@
-# Implement an Issue End to End
+# Implement an Issue
 
-Implement a GitHub issue through a reviewed, validated, open pull request with as little human intervention as possible. `$ARGUMENTS` must contain an issue number, `#number`, or issue URL. If it does not, ask for the issue and stop.
+Take a GitHub issue to a reviewed, open pull request, and stop where its tier says. `$ARGUMENTS` must name an issue: a number, `#number` or URL. If it does not, ask for one and stop.
 
-Invoking this issue-to-PR command authorizes creating a feature branch, editing files, running local checks, making focused commits, pushing the feature branch, and opening its pull request. This supplies the explicit approval required by `.agents/commands/pr.md`; do not stop for a second approval at the PR gate. Never merge or enable auto-merge.
+Invoking this command authorizes a feature branch, edits, local checks, commits, pushing that branch and opening its pull request. That is the approval `/pr` needs. It does not authorize merging or auto-merge; `AGENTS.md` says who merges.
 
-Act as the orchestrator. Use fresh subagents for repository reconnaissance, each implementation phase, and independent review. Keep the issue text, verified reconnaissance, phase state, and validation results in the main context. Subagents share the working tree, so implementation phases must run sequentially, not concurrently.
+## 1. Read the issue
 
-## Phase 1: Read and validate the issue
+1. If `.agents/prune-worktrees.sh` and `.agents/bound-target.sh` exist, run them first to reclaim disk from finished work. Report what they removed in one line, and continue if they fail.
+2. `gh issue view <issue> --json number,title,body,labels,comments,state,closedByPullRequestsReferences`. Stop if it is closed or already has a closing pull request. Read the exact issues, pull requests or commits it cites, not loose search matches.
+3. Read `AGENTS.md`, `README.md` and the README of each area the issue names.
 
-First reclaim disk from finished work. Earlier runs' PRs merge after their session ends, so nobody else removes their worktrees:
+## 2. Reconnaissance
 
-```sh
-"$(git rev-parse --show-toplevel)/.agents/prune-worktrees.sh"
-"$(git rev-parse --show-toplevel)/.agents/bound-target.sh"
-```
+Give one fresh read-only subagent on a high-capability model the issue text, the repository root and this brief:
 
-The first removes only clean worktrees whose PR is merged or closed, and keeps the branches; `git worktree lock <path>` protects one. The second runs `cargo clean` in the main and current checkout when its `target` exceeds `AGENTSCM_TARGET_LIMIT_GB` GiB (default 30), because Cargo never prunes stale artifacts. Report what each removed or cleaned in one line and do not investigate what it kept. If either fails, say so in one line and continue.
+> Do not edit files. Open every file a claim rests on, recount any number the issue gives, and mark what you could not verify. Answer in this order. (1) Does this change need to exist, or does something already do it? (2) Is there a concept to reuse: an existing type, table, command, skill, config key or doc section that already means this and could be extended instead of adding a new one? (3) Only then, the closest pattern to mirror. Return: the concept to reuse, or "none" and why; files to change, with `path:line`; what the change makes obsolete and should delete; one to three phases, each testable and committable; tests to add or change; estimated changed lines outside tests, lockfiles and generated snapshots; anything it adds that is new, or touches that is sensitive, as `AGENTS.md` defines them; questions the issue does not settle; checks an agent can run, and checks only a person can.
 
-1. Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`.
-2. Resolve the issue with:
+Spot-check its key claims yourself. If it finds nothing to implement, stop and say what the issue needs.
 
-   ```sh
-   gh issue view <issue> --json number,title,body,labels,comments,state,closedByPullRequestsReferences
-   ```
+## 3. Propose a tier and stop where it says
 
-3. Use the returned issue number as the canonical number. Stop if the issue is closed or already has a closing pull request. If it references earlier work, inspect those exact issues, PRs, or commits; do not rely on loose search matches.
-4. Derive a short kebab-case slug from the issue title and choose `fix`, `feat`, `refactor`, or `chore` from the requested behavior.
+Size the change with the tier table in `AGENTS.md`. It takes the highest tier any rule gives it. Report the proposed tier, the line estimate and each new or sensitive item, next to the tier the issue states.
 
-## Phase 2: Reconnaissance
+- **At or below the issue's tier** (its `tier-*` label or its text): continue. An L change also needs a plan one owner approved in the issue. If an owner approves it in this session, post the plan on the issue, saying an agent posted it and who approved. Otherwise post the step 2 plan and stop until an owner approves. The other owner reviews it later, and that does not block the work.
+- **No tier on the issue**: an S change continues. For M or L, comment the proposal on the issue and stop.
+- **Above the issue's tier**: stop and ask. The person chooses: split the work, move it up a tier, or drop it.
+- If a question from step 2 would change behavior, scope or a trust boundary, ask before writing code, with two or three options and a recommendation. Settle naming and file placement from the repository's patterns without asking.
 
-Launch one fresh read-only subagent on a high-capability model, with the full issue title, body, relevant comments, repository root, and these instructions:
+## 4. Branch and claim
 
-> Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`. Inspect the repository thoroughly but do not edit files. Open every file needed to support a claim; do not infer behavior from filenames or the issue alone. Check relevant history when claiming that a regression or refactor caused the problem. Recount file lists and numeric claims from the issue. Mark unverified claims in place.
->
-> Return: (1) files that must change with `path:line` anchors; (2) the closest existing patterns to mirror; (3) a two-to-five-phase implementation order whose phases are independently testable and committable; (4) existing and new tests; (5) affected interfaces and evidence boundaries; (6) structural questions; (7) applicable repository rules and likely pitfalls; (8) synthetic checks an agent can run; and (9) checks that genuinely require the user or unavailable external state.
->
-> Pay particular attention to deterministic ordering and digests, typed outcomes, durable journals and crash recovery, expected-object checks on remote updates, bounded subprocesses and output, cancellation, strict decoding, untrusted-code isolation from credentials, and outcomes that must stay Unknown or blocked rather than report stale success. Check `docs/roadmap.md` so that nothing proposed is described as implemented. A successful command is not proof that the behavior is qualified.
+1. `git status --porcelain` must be empty. Never stash or discard someone's work. Run `git fetch origin main`.
+2. On a feature branch for this issue, continue there; on an unrelated one, stop. From `main`, create `<type>/<number>-<slug>` from `origin/main`, where type is `fix`, `feat`, `refactor`, `docs` or `chore`.
+3. Call `agentscm_start` with your session's title as `task`, the step 2 files as `paths` and the branch as `branch`.
 
-Independently spot-check the report's key file and behavior claims. If it finds no implementable change, stop and explain what clarification is missing.
+## 5. Implement
 
-Ask the user only about structural forks where a wrong choice would discard substantial work or change externally visible behavior, trust boundaries, compatibility, or scope. Present two or three concrete options with a recommendation. Resolve naming, file placement, and ordinary internal factoring from repository patterns without asking.
+Run the phases one after another; subagents share the working tree. Do each phase yourself, or give a fresh subagent on a fast model the repository root, the branch, the issue's behavior, this phase only, its file anchors, the concept to reuse and the tests to write. Write the test first where there is a seam. Commit each phase with a factual message, then check that `HEAD` moved, the diff matches the phase and the tree is clean.
 
-## Phase 3: Establish the branch
+Recount changed lines after each phase. If the change passes its tier's limit, or something new or sensitive appears, stop and ask: split the work, move it up a tier, or drop it.
 
-1. Require `git status --porcelain` to be empty before changing branches. Do not stash or discard existing work.
-2. Run `git fetch origin main` and record the exact repository root from `git rev-parse --show-toplevel` for every subagent prompt.
-3. If already on a feature branch, confirm its name and commits correspond to this issue. Continue there when they do. If it is unrelated, stop rather than mixing work.
-4. If on `main`, ensure `<type>/<number>-<slug>` does not already exist locally or remotely, then create it from `origin/main`.
-5. Present the verified phase list and proceed without an extra approval stop unless Phase 2 found a structural question.
+Run the checks `AGENTS.md` and `README.md` give for each changed area, and `git diff --check`. A check that fails three times, or fails for a reason outside the change, is a stop. Report a skipped test as a coverage limit, never as a pass.
 
-## Phase 4: Implement sequential phases
+## 6. Review
 
-For each phase, record `HEAD` and launch one fresh implementation subagent on a fast, cost-efficient model, with a self-contained prompt containing the repository root, expected branch, issue behavior, the current phase only, relevant file anchors and patterns, applicable rules, prior-phase corrections, and required tests. Include these instructions:
+Run `/review` on the head commit, then handle its findings as it says for the author.
 
-> Confirm the expected branch before editing and stop if it differs. Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, and `STYLE.md`. Work only on the assigned phase. Verify reconnaissance claims against the current files and report corrections. Use synthetic fixtures and keep untrusted code isolated from credentials and trusted reporting. Preserve licenses and notices. Add focused tests for observable behavior and failure modes. Run `cargo fmt` before committing, run the phase-specific tests, inspect the diff for confidential data and machine-specific paths, and commit without bypassing hooks. Use a factual commit message; an `Assisted-by:` trailer is optional, but use no generated-by footer, vendor branding, `Co-authored-by` trailer for a tool, session link, or false attribution. Return changed paths, commit SHA, exact test results, corrected assumptions, and unfinished work.
+## 7. Pull request
 
-After each phase, verify that `HEAD` advanced, the commit matches the assigned scope, and the working tree is clean. Read the changed files and test output needed to validate the subagent's claims. If the phase did not land cleanly, give one fresh correction subagent on a high-capability model, the failure evidence and one attempt to fix and commit it. Stop after a second failure rather than accumulating uncertain changes.
+Follow `/pr`: it pushes the branch, opens the pull request with its tier and reads the hosted checks. Stay with it through checks and merge as `AGENTS.md` says, then call `agentscm_done` with `outcome` `complete`. If you stop first, checkpoint a pause naming the pull request and what it waits on.
 
-Propagate corrected reconnaissance to every later phase. If a late structural fork appears, choose the option most consistent with documented behavior only when compatibility and scope remain unchanged; otherwise stop and ask the user.
-
-## Phase 5: Whole-branch pre-push checks
-
-Run the pre-push checks for the whole branch:
-
-Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite locally; the hosted pull request checks run it on the pushed head (step 11 of `.agents/commands/pr.md`).
-
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Hub container end-to-end qualification is a local release-only gate: run `.github/hub-e2e.sh local-release EVIDENCE_DIR` on the clean committed release candidate and retain both profile results as described in [releasing](../../docs/releasing.md). Routine PR validation does not run it; a green PR does not establish Hub end-to-end coverage. Missing, failed or stale candidate evidence blocks release readiness. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
-
-Applicable reviews remain required. Runner or test-configuration changes require the full nextest suite and doctests, which the hosted checks run on every pull request.
-
-Also run focused synthetic CLI or integration checks identified during reconnaissance when they materially test behavior not covered by the suite. Choose focused tests from the actual changed behavior, its callers and failure paths; focused checks do not replace the hosted checks on the final head. Do not use real credentials, private documents, production systems, or untrusted repository code with ambient credentials.
-
-If a check fails because of the branch, send the exact failure to one fresh correction subagent on a fast, cost-efficient model, then rerun the focused checks. If that coding correction fails, use one fresh correction subagent on a high-capability model, for the second and final attempt. Allow at most two correction attempts. If a prerequisite or external artifact is unavailable, record the resulting coverage limit; never convert it into a pass.
-
-## Phase 6: Independent review
-
-Launch a fresh reviewer on a high-capability model, that did not implement any phase. Give it the concrete issue contract, changed-file list, commit range, and the review criteria from `.agents/commands/review.md`. Require it to inspect every changed file and return severity-ranked findings with `path:line`, reasoning, and proposed action, plus check results and limitations.
-
-Verify each finding against the current code. Delegate every valid, actionable fix to a fresh correction subagent on a fast, cost-efficient model, then rerun the focused checks and repeat independent review. If a coding correction fails, route its retry to a fresh correction subagent on a high-capability model. Stop if the same correction fails twice. A review pass count is not a reason to stop while every remaining finding is an actionable fix. Continue correction, validation, and independent review until no material findings remain.
-
-Resolve a truly structural ambiguity with the user only when repository conventions and the documented issue contract do not provide a safe answer. Otherwise choose the most consistent option, record the assumption, and continue without human intervention. Stop only when the same correction fails twice, a structural fork cannot be resolved without materially changing the requested contract, or required external state or authority is unavailable.
-
-## Phase 7: Exercise observable behavior
-
-Run the synthetic checks from reconnaissance that are safe and available. Prefer deterministic fixtures and exact output, exit-status, report, and interruption assertions. When Docker, PostgreSQL, S3, a live forge, or network access are absent, state exactly which behavior remains unobserved.
-
-Keep these evidence classes separate in the result:
-
-- synthetic fixtures and local fake transports;
-- real local services and transports (Git, Docker, PostgreSQL, S3);
-- live forge or network results;
-- build and test health.
-
-Try to replace avoidable manual checks with synthetic fixtures or existing local harnesses. Leave irreversible actions, production access, unavailable credentials, and genuine human judgment to the user.
-
-## Phase 8: PR gate and final report
-
-Treat a development issue as resolved when its requested behavior is implemented and appropriate automated tests pass. Use `Closes #<issue>` in the implementing PR so merge closes it. Deployment, repository activation, operator configuration, release qualification and unavailable live-service checks do not by themselves keep a development issue open, even when listed as qualification steps. Record what remains unverified in the PR and document concrete operational follow-ups separately; reuse or file a focused follow-up issue when work needs an owner. Do not create generic process tickets merely to justify closure.
-
-An issue whose primary deliverable is deployment, activation or live qualification remains open until that deliverable is complete. Missing implementation, failing relevant tests and unresolved correctness defects also remain blockers. Issue resolution does not waive required PR checks, branch protections or release gates, and does not establish production readiness.
-
-Confirm the branch is clean and summarize:
-
-- implemented behavior and commits;
-- independent review findings and their disposition;
-- exact validation commands and results;
-- assumptions and deviations from the issue;
-- evidence obtained in each evidence class;
-- remaining limitations or user-only verification.
-
-Follow `.agents/commands/pr.md`, push the feature branch, open its pull request, read its hosted checks as step 11 requires, and report the URL. Write the title and body before the last push; do not edit them after it, and if you must, follow `pr.md` step 11 (`gh pr update-branch <PR#>` afterwards). Do not merge `main` into the branch unless GitHub reports a conflict. If a hosted check fails because of the branch, the failure first appears after review: send it back through the Phase 5 correction limits and the Phase 6 independent review, then push the new head and read its hosted checks. A failure shown to be unrelated to the change follows the evidence rule in `pr.md` step 11. Once the hosted checks are green and the PR's one review is recorded, report it ready to queue. Do not run the signed attestation for every PR; it is optional evidence, worth running only in the cases `pr.md` step 11 names. The `/implement` invocation already authorizes this phase. Never merge or enable auto-merge.
+Report the tier and why, the commits, each review finding and what happened to it, the checks you ran and their results, and what was not verified. Keep fixture, local-service and live evidence apart.

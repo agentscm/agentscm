@@ -340,7 +340,14 @@ fn edit(machine: &Machine, cwd: &Path, session: &str, file: &str) -> Output {
 }
 
 fn live_paths(hub: &Hub, repo: &str) -> Vec<Vec<String>> {
-    let live = hub.store.live_intents(repo, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(repo, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     live.into_iter().map(|i| i.paths).collect()
 }
 
@@ -3875,6 +3882,51 @@ fn feed(machine: &Machine, cwd: &Path, args: &[&str], input: &str) -> Output {
 }
 
 #[test]
+fn quickstart_json_reports_user_install_even_when_checkout_has_no_origin() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = TempDir::new().unwrap();
+    machine.git(repo.path(), &["init", "-q", "-b", "main"]);
+    let token = hub.token_file(machine.home.path());
+    let mut args = quick(&hub.url, &token, &["--only", "claude", "--json"]);
+
+    let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
+    assert!(machine.claude_plugin_installed());
+    assert!(machine.connections().is_empty());
+    assert_eq!(report["agents"]["installed"], json!(["claude"]));
+    assert_eq!(report["agents"]["skipped"], json!([]));
+    assert_eq!(report["checkout"]["status"], "skipped");
+
+    machine.git(repo.path(), &["remote", "add", "origin", REMOTE]);
+    args.extend(["--only", "claude"]);
+    let report: Value = serde_json::from_str(&ok(&machine.run(repo.path(), &args))).unwrap();
+    assert_eq!(machine.connections()[0]["repo"], REPO);
+    assert_eq!(report["agents"]["installed"], json!(["claude"]));
+    assert_eq!(report["checkout"]["status"], "connected");
+}
+
+#[test]
+fn quickstart_json_reports_checkout_not_attempted_when_hub_is_skipped() {
+    let machine = Machine::new().with_claude();
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "skip",
+            "--only",
+            "claude",
+            "--json",
+        ],
+    );
+    let report: Value = serde_json::from_str(&ok(&output)).unwrap();
+    assert_eq!(report["agents"]["installed"], json!([]));
+    assert_eq!(report["agents"]["skipped"], json!(["claude"]));
+    assert_eq!(report["checkout"]["status"], "not_attempted");
+}
+
+#[test]
 fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_page_sees_it() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
@@ -4732,7 +4784,7 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
         "--hub local|existing|skip",
         "--hub-url",
         "--agent-token-file",
-        "--agent claude|codex|cursor|copilot|gemini",
+        "--agent claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush",
         "--no-agents",
     ] {
         assert!(said.contains(flag), "{flag}: {said}");
@@ -5292,6 +5344,129 @@ fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration(
     }
 }
 
+/// Each agent set up from its table entry gets its MCP entry, hooks and skill in its own user
+/// files, beside what was there, and uninstall leaves those files as they were.
+#[test]
+fn table_agents_are_set_up_in_their_own_files_and_uninstall_restores_them() {
+    let kept_hook = json!([{"hooks": [{"type": "command", "command": "kept-command"}]}]);
+    for (agent, mcp, mcp_key, hooks, original, skill) in [
+        (
+            "droid",
+            ".factory/mcp.json",
+            "mcpServers",
+            ".factory/hooks.json",
+            json!({"PreToolUse": kept_hook}),
+            ".factory/skills",
+        ),
+        (
+            "qwen",
+            ".qwen/settings.json",
+            "mcpServers",
+            ".qwen/settings.json",
+            json!({"theme": "kept-theme", "hooks": {"Stop": kept_hook}}),
+            ".qwen/skills",
+        ),
+        (
+            "junie",
+            ".junie/mcp/mcp.json",
+            "mcpServers",
+            ".junie/config.json",
+            json!({"model": "kept-model"}),
+            ".junie/skills",
+        ),
+        (
+            "crush",
+            ".config/crush/crush.json",
+            "mcp",
+            ".config/crush/crush.json",
+            json!({"$schema": "https://charm.land/crush.json",
+                "mcp": {"kept-server": {"type": "stdio", "command": "kept-command"}},
+                "hooks": {"PreToolUse": [{"command": "kept-command"}]}}),
+            ".config/crush/skills",
+        ),
+    ] {
+        let (hub, machine) = (Hub::start(), Machine::new());
+        let repo = machine.repo();
+        let token = hub.token_file(machine.home.path());
+        let home = machine.home.path();
+        let (mcp, hooks) = (home.join(mcp), home.join(hooks));
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::fs::write(&hooks, original.to_string()).unwrap();
+        ok(&machine.run(
+            repo.path(),
+            &quick(&hub.url, &token, &["--no-collisions", "--agent", agent]),
+        ));
+        let server = &json_file(&mcp)[mcp_key]["agentscm"];
+        assert_eq!(
+            server["args"],
+            json!(["--no-telemetry", "client", "mcp"]),
+            "{agent}"
+        );
+        let written = json_file(&hooks);
+        let text = written.to_string();
+        assert!(
+            text.contains(&format!("hook {agent} --client-connection")),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("kept-command"),
+            original.to_string().contains("kept-command"),
+            "{text}"
+        );
+        match agent {
+            // Its hooks file is the event map itself.
+            "droid" => {
+                assert!(written.get("hooks").is_none() && written["SessionStart"].is_array());
+                assert_eq!(server["type"], "stdio");
+            }
+            "qwen" => assert_eq!(server["trust"], true, "{server}"),
+            // Its hooks are listed straight under each event.
+            "crush" => {
+                assert_eq!(server["type"], "stdio");
+                let pre = written["hooks"]["PreToolUse"].as_array().unwrap();
+                assert!(pre.iter().all(|hook| hook["command"].is_string()), "{text}");
+            }
+            _ => assert_eq!(written["model"], "kept-model"),
+        }
+        let skill = home.join(skill).join("coordinate-edits/SKILL.md");
+        assert!(skill.exists(), "{agent}");
+        assert_eq!(machine.connections()[0]["agents"], json!([agent]));
+
+        ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+        assert_eq!(json_file(&hooks), original, "{agent}");
+        if mcp != hooks {
+            assert!(!mcp.exists(), "{agent}");
+        }
+        assert!(!skill.exists(), "{agent}");
+    }
+}
+
+/// A table agent is set up for all projects only.
+#[test]
+fn a_table_agent_refuses_a_checkout_only_setup() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let refused = machine.run(
+        repo.path(),
+        &[
+            "client",
+            "setup",
+            "--agent",
+            "crush",
+            "--checkout-only",
+            "--hub",
+            &hub.url,
+            "--token-file",
+            token.to_str().unwrap(),
+        ],
+    );
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains("rerun without --checkout-only"), "{said}");
+    assert!(!machine.home.path().join(".config/crush").exists());
+}
+
 /// A checkout set up for one checkout only moves to the user configuration, and a checkout-only
 /// setup is refused while the agent is set up for all projects, so no hook runs twice.
 #[test]
@@ -5318,7 +5493,28 @@ fn checkout_and_user_scope_never_both_hold_an_agents_hooks() {
         user["mcpServers"]["agentscm"]["args"],
         json!(["--no-telemetry", "client", "mcp"])
     );
-    assert_eq!(user["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    let mut startup_commands: Vec<_> = user["hooks"]["SessionStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .map(|hook| {
+            hook["command"]
+                .as_str()
+                .unwrap()
+                .rsplit_once(" --no-telemetry ")
+                .unwrap()
+                .1
+        })
+        .collect();
+    startup_commands.sort_unstable();
+    assert_eq!(
+        startup_commands,
+        [
+            "feedback start --client gemini",
+            "hook gemini --client-connection",
+        ]
+    );
 
     let refused = setup(&["--checkout-only"]);
     assert!(!refused.status.success());

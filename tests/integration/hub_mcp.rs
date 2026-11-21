@@ -150,10 +150,294 @@ impl Hub {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addressed_owner_notice_http_and_mcp_keep_status_and_authority_separate() {
+    let hub = Hub::start().await;
+    let sender = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9701,
+            },
+            "sender",
+        )
+        .unwrap();
+    let recipient = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9702,
+            },
+            "recipient",
+        )
+        .unwrap();
+    let stranger = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 9703,
+            },
+            "stranger",
+        )
+        .unwrap();
+    let (_, sender_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &sender.id,
+        "sender-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (_, recipient_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &recipient.id,
+        "recipient-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (_, stranger_secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &stranger.id,
+        "stranger-agent",
+        REPO,
+        70,
+        3600,
+        false,
+    )
+    .unwrap();
+    let body = json!({
+        "idempotency_key":"mcp-owner-note-1",
+        "source_id":"review-note-1",
+        "target":{"owner":recipient.id},
+        "body":"Please review the current pull request state.",
+        "route":"private"
+    });
+    let sent = hub
+        .client
+        .post(format!("{}/v1/hub/owner-notices", hub.base))
+        .bearer_auth(sender_secret.expose())
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), 200);
+    let sent: Value = serde_json::from_str(&sent.text().await.unwrap()).unwrap();
+    assert_eq!(sent["queued"], true);
+    assert_eq!(sent["delivered"], false);
+    assert_eq!(sent["acknowledged"], false);
+    assert!(
+        sent.get("acted_at").is_none(),
+        "action is not part of sender status: {sent}"
+    );
+    let id = sent["id"].as_str().unwrap();
+
+    let listed = hub
+        .tool_result(
+            recipient_secret.expose(),
+            "agentscm_owner_notice_list",
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        listed["structuredContent"]["notices"][0]["id"], id,
+        "{listed}"
+    );
+    assert_eq!(
+        listed["structuredContent"]["notices"][0]["body"],
+        body["body"]
+    );
+
+    let refused = hub
+        .tool_result(
+            stranger_secret.expose(),
+            "agentscm_owner_notice_status",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+
+    let acknowledged = hub
+        .tool_result(
+            recipient_secret.expose(),
+            "agentscm_owner_notice_acknowledge",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(acknowledged["structuredContent"]["acknowledged"], true);
+    assert_eq!(acknowledged["structuredContent"]["delivered"], false);
+    assert!(acknowledged["structuredContent"].get("acted_at").is_none());
+
+    let sender_status = hub
+        .tool_result(
+            sender_secret.expose(),
+            "agentscm_owner_notice_status",
+            json!({"id":id}),
+        )
+        .await;
+    assert_eq!(sender_status["structuredContent"]["acknowledged"], true);
+    assert_eq!(sender_status["structuredContent"]["delivered"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_native_calls_do_not_publish_mcp_reach_or_deliver_messages() {
+    use agentscm::hub::agent_messages;
+    use agentscm::hub::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
+    for (terminal, alias) in [(false, false), (true, false), (false, true)] {
+        let hub = Hub::start().await;
+        let now = unix_now();
+        let owner = hub
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 9001,
+                },
+                "synthetic-owner",
+            )
+            .unwrap();
+        let (token, secret, _) =
+            mint_bound_agent_token(&*hub.store, &owner.id, "native", REPO, 7, 3600, false).unwrap();
+        let domain = if alias { "default" } else { "native-message" };
+        if alias {
+            let started = hub.tool_result(secret.expose(), "agentscm_start", json!({
+                "request_key":"alias-message", "task":"Read canonical messages", "session":domain, "paths":["src/lib.rs"]
+            })).await;
+            assert_eq!(started["isError"], false, "{started}");
+            for session in [domain, "native-message"] {
+                hub.store
+                    .touch_session(
+                        &token,
+                        &agentscm::hub::session::SessionCall {
+                            session: Some(session.into()),
+                            via: "hook:claude".into(),
+                            task: None,
+                            paths: vec!["src/lib.rs".into()],
+                            deny: false,
+                            report: true,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                hub.store
+                    .session_name_for(&token, Some("native-message"), now)
+                    .unwrap(),
+                domain
+            );
+        }
+        let register = |nonce: &str, expected| LifecycleRegister {
+            session: "native-message".into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("start-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+        let old = hub
+            .store
+            .lifecycle_register(&token, &register("old", None), now)
+            .unwrap();
+        let current = if terminal {
+            hub.store
+                .lifecycle_end(
+                    &token,
+                    &LifecycleEnd {
+                        session: old.session.clone(),
+                        incarnation: old.incarnation.clone(),
+                        operation_id: "end-old".into(),
+                        observed_at: now,
+                        reason: EndReason::ExplicitEnd,
+                        work: vec![],
+                    },
+                    now,
+                )
+                .unwrap()
+                .lifecycle
+        } else {
+            hub.store
+                .lifecycle_register(
+                    &token,
+                    &register("current", Some(old.incarnation.clone())),
+                    now,
+                )
+                .unwrap()
+        };
+        let key = format!("agent_messages:{}:7", owner.id);
+        let queued = json!([{"id":format!("msg_{}", "a".repeat(32)), "token":token,
+            "session":domain, "note":"synthetic private message body", "from":"synthetic-owner",
+            "state":"queued", "created_at":now, "deadline_at":now + 600}]);
+        hub.store
+            .set_setting(&key, &queued.to_string(), &owner.id)
+            .unwrap();
+        let call = |incarnation: String| {
+            let client = hub.client.clone();
+            let url = format!("{}/mcp", hub.base);
+            let secret = secret.expose().to_owned();
+            async move {
+                let response = client.post(url).bearer_auth(secret)
+                    .header("x-agentscm-session", "native-message")
+                    .header("x-agentscm-incarnation", incarnation)
+                    .header("content-type", "application/json")
+                    .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                        "params":{"name":"agentscm_status","arguments":{"session":"native-message"}}}).to_string())
+                    .send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()["result"]
+                    .clone()
+            }
+        };
+        let refused = call(old.incarnation).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(!agent_messages::mcp_delivers(&token, domain));
+        let saved: Value =
+            serde_json::from_str(&hub.store.get_setting(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(saved, queued);
+        assert!(
+            !refused
+                .to_string()
+                .contains("synthetic private message body")
+        );
+
+        let fresh = hub
+            .store
+            .lifecycle_register(&token, &register("fresh", Some(current.incarnation)), now)
+            .unwrap();
+        let accepted = call(fresh.incarnation).await;
+        assert_eq!(accepted["isError"], false, "{accepted}");
+        assert_eq!(agent_messages::mcp_delivers(&token, domain), !alias);
+        assert!(
+            accepted["_meta"]["agentscm"]["source_notice"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("agentscm_hub_message")),
+            "{accepted}"
+        );
+        assert!(
+            !accepted
+                .to_string()
+                .contains("synthetic private message body"),
+            "modern delivery exposes only the ledger pointer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn named_overlap_tools_and_dependency_summary_delivery() {
     let hub = Hub::start().await;
     let (a_token, a) = hub.secret_with_id(801, "first");
-    let (_, b) = hub.secret_with_id(802, "second");
+    let (b_token, b) = hub.secret_with_id(802, "second");
     let listed = hub
         .rpc(&a, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .await
@@ -180,7 +464,19 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
     let target = &first["structuredContent"]["work"]["item"];
     let second=hub.tool_result(&b,"agentscm_start",json!({"request_key":"second","task":"Second behavior","session":"second","paths":["src/shared.rs"]})).await;
     let request = &second["structuredContent"]["work"]["coordination_request"];
-    let grant=hub.tool_result(&a,"agentscm_work_overlap_consent",json!({"request_id":request["id"],"target_work_id":target["id"],"operation_id":"grant","session":"first","expected_updated_seq":request["updated_seq"],"target_generation":target["generation"],"target_updated_seq":target["updated_seq"],"paths":["src/shared.rs"]})).await;
+    let overlap = second["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["kind"] == "propose_overlap")
+        .unwrap();
+    let mut grant_args = overlap["target_lead_recipes"][0]["arguments"].clone();
+    grant_args["session"] = json!("first");
+    grant_args["operation_id"] = json!("grant");
+    grant_args["target_updated_seq"] = target["updated_seq"].clone();
+    let grant = hub
+        .tool_result(&a, "agentscm_work_overlap_consent", grant_args)
+        .await;
     assert_eq!(grant["isError"], false, "{grant}");
     assert_eq!(grant["structuredContent"]["state"], "awaiting_requester");
     let envelope = json!({"start":{"request_key":"second","title":"Second behavior","session":"second","scope":["src/shared.rs"]},"consent_ids":[grant["structuredContent"]["id"]]});
@@ -193,7 +489,7 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
         json!(["src/shared.rs"])
     );
     let accepted = hub
-        .tool_result(&b, "agentscm_work_overlap_start", envelope)
+        .tool_result(&b, "agentscm_work_overlap_start", envelope.clone())
         .await;
     assert_eq!(accepted["isError"], false, "{accepted}");
     assert_eq!(accepted["structuredContent"]["created"], true);
@@ -212,6 +508,113 @@ async fn named_overlap_tools_and_dependency_summary_delivery() {
         dependent["structuredContent"]["work"]["preflight"]["dependencies"]["conditions"][0]["disposition"]
             ["state"],
         "unknown"
+    );
+    let now = unix_now();
+    let registration =
+        |nonce: &str, expected| agentscm::hub::session_lifecycle::LifecycleRegister {
+            session: "second".into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("nested-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+    let old = hub
+        .store
+        .lifecycle_register(&b_token, &registration("old", None), now)
+        .unwrap();
+    let current = hub
+        .store
+        .lifecycle_register(
+            &b_token,
+            &registration("current", Some(old.incarnation.clone())),
+            now,
+        )
+        .unwrap();
+    let cursor = || {
+        rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap()
+        .query_row("SELECT dependency_notice_cursor FROM hub_sessions WHERE token=?1 AND session='second'", [&b_token], |row| row.get::<_, i64>(0)).unwrap()
+    };
+    let before = cursor();
+    let notice = hub
+        .store
+        .notice_record(
+            &b_token,
+            &agentscm::hub::notices::NoticeSource {
+                kind: agentscm::hub::notices::SourceKind::Operational,
+                id: "synthetic-nested-pickup".into(),
+                version: "1".into(),
+            },
+            &agentscm::hub::notices::NoticeRecipient {
+                token: b_token.clone(),
+                session: "second".into(),
+                work_id: None,
+                generation: None,
+            },
+            now,
+        )
+        .unwrap();
+    let nested = |incarnation: String| {
+        let client = hub.client.clone();
+        let url = format!("{}/mcp", hub.base);
+        let token = b.clone();
+        let arguments = envelope.clone();
+        async move {
+            let reply = client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("x-agentscm-session", "second")
+                .header("x-agentscm-incarnation", incarnation)
+                .body(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"agentscm_work_overlap_start","arguments":arguments}})
+                    .to_string(),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+            serde_json::from_str::<Value>(&reply.text().await.unwrap()).unwrap()["result"].clone()
+        }
+    };
+    let refused = nested(old.incarnation).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        hub.store
+            .notice_pending(&b_token, "second", now)
+            .unwrap()
+            .iter()
+            .find(|saved| saved.id == notice.id)
+            .unwrap()
+            .offered_at
+            .is_none()
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "a stale nested call cannot consume successor notices"
+    );
+    assert!(
+        refused["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none()
+    );
+    let modern = nested(current.incarnation).await;
+    assert_eq!(modern["isError"], false, "{modern}");
+    assert!(
+        modern["_meta"]["agentscm"]
+            .get("dependency_notifications")
+            .is_none()
+    );
+    assert_eq!(
+        modern["_meta"]["agentscm"]["source_notice"]["delivery_id"], notice.id,
+        "{modern}"
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "modern nested calls use the notice ledger"
     );
     let pure=hub.tool_result(&a,"agentscm_work_preflight",json!({"request_key":"first","task":"First behavior","session":"first","paths":["src/shared.rs"]})).await;
     assert_eq!(pure["isError"], false, "{pure}");
@@ -561,6 +964,31 @@ async fn onboarding_is_authenticated_revalidates_revocation_and_rejects_fabricat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_status_without_a_recorded_session_start_says_why() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "agent");
+    let (_, reply) = hub
+        .onboarding_request(
+            &secret,
+            &"a".repeat(64),
+            reqwest::Method::POST,
+            "/mcp",
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"agentscm_setup_status","arguments":{"agent":"claude","session":"s"}}}),
+        )
+        .await;
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Native session start is not verified; restart the native session"),
+        "{reply}"
+    );
+    assert!(!text.contains("check the required fields"), "{reply}");
+    let error = &reply["result"]["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_request");
+    assert_eq!(error["recovery"]["action"], "start_session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_lifecycle_invalidates_even_when_coordination_writes_fail() {
     let hub = Hub::start().await;
     let secret = hub.secret(1, "agent");
@@ -746,6 +1174,10 @@ async fn protocol_basics() {
             "agentscm_work_transitions",
             "agentscm_work_recovery",
             "agentscm_work_recovery_preview",
+            "agentscm_owner_notice_list",
+            "agentscm_owner_notice_status",
+            "agentscm_owner_notice_send",
+            "agentscm_owner_notice_acknowledge",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -757,6 +1189,7 @@ async fn protocol_basics() {
             "agentscm_promise_propose",
             "agentscm_promise_report",
             "agentscm_hub_message",
+            "agentscm_work_dependency_ack",
             "agentscm_view_settings",
             "agentscm_coordination_ack",
             "agentscm_coordination_reply",
@@ -1374,6 +1807,53 @@ fn keyless(text: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ask_lapses_once_when_the_holder_releases_the_file() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let file = "src/billing.rs";
+    let token_of = |secret: &str| {
+        hub.store
+            .authenticate(&store::agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    for (secret, paths) in [(&alice, vec![file.to_owned()]), (&bob, vec![])] {
+        hub.store
+            .touch_session(
+                &token_of(secret),
+                &agentscm::hub::session::SessionCall {
+                    session: None,
+                    via: "mcp".into(),
+                    task: Some("work".into()),
+                    paths,
+                    deny: false,
+                    report: true,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let (asked, error) = hub
+        .tool(&bob, "/mcp", "agentscm_ask", json!({"path": file}))
+        .await;
+    assert!(!error, "{asked}");
+    hub.store
+        .end_session(&token_of(&alice), Some("default"), unix_now())
+        .unwrap();
+    let (status, _) = hub.tool(&bob, "/mcp", "agentscm_status", json!({})).await;
+    assert!(
+        status.contains(
+            "your ask for src/billing.rs lapsed: the session you asked no longer holds it and gave no reply."
+        ),
+        "{status}"
+    );
+    let (again, _) = hub.tool(&bob, "/mcp", "agentscm_status", json!({})).await;
+    assert!(!again.contains("lapsed"), "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");
@@ -1427,7 +1907,7 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     // The holder is its MCP session: no hook kind, an 8-hex key, not the token's label.
     let key = asked
         .strip_prefix("AgentSCM: asked user1's agent session ")
-        .and_then(|rest| rest.strip_suffix(" for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too."))
+        .and_then(|rest| rest.strip_suffix(" for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues."))
         .unwrap_or_else(|| panic!("{asked}"));
     assert!(
         key.len() == 8 && key.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -1982,7 +2462,14 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
             .is_some_and(|alternatives| (1..=3).contains(&alternatives.len())),
         "{conflict}"
     );
-    let live = hub.store.live_intents(REPO, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         live.iter()
             .all(|intent| !intent.paths.contains(&"src/conflicted.rs".to_owned())),
@@ -2247,7 +2734,7 @@ async fn a_refused_start_says_a_quiet_leading_agent_cannot_answer_only_when_its_
     // It says when the request is raised to that lead's person if it is not acknowledged.
     assert!(
         said.contains(&format!(
-            "If the agent leading {work_id} has not acknowledged it by Unix "
+            "If the agent leading {work_id} has not acknowledged it within 10 minutes of this request,"
         )) && said.contains("it is raised to its person, user1, in the AgentSCM Hub's Needs you"),
         "{said}"
     );
@@ -3192,7 +3679,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 46] = [
+    const CORE: [&str; 51] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -3207,6 +3694,10 @@ async fn default_tool_list_cost() {
         "agentscm_done",
         "agentscm_handoff",
         "agentscm_hub_message",
+        "agentscm_owner_notice_acknowledge",
+        "agentscm_owner_notice_list",
+        "agentscm_owner_notice_send",
+        "agentscm_owner_notice_status",
         "agentscm_pr_context",
         "agentscm_setup_status",
         "agentscm_show_overview",
@@ -3220,6 +3711,7 @@ async fn default_tool_list_cost() {
         "agentscm_work_catchup",
         "agentscm_work_catchup_ack",
         "agentscm_work_checkpoint",
+        "agentscm_work_dependency_ack",
         "agentscm_work_dependency_notices",
         "agentscm_work_insight",
         "agentscm_work_insights",
@@ -3249,7 +3741,7 @@ async fn default_tool_list_cost() {
     names.sort_unstable();
     assert_eq!(names, CORE);
     assert!(
-        chars <= 17_500,
+        chars <= 18_800,
         "default descriptions grew to {chars} characters"
     );
 }
@@ -3281,6 +3773,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
     hub.store
         .skill_adoption_put(&SkillAdoption {
             repository: REPO.into(),
+            repository_scope: store::repository_scope("github.com", REPO, None),
             source: "default_branch".into(),
             lock_json: r#"{"version":1,"skills":[]}"#.into(),
             default_branch: Some("main".into()),
@@ -3794,6 +4287,8 @@ async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
                 transition: WorkTransitionKind::Release,
                 reason: "synthetic reason".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             unix_now(),
         )
@@ -4317,4 +4812,326 @@ async fn pr_overlap_skips_the_work_that_opened_the_pull_request() {
         .filter_map(|r| r["login"].as_str())
         .collect();
     assert_eq!(logins, ["user2"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finished_paths_prompt_the_lead_and_the_refused_requester() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let texts = |value: &Value| {
+        value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let first = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"request_key":"first","task":"First","session":"s-a","paths":["src/a.rs","src/b.rs"]}),
+        )
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let item = &first["structuredContent"]["work"]["item"];
+    let report = |op: &str, seq: &Value| {
+        json!({"work_id":item["id"],"operation_id":op,"generation":item["generation"],
+            "expected_updated_seq":seq,"session":"s-a","kind":"progress",
+            "summary":"a is done","finished_paths":["src/a.rs"]})
+    };
+    let quiet = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            report("one", &item["updated_seq"]),
+        )
+        .await;
+    assert_eq!(quiet["isError"], false, "{quiet}");
+    assert_eq!(
+        quiet["structuredContent"]["item"]["finished_paths"],
+        json!(["src/a.rs"])
+    );
+    assert!(!texts(&quiet).contains("finished file(s)"), "{quiet}");
+
+    let refused = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"request_key":"second","task":"Second","session":"s-b","paths":["src/a.rs","src/b.rs"]}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = texts(&refused);
+    assert!(
+        text.contains("reports these requested files as finished"),
+        "{text}"
+    );
+    assert!(
+        text.contains("src/a.rs") && text.contains("agentscm_work_overlap_consent"),
+        "{text}"
+    );
+
+    let steps = refused["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap();
+    let subset = steps
+        .iter()
+        .find(|step| step["kind"] == "request_subset")
+        .unwrap();
+    assert_eq!(subset["call"]["arguments"]["paths"], json!(["src/a.rs"]));
+    assert_eq!(subset["call"]["arguments"]["request_key"], "second");
+    let retry = hub
+        .tool_result(&bob, "agentscm_start", subset["call"]["arguments"].clone())
+        .await;
+    assert_eq!(retry["isError"], true, "a subset remains held: {retry}");
+    assert!(retry["structuredContent"]["work"]["coordination_request"].is_object());
+    let overlap = steps
+        .iter()
+        .find(|step| step["kind"] == "propose_overlap")
+        .unwrap();
+    let read = hub
+        .tool_result(
+            &bob,
+            "agentscm_work_overlap_consents",
+            overlap["call"]["arguments"].clone(),
+        )
+        .await;
+    assert_eq!(read["isError"], false, "{read}");
+    assert!(
+        !json!(steps).to_string().contains("s-a"),
+        "another owner's session stays private"
+    );
+
+    let seq = quiet["structuredContent"]["item"]["updated_seq"].clone();
+    let prompted = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", report("two", &seq))
+        .await;
+    let text = texts(&prompted);
+    assert!(
+        text.contains("1 finished file(s) are wanted by another Work: src/a.rs")
+            && text.contains("release_paths"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requester_notice_shows_bounded_released_paths_and_the_several_files_hint() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let files: Vec<String> = (0..8).map(|index| format!("src/f{index}.rs")).collect();
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"request_key":"held","task":"Held","session":"s-a","paths":files}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let refused = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"request_key":"asked","task":"Asked","session":"s-b","paths":files}),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    // Nothing is reported finished, so the refusal still hints at asking for a subset.
+    let text = refused["content"].to_string();
+    assert!(text.contains("The refusal covers several files"), "{text}");
+    assert!(!text.contains("reports these requested files"), "{text}");
+
+    let inbox = hub
+        .tool_result(
+            &bob,
+            "agentscm_coordination_inbox",
+            json!({"session":"s-b"}),
+        )
+        .await;
+    let request = inbox["structuredContent"]["requests"][0].clone();
+    let reply = |op: &str, seq: &Value, released: &[String]| {
+        json!({"request_id":request["id"],"operation_id":op,
+            "target_work_id":request["targets"][0]["work_id"],"session":"s-a",
+            "expected_updated_seq":seq,"kind":"decline","release_paths":released})
+    };
+    let first = hub
+        .tool_result(
+            &alice,
+            "agentscm_coordination_reply",
+            reply("one", &request["updated_seq"], &files[..6]),
+        )
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    serde_json::from_value::<agentscm::hub::coordination::CoordinationRequest>(
+        first["structuredContent"].clone(),
+    )
+    .unwrap();
+    let steps = first["_meta"]["agentscm"]["coordination_remedies"]
+        .as_array()
+        .unwrap();
+    assert!(steps.iter().any(|step| step["kind"] == "propose_overlap"));
+    assert!(steps.iter().any(|step| step["kind"] == "wait"));
+    assert!(
+        !steps.iter().any(|step| step["kind"] == "request_subset"),
+        "holder cannot start as requester"
+    );
+    let second = hub
+        .tool_result(
+            &alice,
+            "agentscm_coordination_reply",
+            reply("two", &first["structuredContent"]["updated_seq"], &[]),
+        )
+        .await;
+    assert_eq!(second["isError"], false, "{second}");
+
+    let status = hub
+        .tool_result(&bob, "agentscm_status", json!({"session":"s-b"}))
+        .await;
+    let notice = status["_meta"]["agentscm"]["coordination_notifications"]["notices"][0].clone();
+    assert_eq!(notice["requested_paths"], "held", "{status}");
+    let replies = notice["replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 2, "{notice}");
+    let with = replies
+        .iter()
+        .find(|reply| reply.get("released_paths").is_some())
+        .unwrap();
+    assert_eq!(
+        with["released_paths"].as_array().unwrap().len(),
+        5,
+        "{notice}"
+    );
+    assert_eq!(with["released_paths_omitted"], 1, "{notice}");
+    let without = replies
+        .iter()
+        .find(|reply| reply.get("released_paths").is_none())
+        .unwrap();
+    assert!(without.get("released_paths_omitted").is_none(), "{notice}");
+    assert_eq!(
+        notice["released_paths"].as_array().unwrap().len(),
+        6,
+        "{notice}"
+    );
+    assert!(notice.get("released_paths_complete").is_none(), "{notice}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_starts_give_applicable_exact_coordination_calls() {
+    let hub = Hub::start().await;
+    let (alice_token, alice) = hub.secret_with_id(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    for (index, paths, subset_expected) in [
+        (0, vec!["one/a.rs"], false),
+        (1, vec!["two/a.rs", "two/b.rs"], true),
+        (2, vec!["directory/**"], false),
+    ] {
+        let holder_session = format!("holder-{index}");
+        let requester_session = format!("requester-{index}");
+        if index == 2 {
+            // Durable Work supports directory scope; MCP's session intent accepts files only.
+            let request = serde_json::from_value(json!({
+                "request_key":format!("held-{index}"),"title":"Hold synthetic directory",
+                "session":holder_session,"scope":paths
+            }))
+            .unwrap();
+            let held = hub
+                .store
+                .work_start(&alice_token, &request, unix_now())
+                .unwrap();
+            assert!(held.conflict.is_none(), "{held:?}");
+        } else {
+            let held = hub
+                .tool_result(
+                    &alice,
+                    "agentscm_start",
+                    json!({
+                        "request_key":format!("held-{index}"),"task":"Hold synthetic files",
+                        "session":holder_session,"paths":paths
+                    }),
+                )
+                .await;
+            assert_eq!(held["isError"], false, "{held}");
+        }
+        let requested_paths = if index == 2 {
+            vec!["directory/a.rs"]
+        } else {
+            paths
+        };
+        let refused = hub
+            .tool_result(
+                &bob,
+                "agentscm_start",
+                json!({
+                    "request_key":format!("requested-{index}"),"task":"Change synthetic files",
+                    "session":requester_session,"paths":requested_paths,"branch":"fix/synthetic"
+                }),
+            )
+            .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let steps = refused["_meta"]["agentscm"]["coordination_remedies"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            steps.iter().any(|step| step["kind"] == "request_subset"),
+            subset_expected,
+            "{refused}"
+        );
+        for kind in ["propose_overlap", "wait"] {
+            let step = steps.iter().find(|step| step["kind"] == kind).unwrap();
+            let call = &step["call"];
+            assert_eq!(call["arguments"]["session"], requester_session);
+            let reply = hub
+                .tool_result(
+                    &bob,
+                    call["tool"].as_str().unwrap(),
+                    call["arguments"].clone(),
+                )
+                .await;
+            assert_eq!(reply["isError"], false, "{reply}");
+            if kind == "wait" {
+                serde_json::from_value::<agentscm::hub::coordination::CoordinationInbox>(
+                    reply["structuredContent"].clone(),
+                )
+                .unwrap();
+                assert!(
+                    reply["_meta"]["agentscm"]["coordination_remedies"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|step| step["kind"] == "propose_overlap")
+                );
+            }
+        }
+        let overlap = steps
+            .iter()
+            .find(|step| step["kind"] == "propose_overlap")
+            .unwrap();
+        assert!(
+            overlap["target_lead_recipes"][0]["arguments"]
+                .get("target_updated_seq")
+                .is_none()
+        );
+        assert!(
+            overlap["target_lead_recipes"][0]["caller_supplies"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("target_updated_seq"))
+        );
+        assert!(
+            overlap["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("alone gives no edit authority")
+        );
+        if subset_expected {
+            let subset = steps
+                .iter()
+                .find(|step| step["kind"] == "request_subset")
+                .unwrap();
+            assert_eq!(subset["call"]["arguments"]["branch"], "fix/synthetic");
+            assert_eq!(subset["call"]["arguments"]["paths"], json!(["two/a.rs"]));
+        }
+    }
 }

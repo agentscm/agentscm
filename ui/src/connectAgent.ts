@@ -10,7 +10,7 @@ export function safeHubOrigin(raw: string): string | null {
   }
 }
 
-export const CLIENT_AGENTS = ['claude', 'codex', 'cursor', 'copilot', 'gemini'] as const
+export const CLIENT_AGENTS = ['claude', 'codex', 'cursor', 'copilot', 'gemini', 'droid', 'qwen', 'junie', 'crush'] as const
 export type ClientAgent = (typeof CLIENT_AGENTS)[number]
 
 // Setup currently targets POSIX shells on macOS and Linux.

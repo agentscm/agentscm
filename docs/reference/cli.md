@@ -4,9 +4,9 @@ title: "Native CLI reference"
 
 # Native CLI reference
 
-> **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [connected local page](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
+> **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). Start with the [README](../../README.md), [setup guide](../setup-guide.md) and [this computer's controls](../connect-this-computer.md) for everyday setup, sign-in and inspection; the [collision](../collisions.md), [intent](../intents.md) and [Hub](../hub.md) guides cover coordination commands.
 
-`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists every command; all of them keep working by name, and `agentscm COMMAND --help` prints any command's usage. `workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden even from `agentscm help --all`, as is the internal `git-remote-credential` helper. `setup` is also hidden: it is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm help --all`.
+`agentscm --help` (and `agentscm help`) lists only the core commands, in groups: `quickstart`, `uninstall`, `hub login`, `hub whoami`, `client setup`, `client remove`, `client doctor` and `open`. `agentscm help --all` lists the remaining visible commands, such as `serve`, `hub`, `client`, `work`, `intent`, `collisions` and `autopsy`. Most native and experimental commands are hidden from both lists, among them `change-capture`, `attached-worktree`, `agent-task`, `local-ci`, `local-validation`, `skill`, `skill-workflow`, `pipeline`, `continuation`, `operating-policy`, `git-export`, `git-snapshot`, `init`, `files`, `approve`, `workspace`, `sync` and the `check-*` commands. All of them keep working by name, and `agentscm COMMAND --help` prints any command's usage, where the experimental ones are marked "[experimental]". `workflow`, `recovery`, `team` and `package-native` are internal to the alpha, as is the `git-remote-credential` helper. `setup` is a contributor helper, documented in [native installation helper](../advanced/native-installation.md). The trusted-local task-workspace entry through `workflow` is documented below; the other internal commands are not documented here.
 
 ## Commands
 
@@ -108,8 +108,9 @@ with the exact call that applies it. `--path` (repeat it, at most 32) also lists
 those paths with the exact overlapping paths, and your owner's resumable Work there. `--work-id`
 reads one Work item of the repository, whoever owns it. `--session` tells your lead session from
 your owner's other sessions; without it you act as your owner's agent. Page with `--after` set to
-the previous `next_after` and `--limit` (1 to 50, default 20). `--json` prints the versioned
-response.
+the previous `next_after` and `--limit` (1 to 50, default 20). Each Work item may list `findings`
+(for example a lapsed hold or a full participant list) with the remedy proposed for you, if any.
+`--json` prints the versioned response.
 
 ```sh
 agentscm work recovery --session "$SESSION" --path src/billing.rs
@@ -125,7 +126,25 @@ paths for the next lead and frees the rest). `agentscm work transitions` applies
 `{"session": …, "items": [...]}` batch of up to 25 transitions in order, each in its own transaction,
 and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (with a `code` and a
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
-items stay applied, and sending the same batch again is safe.
+items stay applied, and sending the same batch again is safe. A batch item may also be a
+`prune_participants` transition with `participants` (`token` and `session`), for the Work's owner or
+a Hub administrator; it removes those non-lead participants so a full Work can be resumed or reopened.
+
+`agentscm work repair [--session SESSION] [--apply] [--json]` repairs your owner's retained claims
+from the findings of `agentscm work recovery`. It reads every page of your owner's inventory (at most
+20 pages; a longer listing is reported as incomplete) and plans one transition for each finding
+whose proposed remedy is a permitted transition: `release` for a lapsed hold, `prune_participants`
+for a full participant list. A finding it will not apply is listed as skipped with the reason:
+report-only (`hidden_hold`, `no_pr_link` and others), not permitted, incomplete facts, a resume or handover, input only you can supply, or a
+second repair of the same Work. It never plans `complete`. The default is a dry run that changes
+nothing. `--apply` sends the plan through `work transitions` in chunks of 25, each item with the
+fixed `operation_id` `repair:{work_id}:{generation}:{expected_updated_seq}:{remedy}`. A rerun reads a
+fresh inventory, so items that already applied are no longer planned; an item that never applied is
+planned again, under the same operation id if its fences are unchanged or with new fences if the Work
+moved. `replayed` is what resending the identical batch through `work transitions` returns. Nothing
+is applied twice. Against a Hub that does not report findings it fails instead of planning nothing. It prints one
+outcome per item and exits non-zero when any item is refused, in conflict or unavailable. `--json`
+prints `{"applied", "planned", "skipped", "results", "complete"}`.
 
 ### `why`
 
@@ -402,7 +421,9 @@ agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes nothing to the repository), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip|URL` (a URL is the same as `--hub-url URL`), `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; alias of `--only`; default: every detected agent on supported Unix hosts), `--no-agents`, `--dry-run` (print every file and setting it would write, then stop), `--json` (one JSON object on stdout; progress on stderr). `--no-collisions` and `--tray` are accepted for older scripts and do nothing.
+
+In the quickstart JSON report, `agents.installed` lists the agents set up for all projects. An explicitly requested agent appears in `agents.skipped` if its setup did not succeed. The separate `checkout.status` describes the checkout setup step in this run. It is `connected` when the step succeeds, `skipped` when quickstart continues after a checkout setup error (for example, a missing origin), and `not_attempted` when the step never runs.
 
 ### Client status
 
@@ -424,18 +445,20 @@ A saved token is configuration, not proof of coordination. Each connection repor
 | `authenticated` | The Hub accepted the token during this check. |
 | `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
 | `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
-| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `expired` | The token ended and nothing renewed it, whatever the Hub answers. |
 | `revoked` | The Hub rejected a token that has not ended. |
-| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+| `unreachable` | The Hub did not answer, or gave an error or an unreadable answer; hooks fail open, so coordination is unknown. |
 
 `coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
-for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
-Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
-same state and build, and stops with the reason when the Hub does not accept the token.
+for the checkout; `partial`, `unverified` and `unknown` otherwise. Whenever the Hub answered a check,
+including with a refusal or an error status, `hub_build` (version and commit) is reported when the
+Hub states one; it is absent when the Hub did not answer. `client doctor` prints the same state
+and build, and stops with the reason, naming the build when known, when the Hub does not accept
+the token.
 
 ## Shared actionable status
 
-`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. Row evidence includes claim freshness, agent report kind/time and provider source coverage/check times; the overall read time is separate. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion.
+`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. Row evidence includes claim freshness, agent report kind/time and provider source coverage/check times; the overall read time is separate. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion on its own (the Hub's own [completion of merged Work](../standup.md#completion-of-merged-work) is a recorded transition, not an inference).
 
 ## Usage telemetry
 
@@ -458,13 +481,31 @@ agentscm telemetry configure --clear-endpoint
 agentscm demo [--no-open]
 ```
 
-`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints a link to its status page. It never writes to the repository. Its last line, and the status page banner, name the next step: `agentscm quickstart` (or `npx agentscm`) for the guided setup. `--no-open` does not open a browser.
+`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints the scripted results in the terminal. It never writes to the repository. Its last line names `agentscm quickstart` (or `npx agentscm`) for setup. Native builds have no dashboard or browser launch; builds with the `ui` feature additionally print a demonstration page link, and `--no-open` suppresses opening it.
 
 ## Agent wiring
 
 ```sh
+agentscm client status --check --json
+agentscm client doctor
+agentscm client service start
+agentscm client service stop
+agentscm client service status
+agentscm client run
+```
+
+`service` controls the same native executable's macOS user resident. `stop` persists across login
+and setup/update; only an explicit `start` enables it again. `status` separates invoked, installed
+and running versions and reports retained handoff recovery. The ordinary client status adds bounded
+pending/stalled journal coverage. `run` is the explicit Unix foreground maintenance loop; it runs
+no model, starts no agent and exposes no listener. Linux managed startup is not implemented;
+Windows retains next-call hooks/MCP behavior. Native hook waiters remain the transport for notices,
+and receipt acknowledgement remains an operation of the actual recipient. See
+[computer controls](../connect-this-computer.md) for setup/update and cleanup limits.
+
+```sh
 agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--yes]
-agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called by agents, not by people
+agentscm hook <claude|codex|cursor|copilot|gemini|generic> [--hub-url URL]   # called by agents, not by people
 ```
 
 `init-repo` writes only the committed agent instruction files for the chosen agents (all five by default) into the Git repository you are in: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursor/rules/agentscm.mdc` and `.github/copilot-instructions.md`. It writes no MCP config, hooks or token. It needs no data directory and is idempotent. `--hub-url` (default: `AGENTSCM_HUB_URL`, then `hub.json`) fills in the setup command in those files and in the next steps it prints; without one they keep a `<HUB_URL>` placeholder. Each developer then runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout. (`init` is the unrelated command that prepares a data directory.) `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`; the hooks `client setup` writes instead pass `--client-connection` (also accepted for `gemini`), which uses only the checkout's saved connection and cannot be combined with `--hub-url` or `--repo`. Details, the file list and limits: [supported agents](../agents.md).

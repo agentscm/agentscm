@@ -276,8 +276,17 @@ impl Env {
             .await
     }
 
+    /// This GitLab repository's scope. By host: a test may connect the same name on GitHub too.
+    fn scope(&self) -> String {
+        self.store
+            .repository_named(&self.host, &self.repo)
+            .unwrap()
+            .expect("the GitLab repository is connected")
+            .repository_scope()
+    }
+
     fn stored(&self, id: &str) -> agentscm::hub::publish::Publication {
-        self.store.publication(&self.repo, id).unwrap().unwrap()
+        self.store.publication(&self.scope(), id).unwrap().unwrap()
     }
 
     fn creates(&self) -> usize {
@@ -705,7 +714,7 @@ async fn an_endpoint_under_a_url_root_or_a_name_shared_with_another_forge_fails_
     let (status, _) = env.api(Method::POST, &env.base(), Some(rooted)).await;
     // The prefix is never stripped: the manifest is refused and nothing is stored or sent.
     assert!(matches!(status, 400 | 409), "{status}");
-    assert!(env.store.publication(&env.repo, &id).unwrap().is_none());
+    assert!(env.store.publication(&env.scope(), &id).unwrap().is_none());
     assert_eq!(env.fake.with(|s| s.requests.len()), before);
 
     share_name_on_github(&env).await;

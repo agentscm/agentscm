@@ -508,8 +508,8 @@ struct Pending {
     device: Table<DeviceLogin>,
     handoffs: Table<Handoff>,
     sessions: Table<Human>,
-    /// Recent role checks of the All repositories list, keyed by person, connection and
-    /// repository: true when readable. Only forge answers are kept, never a failure.
+    /// Recent role checks of the repository lists and the web pages' read polls, keyed by
+    /// person, connection and repository: true when readable. Only forge answers are kept, never a failure.
     role_checks: Table<bool>,
     /// Providers whose forge app refused device sign-in when last asked.
     no_device: std::collections::BTreeSet<String>,
@@ -691,14 +691,13 @@ impl FromRequestParts<HubState> for HumanSession {
         let secret = browser_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         let digest = super::store::browser_session_digest(secret)?;
         let csrf = csrf_token(secret)?;
-        // A request that changes something must also carry the token only the Hub's own page
-        // can read; a cookie alone, as another site's form would send, is refused.
+        // Changes require CSRF; an optional header on a read also binds it to this cookie.
         let reads = matches!(
             parts.method,
             axum::http::Method::GET | axum::http::Method::HEAD
         );
         let named = parts.headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
-        if !reads && named != Some(csrf.as_str()) {
+        if (!reads || parts.headers.contains_key(CSRF_HEADER)) && named != Some(csrf.as_str()) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "csrf").with_message(
                 "This change did not come from the Hub's own page; reload the page and try again",
             ));
@@ -879,7 +878,7 @@ async fn browser_start(
     let web = !workspace && params.get("web").is_some_and(|value| value == "1");
     let return_to = match params.get("return_to") {
         Some(path) if web => web_return_path(path).ok_or_else(ApiError::invalid)?,
-        _ => "/ui/",
+        _ => super::ui::landing(),
     }
     .to_owned();
     let cli_port = if workspace || web {
@@ -986,7 +985,7 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .append_pair("reason", error.code());
         // A connected app's approval page cannot word the reason; the Hub's own page can.
         let page = if apps::return_path(&pending.return_to) {
-            "/ui/"
+            super::ui::landing()
         } else {
             &pending.return_to
         };
@@ -1087,7 +1086,10 @@ async fn callback_inner(
         let cookie = blocking(state, move || workspace.issue_session(&signed.user))
             .await
             .map_err(super::workspace::api_error)?;
-        let mut response = found("/ui/#workspace", cookie_attributes("", 0))?;
+        let mut response = found(
+            &format!("{}#workspace", super::ui::landing()),
+            cookie_attributes("", 0),
+        )?;
         response.headers_mut().append(
             header::SET_COOKIE,
             HeaderValue::from_str(&cookie).map_err(|_| ApiError::invalid())?,

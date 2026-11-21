@@ -96,6 +96,8 @@ impl Address {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::hub::cooperation::NativeMetadata>,
     pub agent: String,
     pub repo: Option<String>,
     pub token: String,
@@ -145,6 +147,14 @@ impl HookRequest {
         }
         if let Some(report) = &self.report {
             request = request.header(crate::hub::hook_overhead::REPORT_HEADER, report);
+        }
+        if let Some(native) = &self.native {
+            request = request
+                .header(crate::hub::cooperation::SESSION_HEADER, &native.session)
+                .header(
+                    crate::hub::cooperation::INCARNATION_HEADER,
+                    &native.incarnation,
+                );
         }
         Ok(request)
     }

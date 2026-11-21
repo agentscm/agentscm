@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 
 use agentscm::hub::HubError;
 use agentscm::hub::handoff::{Answered, Asked, HandoffView, SessionRef, Via};
-use agentscm::hub::intent::Intent;
+use agentscm::hub::intent::{Intent, NewIntent};
 use agentscm::hub::session::{
     HOLD_CAP_SECONDS, SESSION_REQUIRED, SessionCall, Touched, asked_holder,
 };
@@ -48,6 +48,35 @@ impl Db {
 
     fn open(&self) -> Arc<dyn Store> {
         store::open(&self.url).unwrap()
+    }
+
+    fn execute(&self, sql: &str) {
+        match &self._dir {
+            Some(dir) => rusqlite::Connection::open(dir.path().join("hub.sqlite"))
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap(),
+            None => postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap(),
+        }
+    }
+
+    fn untold_lapses(&self) -> i64 {
+        let sql = "SELECT count(*) FROM hub_handoffs
+                   WHERE state = 'lapsed' AND CAST(requester_told AS INTEGER) = 0";
+        match &self._dir {
+            Some(dir) => rusqlite::Connection::open(dir.path().join("hub.sqlite"))
+                .unwrap()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap(),
+            None => postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query_one(sql, &[])
+                .unwrap()
+                .get(0),
+        }
     }
 }
 
@@ -129,7 +158,9 @@ fn full_key(who: &Agent, session: &str) -> String {
 }
 
 fn live(store: &dyn Store, now: i64) -> Vec<Intent> {
-    store.live_intents(REPO, now, 10).unwrap()
+    store
+        .live_intents(&crate::repository_scope::github(REPO, None), now, 10)
+        .unwrap()
 }
 
 /// The live paths of the token's intent.
@@ -465,11 +496,11 @@ fn only_the_holder_can_answer(db: &Db) {
     assert!(matches!(bad, Err(HubError::Invalid(_))));
     assert_eq!(held_by(&*store, &alice, T0 + 3), [A]);
     assert!(held_by(&*store, &bob, T0 + 3).is_empty());
-    // The holder lets go first: the answer says so and the request is closed.
+    // The holder lets go first: the release lapsed the request, so none is open to answer.
     store.end_session(&alice.token, Some("ha"), T0 + 4).unwrap();
     assert_eq!(
         answer(&*store, &alice, Some("ha"), A, true, T0 + 5),
-        Answered::NotHeld
+        Answered::NoRequest
     );
     assert_eq!(
         answer(&*store, &alice, None, A, true, T0 + 6),
@@ -645,12 +676,164 @@ fn a_request_whose_requester_ended_lapses(db: &Db) {
     assert!(held_by(&*store, &bob, T0 + 4).is_empty());
     assert!(events(&*store, "handoff_grant").is_empty());
     // The request is closed, not left to be granted later.
-    touch(&*store, &bob, "hb", &[], T0 + 5);
+    // The returning requester is not told a holder released the file: alice still holds it.
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 5).handoffs.is_empty());
     assert_eq!(
         answer(&*store, &alice, None, A, true, T0 + 6),
         Answered::NoRequest
     );
     assert!(held_by(&*store, &bob, T0 + 6).is_empty());
+}
+
+/// A lapsed ask recorded before lapses were reported is marked told when `handoff_lapse_untold`
+/// applies, so it is never delivered as a holder's release.
+fn the_lapse_migration_marks_old_lapsed_asks_told(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    assert!(!touch(&*store, &bob, "hb", &[], T0 + 3).handoffs.is_empty());
+    drop(store);
+    // The pre-migration boundary: a lapsed row nobody was told about and no migration marker.
+    db.execute(
+        "UPDATE hub_handoffs SET requester_told = FALSE WHERE state = 'lapsed';
+         DELETE FROM hub_named_migrations WHERE name = 'handoff_lapse_untold';",
+    );
+    assert!(db.untold_lapses() > 0);
+    let store = db.open();
+    assert_eq!(db.untold_lapses(), 0);
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 4).handoffs.is_empty());
+}
+
+/// A request whose holder released the file lapses and is told to the requester once, never as an
+/// acceptance.
+fn a_request_for_released_files_is_told_as_lapsed_once(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A, "src/b.rs"]);
+    let carol = agent(&*store, 3);
+    touch(&*store, &carol, "hc", &["src/c.rs"], T0);
+    assert!(matches!(
+        ask(&*store, &bob, "hb", "src/c.rs", T0 + 2),
+        Asked::Requested { .. }
+    ));
+    // A whole release, then the holder ending its session, both leave the asks unanswered.
+    let intent = live(&*store, T0 + 3)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 3)
+            .unwrap()
+    );
+    store.end_session(&carol.token, Some("hc"), T0 + 3).unwrap();
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert!(!told.handoffs.is_empty());
+    assert!(told.handoffs.iter().all(|note| note.kind == "lapse"));
+    assert!(told.handoffs.iter().all(|note| note.note.is_none()));
+    let lines = self::told(&told, T0 + 4);
+    assert!(
+        lines.contains("the session you asked no longer holds it and gave no reply"),
+        "{lines}"
+    );
+    assert!(lines.contains("agentscm_start"), "{lines}");
+    assert!(!lines.contains("handed"), "{lines}");
+    assert!(events(&*store, "handoff_grant").is_empty());
+    // Told once.
+    assert!(touch(&*store, &bob, "hb", &[], T0 + 5).handoffs.is_empty());
+    let owner = owner_of(&*store, 2);
+    let views = store
+        .handoffs_of_owner(
+            &owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 6,
+            10,
+        )
+        .unwrap();
+    assert!(!views.is_empty());
+    assert!(
+        views
+            .iter()
+            .all(|view| view.state == "lapsed" && view.requester_told)
+    );
+}
+
+/// When another session holds the file by the time the requester is told, the lapse says so and
+/// does not call the file free.
+fn a_lapsed_ask_says_when_another_session_holds_the_file_now(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let carol = agent(&*store, 3);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    touch(&*store, &carol, "hc", &[A], T0 + 3);
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert_eq!(told.handoffs.len(), 1);
+    assert_eq!(told.handoffs[0].kind, "lapse_held");
+    let lines = self::told(&told, T0 + 4);
+    assert!(
+        lines.contains("another session does; agentscm_start names the current holder"),
+        "{lines}"
+    );
+    assert!(!lines.contains("free"), "{lines}");
+}
+
+/// A directory hold by another session counts as holding the file when the lapse is told.
+fn a_lapsed_ask_says_held_when_a_directory_is_held_now(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let carol = agent(&*store, 3);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    assert!(
+        store
+            .release_intent(&alice.token, &intent.id, T0 + 2)
+            .unwrap()
+    );
+    let directory = NewIntent {
+        id: format!("int_{:032x}", 9),
+        task: "refactor".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec!["src/**".into()],
+        ttl_seconds: 600,
+    };
+    store
+        .announce_intent(&carol.token, &directory, T0 + 3)
+        .unwrap();
+    let told = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert_eq!(told.handoffs.len(), 1);
+    assert_eq!(told.handoffs[0].kind, "lapse_held");
+}
+
+/// An ask past the hold cap keeps its expiry semantics: a late release does not lapse it.
+fn a_release_after_the_cap_does_not_lapse_an_expired_ask(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let intent = live(&*store, T0 + 1)
+        .into_iter()
+        .find(|intent| intent.token == alice.token)
+        .unwrap();
+    let at = T0 + 1 + HOLD_CAP_SECONDS;
+    store.release_intent(&alice.token, &intent.id, at).unwrap();
+    assert!(touch(&*store, &bob, "hb", &[], at).handoffs.is_empty());
 }
 
 fn handoffs_wait_for_a_reply_that_can_show_them(db: &Db) {
@@ -871,7 +1054,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     // Each person reads their own side, with a third person seeing nothing.
     let (alice_owner, bob_owner) = (owner_of(&*store, 1), owner_of(&*store, 2));
     let bobs = store
-        .handoffs_of_owner(&bob_owner, REPO, T0 + 4, 10)
+        .handoffs_of_owner(
+            &bob_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 4,
+            10,
+        )
         .unwrap();
     assert_eq!(bobs.len(), 1);
     assert_eq!(mine(&bobs), ("pending", true, false));
@@ -886,13 +1074,23 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     let carol = owner_of(&*store, 3);
     assert!(
         store
-            .handoffs_of_owner(&carol, REPO, T0 + 4, 10)
+            .handoffs_of_owner(
+                &carol,
+                &crate::repository_scope::github(REPO, None),
+                T0 + 4,
+                10
+            )
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .handoffs_of_owner(&bob_owner, "acme/other", T0 + 4, 10)
+            .handoffs_of_owner(
+                &bob_owner,
+                &crate::repository_scope::github("acme/other", None),
+                T0 + 4,
+                10
+            )
             .unwrap()
             .is_empty()
     );
@@ -907,7 +1105,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     assert_eq!(heard.handoffs.len(), 1);
     assert!(heard.handoffs[0].via == Via::Hub && heard.handoffs[0].kind == "grant");
     let alices = store
-        .handoffs_of_owner(&alice_owner, REPO, T0 + 7, 10)
+        .handoffs_of_owner(
+            &alice_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 7,
+            10,
+        )
         .unwrap();
     assert_eq!(mine(&alices), ("granted", true, true));
     assert!(alices[0].requester_told);
@@ -918,7 +1121,12 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
         .unwrap();
     assert!(matches!(again, Asked::Requested { .. }), "{again:?}");
     let late = store
-        .handoffs_of_owner(&bob_owner, REPO, T0 + 9 + HOLD_CAP_SECONDS + 1, 10)
+        .handoffs_of_owner(
+            &bob_owner,
+            &crate::repository_scope::github(REPO, None),
+            T0 + 9 + HOLD_CAP_SECONDS + 1,
+            10,
+        )
         .unwrap();
     assert_eq!(late[0].state, "lapsed");
 
@@ -962,7 +1170,12 @@ fn a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told(db: 
     assert_eq!(heard.handoffs.len(), 1);
     assert!(heard.handoffs[0].via == Via::Slack && heard.handoffs[0].kind == "decline");
     let alices = store
-        .handoffs_of_owner(&owner_of(&*store, 1), REPO, T0 + 5, 10)
+        .handoffs_of_owner(
+            &owner_of(&*store, 1),
+            &crate::repository_scope::github(REPO, None),
+            T0 + 5,
+            10,
+        )
         .unwrap();
     assert_eq!(
         (
@@ -1228,7 +1441,12 @@ fn hand_offs_between_two_tokens_name_each_session(db: &Db) {
     );
     // The owner's page: either side's key and kind, whoever reads.
     let views = store
-        .handoffs_of_owner(&owner_of(&*store, 2), REPO, T0 + 3, 10)
+        .handoffs_of_owner(
+            &owner_of(&*store, 2),
+            &crate::repository_scope::github(REPO, None),
+            T0 + 3,
+            10,
+        )
         .unwrap();
     assert_eq!(views[0].requester.key, full_key(&bob, "hb"));
     assert_eq!(views[0].holder.key, full_key(&alice, "ha"));
@@ -1294,6 +1512,11 @@ conformance!(
     concurrent_grants_and_touches_leave_one_owner,
     asking_needs_a_session_and_a_free_queue,
     a_request_whose_requester_ended_lapses,
+    a_request_for_released_files_is_told_as_lapsed_once,
+    the_lapse_migration_marks_old_lapsed_asks_told,
+    a_lapsed_ask_says_when_another_session_holds_the_file_now,
+    a_lapsed_ask_says_held_when_a_directory_is_held_now,
+    a_release_after_the_cap_does_not_lapse_an_expired_ask,
     handoffs_wait_for_a_reply_that_can_show_them,
     pending_requests_follow_the_adopted_session,
     the_same_agent_is_not_a_holder_to_ask,

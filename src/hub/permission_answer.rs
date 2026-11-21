@@ -1496,7 +1496,7 @@ async fn list(
             candidates
         } else {
             let (readable, missed) =
-                super::login::devices::readable(&state, &user, candidates, true).await;
+                super::login::devices::readable(&state, &user, candidates).await;
             unchecked = (missed > 0).then_some(missed);
             readable
         };
@@ -2221,6 +2221,12 @@ mod tests {
 
     #[test]
     fn the_list_shows_only_the_owners_confirmed_requests_in_one_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::hub::store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
         let (requests, waiting) = (Requests::default(), Waiting::default());
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         let id = pending(&requests, &waiting, &mine);
@@ -2234,7 +2240,9 @@ mod tests {
                 .len(),
             1
         );
-        assert!(waiting.owned(&mine, 1_010).unwrap().is_empty());
+        let shown = waiting.owned(&*store, &mine, 1_010);
+        assert!(shown.complete);
+        assert!(shown.waits.is_empty());
         // Another person, another repository: nothing.
         assert!(
             requests
@@ -3011,6 +3019,12 @@ mod tests {
 
     #[test]
     fn a_notice_routed_to_the_persons_other_repository_confirms_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::hub::store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
         let (requests, waiting) = (Requests::default(), Waiting::default());
         // An edit in another repository's checkout: the prompt's hook calls for the repository
         // of the file, the host's notice for the one the session runs in.
@@ -3031,8 +3045,11 @@ mod tests {
             Some(Phase::Pending)
         );
         // The session has one wait, listed with its request in the repository of the file.
-        assert_eq!(waiting.owned(&file, 1_100).unwrap().len(), 1);
-        assert!(waiting.owned(&runs, 1_100).unwrap().is_empty());
+        let file_waits = waiting.owned(&*store, &file, 1_100);
+        let run_waits = waiting.owned(&*store, &runs, 1_100);
+        assert!(file_waits.complete && run_waits.complete);
+        assert_eq!(file_waits.waits.len(), 1);
+        assert!(run_waits.waits.is_empty());
         // It shows one prompt at a time, whichever repository the next one is offered for.
         requests
             .register(
@@ -3050,10 +3067,17 @@ mod tests {
 
     #[test]
     fn the_item_key_matches_the_one_the_waiting_list_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::hub::store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
         let waiting = Waiting::default();
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         wait(&waiting, &mine, "s1", WaitReason::Permission, None, 1_000);
-        let shown = waiting.owned(&mine, 1_000 + GRACE_SECONDS).unwrap();
-        assert_eq!(shown[0].key, wait_key("tok_a", "s1"));
+        let shown = waiting.owned(&*store, &mine, 1_000 + GRACE_SECONDS);
+        assert!(shown.complete);
+        assert_eq!(shown.waits[0].key, wait_key("tok_a", "s1"));
     }
 }

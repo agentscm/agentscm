@@ -58,7 +58,7 @@ resolves before this check.
 
 A new store operation `work_transition` runs in one transaction. It is idempotent by `operation_id`
 and fenced by both `expected_updated_seq` and `generation`. An exact retry returns the stored
-receipt and the current item and acquires nothing. A different request with the same `operation_id`
+receipt and the current item and acquires nothing. The sequence fence also passes when `expected_updated_seq` is a recorded event of the Work and every later event of it is `work_joined`, so a participant joining or changing role cannot expire an owner's cleanup. This does not apply to `prune_participants`, which requires the exact `expected_updated_seq`: a participant that rejoined after the plan was read must not be removed. A different request with the same `operation_id`
 is refused. A bounded, sanitized reason is required.
 
 Actors:
@@ -95,6 +95,8 @@ fencing and session resolution stay as they are. This is not a lease. A later re
 | abandon | unfinished | yes | yes | yes | `finished`, outcome `abandoned`, reservation cleared |
 | supersede | unfinished | yes | yes | yes | `finished`, outcome `superseded`, reservation cleared; names another Work in the same repository |
 | reopen | finished | yes, agent only | yes, agent only | no | fresh admission, described below |
+| prune_participants | any state | no | yes | yes | removes the listed non-lead participants (`participants`: `token` and `session`, 1 to 100, no repeats); state, generation, lead, outcome and reservation (lease included) are unchanged; needs no reservation |
+| release_paths | unfinished, reservation held | yes | yes | no | releases the named paths and keeps the rest (`paths`, each an exact scope entry); state, generation, lead and lease are unchanged |
 
 Every other combination is refused with `HubError::Invalid` or, for an unauthorized actor,
 `Unauthorized`. `complete`, `abandon` and `supersede` bump the generation unless the actor is the
@@ -102,6 +104,33 @@ lead session, so an older session is fenced. `release` never changes `current`, 
 outcome. A blocker stays in the snapshot through release and terminal transitions as history. A
 terminal transition by anyone does not write a checkpoint in the agent's name; the event records
 the actor and reason.
+
+`prune_participants` repairs a full participant list, which refuses a resume or reopen from a new
+session at 100 participants, and Work joined before the cap on participants from other owners,
+which can hold more than 25 of them. Every listed pair must be a current non-lead participant, or
+nothing is removed. The rows are deleted in the transaction of the transition, the live intent of
+each removed session is released unless that session is eligible on other Work, and the
+`work_transition` event names each removed participant by owner, agent and session, never by
+token. It is excluded from the operational projection's `remedies`, while recovery offers it as the `prune_participants` remedy and proposes it from the `participant_cap` finding. Its event is not a lifecycle or outcome change: outcome provenance and recent outcomes skip it.
+
+`release_paths` frees named paths while the Work keeps the rest, so a waiting start can take them
+without the whole Work being released. It is for the lead or the owner (an agent with a named
+session, or the owner as a person); an administrator and the repository policy may not request it.
+`paths` is required, deduplicated and sorted, and every entry must be an exact entry of the
+Work's current scope: a path only covered by a directory entry, or not in scope, refuses the whole
+request and the refusal names it. At least one entry must remain; to release everything use
+`release`. The scope shrinks in the transaction of the transition, with no generation, state,
+lead or lease change, and it requires the exact `expected_updated_seq` like
+`prune_participants`. Only the released paths leave the intents of the participant sessions and
+of the participants' tokens' session-less intents. Each open coordination request that targets the
+Work and asks for a released path gets the existing `coordination_target_released` event with a
+`paths` field; the status is unchanged. A checkpoint that narrows the scope records the same event with the paths it dropped, so a requester sees them as released too. The `work_transition` event records `released_paths`.
+Admission of a waiting start is unchanged: it reruns `work_scope_overlaps` over live reservations,
+so a released path is free to the next `agentscm_start`, and no queue holds it. A release only
+shrinks the caller's own scope, so it never moves a file another live Work holds. The overlap
+epoch trigger bumps `overlap_epoch` when the scope changes, so overlap consents on this Work are
+invalidated; this is deliberately conservative. Like `prune_participants` it is excluded from the
+operational projection's `remedies`, and its event is not a lifecycle or outcome change.
 
 Reopen requires a session, generation, `expected_updated_seq`, `operation_id` and reason, and always
 runs the overlap check whether or not the client ran preflight. On overlap it returns a conflict and
@@ -460,7 +489,7 @@ a reopen's or resume's overlap; the apply does, inside its own transaction, with
 the same actor, and returns one outcome per item. A refused item never stops the rest; an exact
 retry of the batch replays applied items through their `operation_id` and retries the others.
 Refusals carry a fixed code and sentence, never the store's internal text, except a `LEASE_LAPSED`
-refusal, which every surface already passes through. The shared error envelope (#314) will carry
+refusal, which every surface already passes through. The shared error envelope (#314) carries
 the same codes for single calls.
 
 ### Resolving before a duplicate
@@ -496,10 +525,11 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Waiting for its person** (a permission prompt, a question, or the end of a turn that may have asked for something): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
 - **Ended its turn and asked nothing**: a finished turn is read, not answered. The session's
   hook judges its whole last message where it is and sends only the answer. The message asked
-  nothing when it is English prose or only identifiers (an id, a path, a number), with no
-  question mark, no word to the person, no offer or choice and no word for waiting, needing or
-  being stuck; a wrong "asked" only shows a session, a wrong "asked
-  nothing" hides a request, so anything else counts as an ask. A hook that sends no answer
+  nothing when it is English prose or only identifiers (an id, a path, a number) and its last
+  paragraph has no sentence that closes with a question mark, no offer or request in so many
+  words and no sentence that opens with a request to the person. Words that only report a
+  state (waiting on CI, the owner, blocked) ask nothing, since nearly every report has some;
+  anything the rule cannot read counts as an ask. A hook that sends no answer
   leaves the Hub its excerpt, which decides only when it is the whole message and not its cut
   end. Where the turn asked nothing, no `session_waiting` action is listed, and the row stays
   `active`, names its lead agent and asks nobody, like a stop on background work: the session
@@ -517,11 +547,19 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Unknown, never stale.** After a Hub restart that left no list of waits (the Hub died, or was
   down for 10 minutes or more), or when the Hub dropped a wait for room, a quiet
   Work whose lead session has not called since reads `freshness: unknown` with the limit
-  `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
-  24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
+  `lead_wait_unknown`. It names nobody (unless the Hub observed its pull request open) and needs
+  nobody until that session calls again, or until 24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
   leaves its waits for the process that starts next, which then knows them as before. What
   sessions reported while no Hub ran is still missing, so Work whose lead session called in the
   hour before the stop, has no wait in that list and has not called since reads unknown too.
+- **Waiting on an open pull request.** Quiet or paused Work whose Hub-observed stage is
+  `pull_request_open` reads `active`, names its lead agent and asks nobody. Its action says that
+  the pull request is open and that the Hub observed only that, not whether its checks pass or
+  anyone reviews it. Freshness and the `lead_wait_unknown` limit are unchanged. A handover, a
+  reported blocker or its reassessment, a Work version change during the read, an observed merge
+  and a live wait are shown instead; unavailable provider coverage (`provider_coverage_unavailable`)
+  keeps the reassessment, because the stored observation may be stale. A closed or unreadable
+  pull request and Work with no pull request read as before.
 - **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews may lapse, or be retained. A directed request to a quiet lead says its lead is not running only when its session is not live. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
   rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:

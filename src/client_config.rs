@@ -74,7 +74,8 @@ pub(crate) struct Connection {
 }
 
 /// The names `client setup --agent` accepts.
-pub(crate) const AGENTS: [&str; 5] = ["claude", "codex", "cursor", "copilot", "gemini"];
+pub(crate) static AGENTS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| agentscm::clients::names().collect());
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +126,7 @@ fn checked(mut connection: Connection) -> Result<Connection> {
             .owned_token_expires_at
             .is_some_and(|expiry| expiry <= 0)
         || connection.agents.iter().enumerate().any(|(index, agent)| {
-            !AGENTS.contains(&agent.as_str()) || connection.agents[..index].contains(agent)
+            agentscm::clients::find(agent).is_none() || connection.agents[..index].contains(agent)
         })
     {
         return Err(invalid("connections.json has an invalid connection"));

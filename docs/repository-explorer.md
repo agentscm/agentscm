@@ -5,20 +5,17 @@ title: "Repository explorer"
 # Repository explorer
 
 The repository explorer connects committed Git source with its history and locally retained
-agent evidence. Open **Repository explorer** under **This computer** in the Hub UI. Start with a
+agent evidence. In a UI-enabled team Hub, open **Repository explorer** under **This computer**. Start with a
 file, open its history or a comparison, then inspect recorded actions and visible conversation.
 
 This is a read-only alpha feature for Unix hosts. It reads one checkout selected by the local
 operator. It does not fetch, check out a branch, run an agent or execute a check.
 
-## Open it
+## Connect the optional read-only API
 
-Run `agentscm open` in a connected checkout.
-The browser opens this computer's Hub page on Repository explorer, already connected to every
-checkout connected on this computer, with capture included where change capture is set up for that
-checkout. See [Open the Hub from this computer](connect-this-computer.md).
-
-### Advanced: connect without `agentscm open`
+Native releases no longer start a local dashboard with `agentscm open`. Setup, capture controls
+and diagnostics use the [existing CLI](connect-this-computer.md). Source reads remain available
+through native source commands and the explicit explorer API below.
 
 For a Hub page served elsewhere, start a local service yourself. Choose a local read secret with
 at least 32 bytes and set `AGENTSCM_SERVE_READ_TOKEN` in the service environment. Use a separate

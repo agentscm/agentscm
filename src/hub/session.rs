@@ -724,9 +724,21 @@ pub async fn announce_named(
     call: SessionCall,
     named: bool,
 ) -> Result<Advice> {
-    Ok(announce_with(state, principal, call, named, |_, _| ())
-        .await?
-        .0)
+    announce_native(state, principal, call, named, None).await
+}
+
+pub async fn announce_native(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    named: bool,
+    incarnation: Option<String>,
+) -> Result<Advice> {
+    Ok(
+        announce_with(state, principal, call, named, incarnation, |_, _| ())
+            .await?
+            .0,
+    )
 }
 
 /// [`announce_for`], also running `read` in the same store hop right after the touch commits.
@@ -735,10 +747,11 @@ pub(super) async fn announce_reading<T: Send + 'static>(
     state: &HubState,
     principal: &Principal,
     call: SessionCall,
+    incarnation: Option<String>,
     read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
 ) -> Result<(Advice, T)> {
     let named = call.session.is_some();
-    announce_with(state, principal, call, named, read).await
+    announce_with(state, principal, call, named, incarnation, read).await
 }
 
 async fn announce_with<T: Send + 'static>(
@@ -746,12 +759,19 @@ async fn announce_with<T: Send + 'static>(
     principal: &Principal,
     call: SessionCall,
     named: bool,
+    incarnation: Option<String>,
     read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
 ) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let (touched, read, holder_intents) = blocking(state, move || {
-        let touched = store.touch_session_named(&token, &call, named, unix_now())?;
+        let touched = store.touch_session_named_with_transport(
+            &token,
+            &call,
+            named,
+            incarnation.as_deref(),
+            unix_now(),
+        )?;
         let read = read(&*store, &touched);
         let holder_intents = if touched.denied.is_empty() && touched.overlaps.is_empty() {
             None
@@ -915,9 +935,9 @@ pub async fn others_for(
     own_intent: Option<&str>,
 ) -> Result<String> {
     let store = state.store.clone();
-    let repository = principal.repository.clone();
+    let scope = super::store::scope_of(state, principal).await?;
     let (intents, truncated) = blocking(state, move || {
-        live_intents_capped(&*store, &repository, unix_now())
+        live_intents_capped(&*store, &scope, unix_now())
     })
     .await?;
     let mut text = advice::others(&intents, own_intent, &principal.repository, unix_now());
@@ -974,7 +994,17 @@ pub async fn status_for(
     principal: &Principal,
     call: SessionCall,
 ) -> Result<String> {
-    let advice = announce_for(state, principal, call).await?;
+    status_native(state, principal, call, None).await
+}
+
+pub async fn status_native(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    incarnation: Option<String>,
+) -> Result<String> {
+    let named = call.session.is_some();
+    let advice = announce_native(state, principal, call, named, incarnation).await?;
     let own = advice
         .touched
         .intent
@@ -1037,6 +1067,17 @@ pub async fn done_pausing_for(
     via: &str,
     completion_reporting: bool,
 ) -> Result<SessionEnd> {
+    done_pausing_native(state, principal, session, via, completion_reporting, None).await
+}
+
+pub async fn done_pausing_native(
+    state: &HubState,
+    principal: &Principal,
+    session: Option<String>,
+    via: &str,
+    completion_reporting: bool,
+    incarnation: Option<String>,
+) -> Result<SessionEnd> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let via = via.to_owned();
@@ -1044,13 +1085,29 @@ pub async fn done_pausing_for(
         let now = unix_now();
         // The session's own end hook, not an MCP `done`: a Hub message no longer reaches it.
         // Best effort, read before the end removes the session's row.
-        if via.starts_with("hook:")
-            && let Some(native) = session.as_deref()
-            && let Ok(name) = store.session_name_for(&token, Some(native), now)
+        let native_end = via
+            .starts_with("hook:")
+            .then(|| {
+                session
+                    .as_deref()
+                    .and_then(|native| store.session_name_for(&token, Some(native), now).ok())
+            })
+            .flatten();
+        let ended = store.end_session_pausing_with_transport(
+            &token,
+            session.as_deref(),
+            &via,
+            incarnation.as_deref(),
+            now,
+        )?;
+        // Protocol-1 terminal truth is the durable incarnation projection. A delayed
+        // callback cannot delete a successor's MCP/hook reachability observation.
+        if incarnation.is_none()
+            && let Some(name) = native_end
         {
             super::agent_messages::note_end(&token, &name);
         }
-        store.end_session_pausing(&token, session.as_deref(), &via, now)
+        Ok(ended)
     })
     .await?;
     if completion_reporting && let Some(item) = end.work.clone() {

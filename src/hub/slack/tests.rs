@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::LocalBackend;
+use crate::hub::notices::NewOwnerNotice;
 use crate::hub::session::SessionCall;
 use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
 use crate::hub::work::WorkStart;
@@ -11,6 +12,7 @@ mod waits;
 
 const REPO: &str = "acme/widgets";
 const PATH: &str = "src/widget.rs";
+type RawReplies = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
 
 struct Fixture {
     dir: TempDir,
@@ -18,6 +20,7 @@ struct Fixture {
     address: std::net::SocketAddr,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     replies: Arc<Mutex<Vec<(u16, Value)>>>,
+    raw_replies: RawReplies,
     auth_team: Arc<Mutex<String>>,
     /// How long the fake Slack takes to answer `chat.update`.
     update_delay: Arc<Mutex<Duration>>,
@@ -95,6 +98,14 @@ impl Fixture {
     }
 
     async fn configured(policy: Option<Value>, other_forge: bool) -> Self {
+        Self::configured_owner_channel(policy, other_forge, None).await
+    }
+
+    async fn configured_owner_channel(
+        policy: Option<Value>,
+        other_forge: bool,
+        owner_notice_channel: Option<&str>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -119,6 +130,9 @@ impl Fixture {
         if let Some(policy) = policy {
             alice_binding["reminders"] = policy;
         }
+        if let Some(channel) = owner_notice_channel {
+            alice_binding["owner_notice_channel"] = json!(channel);
+        }
         private(&dir.path().join("signing"), "synthetic-signing-secret");
         private(&dir.path().join("bot"), "xoxb-synthetic");
         let config = json!({"version":1,"app_id":"A123","bot_id":"B123","team_id":"T123",
@@ -129,18 +143,25 @@ impl Fixture {
 
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let replies = Arc::new(Mutex::new(Vec::<(u16, Value)>::new()));
+        let raw_replies = Arc::new(Mutex::new(Vec::<(u16, Vec<u8>)>::new()));
         let auth_team = Arc::new(Mutex::new("T123".to_owned()));
         let update_delay = Arc::new(Mutex::new(Duration::ZERO));
-        let (capture, outcomes, team, delay) = (
+        let (capture, outcomes, raw_outcomes, team, delay) = (
             calls.clone(),
             replies.clone(),
+            raw_replies.clone(),
             auth_team.clone(),
             update_delay.clone(),
         );
         let fake = Router::new().route(
             "/api/{method}",
             post(move |OriginalUri(uri): OriginalUri, body: Bytes| {
-                let (capture, outcomes, team) = (capture.clone(), outcomes.clone(), team.clone());
+                let (capture, outcomes, raw_outcomes, team) = (
+                    capture.clone(),
+                    outcomes.clone(),
+                    raw_outcomes.clone(),
+                    team.clone(),
+                );
                 let delay = *delay.lock().unwrap();
                 async move {
                     if uri.path() == "/api/chat.update" {
@@ -150,19 +171,27 @@ impl Fixture {
                         let team = team.lock().unwrap().clone();
                         return (
                             StatusCode::OK,
-                            axum::Json(json!({"ok":true,"team_id":team,"bot_id":"B123"})),
+                            Bytes::from(
+                                serde_json::to_vec(
+                                    &json!({"ok":true,"team_id":team,"bot_id":"B123"}),
+                                )
+                                .unwrap(),
+                            ),
                         );
                     }
                     capture.lock().unwrap().push((
                         uri.path().to_owned(),
                         serde_json::from_slice(&body).unwrap(),
                     ));
-                    let (status, reply) = outcomes
-                        .lock()
-                        .unwrap()
-                        .pop()
-                        .unwrap_or((200, json!({"ok":true})));
-                    (StatusCode::from_u16(status).unwrap(), axum::Json(reply))
+                    let (status, reply) = raw_outcomes.lock().unwrap().pop().unwrap_or_else(|| {
+                        let (status, reply) = outcomes
+                            .lock()
+                            .unwrap()
+                            .pop()
+                            .unwrap_or((200, json!({"ok":true})));
+                        (status, serde_json::to_vec(&reply).unwrap())
+                    });
+                    (StatusCode::from_u16(status).unwrap(), Bytes::from(reply))
                 }
             }),
         );
@@ -186,6 +215,7 @@ impl Fixture {
             address,
             calls,
             replies,
+            raw_replies,
             auth_team,
             update_delay,
             alice,
@@ -457,6 +487,288 @@ fn old_handoff_body(holder: &str, headline: &str, guidance: &str) -> Value {
     body
 }
 
+fn owner_invalidation(f: &Fixture, number: i64) -> crate::hub::notices::OwnerNotice {
+    let owner = f.owner(0);
+    f.store()
+        .owner_notice_invalidation_put(
+            REPO,
+            101,
+            &NewOwnerNotice {
+                idempotency_key: format!("validation-pr-{number}"),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: format!("pr:{number}:local-validation:policy:evidence:trusted"),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner,
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::RepositoryChannel,
+                body: format!("Private detail for pull request #{number}."),
+            },
+            unix_now(),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_invalidation_posts_one_restricted_channel_message_and_records_proof() {
+    let f = Fixture::configured_owner_channel(None, false, Some("CNOTICE")).await;
+    let notice = owner_invalidation(&f, 42);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"CNOTICE","ts":"123.456"})));
+    f.run().await;
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [json!({
+            "channel":"CNOTICE",
+            "text":"<@U1> Local validation for pull request #42 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "unfurl_links":false,
+            "unfurl_media":false
+        })]
+    );
+    assert!(!messages[0].to_string().contains("Private detail"));
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    let stored = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap()
+        .notices
+        .into_iter()
+        .find(|item| item.id == notice.id)
+        .unwrap();
+    assert!(stored.delivery_proven());
+    assert_eq!(stored.delivery.unwrap().external_id, "CNOTICE:123.456");
+    assert!(stored.acknowledged_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_post_response_is_unknown_and_is_not_retried() {
+    let f = Fixture::new().await;
+    let notice = owner_invalidation(&f, 44);
+    f.raw_replies
+        .lock()
+        .unwrap()
+        .push((200, b"not-json".to_vec()));
+    f.run().await;
+    f.run().await;
+    let sent = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .count();
+    assert_eq!(sent, 1);
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    let stored = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap()
+        .notices
+        .into_iter()
+        .find(|item| item.id == notice.id)
+        .unwrap();
+    assert_eq!(stored.delivery_attempts.len(), 1);
+    assert_eq!(stored.delivery_attempts[0].outcome, AttemptOutcome::Unknown);
+    assert!(!stored.delivery_eligible());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_notice_delivery_continues_past_one_hundred_historical_records() {
+    let f = Fixture::new().await;
+    let slack = f.slack();
+    let principal = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+    let reader = crate::hub::work_transition::WorkLifecycleReader::Person {
+        owner: &principal.owner,
+        repository: &principal.repository,
+        repository_id: principal.repository_id.unwrap(),
+    };
+    for number in 1..=101 {
+        let notice = owner_invalidation(&f, 1_000 + number);
+        let claim = f
+            .store()
+            .owner_notice_delivery_claim(&reader, &notice.id, "slack", unix_now())
+            .unwrap()
+            .unwrap();
+        f.store()
+            .owner_notice_delivery_report(
+                &reader,
+                &notice.id,
+                &OwnerNoticeDeliveryReport {
+                    attempt_id: claim.attempt_id,
+                    outcome: AttemptOutcome::Unknown,
+                    proof: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let eligible = owner_invalidation(&f, 2_000);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D1","ts":"2000.1"})));
+    for _ in 0..3 {
+        f.run().await;
+    }
+    let sent = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .count();
+    assert_eq!(sent, 1);
+    let first = f
+        .store()
+        .owner_notice_list(&reader, None, 100, unix_now())
+        .unwrap();
+    let second = f
+        .store()
+        .owner_notice_list(&reader, first.next_after.as_deref(), 100, unix_now())
+        .unwrap();
+    let delivered = first
+        .notices
+        .into_iter()
+        .chain(second.notices)
+        .find(|notice| notice.id == eligible.id)
+        .expect("eligible notice is in the paged mailbox");
+    assert!(delivered.delivery_proven());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_invalidation_falls_back_to_one_direct_message_without_a_channel() {
+    let f = Fixture::new().await;
+    owner_invalidation(&f, 43);
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D43","ts":"456.789"})));
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["channel"], "U1");
+    assert_eq!(
+        messages[0]["text"],
+        "Local validation for pull request #43 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addressed_notice_uses_channel_only_by_opt_in_and_never_copies_its_text() {
+    let f = Fixture::configured_owner_channel(None, false, Some("CNOTICE")).await;
+    let notice = f
+        .store()
+        .owner_notice_put(
+            &f.bob,
+            &NewOwnerNotice {
+                idempotency_key: "addressed-channel-1".into(),
+                source_kind: OwnerNoticeSourceKind::Addressed,
+                source_id: "private-source-detail".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: f.owner(0),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::RepositoryChannel,
+                body: "Secret agent-written detail must stay on the Hub.".into(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"CNOTICE","ts":"789.012"})));
+    f.run().await;
+    let messages = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [json!({
+            "channel":"CNOTICE",
+            "text":"<@U1> You have an AgentSCM repository notice. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "unfurl_links":false,
+            "unfurl_media":false
+        })]
+    );
+    let rendered = messages[0].to_string();
+    assert!(!rendered.contains(&notice.body));
+    assert!(!rendered.contains(&notice.source_id));
+
+    f.store()
+        .owner_notice_put(
+            &f.bob,
+            &NewOwnerNotice {
+                idempotency_key: "addressed-private-1".into(),
+                source_kind: OwnerNoticeSourceKind::Addressed,
+                source_id: "private-default".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: f.owner(0),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                body: "Another private detail.".into(),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":true,"channel":"D1","ts":"789.013"})));
+    f.run().await;
+    let calls = f.calls.lock().unwrap();
+    let private = calls
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| body)
+        .next_back()
+        .unwrap();
+    assert_eq!(private["channel"], "U1");
+    assert_eq!(
+        private["text"],
+        "You have a private AgentSCM notice. <https://hub.example.test/ui/#home|Open AgentSCM>"
+    );
+}
+
 /// A handoff message as an earlier version sent it, still in Slack with its buttons: alice's
 /// agent holds `PATH` and bob's has asked for it. Nothing sends such a message any more, so it
 /// is put in the journal directly, and `run` delivers it.
@@ -560,7 +872,11 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     );
     let holders: Vec<String> = tokio::task::block_in_place(|| {
         f.store()
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
             .into_iter()
             .filter(|i| i.paths.contains(&PATH.to_owned()))
@@ -572,7 +888,12 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     let alice = f.owner(0);
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert_eq!(handoffs.len(), 1);
@@ -815,7 +1136,12 @@ async fn keeping_a_file_from_slack_tells_the_requesting_agent_and_messages_nobod
     let alice = f.owner(0);
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert!(handoffs[0].answered_via_slack && !handoffs[0].answered_via_hub);
@@ -869,7 +1195,12 @@ async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
     );
     let handoffs = tokio::task::block_in_place(|| {
         f.store()
-            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .handoffs_of_owner(
+                &alice,
+                &store::repository_scope("github.com", REPO, Some(101)),
+                unix_now(),
+                10,
+            )
             .unwrap()
     });
     assert_eq!(handoffs[0].state, "pending");
@@ -2313,7 +2644,14 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
                     .unwrap();
             }
             "release" => {
-                let held = f.store().live_intents(REPO, unix_now(), 100).unwrap();
+                let held = f
+                    .store()
+                    .live_intents(
+                        &store::repository_scope("github.com", REPO, Some(101)),
+                        unix_now(),
+                        100,
+                    )
+                    .unwrap();
                 f.store()
                     .release_intent(
                         &f.alice,

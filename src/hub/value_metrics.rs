@@ -1957,6 +1957,7 @@ mod tests {
             updated_at: 90,
             created_seq: 1,
             updated_seq: 2,
+            finished_paths: Vec::new(),
         }
     }
     #[test]
@@ -2018,6 +2019,7 @@ mod tests {
                     kind: "checkpoint".into(),
                     work_id: work.id.clone(),
                     item: work.clone(),
+                    transition: None,
                 })
                 .collect(),
             coordination_events: vec![],
@@ -2030,6 +2032,7 @@ mod tests {
                 merge_available_from: 0,
             },
             source_coverage: vec![],
+            owner_notices: vec![],
             complete: true,
         };
         f.deliveries = vec![ValueDelivery {

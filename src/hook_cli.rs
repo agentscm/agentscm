@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use agentscm::clients::{CommandHooks, Event, Note, Refusal};
 use agentscm::hook_relay::{self, Address, HookRequest, REPLY_BYTES, STDIN_BYTES};
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use clap::Args;
@@ -19,7 +20,9 @@ mod permission;
 #[cfg(unix)]
 mod shell_observation;
 
-const LIMIT: Duration = Duration::from_secs(3);
+/// Under the shortest timeout an installer gives a hook (3 seconds), so the hook's own "could
+/// not check" reply is printed before the host stops it.
+const LIMIT: Duration = Duration::from_millis(2500);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
 /// How long a session start waits for auto-connect before going on without it.
@@ -93,6 +96,53 @@ pub async fn run(args: HookArgs) {
     run_unparsed(args.args).await
 }
 
+/// A host that dropped a hook's argv must not turn CLI usage (exit 2) into a tool refusal.
+pub(crate) fn missing_arguments_reply() -> Option<Value> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("agentscm-hook-input".into())
+        .spawn(move || {
+            let hook = read_stdin()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .filter(|payload| {
+                    let named = payload["hook_event_name"].as_str().is_some_and(|event| {
+                        !event.is_empty()
+                            && event.len() <= 64
+                            && event.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    });
+                    let copilot_tool = payload["sessionId"].as_str().is_some()
+                        && payload["toolName"].as_str().is_some()
+                        && payload.get("toolArgs").is_some();
+                    (named || copilot_tool) && session_of(payload).is_some()
+                })
+                .map(|payload| {
+                    // Older Claude Code plugins used a separate args field that some
+                    // hosts dropped. Give those sessions the same setup remedy.
+                    if cfg!(unix)
+                        && payload["hook_event_name"] == "SessionStart"
+                        && std::env::var_os("CLAUDE_PROJECT_DIR").is_some_and(|dir| !dir.is_empty())
+                    {
+                        json!({"systemMessage": "AgentSCM: Claude Code did not pass the hook arguments. Run `agentscm client setup --agent claude`, then restart Claude Code."})
+                    } else {
+                        json!({})
+                    }
+                });
+            let _ = send.send(hook);
+        })
+        .is_err()
+    {
+        return None;
+    }
+    receive
+        .recv_timeout(Duration::from_millis(200))
+        .ok()
+        .flatten()
+}
+
 /// Never returns: prints the agent's reply and exits 0.
 pub async fn run_unparsed(args: Vec<String>) -> ! {
     let (agent, flag_url, repo) = parse_args(&args);
@@ -112,6 +162,7 @@ pub async fn run_unparsed(args: Vec<String>) -> ! {
         client_connection,
         destination_args,
         hold_limit(&args),
+        hook_event_hint(&args),
     )
     .await;
     let mut out = std::io::stdout();
@@ -137,6 +188,9 @@ fn parse_args(args: &[String]) -> (String, Option<String>, Option<String>) {
             repo = rest.next().cloned();
         } else if let Some(value) = arg.strip_prefix("--repo=") {
             repo = Some(value.to_owned());
+        } else if arg == "--hook-event" {
+            // The configured native event is not a positional agent name.
+            let _ = rest.next();
         } else if !arg.starts_with('-') && agent.is_none() {
             agent = Some(arg.clone());
         }
@@ -163,6 +217,30 @@ fn hold_limit(args: &[String]) -> Option<Duration> {
     None
 }
 
+/// A configured event hint for hosts whose native payload omits it. Ambiguous or malformed
+/// hints disable capture; they never change the native payload used by coordination.
+fn hook_event_hint(args: &[String]) -> std::result::Result<Option<String>, ()> {
+    let mut found = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let value = match arg.strip_prefix("--hook-event") {
+            Some("") => rest.next().map(String::as_str),
+            Some(value) if value.starts_with('=') => value.strip_prefix('='),
+            _ => continue,
+        }
+        .ok_or(())?;
+        if found.is_some()
+            || value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(());
+        }
+        found = Some(value.to_owned());
+    }
+    Ok(found)
+}
+
 async fn hook(
     agent: &str,
     flag_url: Option<String>,
@@ -170,6 +248,7 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
     hold_limit: Option<Duration>,
+    event_hint: std::result::Result<Option<String>, ()>,
 ) -> Value {
     let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
@@ -177,24 +256,83 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    #[cfg(unix)]
+    let capture_payload = std::sync::Arc::new(payload.clone());
+    // Recover start-only session identities before fencing an end, without an intervening await.
+    if let Some(table) = table(agent) {
+        prepare_table_payload(table, &mut payload);
+    }
+    let end_cleanup = if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        let at = agentscm::hub::store::unix_now();
+        crate::client_session::cleanup_fence(&config, session)
+            .ok()
+            .map(|fence| (config, fence, at))
+    } else {
+        None
+    };
+    let configured = agent;
+    let Some(agent) = crate::client_session::hook_agent(configured, &payload).await else {
+        eprintln!(
+            "AgentSCM: coordination unknown (inherited hook host is ambiguous or unsupported)"
+        );
+        return json!({});
+    };
+    #[cfg(unix)]
+    if configured == "claude" && agent == "cursor" && client_connection && !destination_args {
+        let root = payload["workspace_roots"][0]
+            .as_str()
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd_of(&payload));
+        let event = payload["hook_event_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::task::spawn_blocking(move || {
+                crate::client_setup::cursor_hook_registered(&root, &event)
+            }),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok_and(|found| found))
+        {
+            return json!({});
+        }
+    }
     // Cursor names a reply apart from the end of its turn: the reply waits here for that end.
-    if agent == "cursor"
+    // Keep its original full reply for capture before this coordination-only tail is updated.
+    let cursor_reply = if agent == "cursor"
         && client_connection
         && let Ok(config) = config_dir()
-        && keep_reply(&config, &mut payload)
     {
-        return json!({});
-    }
+        keep_reply(&config, &mut payload)
+    } else {
+        false
+    };
     let payload = std::sync::Arc::new(payload);
+    let end_contexts = matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    )
+    .then(|| {
+        end_cleanup
+            .as_ref()
+            .map(|(_, fence, _)| (fence.end_contexts().to_vec(), fence.complete()))
+            .unwrap_or_default()
+    });
     let session_start = is_session_start(agent, &payload);
-    let host_session = host_session(agent, &payload);
-    #[cfg(unix)]
-    let wants_capture =
-        client_connection && crate::change_capture_cli::captured_harness(agent, &payload).is_some();
-    // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
-    #[cfg(not(unix))]
-    let wants_capture = false;
-    // Capture stops in time for the reply to be printed before the host's hook timeout.
+    if client_connection
+        && let Some((config, fence, at)) = &end_cleanup
+        && remember_session_end_in(config, agent, &payload, fence, *at).is_err()
+    {
+        eprintln!("AgentSCM: terminal observation could not be retained; coordination is unknown.");
+    }
+    // Capture and host recording finish before the host's hook timeout.
     let budget = started
         + if session_start {
             CAPTURE_SESSION_START_BUDGET
@@ -202,13 +340,37 @@ async fn hook(
             CAPTURE_BUDGET
         };
     #[cfg(unix)]
+    let plugin_check =
+        (agent == "claude" && client_connection && session_start && !destination_args).then(|| {
+            let root = cwd_of(&payload);
+            tokio::task::spawn_blocking(move || crate::client_plugin::claude_plugin_is_older(&root))
+        });
+    let host_session = host_session(agent, &payload, budget);
+    #[cfg(unix)]
+    let wants_capture = client_connection
+        && event_hint.as_ref().is_ok_and(|hint| {
+            crate::change_capture_cli::captured_harness(agent, &capture_payload, hint.as_deref())
+                .is_some()
+        });
+    // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
+    #[cfg(not(unix))]
+    let wants_capture = false;
+    #[cfg(unix)]
     let spawn_capture = || {
-        tokio::spawn(capture(
+        let (agent, body, payload, hint) = (
             agent.to_owned(),
             body.clone(),
-            std::sync::Arc::clone(&payload),
-            budget,
-        ))
+            std::sync::Arc::clone(&capture_payload),
+            event_hint.as_ref().ok().and_then(|hint| hint.clone()),
+        );
+        // Spool locks and source reads must not occupy the workers driving the hook deadline.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?
+                .block_on(capture(agent, body, payload, budget, hint))
+        })
     };
     // Never called: nothing wants capture where it is not built.
     #[cfg(not(unix))]
@@ -217,9 +379,23 @@ async fn hook(
     // and runs beside it otherwise.
     let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
-    let reply = if client_connection
-        && capture_only(agent, payload["hook_event_name"].as_str().unwrap_or(""))
+    let reply = if cursor_reply {
+        json!({})
+    } else if client_connection
+        && capture_only(
+            agent,
+            payload["hook_event_name"]
+                .as_str()
+                .or_else(|| event_hint.as_ref().ok().and_then(|hint| hint.as_deref()))
+                .unwrap_or(""),
+        )
         && !observes_shell(agent, &payload)
+        // Native failure events also close delegated calls, without shell observation.
+        && !(matches!(agent, "claude" | "codex" | "copilot")
+            && payload["hook_event_name"] == "PostToolUseFailure"
+            && agentscm::hub::hook::is_in_flight_tool(
+                payload["tool_name"].as_str().unwrap_or(""),
+            ))
     {
         fail_open(agent, &payload, None)
     } else {
@@ -231,6 +407,7 @@ async fn hook(
             destination_args,
             body.clone(),
             std::sync::Arc::clone(&payload),
+            end_contexts,
             started,
         )
         .await
@@ -248,10 +425,34 @@ async fn hook(
         }
         None => reply,
     };
+    #[cfg(unix)]
+    let reply = {
+        let mut reply = reply;
+        if let Some(check) = plugin_check
+            && matches!(
+                tokio::time::timeout_at(budget.into(), check).await,
+                Ok(Ok(Some(true)))
+            )
+            && let Some(fields) = reply.as_object_mut()
+        {
+            let note = "AgentSCM: the installed Claude Code plugin is older than this binary. Run `agentscm client setup --agent claude`, then restart Claude Code.";
+            let message = match fields.get("systemMessage").and_then(Value::as_str) {
+                Some(existing) if !existing.is_empty() => format!("{note}\n\n{existing}"),
+                _ => note.to_owned(),
+            };
+            let fitted =
+                agentscm::hub::hook::fit_context(&message, agentscm::hub::hook::CONTEXT_LIMIT);
+            fields.insert("systemMessage".into(), json!(fitted));
+        }
+        reply
+    };
     // The record is written beside the Hub call; the process must not exit before it is.
     if let Some(recording) = host_session {
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
+    }
+    if let Some((config, fence, _)) = end_cleanup {
+        let _ = crate::client_session::forget(&config, &fence);
     }
     // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
     // decision there. Any failure returns `reply`, which carries no decision.
@@ -269,40 +470,154 @@ async fn capture(
     body: Vec<u8>,
     payload: std::sync::Arc<Value>,
     budget: Instant,
+    event_hint: Option<String>,
 ) -> Option<String> {
-    let harness = crate::change_capture_cli::captured_harness(&agent, &payload)?;
-    let routed = route_client(&agent, &payload).ok()?;
-    crate::change_capture_cli::plugin_capture(
-        harness,
-        &body,
-        &payload,
-        routed.checkout,
-        routed.connection,
-        budget.into(),
-    )
-    .await
+    if matches!(agent.as_str(), "cursor" | "copilot" | "gemini") {
+        let hook = agentscm::change_capture::native_hooks::normalize(
+            &agent,
+            &payload,
+            event_hint.as_deref(),
+        )
+        .ok()
+        .flatten()?;
+        let connections = client_config::load().ok()?;
+        let (connection, checkout, _) =
+            select_client_checkout(&agent, &payload, &connections).ok()?;
+        if !client_config::is_current_in(&connection, &checkout) {
+            return None;
+        }
+        let mut context = None;
+        for event in hook.events {
+            let input = serde_json::to_vec(&event).ok()?;
+            let (captured, _) = crate::change_capture_cli::plugin_capture(
+                hook.harness,
+                &input,
+                &event,
+                checkout.clone(),
+                connection.clone(),
+                budget.into(),
+            )
+            .await;
+            if context.is_none() {
+                context = captured;
+            }
+        }
+        // These hosts have no vetted retrospective reader or source-authenticated fanout.
+        return context;
+    }
+    let harness = crate::change_capture_cli::captured_harness(&agent, &payload, None)?;
+    let routed = route_client(&agent, &payload).ok();
+    let mut default = None;
+    let mut context = None;
+    if let Some(routed) = routed {
+        let namespace = (
+            routed.connection.hub.clone(),
+            routed.connection.repo.clone(),
+        );
+        let (captured, target) = crate::change_capture_cli::plugin_capture(
+            harness,
+            &body,
+            &payload,
+            routed.checkout,
+            routed.connection,
+            budget.into(),
+        )
+        .await;
+        context = captured;
+        default = target.map(|target| (namespace, target));
+    }
+    if matches!(agent.as_str(), "codex" | "claude")
+        && let (Some(session), Ok(config), Ok(connections)) =
+            (session_of(&payload), config_dir(), client_config::load())
+    {
+        let tool = matches!(
+            payload["hook_event_name"].as_str(),
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        );
+        for association in crate::client_session::capture_associations(&config, session)
+            .iter()
+            .filter(|association| association.harness == harness)
+        {
+            // The default route already handled this literal event. Tool claims can retain an
+            // older Work route, so those use each association's exact phase dedup instead.
+            if !needs_associated_capture(association, default.as_ref(), tool) {
+                continue;
+            }
+            let Some((connection, _)) =
+                client_config::connection_for_checkout(&connections, &association.checkout).filter(
+                    |(connection, _)| {
+                        connection.hub == association.hub
+                            && connection.repo.eq_ignore_ascii_case(&association.repo)
+                            && client_config::is_current_in(connection, &association.checkout)
+                    },
+                )
+            else {
+                continue;
+            };
+            crate::change_capture_cli::plugin_capture_for_work(
+                harness,
+                &body,
+                &payload,
+                association.checkout.clone(),
+                connection.clone(),
+                budget.into(),
+                Some(association),
+            )
+            .await;
+        }
+    }
+    context
+}
+
+fn needs_associated_capture(
+    association: &crate::client_session::CaptureAssociation,
+    default: Option<&((String, String), agentscm::change_record::CaptureTargetV1)>,
+    tool: bool,
+) -> bool {
+    tool || !default.is_some_and(|((hub, repo), target)| {
+        association.hub == *hub
+            && association.repo.eq_ignore_ascii_case(repo)
+            && association.work_id == target.work_id
+            && association.generation == target.generation
+    })
 }
 
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
 /// conversation's session ([`crate::client_session`]): written when the session starts, dropped
 /// when it ends. Only an ID the Hub would accept as a session is recorded.
-fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<()>> {
+fn host_session(
+    agent: &str,
+    payload: &Value,
+    deadline: Instant,
+) -> Option<tokio::task::JoinHandle<()>> {
     let session = session_of(payload)
         .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))?
         .to_owned();
     let config = config_dir().ok()?;
     if is_session_start(agent, payload) {
         return Some(tokio::task::spawn_blocking(move || {
-            crate::client_session::record(&config, &session);
+            crate::client_session::record(&config, &session, deadline);
         }));
     }
+    None
+}
+
+fn remember_session_end_in(
+    config: &Path,
+    agent: &str,
+    payload: &Value,
+    fence: &crate::client_session::CleanupFence,
+    at: i64,
+) -> Result<(), String> {
     if matches!(
         payload["hook_event_name"].as_str(),
         Some("SessionEnd" | "sessionEnd")
-    ) {
-        crate::client_session::forget(&config, &session);
+    ) && session_of(payload).is_some()
+    {
+        crate::client_cooperation::remember_end(config, agent, fence, at)
+            .map_err(|_| "terminal observation unavailable".to_owned())?;
     }
-    None
+    Ok(())
 }
 
 /// Remembers which connection this session's hooks route to, so the checkout's MCP server names
@@ -421,6 +736,20 @@ fn capture_only(agent: &str, event: &str) -> bool {
                 | "SubagentStart"
                 | "SubagentStop"
         ),
+        "cursor" => matches!(
+            event,
+            "beforeSubmitPrompt" | "afterAgentResponse" | "preCompact" | "postToolUseFailure"
+        ),
+        "copilot" => matches!(
+            event,
+            "userPromptSubmitted"
+                | "UserPromptSubmit"
+                | "preCompact"
+                | "PreCompact"
+                | "postToolUseFailure"
+                | "PostToolUseFailure"
+        ),
+        "gemini" => matches!(event, "BeforeAgent" | "BeforeModel" | "PreCompress"),
         _ => matches!(
             event,
             "PostToolUseFailure" | "MessageDisplay" | "PreCompact"
@@ -437,6 +766,7 @@ async fn coordinate(
     destination_args: bool,
     body: Vec<u8>,
     payload: std::sync::Arc<Value>,
+    end_contexts: Option<(Vec<crate::client_session::SessionContext>, bool)>,
     started: Instant,
 ) -> Value {
     let mut deadline = started + LIMIT;
@@ -482,6 +812,7 @@ async fn coordinate(
             observed: observed.clone(),
             deadline,
             report: report.header(),
+            end_contexts,
         },
     ));
     let result = tokio::time::timeout(remaining, &mut call).await;
@@ -575,6 +906,7 @@ fn within_context_limit(mut reply: Value) -> Value {
         "/additional_context",
         "/additionalContext",
         "/systemMessage",
+        "/context",
     ] {
         if let Some(value) = reply.pointer_mut(field)
             && let Some(text) = value.as_str()
@@ -606,6 +938,7 @@ struct HubCallContext {
     observed: ObservedSlot,
     deadline: Instant,
     report: Option<String>,
+    end_contexts: Option<(Vec<crate::client_session::SessionContext>, bool)>,
 }
 
 async fn call_hub(
@@ -623,11 +956,9 @@ async fn call_hub(
         observed: observed_slot,
         deadline,
         report,
+        end_contexts,
     } = context;
-    let supported_client = matches!(
-        agent.as_str(),
-        "claude" | "codex" | "cursor" | "copilot" | "gemini"
-    );
+    let supported_client = agentscm::clients::find(&agent).is_some();
     if client_connection && destination_args {
         return Err("client connection mode cannot use destination flags".into());
     }
@@ -680,6 +1011,18 @@ async fn call_hub(
                 routed = route_client(&agent, &payload)?;
             }
             record_session_route(&payload, &routed.connection);
+            if end_contexts.is_none()
+                && let Some(session) = session_of(&payload)
+            {
+                let _ = crate::client_cooperation::prepare(
+                    &routed.connection,
+                    &agent,
+                    session,
+                    session_start,
+                    payload["hook_event_name"].as_str().unwrap_or(""),
+                )
+                .await;
+            }
             let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
             if !conflicted.is_empty() {
                 routed.edits.retain(|edit| !conflicted.contains(&edit.path));
@@ -777,7 +1120,31 @@ async fn call_hub(
         // Preserve the legacy transport contract, including original JSON bytes.
         original_body
     };
+    let native_context = match (&client_connection, &end_contexts) {
+        (Some(connection), Some((contexts, complete))) => {
+            crate::client_cooperation::end_transport_context(connection, contexts, *complete)
+                .map_err(|_| "native end identity unavailable or changed")?
+        }
+        (Some(connection), None) => session_of(&payload)
+            .and_then(|session| crate::client_cooperation::transport_context(connection, session)),
+        _ => None,
+    };
     let request = HookRequest {
+        native: native_context
+            .as_ref()
+            .map(|context| agentscm::hub::cooperation::NativeMetadata {
+                session: context.session.clone(),
+                incarnation: context.incarnation.clone().expect("validated incarnation"),
+            })
+            .or_else(|| {
+                end_contexts
+                    .as_ref()
+                    .and_then(|_| session_of(&payload))
+                    .map(|session| agentscm::hub::cooperation::NativeMetadata {
+                        session: session.into(),
+                        incarnation: agentscm::hub::session_lifecycle::EXPECT_NO_LIFECYCLE.into(),
+                    })
+            }),
         agent: path_segment(&endpoint_agent),
         repo,
         client: client_connection
@@ -815,10 +1182,17 @@ async fn call_hub(
     };
     match status {
         200 if reply.is_object() => {
-            let reply = if agent == "gemini" && plugin_route {
-                gemini_reply(reply, &payload)
-            } else {
-                defanged(reply, &payload)
+            if matches!(
+                payload["hook_event_name"].as_str(),
+                Some("SessionEnd" | "sessionEnd")
+            ) && let (Some(connection), Some(expected)) = (&client_connection, &native_context)
+            {
+                let _ = crate::client_cooperation::finish_hook(connection, expected).await;
+            }
+            let reply = match table(&agent) {
+                _ if agent == "gemini" && plugin_route => gemini_reply(reply, &payload),
+                Some(table) if plugin_route => table_reply(table, reply, &payload),
+                _ => defanged(reply, &payload),
             };
             Ok(match note {
                 Some(note) => with_note(reply, &agent, &payload, &note),
@@ -907,7 +1281,7 @@ fn branch_advisory_at(
             },
         ));
     }
-    let paths = if agent == "gemini" {
+    let paths = if generic_route(agent) {
         normalized["paths"]
             .as_array()?
             .iter()
@@ -1369,34 +1743,72 @@ fn tool_call(agent: &str, payload: &Value) -> (String, Value) {
     )
 }
 
+/// The files a patch names in its `*** ... File:` headers.
+fn patch_paths(patch: &str) -> Result<Vec<EditPath>, String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some((header, path)) = PATCH_HEADERS
+            .iter()
+            .find_map(|header| line.strip_prefix(header).map(|path| (*header, path)))
+        {
+            let path = path.trim();
+            if valid_path_text(path) {
+                paths.push(EditPath {
+                    header: Some(header),
+                    path: path.to_owned(),
+                });
+            } else {
+                return Err("edit path not understood".into());
+            }
+        }
+        if paths.len() > MAX_EDIT_PATHS {
+            return Err("too many edit paths".into());
+        }
+    }
+    if paths.is_empty() {
+        return Err("edit path not understood".into());
+    }
+    Ok(paths)
+}
+
+/// The files a table agent's tool call edits: none for a tool that is not one of its edit or
+/// patch tools, an error for one whose file cannot be read.
+fn table_edit_paths(table: &CommandHooks, payload: &Value) -> Result<Vec<EditPath>, String> {
+    let tool = payload["tool_name"].as_str().unwrap_or_default();
+    let input = &payload["tool_input"];
+    if let Some((_, key)) = table
+        .patch_tools
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool))
+    {
+        return patch_paths(input[*key].as_str().ok_or("edit path not understood")?);
+    }
+    if !table
+        .edit_tools
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(tool))
+    {
+        return Ok(Vec::new());
+    }
+    let path = input["file_path"]
+        .as_str()
+        .filter(|path| valid_path_text(path))
+        .ok_or("edit path not understood")?;
+    Ok(vec![EditPath {
+        header: None,
+        path: path.to_owned(),
+    }])
+}
+
 fn edit_paths(agent: &str, payload: &Value) -> Result<Vec<EditPath>, String> {
+    if let Some(table) = table(agent) {
+        return table_edit_paths(table, payload);
+    }
     let (tool, input) = tool_call(agent, payload);
     let mut paths = Vec::new();
     if tool.eq_ignore_ascii_case("apply_patch") {
         let patch = patch_text(&input).ok_or_else(|| "edit path not understood".to_owned())?;
-        for line in patch.lines() {
-            if let Some((header, path)) = PATCH_HEADERS
-                .iter()
-                .find_map(|header| line.strip_prefix(header).map(|path| (*header, path)))
-            {
-                let path = path.trim();
-                if valid_path_text(path) {
-                    paths.push(EditPath {
-                        header: Some(header),
-                        path: path.to_owned(),
-                    });
-                } else {
-                    return Err("edit path not understood".into());
-                }
-            }
-            if paths.len() > MAX_EDIT_PATHS {
-                return Err("too many edit paths".into());
-            }
-        }
-        if paths.is_empty() {
-            return Err("edit path not understood".into());
-        }
-        return Ok(paths);
+        return patch_paths(patch);
     }
     if [
         "edit",
@@ -1527,6 +1939,28 @@ fn route_client_with(
     payload: &Value,
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
+    let (connection, checkout, normalized) = select_client_checkout(agent, payload, connections)?;
+    let endpoint_agent = if generic_route(agent) {
+        "generic"
+    } else {
+        agent
+    };
+    Ok(RoutedClient {
+        payload: sanitized_client(agent, payload, &normalized)?,
+        connection,
+        checkout,
+        endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
+    })
+}
+
+/// Select source with the same connection and worktree checks for capture and coordination.
+/// Capture-only native events need no coordination payload or invented lifecycle event.
+fn select_client_checkout(
+    agent: &str,
+    payload: &Value,
+    connections: &[Connection],
+) -> Result<(Connection, PathBuf, Vec<EditPath>), String> {
     if connections.is_empty() {
         return Err(NO_CONNECTION.into());
     }
@@ -1571,14 +2005,7 @@ fn route_client_with(
             .map(|(connection, checkout)| (connection.clone(), checkout))
             .ok_or_else(|| NO_CONNECTION.to_owned())?,
     };
-    let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
-    Ok(RoutedClient {
-        payload: sanitized_client(agent, payload, &normalized)?,
-        connection,
-        checkout,
-        endpoint_agent: endpoint_agent.to_owned(),
-        edits: normalized,
-    })
+    Ok((connection, checkout, normalized))
 }
 
 /// One sentence for the start context that names the other repositories this computer can
@@ -1741,6 +2168,9 @@ async fn renew(connection: &Connection, session_start: bool) -> bool {
 /// Append historical local advice after connection and Hub context. Local scan
 /// availability must not replace or take priority over coordination messages.
 fn with_local_note(mut reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    if let Some(table) = table(agent) {
+        return with_table_note(reply, table, payload, note, false);
+    }
     for (field, supported) in [
         ("/hookSpecificOutput/additionalContext", true),
         ("/additional_context", agent == "cursor"),
@@ -1766,6 +2196,9 @@ fn with_local_note(mut reply: Value, agent: &str, payload: &Value, note: &str) -
 
 /// The hub's reply with `note` first in the agent's context.
 fn with_note(reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    if let Some(table) = table(agent) {
+        return with_table_note(reply, table, payload, note, true);
+    }
     let Value::Object(mut top) = reply else {
         return reply;
     };
@@ -1800,6 +2233,50 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
     route_client_with("codex", payload, connections)
 }
 
+/// Sends only a completely read native question snapshot, independently of conversation
+/// sharing. The caller has already bound the native file to this session and checkout.
+pub(crate) async fn forward_questions(
+    connection: &Connection,
+    session: &str,
+    snapshot: Option<&agentscm::hub::session_waiting::QuestionSnapshot>,
+) -> Result<(), String> {
+    if session.is_empty() || session.len() > 1024 || session.chars().any(char::is_control) {
+        return Err("invalid native question session".into());
+    }
+    let payload = match snapshot {
+        Some(snapshot) => {
+            json!({"hook_event_name": "QuestionsSnapshot", "session_id": session, "questions": snapshot})
+        }
+        None => json!({"hook_event_name": "QuestionsUnavailable", "session_id": session}),
+    };
+    let payload = sanitized_codex(&payload, Some(&[]))?;
+    let token = crate::client_cli::read_token(&connection.token_file).map_err(|_| "no token")?;
+    let request = HookRequest {
+        agent: "codex".into(),
+        // A retained question snapshot is observation, not current-session activity.
+        native: None,
+        repo: Some(connection.repo.clone()),
+        client: Some(client_config::onboarding_client(&connection.root, &token)),
+        token,
+        root: None,
+        report_completion: false,
+        report: None,
+        body: serde_json::to_vec(&payload).map_err(|_| "invalid native question snapshot")?,
+    };
+    let client = forge_http::client().map_err(|_| "hub unreachable")?;
+    let request = request
+        .request(&client, &connection.hub)
+        .map_err(|_| "hub unreachable")?;
+    let (status, reply) = tokio::time::timeout(LIMIT, send(request, REPLY_BYTES))
+        .await
+        .map_err(|_| "hub unreachable")?
+        .map_err(|_| "hub unreachable")?;
+    if status != 200 || reply["questions_accepted"] != true {
+        return Err("native question snapshot not accepted".into());
+    }
+    Ok(())
+}
+
 /// Codex may include source, patch bodies and prompts outside the tool input. Only fields needed
 /// for coordination leave the machine. For patches, only recognized operation headers survive.
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
@@ -1822,6 +2299,18 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
             out.insert(key.into(), json!(value));
         }
     }
+    if payload["hook_event_name"] == "QuestionsSnapshot" {
+        let mut snapshot: agentscm::hub::session_waiting::QuestionSnapshot =
+            serde_json::from_value(payload["questions"].clone())
+                .map_err(|_| "invalid native question snapshot")?;
+        for question in &mut snapshot.pending {
+            question.asks = question.asks.as_deref().and_then(line_end);
+        }
+        if !snapshot.valid() {
+            return Err("invalid native question snapshot".into());
+        }
+        out.insert("questions".into(), json!(snapshot));
+    }
     // A session its person cleared (`/clear`) waits for nobody; no other end reason leaves.
     if payload["hook_event_name"] == "SessionEnd" && payload["reason"] == "clear" {
         out.insert("reason".into(), json!("clear"));
@@ -1840,9 +2329,10 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         && !resumes_itself(payload)
         && let Some(message) = payload["last_assistant_message"]
             .as_str()
-            .and_then(redacted_line)
+            .filter(|message| !message.trim().is_empty())
     {
-        let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&message);
+        // Judged as written: its last paragraph is where an ask sits.
+        let nothing = agentscm::hub::session_waiting::turn_asked_nothing(message);
         out.insert("asked_nothing".into(), json!(nothing));
     }
     if let Some(subagent) = started_subagent(payload) {
@@ -1913,14 +2403,21 @@ const ASKS_CHARS: usize = 400;
 fn wait_asks(payload: &Value) -> Option<String> {
     match payload["hook_event_name"].as_str()? {
         "Stop" if !resumes_itself(payload) => line_end(payload["last_assistant_message"].as_str()?),
-        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => line_end(
-            &payload["tool_input"]["questions"]
-                .as_array()?
-                .iter()
-                .filter_map(|q| q["question"].as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
+        "PreToolUse"
+            if matches!(
+                payload["tool_name"].as_str(),
+                Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+            ) =>
+        {
+            line_end(
+                &payload["tool_input"]["questions"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|q| q["question"].as_str().or_else(|| q["title"].as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
         _ => None,
     }
 }
@@ -1956,7 +2453,7 @@ fn line_start(text: &str) -> Option<String> {
 /// nothing. Judged here, where the whole message is; only the excerpt and the answer leave.
 fn turn_end(message: &str) -> Option<(String, bool)> {
     let line = redacted_line(message)?;
-    let nothing = agentscm::hub::session_waiting::turn_asked_nothing(&line);
+    let nothing = agentscm::hub::session_waiting::turn_asked_nothing(message);
     Some((end_of(&line), nothing))
 }
 
@@ -2145,6 +2642,9 @@ fn bounded_string(value: &Value, max: usize) -> Option<&str> {
 }
 
 fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<Value, String> {
+    if let Some(table) = table(agent) {
+        return sanitized_table(agent, table, payload, paths);
+    }
     match agent {
         "claude" | "codex" => sanitized_codex(payload, Some(paths)),
         "cursor" => {
@@ -2272,6 +2772,191 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
     }
 }
 
+/// The table entry of a command-hook agent set up from [`agentscm::clients`].
+fn table(agent: &str) -> Option<&'static CommandHooks> {
+    agentscm::clients::find(agent)?.hooks
+}
+
+/// An agent whose hooks reach the Hub's generic endpoint.
+fn generic_route(agent: &str) -> bool {
+    agentscm::clients::find(agent).is_some_and(|client| client.generic)
+}
+
+/// The registered event a table agent's payload names.
+fn table_event(table: &CommandHooks, payload: &Value) -> Option<Event> {
+    table
+        .event(payload["hook_event_name"].as_str()?)
+        .map(|(_, event)| event)
+}
+
+/// A table agent's payload made ready: its event named as setup registered it, so every check
+/// here reads it. An agent that names its session and folder only at a session start gets the
+/// session the start hook recorded for the agent's process (none when that process has several
+/// open) and this hook's own folder, which the agent starts it in.
+fn prepare_table_payload(table: &CommandHooks, payload: &mut Value) {
+    let Some((native, event)) = payload["hook_event_name"]
+        .as_str()
+        .and_then(|name| table.event(name))
+    else {
+        return;
+    };
+    payload["hook_event_name"] = json!(native);
+    if !table.session_at_start_only {
+        return;
+    }
+    if event != Event::Start
+        && session_of(payload).is_none()
+        && let Ok(config) = config_dir()
+        && let crate::client_session::Recorded::One(session) =
+            crate::client_session::recorded(&config, &crate::client_session::ancestors())
+    {
+        payload["session_id"] = json!(session);
+    }
+    if payload["cwd"].as_str().is_none()
+        && let Some(cwd) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.to_str().map(str::to_owned))
+    {
+        payload["cwd"] = json!(cwd);
+    }
+}
+
+/// A table agent's payload in the Hub's generic shape, as [`sanitized_client`] does Gemini's.
+fn sanitized_table(
+    agent: &str,
+    table: &CommandHooks,
+    payload: &Value,
+    paths: &[EditPath],
+) -> Result<Value, String> {
+    let event = table_event(table, payload).ok_or("hook event not recognised")?;
+    let kind = match event {
+        Event::Start => "start",
+        Event::PreTool if !paths.is_empty() => "check",
+        Event::PreTool | Event::PostTool => "activity",
+        Event::Notification | Event::Stop => "waiting",
+        Event::End => "done",
+    };
+    let mut out = json!({"agent": agent, "event": kind});
+    let message = payload["message"].as_str();
+    match event {
+        // The end of the reply, and whether the whole of it asked its person anything.
+        Event::Stop => {
+            out["reason"] = json!("idle");
+            if let Some((asks, nothing)) = payload["last_assistant_message"]
+                .as_str()
+                .and_then(turn_end)
+            {
+                out["asks"] = json!(asks);
+                out["asked_nothing"] = json!(nothing);
+            }
+        }
+        // Without a reason the Hub ignores the wait.
+        Event::Notification => match payload["notification_type"].as_str() {
+            Some("permission_prompt") => {
+                out["reason"] = json!("permission");
+                if let Some(asks) = message.and_then(line_start) {
+                    out["asks"] = json!(asks);
+                }
+            }
+            Some("elicitation_dialog") => {
+                out["reason"] = json!("question");
+                if let Some(asks) = message.and_then(line_end) {
+                    out["asks"] = json!(asks);
+                }
+            }
+            Some("idle_prompt") => out["reason"] = json!("idle"),
+            _ => {}
+        },
+        Event::PreTool | Event::PostTool
+            if kind == "activity"
+                && table.is_shell(payload["tool_name"].as_str().unwrap_or("")) =>
+        {
+            out["phase"] = json!(if event == Event::PreTool {
+                "start"
+            } else {
+                "end"
+            });
+        }
+        _ => {}
+    }
+    if let Some(session) = bounded_string(&payload["session_id"], 1024) {
+        out["session"] = json!(session);
+    }
+    if !paths.is_empty() {
+        out["paths"] = json!(
+            paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
+}
+
+/// The Hub's generic reply as a table agent reads it: a refusal before a tool call, else a note
+/// where the agent takes one, else nothing. Built from the status and text alone, so nothing
+/// else in the reply reaches the agent.
+fn table_reply(table: &CommandHooks, reply: Value, payload: &Value) -> Value {
+    let text = reply["text"].as_str().unwrap_or_default();
+    if text.is_empty() {
+        return json!({});
+    }
+    match table_event(table, payload) {
+        Some(Event::PreTool) if reply["status"] == "stop" => match table.refusal {
+            Refusal::PermissionDecision => json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": text,
+            }}),
+            Refusal::Decision => json!({"decision": "deny", "reason": text}),
+        },
+        _ => with_table_note(json!({}), table, payload, text, true),
+    }
+}
+
+/// `reply` with `text` where the table agent takes a note on this event, before what is there
+/// when `first`, else after it. Unchanged on an event that takes none.
+fn with_table_note(
+    mut reply: Value,
+    table: &CommandHooks,
+    payload: &Value,
+    text: &str,
+    first: bool,
+) -> Value {
+    let note = match table_event(table, payload) {
+        Some(Event::Start) => table.start,
+        Some(Event::PreTool) => table.note,
+        _ => Note::None,
+    };
+    let field = match note {
+        Note::None => return reply,
+        Note::HookSpecific => "/hookSpecificOutput/additionalContext",
+        Note::AdditionalContext => "/additionalContext",
+        Note::Context => "/context",
+    };
+    if !reply.is_object() {
+        return reply;
+    }
+    let combined = match reply.pointer(field).and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() && first => format!("{text}\n\n{existing}"),
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+        _ => text.to_owned(),
+    };
+    if note == Note::HookSpecific {
+        if !reply["hookSpecificOutput"].is_object() {
+            reply["hookSpecificOutput"] = json!({});
+        }
+        let inner = &mut reply["hookSpecificOutput"];
+        if inner.get("hookEventName").is_none() {
+            inner["hookEventName"] = payload["hook_event_name"].clone();
+        }
+        inner["additionalContext"] = json!(combined);
+    } else {
+        reply[&field[1..]] = json!(combined);
+    }
+    reply
+}
+
 /// The Hub decides when an edit is refused: it reports a contested file once per hold, so a
 /// retry under the same hold comes back clean.
 fn gemini_reply(reply: Value, payload: &Value) -> Value {
@@ -2367,20 +3052,28 @@ fn is_pre_tool(payload: &Value) -> bool {
 }
 
 /// The marker key of a tool event that only renews the session's lease: every tool event except
-/// the one that checks an edit (preToolUse, or postToolUse in Cursor), a shell call's start or
+/// the one that checks an edit (preToolUse, or postToolUse in Cursor), an in-flight call's start or
 /// end, which the Hub counts so a long call stays live, and the end of a call that started a
 /// subagent, which says what the subagent is for. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
     let session = session_of(payload)?;
-    if waits(agent, payload)
-        || agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0)
-        || started_subagent(payload).is_some()
-    {
+    let tool = tool_call(agent, payload).0;
+    let shell = match table(agent) {
+        Some(table) => table.is_shell(&tool),
+        None => agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool),
+    };
+    let in_flight = agent != "cursor" && agentscm::hub::hook::is_in_flight_tool(&tool);
+    if waits(agent, payload) || shell || in_flight || started_subagent(payload).is_some() {
         return None;
     }
     // A path that cannot be read is sent on, so the Hub decides.
     let edit = edit_paths(agent, payload).map_or(true, |paths| !paths.is_empty());
     let renews = match (agent, payload["hook_event_name"].as_str()) {
+        _ if let Some(table) = table(agent) => match table_event(table, payload) {
+            Some(Event::PreTool) => !edit,
+            Some(Event::PostTool) => true,
+            _ => false,
+        },
         ("cursor", Some("postToolUse")) => !edit,
         ("cursor", _) => false,
         ("gemini", Some("AfterTool")) | (_, Some("PostToolUse")) => true,
@@ -2407,10 +3100,20 @@ fn activity_marker(agent: &str, session: &str, payload: &Value) -> String {
 /// A report that the session stopped for its person: a permission prompt, a question or the end
 /// of a turn. The Hub reads which; this says only that the session's next call ends it.
 fn waits(agent: &str, payload: &Value) -> bool {
+    if let Some(table) = table(agent) {
+        return matches!(
+            table_event(table, payload),
+            Some(Event::Notification | Event::Stop)
+        );
+    }
     match payload["hook_event_name"].as_str() {
         Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
         Some("stop") => agent == "cursor",
-        Some("PreToolUse") => payload["tool_name"] == "AskUserQuestion",
+        Some("QuestionsSnapshot" | "QuestionsUnavailable") => true,
+        Some("PreToolUse") => matches!(
+            payload["tool_name"].as_str(),
+            Some("AskUserQuestion" | "request_user_input" | "functions.request_user_input")
+        ),
         Some(_) => false,
         None => {
             agent == "copilot"
@@ -2435,11 +3138,17 @@ fn path_segment(agent: &str) -> String {
 
 /// Where the agent is working: the payload's `cwd`, else its first workspace root, else here.
 fn cwd_of(payload: &Value) -> PathBuf {
-    let first_root = payload["workspace_roots"][0].as_str();
-    payload["cwd"].as_str().or(first_root).map_or_else(
-        || std::env::current_dir().unwrap_or_default(),
-        PathBuf::from,
-    )
+    let first_root = payload["workspace_roots"][0]
+        .as_str()
+        .filter(|root| !root.is_empty());
+    payload["cwd"]
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .or(first_root)
+        .map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        )
 }
 
 /// Added to a failure note: it is given once per session and failure, so it has to cover the edits
@@ -2819,6 +3528,12 @@ fn context_reply(agent: &str, payload: &Value, text: &str) -> Value {
 }
 
 fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value {
+    if let Some(table) = table(agent) {
+        return note.map_or_else(
+            || json!({}),
+            |text| with_table_note(json!({}), table, payload, text, true),
+        );
+    }
     let event = payload["hook_event_name"].as_str();
     let text = |text: &str| text.to_owned();
     match (agent, event, note) {
@@ -2845,8 +3560,184 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
     }
 }
 
+#[cfg(all(test, unix))]
+mod native_capture_tests {
+    use super::*;
+
+    #[test]
+    fn configured_hook_event_is_not_a_position_and_ambiguous_hints_are_refused() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for values in [
+            args(&[
+                "copilot",
+                "--client-connection",
+                "--hook-event",
+                "userPromptSubmitted",
+            ]),
+            args(&["--hook-event=userPromptSubmitted", "copilot"]),
+            args(&["--hook-event", "userPromptSubmitted", "copilot"]),
+        ] {
+            assert_eq!(parse_args(&values).0, "copilot");
+            assert_eq!(
+                hook_event_hint(&values).unwrap().as_deref(),
+                Some("userPromptSubmitted")
+            );
+        }
+        for values in [
+            args(&["copilot", "--hook-event"]),
+            args(&["copilot", "--hook-event="]),
+            args(&["copilot", "--hook-event", "bad event"]),
+            args(&[
+                "copilot",
+                "--hook-event=postToolUse",
+                "--hook-event=preToolUse",
+            ]),
+        ] {
+            assert!(hook_event_hint(&values).is_err());
+        }
+    }
+
+    #[test]
+    fn gemini_capture_only_events_select_source_without_coordination_payloads() {
+        use agentscm::change_capture::{LocalSpool, claude_code, native_hooks};
+        use agentscm::change_record::{
+            AgentHarnessV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let connection = Connection {
+            root: root.clone(),
+            origin_host: "example.test".into(),
+            hub: "https://hub.example.test".into(),
+            repo: "acme/widgets".into(),
+            token_file: temp.path().join("token"),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        };
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        for (name, expected) in [
+            ("BeforeAgent", CapturedEventKindV1::UserPrompt),
+            ("BeforeModel", CapturedEventKindV1::SetupObserved),
+        ] {
+            let payload = json!({"hook_event_name":name,"session_id":"native_session","cwd":root,
+                "prompt":"Visible user prompt", "llm_request":{"model":"gemini-example","messages":["excluded-context"]},
+                "llm_response":{"candidates":["excluded-thought"],"usageMetadata":{"totalTokenCount":42}}});
+            let original = payload.clone();
+            let (_, checkout, paths) =
+                select_client_checkout("gemini", &payload, std::slice::from_ref(&connection))
+                    .unwrap();
+            assert_eq!(checkout, root);
+            assert!(paths.is_empty());
+            assert!(capture_only("gemini", name));
+            assert!(sanitized_client("gemini", &payload, &paths).is_err());
+            let hook = native_hooks::normalize("gemini", &payload, None)
+                .unwrap()
+                .unwrap();
+            let request = claude_code::CaptureRequest {
+                operation_prefix: name.into(),
+                work_id: "wrk_native".into(),
+                generation: 1,
+                observed_session_id: "native_session".into(),
+                canonical_session_id: "native_session".into(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::LocalConversation,
+                live_capture_mode: CaptureModeV1::LocalConversation,
+                harness: AgentHarnessV1::GeminiCli,
+            };
+            for event in hook.events {
+                claude_code::capture_hook(&serde_json::to_vec(&event).unwrap(), &request, &spool)
+                    .unwrap();
+            }
+            assert_eq!(payload, original);
+            assert!(spool.pending(100).unwrap().iter().any(|envelope| matches!(envelope,
+                CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().any(|event| event.kind == expected))));
+        }
+        assert!(
+            !spool
+                .pending(100)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(envelope, CaptureEnvelopeV1::Usage(_)))
+        );
+        let child = root.join("unregistered");
+        std::fs::create_dir_all(child.join(".git")).unwrap();
+        assert!(
+            select_client_checkout(
+                "gemini",
+                &json!({"hook_event_name":"BeforeModel","cwd":child}),
+                &[connection]
+            )
+            .is_err()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literal_fanout_skips_only_the_exact_default_work_and_preserves_tool_context() {
+        let association = crate::client_session::CaptureAssociation {
+            session: "native".into(),
+            harness: agentscm::change_record::AgentHarnessV1::ClaudeCode,
+            hub: "https://hub.example".into(),
+            repo: "acme/one".into(),
+            checkout: std::path::PathBuf::from("/synthetic/checkout"),
+            work_id: "wrk_one".into(),
+            generation: 1,
+            native_start_verified: true,
+        };
+        let default = (
+            (association.hub.clone(), association.repo.clone()),
+            agentscm::change_record::CaptureTargetV1 {
+                version: 1,
+                work_id: association.work_id.clone(),
+                generation: 1,
+                session_id: "native".into(),
+            },
+        );
+        assert!(!super::needs_associated_capture(
+            &association,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(
+            &association,
+            Some(&default),
+            true
+        ));
+        let mut other = association.clone();
+        other.work_id = "wrk_two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.repo = "acme/two".into();
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        other = association.clone();
+        other.generation += 1;
+        assert!(super::needs_associated_capture(
+            &other,
+            Some(&default),
+            false
+        ));
+        assert!(super::needs_associated_capture(&association, None, false));
+    }
+
     use super::*;
 
     fn changed(paths: &[&str], truncated: bool) -> Value {
@@ -3010,6 +3901,183 @@ mod tests {
     }
 
     #[test]
+    fn native_question_snapshots_send_only_validated_redacted_wait_metadata() {
+        let raw = json!({"hook_event_name":"QuestionsSnapshot","session_id":"s",
+            "prompt":"private reply", "transcript_path":"private path",
+            "questions":{"offset":123,"pending":[{"id":"[\"request_user_input_async\",\"call_example\",0]",
+                "since":1000,"asks":"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nChoose a format"}]}});
+        let sent = sanitized_codex(&raw, Some(&[])).unwrap();
+        let text = sent.to_string();
+        assert!(!text.contains("private") && !text.contains("ghp_abc"));
+        assert!(text.contains("Choose a format"));
+        assert_eq!(sent["questions"]["offset"], 123);
+        assert!(waits("codex", &raw));
+        let mut malformed = raw;
+        malformed["questions"]["pending"][0]["id"] = json!("not a question id");
+        assert!(sanitized_codex(&malformed, Some(&[])).is_err());
+        let synchronous = json!({"hook_event_name":"PreToolUse","tool_name":"request_user_input",
+            "tool_input":{"questions":[{"question":"Choose a format"}]}});
+        assert_eq!(wait_asks(&synchronous).as_deref(), Some("Choose a format"));
+        assert!(waits("codex", &synchronous));
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":"s",
+            "prompt":"private", "transcript_path":"private", "questions":{"pending":["private"]}});
+        let sent = sanitized_codex(&unavailable, Some(&[])).unwrap();
+        assert!(waits("codex", &sent));
+        assert_eq!(sent["hook_event_name"], "QuestionsUnavailable");
+        assert!(!sent.to_string().contains("private"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_question_poll_forward_and_status_preserve_the_wait_until_a_matched_reply() {
+        use agentscm::backend::LocalBackend;
+        use agentscm::change_capture::codex::poll_questions;
+        use agentscm::hub::store::{self, ForgeIdentity, mint_bound_agent_token, unix_now};
+        use agentscm::hub::{HubState, router};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        const SESSION: &str = "55555555-5555-4555-8555-555555555555";
+        let temp = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            temp.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 913,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(&*store, &user.id, "codex", "acme/widgets", 101, 3600, false)
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connection = connection(temp.path(), "acme/widgets");
+        connection.hub = format!("http://{}", listener.local_addr().unwrap());
+        connection.token_file = temp.path().join("token");
+        std::fs::write(&connection.token_file, secret.expose()).unwrap();
+        std::fs::set_permissions(
+            &connection.token_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let app = router(HubState::new(
+            store,
+            Arc::new(LocalBackend::open(temp.path().join("objects")).unwrap()),
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = temp.path().join("rollout.jsonl");
+        let append = |value: Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{value}").unwrap();
+        };
+        append(json!({"type":"session_meta","payload":{"id":SESSION}}));
+        let item = |value: Value| {
+            json!({"type":"event_msg","timestamp":"2026-11-15T12:00:00Z",
+            "payload":{"type":"item_completed","thread_id":SESSION,"item":value}})
+        };
+        append(item(
+            json!({"type":"AgentMessage","id":"call_question","delivery":"async",
+            "content":[],"questions":[{"title":"Choose a format","options":["JSON","CSV"]}]}),
+        ));
+        let mut cursor = None;
+        let read = |cursor: &mut Option<_>| {
+            let mut report = poll_questions(&path, SESSION, cursor).unwrap();
+            assert!(report.complete && report.reliable);
+            // Simulate an elapsed grace interval without making a local test wait a minute.
+            for question in &mut report.snapshot.pending {
+                question.since = unix_now() - 70;
+            }
+            report.snapshot
+        };
+        let first = read(&mut cursor);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let status = || async {
+            let body = client
+                .get(format!("{}/v1/hub/standup/status", connection.hub))
+                .bearer_auth(secret.expose())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        };
+        let waiting_count = |value: &Value| {
+            value["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["kind"] == "session_waiting")
+                .count()
+        };
+        assert_eq!(waiting_count(&status().await), 1);
+        append(
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_question","output":"{\"accepted\":true}"}}),
+        );
+        // Continued native work and hook events also flow through the real hooks.
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"] {
+            client
+                .post(format!(
+                    "{}/v1/hub/hook/codex?repo=acme/widgets",
+                    connection.hub
+                ))
+                .bearer_auth(secret.expose())
+                .header("content-type", "application/json")
+                .body(
+                    json!({"hook_event_name":event,"session_id":SESSION,"tool_name":"exec"})
+                        .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        forward_questions(&connection, SESSION, Some(&read(&mut cursor)))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 1);
+        let reply = json!([{"questionItemId":first.pending[0].id,"question":"Choose a format","answer":"JSON"}]);
+        append(item(
+            json!({"type":"UserMessage","id":"reply","content":[{"type":"Text",
+            "text":format!("<send_user_message_question_reply>{reply}</send_user_message_question_reply>")}]}),
+        ));
+        let answered = read(&mut cursor);
+        assert!(answered.pending.is_empty());
+        forward_questions(&connection, SESSION, Some(&answered))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        forward_questions(&connection, SESSION, Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(waiting_count(&status().await), 0);
+        std::fs::write(&connection.token_file, "invalid-token").unwrap();
+        assert!(
+            forward_questions(&connection, SESSION, Some(&answered))
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    #[test]
     fn a_wait_sends_one_redacted_line_of_what_it_asks() {
         let long = format!(
             "{}\n\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 is set.\n\nShould I force-push the rebased branch?",
@@ -3039,6 +4107,11 @@ mod tests {
             false
         );
         assert_eq!(judged("  ".into()), Value::Null);
+        // Judged as written, so a question in an earlier paragraph is not the turn's ask.
+        assert_eq!(
+            judged(format!("Why did it fail? A stale cache.\n\n{report}")),
+            true
+        );
 
         let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
             "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});
@@ -3376,6 +4449,42 @@ mod tests {
         };
         assert_eq!(read(json!({})), "activity\0claude\0s");
         assert_ne!(read(json!({"agent_id":"a"})), read(json!({"agent_id":"b"})));
+    }
+
+    #[test]
+    fn delegated_call_boundaries_are_never_throttled() {
+        for tool in [
+            "Agent",
+            "Task",
+            "wait",
+            "functions.wait",
+            "wait_agent",
+            "collaboration.wait_agent",
+        ] {
+            for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+                for agent in ["claude", "codex"] {
+                    assert!(
+                        activity_key(
+                            agent,
+                            &json!({
+                                "hook_event_name":event,"session_id":"s","tool_name":tool
+                            })
+                        )
+                        .is_none(),
+                        "{tool} {event}"
+                    );
+                }
+            }
+            assert!(
+                activity_key(
+                    "cursor",
+                    &json!({
+                        "hook_event_name":"postToolUse","conversation_id":"s","tool_name":tool
+                    })
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]
@@ -4466,6 +5575,10 @@ mod tests {
     #[test]
     fn payload_directory_comes_from_cwd_then_workspace_roots() {
         assert_eq!(
+            cwd_of(&json!({"cwd":"", "workspace_roots":["/b"]})),
+            PathBuf::from("/b")
+        );
+        assert_eq!(
             cwd_of(&json!({"cwd": "/a", "workspace_roots": ["/b"]})),
             PathBuf::from("/a")
         );
@@ -4506,10 +5619,44 @@ mod tests {
         // The end event drops the record first (as `host_session` does) and must not rewrite it.
         for name in ["SessionEnd", "sessionEnd"] {
             record_session_route_in(config.path(), &event("PreToolUse"), &connection);
-            crate::client_session::forget(config.path(), "s-1");
+            let fence = crate::client_session::cleanup_fence(config.path(), "s-1").unwrap();
+            crate::client_session::forget(config.path(), &fence).unwrap();
             record_session_route_in(config.path(), &event(name), &connection);
             assert_eq!(route(), None, "{name}");
         }
+    }
+
+    // The native journal that records lifecycle intent exists only on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn failed_session_end_cleanup_retains_the_lifecycle_intent_and_route() {
+        let config = tempfile::tempdir().unwrap();
+        let context:crate::client_session::SessionContext=serde_json::from_value(json!({"session":"s-1","start_nonce":"nonce","incarnation":"inc","agent":"codex","hub":"https://hub.example.test","repo":"acme/widgets","root":"/synthetic/repo","protocol":1,"registered":true,"observed_at":10,"host":null,"credential_id":"token-id","binding_id":"binding"})).unwrap();
+        crate::client_session::save_context(config.path(), &context).unwrap();
+        let event = json!({"hook_event_name":"SessionEnd","session_id":"s-1"});
+        let fence = crate::client_session::cleanup_fence(config.path(), "s-1").unwrap();
+        remember_session_end_in(config.path(), "codex", &event, &fence, 20).unwrap();
+        // The ordinary Hub request failed or exceeded its deadline before any successful reply.
+        crate::client_session::forget(config.path(), &fence).unwrap();
+        let saved =
+            crate::client_session::context(config.path(), "s-1", &context.hub, &context.repo)
+                .unwrap()
+                .unwrap();
+        assert!(saved.explicit_end_requested);
+        assert!(saved.exit_observed_at.is_some());
+        assert_eq!(saved.start_nonce, context.start_nonce);
+        assert_eq!(saved.incarnation, context.incarnation);
+        let journal = crate::client_journal::inspect(config.path()).unwrap();
+        assert_eq!(journal.records.len(), 1);
+        assert_eq!(
+            journal.records[0].kind,
+            crate::client_journal::Kind::TerminalEnd
+        );
+        assert_eq!(journal.records[0].payload["end_intent"], true);
+        assert!(
+            crate::client_session::route_of(config.path(), "s-1", &context.hub, &context.repo)
+                .is_some()
+        );
     }
 
     fn git_repo(parent: &Path, name: &str) -> PathBuf {
@@ -4936,6 +6083,7 @@ mod tests {
         )
         .unwrap();
         let request = HookRequest {
+            native: None,
             agent: "codex".into(),
             repo: Some("acme/widgets".into()),
             token: "synthetic-token".into(),
@@ -5055,6 +6203,319 @@ mod tests {
         );
     }
 
+    /// One payload from a table agent: its event, session and folder, as its docs show them.
+    fn table_payload(event: &str, extra: Value) -> Value {
+        let mut payload = json!({"hook_event_name": event, "session_id": "s", "cwd": "/r"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        payload
+    }
+
+    /// The Hub's generic payload for one table agent's hook call.
+    fn generic_for(agent: &str, payload: &Value) -> Value {
+        let paths = edit_paths(agent, payload).unwrap();
+        sanitized_client(agent, payload, &paths).unwrap()
+    }
+
+    #[test]
+    fn table_agents_send_the_generic_shape_for_each_event() {
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let table = table(agent).unwrap();
+            let native = |kind: Event| {
+                table
+                    .events
+                    .iter()
+                    .find(|(_, event, _)| *event == kind)
+                    .map(|(name, ..)| *name)
+            };
+            let (pre, post) = (
+                native(Event::PreTool).unwrap(),
+                native(Event::PostTool).unwrap(),
+            );
+            let edit = table.edit_tools[0];
+            let shell = table.shell_tools[0];
+            let sent = |payload: Value| generic_for(agent, &payload);
+            assert_eq!(
+                sent(table_payload(
+                    native(Event::Start).unwrap(),
+                    json!({"source": "startup"})
+                )),
+                json!({"agent": agent, "event": "start", "session": "s"})
+            );
+            // An edit before it runs is checked; its content never leaves.
+            let edited = json!({"tool_name": edit,
+                "tool_input": {"file_path": "/r/src/a.rs", "content": "private"}});
+            assert_eq!(
+                sent(table_payload(pre, edited.clone())),
+                json!({"agent": agent, "event": "check", "session": "s", "paths": ["/r/src/a.rs"]})
+            );
+            assert_eq!(sent(table_payload(post, edited))["event"], "activity");
+            // Any other tool call is activity; a shell call's start and end are counted.
+            assert_eq!(
+                sent(table_payload(
+                    pre,
+                    json!({"tool_name": "Read", "tool_input": {}})
+                )),
+                json!({"agent": agent, "event": "activity", "session": "s"})
+            );
+            let command = json!({"tool_name": shell, "tool_input": {"command": "make private"}});
+            assert_eq!(
+                sent(table_payload(pre, command.clone())),
+                json!({"agent": agent, "event": "activity", "phase": "start", "session": "s"})
+            );
+            assert_eq!(sent(table_payload(post, command))["phase"], "end");
+            // The end of a turn is a wait for the person, with what the reply ended on.
+            let stop = native(Event::Stop).unwrap();
+            let ended = sent(table_payload(
+                stop,
+                json!({"last_assistant_message": "Done. Shall I push it?"}),
+            ));
+            assert_eq!(ended["event"], "waiting");
+            assert_eq!(ended["reason"], "idle");
+            assert_eq!(ended["asks"], "Done. Shall I push it?");
+            assert_eq!(
+                sent(table_payload(
+                    native(Event::End).unwrap(),
+                    json!({"reason": "other"})
+                )),
+                json!({"agent": agent, "event": "done", "session": "s"})
+            );
+            if let Some(notification) = native(Event::Notification) {
+                let prompt = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "permission_prompt",
+                        "message": "Allow make private?"}),
+                ));
+                assert_eq!(prompt["reason"], "permission");
+                assert_eq!(prompt["asks"], "Allow make private?");
+                let idle = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "idle_prompt"}),
+                ));
+                assert_eq!(idle["reason"], "idle");
+                // A notification with no known reason is sent without one, which the Hub ignores.
+                let other = sent(table_payload(
+                    notification,
+                    json!({"notification_type": "auth_success"}),
+                ));
+                assert!(other.get("reason").is_none(), "{other}");
+            }
+            assert!(
+                sanitized_client(agent, &table_payload("Unknown", json!({})), &[]).is_err(),
+                "{agent}"
+            );
+            assert!(waits(agent, &table_payload(stop, json!({}))));
+            assert!(!waits(agent, &table_payload(pre, json!({}))));
+        }
+    }
+
+    #[test]
+    fn table_agents_name_their_edits_by_their_own_tools() {
+        let edit = |agent: &str, tool: &str, input: Value| {
+            edit_paths(
+                agent,
+                &table_payload(
+                    "PreToolUse",
+                    json!({"tool_name": tool, "tool_input": input}),
+                ),
+            )
+        };
+        let path = |text: &str| {
+            vec![EditPath {
+                header: None,
+                path: text.into(),
+            }]
+        };
+        assert_eq!(
+            edit("qwen", "write_file", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("qwen", "edit", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("crush", "multiedit", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        assert_eq!(
+            edit("droid", "Create", json!({"file_path": "a.rs"})).unwrap(),
+            path("a.rs")
+        );
+        // An edit tool whose file cannot be read is an error, never a free file.
+        assert!(edit("droid", "Edit", json!({"path": "a.rs"})).is_err());
+        assert!(edit("junie", "Write", json!({"file_path": "bad\npath"})).is_err());
+        // Junie's patch names its files in its headers.
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n+private\n*** End Patch\n";
+        let named = edit("junie", "apply_patch", json!({"patch": patch})).unwrap();
+        assert_eq!(named[0].path, "src/a.rs");
+        assert!(edit("junie", "apply_patch", json!({"patch": "--- a\n+++ b\n"})).is_err());
+        // A tool not in the table edits nothing.
+        assert!(
+            edit("droid", "ApplyPatch", json!({"input": patch}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            edit("crush", "view", json!({"file_path": "a.rs"}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn table_agents_read_a_refusal_and_a_note_in_their_own_shape() {
+        let stop = json!({"status": "stop", "text": "coordinate this edit", "extra": "drop"});
+        let fyi = json!({"status": "fyi", "text": "overlap noted"});
+        let clean = json!({"status": "clean", "text": ""});
+        let pre = table_payload("PreToolUse", json!({"tool_name": "x"}));
+        let start = table_payload("SessionStart", json!({}));
+        let reply = |agent: &str, hub: &Value, payload: &Value| {
+            table_reply(table(agent).unwrap(), hub.clone(), payload)
+        };
+        let denied = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "deny", "permissionDecisionReason": "coordinate this edit"}});
+        let decided = json!({"decision": "deny", "reason": "coordinate this edit"});
+        for (agent, refusal, note, started) in [
+            (
+                "droid",
+                denied.clone(),
+                json!({}),
+                json!({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                    "additionalContext": "overlap noted"}}),
+            ),
+            (
+                "qwen",
+                denied,
+                json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                    "additionalContext": "overlap noted"}}),
+                json!({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                    "additionalContext": "overlap noted"}}),
+            ),
+            (
+                "junie",
+                decided.clone(),
+                json!({"additionalContext": "overlap noted"}),
+                json!({}),
+            ),
+            (
+                "crush",
+                decided,
+                json!({"context": "overlap noted"}),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(reply(agent, &stop, &pre), refusal, "{agent}");
+            assert_eq!(reply(agent, &fyi, &pre), note, "{agent}");
+            assert_eq!(reply(agent, &fyi, &start), started, "{agent}");
+            assert_eq!(reply(agent, &clean, &pre), json!({}), "{agent}");
+            // A stop is a refusal only before a tool call.
+            assert_eq!(
+                reply(agent, &stop, &table_payload("PostToolUse", json!({}))),
+                json!({}),
+                "{agent}"
+            );
+            // When the Hub cannot be asked, the agent goes on, told where it takes a note.
+            let failed = fail_open(agent, &pre, Some("no token"));
+            let text = failed.to_string();
+            assert!(
+                !text.contains("decision") && !text.contains("deny"),
+                "{agent}: {text}"
+            );
+            assert_eq!(
+                text.contains("no token"),
+                note != json!({}),
+                "{agent}: {text}"
+            );
+            assert_eq!(fail_open(agent, &pre, None), json!({}), "{agent}");
+            let started = fail_open(agent, &start, Some("hub unreachable"));
+            assert_eq!(
+                started.to_string().contains("hub unreachable"),
+                agent == "droid" || agent == "qwen",
+                "{agent}: {started}"
+            );
+            // A connection note comes first, beside what the Hub said.
+            let noted = with_note(reply(agent, &fyi, &pre), agent, &pre, "AgentSCM: first");
+            if note != json!({}) {
+                let text = noted.to_string();
+                assert!(
+                    text.contains("AgentSCM: first\\n\\noverlap noted"),
+                    "{agent}: {text}"
+                );
+            }
+            let local = with_local_note(reply(agent, &fyi, &pre), agent, &pre, "local");
+            if note != json!({}) {
+                assert!(
+                    local.to_string().contains("overlap noted\\n\\nlocal"),
+                    "{agent}: {local}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_agents_renew_on_tool_calls_that_check_nothing() {
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let table = table(agent).unwrap();
+            let read = table_payload("PreToolUse", json!({"tool_name": "Read"}));
+            assert!(activity_key(agent, &read).is_some(), "{agent}");
+            let edit = table_payload(
+                "PreToolUse",
+                json!({"tool_name": table.edit_tools[0],
+                "tool_input": {"file_path": "a.rs"}}),
+            );
+            assert!(activity_key(agent, &edit).is_none(), "{agent}");
+            let after = table_payload(
+                "PostToolUse",
+                json!({"tool_name": table.edit_tools[0],
+                "tool_input": {"file_path": "a.rs"}}),
+            );
+            assert!(activity_key(agent, &after).is_some(), "{agent}");
+            let shell = table_payload("PreToolUse", json!({"tool_name": table.shell_tools[0]}));
+            assert!(activity_key(agent, &shell).is_none(), "{agent}");
+        }
+    }
+
+    #[test]
+    fn a_table_payload_is_named_as_setup_registered_it() {
+        let mut crush = json!({"hook_event_name": "pre_tool_use", "session_id": "s", "cwd": "/r"});
+        prepare_table_payload(table("crush").unwrap(), &mut crush);
+        assert_eq!(crush["hook_event_name"], "PreToolUse");
+        assert_eq!(crush["cwd"], "/r");
+        // Junie names its folder only at a session start: later hooks use their own.
+        let mut junie = json!({"hook_event_name": "PreToolUse", "tool_name": "Read"});
+        prepare_table_payload(table("junie").unwrap(), &mut junie);
+        assert_eq!(
+            junie["cwd"].as_str().map(PathBuf::from),
+            std::env::current_dir().ok()
+        );
+        // An event setup did not register is left as it came.
+        let mut other = json!({"hook_event_name": "Elsewhere"});
+        prepare_table_payload(table("junie").unwrap(), &mut other);
+        assert_eq!(other, json!({"hook_event_name": "Elsewhere"}));
+    }
+
+    #[test]
+    fn table_agents_route_to_the_generic_endpoint() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = git_repo(parent.path(), "repo");
+        let connections = [connection(&root, "acme/widgets")];
+        for agent in ["droid", "qwen", "junie", "crush"] {
+            let tool = table(agent).unwrap().edit_tools[0];
+            let payload = json!({"hook_event_name": "PreToolUse", "session_id": "s", "cwd": root,
+                "tool_name": tool, "tool_input": {"file_path": "src/a.rs", "content": "secret"}});
+            let routed = route_client_with(agent, &payload, &connections).unwrap();
+            assert_eq!(routed.endpoint_agent, "generic");
+            assert_eq!(
+                routed.payload,
+                json!({"agent": agent, "event": "check", "session": "s", "paths": ["src/a.rs"]})
+            );
+        }
+        assert!(generic_route("gemini") && !generic_route("claude") && !generic_route("other"));
+    }
+
     #[test]
     fn generic_and_unknown_agents_get_an_empty_object() {
         for agent in ["generic", "mystery", ""] {
@@ -5079,8 +6540,19 @@ mod tests {
         #[cfg(unix)]
         for event in agentscm::change_capture::codex::HOOK_EVENTS {
             let payload = json!({"hook_event_name": event});
-            assert!(crate::change_capture_cli::captured_harness("codex", &payload).is_some());
-            assert!(crate::change_capture_cli::captured_harness("cursor", &payload).is_none());
+            assert!(crate::change_capture_cli::captured_harness("codex", &payload, None).is_some());
+            assert!(
+                crate::change_capture_cli::captured_harness("cursor", &payload, None).is_none()
+            );
         }
+    }
+
+    /// The installers' hook tables are private to them; their own tests pin the shortest
+    /// timeout, 3 seconds, that this deadline has to stay under.
+    #[test]
+    fn the_hook_deadline_leaves_time_to_reply_before_the_host_stops_it() {
+        let shortest_host_timeout = Duration::from_secs(3);
+        assert!(LIMIT + Duration::from_millis(500) <= shortest_host_timeout);
+        assert!(CAPTURE_BUDGET + Duration::from_millis(500) <= shortest_host_timeout);
     }
 }

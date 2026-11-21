@@ -332,9 +332,9 @@ pub(super) async fn reconcile_repo(
         Some(number) => (number.saturating_sub(1), 1),
         None => (state.sync.forge_cursor(&repo.id), MAX_PULLS_PER_PASS),
     };
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let publications =
-        blocking(state, move || store.pull_publications(&name, after, limit)).await?;
+        blocking(state, move || store.pull_publications(&scope, after, limit)).await?;
     let full = publications.len() >= limit;
     let mut base_tips = HashMap::new();
     let last = publications.last().and_then(|p| p.pr_number).unwrap_or(0);
@@ -418,9 +418,13 @@ async fn retire_disabled(
         .iter()
         .filter_map(|p| status_context(&p.target).ok())
         .collect();
-    let (store, id, name) = (state.store.clone(), repo.id.clone(), repo.full_name.clone());
+    let (store, id, scope) = (
+        state.store.clone(),
+        repo.id.clone(),
+        repo.repository_scope(),
+    );
     let rows = blocking(state, move || {
-        store.forge_checks_showing_success(&id, &name, &enabled, MAX_PULLS_PER_PASS)
+        store.forge_checks_showing_success(&id, &scope, &enabled, MAX_PULLS_PER_PASS)
     })
     .await?;
     let api = state.sync.forge(conn)?;
@@ -495,9 +499,9 @@ async fn newest_publication(
     repo: &ConnectedRepository,
     number: i64,
 ) -> Result<Option<Publication>> {
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let newest = blocking(state, move || {
-        store.pull_publications(&name, number.saturating_sub(1), 1)
+        store.pull_publications(&scope, number.saturating_sub(1), 1)
     })
     .await?;
     let found = newest.into_iter().find(|p| p.pr_number == Some(number));

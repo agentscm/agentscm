@@ -1,5 +1,5 @@
 import { ApiError } from './api.ts'
-import { decodeWorkItem, type WorkItem } from './standup.ts'
+import { decodeWorkItem, transitionField, type WorkItem, type WorkTransitionKind } from './standup.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -26,6 +26,7 @@ export interface CatchupWorkEvent {
   kind: string
   work_id: string
   item: WorkItem
+  transition?: WorkTransitionKind
 }
 
 export interface CatchupCoordinationEvent {
@@ -227,6 +228,7 @@ function workEvent(value: unknown): CatchupWorkEvent {
     kind: boundedText(row['kind'], 'work_events.kind', 64),
     work_id: workId,
     item,
+    ...transitionField(row['transition']),
   }
 }
 

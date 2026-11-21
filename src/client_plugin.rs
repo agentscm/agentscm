@@ -17,6 +17,8 @@ pub struct PluginArgs {
 
 use crate::client_setup::SKILL;
 
+const CLAUDE_PLUGIN_ID: &str = "agentscm@agentscm-claude-client";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
     Codex,
@@ -61,6 +63,11 @@ fn metadata() -> Value {
 /// Seconds Codex gives the `PermissionRequest` hook; the hook is told the same.
 const PERMISSION_LIMIT: u64 = 600;
 
+fn feedback_hook(program: &str, client: &str) -> Value {
+    json!({"type":"command", "timeout":3,
+        "command":format!("{} --no-telemetry feedback start --client {client}", shell_quote(program))})
+}
+
 fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
     let command = format!(
         "{} --no-telemetry hook codex --client-connection",
@@ -82,7 +89,8 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         "command":format!("{} --no-telemetry hook-wait codex --end", shell_quote(program)),
         "timeout":3});
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5), wait.clone()]}],
+        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5), wait.clone()]},
+            {"hooks":[feedback_hook(program, "codex")]}],
         // Every tool call keeps this chat's hold live; the Hub checks only the edits.
         "PreToolUse":[{"hooks":[hook("AgentSCM: coordinate this tool call", 5)]}],
         "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
@@ -143,10 +151,13 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str, Vec<u8>)> {
+    let command = format!(
+        "{} --no-telemetry hook claude --client-connection",
+        shell_quote(program)
+    );
     let hook = |timeout| {
         json!({
-            "type":"command", "command":program,
-            "args":["--no-telemetry", "hook", "claude", "--client-connection"],
+            "type":"command", "command":command,
             "timeout":timeout
         })
     };
@@ -160,18 +171,20 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     // The waiter runs in the background from session start and after every turn: it waits at
     // the Hub for a message to this session and wakes it with one (asyncRewake, exit 2), idle or
     // busy. Only one waits per session; it leaves on its own before this timeout.
+    // Explicit async also backgrounds the waiter in single-shot print mode.
     let wait = json!({
-        "type":"command", "command":program,
-        "args":["--no-telemetry", "hook-wait", "claude"],
-        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
+        "type":"command",
+        "command":format!("{} --no-telemetry hook-wait claude", shell_quote(program)),
+        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "async":true, "asyncRewake":true
     });
     // SessionEnd tells this session's waiter to leave, as /clear keeps the same process.
     let wait_end = json!({
-        "type":"command", "command":program,
-        "args":["--no-telemetry", "hook-wait", "claude", "--end"], "timeout":5
+        "type":"command",
+        "command":format!("{} --no-telemetry hook-wait claude --end", shell_quote(program)), "timeout":5
     });
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
+        "SessionStart":[{"hooks":[hook(5), wait.clone()]},
+            {"hooks":[feedback_hook(program, "claude")]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
@@ -568,16 +581,7 @@ fn has_agentscm_hooks(path: &Path) -> Result<bool> {
         .flatten()
         .filter_map(|group| group["hooks"].as_array())
         .flatten()
-        .any(|hook| {
-            hook["url"]
-                .as_str()
-                .is_some_and(|url| url.contains("/v1/hub/hook/"))
-                || ["command", "command_windows"].iter().any(|key| {
-                    hook[*key]
-                        .as_str()
-                        .is_some_and(|command| command.to_ascii_lowercase().contains("agentscm"))
-                })
-        }))
+        .any(crate::client_setup::agentscm_hook))
 }
 
 fn check_existing_hooks(root: &Path) -> Result<()> {
@@ -608,6 +612,47 @@ pub(crate) fn claude_config_dir(root: &Path) -> Result<PathBuf> {
     } else {
         root.join(path)
     })
+}
+
+/// The installed Claude bundle's release is strictly older than the executing binary's release.
+/// An absent or unfamiliar registry does not establish which bundle is installed.
+pub(crate) fn claude_plugin_is_older(root: &Path) -> Option<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+    let registry = claude_config_dir(root)
+        .ok()?
+        .join("plugins/installed_plugins.json");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(registry)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_REGISTRY_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_REGISTRY_BYTES {
+        return None;
+    }
+    let registry: Value = serde_json::from_slice(&bytes).ok()?;
+    if registry["version"] != 2 {
+        return None;
+    }
+    let [installed] = registry["plugins"][CLAUDE_PLUGIN_ID].as_array()?.as_slice() else {
+        return None;
+    };
+    if installed["scope"] != "user" {
+        return None;
+    }
+    let installed = semver::Version::parse(installed["version"].as_str()?).ok()?;
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    Some(installed.cmp_precedence(&running).is_lt())
 }
 
 fn check_existing_claude_hooks(root: &Path) -> Result<()> {
@@ -665,15 +710,15 @@ fn is_agentscm_plugin(plugin: &Value) -> bool {
 }
 
 fn claude_plugin(plugins: &[Value]) -> Result<Option<&Value>> {
-    let mut ours = plugins.iter().filter(|plugin| {
-        plugin["id"] == "agentscm@agentscm-claude-client" && plugin["scope"] == "user"
-    });
+    let mut ours = plugins
+        .iter()
+        .filter(|plugin| plugin["id"] == CLAUDE_PLUGIN_ID && plugin["scope"] == "user");
     let installed = ours.next();
     if ours.next().is_some()
         || plugins.iter().any(|plugin| {
             plugin["enabled"] == true
                 && is_agentscm_plugin(plugin)
-                && !(plugin["id"] == "agentscm@agentscm-claude-client" && plugin["scope"] == "user")
+                && !(plugin["id"] == CLAUDE_PLUGIN_ID && plugin["scope"] == "user")
         })
     {
         return Err(invalid(
@@ -1218,6 +1263,13 @@ mod tests {
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let command = group["hooks"][0]["command"].as_str().unwrap();
+                if command.ends_with(" --no-telemetry feedback start --client codex") {
+                    assert_eq!(
+                        group["hooks"][0],
+                        feedback_hook("/opt/team's bin/agentscm", "codex")
+                    );
+                    continue;
+                }
                 assert_eq!(
                     command.trim_end_matches(" --hold-limit 600"),
                     "'/opt/team'\\''s bin/agentscm' --no-telemetry hook codex --client-connection"
@@ -1276,32 +1328,42 @@ mod tests {
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let hook = &group["hooks"][0];
-                assert_eq!(hook["command"], "/opt/old agentscm");
+                if hook["command"]
+                    == "'/opt/old agentscm' --no-telemetry feedback start --client claude"
+                {
+                    assert_eq!(*hook, feedback_hook("/opt/old agentscm", "claude"));
+                    continue;
+                }
                 assert_eq!(
-                    hook["args"],
-                    json!(["--no-telemetry", "hook", "claude", "--client-connection"])
+                    hook["command"],
+                    "'/opt/old agentscm' --no-telemetry hook claude --client-connection"
                 );
+                assert!(hook.get("args").is_none());
                 assert!(!hook.to_string().contains("token"));
                 assert!(!hook.to_string().contains("hub-url"));
+                assert!(hook.get("async").is_none());
+                assert!(hook.get("asyncRewake").is_none());
             }
         }
         // The background waiter starts with the session and again after each turn, only there.
         for event in ["SessionStart", "Stop"] {
             let wait = &hooks["hooks"][event][0]["hooks"][1];
             assert_eq!(
-                wait["args"],
-                json!(["--no-telemetry", "hook-wait", "claude"])
+                wait["command"],
+                "'/opt/old agentscm' --no-telemetry hook-wait claude"
             );
             assert_eq!(wait["asyncRewake"], true);
+            assert_eq!(wait["async"], true, "print mode must not wait for the hook");
             assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
         }
         // SessionEnd ends the waiter, briefly and in the foreground.
         let end = &hooks["hooks"]["SessionEnd"][0]["hooks"][1];
         assert_eq!(
-            end["args"],
-            json!(["--no-telemetry", "hook-wait", "claude", "--end"])
+            end["command"],
+            "'/opt/old agentscm' --no-telemetry hook-wait claude --end"
         );
         assert!(end.get("asyncRewake").is_none());
+        assert!(end.get("async").is_none());
         assert_eq!(end["timeout"], 5);
         let waits = hooks.to_string().matches("hook-wait").count();
         assert_eq!(waits, 3, "no other event starts or ends a waiter");
@@ -1318,6 +1380,60 @@ mod tests {
                 .1,
             SKILL.as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_hook_commands_preserve_arguments_without_separate_args() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("agent's executable");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let files = claude_package_files(program.to_str().unwrap());
+        let hooks: Value = serde_json::from_slice(
+            &files
+                .iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        for groups in hooks["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for hook in group["hooks"].as_array().unwrap() {
+                    assert!(hook.get("args").is_none());
+                    let output = std::process::Command::new("/bin/sh")
+                        .args(["-c", hook["command"].as_str().unwrap()])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    let output = String::from_utf8(output.stdout).unwrap();
+                    let args: Vec<_> = output.lines().collect();
+                    assert_eq!(args[0], "--no-telemetry");
+                    if args[1] == "feedback" {
+                        assert_eq!(
+                            args,
+                            ["--no-telemetry", "feedback", "start", "--client", "claude"]
+                        );
+                        continue;
+                    }
+                    assert_eq!(args[2], "claude");
+                    if args[1] == "hook" {
+                        assert_eq!(
+                            args,
+                            ["--no-telemetry", "hook", "claude", "--client-connection"]
+                        );
+                    } else {
+                        assert_eq!(args[1], "hook-wait");
+                        assert!(
+                            args.len() == 3
+                                || args == ["--no-telemetry", "hook-wait", "claude", "--end"]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1421,6 +1537,16 @@ mod tests {
         std::fs::write(&path, unrelated).unwrap();
         assert!(!has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), unrelated);
+        for helper in [
+            json!({"command":"node /opt/agentscm/hooks/helper.mjs"}),
+            json!({"command":"/opt/agentscm-helper.sh", "args":["--event", "notification"]}),
+            json!({"command_windows":"node C:\\agentscm\\hooks\\helper.mjs"}),
+        ] {
+            let text = json!({"hooks":{"Stop":[{"hooks":[helper]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            assert!(!has_agentscm_hooks(&path).unwrap(), "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
         let legacy = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"agentscm hook codex --hub-url https://hub.example.test"}]}]}}"#;
         std::fs::write(&path, legacy).unwrap();
         assert!(has_agentscm_hooks(&path).unwrap());
@@ -1433,6 +1559,20 @@ mod tests {
         std::fs::write(&path, http).unwrap();
         assert!(has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), http);
+        for hook in [
+            json!({"command":"agentscm intent start --hook claude"}),
+            json!({"command":"agentscm 'intent' 'check' --hook=claude"}),
+            json!({"command":"/opt/agentscm", "args":["intent", "done", "--hook", "claude"]}),
+            json!({"command_windows":"C:\\tools\\agentscm.exe", "args":["hook", "codex"]}),
+            json!({"command":"agentscm --no-telemetry hook-wait copilot --notification"}),
+            json!({"command":"agentscm change-capture hook-claude"}),
+            json!({"command":"node", "args":["/opt/agentscm/cli.js", "hook", "claude"]}),
+        ] {
+            let text = json!({"hooks":{"Stop":[{"hooks":[hook]}]}}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            assert!(has_agentscm_hooks(&path).unwrap(), "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]
@@ -1568,6 +1708,31 @@ mod tests {
         #[cfg(unix)]
         for event in agentscm::change_capture::codex::HOOK_EVENTS {
             assert!(codex.iter().any(|wired| wired == event), "{event}");
+        }
+    }
+
+    #[test]
+    fn feedback_is_wired_only_once_at_startup_in_both_native_plugins() {
+        for (engine, client) in [(Engine::Claude, "claude"), (Engine::Codex, "codex")] {
+            let files = package_files(engine, "/opt/agentscm");
+            let (_, bytes) = files
+                .iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap();
+            let hooks: Value = serde_json::from_slice(bytes).unwrap();
+            let mut count = 0;
+            for (event, groups) in hooks["hooks"].as_object().unwrap() {
+                for group in groups.as_array().unwrap() {
+                    for hook in group["hooks"].as_array().unwrap() {
+                        if hook["command"].as_str().unwrap().contains(" feedback ") {
+                            assert_eq!(event, "SessionStart");
+                            assert_eq!(*hook, feedback_hook("/opt/agentscm", client));
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(count, 1);
         }
     }
 }

@@ -16,7 +16,8 @@ The projections keep different kinds of evidence separate:
 
 ## Observed contributions
 
-The All repositories homepage, `GET /v1/hub/value-metrics`, and
+The All repositories homepage, `GET /v1/hub/session/value-metrics` (and per repository
+`GET /v1/hub/standup/value-metrics`), and
 `agentscm_value_metrics` share the deterministic `agentscm.observed.v1` projection.
 The MCP app uses that tool's structured result. Repository tokens remain limited to their
 own repository; the signed-in homepage aggregates only repositories its reader can access.

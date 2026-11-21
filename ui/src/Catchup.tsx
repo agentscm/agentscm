@@ -13,6 +13,7 @@ import {
   type CatchupWorkEvent,
 } from './catchup.ts'
 import { READING_CHANGES_NOTHING } from './copy.ts'
+import { TRANSITION_LABEL } from './standup.ts'
 import { Ago, Explain, Icon, Notice, Skeleton, localDate } from './ui.tsx'
 import { useNow } from './useHub.ts'
 
@@ -32,7 +33,7 @@ const WORK_LABEL: Record<string, string> = {
   work_checkpoint: 'Checkpoint reported',
   work_pr_link: 'PR evidence or prerequisites changed',
   work_issue_link: 'Issue link changed',
-  work_transition: 'Outcome or reservation changed',
+  work_transition: 'Outcome, reservation or participants changed',
 }
 
 const COORDINATION_LABEL: Record<string, string> = {
@@ -46,11 +47,11 @@ export function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
   const issueLinkChanged = event.kind === 'work_issue_link'
   const relationshipChanged = event.kind === 'work_pr_link' || issueLinkChanged
   const transitioned = event.kind === 'work_transition'
-  const summary = issueLinkChanged ? 'Caller-declared issue link updated; this does not report progress or completion.' : relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : transitioned ? 'Outcome or reservation changed; inspect Work for the reason and current state.' : event.item.current?.summary
+  const summary = issueLinkChanged ? 'Caller-declared issue link updated; this does not report progress or completion.' : relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : transitioned ? `${event.transition ? TRANSITION_LABEL[event.transition] : 'Outcome, reservation or participants changed'}; inspect Work for the reason and current state.` : event.item.current?.summary
   return (
     <li className={!relationshipChanged && !transitioned && event.item.state === 'finished' ? 'tone-ok' : undefined}>
       <Icon name={relationshipChanged ? 'git' : event.item.state === 'finished' && !transitioned ? 'check2-circle' : 'chat-square-text'} />
-      <div><strong>{WORK_LABEL[event.kind] ?? 'Work updated'}</strong> · <a href={`#work/${encodeURIComponent(event.work_id)}`}>{event.item.title}</a></div>
+      <div><strong>{(event.transition && TRANSITION_LABEL[event.transition]) || WORK_LABEL[event.kind] || 'Work updated'}</strong> · <a href={`#work/${encodeURIComponent(event.work_id)}`}>{event.item.title}</a></div>
       <div className="small muted">{event.item.lead_agent} · {summary ?? <span className="muted">No summary reported</span>} · <Ago at={event.at} /></div>
       <details className="disclosure">
         <summary>Source details</summary>

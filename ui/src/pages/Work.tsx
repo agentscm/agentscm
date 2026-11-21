@@ -6,6 +6,7 @@ import {
   hasMoreBriefing,
   workIdFromHash,
   workMatchesSearch,
+  TRANSITION_LABEL,
   type BriefingQuery,
   type StandupBriefing,
   type BriefingEvent,
@@ -29,7 +30,7 @@ export { STATE, lead, StatePill, ClaimPill, LaneBar } from './workParts.tsx'
 
 const LANES: WorkState[] = ['active', 'blocked', 'handover', 'paused']
 
-const EVENT_LABEL: Record<string, string> = { work_started: 'Started work', work_joined: 'Joined work', work_takeover: 'Took over the claim', work_checkpoint: 'Reported a checkpoint', work_pr_link: 'PR evidence or prerequisites changed', work_issue_link: 'Changed issue link', work_transition: 'Changed outcome or reservation' }
+const EVENT_LABEL: Record<string, string> = { work_started: 'Started work', work_joined: 'Joined work', work_takeover: 'Took over the claim', work_checkpoint: 'Reported a checkpoint', work_pr_link: 'PR evidence or prerequisites changed', work_issue_link: 'Changed issue link', work_transition: 'Changed outcome, reservation or participants' }
 const EVENT_ICON: Record<string, string> = { work_started: 'play-fill', work_joined: 'person-plus', work_takeover: 'arrow-left-right', work_checkpoint: 'flag', work_pr_link: 'git', work_issue_link: 'link-45deg', work_transition: 'signpost' }
 
 const spanText = (seconds: number) => (seconds <= 48 * 3600 ? plural(Math.max(1, Math.round(seconds / 3600)), 'hour') : plural(Math.round(seconds / 86400), 'day'))
@@ -232,7 +233,7 @@ function History({ token }: { token: string }) {
                 <div className="change-main">
                   <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
                   <div className="change-meta">
-                    <span>{EVENT_LABEL[e.kind] ?? e.kind}</span>
+                    <span>{(e.transition && TRANSITION_LABEL[e.transition]) || EVENT_LABEL[e.kind] || e.kind}</span>
                     <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{who(l.login, l.agent)}</span></span>
                     <StatePill state={e.item.state} />
                   </div>

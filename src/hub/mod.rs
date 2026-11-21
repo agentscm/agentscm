@@ -13,6 +13,7 @@ pub mod connection;
 pub mod context_source;
 pub mod continuity;
 pub mod conversation_sharing;
+pub mod cooperation;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
@@ -40,8 +41,10 @@ pub mod login;
 pub mod mcp;
 pub mod merged_holds;
 pub mod narrative;
+pub mod notices;
 pub mod onboarding;
 mod overlap_detail;
+pub mod owner_notice_http;
 mod permission_answer;
 pub mod pickup;
 #[cfg(unix)]
@@ -58,6 +61,7 @@ mod repo_setup;
 mod repository_summary;
 mod retention;
 pub mod session;
+pub mod session_lifecycle;
 pub mod session_subagents;
 pub mod session_waiting;
 pub mod setup_attention;
@@ -207,6 +211,11 @@ impl From<postgres::Error> for HubError {
             *code == SqlState::T_R_DEADLOCK_DETECTED || *code == SqlState::T_R_SERIALIZATION_FAILURE
         }) {
             return Self::Busy;
+        }
+        // The driver's Display omits the server detail, so keep the SQLSTATE of a unique
+        // violation: the online rename repair reports it as a collision.
+        if error.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+            return Self::Unavailable(format!("{error} (SQLSTATE 23505)"));
         }
         Self::Unavailable(error.to_string())
     }
@@ -594,6 +603,7 @@ pub fn router_with(state: HubState, extra: Router<HubState>) -> Router {
     let workspace_routes = workspace::routes();
     let router = Router::new()
         .merge(http::routes())
+        .merge(cooperation::routes())
         .merge(onboarding::routes())
         .merge(repo_setup::routes())
         .merge(slack::routes())

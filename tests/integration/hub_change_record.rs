@@ -23,6 +23,114 @@ use tempfile::TempDir;
 const REPO: &str = "acme/widgets";
 static NEXT_SETUP: AtomicUsize = AtomicUsize::new(1);
 
+fn native_question_coverage_retry_floor(db: &Db) {
+    let (owner, scope, native) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+    let (other_native, other_scope) = ("4".repeat(64), "5".repeat(64));
+    let store = db.open();
+    for offset in [100, 200, 0, 50] {
+        store
+            .native_question_coverage_mark(&owner, &scope, &native, offset)
+            .unwrap();
+    }
+    store
+        .native_question_coverage_mark(&owner, &scope, &other_native, 50)
+        .unwrap();
+    store
+        .native_question_coverage_mark(&owner, &other_scope, &native, 300)
+        .unwrap();
+    drop(store);
+    let store = db.open();
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &native)
+            .unwrap(),
+        Some(200)
+    );
+    // A newer rejection can land after a reader saw an older floor. Conditional resolution
+    // must preserve that barrier when the reader was ready to accept the old offset.
+    assert!(
+        !store
+            .native_question_coverage_resolve(&owner, Some(&scope), &native, Some(100))
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &native)
+            .unwrap(),
+        Some(200)
+    );
+    assert!(
+        store
+            .native_question_coverage_resolve(&owner, Some(&scope), &native, Some(200))
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &native)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &other_scope, &native)
+            .unwrap(),
+        Some(300)
+    );
+    for offset in [u64::MAX, i64::MAX as u64, 0] {
+        store
+            .native_question_coverage_mark(&owner, &scope, &native, offset)
+            .unwrap();
+    }
+    drop(store);
+    let store = db.open();
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &native)
+            .unwrap(),
+        Some(u64::MAX)
+    );
+    assert!(
+        !store
+            .native_question_coverage_resolve(&owner, Some(&scope), &native, Some(i64::MAX as u64))
+            .unwrap()
+    );
+    assert!(
+        store
+            .native_question_coverage_resolve(&owner, None, &native, None)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &native)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &other_scope, &native)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .native_question_coverage_floor(&owner, &scope, &other_native)
+            .unwrap(),
+        Some(50)
+    );
+}
+
+#[test]
+fn sqlite_native_question_coverage_retry_floor_is_monotonic_and_scoped() {
+    native_question_coverage_retry_floor(&Db::sqlite());
+}
+
+#[test]
+fn postgres_native_question_coverage_retry_floor_is_monotonic_and_scoped() {
+    if let Some(db) = Db::postgres() {
+        native_question_coverage_retry_floor(&db);
+    }
+}
+
 struct Db {
     url: String,
     _pg: Option<PgSchema>,
@@ -231,6 +339,7 @@ fn action_capture_receipt(db: &Db) {
                 }],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             290,
         )
@@ -395,6 +504,7 @@ fn action_capture_receipt(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             311,
         )
@@ -540,6 +650,7 @@ fn review_projection_acceptance_cases(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             706,
         )
@@ -777,6 +888,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
                 source_refs: vec![],
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             408,
         )
@@ -922,6 +1034,7 @@ fn checkpoint(
         source_refs: vec![],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     }
 }
 
@@ -1793,9 +1906,9 @@ fn audience(admin: bool) -> ConversationAudience {
     }
 }
 
-/// While a repository permits sharing, another reader lists an author's entries only after the
-/// author affirmatively opts in. Notice-only, absent and invalid choices grant no access.
-fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
+/// While a repository shares, a reader lists every author's entries except those of an author
+/// who opted out (or whose choice is unreadable), whose earlier entries leave the listing too.
+fn opting_out_leaves_the_listing_other_readers_get(db: &Db) {
     use ConversationAudience::{Everyone, Own, Sharing};
     const REPOSITORY_ID: i64 = 77;
     let store = db.open();
@@ -1850,25 +1963,33 @@ fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
             .len()
     };
     let opt_out = |user: &str, repository_id: i64| {
-        format!("conversation_sharing:opt_out:{user}:{repository_id}")
+        format!("conversation_sharing:opt_out:{user}:github.com/@repo-id:{repository_id}")
     };
     let notified = |user: &str, repository_id: i64| {
-        format!("conversation_sharing:notified:{user}:{repository_id}")
+        format!("conversation_sharing:notified:{user}:github.com/@repo-id:{repository_id}")
     };
     assert_eq!(listed(&reader_token, Own), 0);
-    assert_eq!(listed(&reader_token, Sharing), 0, "absent consent");
+    assert_eq!(listed(&reader_token, Sharing), 1, "shared by default");
     store
         .set_setting(&notified(&author.id, REPOSITORY_ID), "1", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 0, "notice is not consent");
+    assert_eq!(
+        listed(&reader_token, Sharing),
+        1,
+        "the notice changes nothing"
+    );
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "invalid", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 0, "invalid choice");
+    assert_eq!(
+        listed(&reader_token, Sharing),
+        0,
+        "an unreadable choice opts out"
+    );
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "0", &author.id)
         .unwrap();
-    assert_eq!(listed(&reader_token, Sharing), 1, "explicit opt-in");
+    assert_eq!(listed(&reader_token, Sharing), 1, "opted back in");
     store
         .set_setting(&opt_out(&author.id, REPOSITORY_ID), "1", &author.id)
         .unwrap();
@@ -1892,14 +2013,155 @@ fn affirmative_consent_controls_the_listing_other_readers_get(db: &Db) {
 }
 
 #[test]
-fn sqlite_affirmative_consent_controls_the_listing_other_readers_get() {
-    affirmative_consent_controls_the_listing_other_readers_get(&Db::sqlite());
+fn sqlite_opting_out_leaves_the_listing_other_readers_get() {
+    opting_out_leaves_the_listing_other_readers_get(&Db::sqlite());
 }
 
 #[test]
-fn postgres_affirmative_consent_controls_the_listing_other_readers_get() {
+fn postgres_opting_out_leaves_the_listing_other_readers_get() {
     if let Some(db) = Db::postgres() {
-        affirmative_consent_controls_the_listing_other_readers_get(&db);
+        opting_out_leaves_the_listing_other_readers_get(&db);
+    }
+}
+
+fn conversation_occurrences_survive_resume(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let now = unix_now();
+    join_session(&*store, &token, &work_id, "old-helper");
+    let body = br#"{"text":"same prompt"}"#;
+    for sequence in 1..=2 {
+        let mut batch = shared_batch(
+            &work_id,
+            generation,
+            &format!("first-{sequence}"),
+            sequence,
+            body,
+            body.len() as u64,
+        );
+        batch.events[0].event_id = format!("evt:history:{sequence}");
+        store.change_ingest(&token, &batch, now).unwrap();
+    }
+    let seq = updated_seq(&*store, &token, &work_id);
+    store
+        .work_checkpoint(
+            &token,
+            &checkpoint(
+                &work_id,
+                generation,
+                seq,
+                "pause-repeat",
+                CheckpointKind::Pause,
+            ),
+            now,
+        )
+        .unwrap();
+    let resumed = store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: Some(work_id.clone()),
+                source: None,
+                request_key: None,
+                title: "resume conversation".into(),
+                description: None,
+                session: "session-1".into(),
+                role: WorkRole::Lead,
+                scope: vec![],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: Some(generation),
+                preflight: None,
+            },
+            now,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(resumed.generation, generation + 1);
+    assert!(
+        store
+            .capture_work_for_session_at(&token, "old-helper", Some(&work_id), now)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .capture_work_for_session_at(&token, "session-1", Some(&work_id), now)
+            .unwrap()
+            .unwrap()
+            .generation,
+        resumed.generation
+    );
+    // A replay keeps the original visible occurrence; a new identical prompt stays distinct.
+    for (sequence, native_id) in [(1, 1), (2, 3)] {
+        let mut batch = shared_batch(
+            &work_id,
+            resumed.generation,
+            &format!("resumed-{sequence}"),
+            sequence,
+            body,
+            body.len() as u64,
+        );
+        batch.events[0].event_id = format!("evt:history:{native_id}");
+        store.change_ingest(&token, &batch, now).unwrap();
+    }
+    let page = store
+        .shared_conversation_page(&token, &work_id, None, ConversationAudience::Own, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|entry| (entry.generation, entry.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(generation), 1),
+            (Some(generation), 2),
+            (Some(resumed.generation), 2)
+        ]
+    );
+    assert!(page.iter().all(|entry| entry.digest == page[0].digest));
+    for (index, entry) in page.iter().enumerate() {
+        let rest = store
+            .shared_conversation_page(
+                &token,
+                &work_id,
+                Some(&entry.cursor()),
+                ConversationAudience::Own,
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest, page[index + 1..]);
+    }
+    let legacy = format!("2:{}:session-1", page[0].digest);
+    let revisited = store
+        .shared_conversation_page(
+            &token,
+            &work_id,
+            Some(&legacy),
+            ConversationAudience::Own,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        revisited, page,
+        "legacy cursors must not omit resumed occurrences"
+    );
+}
+
+#[test]
+fn sqlite_conversation_occurrences_survive_resume() {
+    conversation_occurrences_survive_resume(&Db::sqlite());
+}
+
+#[test]
+fn postgres_conversation_occurrences_survive_resume() {
+    if let Some(db) = Db::postgres() {
+        conversation_occurrences_survive_resume(&db);
     }
 }
 

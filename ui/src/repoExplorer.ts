@@ -1,5 +1,6 @@
 import { loadLocalBase, loadLocalToken, localCredential, validLocalBase } from './localApi.ts'
 import { withTimeout } from './timeout.ts'
+import { CONVERSATION_EVENT_KINDS, type ConversationEventKind } from './changeRecord.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_FILE_TEXT_BYTES = 1024 * 1024
@@ -157,7 +158,7 @@ export interface ExplorerSessionEvidence {
   work_id: string
   generation: number
   session_id: string
-  harness: 'claude_code' | 'codex'
+  harness: string
   capture_mode: 'metadata_only' | 'local_conversation' | 'shared_conversation'
   first_observed_at: number
   last_observed_at: number
@@ -173,6 +174,17 @@ export interface ExplorerProjectionCoverage {
   unverified_bodies: number
   capture_gaps: number
   complete: boolean
+}
+
+export function harnessName(harness: string): string {
+  switch (harness) {
+    case 'claude_code': return 'Claude Code'
+    case 'codex': return 'Codex'
+    case 'cursor': return 'Cursor'
+    case 'copilot': return 'GitHub Copilot'
+    case 'gemini_cli': return 'Gemini CLI'
+    default: return 'Agent'
+  }
 }
 
 export interface ExplorerEvidencePage {
@@ -194,7 +206,7 @@ export interface ExplorerConversationEvent {
   event_id: string
   sequence: number
   observed_at: number
-  kind: 'session_started' | 'user_prompt' | 'assistant_message' | 'tool_started' | 'tool_finished' | 'check_started' | 'check_finished' | 'session_ended' | 'gap'
+  kind: ConversationEventKind
   tool: { kind: 'read' | 'edit' | 'write' | 'search' | 'shell' | 'test' | 'model' | 'other'; request_id: string | null } | null
   relation: 'same_work_session'
   body: { availability: ExplorerBodyAvailability; media: 'json' | 'text' | 'json_lines' | 'binary' | null; content: string | null }
@@ -561,7 +573,7 @@ function decodeSessionEvidence(value: unknown, path: string): ExplorerSessionEvi
     work_id: nonempty(raw['work_id'], `${path}.work_id`, 255),
     generation: integer(raw['generation'], `${path}.generation`, 1),
     session_id: nonempty(raw['session_id'], `${path}.session_id`, 255),
-    harness: enumValue(raw['harness'], ['claude_code', 'codex'] as const, `${path}.harness`),
+    harness: nonempty(raw['harness'], `${path}.harness`, 128),
     capture_mode: enumValue(raw['capture_mode'], ['metadata_only', 'local_conversation', 'shared_conversation'] as const, `${path}.capture_mode`),
     first_observed_at: integer(raw['first_observed_at'], `${path}.first_observed_at`),
     last_observed_at: integer(raw['last_observed_at'], `${path}.last_observed_at`),
@@ -660,7 +672,7 @@ function decodeConversationEvent(value: unknown, path: string): ExplorerConversa
     event_id: nonempty(raw['event_id'], `${path}.event_id`, 255),
     sequence: integer(raw['sequence'], `${path}.sequence`),
     observed_at: integer(raw['observed_at'], `${path}.observed_at`),
-    kind: enumValue(raw['kind'], ['session_started', 'user_prompt', 'assistant_message', 'tool_started', 'tool_finished', 'check_started', 'check_finished', 'session_ended', 'gap'] as const, `${path}.kind`),
+    kind: enumValue(raw['kind'], CONVERSATION_EVENT_KINDS, `${path}.kind`),
     tool,
     relation: 'same_work_session',
     body: { availability, media, content },

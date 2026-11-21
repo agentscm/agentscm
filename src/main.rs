@@ -44,9 +44,14 @@ mod change_capture_cli;
 mod change_capture_client;
 mod client_cli;
 mod client_config;
+mod client_cooperation;
+#[cfg(unix)]
+mod client_feedback;
+mod client_journal;
 mod client_mcp;
 #[cfg(unix)]
 mod client_plugin;
+mod client_service;
 mod client_session;
 #[cfg(unix)]
 mod client_setup;
@@ -78,7 +83,7 @@ mod hook_report;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 mod hub_read_token;
 mod init_cli;
 mod intent_cli;
@@ -168,8 +173,7 @@ enum Command {
     /// Removed: the menu bar app. Kept so an old Start at Login entry cleans itself up.
     #[command(hide = true)]
     Tray(quickstart::RetiredTrayArgs),
-    /// Open this checkout's Hub page in your browser, connected to this computer's files and
-    /// saved conversations. Starts the local page when needed; `--stop` stops it.
+    /// Stop a legacy local dashboard with --stop; opening it is no longer supported.
     #[cfg(unix)]
     Open(open_cli::OpenArgs),
     /// [experimental] Capture local agent events and observed command receipts.
@@ -308,8 +312,8 @@ enum Command {
     /// program copy and a local hub.
     Uninstall(quickstart::UninstallArgs),
     /// Agent hook client: reads the hook JSON on stdin, asks the hub, prints the agent's reply.
-    /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|gemini>
-    /// --client-connection` (what `client setup` writes; hub, repository and token come from the
+    /// Always exits 0 and fails open. Usage: `agentscm hook
+    /// <claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush> --client-connection` (what `client setup` writes; hub, repository and token come from the
     /// saved connection), or `agentscm hook <agent|generic> [--hub-url URL] [--repo OWNER/NAME]`
     /// with the token from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
     Hook(hook_cli::HookArgs),
@@ -317,6 +321,10 @@ enum Command {
     /// the session with it (exit 2); exits 0 otherwise. `client setup` installs it.
     #[command(hide = true)]
     HookWait(message_wait::HookWaitArgs),
+    /// Run optional feedback only when the configured Hub admits the enrolled reporter.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Feedback(client_feedback::FeedbackArgs),
     /// Write this Git repository's shared agent instructions (AGENTS.md and the files that point
     /// each agent at it). Hooks and MCP come from `agentscm client setup` on each machine.
     InitRepo(init_cli::InitArgs),
@@ -686,8 +694,7 @@ enum Command {
         /// Allow a non-loopback bind address.
         #[arg(long)]
         public: bool,
-        /// Serve the Hub page and every checkout connected on this computer, for
-        /// `agentscm open`. Takes no source flags.
+        /// Serve the legacy local dashboard in UI-enabled builds. Takes no source flags.
         #[arg(long, hide = true)]
         front_door: bool,
     },
@@ -868,6 +875,17 @@ fn runtime(builder: &mut tokio::runtime::Builder) -> tokio::runtime::Runtime {
 }
 
 fn main() {
+    if std::env::args_os()
+        .skip(1)
+        .all(|arg| arg == "--no-telemetry")
+        && let Some(reply) = hook_cli::missing_arguments_reply()
+    {
+        eprintln!(
+            "AgentSCM: coordination unknown (hook command arguments are missing); update the installed hooks"
+        );
+        println!("{reply}");
+        std::process::exit(0);
+    }
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook")
         && !std::env::args_os().any(|a| a == "--help" || a == "-h")
@@ -910,9 +928,10 @@ fn worker_threads(command: &Command) -> Option<usize> {
         command,
         Command::ChangeCapture {
             command: change_capture_cli::ChangeCaptureCommand::HookClaude
+                | change_capture_cli::ChangeCaptureCommand::DeliverWorker(_)
         }
     ) {
-        // A capture hook runs on every tool call, so it gets the `hook` path's runtime.
+        // Capture hooks and their bounded delivery worker need only a small runtime.
         return Some(2);
     }
     None
@@ -1068,6 +1087,8 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::Walkthrough { command } => print_json(&walkthrough_cli::run(command)?),
         Command::Hook(args) => hook_cli::run(args).await,
         Command::HookWait(args) => message_wait::run(args).await,
+        #[cfg(unix)]
+        Command::Feedback(args) => client_feedback::run(args),
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Client { command } => client_cli::run(command).await?,
         #[cfg(unix)]
@@ -1593,6 +1614,10 @@ fn telemetry_feature(command: &Command) -> Option<telemetry::Feature> {
 }
 
 fn verified_install_command(command: &Command) -> bool {
+    #[cfg(unix)]
+    if matches!(command, Command::Feedback(_)) {
+        return false;
+    }
     !matches!(
         command,
         Command::Demo(_)
@@ -1823,6 +1848,17 @@ mod tests {
     }
 
     #[test]
+    fn hook_help_names_every_natively_wired_agent() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("hook")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let names = format!("<{}>", agentscm::clients::names_joined("|"));
+        assert!(help.contains(&names), "{help}");
+    }
+
+    #[test]
     fn quickstart_and_uninstall_help_describe_current_behaviour() {
         let root = <Cli as clap::CommandFactory>::command();
         let about = |name: &str| {
@@ -1943,7 +1979,16 @@ mod tests {
             if command == "lookup" {
                 arguments.push("not-retained");
             }
-            let cli = Cli::try_parse_from(arguments).unwrap();
+            // Debug builds of the derived parser need more than a test thread's stack, as in
+            // `parse_cli_on_bounded_stack`.
+            let cli = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(4 * 1024 * 1024)
+                    .spawn_scoped(scope, || Cli::try_parse_from(arguments).unwrap())
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
             assert!(run(cli).await.is_err());
             assert!(
                 !data.exists(),

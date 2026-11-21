@@ -1477,6 +1477,7 @@ fn explicit_cli_recovery_preserves_work_and_does_not_replay_failed_effect() {
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         };
         let mut reserved = binding.clone();
         reserved.recovery = Some(OperatingRecovery {
@@ -2191,6 +2192,8 @@ fn reopen_as_lead(
                 transition: WorkTransitionKind::Reopen,
                 reason: "stage a lost recovery response".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             agentscm::hub::store::unix_now(),
         )
@@ -2311,6 +2314,8 @@ fn operator_rebinds_a_dispatch_after_reopen_or_release_and_recovery_continues() 
                 transition: WorkTransitionKind::Release,
                 reason: "stage a release".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             now,
         )
@@ -2501,6 +2506,7 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
         }],
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     };
     // The run already finished the Work, and finished Work accepts no new checkpoint. Reopen it
     // as its lead so the recovery checkpoint below is a first commit whose response is lost.
@@ -2717,6 +2723,7 @@ fn lead_report(
             .unwrap_or_default(),
         depends_on: vec![],
         related_work: vec![],
+        finished_paths: None,
     };
     hub.store
         .work_checkpoint(&hub.token_id, &request, agentscm::hub::store::unix_now())
@@ -2745,6 +2752,8 @@ fn lead_transition(
                 transition,
                 reason: "stage a recovery case".into(),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             },
             agentscm::hub::store::unix_now(),
         )
@@ -2785,6 +2794,7 @@ fn retain_unresolved_finish(
             }],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         },
         rejected_at_seq: None,
     });
@@ -3173,6 +3183,7 @@ fn reconciliation_distinguishes_absent_workflow_from_pending_or_incomplete_runti
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         };
         let mut reserved = binding.clone();
         reserved.recovery = Some(OperatingRecovery {

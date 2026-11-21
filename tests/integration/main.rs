@@ -16,6 +16,8 @@ mod fake_gitlab;
 mod hub_error_assert;
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
+#[path = "common/repository_scope.rs"]
+mod repository_scope;
 #[cfg(unix)]
 #[path = "common/team_pg.rs"]
 mod team_pg;
@@ -24,6 +26,7 @@ mod team_pg;
 mod workspace_hub;
 
 // Test modules.
+mod agent_gates;
 #[cfg(unix)]
 mod agent_stop_cli;
 #[cfg(unix)]
@@ -53,6 +56,8 @@ mod checks;
 mod cli;
 #[cfg(unix)]
 mod client_completion;
+#[cfg(unix)]
+mod client_feedback;
 #[cfg(unix)]
 mod client_replies;
 #[cfg(unix)]
@@ -169,6 +174,7 @@ mod hub_merge_queue;
 mod hub_merged_release;
 #[cfg(unix)]
 mod hub_narrative;
+mod hub_notice_delivery;
 mod hub_planned_issues;
 #[cfg(unix)]
 mod hub_promises;

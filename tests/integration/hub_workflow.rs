@@ -281,7 +281,14 @@ async fn concurrent_http_claims_and_mcp_participation_fence_overlapping_work() {
         &rejected["structuredContent"]["work"]["conflict"],
         &winner_id,
     );
-    let live = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         live.iter()
             .all(|intent| !intent.paths.contains(&"src/rejected-only.rs".to_owned())),
@@ -374,7 +381,14 @@ async fn concurrent_http_claims_and_mcp_participation_fence_overlapping_work() {
         )
         .await;
     assert_eq!(no_goal["isError"], true, "{no_goal}");
-    let live = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     for refused_path in ["src/outside-declared-scope.rs", "src/no-goal.rs"] {
         assert!(
             live.iter()
@@ -778,6 +792,83 @@ async fn exact_claims_acknowledgements_and_reconnects_remain_token_scoped() {
     assert_eq!(overview["overlaps_complete"], true);
 }
 
+/// Only the target that replied sees the requester's state; another target of the same request
+/// has said nothing, so it shows none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requester_state_shows_only_to_the_target_that_replied() {
+    let hub = Hub::start().await;
+    let first = hub.token(11, "first-lead", REPOSITORY, false).await;
+    let second = hub.token(11, "second-lead", REPOSITORY, false).await;
+    let requester = hub.token(11, "requester-agent", REPOSITORY, false).await;
+    let mut work_ids = Vec::new();
+    for (token, key, session, path) in [
+        (&first, "first-held", "first-session", "src/one.rs"),
+        (&second, "second-held", "second-session", "src/two.rs"),
+    ] {
+        let (status, held) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                token,
+                Some(start(key, key, session, &[path])),
+            )
+            .await;
+        assert_eq!(status, 200, "{held}");
+        work_ids.push(held["item"]["id"].as_str().unwrap().to_owned());
+    }
+    let (status, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "asked",
+                "Asked",
+                "requester-session",
+                &["src/one.rs", "src/two.rs"],
+            )),
+        )
+        .await;
+    assert_eq!(status, 200, "{refused}");
+    let request = &refused["coordination_request"];
+    assert_eq!(request["targets"].as_array().unwrap().len(), 2, "{request}");
+    let reply = hub
+        .mcp(
+            &first,
+            "agentscm_coordination_reply",
+            json!({"request_id": request["id"], "operation_id": "first-declines",
+                "target_work_id": work_ids[0], "session": "first-session",
+                "expected_updated_seq": request["updated_seq"], "kind": "decline"}),
+        )
+        .await;
+    assert_eq!(reply["isError"], false, "{reply}");
+    let notice = |view: &Value| {
+        view["_meta"]["agentscm"]["coordination_notifications"]["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["request_id"] == request["id"])
+            .unwrap()
+            .clone()
+    };
+    let replied = hub
+        .mcp(
+            &first,
+            "agentscm_status",
+            json!({"session": "first-session"}),
+        )
+        .await;
+    assert_eq!(notice(&replied)["requester"], json!({"state": "not_seen"}));
+    let silent = hub
+        .mcp(
+            &second,
+            "agentscm_status",
+            json!({"session": "second-session"}),
+        )
+        .await;
+    assert!(notice(&silent).get("requester").is_none(), "{silent}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution() {
     let hub = Hub::start().await;
@@ -972,6 +1063,19 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
     assert_eq!(notice["requested_paths"], "held", "{delivered}");
     let text = delivered["content"].to_string();
     assert!(text.contains("For your own requests"), "{text}");
+
+    // The lead's notice for a request it replied to says whether the requester has seen the reply.
+    let holder_view = hub
+        .mcp(&lead, "agentscm_status", json!({"session": "lead-session"}))
+        .await;
+    let held = holder_view["_meta"]["agentscm"]["coordination_notifications"]["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["request_id"] == request_id)
+        .unwrap()
+        .clone();
+    assert_eq!(held["requester"], json!({"state": "not_seen"}), "{held}");
 
     // A response is a report, not permission to close an overlap that still exists.
     let unresolved = hub
@@ -1378,7 +1482,11 @@ async fn takeover_long_poll_and_fixed_pages_follow_current_recipients() {
     let finishing_id = finishing_work["id"].as_str().unwrap().to_owned();
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .any(|intent| intent.paths.contains(&"src/finished-live.rs".to_owned()))
@@ -1401,7 +1509,11 @@ async fn takeover_long_poll_and_fixed_pages_follow_current_recipients() {
     assert_eq!(finished["structuredContent"]["item"]["state"], "finished");
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/finished-live.rs".to_owned()))
@@ -1556,6 +1668,7 @@ fn postgres_finish_and_live_heartbeat_share_one_lock_order() {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             now + 2,
         )
@@ -1574,7 +1687,11 @@ fn postgres_finish_and_live_heartbeat_share_one_lock_order() {
     assert!(
         store::open(&database)
             .unwrap()
-            .live_intents(REPOSITORY, now + 2, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 2,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| intent.id != intent_id)
@@ -1694,7 +1811,14 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
         second_repeat["hookSpecificOutput"]["permissionDecision"], "deny",
         "{second_repeat}"
     );
-    let intents = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    let intents = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+            unix_now(),
+            100,
+        )
+        .unwrap();
     assert!(
         intents
             .iter()
@@ -1718,7 +1842,11 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
     assert!(!denied(&allowed), "{allowed}");
     assert!(
         hub.store
-            .live_intents(REPOSITORY, unix_now(), 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                unix_now(),
+                100
+            )
             .unwrap()
             .iter()
             .any(|intent| intent.session.as_deref() == Some("default")
@@ -1976,6 +2104,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             now + 1,
         )
@@ -2000,7 +2129,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     ));
     assert!(
         setup
-            .live_intents(REPOSITORY, now + 2, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                now + 2,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-takeover.rs".to_owned()))
@@ -2024,6 +2157,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             now + 3,
         )
@@ -2106,7 +2240,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     let after_takeover = store::open(database).unwrap();
     assert!(
         after_takeover
-            .live_intents(REPOSITORY, takeover_at + 1, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 1,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-takeover.rs".to_owned()))
@@ -2208,6 +2346,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             takeover_at + 3,
         )
@@ -2232,7 +2371,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     ));
     assert!(
         after_takeover
-            .live_intents(REPOSITORY, takeover_at + 4, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 4,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-finish.rs".to_owned()))
@@ -2256,6 +2399,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             takeover_at + 5,
         )
@@ -2305,6 +2449,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 source_refs: Vec::new(),
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
+                finished_paths: None,
             },
             takeover_at + 6,
         )
@@ -2326,7 +2471,11 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     let finished_store = store::open(database).unwrap();
     assert!(
         finished_store
-            .live_intents(REPOSITORY, takeover_at + 7, 100)
+            .live_intents(
+                &crate::repository_scope::github(REPOSITORY, Some(REPOSITORY_ID)),
+                takeover_at + 7,
+                100
+            )
             .unwrap()
             .iter()
             .all(|intent| !intent.paths.contains(&"src/managed-finish.rs".to_owned()))
@@ -2439,10 +2588,8 @@ async fn following_the_start_context_and_each_refusal_links_the_edits() {
         context.contains("as `session` to agentscm_start"),
         "{context}"
     );
-    assert!(
-        agentscm::hub::agent_rules::carries_all(context),
-        "{context}"
-    );
+    // The rules come once, in the MCP server's instructions below.
+    assert!(!context.contains("Required AgentSCM rules"), "{context}");
     let (status, initialized) = hub
         .call(
             Method::POST,
@@ -2689,4 +2836,179 @@ async fn an_unnamed_start_bound_elsewhere_warns_and_its_fix_links_the_claim() {
         refusal(&outside).is_some_and(|reason| reason.starts_with("AgentSCM: EDIT_UNLINKED: ")),
         "{outside}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordination_http_reply_distinguishes_role_denial_from_bad_credentials() {
+    let hub = Hub::start().await;
+    let holder = hub.token(901, "holder", REPOSITORY, false).await;
+    let requester = hub.token(902, "requester", REPOSITORY, false).await;
+    let (_, held) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &holder,
+            Some(start(
+                "role-holder",
+                "Hold shared path",
+                "holder",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let work_id = &held["item"]["id"];
+    assert!(work_id.is_string(), "{held}");
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "role-requester",
+                "Request shared path",
+                "requester",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let request = &refused["coordination_request"];
+    assert!(request["id"].is_string(), "{refused}");
+    let mut reply = json!({"request_id":request["id"], "target_work_id":work_id,
+        "expected_updated_seq":request["updated_seq"], "operation_id":"role-reply",
+        "session":"requester", "kind":"propose_split", "note":"Split shared work"});
+    let path = "/v1/hub/standup/coordination/reply";
+    let (status, denied) = hub
+        .call(Method::POST, path, &requester, Some(reply.clone()))
+        .await;
+    assert_eq!(status, 403, "{denied}");
+    assert_eq!(denied["error"], "forbidden", "{denied}");
+    assert!(
+        denied["message"]
+            .as_str()
+            .unwrap()
+            .contains("current affected Work lead")
+    );
+    assert!(!denied.to_string().contains("hub login"));
+    let (status, invalid) = hub
+        .call(
+            Method::POST,
+            path,
+            "invalid-synthetic-token",
+            Some(reply.clone()),
+        )
+        .await;
+    assert_eq!(status, 401, "{invalid}");
+    assert_eq!(invalid["error"], "unauthorized", "{invalid}");
+    reply["session"] = json!("holder");
+    let (status, allowed) = hub.call(Method::POST, path, &holder, Some(reply)).await;
+    assert_eq!(status, 200, "{allowed}");
+    for (token, session) in [(&holder, "holder"), (&requester, "requester")] {
+        let (status, inbox) = hub
+            .call(
+                Method::GET,
+                &format!("/v1/hub/standup/inbox?session={session}"),
+                token,
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{inbox}");
+        assert!(
+            inbox["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == request["id"]
+                    && row["responses"][0]["operation_id"] == "role-reply"),
+            "{inbox}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordination_mcp_reply_distinguishes_role_denial_from_bad_credentials() {
+    let hub = Hub::start().await;
+    let holder = hub.token(901, "holder", REPOSITORY, false).await;
+    let requester = hub.token(902, "requester", REPOSITORY, false).await;
+    let (_, held) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &holder,
+            Some(start(
+                "role-holder",
+                "Hold shared path",
+                "holder",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let work_id = &held["item"]["id"];
+    assert!(work_id.is_string(), "{held}");
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &requester,
+            Some(start(
+                "role-requester",
+                "Request shared path",
+                "requester",
+                &["src/shared.rs"],
+            )),
+        )
+        .await;
+    let request = &refused["coordination_request"];
+    assert!(request["id"].is_string(), "{refused}");
+    let mut reply = json!({"request_id":request["id"], "target_work_id":work_id,
+        "expected_updated_seq":request["updated_seq"], "operation_id":"role-reply",
+        "session":"requester", "kind":"propose_split", "note":"Split shared work"});
+    let denied = hub
+        .mcp(&requester, "agentscm_coordination_reply", reply.clone())
+        .await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    let error = &denied["structuredContent"]["error"];
+    assert_eq!(error["code"], "forbidden", "{denied}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("current affected Work lead")
+    );
+    assert_eq!(error["recovery"]["action"], "ask_owner");
+    assert!(!denied.to_string().contains("hub login"));
+    let (status, invalid) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            "invalid-synthetic-token",
+            Some(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"agentscm_coordination_reply","arguments":reply}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 401, "{invalid}");
+    reply["session"] = json!("holder");
+    let allowed = hub.mcp(&holder, "agentscm_coordination_reply", reply).await;
+    assert_eq!(allowed["isError"], false, "{allowed}");
+    for (token, session) in [(&holder, "holder"), (&requester, "requester")] {
+        let read = hub
+            .mcp(
+                token,
+                "agentscm_coordination_inbox",
+                json!({"session":session}),
+            )
+            .await;
+        assert_eq!(read["isError"], false, "{read}");
+        let inbox = &read["structuredContent"];
+        assert!(
+            inbox["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == request["id"]
+                    && row["responses"][0]["operation_id"] == "role-reply"),
+            "{inbox}"
+        );
+    }
 }

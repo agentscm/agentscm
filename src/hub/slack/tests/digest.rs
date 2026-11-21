@@ -55,7 +55,8 @@ fn merged(f: &Fixture, branch: &str) {
 
 fn switch_on(f: &Fixture, repository_id: i64) {
     tokio::task::block_in_place(|| {
-        digest_http::set_repository(&**f.store(), repository_id, true, "usr_admin").unwrap()
+        digest_http::set_repository(&**f.store(), "github.com", repository_id, true, "usr_admin")
+            .unwrap()
     });
 }
 
@@ -303,7 +304,7 @@ async fn a_person_who_switched_it_off_gets_none_and_the_stop_button_switches_it_
     tokio::task::block_in_place(|| f.slack().queue_digests(&f.state, unix_now())).unwrap();
     assert_eq!((digest_jobs(&f, "U1"), digest_jobs(&f, "U2")), (1, 1));
     tokio::task::block_in_place(|| {
-        digest_http::set_opted_out(&**f.store(), &bob, REPO_ID, true).unwrap();
+        digest_http::set_opted_out(&**f.store(), "github.com", &bob, REPO_ID, true).unwrap();
     });
     drain(&f).await;
     let sent = digests(&f);
@@ -330,7 +331,7 @@ async fn a_person_who_switched_it_off_gets_none_and_the_stop_button_switches_it_
     );
     assert!(text_of(&update["blocks"]).ends_with(outcome));
     let settings = tokio::task::block_in_place(|| {
-        digest_http::settings(&**f.store(), REPO, Some(REPO_ID), &alice).unwrap()
+        digest_http::settings(&**f.store(), "github.com", REPO, Some(REPO_ID), &alice).unwrap()
     });
     assert!(settings.enabled && settings.opted_out && !settings.delivering);
 

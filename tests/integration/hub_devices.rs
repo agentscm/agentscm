@@ -1415,6 +1415,28 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
         context(&reply).contains("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
+    // The refusal is visible without opening the Hub: the token still works, so status says the
+    // renewal failed, and says what to do.
+    let root = machine.root();
+    let (ok, status, stderr) = machine.run(&[
+        "client",
+        "status",
+        "--json",
+        "--check",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let status: Value = serde_json::from_str(&status).unwrap();
+    let health = &status["connections"][0]["health"];
+    assert_eq!(health["state"], "renewal_failed", "{status}");
+    assert!(
+        health["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask a repository owner for"),
+        "{health}"
+    );
 
     // Revoking the computer signs it out: renewal says so, and nothing re-enrolls it.
     env.role(ALICE, "write", "write", 30);
@@ -1441,6 +1463,105 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
             .is_none()
     );
     assert_eq!(machine.renew()["result"], "refused");
+}
+
+/// Two renewals that fall due together (two hooks, or a hook and a person) leave one live token
+/// and neither reports a failure. The two processes may or may not overlap on a given run. If both
+/// minted a token, both report `renewed` and the losing process's token is revoked, so exactly one
+/// is live. If they did not overlap, one renews and the other reports `not_due`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renewals_leave_one_live_token() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let (ok, _, stderr) = machine.run(&["hub", "login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    let first_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(env.whoami(&first).await, 200);
+    let alice = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let live = |env: &Env| -> Vec<String> {
+        let now = unix_now();
+        let mut ids: Vec<String> = env
+            .store
+            .list_agent_tokens(&alice.id)
+            .unwrap()
+            .into_iter()
+            .filter(|token| !token.revoked && token.expires_at > now)
+            .map(|token| token.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(live(&env), std::slice::from_ref(&first_id));
+
+    machine.age_token();
+    let root = machine.root();
+    let spawn = || {
+        machine
+            .command(&[
+                "--no-telemetry",
+                "client",
+                "renew",
+                "--root",
+                root.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // Both processes are running before either is waited on.
+    let children = [spawn(), spawn()];
+    let mut results = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reply: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        // Which process wins is not fixed; neither may report the renewal as failed.
+        assert!(
+            ["renewed", "not_due"].contains(&reply["result"].as_str().unwrap()),
+            "{reply}"
+        );
+        results.push(reply["result"].as_str().unwrap().to_owned());
+    }
+
+    let saved = machine.token();
+    let saved_id = machine.connection()["owned_token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(saved_id, first_id);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&saved).await, 200);
+    assert_eq!(live(&env), [saved_id]);
+    // Every token issued for the user, live or revoked, including the first.
+    let issued = env.store.list_agent_tokens(&alice.id).unwrap().len();
+    if issued == 3 {
+        // The runs overlapped: both minted a token and the loser's was revoked.
+        assert_eq!(results, ["renewed", "renewed"]);
+    } else {
+        assert_eq!(issued, 2, "{results:?}");
+        assert!(results.contains(&"not_due".to_owned()), "{results:?}");
+    }
 }
 
 /// Signing in again replaces this computer's credential, which revokes the agent tokens it
@@ -1667,16 +1788,51 @@ async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_a
     // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
     // that could be compared with it, so the two agents are told apart by name only.
 
-    // Ending the session drops its route record, and the hook does not write it back.
+    // Ending the session retains its terminal lifecycle evidence for recovery.
     let routes = machine.config.path().join("agentscm/session-routes");
-    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
-    assert_eq!(recorded(), 1);
+    let recorded = || {
+        std::fs::read_dir(&routes)
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = recorded();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["lifecycle"]["terminal"], false);
     machine.hook_in(
         &linked,
         "native-1",
         json!({"hook_event_name": "SessionEnd"}),
     );
-    assert_eq!(recorded(), 0);
+    let after = recorded();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["session"], "native-1");
+    assert_eq!(after[0]["lifecycle"]["terminal"], true);
+    assert_eq!(after[0]["lifecycle"]["explicit_end_requested"], true);
+    for key in ["start_nonce", "incarnation"] {
+        assert_eq!(after[0]["lifecycle"][key], before[0]["lifecycle"][key]);
+    }
+    for entry in std::fs::read_dir(machine.config.path().join("agentscm/agent-hosts")).unwrap() {
+        let host: Value =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        assert_ne!(host["session"], "native-1");
+    }
+    let remaining = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let main_work = |items: &[agentscm::hub::work::WorkItem]| {
+        let work = items
+            .iter()
+            .find(|work| work.title == "Work in the main checkout")
+            .unwrap();
+        (work.id.clone(), work.generation, work.updated_seq)
+    };
+    assert_eq!(main_work(&remaining), main_work(&current));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2030,7 +2186,14 @@ async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
 async fn web_sign_in(env: &Env, user: i64) -> String {
     let done = web_callback(env, user).await;
     assert_eq!(done.status(), 302);
-    assert_eq!(done.headers()[header::LOCATION], "/ui/#home");
+    assert_eq!(
+        done.headers()[header::LOCATION],
+        if cfg!(feature = "ui") {
+            "/ui/#home"
+        } else {
+            "/auth/complete/#home"
+        }
+    );
     let all: Vec<_> = done
         .headers()
         .get_all(header::SET_COOKIE)
@@ -2148,6 +2311,36 @@ fn work(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
     }
 }
 
+/// A lead's Work that also holds `src/tax.rs`, so a reply can release the file asked for and
+/// leave it a Work.
+fn work_with_tax(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
+    let mut start = work(key, session);
+    start.scope.push("src/tax.rs".into());
+    start
+}
+
+/// The `work_transition` events whose data names the released file.
+fn release_transitions(env: &Env) -> usize {
+    env.store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "work_transition" && event.data.contains("release_paths"))
+        .count()
+}
+
+/// The recorded actor of the one partial release: the person who answered, not the lead agent.
+fn assert_released_by_person(env: &Env) {
+    let events = env.store.events_after(0, 1000).unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "work_transition" && event.data.contains("release_paths"))
+        .expect("a partial release");
+    let data: Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["actor"]["via"], "person", "{data}");
+    assert_eq!(data["actor"]["login"], "alice", "{data}");
+}
+
 const REPLY: &str = "/v1/hub/session/coordination/reply";
 const ANSWER: &str = "/v1/hub/session/handoff/answer";
 const ASK: &str = "/v1/hub/session/handoff/ask";
@@ -2161,7 +2354,7 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     let (asker, asker_secret) = agent_for(&env, &bob.id, "codex", false);
     let now = unix_now();
     env.store
-        .work_start(&lead, &work("billing", "alice-session"), now)
+        .work_start(&lead, &work_with_tax("billing", "alice-session"), now)
         .unwrap();
     let request = env
         .store
@@ -2173,7 +2366,7 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
         json!({"token": token, "request_id": request.id, "operation_id": operation,
             "target_work_id": request.targets[0].work_id, "session": "alice-session",
             "expected_updated_seq": request.updated_seq, "kind": "propose_split",
-            "note": "I take tax, you take rounding"})
+            "note": "I take tax, you take rounding", "release_paths": ["src/billing.rs"]})
     };
 
     // Signed out, a cookie without its CSRF token, and a computer's bearer session are refused.
@@ -2247,12 +2440,16 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     assert_eq!(response["responder"]["login"], "alice");
     assert_eq!(response["responder"]["agent"], "claude-code");
     assert_eq!(response["responder"]["token"], json!(lead));
+    assert_eq!(response["released_paths"], json!(["src/billing.rs"]));
+    assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     // A retry replays the same answer instead of adding a second.
     let (status, replay) = page_post(&env, &alice, true, REPLY, body(&lead, "f")).await;
     assert_eq!(
         (status, replay["responses"].as_array().unwrap().len()),
         (200, 1)
     );
+    assert_eq!(release_transitions(&env), 1);
 
     // The asking agent reads it in its inbox at its next touch, marked as a person's answer.
     let (status, inbox) = env
@@ -2300,7 +2497,10 @@ async fn a_web_session_closes_a_request_only_once_its_requester_is_gone() {
             "session": "alice-session", "expected_updated_seq": request.updated_seq,
             "target_work_id": target.work_id, "target_generation": target.generation})
     };
-    let action = format!("request:{}:{}", request.id, target.work_id);
+    let action = format!(
+        "request:{}:{}:{}",
+        request.id, target.work_id, target.generation
+    );
     let has_action = |status: &Value| {
         status["actions"]
             .as_array()
@@ -2817,6 +3017,86 @@ async fn a_web_sign_in_returns_to_the_hub_page_that_asked_and_nowhere_else() {
 }
 
 #[tokio::test]
+async fn browser_reads_bind_an_optional_csrf_header_to_the_current_cookie() {
+    let env = Env::start("github").await;
+    let alice = page(&env, ALICE).await;
+    let bob = page(&env, BOB).await;
+    let path = "/v1/hub/session/repositories";
+    for method in [Method::GET, Method::HEAD] {
+        for csrf in [None, Some(alice.csrf.as_str())] {
+            assert_eq!(
+                with_cookie(&env.hub, method.clone(), path, &alice.cookie, csrf)
+                    .await
+                    .0,
+                200
+            );
+        }
+        for csrf in [bob.csrf.as_str(), "wrong"] {
+            assert_eq!(
+                with_cookie(&env.hub, method.clone(), path, &alice.cookie, Some(csrf))
+                    .await
+                    .0,
+                403
+            );
+        }
+        let malformed = browser()
+            .request(method, format!("{}{path}", env.hub))
+            .header(
+                header::COOKIE,
+                format!("__Host-agentscm_session={}", alice.cookie),
+            )
+            .header(
+                "x-csrf-token",
+                axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), 403);
+    }
+    // Returning to Alice's cookie cannot make a request handled under Bob's cookie succeed.
+    let (status, body) =
+        with_cookie(&env.hub, Method::GET, path, &bob.cookie, Some(&alice.csrf)).await;
+    assert_eq!((status, body["error"].as_str()), (403, Some("csrf")));
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::GET,
+            path,
+            &alice.cookie,
+            Some(&alice.csrf)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &alice.cookie,
+            None
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &alice.cookie,
+            Some(&alice.csrf),
+        )
+        .await
+        .0,
+        204
+    );
+}
+
+#[tokio::test]
 async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
     let env = Env::start("github").await;
     let cookie = web_sign_in(&env, ALICE).await;
@@ -2928,7 +3208,11 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
     assert_eq!(refused.status(), 302);
     assert_eq!(
         refused.headers()[header::LOCATION],
-        "/ui/#/signed-in?status=refused&reason=user_disabled"
+        if cfg!(feature = "ui") {
+            "/ui/#/signed-in?status=refused&reason=user_disabled"
+        } else {
+            "/auth/complete/#/signed-in?status=refused&reason=user_disabled"
+        }
     );
     assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
     // A page that asked to come back gets the refusal on itself.
@@ -3234,12 +3518,14 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         }
     }
 
-    // Losing access shows on the next fresh read: the role is asked, not cached.
-    {
+    // Within the 90-second role cache a lost access is not asked again: the forge is not called
+    // and the repository still lists; it drops out once the answer expires or alice signs out.
+    let reads = {
         let mut fake = env.fake.lock().unwrap();
         fake.roles.remove(&("acme/docs".into(), ALICE));
         fake.levels.remove(&(4343, ALICE));
-    }
+        fake.role_reads
+    };
     let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
     let names: Vec<_> = body["repositories"]
         .as_array()
@@ -3247,7 +3533,8 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
         .iter()
         .map(|row| row["repository"].as_str().unwrap())
         .collect();
-    assert_eq!(names, [REPO], "{body}");
+    assert_eq!(names, ["acme/docs", REPO], "{body}");
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
     // The token that asked within the last 30 seconds gets its earlier answer back.
     let (_, again) = env.get(path, &alice).await;
     assert_eq!(again, first);
@@ -3662,7 +3949,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
-    // The detailed device list checks the forge again even while the web list's answer is cached.
+    // The detailed device list reuses the same cached answers, so the lost role still lists.
     let (status, device_after_role_loss) = env
         .call(
             &env.hub,
@@ -3678,12 +3965,9 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
-    assert_eq!(
-        device_after_role_loss["repositories"][0]["repository"],
-        "acme/docs"
-    );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
 
     // Signing out forgets them: losing the role leaves the repository out, with no refused
     // sign-in recorded.
@@ -3997,6 +4281,19 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
         .unwrap()
         .roles
         .remove(&("acme/docs".into(), ALICE));
+    // The role answer is kept for 90 seconds; signing out forgets it, so the next sign-in asks.
+    let (_, session) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let csrf = session["csrf_token"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &cookie,
+        Some(csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let cookie = web_sign_in(&env, ALICE).await;
     let (revoked_status, revoked) = with_cookie(&env.hub, Method::GET, &path, &cookie, None).await;
     assert_eq!(revoked_status, 404);
     assert_eq!(revoked, unknown);
@@ -4484,12 +4781,33 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     assert_eq!(page["dismissals"].as_array().unwrap().len(), 1);
     assert_eq!(page["dismissals"][0]["key"], "stale:wrk_1");
 
+    // A lost role reads from the 90-second role answer, without asking the forge, until it
+    // expires or bob signs out (and signing in again checks the role).
+    let reads = env.fake.lock().unwrap().role_reads;
     env.drop_role(BOB);
+    assert_eq!(read(&bob).await.0, 200);
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &bob.cookie,
+        Some(&bob.csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(read(&bob).await.0, 401);
+    // With nothing kept, a person without the role is refused and the forge was asked.
+    env.role(BOB, "read", "read", 20);
+    let bob = self::page(&env, BOB).await;
+    env.drop_role(BOB);
+    let reads = env.fake.lock().unwrap().role_reads;
     let (status, refused) = read(&bob).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("insufficient_role"))
     );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 1);
 }
 
 const PERMISSIONS: &str = "/v1/hub/session/permissions";
@@ -5587,7 +5905,7 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     let (asker, _) = agent_for(&env, &bob.id, "codex", false);
     let now = unix_now();
     env.store
-        .work_start(&lead, &work("billing", "alice-session"), now)
+        .work_start(&lead, &work_with_tax("billing", "alice-session"), now)
         .unwrap();
     let request = env
         .store
@@ -5598,7 +5916,8 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     let body = |token: &str| {
         json!({"token": token, "request_id": request.id, "operation_id": "slack-1",
             "target_work_id": request.targets[0].work_id, "session": "alice-session",
-            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null})
+            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null,
+            "release_paths": ["src/billing.rs"]})
     };
     let (status, refused) = env
         .call(
@@ -5619,6 +5938,12 @@ async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() 
     assert_eq!(status, 200, "{answered}");
     assert_eq!(answered["responses"][0]["via"], "slack");
     assert_eq!(answered["responses"][0]["responder"]["login"], "alice");
+    assert_eq!(
+        answered["responses"][0]["released_paths"],
+        json!(["src/billing.rs"])
+    );
+    assert_eq!(release_transitions(&env), 1);
+    assert_released_by_person(&env);
     let (status, replay) = env
         .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
         .await;
@@ -5979,6 +6304,83 @@ async fn an_embedders_grants_decide_who_signs_in_and_who_may_change_anything() {
         "{body}"
     );
     let (status, body) = whoami(&env, &alice_secret).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn file_handoff_reads_require_a_current_repository_grant() {
+    const OTHER: &str = "other/tools";
+    let mut env = Env::start("github").await;
+    env.connect_repo(OTHER, REPO_ID + 1, BOB);
+    let grants = Arc::new(Grants {
+        store: env.store.clone(),
+        people: Mutex::new(HashMap::from([
+            (ALICE, vec![(REPO, Level::Contribute)]),
+            (BOB, vec![(REPO, Level::Read), (OTHER, Level::Read)]),
+        ])),
+    });
+    env.access = Some(grants.clone());
+    env.hub = env.serve("").await;
+    let alice = page(&env, ALICE).await;
+    let bob = page(&env, BOB).await;
+    let (holder, _) = agent_for(&env, &alice.id, "holder", false);
+    let (requester, secret) = agent_for(&env, &bob.id, "requester", false);
+    let now = unix_now();
+    let file = "src/widgets.rs";
+    env.store
+        .touch_session(&holder, &hook_call("holder", &[file]), now)
+        .unwrap();
+    env.store
+        .touch_session(&requester, &hook_call("requester", &[]), now)
+        .unwrap();
+    env.store
+        .ask_handoff(
+            &requester,
+            Some("requester"),
+            file,
+            Some("finish widgets"),
+            now,
+        )
+        .unwrap();
+    let read = |page: &Page, repository: &str| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        let path = format!("/v1/hub/session/handoffs?repository={repository}");
+        async move { with_cookie(&hub, Method::GET, &path, &cookie, None).await }
+    };
+    for person in [&alice, &bob] {
+        let (status, body) = read(person, REPO).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["handoffs"][0]["path"], file, "{body}");
+    }
+    let (status, body) = read(&bob, OTHER).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["handoffs"].as_array().unwrap().is_empty());
+
+    // Losing one repository keeps the sign-in but ends reads of its retained handoffs.
+    grants
+        .people
+        .lock()
+        .unwrap()
+        .insert(BOB, vec![(OTHER, Level::Read)]);
+    let (status, body) = read(&bob, REPO).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+    let (status, body) = whoami(&env, &secret).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("insufficient_role")),
+        "{body}"
+    );
+    assert_eq!(read(&bob, OTHER).await.0, 200);
+    assert_eq!(read(&alice, REPO).await.0, 200);
+    let (status, body) = read(&alice, OTHER).await;
     assert_eq!(
         (status, body["error"].as_str()),
         (403, Some("insufficient_role")),

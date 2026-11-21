@@ -2,6 +2,7 @@
 //!
 //! This bounded read is advisory, never completion or edit authority. Its digest identifies the
 //! captured facts, not a transactional snapshot or current provider evidence omitted by V2.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -9,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::hub::coordination::{
     ACK_BOUND_SECS, CoordinationInbox, CoordinationListQuery, CoordinationStatus,
 };
+use crate::hub::notices::OwnerNoticeSourceKind;
 use crate::hub::onboarding::Observations;
 use crate::hub::session_waiting::{LeadWait, WaitReason};
 use crate::hub::store::{Principal, Store, owner_session, session_ancestors, session_key};
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
-use crate::hub::work_reconcile::WorkStage;
+use crate::hub::work_reconcile::{WorkStage, WorkStageV1};
 use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
@@ -116,7 +118,7 @@ pub struct StatusWork {
     pub reconciliation: Option<StatusReconciliation>,
     /// Working, pull request open or merged, or complete, with the pull request number.
     #[serde(default)]
-    pub stage: Option<crate::hub::work_reconcile::WorkStageV1>,
+    pub stage: Option<WorkStageV1>,
     pub limits: Vec<String>,
 }
 
@@ -255,6 +257,94 @@ fn pause_asks_person(item: &WorkItem) -> bool {
         })
 }
 
+fn owner_notice_actions(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    principal: &Principal,
+    actions: &mut Vec<StatusAction>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut after = None;
+    let mut limits = Vec::new();
+    loop {
+        let page = match store.owner_notice_list(reader, after.as_deref(), 100, now) {
+            Ok(page) => page,
+            Err(_) => {
+                limits.push("owner_notices_unavailable".into());
+                break;
+            }
+        };
+        for notice in page
+            .notices
+            .into_iter()
+            .filter(|notice| notice.acknowledged_at.is_none() && notice.acted_at.is_none())
+        {
+            project_owner_notice(actions, principal, notice);
+        }
+        let Some(next) = page.next_after else {
+            break;
+        };
+        if after.is_some() {
+            limits.push("owner_notices_truncated".into());
+            break;
+        }
+        after = Some(next);
+    }
+    Ok(limits)
+}
+
+fn project_owner_notice(
+    actions: &mut Vec<StatusAction>,
+    principal: &Principal,
+    notice: crate::hub::notices::OwnerNotice,
+) {
+    let pull = (notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation)
+        .then(|| notice.source_id.strip_prefix("pr:"))
+        .flatten()
+        .and_then(|rest| rest.split(':').next())
+        .filter(|number| number.bytes().all(|byte| byte.is_ascii_digit()));
+    let folded = pull.is_some_and(|number| {
+        actions
+            .iter_mut()
+            .find(|action| {
+                action.kind == "failed_check"
+                    && action
+                        .id
+                        .rsplit_once(':')
+                        .and_then(|(prefix, _)| prefix.rsplit_once(':'))
+                        .is_some_and(|(_, pull)| pull == number)
+            })
+            .map(|action| {
+                action.action = format!("{} {}", action.action, notice.body);
+                action.semantic_version = Some(identity(&[
+                    action.semantic_version.as_deref().unwrap_or(""),
+                    &notice.id,
+                ]));
+            })
+            .is_some()
+    });
+    if folded {
+        return;
+    }
+    actions.push(StatusAction {
+        id: format!("owner_notice:{}", notice.id),
+        kind: "owner_notice".into(),
+        work_ids: vec![],
+        recipients: vec![StatusRecipient {
+            kind: RecipientKind::Person,
+            owner: Some(principal.owner.id.clone()),
+            login: Some(principal.owner.login.clone()),
+            agent: None,
+        }],
+        needs_you: true,
+        action: notice.body,
+        updated_seq: 0,
+        semantic_version: Some(notice.id),
+        session: None,
+        limits: vec![],
+    });
+}
+
 /// A report is routed to its named lead/owner, never to every reader of the repository. `wait`
 /// is what the lead session's hooks said of it: a session that stopped to wait makes no calls,
 /// which the claim alone cannot tell from one that is gone.
@@ -264,6 +354,19 @@ pub fn project_work(
     reconciliation: Option<ReconciliationView>,
     wait: LeadWait,
     viewer: &str,
+) -> StatusWork {
+    project_work_staged(item, operational, reconciliation, wait, viewer, None)
+}
+
+/// [`project_work`] with the Hub-observed stage. Quiet Work whose pull request the provider
+/// observed open waits on that pull request; the stage is also set on the row.
+fn project_work_staged(
+    item: &WorkItem,
+    operational: WorkOperationalV1,
+    reconciliation: Option<ReconciliationView>,
+    wait: LeadWait,
+    viewer: &str,
+    stage: Option<WorkStageV1>,
 ) -> StatusWork {
     let mut limits = BTreeSet::new();
     // A session that reported a wait is there, however long ago its Work checked in. One whose
@@ -337,17 +440,21 @@ pub fn project_work(
             }
         }
     }
-    let (state, recipient, action) = if !consistent {
+    let open_pull_request = stage
+        .as_ref()
+        .filter(|s| s.stage == WorkStage::PullRequestOpen)
+        .and_then(|s| s.pull_request);
+    let (state, recipient, action): (_, _, Cow<str>) = if !consistent {
         (
             StatusState::ReassessmentNeeded,
             StatusRecipient::none(),
-            "Refresh changed Work before acting.",
+            "Refresh changed Work before acting.".into(),
         )
     } else if item.state == WorkState::Finished {
         (
             StatusState::Retired,
             StatusRecipient::none(),
-            "Inspect the recorded outcome and its provenance.",
+            "Inspect the recorded outcome and its provenance.".into(),
         )
     } else if item.state == WorkState::Handover {
         // Handover is an agent follow-up, regardless of merge coverage or reservation state.
@@ -360,13 +467,13 @@ pub fn project_work(
             } else {
                 lead(item)
             },
-            "Its lead reviews the handover and completes or resumes the remaining Work.",
+            "Its lead reviews the handover and completes or resumes the remaining Work.".into(),
         )
     } else if current.is_some_and(|r| !r.reassessments.is_empty()) {
         (
             StatusState::ReassessmentNeeded,
             lead(item),
-            "Reassess the reported blocker against current prerequisite evidence.",
+            "Reassess the reported blocker against current prerequisite evidence.".into(),
         )
     } else if operational.merge.hidden_by_merged_pr {
         // Only the close is left, and it is the lead's: a hold still held lapses by itself. The
@@ -376,13 +483,13 @@ pub fn project_work(
         (
             StatusState::ReassessmentNeeded,
             lead(item),
-            "Its pull request merged: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.",
+            "Its pull request merged: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.".into(),
         )
     } else if item.state == WorkState::Blocked {
         (
             StatusState::Blocked,
             lead(item),
-            "Review the reported blocker and identify its next action.",
+            "Review the reported blocker and identify its next action.".into(),
         )
     } else if let LeadWait::Waiting(reason) = wait {
         match reason {
@@ -391,11 +498,11 @@ pub fn project_work(
             WaitReason::Finished if pause_asks_person(item) => (
                 StatusState::AwaitingParty,
                 lead_person(item),
-                "Its lead session ended its turn, and its pause report says what it needs from its person.",
+                "Its lead session ended its turn, and its pause report says what it needs from its person.".into(),
             ),
             // Neither asks anybody, and neither is stuck: the text says which it is.
             WaitReason::Finished | WaitReason::Background => {
-                (StatusState::Active, lead(item), waiting_text(reason))
+                (StatusState::Active, lead(item), waiting_text(reason).into())
             }
             WaitReason::Permission | WaitReason::Question | WaitReason::Idle => {
                 // Its `session_waiting` action asks the person, so one wait counts once.
@@ -403,30 +510,43 @@ pub fn project_work(
                 (
                     StatusState::AwaitingParty,
                     lead_person(item),
-                    waiting_text(reason),
+                    waiting_text(reason).into(),
                 )
             }
         }
     } else if quiet {
-        if wait == LeadWait::Unknown {
+        // A provider known unavailable leaves the stored observation possibly stale.
+        if let Some(n) =
+            open_pull_request.filter(|_| !limits.contains("provider_coverage_unavailable"))
+        {
+            // The Hub saw only that the pull request is open, so the row claims no more.
+            (
+                StatusState::Active,
+                lead(item),
+                Cow::Owned(format!(
+                    "Pull request #{n} is open. The Hub observed only that it is open, not whether its checks pass or anyone reviews it."
+                )),
+            )
+        } else if wait == LeadWait::Unknown {
             (
                 StatusState::ReassessmentNeeded,
                 StatusRecipient::none(),
-                "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.",
+                "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.".into(),
             )
         } else {
             // Nobody is asked, held or not: a hold its lead no longer renews lapses by itself.
             (
                 StatusState::ReassessmentNeeded,
                 StatusRecipient::none(),
-                "Review the unfinished Work; a quiet claim does not prove failure or completion.",
+                "Review the unfinished Work; a quiet claim does not prove failure or completion."
+                    .into(),
             )
         }
     } else {
         (
             StatusState::Active,
             lead(item),
-            "Continue the reported work; activity is not independently observed.",
+            "Continue the reported work; activity is not independently observed.".into(),
         )
     };
     if recipient.kind == RecipientKind::Unknown {
@@ -447,7 +567,7 @@ pub fn project_work(
         needs_you,
         action: if consistent && item.state == WorkState::Handover {
             item.blocker.as_ref().map_or_else(
-                || action.to_owned(),
+                || action.into_owned(),
                 |blocker| {
                     format!(
                         "Resolve the handover's reported blocker: {}",
@@ -456,7 +576,7 @@ pub fn project_work(
                 },
             )
         } else {
-            action.into()
+            action.into_owned()
         },
         reported_next_action: item.next_action.clone(),
         freshness,
@@ -482,7 +602,7 @@ pub fn project_work(
             current_source_coverage: r.current_source_coverage,
             stale_reasons: r.stale_reasons,
         }),
-        stage: None,
+        stage,
         limits: limits.into_iter().collect(),
     }
 }
@@ -612,6 +732,14 @@ fn read_scoped(
     }
     let ids = selected.keys().cloned().collect::<Vec<_>>();
     let operational = store.work_operational(reader, &OperationalSelect::Many(&ids), now)?;
+    let terminal = match store.notice_owner_terminal(reader, &ids, now) {
+        Ok(ids) => ids.into_iter().collect::<BTreeSet<_>>(),
+        Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+        Err(_) => {
+            limits.insert("native_lifecycle_unavailable".into());
+            BTreeSet::new()
+        }
+    };
     // When each live session last called. A claim follows its lead's reports only, so a lead
     // that works on without reporting would read as quiet: its session's calls say it is there.
     let sessions = store.live_sessions(principal, now, MAX_STATUS_WORK + 1)?;
@@ -631,6 +759,7 @@ fn read_scoped(
     });
     let mut work = Vec::new();
     let mut staged = Vec::new();
+    let mut gathered = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
         let item = match item {
@@ -656,25 +785,38 @@ fn read_scoped(
         let called_at = called
             .get(session_key(&item.lead_token, &item.lead_session).as_str())
             .copied();
-        let wait = setup.waiting().lead(
-            &item.owner,
-            &item.lead_token,
-            &item.lead_session,
-            called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
-            now,
-        );
+        let wait = if terminal.contains(&id) {
+            LeadWait::NotWaiting
+        } else {
+            setup.waiting().lead(
+                &item.owner,
+                &item.lead_token,
+                &item.lead_session,
+                called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
+                now,
+            )
+        };
         // Only the row reads the session's calls: where a request goes and which overlaps count
         // still follow the lead's reports.
         let mut shown = item.clone();
         if called_at.is_some() && shown.claim_status == ClaimStatus::Stale {
             shown.claim_status = ClaimStatus::Active;
         }
-        let mut row = project_work(
+        staged.push((item.clone(), op.outcome.value));
+        gathered.push((id, item, op.clone(), reconciliation, wait, shown));
+    }
+    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
+    let (mut stages, stage_limits) =
+        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
+    limits.extend(stage_limits);
+    for (id, item, op, reconciliation, wait, shown) in gathered {
+        let mut row = project_work_staged(
             &shown,
-            op.clone(),
+            op,
             reconciliation,
             wait,
             &principal.owner.id,
+            stages.remove(&id),
         );
         // Fence the row with the final Work version. This does not claim an atomic snapshot.
         if store
@@ -687,20 +829,12 @@ fn read_scoped(
             row.recipient = StatusRecipient::none();
             row.action = "Refresh changed Work before acting.".into();
         }
-        staged.push((item.clone(), op.outcome.value));
         if !row.limits.iter().any(|limit| {
             limit == "work_changed_during_read" || limit == "reconciliation_work_changed"
         }) {
             items.insert(id, item);
         }
         work.push(row);
-    }
-    let staged_refs: Vec<_> = staged.iter().map(|(i, o)| (i, *o)).collect();
-    let (mut stages, stage_limits) =
-        crate::hub::work_reconcile::work_stages(store, principal, reader, &staged_refs, now);
-    limits.extend(stage_limits);
-    for row in &mut work {
-        row.stage = stages.remove(&row.work_id);
     }
     for request in &requests.requests {
         if !request.responses_complete {
@@ -719,11 +853,12 @@ fn read_scoped(
         .filter(|w| w.operational.reservation.status == ReservationStatus::Held)
         .map(|w| w.work_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut actions = request_actions(
+    let mut actions = request_actions_with_terminal(
         &requests,
         &items,
         &holding,
         live_keys.as_ref(),
+        &terminal,
         &principal.owner.id,
         now,
     );
@@ -749,7 +884,11 @@ fn read_scoped(
                                     && request.proposal.scope == source.scope
                                     && request.requester.token == source.lead_token
                                     && request.requester.session == source.lead_session
-                                    && action.id == format!("request:{}:{}", request.id, target.id)
+                                    && action.id
+                                        == format!(
+                                            "request:{}:{}:{}",
+                                            request.id, target.id, target.generation
+                                        )
                             })
                         })
             })
@@ -808,12 +947,45 @@ fn read_scoped(
         checks::read(store, principal, &items, now)?;
     actions.extend(checks);
     limits.extend(check_limits);
+    limits.extend(owner_notice_actions(
+        store,
+        reader,
+        principal,
+        &mut actions,
+        now,
+    )?);
     let (dependency_actions, dependency_limits) =
         dependency_actions(store, reader, &items, &principal.owner.id, now)?;
     actions.extend(dependency_actions);
     limits.extend(dependency_limits);
+    let (notice_actions, notice_limits) =
+        notice_recovery_actions(store, reader, &principal.owner.id, now)?;
+    limits.extend(notice_limits);
+    for action in notice_actions {
+        if let Some(existing) = actions.iter_mut().find(|existing| existing.id == action.id) {
+            if action.needs_you && !existing.needs_you {
+                *existing = action;
+            }
+        } else if !(action.kind == "session_recovery"
+            && actions.iter().any(|existing| {
+                existing.kind == "directed_request"
+                    && existing.needs_you
+                    && existing
+                        .work_ids
+                        .iter()
+                        .any(|id| action.work_ids.contains(id))
+            }))
+        {
+            actions.push(action);
+        }
+    }
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
-    actions.extend(waiting_actions(store, setup, principal, &items, now)?);
+    let (waiting, waiting_complete) =
+        waiting_actions_with_terminal(store, setup, principal, &items, &terminal, now)?;
+    actions.extend(waiting);
+    if !waiting_complete {
+        limits.insert("session_waiting_unavailable".into());
+    }
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -822,9 +994,8 @@ fn read_scoped(
                 .expect("actions serialize"),
         ]);
     actions.dedup_by(|a, b| a.id == b.id);
-    if actions.len() > 200 {
+    if limit_actions(&mut actions) {
         limits.insert("status_actions_truncated".into());
-        actions.truncate(200);
     }
     for action in &mut actions {
         if action.recipients.len() > 8 {
@@ -899,32 +1070,7 @@ fn read_scoped(
     // The existing agent CLI accepts at most 1 MiB. Preserve every selected Work/reservation
     // row and bound displayed actions below that transport limit. Their full identity remains
     // in complete_action_digest, so omission never makes changed captured facts look current.
-    let mut response_bytes = serde_json::to_vec(&result)
-        .expect("status serializes")
-        .len();
-    if response_bytes > 768 * 1024 {
-        while response_bytes > 767 * 1024 {
-            let Some(action) = result.actions.pop() else {
-                return Err(HubError::Unavailable(
-                    "shared status exceeds its response budget".into(),
-                ));
-            };
-            response_bytes = response_bytes.saturating_sub(
-                serde_json::to_vec(&action)
-                    .expect("action serializes")
-                    .len(),
-            );
-            result.counts.needs_you = result
-                .counts
-                .needs_you
-                .saturating_sub(usize::from(action.needs_you));
-        }
-        result.complete = false;
-        result
-            .limits
-            .push("status_response_budget_truncated".into());
-        result.limits.sort();
-    }
+    bound_response(&mut result)?;
     // Include complete request versions, even omitted/no-longer-actionable request bodies, so a
     // changed recipient/response invalidates the captured evidence. No credential is included.
     let mut hashed = result.clone();
@@ -939,6 +1085,52 @@ fn read_scoped(
     ))
     .expect("status serializes")]);
     Ok(result)
+}
+
+/// The waiting store already bounds the viewer's human prompts. Preserve all of those
+/// accepted waits; the general action limit must not turn an unrelated busy queue into
+/// missing human questions. This applies to both token and role-checked person reads.
+fn limit_actions(actions: &mut Vec<StatusAction>) -> bool {
+    let before = actions.len();
+    let mut ordinary = 0;
+    actions.retain(|action| {
+        if action.kind == "session_waiting" {
+            return true;
+        }
+        ordinary += 1;
+        ordinary <= 200
+    });
+    actions.len() != before
+}
+
+fn bound_response(result: &mut ActionableStatus) -> Result<()> {
+    if serde_json::to_vec(result).expect("status serializes").len() <= 768 * 1024 {
+        return Ok(());
+    }
+    result.complete = false;
+    result
+        .limits
+        .push("status_response_budget_truncated".into());
+    result.limits.sort();
+    // Include the limit marker and count changes in the measured result. Leave room for the
+    // final digest; a successful response never silently omits a person's waiting prompt.
+    while serde_json::to_vec(result).expect("status serializes").len() > 767 * 1024 {
+        let Some(index) = result
+            .actions
+            .iter()
+            .rposition(|action| action.kind != "session_waiting")
+        else {
+            return Err(HubError::Unavailable(
+                "shared status exceeds its response budget".into(),
+            ));
+        };
+        let action = result.actions.remove(index);
+        result.counts.needs_you = result
+            .counts
+            .needs_you
+            .saturating_sub(usize::from(action.needs_you));
+    }
+    Ok(())
 }
 
 /// An action as a change marker hashes it. An overlap alert says how long ago each holder was
@@ -1019,13 +1211,25 @@ fn lead_order(i: &WorkItem) -> Option<(u8, std::cmp::Reverse<i64>, &str)> {
 /// session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
 /// version the time the wait began. A permission wait whose hook offers its prompt to the Hub
 /// (`permission_answer`) says so; every other wait is answered in the session.
+#[cfg(test)]
 fn waiting_actions(
     store: &dyn Store,
     setup: &Observations,
     principal: &Principal,
     items: &BTreeMap<String, WorkItem>,
     now: i64,
-) -> Result<Vec<StatusAction>> {
+) -> Result<(Vec<StatusAction>, bool)> {
+    waiting_actions_with_terminal(store, setup, principal, items, &BTreeSet::new(), now)
+}
+
+fn waiting_actions_with_terminal(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    terminal: &BTreeSet<String>,
+    now: i64,
+) -> Result<(Vec<StatusAction>, bool)> {
     let owner = principal.owner.id.as_str();
     let viewer = StatusRecipient {
         kind: RecipientKind::Person,
@@ -1033,7 +1237,8 @@ fn waiting_actions(
         login: Some(principal.owner.login.clone()),
         agent: None,
     };
-    let waits = setup.waiting().owned(principal, now)?;
+    let waiting = setup.waiting().owned(store, principal, now);
+    let waits = waiting.waits;
     // Which of this person's sessions another started, and which lead unfinished Work in any
     // repository. Read only while one of them waits.
     let (starts, leads) = if waits.is_empty() {
@@ -1058,6 +1263,9 @@ fn waiting_actions(
                 leads && i.lead_session == wait.session && lead_order(i).is_some()
             })
             .collect::<Vec<_>>();
+        if !led.is_empty() && led.iter().all(|item| terminal.contains(&item.id)) {
+            continue;
+        }
         led.sort_by_key(|&i| lead_order(i));
         // The sessions that started this one, nearest first.
         let above = session_ancestors(&starts, &wait.session);
@@ -1145,7 +1353,7 @@ fn waiting_actions(
             limits: vec![],
         });
     }
-    Ok(actions)
+    Ok((actions, waiting.complete))
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -1176,6 +1384,94 @@ pub fn render_compact_text(status: &ActionableStatus) -> String {
         text.push_str("\nShowing at most six tasks and six personal actions; full captured facts and coverage remain in the structured status read.");
     }
     text
+}
+
+/// The session-start form: one line per Work and the actions that need the person. Claims,
+/// provider coverage and the evidence revision stay in `render_text` for the status tool.
+pub fn render_start_text(status: &ActionableStatus) -> String {
+    let c = &status.counts;
+    let mut lines = vec![format!(
+        "{}: {} active, {} awaiting a named party, {} blocked, {} reassessment needed; {} actions need you.",
+        status.repository,
+        c.active,
+        c.awaiting_party,
+        c.blocked,
+        c.reassessment_needed,
+        c.needs_you
+    )];
+    // Unassigned stale reassessments have no decision for this session. Keep live holds and
+    // named actions visible, and leave every captured row in the detailed status tool.
+    let dormant = |row: &&StatusWork| {
+        row.state == StatusState::ReassessmentNeeded
+            && row.freshness != ClaimStatus::Active
+            && !row.needs_you
+            && row.recipient.kind == RecipientKind::None
+            && row.operational.reservation.status != ReservationStatus::Held
+    };
+    let collapsed = status.work.iter().filter(dormant).count();
+    if collapsed > 0 {
+        lines.push(format!(
+            "{collapsed} stale unassigned reassessment item(s) summarized; read agentscm_work_status for their retained claims."
+        ));
+    }
+    let mut work: Vec<_> = status.work.iter().filter(|row| !dormant(row)).collect();
+    work.sort_by_key(|row| {
+        (
+            !row.needs_you,
+            row.operational.reservation.status != ReservationStatus::Held,
+            row.state == StatusState::ReassessmentNeeded,
+        )
+    });
+    for row in work.iter().take(6) {
+        let state = match row.state {
+            StatusState::Active => "active",
+            StatusState::AwaitingParty => "awaiting a named party",
+            StatusState::Blocked => "blocked",
+            StatusState::ReassessmentNeeded => "reassessment needed",
+            StatusState::Retired => "retired",
+        };
+        let claim = match row.freshness {
+            ClaimStatus::Active => String::new(),
+            other => format!("; claim {other:?}"),
+        };
+        let stage = match row.stage.as_ref().map(|s| (s.stage, s.pull_request)) {
+            Some((WorkStage::PullRequestMerged, Some(n))) => format!("; pull request #{n} merged"),
+            Some((WorkStage::PullRequestOpen, Some(n))) => format!("; pull request #{n} open"),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "- {} [{state}; {}{claim}{stage}]: {}",
+            crate::hub::advice::sanitize(&row.title, 80),
+            crate::hub::advice::sanitize(&recipient_label(&row.recipient), 64),
+            crate::hub::advice::sanitize(&row.action, 160)
+        ));
+    }
+    if work.len() > 6 {
+        lines.push(format!(
+            "- and {} more in agentscm_work_status.",
+            work.len() - 6
+        ));
+    }
+    let needs_you: Vec<_> = status.actions.iter().filter(|a| a.needs_you).collect();
+    lines.extend(
+        needs_you
+            .iter()
+            .take(6)
+            .map(|a| crate::hub::advice::sanitize(&a.action, 200)),
+    );
+    if needs_you.len() > 6 {
+        lines.push(format!(
+            "And {} more actions need you; see agentscm_work_status.",
+            needs_you.len() - 6
+        ));
+    }
+    if !status.complete {
+        lines.push(
+            "Coverage incomplete: these counts can miss Work, so missing signals remain unknown."
+                .into(),
+        );
+    }
+    lines.join("\n")
 }
 
 pub fn render_text(status: &ActionableStatus) -> String {
@@ -1351,6 +1647,83 @@ fn dependency_actions(
     Ok((actions, limits))
 }
 
+/// Observe owner-readable declarations, then project existing durable receipt facts.
+fn notice_recovery_actions(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    viewer: &str,
+    now: i64,
+) -> Result<(Vec<StatusAction>, BTreeSet<String>)> {
+    let mut limits = BTreeSet::new();
+    let mut after = None;
+    let mut refreshed = false;
+    for _ in 0..16 {
+        match store.notice_owner_refresh(reader, after.as_deref(), 100, now) {
+            Ok(page) => {
+                if !page.coverage_complete {
+                    limits.insert("dependency_refresh_incomplete".into());
+                }
+                if page.complete {
+                    refreshed = true;
+                    break;
+                }
+                after = page.next_after;
+                if after.is_none() {
+                    break;
+                }
+            }
+            Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+            Err(_) => {
+                limits.insert("dependency_refresh_unavailable".into());
+                break;
+            }
+        }
+    }
+    if !refreshed {
+        limits.insert("dependency_refresh_incomplete".into());
+    }
+    let notices = match store.notice_owner_pending(reader, now) {
+        Ok(notices) => notices,
+        Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
+        Err(_) => {
+            limits.insert("notice_receipts_unavailable".into());
+            return Ok((vec![], limits));
+        }
+    };
+    let mut actions = vec![];
+    for notice in notices
+        .into_iter()
+        .filter(|notice| notice.needs_recovery(now))
+    {
+        use crate::hub::notices::SourceKind;
+        let work_ids = notice.recipient.work_id.iter().cloned().collect::<Vec<_>>();
+        let id = match (
+            &notice.source.kind,
+            &notice.recipient.work_id,
+            notice.recipient.generation,
+        ) {
+            (SourceKind::Coordination, Some(work), Some(generation)) => {
+                format!("request:{}:{work}:{generation}", notice.source.id)
+            }
+            (SourceKind::Operational, Some(work), Some(generation)) => {
+                format!("session-ended:{work}:{generation}")
+            }
+            _ => format!("notice:{}", notice.id),
+        };
+        let terminal = notice.terminal_at.is_some();
+        let label = if terminal {
+            "The recipient session ended"
+        } else {
+            "The recipient has not acknowledged this notice by its fixed pickup deadline"
+        };
+        actions.push(StatusAction{id,kind:if notice.source.kind==SourceKind::Operational {"session_recovery"} else {"notice_not_picked_up"}.into(),
+            work_ids,recipients:vec![StatusRecipient{kind:RecipientKind::Person,owner:Some(viewer.into()),login:None,agent:None}],needs_you:true,
+            action:format!("{label}. Review the current source {} and its permitted recovery action. Queued or offered delivery is not recipient acknowledgement; this notice grants no resume, replacement, edit or merge authority.",notice.source.id),
+            updated_seq:0,semantic_version:Some(notice.source.version),session:None,limits:vec![]});
+    }
+    Ok((actions, limits))
+}
+
 /// Requests still waiting for an answer from the lead agent they were sent to. An answer is
 /// that agent's to give, not its person's, and `holding` is the Work that still holds its scope:
 /// once the target holds nothing the asker's next start takes the scope, so nothing waits. The
@@ -1361,11 +1734,24 @@ fn dependency_actions(
 /// reads too, says why it waits and when it is raised. `live` holds the keys of the live
 /// sessions, or is `None` when that list was incomplete: a quiet Work whose lead session is live
 /// can still answer, and one whose session is not in a complete list cannot.
+#[cfg(test)]
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
     holding: &BTreeSet<&str>,
     live: Option<&BTreeSet<String>>,
+    viewer: &str,
+    now: i64,
+) -> Vec<StatusAction> {
+    request_actions_with_terminal(inbox, items, holding, live, &BTreeSet::new(), viewer, now)
+}
+
+fn request_actions_with_terminal(
+    inbox: &CoordinationInbox,
+    items: &BTreeMap<String, WorkItem>,
+    holding: &BTreeSet<&str>,
+    live: Option<&BTreeSet<String>>,
+    terminal: &BTreeSet<String>,
     viewer: &str,
     now: i64,
 ) -> Vec<StatusAction> {
@@ -1406,15 +1792,14 @@ fn request_actions(
                     && a.agent == target.lead
             });
             let due = request.created_at + ACK_BOUND_SECS;
-            // Between two agents of one person the asking agent asks that person in its session,
-            // so the request never becomes their action too.
-            let one_person = request.requester.owner == target.lead.owner;
-            // An incomplete receipt page proves no missing acknowledgement.
+            let ended = terminal.contains(&target.work_id);
+            let unreachable = item.lead_idle()
+                && live.is_some_and(|keys| {
+                    !keys.contains(&session_key(&item.lead_token, &item.lead_session))
+                });
+            // Activity, a shared owner and old process facts do not prove recipient uptake.
             let stuck = request.acknowledgements_complete
-                && !acknowledged
-                && !one_person
-                && !item.lead_idle()
-                && now >= due;
+                && (ended || (now >= due && (!acknowledged || unreachable)));
             let mut files = target
                 .reasons
                 .iter()
@@ -1449,10 +1834,16 @@ fn request_actions(
             };
             let (recipients, needs_you, action) = if stuck {
                 let needs_you = people.iter().any(|p| p.owner.as_deref() == Some(viewer));
-                let action = format!(
-                    "{about} Its lead agent has not responded to it since it was made at Unix {}, though its Work is live, so it is raised to {to}: answer it for that agent from the Hub's Inbox, or release that Work's hold so the asker's next agentscm_start takes the files.",
-                    request.created_at
-                );
+                let action = if ended {
+                    format!(
+                        "{about} Its current lead session ended while this Work retains the requested files. {to} must review the permitted resume or recovery action, or release the hold. No replacement session or takeover is authorized by this notice."
+                    )
+                } else {
+                    format!(
+                        "{about} Its lead agent has not responded to it since it was made at Unix {}, so it is raised to {to}: review its permitted response or recovery action, or release that Work's hold so the asker's next agentscm_start takes the files.",
+                        request.created_at
+                    )
+                };
                 (people, needs_you, action)
             } else {
                 let why = if acknowledged {
@@ -1469,8 +1860,6 @@ fn request_actions(
                     "Its lead is not running, so it is not raised in Needs you; its Work row says whether its hold lapses or is retained.".to_owned()
                 } else if !request.acknowledgements_complete {
                     "Its receipts are not all read, so whether its lead acknowledged it is not known.".to_owned()
-                } else if one_person {
-                    "Both agents are one person's, so it is not raised in Needs you: the asking agent asks its person in its session.".to_owned()
                 } else {
                     format!(
                         "Its lead has not acknowledged it; if it still has not at Unix {due}, it is raised to {to}."
@@ -1490,7 +1879,10 @@ fn request_actions(
                 limits.push("request_acknowledgements_truncated".to_owned());
             }
             actions.push(StatusAction {
-                id: format!("request:{}:{}", request.id, target.work_id),
+                id: format!(
+                    "request:{}:{}:{}",
+                    request.id, target.work_id, target.generation
+                ),
                 kind: "directed_request".into(),
                 work_ids: vec![target.work_id.clone()],
                 needs_you,
@@ -1552,6 +1944,301 @@ mod tests {
             "scope":["src/example.rs"], "branch":null,"worktree":null,"next_action":null,"current":null,"blocker":null,
             "depends_on":[],"related_work":[],"created_at":100,"updated_at":100,"created_seq":1,"updated_seq":1
         })).unwrap()
+    }
+
+    fn queue_action(id: String, kind: &str, bytes: usize) -> StatusAction {
+        StatusAction {
+            id,
+            kind: kind.into(),
+            work_ids: vec![],
+            recipients: vec![],
+            needs_you: true,
+            action: "a".repeat(bytes),
+            updated_seq: 1,
+            semantic_version: None,
+            session: None,
+            limits: vec![],
+        }
+    }
+
+    #[test]
+    fn invalidation_notice_folds_into_the_matching_failed_check_only() {
+        let principal = Principal {
+            token_id: "tok_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            name: "reader".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(101),
+            expires_at: 1_000,
+            read_only: true,
+            owner: crate::hub::store::User {
+                id: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                identity: ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: "alice".into(),
+                name: None,
+                disabled: false,
+            },
+        };
+        let mut actions = vec![StatusAction {
+            id: "check:repo:42:agentscm/local-validation".into(),
+            kind: "failed_check".into(),
+            work_ids: vec![],
+            recipients: vec![],
+            needs_you: true,
+            action: "Required check agentscm/local-validation reports failure on pull request #42; fix or rerun it before merging.".into(),
+            updated_seq: 0,
+            semantic_version: Some("check-v1".into()),
+            session: None,
+            limits: vec![],
+        }];
+        project_owner_notice(
+            &mut actions,
+            &principal,
+            crate::hub::notices::OwnerNotice {
+                id: "ont_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                idempotency_key: "validation-42".into(),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: "pr:42:local-validation:policy:evidence:trusted".into(),
+                sender_owner: "hub".into(),
+                sender_token: "hub:validation".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: principal.owner.id.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                repository: principal.repository.clone(),
+                repository_id: principal.repository_id,
+                body: "Update from the base branch and submit a new attestation.".into(),
+                created_at: 100,
+                delivery_attempts: vec![],
+                delivered_at: None,
+                delivery: None,
+                acknowledged_at: None,
+                acted_at: None,
+            },
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "failed_check");
+        assert!(
+            actions[0]
+                .action
+                .ends_with("Update from the base branch and submit a new attestation.")
+        );
+        assert_ne!(actions[0].semantic_version.as_deref(), Some("check-v1"));
+
+        let mut near_match = actions;
+        project_owner_notice(
+            &mut near_match,
+            &principal,
+            crate::hub::notices::OwnerNotice {
+                id: "ont_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                idempotency_key: "validation-4".into(),
+                source_kind: OwnerNoticeSourceKind::AttestationInvalidation,
+                source_id: "pr:4:transition:policy".into(),
+                sender_owner: "hub".into(),
+                sender_token: "hub:validation".into(),
+                recipient: crate::hub::notices::OwnerNoticeRecipient {
+                    owner: principal.owner.id.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                },
+                route: crate::hub::notices::OwnerNoticeRoute::Private,
+                repository: principal.repository.clone(),
+                repository_id: principal.repository_id,
+                body: "Pull request #4 needs a new attestation.".into(),
+                created_at: 101,
+                delivery_attempts: vec![],
+                delivered_at: None,
+                delivery: None,
+                acknowledged_at: None,
+                acted_at: None,
+            },
+        );
+        assert_eq!(near_match.len(), 2, "PR #4 must not fold into PR #42");
+        assert_eq!(near_match[1].kind, "owner_notice");
+    }
+
+    #[test]
+    fn busy_status_keeps_every_wait_beyond_both_general_action_limits() {
+        let mut actions = (0..240)
+            .map(|n| queue_action(format!("first:{n:03}"), "directed_request", 10))
+            .collect::<Vec<_>>();
+        actions.extend(
+            (0..256)
+                .map(|n| queue_action(format!("waiting:question:{n:03}"), "session_waiting", 400)),
+        );
+        assert!(limit_actions(&mut actions));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind == "session_waiting")
+                .count(),
+            256
+        );
+        assert_eq!(actions.len(), 456);
+        // The response byte limit used to pop the last alphabetic actions, which are waits.
+        for action in actions
+            .iter_mut()
+            .filter(|action| action.kind != "session_waiting")
+        {
+            action.action = "a".repeat(5_000);
+        }
+        let mut status = ActionableStatus {
+            schema_version: 1,
+            repository: "acme/widgets".into(),
+            repository_id: Some(7),
+            provider: "github".into(),
+            host: "github.com".into(),
+            viewer_owner: "usr_me".into(),
+            counts: StatusCounts {
+                needs_you: actions.len(),
+                ..Default::default()
+            },
+            work: vec![],
+            actions,
+            observed_at: 1_000,
+            complete: true,
+            atomic_snapshot: false,
+            limits: vec![],
+            digest: String::new(),
+        };
+        bound_response(&mut status).unwrap();
+        assert!(!status.complete);
+        assert!(
+            status
+                .limits
+                .iter()
+                .any(|limit| limit == "status_response_budget_truncated")
+        );
+        assert_eq!(
+            status
+                .actions
+                .iter()
+                .filter(|action| action.kind == "session_waiting")
+                .count(),
+            256
+        );
+        assert_eq!(status.counts.needs_you, status.actions.len());
+        assert!(serde_json::to_vec(&status).unwrap().len() <= 767 * 1024);
+        status
+            .actions
+            .retain(|action| action.kind == "session_waiting");
+        for action in &mut status.actions {
+            action.action = "a".repeat(5_000);
+        }
+        assert!(matches!(
+            bound_response(&mut status),
+            Err(HubError::Unavailable(_))
+        ));
+        assert_eq!(status.actions.len(), 256);
+    }
+
+    #[test]
+    fn sqlite_status_returns_all_accepted_human_waits_above_two_hundred() {
+        use crate::hub::session_waiting::GRACE_SECONDS;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 812,
+                },
+                "viewer",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let viewer = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let observations = Observations::default();
+        for n in 0..256 {
+            let native = format!("session-{n}");
+            observations
+                .waiting()
+                .record(
+                    &viewer,
+                    &native,
+                    &native,
+                    "codex",
+                    WaitReason::Question,
+                    None,
+                    Some("Choose a format"),
+                    now - GRACE_SECONDS,
+                )
+                .unwrap();
+        }
+        let token = super::read(&*store, &observations, &viewer, now).unwrap();
+        let person =
+            super::read_person(&*store, &observations, &user, "acme/widgets", 101, now).unwrap();
+        for status in [token, person] {
+            assert_eq!(
+                status
+                    .actions
+                    .iter()
+                    .filter(|action| action.kind == "session_waiting")
+                    .count(),
+                256
+            );
+            assert_eq!(status.counts.needs_you, 256);
+            assert!(
+                !status
+                    .limits
+                    .iter()
+                    .any(|limit| limit == "status_actions_truncated")
+            );
+        }
+        assert!(matches!(
+            observations.waiting().questions_unavailable(
+                &*store,
+                &viewer,
+                "unavailable",
+                "unavailable",
+                now
+            ),
+            Err(HubError::Busy)
+        ));
+        let token = super::read(&*store, &observations, &viewer, now).unwrap();
+        let person =
+            super::read_person(&*store, &observations, &user, "acme/widgets", 101, now).unwrap();
+        for status in [token, person] {
+            assert!(!status.complete);
+            assert!(
+                status
+                    .limits
+                    .iter()
+                    .any(|limit| limit == "session_waiting_unavailable")
+            );
+            assert_eq!(
+                status
+                    .actions
+                    .iter()
+                    .filter(|action| action.kind == "session_waiting")
+                    .count(),
+                256,
+            );
+            assert_eq!(status.counts.needs_you, 256);
+        }
     }
     fn op(item: &WorkItem, held: bool, merged: bool) -> WorkOperationalV1 {
         work_operational(&OperationalFacts {
@@ -1729,6 +2416,8 @@ mod tests {
                         transition,
                         reason: "Synthetic disposition".into(),
                         superseded_by: None,
+                        participants: Vec::new(),
+                        paths: Vec::new(),
                     },
                     now,
                 )
@@ -2146,6 +2835,144 @@ mod tests {
     }
 
     #[test]
+    fn an_open_pull_request_reads_as_waiting_not_as_a_quiet_claim() {
+        let open = |number, stage| {
+            Some(WorkStageV1 {
+                stage,
+                pull_request: Some(number),
+                basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+            })
+        };
+        let read = |item: &WorkItem, wait, stage| {
+            project_work_staged(item, op(item, false, false), None, wait, "usr_owner", stage)
+        };
+        let mut paused = item(WorkState::Paused);
+        let mut stale = item(WorkState::Active);
+        stale.claim_status = ClaimStatus::Stale;
+        paused.claim_status = ClaimStatus::Active;
+        let waits = |row: &StatusWork| {
+            assert_eq!(row.state, StatusState::Active);
+            assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+            assert!(!row.needs_you);
+            assert!(row.action.contains("Pull request #12 is open"));
+            assert!(row.action.contains("not whether its checks pass"));
+            assert_eq!(
+                row.stage.as_ref().map(|s| (s.stage, s.pull_request)),
+                Some((WorkStage::PullRequestOpen, Some(12)))
+            );
+        };
+        for (item, wait) in [(&paused, NotWaiting), (&stale, NotWaiting)] {
+            let row = read(item, wait, open(12, WorkStage::PullRequestOpen));
+            waits(&row);
+            assert_eq!(row.freshness, item.claim_status);
+        }
+        let unknown = read(
+            &stale,
+            LeadWait::Unknown,
+            open(12, WorkStage::PullRequestOpen),
+        );
+        waits(&unknown);
+        assert_eq!(unknown.freshness, ClaimStatus::Unknown);
+        assert!(unknown.limits.contains(&"lead_wait_unknown".into()));
+        // Anything but an observed open pull request keeps the reassessment.
+        for stage in [
+            open(12, WorkStage::Unknown),
+            Some(WorkStageV1 {
+                stage: WorkStage::Working,
+                pull_request: None,
+                basis: None,
+            }),
+            open(12, WorkStage::PullRequestMerged),
+            None,
+        ] {
+            for wait in [NotWaiting, LeadWait::Unknown] {
+                let row = read(&paused, wait, stage.clone());
+                assert_eq!(row.state, StatusState::ReassessmentNeeded, "{stage:?}");
+                assert!(!row.action.contains("Pull request #"));
+            }
+        }
+        // A live wait and a handover still win over the observed pull request.
+        let row = read(
+            &paused,
+            LeadWait::Waiting(WaitReason::Question),
+            open(12, WorkStage::PullRequestOpen),
+        );
+        assert_eq!(row.state, StatusState::AwaitingParty);
+        assert!(!row.action.contains("Pull request #"));
+        let handover = item(WorkState::Handover);
+        let row = read(&handover, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert_eq!(row.state, StatusState::AwaitingParty);
+        assert!(row.action.contains("handover"));
+        assert!(!row.action.contains("Pull request #"));
+        // A merged pull request and a reported blocker still win; live Work keeps its own text.
+        let merged = project_work_staged(
+            &paused,
+            op(&paused, false, true),
+            None,
+            NotWaiting,
+            "usr_owner",
+            open(12, WorkStage::PullRequestOpen),
+        );
+        assert_eq!(merged.state, StatusState::ReassessmentNeeded);
+        assert!(merged.action.starts_with("Its pull request merged"));
+        let blocked = item(WorkState::Blocked);
+        let row = read(&blocked, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert_eq!(row.state, StatusState::Blocked);
+        let live = item(WorkState::Active);
+        let row = read(&live, NotWaiting, open(12, WorkStage::PullRequestOpen));
+        assert!(row.action.starts_with("Continue the reported work"));
+    }
+
+    #[test]
+    fn unavailable_provider_coverage_keeps_the_reassessment_over_an_open_pull_request() {
+        use crate::hub::work_reconciliation::{
+            SourceEvidence, WorkDeclarations, WorkDeclarationsView, reconciliation_view,
+        };
+        let mut paused = item(WorkState::Paused);
+        paused.claim_status = ClaimStatus::Active;
+        let declarations = WorkDeclarationsView {
+            schema_version: 2,
+            work_id: paused.id.clone(),
+            generation: paused.generation,
+            updated_seq: paused.updated_seq,
+            declaration_seq: 1,
+            compatibility_link: None,
+            declarations: WorkDeclarations::default(),
+        };
+        let mut evidence: ReconciliationEvidence = serde_json::from_value(json!({
+            "provider":"github", "host":"github.com", "repository_id":1,
+            "merge_through":0,"merge_floor":0,"sources":[],"pulls":[],"prerequisites":[]
+        }))
+        .unwrap();
+        evidence.sources = ["forge_pull", "tracked_publication"]
+            .into_iter()
+            .map(|source| SourceEvidence {
+                source: source.into(),
+                state: "unavailable".into(),
+                checked_at_seconds: 1,
+                unread_pages: 0,
+                deferred: 0,
+            })
+            .collect();
+        let view = reconciliation_view(&paused, &declarations, &evidence, None);
+        let row = project_work_staged(
+            &paused,
+            op(&paused, false, false),
+            Some(view),
+            NotWaiting,
+            "usr_owner",
+            Some(WorkStageV1 {
+                stage: WorkStage::PullRequestOpen,
+                pull_request: Some(12),
+                basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+            }),
+        );
+        assert!(row.limits.contains(&"provider_coverage_unavailable".into()));
+        assert_eq!(row.state, StatusState::ReassessmentNeeded);
+        assert!(!row.action.contains("Pull request #"));
+    }
+
+    #[test]
     fn a_waiting_lead_session_reads_as_waiting_not_as_a_quiet_claim() {
         let mut item = item(WorkState::Active);
         item.claim_status = ClaimStatus::Stale;
@@ -2346,6 +3173,7 @@ mod tests {
             source_refs: vec![],
             depends_on: vec![],
             related_work: vec![],
+            finished_paths: None,
         };
         store
             .work_checkpoint(&principal.token_id, &checkpoint, now)
@@ -2711,6 +3539,7 @@ mod tests {
                 .skill_evidence_add(&EvidenceRow {
                     id: format!("evd_{n}"),
                     repository: "acme/widgets".into(),
+                    repository_scope: crate::hub::store::principal_scope(store, who).unwrap(),
                     branch: branch.into(),
                     run_id: run_id_of("acme/widgets", branch, "pr-gate"),
                     skill: "pr-gate".into(),
@@ -3516,7 +4345,9 @@ mod tests {
                 now - GRACE_SECONDS,
             )
             .unwrap();
-        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        let (actions, complete) =
+            waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        assert!(complete);
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             actions[0].action.contains("on “Current task”"),
@@ -3550,7 +4381,9 @@ mod tests {
                 now - GRACE_SECONDS,
             )
             .unwrap();
-        let actions = waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        let (actions, complete) =
+            waiting_actions(&*store, &observations, &viewer, &items, now).unwrap();
+        assert!(complete);
         let started = actions
             .iter()
             .find(|a| a.action.contains("started under"))
@@ -3728,6 +4561,119 @@ mod tests {
         on_postgres(lead_wait_contract);
     }
 
+    /// Quiet Work whose branch has an open pull request reads as waiting on it, and as
+    /// reassessment again once that pull request closes unmerged.
+    fn open_pull_request_contract(store: &dyn Store) {
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 612,
+                },
+                "shipper",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            store,
+            &user.id,
+            "shipper-laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let who = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "ship-it", "title": "Ship it", "session": "shipping",
+            "scope": ["src/ship.rs"], "branch": "feat/ship"
+        }))
+        .unwrap();
+        let work = store.work_start(&who.token_id, &request, now).unwrap().item;
+        let connection = store
+            .insert_connection(
+                &crate::hub::connection::NewConnection {
+                    id: store::new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("robot".into()),
+                },
+                &user.id,
+            )
+            .unwrap();
+        let repository = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let later = now + crate::hub::work::CLAIM_STALE_SECONDS + 60;
+        let observations = Observations::default();
+        let read = || {
+            let status = super::read(store, &observations, &who, later).unwrap();
+            status
+                .work
+                .into_iter()
+                .find(|w| w.work_id == work.id)
+                .unwrap()
+        };
+        let observe = |state: &str| {
+            let data = json!({"number": 12, "state": state, "repository_id": 101,
+                "head_ref": "feat/ship", "head_sha": "a".repeat(40), "base_ref": "main",
+                "head_repository_id": 101})
+            .to_string();
+            store
+                .observe(&repository.id, "pull_request", "12", &data, now + 1)
+                .unwrap();
+        };
+        assert_eq!(read().state, StatusState::ReassessmentNeeded);
+        observe("open");
+        let open = read();
+        assert_eq!(open.state, StatusState::Active);
+        assert_eq!(open.recipient.kind, RecipientKind::LeadAgent);
+        assert!(!open.needs_you);
+        assert!(open.action.contains("Pull request #12 is open"));
+        let person = read_person(store, &user, "acme/widgets", 101, later).unwrap();
+        let through_person = person.work.iter().find(|w| w.work_id == work.id).unwrap();
+        assert_eq!(through_person.state, StatusState::Active);
+        assert!(through_person.action.contains("Pull request #12 is open"));
+        let stage = open.stage.unwrap();
+        assert_eq!(stage.stage, WorkStage::PullRequestOpen);
+        assert_eq!(stage.pull_request, Some(12));
+        observe("closed");
+        let closed = read();
+        assert_eq!(closed.state, StatusState::ReassessmentNeeded);
+        assert!(!closed.action.contains("Pull request #"));
+    }
+
+    #[test]
+    fn sqlite_an_open_pull_request_reads_as_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        open_pull_request_contract(&*store);
+    }
+
+    #[test]
+    fn an_open_pull_request_reads_as_waiting_on_postgres() {
+        on_postgres(open_pull_request_contract);
+    }
+
     #[test]
     fn sqlite_failed_checks_and_stopped_gates_reach_their_owner() {
         let dir = tempfile::tempdir().unwrap();
@@ -3822,6 +4768,7 @@ mod tests {
                         source_refs: vec![],
                         depends_on: vec![],
                         related_work: vec![],
+                        finished_paths: None,
                     },
                     now,
                 )
@@ -3829,7 +4776,7 @@ mod tests {
         };
         let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
         report(&paused, CheckpointKind::Pause, "pause");
-        // The one thing here that asks a person: Work its agent reported blocked.
+        // Blocked Work asks its person; unacknowledged requests also escalate after their deadline.
         let blocked: WorkStart = serde_json::from_value(json!({
             "request_key": "Blocked own work-viewer", "title": "Blocked own work",
             "session": "viewer-blocked", "scope": ["src/blocked.rs"]
@@ -3926,9 +4873,9 @@ mod tests {
             text
         };
         assert_eq!(overlap_text(&status), overlap_text(&fixture));
-        // The paused Work, the request to it, the shared file and the pull request over a held
-        // file are for agents to settle, so none of them counts.
-        assert_eq!(status.counts.needs_you, 1);
+        // The overdue directed request and blocked Work ask the viewer. Quiet Work and
+        // unrelated file/PR overlaps remain listed without becoming personal actions.
+        assert_eq!(status.counts.needs_you, 2);
         assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
         let mut personal = status
             .work
@@ -3944,22 +4891,47 @@ mod tests {
             )
             .collect::<Vec<_>>();
         personal.sort();
-        assert_eq!(personal, std::slice::from_ref(&blocked.id));
-        // The request to the viewer's paused Work is still listed, for its lead agent.
         let request = format!(
-            "request:{}:{}",
+            "request:{}:{}:{}",
             to_viewer.coordination_request.unwrap().id,
-            paused.id
+            paused.id,
+            paused.generation
         );
+        let mut expected = vec![blocked.id.clone(), request.clone()];
+        expected.sort();
+        assert_eq!(personal, expected);
         let listed = status.actions.iter().find(|a| a.id == request).unwrap();
-        assert_eq!(listed.recipients[0].kind, RecipientKind::LeadAgent);
+        assert_eq!(listed.recipients[0].kind, RecipientKind::Person);
+        // Missing question coverage leaves Work and directed requests available to the viewer.
+        let observations = Observations::default();
+        observations
+            .waiting()
+            .questions_unavailable(store, &viewer, "unavailable", "unavailable", later)
+            .unwrap();
+        let incomplete = super::read(store, &observations, &viewer, later).unwrap();
+        assert!(!incomplete.complete);
+        assert!(
+            incomplete
+                .limits
+                .iter()
+                .any(|limit| limit == "session_waiting_unavailable")
+        );
+        assert_eq!(
+            attention_signature(&incomplete),
+            attention_signature(&status)
+        );
+        assert!(incomplete.actions.iter().any(|action| action.id == request));
+        observations
+            .waiting()
+            .cleared(store, &viewer, "unavailable", later)
+            .unwrap();
         assert!(status.actions.iter().any(|a| {
             a.id == format!("pr:{}:7", repo.id) && a.recipients[0].kind == RecipientKind::LeadAgent
         }));
         assert_eq!(
             read(store, &third, later).unwrap().counts.needs_you,
-            0,
-            "the third person's quiet Work, request, file and pull request ask nobody"
+            1,
+            "the third person's overdue request asks that person, not the viewer"
         );
         // Once the paused Work's hold has lapsed nothing waits on the request to it.
         let lapsed = now + crate::hub::work_lifecycle::LEASE_SECONDS + 1;
@@ -3988,22 +4960,22 @@ mod tests {
             read(store, &viewer, later).unwrap()
         };
         let aside = set_aside(row.updated_seq, None);
-        assert_eq!(aside.counts.needs_you, 0);
+        assert_eq!(aside.counts.needs_you, 1, "the overdue request remains");
         assert_ne!(aside.digest, status.digest, "a reader sees the change");
         assert_eq!(
             set_aside(row.updated_seq, Some(later + 60))
                 .counts
                 .needs_you,
-            0
+            1
         );
         assert_eq!(
             set_aside(row.updated_seq - 1, None).counts.needs_you,
-            1,
+            2,
             "a changed item returns"
         );
         assert_eq!(
             set_aside(row.updated_seq, Some(later)).counts.needs_you,
-            1,
+            2,
             "an ended snooze returns"
         );
     }
@@ -4077,6 +5049,7 @@ mod tests {
                             source_refs: vec![],
                             depends_on: vec![],
                             related_work: vec![],
+                            finished_paths: None,
                         },
                         now,
                     )
@@ -4209,6 +5182,7 @@ mod tests {
                 kind: crate::hub::coordination::CoordinationResponseKind::Decline,
                 note: None,
                 via: None,
+                released_paths: Vec::new(),
                 created_at: 100,
                 seq: 2,
             });
@@ -4312,7 +5286,7 @@ mod tests {
         );
         // A quiet lead whose session is not live will not answer; no lapse is promised.
         item.claim_status = ClaimStatus::Stale;
-        let quiet = actions(&request, &item, "usr_owner", due);
+        let quiet = actions(&request, &item, "usr_owner", due - 1);
         assert!(!quiet.needs_you);
         assert_eq!(quiet.recipients[0].kind, RecipientKind::LeadAgent);
         let with_live = |live: Option<&BTreeSet<String>>| {
@@ -4323,7 +5297,7 @@ mod tests {
                 &holding,
                 live,
                 "usr_owner",
-                due,
+                due - 1,
             )
             .remove(0)
             .action
@@ -4340,17 +5314,32 @@ mod tests {
         assert!(said.contains("its session is live"), "{said}");
         assert!(!said.contains("not running"), "{said}");
         assert!(with_live(None).contains("is unknown"));
-        // Between two agents of one person the asking agent asks that person in its session.
+        // Sharing one owner does not establish uptake by either agent.
         item.claim_status = ClaimStatus::Active;
         let mut own = request.clone();
         own.requester.owner = "usr_lead".into();
-        let own = actions(&own, &item, "usr_lead", due);
-        assert!(!own.needs_you);
-        assert_eq!(own.recipients[0].kind, RecipientKind::LeadAgent);
+        let own_action = actions(&own, &item, "usr_lead", due);
+        assert!(own_action.needs_you);
+        assert_eq!(own_action.recipients[0].kind, RecipientKind::Person);
+        let ended = BTreeSet::from([id.clone()]);
+        let items = BTreeMap::from([(id.clone(), item.clone())]);
+        let closed = request_actions_with_terminal(
+            &inbox(own),
+            &items,
+            &holding,
+            None,
+            &ended,
+            "usr_lead",
+            100,
+        );
+        assert_eq!(closed.len(), 1);
         assert!(
-            own.action.contains("Both agents are one person's"),
-            "{}",
-            own.action
+            closed[0].needs_you,
+            "positive terminal state asks immediately, before deadline"
+        );
+        assert_eq!(
+            closed[0].id,
+            format!("request:{}:{}:{}", request.id, id, item.generation)
         );
     }
 
@@ -4391,7 +5380,10 @@ mod tests {
         let request = refused
             .coordination_request
             .expect("the start files a request");
-        let id = format!("request:{}:{}", request.id, release.id);
+        let id = format!(
+            "request:{}:{}:{}",
+            request.id, release.id, release.generation
+        );
         let row = |status: &ActionableStatus| {
             status.actions.iter().find(|a| a.id == id).cloned().unwrap()
         };
@@ -4613,6 +5605,21 @@ mod tests {
                 .limits
                 .contains(&"reservation_holders_truncated".into())
         );
+        // The start form names six Works, counts the rest and keeps the incomplete note.
+        let start = render_start_text(&status);
+        assert_eq!(
+            start
+                .lines()
+                .filter(|l| l.starts_with("- Synthetic"))
+                .count(),
+            6
+        );
+        assert!(
+            start.contains(&format!("- and {} more", MAX_STATUS_WORK - 6)),
+            "{start}"
+        );
+        assert!(start.contains("Coverage incomplete"), "{start}");
+        assert!(!start.contains("Evidence revision"), "{start}");
         assert!(
             status
                 .work
@@ -4620,6 +5627,52 @@ mod tests {
                 .all(|rows| rows[0].work_id < rows[1].work_id)
         );
     }
+    #[test]
+    fn startup_collapses_only_unassigned_stale_rows_and_bounds_visible_text() {
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let mut stale = status.work[0].clone();
+        stale.title = "Dormant history".into();
+        stale.state = StatusState::ReassessmentNeeded;
+        stale.freshness = ClaimStatus::Stale;
+        stale.needs_you = false;
+        stale.recipient = StatusRecipient::none();
+        stale.operational.reservation.status = ReservationStatus::Lapsed;
+        status.work = vec![stale.clone(); 30];
+        let mut held = stale.clone();
+        held.title = "Live reservation".into();
+        held.operational.reservation.status = ReservationStatus::Held;
+        status.work.push(held);
+        let mut addressed = stale;
+        addressed.title = "Named reassessment".into();
+        addressed.needs_you = true;
+        addressed.recipient.kind = RecipientKind::Person;
+        status.work.push(addressed);
+        status.counts.reassessment_needed = status.work.len();
+        status.counts.active = 0;
+        status.counts.blocked = 0;
+        status.counts.awaiting_party = 0;
+        status.counts.needs_you = 2;
+        status.actions = vec![queue_action("long".into(), "session_waiting", 10_000)];
+        status.actions[0].action = format!("{}\nInjected row", "😀".repeat(10_000));
+        let before = status.clone();
+        let text = render_start_text(&status);
+        assert!(
+            text.contains("30 stale unassigned reassessment item(s) summarized"),
+            "{text}"
+        );
+        assert!(text.contains("agentscm_work_status"));
+        assert!(!text.contains("Dormant history"));
+        assert!(text.contains("Live reservation") && text.contains("Named reassessment"));
+        assert!(text.find("Named reassessment") < text.find("Live reservation"));
+        assert!(!text.contains("Injected row"));
+        assert!(text.encode_utf16().count() < 1_500);
+        assert_eq!(
+            status, before,
+            "startup presentation must not change retained facts"
+        );
+    }
+
     #[test]
     fn frozen_surface_fixture_matches_work_projection_and_text() {
         let fixture: ActionableStatus =
@@ -5126,6 +6179,7 @@ mod tests {
             .coordination_reply(
                 &a.token_id,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: current.id.clone(),
                     operation_id: "decline".into(),
                     target_work_id: target.id,

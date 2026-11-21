@@ -251,7 +251,7 @@ fn stable(text: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_start_carries_the_block_between_the_status_and_the_shared_work() {
+async fn session_start_keeps_coordination_summary_before_operator_data() {
     let (url, seen) = answering_source().await;
     let hub = Hub::start(Some(&url)).await;
     let secret = hub.token(false);
@@ -260,17 +260,14 @@ async fn session_start_carries_the_block_between_the_status_and_the_shared_work(
     let (before, after) = text
         .split_once(HEADER)
         .unwrap_or_else(|| panic!("no block in {text}"));
-    // Each line is marked as the Hub's own list item under the header that calls it data.
-    let lines = format!("\n- {}\n- {}\nAgentSCM shared work", LINES[0], LINES[1]);
+    // Optional operator data follows the coordination summary and coverage, so it cannot
+    // push an active overlap out of the host's startup context budget.
+    assert!(before.contains("actions need you."), "{text}");
+    assert!(before.contains("AgentSCM shared work"), "{text}");
+    assert!(before.contains("AgentSCM coverage is partial"), "{text}");
+    // Each source line is intact and marked as data under the Hub's header.
+    let lines = format!("\n- {}\n- {}", LINES[0], LINES[1]);
     assert!(after.starts_with(&lines), "{text}");
-    // After the actionable status, and never first.
-    let status = before.trim_end().lines().next_back().unwrap_or_default();
-    assert!(
-        status.starts_with("Evidence revision ")
-            || status.starts_with("Current actionable status unavailable"),
-        "{text}"
-    );
-    assert!(!before.contains("AgentSCM shared work"), "{text}");
 
     assert_eq!(seen.calls(), 1);
     let (authorization, mut body) = seen.last();

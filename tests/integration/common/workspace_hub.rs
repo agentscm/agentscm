@@ -263,7 +263,14 @@ impl Env {
             .unwrap();
         let status = callback.status().as_u16();
         if status == 302 {
-            assert_eq!(callback.headers()[header::LOCATION], "/ui/#workspace");
+            assert_eq!(
+                callback.headers()[header::LOCATION],
+                if cfg!(feature = "ui") {
+                    "/ui/#workspace"
+                } else {
+                    "/auth/complete/#workspace"
+                }
+            );
             let cookie = callback
                 .headers()
                 .get_all(header::SET_COOKIE)

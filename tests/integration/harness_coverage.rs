@@ -125,7 +125,13 @@ impl Bench {
     /// Runs the command `client setup` installs for `agent` with one payload from its host and
     /// returns what the host reads back.
     fn hook(&self, agent: &str, payload: &Value) -> Value {
+        self.hook_in(agent, payload, Path::new("."))
+    }
+
+    /// [`Self::hook`], with the hook started in `dir`, as a host starts it in its folder.
+    fn hook_in(&self, agent: &str, payload: &Value, dir: &Path) -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .current_dir(dir)
             .args(["--no-telemetry", "hook", agent, "--client-connection"])
             .env_clear()
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
@@ -191,7 +197,7 @@ impl Bench {
         // routes the same hold also came through may be listed beside it.
         let via = format!("hook:{agent}");
         self.store
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
             .unwrap()
             .into_iter()
             .filter(|intent| intent.via.contains(&via))
@@ -273,6 +279,18 @@ fn carries_rules(reply: &Value, pointer: &str) {
     assert!(agentscm::hub::agent_rules::carries_all(context), "{reply}");
 }
 
+/// Claude Code reads the rules in the MCP server's instructions, so its start context names the
+/// session and leaves them out.
+fn names_session_only(reply: &Value, pointer: &str) {
+    let context = text(reply, pointer);
+    assert!(context.contains(SESSION), "{reply}");
+    assert!(!context.contains("Required AgentSCM rules"), "{reply}");
+    assert!(
+        context.contains("agentscm MCP server's instructions"),
+        "{reply}"
+    );
+}
+
 /// A subagent's edit under its parent's session: it is not refused, and the note it gets points
 /// at the lead session without handing it the request addressed to that session.
 fn under_parent(reply: &Value, request: &str) -> bool {
@@ -329,7 +347,7 @@ fn claude_code_gets_what_its_row_says() {
             json!({"file_path": bench.file(file), "old_string": "a", "new_string": "b"});
         edit
     };
-    carries_rules(
+    names_session_only(
         &bench.hook("claude", &pascal(&bench.root, "SessionStart")),
         HOOK_CONTEXT,
     );
@@ -626,4 +644,104 @@ fn a_client_with_no_hooks_gets_what_its_row_says() {
     assert!(seen().contains("refactor docs"), "{}", seen());
     bench.tool(&bench.own, "agentscm_done", json!({}));
     assert!(!seen().contains("refactor docs"), "{}", seen());
+}
+
+/// What each agent set up from its table entry gets: its payloads are written from its vendor's
+/// docs and source, not recorded from a live run. `note` is where it takes a note before a tool
+/// call and `start` where it takes the session start context, when it takes one.
+fn table_agent_gets_what_its_row_says(agent: &str, note: Option<&str>, start: Option<&str>) {
+    let table = agentscm::clients::find(agent).unwrap().hooks.unwrap();
+    let named = |kind| {
+        table
+            .events
+            .iter()
+            .find(|(_, event, _)| *event == kind)
+            .map(|(name, ..)| *name)
+            .unwrap()
+    };
+    use agentscm::clients::Event;
+    // Junie names the session and folder only at its start.
+    let payload = |bench: &Bench, kind| {
+        let mut payload = pascal(&bench.root, named(kind));
+        if table.session_at_start_only && kind != Event::Start {
+            let object = payload.as_object_mut().unwrap();
+            object.remove("session_id");
+            object.remove("cwd");
+        }
+        payload
+    };
+    let edit = |bench: &Bench, file: &str| {
+        let mut edit = payload(bench, Event::PreTool);
+        edit["tool_name"] = json!(table.edit_tools[0]);
+        edit["tool_input"] = json!({"file_path": bench.file(file), "content": "b"});
+        edit
+    };
+    let bench = Bench::start();
+    let started = bench.hook_in(agent, &payload(&bench, Event::Start), &bench.root);
+    match start {
+        Some(pointer) => carries_rules(&started, pointer),
+        None => says_nothing(&started),
+    }
+    // The edit check runs before the write and can refuse it.
+    bench.other_holds("src/held.rs");
+    let refused = bench.hook_in(agent, &edit(&bench, "src/held.rs"), &bench.root);
+    let reason = match table.refusal {
+        agentscm::clients::Refusal::PermissionDecision => {
+            assert_eq!(
+                refused["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{refused}"
+            );
+            "/hookSpecificOutput/permissionDecisionReason"
+        }
+        agentscm::clients::Refusal::Decision => {
+            assert_eq!(refused["decision"], "deny", "{refused}");
+            "/reason"
+        }
+    };
+    assert!(text(&refused, reason).contains("src/held.rs"), "{refused}");
+    // Waiting is reported for the end of a turn and never answered.
+    let mut stop = payload(&bench, Event::Stop);
+    stop["last_assistant_message"] = json!("Done. Shall I push it?");
+    says_nothing(&bench.hook_in(agent, &stop, &bench.root));
+    bench.hook_in(agent, &edit(&bench, "src/own.rs"), &bench.root);
+    // The end of the session releases what it held.
+    assert!(bench.held_through(agent).contains(&"src/own.rs".to_owned()));
+    bench.hook_in(agent, &payload(&bench, Event::End), &bench.root);
+    let held = bench.held_through(agent);
+    assert!(held.is_empty(), "{agent} still holds {held:?}");
+
+    // Messages from the Hub arrive where the agent takes them, and never hold the edit.
+    let bench = Bench::start();
+    let request = bench.request();
+    let started = bench.hook_in(agent, &payload(&bench, Event::Start), &bench.root);
+    match start {
+        Some(pointer) => assert!(text(&started, pointer).contains(&request), "{started}"),
+        None => says_nothing(&started),
+    }
+    let noted = bench.hook_in(agent, &edit(&bench, LED), &bench.root);
+    cannot_refuse(&noted);
+    match note {
+        Some(pointer) => assert!(text(&noted, pointer).contains(&request), "{noted}"),
+        None => assert!(!noted.to_string().contains(&request), "{noted}"),
+    }
+}
+
+#[test]
+fn factory_droid_gets_what_its_row_says() {
+    table_agent_gets_what_its_row_says("droid", None, Some(HOOK_CONTEXT));
+}
+
+#[test]
+fn qwen_code_gets_what_its_row_says() {
+    table_agent_gets_what_its_row_says("qwen", Some(HOOK_CONTEXT), Some(HOOK_CONTEXT));
+}
+
+#[test]
+fn junie_cli_gets_what_its_row_says() {
+    table_agent_gets_what_its_row_says("junie", Some("/additionalContext"), None);
+}
+
+#[test]
+fn crush_gets_what_its_row_says() {
+    table_agent_gets_what_its_row_says("crush", Some("/context"), None);
 }

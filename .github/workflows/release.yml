@@ -24,6 +24,25 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # Hub container end-to-end on the exact tagged commit: both profiles (SQLite, PostgreSQL/S3).
+  # Release-only, so routine pull requests skip its cold image build (#365). The GitHub release waits for it.
+  hub-e2e:
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 135
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Bounded below the job so the evidence still uploads: build and each profile have 40-minute budgets.
+      - run: .github/hub-e2e.sh local-release "$RUNNER_TEMP/hub-e2e"
+        timeout-minutes: 125
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hub-e2e-evidence
+          path: ${{ runner.temp }}/hub-e2e
+
   image-platform:
     # Each runnable child is built and fully exercised on matching native hardware before it is pushed.
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
@@ -216,33 +235,9 @@ jobs:
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
 
-  ui:
-    # The status page, built once and embedded into every binary below with `--features ui`.
-    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          package-manager-cache: false # never restore a cache into a release build
-      - run: npm ci --ignore-scripts && npm run build
-        working-directory: ui
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ui-dist
-          path: ui/dist/
-          if-no-files-found: error
-
   binaries:
     # Builds only: no OIDC token or attestation rights here, so build-time code cannot sign anything.
-    # Runs in parallel with the per-arch image builds once the UI is built; the version index and `attest` wait for it.
-    needs: ui
+    # Native installations are headless; the separately built container retains the Hub UI.
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     strategy:
       fail-fast: true
@@ -275,11 +270,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
           # ring and bundled SQLite compile C; cc-rs only guesses musl-gcc for x86_64.
           echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: ui-dist
-          path: ui/dist
-      - run: cargo build --locked --release --features ui --target "$TARGET"
+      - run: cargo build --locked --release --target "$TARGET"
         env:
           # Static CRT: the .exe needs no VC++ redistributable. Affects only the Windows target.
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
@@ -339,7 +330,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [image, attest]
+    needs: [image, attest, hub-e2e]
     # Only the public repository publishes: the image name, the attestation and the docs assume it.
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
@@ -439,3 +430,24 @@ jobs:
           dist_tag=latest
           case "$TAG" in *-*) dist_tag=next ;; esac
           npm publish --provenance --access public --ignore-scripts --tag "$dist_tag"
+
+  # Settles the `Release v<version>` tracking issue (docs/releasing.md) once npm has the package.
+  close-tracking-issue:
+    needs: npm
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$TAG" in *-dry*) echo "dry-run tag $TAG: leaving the tracking issue open"; exit 0 ;; esac
+          issues=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"Release $TAG\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"Release $TAG\") | .number")
+          for issue in $issues; do
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Published by $RUN."
+          done

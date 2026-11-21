@@ -47,6 +47,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
+        .merge(super::owner_notice_http::routes())
 }
 
 /// Run blocking store work off the async runtime, bounded process-wide: with
@@ -571,7 +572,7 @@ async fn view_settings(
 async fn whoami(
     State(state): State<HubState>,
     Reader(principal): Reader,
-) -> Json<serde_json::Value> {
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let (hub, repository) = (
         state.clone(),
         super::work::WorkRepositoryScope::of(&principal),
@@ -583,14 +584,32 @@ async fn whoami(
     .await
     .inspect_err(super::error_envelope::log_internal)
     .ok();
+    // The `rep_` row a token bound to a forge repository id acts on, as validation evidence
+    // routes require; null when the token has no id, this Hub has not connected it, or the
+    // repository was renamed since the token was minted (those routes then refuse the token).
+    let (store, host, id, name) = (
+        state.store.clone(),
+        principal.owner.identity.host.clone(),
+        principal.repository_id,
+        principal.repository.clone(),
+    );
+    let connected = match id {
+        Some(id) => blocking(&state, move || store.repository_by_id(&host, id))
+            .await?
+            .filter(|repository| repository.full_name == name)
+            .map(|repository| repository.id),
+        None => None,
+    };
     let owner = principal.owner;
-    Json(json!({
+    Ok(Json(json!({
         "shared_conversation_retention_days": retention_days,
+        "cooperation_protocol": super::notices::PROTOCOL,
         "token": {
             "id": principal.token_id,
             "name": principal.name,
             "repository": principal.repository,
             "repository_id": principal.repository_id,
+            "connected_repository": connected,
             "expires_at": principal.expires_at,
             "read_only": principal.read_only,
         },
@@ -600,7 +619,7 @@ async fn whoami(
             "user_id": owner.identity.user_id,
             "login": owner.login,
         },
-    }))
+    })))
 }
 
 async fn skill_workflow(
@@ -613,8 +632,8 @@ async fn skill_workflow(
         return Err(ApiError::invalid());
     }
     let registry = state.skill_workflows.clone();
-    let repository = principal.repository;
-    let outcome = blocking(&state, move || Ok(registry.read(&repository, &run_id))).await?;
+    let scope = super::store::scope_of(&state, &principal).await?;
+    let outcome = blocking(&state, move || Ok(registry.read(&scope, &run_id))).await?;
     match outcome {
         Ok(envelope) => Ok(Json(envelope).into_response()),
         Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),
@@ -651,9 +670,9 @@ async fn skill_workflows(
     let before = query.before.as_deref().map(sequence_cursor).transpose()?;
     let search = super::store::search_text(query.q.as_deref())?;
     let registry = state.skill_workflows.clone();
-    let repository = principal.repository;
+    let scope = super::store::scope_of(&state, &principal).await?;
     let outcome = blocking(&state, move || {
-        Ok(registry.page(&repository, before, search.as_deref()))
+        Ok(registry.page(&scope, before, search.as_deref()))
     })
     .await?;
     match outcome {

@@ -95,7 +95,7 @@
       "Unavailable": {"description": "Hub storage unavailable", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
     },
     "schemas": {
-      "Error": {"type": "object", "additionalProperties": false, "required": ["error"], "properties": {"error": {"type": "string"}}},
+      "Error": {"type": "object", "additionalProperties": true, "description": "Hub error envelope (see api.md#hub-errors). Codes may add their own detail fields.", "required": ["error", "message", "retryable", "recovery"], "properties": {"error": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean"}, "retry_after_seconds": {"type": "integer", "minimum": 0}, "recovery": {"type": "object", "required": ["action"], "properties": {"action": {"type": "string"}, "command": {"type": "string"}}}, "fields": {"type": "array", "items": {"type": "object", "required": ["name", "problem", "hint"], "properties": {"name": {"type": "string"}, "problem": {"type": "string"}, "hint": {"type": "string"}}}}, "correlation_id": {"type": "string"}}},
       "UsageRecord": {
         "type": "object", "additionalProperties": false,
         "required": ["work_id", "observation_id", "generation", "session", "phase", "outcome", "agent", "provider", "model", "usage_basis"],

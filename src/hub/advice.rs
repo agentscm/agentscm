@@ -316,7 +316,7 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
     let declined = touched
         .handoffs
         .iter()
-        .any(|note| !matches!(note.kind, "request" | "grant"));
+        .any(|note| !matches!(note.kind, "request" | "grant" | "lapse" | "lapse_held"));
     fyi.retain(|path| !stop.contains(path));
     let mut out = Vec::new();
     if !agreed.is_empty() {
@@ -397,6 +397,14 @@ fn handoff_line(note: &HandoffNote) -> String {
             )
         }
         "grant" => format!("{who} handed {path} to this session; repeating the edit applies it."),
+        "lapse" => format!(
+            "your ask for {path} lapsed: the session you asked no longer holds it and gave no \
+             reply. agentscm_start tells you whether it is free now."
+        ),
+        "lapse_held" => format!(
+            "your ask for {path} lapsed: the session you asked no longer holds it, and another \
+             session does; agentscm_start names the current holder."
+        ),
         _ => {
             let about = note.reason.as_deref().map(|text| ascii(text, NOTE_CHARS));
             let about = about
@@ -458,7 +466,7 @@ pub fn agent_name(agent: &str) -> String {
         "grok" => Some("Grok"),
         _ => None,
     };
-    if let Some(brand) = brand {
+    if let Some(brand) = brand.or_else(|| crate::clients::find(agent).map(|client| client.label)) {
         return brand.into();
     }
     if let Some(rest) = agent
@@ -546,7 +554,7 @@ pub fn asked(asked: &Asked, path: &str) -> String {
     let path = sanitize(path, PATH_CHARS);
     match asked {
         Asked::Requested { holder } => format!(
-            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too.",
+            "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues.",
             holder_who(holder)
         ),
         Asked::NotHeld => {
@@ -754,6 +762,15 @@ pub(super) fn test_intent(id: &str, task: &str, paths: &[&str]) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_natively_wired_agent_without_a_brand_is_named_by_its_label() {
+        assert_eq!(agent_name("droid"), "Factory Droid");
+        assert_eq!(agent_name("crush"), "Crush");
+        // The brands said before stay as they were.
+        assert_eq!(agent_name("copilot"), "Copilot");
+        assert_eq!(agent_name("gemini"), "Gemini");
+    }
 
     #[test]
     fn relayed_text_never_reads_as_a_hub_message() {
@@ -1185,7 +1202,7 @@ mod tests {
                 },
                 "src/a.rs"
             ),
-            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too."
+            "AgentSCM: asked bob's Claude Code for src/a.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues."
         );
         let who = ("codex".to_owned(), "amy".to_owned());
         let session = SessionRef {

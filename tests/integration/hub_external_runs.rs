@@ -23,7 +23,16 @@ const OTHER: &str = "2222222222222222222222222222222222222222";
 const EARLY: &str = "2023-11-14T22:13:20Z";
 const LATE: &str = "2023-11-14T22:15:00Z";
 
+/// The key `PUT .../deploy-workflow` stores a repository's workflow under.
+fn deploy_key(host: &str, id: i64) -> String {
+    format!(
+        "deploy_workflow:repo:{}",
+        store::repository_scope(host, "", Some(id))
+    )
+}
+
 struct Env {
+    host: String,
     fake: FakeGithub,
     state: HubState,
     store: Arc<dyn Store>,
@@ -75,6 +84,7 @@ impl Env {
         .with_sync(Sync::new(config).unwrap());
         sync::start(&state).await.unwrap();
         let host = fake.base.trim_start_matches("http://").to_owned();
+        let env_host = host.clone();
         let setup = store.clone();
         let (repo, token, secret) = tokio::task::spawn_blocking(move || {
             let connection = setup.pat_connection(&host).unwrap().unwrap().id;
@@ -99,6 +109,7 @@ impl Env {
         .await
         .unwrap();
         Self {
+            host: env_host,
             fake,
             state,
             store,
@@ -374,7 +385,14 @@ async fn a_persistent_run_read_403_does_not_stall_merge_detection() {
         env.publish(n, &format!("{n:040x}"), None).await;
     }
     env.publish(100, OTHER, Some(MERGED)).await;
-    let late = env.store.pull_publications(REPO, 20, 1).unwrap()[0]
+    let late = env
+        .store
+        .pull_publications(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            20,
+            1,
+        )
+        .unwrap()[0]
         .id
         .clone();
     env.seed(|r| {
@@ -390,7 +408,14 @@ async fn a_persistent_run_read_403_does_not_stall_merge_detection() {
     }
     env.pass().await;
     env.pass().await;
-    let publication = env.store.publication(REPO, &late).unwrap().unwrap();
+    let publication = env
+        .store
+        .publication(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            &late,
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(publication.merge_commit, Some("9".repeat(40)));
 }
 
@@ -414,7 +439,11 @@ async fn a_forge_reported_merge_is_recorded_then_its_runs_are_read() {
         ));
     });
     env.pass().await;
-    let publication = env.store.publication(REPO, &id).unwrap().unwrap();
+    let publication = env
+        .store
+        .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+        .unwrap()
+        .unwrap();
     assert_eq!(publication.merge_commit.as_deref(), Some(MERGED));
     assert_eq!(env.runs(MERGED).len(), 1);
 }
@@ -695,7 +724,11 @@ async fn a_list_cut_short_by_the_page_cap_is_marked_incomplete() {
 async fn external_outcomes_change_no_check_or_publication_state() {
     let env = Env::start(true).await;
     let id = env.publish(1, OTHER, Some(MERGED)).await;
-    let before = env.store.publication(REPO, &id).unwrap().unwrap();
+    let before = env
+        .store
+        .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+        .unwrap()
+        .unwrap();
     env.seed(|r| {
         r.runs.push(run_json(
             REPO_ID,
@@ -712,7 +745,13 @@ async fn external_outcomes_change_no_check_or_publication_state() {
     });
     env.pass().await;
     assert_eq!(env.runs(MERGED).len(), 2);
-    assert_eq!(env.store.publication(REPO, &id).unwrap().unwrap(), before);
+    assert_eq!(
+        env.store
+            .publication(&crate::repository_scope::connected(&*env.store, REPO), &id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
     assert_eq!(
         env.store
             .forge_check(&env.repo, 1, "agentscm/workflow/main")
@@ -1079,7 +1118,7 @@ async fn a_deploy_workflow_run_is_a_workflow_deployment_without_the_opt_in() {
     // What `PUT .../deploy-workflow` stores once a repository admin names the workflow.
     env.store
         .set_setting(
-            &format!("deploy_workflow:repo:{REPO_ID}"),
+            &deploy_key(&env.host, REPO_ID),
             ".github/workflows/deploy.yml",
             "usr_admin",
         )
@@ -1172,8 +1211,159 @@ async fn the_deploy_workflow_setting_reads_validates_and_needs_an_admin() {
     assert_eq!(refused.status().as_u16(), 403);
     assert!(
         env.store
-            .get_setting(&format!("deploy_workflow:repo:{REPO_ID}"))
+            .get_setting(&deploy_key(&env.host, REPO_ID))
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deploy_workflow_write_authorizes_the_tokens_stable_id_after_a_rename() {
+    use agentscm::hub::access::{Access, Grant, Level};
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::store::mint_bound_agent_token;
+
+    struct Grants(Vec<(String, Grant)>);
+    impl Access for Grants {
+        fn grants(&self, user: &store::User) -> agentscm::hub::Result<Option<Vec<Grant>>> {
+            Ok(Some(
+                self.0
+                    .iter()
+                    .filter(|(id, _)| *id == user.id)
+                    .map(|(_, grant)| grant.clone())
+                    .collect(),
+            ))
+        }
+    }
+    let root = TempDir::new().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        root.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let user = |id: i64, login: &str| {
+        store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap()
+    };
+    let (person, keeper) = (user(1, "owner"), user(2, "keeper"));
+    let connection = store
+        .insert_connection(
+            &NewConnection {
+                id: store::new_connection_id().unwrap(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "embedded".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic-bot".into()),
+            },
+            &person.id,
+        )
+        .unwrap();
+    // Repository 101 was `acme/widgets`, was renamed, and 202 took the old name.
+    let original = store
+        .upsert_repository(
+            &connection.id,
+            "github.com",
+            101,
+            "acme/renamed",
+            None,
+            None,
+        )
+        .unwrap();
+    let replacement = store
+        .upsert_repository(&connection.id, "github.com", 202, REPO, None, None)
+        .unwrap();
+    let token = |owner: &store::User, id: i64| {
+        mint_bound_agent_token(&*store, &owner.id, "agent", REPO, id, 3600, false)
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+    };
+    let (person_token, keeper_token, replacement_token) = (
+        token(&person, 101),
+        token(&keeper, 101),
+        token(&person, 202),
+    );
+    let grant =
+        |who: &store::User, repository, level| (who.id.clone(), Grant { repository, level });
+    let access = Grants(vec![
+        grant(&person, original.clone(), Level::Contribute),
+        grant(&person, replacement, Level::Administer),
+        grant(&keeper, original, Level::Administer),
+    ]);
+    let state = HubState::new(
+        store.clone(),
+        Arc::new(LocalBackend::open(root.path().join("objects")).unwrap()),
+    )
+    .with_access(Arc::new(access));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/hub/repos/acme%2Fwidgets/deploy-workflow",
+        listener.local_addr().unwrap()
+    );
+    let app = agentscm::hub::router(state);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let put = |secret: String| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .put(&url)
+                .bearer_auth(secret)
+                .header("content-type", "application/json")
+                .body(json!({"workflow": ".github/workflows/deploy.yml"}).to_string())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let workflow_of = |id: i64| store.get_setting(&deploy_key("github.com", id)).unwrap();
+    let read = |secret: String| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let body = client
+                .get(&url)
+                .bearer_auth(secret)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&body).unwrap()["workflow"].clone()
+        }
+    };
+
+    assert_eq!(
+        put(person_token.clone()).await,
+        403,
+        "administering the reused name must not administer the original ID"
+    );
+    assert!(workflow_of(101).is_none());
+    assert_eq!(read(person_token).await, Value::Null);
+
+    assert_eq!(put(replacement_token).await, 200);
+    assert!(workflow_of(202).is_some());
+    assert!(workflow_of(101).is_none());
+
+    assert_eq!(put(keeper_token.clone()).await, 200);
+    assert!(workflow_of(101).is_some());
+    assert_eq!(
+        read(keeper_token).await,
+        json!(".github/workflows/deploy.yml")
     );
 }

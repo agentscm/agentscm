@@ -72,7 +72,7 @@ Without `--verify`, doctor performs local validation only. With it, doctor check
 
 ### Manual installation and additional bindings
 
-Customer-operated installations can import [examples/slack-manifest.json](../examples/slack-manifest.json) through Slack's app settings, replace its placeholder URLs and upload [the app icon](assets/agentscm-icon.png). Alternatively, `agentscm hub slack manifest --hub-url https://hub.example.com` prints the configured manifest. Marketplace listing is not required to create a workspace-local app; Slack's distribution and workspace policies still apply.
+To set the app up by hand, import [examples/slack-manifest.json](../examples/slack-manifest.json) through Slack's app settings, replace its placeholder URLs and upload [the app icon](assets/agentscm-icon.png). Alternatively, `agentscm hub slack manifest --hub-url https://hub.example.com` prints the configured manifest. Marketplace listing is not required to create a workspace-local app; Slack's distribution and workspace policies still apply.
 
 Use explicit bindings, one repository per Slack user (up to 32 users). Before starting the Hub, an administrator should verify the exact values in the Slack and forge admin consoles:
 
@@ -102,11 +102,14 @@ The adapter's SQLite journal must be in an existing, operator-owned directory wi
       "forge_user_id": 123456789,
       "repository": "org/repository",
       "repository_id": 987654321,
-      "agent_token_file": "/absolute/private/agentscm-slack/read-only-agent.token"
+      "agent_token_file": "/absolute/private/agentscm-slack/read-only-agent.token",
+      "owner_notice_channel": "C0123456789"
     }
   ]
 }
 ```
+
+`owner_notice_channel` is optional. When set, Hub-produced attestation invalidation notices for that repository use a fixed message containing the bound owner's mention, pull request number, required action and Hub link. The bot must already be invited to the channel. Without it, those notices go to the bound user by direct message. Existing wait, blocked and handoff message kinds remain private. Agent-addressed note text is never copied into a channel; addressed notes default to direct message and keep their body behind the authenticated Hub UI.
 
 The adapter checks the bot token with Slack [`auth.test`](https://docs.slack.dev/reference/methods/auth.test/) before every outbound call and caches the verified workspace and bot identity for at most 60 seconds. A mismatched workspace, mismatched bot, or non-bot token fails closed. Independently copy `bot_id` from the intended app installation record during operator setup; do not derive the expected identity from an arbitrary supplied token. A conflicting `app_id` is also rejected when Slack returns it.
 

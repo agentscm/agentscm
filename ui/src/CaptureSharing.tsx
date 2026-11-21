@@ -10,8 +10,7 @@ export function SharingConsequences({ hub, retentionDays }: { hub: string; reten
       <li>Prompts, replies and tool output are redacted for secrets on this computer first. Redaction is best effort, so avoid putting secrets in conversations.</li>
       <li>The redacted conversation is uploaded to <code>{hub}</code>.</li>
       <li>{retentionDays === null ? 'It is kept for as long as the Hub operator sets (30 days unless changed).' : retentionDays === 0 ? <><code>{hub}</code> keeps no conversations for this repository, so nothing is uploaded.</> : <>It is kept {retentionDays === 1 ? '1 day' : `${retentionDays} days`} on <code>{hub}</code>.</>}</li>
-      <li>While the repository permits sharing and you are opted in, anyone who can read the repository on the Hub can read it. Otherwise only you and Hub admins can.</li>
-      <li>This checkout setting does not opt you in on the Hub. Run <code>agentscm change-capture opt-in</code> in the checkout before its sessions can upload.</li>
+      <li>While the repository shares, anyone who can read the repository on the Hub can read it, unless you opt out with <code>agentscm change-capture opt-out</code>. Otherwise only you and Hub admins can.</li>
       <li>Turning this setting off or opting out stops future uploads. Copies already uploaded stay until they expire or you delete them.</li>
     </ul>
   )

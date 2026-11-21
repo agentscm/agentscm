@@ -497,7 +497,10 @@ fn planned_projection(f: Fixture) {
         [8]
     );
     assert_eq!(view.planned_issues.linked.len(), 1);
-    assert_eq!(view.planned_issues.linked[0].work_ids, [created.item.id]);
+    assert_eq!(
+        view.planned_issues.linked[0].work_ids,
+        std::slice::from_ref(&created.item.id)
+    );
     let frozen = f
         .store
         .work_briefing(
@@ -557,8 +560,8 @@ fn planned_projection(f: Fixture) {
     assert!(!missing.planned_issues.complete);
     assert_eq!(missing.planned_issues.attempted_at_ms, None);
     assert!(missing.planned_issues.unclaimed.is_empty());
-    // A new name has no current-page Work until namespace repair, but stable-ID linkage
-    // remains visible and cannot turn the old native Work into an unclaimed issue.
+    // Recording the rename repairs the Work namespace, so the Work is current under the new
+    // name, and stable-ID linkage still cannot turn it into an unclaimed issue.
     snapshot.coverage = IssueCoverage::Complete;
     snapshot.attempted_at_ms = now * 1000 + 3;
     observe(&snapshot, now * 1000 + 3);
@@ -597,7 +600,12 @@ fn planned_projection(f: Fixture) {
         .store
         .work_overview(&renamed, &WorkOverviewQuery::default(), now + 3)
         .unwrap();
-    assert!(renamed.current.is_empty());
+    let moved = renamed
+        .current
+        .iter()
+        .find(|w| w.id == created.item.id)
+        .expect("the repaired Work is current under the new name");
+    assert_eq!(moved.repository, "acme/renamed");
     assert_eq!(renamed.planned_issues.linked[0].issue.identity.number, 7);
     assert!(
         renamed

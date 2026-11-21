@@ -23,18 +23,20 @@ not require migrating your repository.
 [Install](docs/install.md) · [Supported agents](docs/agents.md) ·
 [Documentation](docs/README.md) · [Releases](https://github.com/agentscm/agentscm/releases)
 
+[![npm downloads per week](https://img.shields.io/npm/dw/agentscm?label=npm)](https://npm-stat.com/charts.html?package=agentscm) [![npm downloads per month](https://img.shields.io/npm/dm/agentscm?label=npm)](https://npm-stat.com/charts.html?package=agentscm) [![npm downloads in the last 18 months](https://img.shields.io/npm/d18m/agentscm?label=npm%2018mo)](https://npm-stat.com/charts.html?package=agentscm)
+
 ## Quickstart
 
-### Try a scripted demo first
+### See it in action
 
 ```sh
 npx agentscm demo
 ```
 
 This starts a temporary local Hub, simulates three agents through its real hook endpoint and
-opens the status page. No account, Docker or forge is required; nothing is written to your
-repository. The agents and decisions are scripted. Press Ctrl-C to stop. See the
-[scripted demo guide](docs/scripted-demo.md) for prerequisites and limits.
+prints the results in your terminal. No account, Docker or forge is required; nothing is written to your
+repository. The agents and decisions are scripted. Press Ctrl-C to stop. The
+[demo guide](docs/scripted-demo.md) covers prerequisites and limits.
 
 ### Connect your agents
 
@@ -46,7 +48,8 @@ npx agentscm
 ```
 
 This installs a release binary, guides local Hub setup, signs you in and sets up **every detected
-agent**: Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI. A managed Hub runs natively
+agent**: Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI, Factory Droid, Qwen Code, Junie
+CLI and Crush. A managed Hub runs natively
 on Apple Silicon macOS; Linux and Intel macOS need Docker or an existing Hub. Setup writes no
 repository files. The local Hub's first run opens a page to create and install its GitHub App.
 
@@ -56,6 +59,9 @@ To join a Hub that already runs:
 npx agentscm --hub-url https://hub.example.com
 ```
 
+Or let your coding agent do it: copy the prompt from
+[Let your coding agent set it up](docs/install.md#let-your-coding-agent-set-it-up).
+
 Then fully quit and reopen your agents. In a repository, ask one:
 
 > Get started with AgentSCM.
@@ -64,15 +70,16 @@ In Codex, run `/hooks` once and trust the AgentSCM hooks. Other clients may ask 
 the folder or enable MCP. Installation does not mean every integration has been qualified in
 live sessions; see [agent support and qualification](docs/agents.md#support-tiers).
 
-Open a connected checkout's source and team view:
+Check this computer's connection and agent setup:
 
 ```sh
-npx agentscm open
+npx agentscm client status --check
+npx agentscm client doctor
 ```
 
-The page can switch between repositories connected on this computer, each using its own Hub
-and access. The local source explorer is currently Unix-only.
-Windows users can use `agentscm client status`.
+Native installations run without a local dashboard. Your team's Hub can still serve its web
+interface. The CLI retains setup, sharing controls, sign-out, diagnostics and recovery; see
+[this computer](docs/connect-this-computer.md).
 
 See [install options](docs/install.md) for platform/runtime requirements, `--only`, `--dry-run`,
 containers and uninstall (`npx agentscm uninstall`). A managed native Hub is qualified on Apple
@@ -115,15 +122,19 @@ working-file capture handles dirty source and reports omissions. Outcome, eviden
 coverage, source drift and freshness stay separate. A local receipt remains a caller assertion,
 not independently verified execution.
 
-Claude Code has the fuller capture adapter. Codex is captured as far as its hooks expose a
-session: prompts, tool starts and finishes, the last assistant message of each turn and each model
-request's token usage, with past sessions imported from a session file; **not** interim assistant
-messages, tool failures or hosted tool calls. Capture is best effort and bounded; missing events
-and unavailable evidence must remain visible. See
+Claude Code and Codex capture visible prompts, assistant replies and supported tool records
+from their native session files as well as hooks. When one parent chat explicitly starts Work in
+several repositories, its visible history follows each Work, including earlier context. Each
+repository's sharing setting and the author's opt-out still apply. Hidden reasoning and system
+instructions are excluded. Capture is bounded and best effort; missing events and unavailable
+evidence remain visible. Cursor, Copilot and Gemini CLI capture the visible fields their hooks
+provide, with no history-file replay. Cursor and Gemini supply replies and model metadata;
+Copilot does not. Automatic token usage is available for Claude Code and Codex. See
 [capture and qualification](docs/change-capture.md).
 
-Conversation capture defaults to **metadata-only**: no conversation bodies are retained or sent
-to the Hub. Per checkout, you can opt into local conversations or shared conversations.
+Manually configured capture defaults to **metadata-only**, retaining no conversation bodies.
+Connected checkouts that follow the Hub use its repository sharing setting; new Hubs enable
+sharing by default. Each author can opt out, and a checkout can be pinned to local capture.
 Shared bodies are redacted on the computer on a best-effort basis, then uploaded. While the
 repository shares agent conversations, anyone who can read the repository on the Hub can read
 them; otherwise only the person sharing them and Hub admins can. Hub retention defaults to 30 days.
@@ -132,9 +143,9 @@ Read [sharing, access and deletion](docs/change-capture.md#sharing-conversations
 before enabling it. This is distinct from task text and coordination metadata the Hub already
 stores; see [Hub data](docs/hub.md#data-the-hub-stores).
 
-The repository explorer reads local source and retained evidence. It does not run an agent,
-execute checks, fetch or check out branches. One connected local page can combine that private
-view with read-only team data from multiple repositories and Hubs.
+The optional repository explorer API reads local source and retained evidence. It does not run an
+agent, execute checks, fetch or check out branches. Native CLI source and workflow tools remain
+available; removing the local dashboard does not remove those facilities.
 
 ## Git, forge checks and native workflows
 

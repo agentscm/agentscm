@@ -321,6 +321,8 @@ pub(super) fn plan(
 pub(super) struct Who {
     pub token: String,
     pub repository: String,
+    /// What the token's repository rows are keyed by; see [`super::store::repository_scope`].
+    pub scope: String,
     pub agent: String,
     pub owner: User,
 }
@@ -660,14 +662,15 @@ async fn announce(
     ))
 }
 
-/// At most `MAX_LIVE_INTENTS` live intents of `repository`, and whether more exist (then any
-/// overlap check over them is incomplete).
+/// At most `MAX_LIVE_INTENTS` live intents of the repository with `scope` (see
+/// [`super::store::repository_scope`]), and whether more exist (then any overlap check over them
+/// is incomplete).
 pub(super) fn live_intents_capped(
     store: &dyn Store,
-    repository: &str,
+    scope: &str,
     now: i64,
 ) -> Result<(Vec<Intent>, bool)> {
-    let mut intents = store.live_intents(repository, now, MAX_LIVE_INTENTS + 1)?;
+    let mut intents = store.live_intents(scope, now, MAX_LIVE_INTENTS + 1)?;
     let truncated = intents.len() > MAX_LIVE_INTENTS;
     intents.truncate(MAX_LIVE_INTENTS);
     Ok((intents, truncated))
@@ -679,9 +682,10 @@ async fn list(
     Path(repo): Path<String>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
+    let rows = super::store::scope_of(&state, &principal).await?;
     let store = state.store.clone();
     let (intents, truncated) = blocking(&state, move || {
-        live_intents_capped(&*store, &repo, unix_now())
+        live_intents_capped(&*store, &rows, unix_now())
     })
     .await?;
     let intents: Vec<Value> = intents
@@ -716,16 +720,17 @@ async fn activity(
     };
     let (store, setup) = (state.store.clone(), state.onboarding.clone());
     let now = unix_now();
-    let (sessions, mut events) = blocking(&state, move || {
+    let (sessions, mut events, waiting_complete) = blocking(&state, move || {
         // The reader's own sessions that started another, or that wait for the reader, stay
         // listed after their last call, so a wait can be shown under the session that started it.
         // shortcut: the waiting ones first, then the newest starts, up to the page's limit; a
         // person with more starting sessions than that loses the row of an old one. Read only
         // the starters of listed sessions if that is ever reached.
-        let waiting = setup.waiting().owned(&principal, now)?;
+        let waiting = setup.waiting().owned(&*store, &principal, now);
         let starts = store.session_starts(&principal.owner.id)?;
         let mut listed = BTreeSet::new();
         let also: Vec<String> = waiting
+            .waits
             .into_iter()
             .map(|wait| wait.session)
             .chain(starts.into_iter().map(|(_, started_by)| started_by))
@@ -737,6 +742,7 @@ async fn activity(
         Ok((
             sessions,
             store.repository_events(&principal, before, limit + 1)?,
+            waiting.complete,
         ))
     })
     .await?;
@@ -818,7 +824,8 @@ async fn activity(
         .collect::<Result<Vec<Value>>>()?;
     Ok(Json(
         json!({"sessions": sessions, "quiet_sessions": quiet_sessions, "events": events,
-        "next_before": next_before.flatten()}),
+        "next_before": next_before.flatten(), "waiting_complete": waiting_complete,
+        "limits": if waiting_complete { vec![] } else { vec!["session_waiting_unavailable"] }}),
     ))
 }
 

@@ -476,7 +476,10 @@ pub(super) async fn qualify(
     let publication_before = {
         let (store, _workspace) = offline(&storage);
         store
-            .publication("synthetic/project", publication_id)
+            .publication(
+                &crate::repository_scope::connected(&*store, "synthetic/project"),
+                publication_id,
+            )
             .unwrap()
             .unwrap()
             .branch_state
@@ -821,7 +824,10 @@ pub(super) async fn qualify(
         assert_eq!(observed.1["id"], publication_id);
         let retained = env
             .store
-            .publication("synthetic/project", publication_id)
+            .publication(
+                &crate::repository_scope::connected(&*env.store, "synthetic/project"),
+                publication_id,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(retained.branch_state, publication_before);

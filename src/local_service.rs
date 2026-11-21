@@ -7,7 +7,7 @@
 use std::io::Read as _;
 use std::path::PathBuf;
 
-use agentscm::{Error, Result};
+use agentscm::Result;
 use serde::{Deserialize, Serialize};
 
 const RECORD_BYTES: u64 = 16 * 1024;
@@ -41,13 +41,16 @@ pub(crate) fn valid_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+#[cfg(feature = "ui")]
 pub(crate) fn random_hex(bytes: usize) -> Result<String> {
     let mut random = vec![0_u8; bytes];
-    getrandom::fill(&mut random).map_err(|_| Error::Invalid("random source unavailable".into()))?;
+    getrandom::fill(&mut random)
+        .map_err(|_| agentscm::Error::Invalid("random source unavailable".into()))?;
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Create the private directory with owner-only permissions.
+#[cfg(feature = "ui")]
 pub(crate) fn ensure_dir() -> Result<PathBuf> {
     let dir = dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -60,6 +63,7 @@ pub(crate) fn ensure_dir() -> Result<PathBuf> {
 }
 
 /// The short host name, which the page shows to identify this computer.
+#[cfg(feature = "ui")]
 pub(crate) fn computer_name() -> String {
     #[cfg(unix)]
     let name = {
@@ -91,6 +95,7 @@ pub(crate) fn computer_name() -> String {
 }
 
 /// Publish this process's record; dropping the guard removes it if it is still ours.
+#[cfg(feature = "ui")]
 pub(crate) fn publish(record: &ServiceRecord) -> Result<RecordGuard> {
     ensure_dir()?;
     let path = record_path()?;
@@ -101,11 +106,13 @@ pub(crate) fn publish(record: &ServiceRecord) -> Result<RecordGuard> {
     })
 }
 
+#[cfg(feature = "ui")]
 pub(crate) struct RecordGuard {
     path: PathBuf,
     instance: String,
 }
 
+#[cfg(feature = "ui")]
 impl Drop for RecordGuard {
     fn drop(&mut self) {
         // A newer service may have replaced the record; leave its record alone.
@@ -211,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ui")]
     fn computer_name_is_a_short_safe_label() {
         let name = computer_name();
         assert!(!name.is_empty() && name.len() <= 63);

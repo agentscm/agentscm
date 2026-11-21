@@ -95,12 +95,31 @@ export function currentLeadParticipant(item: WorkItem): WorkParticipant {
   return lead ?? fail('work.lead')
 }
 
+export type WorkTransitionKind = 'release' | 'retain' | 'complete' | 'abandon' | 'supersede' | 'reopen' | 'prune_participants' | 'release_paths'
+
+/** How a `work_transition` event reads in a feed; callers fall back to a generic label for an absent kind. */
+export const TRANSITION_LABEL: Readonly<Record<WorkTransitionKind, string>> = {
+  release: 'Reservation released',
+  retain: 'Reservation retained',
+  complete: 'Work completed',
+  abandon: 'Work abandoned',
+  supersede: 'Work superseded',
+  reopen: 'Work reopened',
+  prune_participants: 'Participants pruned',
+  release_paths: 'Paths released',
+}
+
+/** Leniently decodes a feed event's transition kind: anything unrecognised is undefined, never an error. */
+export const decodeTransition = (value: unknown): WorkTransitionKind | undefined =>
+  typeof value === 'string' && Object.hasOwn(TRANSITION_LABEL, value) ? value as WorkTransitionKind : undefined
+
 export interface BriefingEvent {
   seq: number
   at: number
   kind: WorkEventKind
   work_id: string
   item: WorkItem
+  transition?: WorkTransitionKind
 }
 
 export interface StandupBriefing {
@@ -201,6 +220,8 @@ export interface CoordinationResponse {
   note: string | null
   /** `hub` when the person who owns the responding agent answered for it on the Hub's web pages; `responder` is still the agent. */
   via: 'hub' | 'slack' | null
+  /** The requested paths this reply released from the target Work; empty when it released none. */
+  released_paths: string[]
   created_at: number
   seq: number
 }
@@ -457,6 +478,11 @@ export function decodeWorkItem(value: unknown, expectedId?: string): WorkItem {
   return decoded
 }
 
+export const transitionField = (value: unknown): { transition?: WorkTransitionKind } => {
+  const transition = decodeTransition(value)
+  return transition ? { transition } : {}
+}
+
 function event(value: unknown): BriefingEvent {
   const item = record(value, 'briefing.event')
   const id = workId(item['work_id'], 'briefing.event.work_id')
@@ -466,6 +492,7 @@ function event(value: unknown): BriefingEvent {
     kind: enumValue(item['kind'], EVENT_KINDS, 'briefing.event.kind'),
     work_id: id,
     item: decodeWorkItem(item['item'], id),
+    ...transitionField(item['transition']),
   }
 }
 
@@ -663,6 +690,7 @@ function coordinationRequest(value: unknown): CoordinationRequest {
       kind: enumValue(response['kind'], COORDINATION_RESPONSE_KINDS, 'coordination.request.response.kind'),
       note: nullableText(response['note'], 'coordination.request.response.note'),
       via: response['via'] === 'hub' || response['via'] === 'slack' ? (response['via'] as 'hub' | 'slack') : null,
+      released_paths: response['released_paths'] === undefined ? [] : list(response['released_paths'], MAX_SCOPE, 'coordination.request.response.released_paths').map((entry) => repositoryPath(entry, 'coordination.request.response.released_paths.item')),
       created_at: timestamp(response['created_at'], 'coordination.request.response.created_at'),
       seq: safeInteger(response['seq'], 'coordination.request.response.seq'),
     }

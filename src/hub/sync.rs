@@ -893,13 +893,13 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
         }
         return Ok(reports);
     }
-    for conn in db(state, |store| store.connections()).await? {
+    for mut conn in db(state, |store| store.connections()).await? {
         let due = match only {
             Some(id) => conn.id == id,
             None => conn.next_poll_at <= unix_now(),
         };
         if due {
-            reports.extend(poll_connection(state, &conn).await?);
+            reports.extend(poll_connection(state, &mut conn).await?);
         }
     }
     let before = now_ms() - TOMBSTONE_KEEP_MS;
@@ -1004,7 +1004,7 @@ async fn catchup_connection_status(
     Ok(())
 }
 
-async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<PollReport>> {
+async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<PollReport>> {
     catchup_connection_status(
         state,
         conn,
@@ -1014,7 +1014,7 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
     let mut reports = Vec::new();
     let mut marked = false;
     let found = match conn.kind.as_str() {
-        "app" => Some(discover(state, conn).await.map(|()| 0)),
+        "app" => Some(poll_app(state, conn).await.map(|()| 0)),
         _ => match followed_namespace(state, conn).await? {
             Some(namespace) => Some(follow_namespace(state, conn, namespace).await),
             None => None,
@@ -1122,12 +1122,37 @@ async fn follow_rename(
     Ok(())
 }
 
+/// Refresh the bot identity before this poll can reconcile any repository.
+async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<()> {
+    let jwt = state.sync.jwt(conn).await?;
+    let app = state.sync.api()?.authenticated_app(&jwt).await?;
+    let app_id = app["id"]
+        .as_i64()
+        .filter(|id| *id > 0 && Some(*id) == conn.app_id)
+        .ok_or_else(|| GhError::Failed("authenticated App ID does not match connection".into()))?;
+    let slug = app["slug"]
+        .as_str()
+        .filter(|slug| simple(slug, b"-_", 255))
+        .ok_or_else(|| GhError::Failed("authenticated App slug is missing or invalid".into()))?;
+    let (id, previous, observed) = (conn.id.clone(), conn.app_slug.clone(), slug.to_owned());
+    let current = db(state, move |store| {
+        store.refresh_connection_app_slug(&id, app_id, previous.as_deref(), &observed)
+    })
+    .await?;
+    if !current {
+        return Err(GhError::Failed(
+            "App identity changed during discovery".into(),
+        ));
+    }
+    conn.app_slug = Some(slug.to_owned());
+    discover(state, conn, &jwt).await
+}
+
 /// Connects every repository the app's installations can see.
-async fn discover(state: &HubState, conn: &Connection) -> Gh<()> {
+async fn discover(state: &HubState, conn: &Connection, jwt: &str) -> Gh<()> {
     let sync = &state.sync;
     let api = sync.api()?;
-    let jwt = sync.jwt(conn).await?;
-    for (installation, _) in api.installations(&jwt).await? {
+    for (installation, _) in api.installations(jwt).await? {
         let token = sync.token(conn, Some(installation)).await?;
         let repos = api.installation_repos(&token).await?;
         let (id, host) = (conn.id.clone(), conn.host.clone());
@@ -1495,8 +1520,11 @@ async fn poll_issue_closures(
             })
             .map(|(item, _)| item.id.clone())
             .collect();
-        let releasing =
-            super::merged_holds::merged_release_enabled(store, store_repo.repository_id);
+        let releasing = super::merged_holds::merged_release_enabled(
+            store,
+            &store_repo.host,
+            store_repo.repository_id,
+        );
         let cursor = store
             .get_setting(&key)?
             .and_then(|v| v.parse::<u64>().ok())
@@ -2057,9 +2085,9 @@ async fn repo_intents(
     conn: &Connection,
     repo: &ConnectedRepository,
 ) -> Gh<Vec<Intent>> {
-    let name = repo.full_name.clone();
+    let scope = repo.repository_scope();
     let (intents, truncated) = db(state, move |store| {
-        live_intents_capped(store, &name, unix_now())
+        live_intents_capped(store, &scope, unix_now())
     })
     .await?;
     if truncated {
@@ -2667,7 +2695,12 @@ async fn webhook_work(
             super::catchup::CatchupCoverageState::Incomplete,
         )
         .await?;
-        if let Err(error) = discover(state, conn).await {
+        let discovery = async {
+            let jwt = sync.jwt(conn).await?;
+            discover(state, conn, &jwt).await
+        }
+        .await;
+        if let Err(error) = discovery {
             catchup_connection_status(
                 state,
                 conn,
@@ -2997,8 +3030,9 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
 /// The page that shows who will own the app and what it is called, then posts the
 /// manifest to GitHub when the person clicks Continue. The state in the URL is the
 /// capability. `owner` and `name` in the query replace the defaults for this view only
-/// (an empty `owner` means the signed-in personal account); they are checked as
-/// `begin_setup` checks them and the callback never reads them back.
+/// (an empty `owner` means the signed-in personal account). Quickstart's
+/// `suggested_owner` applies only without a configured or explicit owner.
+/// The callback never reads these parameters back.
 async fn setup_page(
     State(state): State<HubState>,
     Path(secret): Path<String>,
@@ -3018,6 +3052,11 @@ async fn setup_page(
     };
     if let Some(owner) = params.get("owner") {
         org = Some(owner.trim().to_owned()).filter(|owner| !owner.is_empty());
+    } else if org.is_none()
+        && let Some(owner) = params.get("suggested_owner")
+        && simple(owner, b"-", 39)
+    {
+        org = Some(owner.clone());
     }
     if let Some(chosen) = params
         .get("name")
@@ -3355,11 +3394,11 @@ async fn work(
 ) -> ApiResult<Json<Value>> {
     scope(&principal, &repo)?;
     let host = principal.owner.identity.host.clone();
-    let (name, name_for_intents) = (repo.clone(), repo);
+    let (name, scope) = (repo, super::store::scope_of(&state, &principal).await?);
     let repository_id = principal.repository_id;
     let (intents, prs, branches, connected) = db(&state, move |store| {
         // By the forge's id when the token has one: a renamed or re-created name never serves another repository.
-        let intents = store.live_intents(&name_for_intents, unix_now(), MAX_LIVE_INTENTS + 1)?;
+        let intents = store.live_intents(&scope, unix_now(), MAX_LIVE_INTENTS + 1)?;
         Ok(match find_repository(store, &host, &name, repository_id)? {
             Some(found) => (
                 intents,

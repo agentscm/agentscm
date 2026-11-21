@@ -122,7 +122,7 @@ pub enum Answered {
 }
 
 /// A handoff line for the touched session: `kind` is `request` (to the holder), `grant` or
-/// `decline` (to the requester); `agent` and `login` are the other side's.
+/// `decline`, `lapse` or `lapse_held` (to the requester); `agent` and `login` are the other side's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffNote {
     pub kind: &'static str,
@@ -309,9 +309,12 @@ pub(super) fn grant_call(session: &str, key: &str, via_json: Option<&str>) -> Se
 }
 
 /// The note kind of a decided request.
-pub(super) fn answer_kind(state: &str) -> &'static str {
+/// A lapsed request is `lapse_held` when another session holds the file now.
+pub(super) fn answer_kind(state: &str, held_now: bool) -> &'static str {
     if state == "granted" {
         "grant"
+    } else if state == "lapsed" {
+        if held_now { "lapse_held" } else { "lapse" }
     } else {
         "decline"
     }

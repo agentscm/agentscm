@@ -154,6 +154,106 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_startup_warns_about_an_older_plugin_without_a_hub_connection() {
+    use std::process::{Command, Stdio};
+
+    let dir = TempDir::new().unwrap();
+    let plugins = dir.path().join("claude-config/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    let registry = plugins.join("installed_plugins.json");
+    let plugin_id = "agentscm@agentscm-claude-client";
+    let release = env!("CARGO_PKG_VERSION").split('+').next().unwrap();
+    let current_bundle = format!("{release}+agentscm.0123456789abcdef");
+    let registry_with = |id: &str, scope: &str, version: &str| json!({"version": 2, "plugins": {(id): [{"scope": scope, "version": version}]}});
+    let old = registry_with(plugin_id, "user", "0.0.0").to_string();
+    let run_hook = |event: &str, args: &[&str], from_claude: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(args)
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("CLAUDE_CONFIG_DIR", "claude-config")
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if from_claude {
+            command.env("CLAUDE_PROJECT_DIR", dir.path());
+        }
+        let mut child = command.spawn().unwrap();
+        let payload = json!({
+            "hook_event_name": event,
+            "session_id": "synthetic-session",
+            "cwd": dir.path(),
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let hook = |event: &str, flags: &[&str]| {
+        let args = ["--no-telemetry", "hook", "claude"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .collect::<Vec<_>>();
+        run_hook(event, &args, true)
+    };
+    let setup = "agentscm client setup --agent claude";
+    let baseline = hook("SessionStart", &["--client-connection"]);
+    assert!(baseline.get("systemMessage").is_none(), "{baseline}");
+    fs::write(&registry, &old).unwrap();
+    let output = hook("SessionStart", &["--client-connection"]);
+    let context = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        output["systemMessage"].as_str().unwrap().contains(setup),
+        "{output}"
+    );
+    assert!(context.contains("no client connection"), "{output}");
+    assert_eq!(output["hookSpecificOutput"], baseline["hookSpecificOutput"]);
+    assert_eq!(fs::read_to_string(&registry).unwrap(), old);
+    let legacy = run_hook("SessionStart", &[], true);
+    assert!(
+        legacy["systemMessage"].as_str().unwrap().contains(setup),
+        "{legacy}"
+    );
+    assert_eq!(run_hook("SessionStart", &[], false), json!({}));
+    assert_eq!(run_hook("UserPromptSubmit", &[], true), json!({}));
+    for output in [
+        hook("UserPromptSubmit", &["--client-connection"]),
+        hook("SessionStart", &[]),
+    ] {
+        assert!(!output.to_string().contains(setup), "{output}");
+    }
+
+    for contents in [
+        registry_with(plugin_id, "user", &current_bundle).to_string(),
+        registry_with(plugin_id, "user", "9999.0.0").to_string(),
+        registry_with(plugin_id, "user", "unknown").to_string(),
+        registry_with(plugin_id, "project", "0.0.0").to_string(),
+        registry_with("agentscm@other-marketplace", "user", "0.0.0").to_string(),
+        "{".to_owned(),
+    ] {
+        fs::write(&registry, &contents).unwrap();
+        let output = hook("SessionStart", &["--client-connection"]);
+        assert!(!output.to_string().contains(setup), "{contents}: {output}");
+    }
+}
+
+// #295 root cause: a SessionStart from a later session, after another hook session had
+// adopted the durable `default` Work, got `Invalid("durable default work is already bound to
+// another hook session")`, which the hook route reported as "invalid hook payload". #344 removed
+// that error. The later-new-session case reproduced locally (in-process Hub on SQLite) at
+// aaaaaa9a, the reported build, and at v0.2.1; first start, replay and resume did not. The
+// hosted Hub that reported it was not re-checked.
 async fn i295_startup_scenario(scenario: &str) {
     let mut hub = Hub::start().await;
     let secret = hub.agent();
@@ -498,10 +598,12 @@ async fn every_fixture_gets_its_agents_output_shape() {
             Expect::Empty => assert_eq!(answer, json!({}), "{name}"),
             Expect::Context(pointer) => {
                 let text = text_at(&answer, pointer);
-                // The session ID and required rules lead a start context.
+                // The session ID and required rules lead a start context; Claude Code reads the
+                // rules in the MCP server's instructions instead.
                 assert!(text.starts_with("AgentSCM"), "{name}: {answer}");
-                assert!(
+                assert_eq!(
                     agentscm::hub::agent_rules::carries_all(text),
+                    agent != "claude",
                     "{name}: {answer}"
                 );
                 assert!(
@@ -562,7 +664,10 @@ async fn hooks_register_one_session_and_done_releases_it() {
     let bob = hub.agent();
     hub.hook("claude", &alice, &fixture("claude-SessionStart"));
     hub.hook("claude", &alice, &fixture("claude-PreToolUse-Edit"));
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].paths, ["src/widget.rs"]);
     assert_eq!(live[0].via, ["hook:claude"]);
@@ -574,11 +679,17 @@ async fn hooks_register_one_session_and_done_releases_it() {
     );
     assert_eq!(answer["status"], "clean");
     assert_eq!(
-        hub.store.live_intents(REPO, unix_now(), 10).unwrap().len(),
+        hub.store
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+            .unwrap()
+            .len(),
         2
     );
     hub.hook("claude", &alice, &fixture("claude-SessionEnd"));
-    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let live = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].via, ["hook:generic"]);
 }
@@ -590,12 +701,13 @@ async fn session_end_leaves_held_work_active_without_claiming_completion() {
     let session = "11111111-2222-3333-4444-555555555555";
     let start_answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
     assert!(start_answer.to_string().contains("actions need you"));
-    assert!(start_answer.to_string().contains("Coverage incomplete"));
     assert!(
         start_answer
             .to_string()
-            .contains("provider times shown separately")
+            .contains("AgentSCM coverage is partial")
     );
+    assert!(start_answer.to_string().contains("Coverage incomplete"));
+    assert!(!start_answer.to_string().contains("Evidence revision"));
     let start_context = text_at(&start_answer, CLAUDE_CONTEXT);
     assert!(
         start_context.contains("AgentSCM shared work"),
@@ -777,15 +889,70 @@ async fn session_start_flags_records_omitted_from_a_complete_preview() {
         context.contains("AgentSCM shared work: 6 unfinished item(s)"),
         "{answer}"
     );
-    assert!(
-        context.contains("This bounded hook preview omits shared-work records"),
-        "{answer}"
-    );
-    assert!(
-        context.contains("agentscm_work_briefing to begin durable pagination"),
-        "{answer}"
-    );
+    assert!(context.contains("agentscm_work_briefing"), "{answer}");
     assert!(!context.contains("Briefing delivery"), "{answer}");
+}
+
+/// A start in a repository with six unfinished Works stays small: the hook text is re-read on
+/// every turn, so its size is a cost to every session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_start_context_stays_small() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    for index in 0..6 {
+        hub.store
+            .work_start_auto(
+                &principal.token_id,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: None,
+                    title: format!("unfinished goal {index}"),
+                    description: None,
+                    session: format!("preview-session-{index}"),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/preview-{index}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
+    let context = text_at(&answer, CLAUDE_CONTEXT);
+    // Each unfinished Work is named once, with no field dumps or record ids.
+    assert_eq!(context.matches("unfinished goal 3").count(), 1, "{context}");
+    for dump in [
+        "Provider source",
+        "Evidence revision",
+        "wrk_",
+        "merge-base",
+        "Claim Active",
+    ] {
+        assert!(!context.contains(dump), "{dump}: {context}");
+    }
+    assert!(
+        context.contains("AgentSCM coverage is partial"),
+        "{context}"
+    );
+    // It was 7,557 characters before the start context was trimmed.
+    assert!(
+        context.chars().count() < 2_500,
+        "{}",
+        context.chars().count()
+    );
 }
 
 /// The warn-once part of a refusal. A session's first edit while it has declared no Work carries
@@ -835,7 +1002,10 @@ async fn sessions_sharing_one_token_name_the_holder_and_only_it_hears() {
     let asks = "asks to take over src/widget.rs";
 
     hub.hook("claude", &secret, &edit("holder-s", "src/widget.rs"));
-    let token = hub.store.live_intents(REPO, unix_now(), 10).unwrap()[0]
+    let token = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap()[0]
         .token
         .clone();
     let key = |session: &str| {
@@ -887,7 +1057,10 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     let first = hub.agent();
     hub.hook("claude", &first, &fixture("claude-PreToolUse-Write"));
     // The holder is named by the digest of its session, never by the session id or token label.
-    let held = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let held = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     let digest = lower_hex_of(
         format!(
             "agentscm.hub.session-view.v1\0{}\0{}",
@@ -968,7 +1141,7 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     );
     assert!(
         hub.store
-            .live_intents(REPO, unix_now(), 10)
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
             .unwrap()
             .iter()
             .all(|i| { !i.paths.contains(&"src/gadget.rs".to_owned()) })
@@ -1138,7 +1311,10 @@ async fn encoded_repository_guards_are_judged_identically_to_raw_guards() {
                 !accepted,
                 "{guard}: {reply}"
             );
-            let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+            let live = hub
+                .store
+                .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+                .unwrap();
             assert_eq!(live.len(), usize::from(accepted), "{guard}");
             if accepted {
                 assert_eq!(live[0].paths, ["src/widget.rs"]);
@@ -1245,7 +1421,10 @@ async fn the_root_header_sets_what_paths_are_relative_to() {
         let (status, _) =
             hub.post_with("/v1/hub/hook/claude", Some(secret), header, body.as_bytes());
         assert_eq!(status, 200);
-        let token = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+        let token = hub
+            .store
+            .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+            .unwrap();
         let mut all: Vec<_> = token.into_iter().map(|i| i.paths).collect();
         all.sort();
         all
@@ -1382,6 +1561,7 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
             .coordination_reply(
                 &lead_token,
                 &CoordinationReply {
+                    release_paths: Vec::new(),
                     request_id: request.clone(),
                     operation_id: "decline-widget".into(),
                     target_work_id: target,
@@ -1453,6 +1633,7 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
                     source_refs: Vec::new(),
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
+                    finished_paths: None,
                 },
                 now,
             )
@@ -1463,6 +1644,138 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
             "{answer}"
         );
     }
+}
+
+/// A partial release reaches the requester's prompt once per released set: an unchanged set
+/// stays quiet, and a further release shows again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_release_shows_once_per_released_set() {
+    use agentscm::hub::coordination::{
+        CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResponseKind,
+    };
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let other = hub.agent();
+    let token_id = |secret: &str| {
+        hub.store
+            .authenticate(&agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    let (lead_token, other_token) = (token_id(&lead), token_id(&other));
+    let files = [
+        "src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs", "src/f.rs", "src/g.rs",
+    ];
+    let start = |key: &str, session: &str| WorkStart {
+        issue_choice: None,
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        description: None,
+        session: session.into(),
+        role: WorkRole::Lead,
+        scope: files.iter().map(|path| (*path).into()).collect(),
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: Vec::new(),
+        related_work: Vec::new(),
+        takeover_generation: None,
+        preflight: None,
+    };
+    let session = "11111111-2222-3333-4444-555555555555";
+    let now = unix_now();
+    hub.store
+        .work_start(&lead_token, &start("hold-files", session), now)
+        .unwrap();
+    let request = hub
+        .store
+        .work_start(&other_token, &start("needs-files", "other-session"), now)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let prompt = json!({"hook_event_name":"UserPromptSubmit", "session_id":"other-session",
+        "cwd":"/work/acme-widgets", "prompt":"not read"});
+    let inbox = |token: &str, session: &str| {
+        hub.store
+            .coordination_inbox(
+                token,
+                &CoordinationInboxQuery {
+                    session: Some(session.into()),
+                    ..CoordinationInboxQuery::default()
+                },
+                now,
+            )
+            .unwrap()
+            .requests
+            .remove(0)
+    };
+    let release = |operation: &str, paths: &[&str]| {
+        let open = inbox(&lead_token, session);
+        hub.store
+            .coordination_reply(
+                &lead_token,
+                &CoordinationReply {
+                    release_paths: paths.iter().map(|path| (*path).into()).collect(),
+                    request_id: request.id.clone(),
+                    operation_id: operation.into(),
+                    target_work_id: open.targets[0].work_id.clone(),
+                    session: session.into(),
+                    expected_updated_seq: open.updated_seq,
+                    kind: CoordinationResponseKind::Decline,
+                    note: None,
+                    via: agentscm::hub::handoff::Via::Agent,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    let acknowledge = || {
+        hub.store
+            .coordination_ack(
+                &other_token,
+                &CoordinationAck {
+                    request_id: request.id.clone(),
+                    target_work_id: None,
+                    session: "other-session".into(),
+                    expected_updated_seq: inbox(&other_token, "other-session").updated_seq,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    release("free-a", &["src/a.rs"]);
+    acknowledge();
+    let context = |answer: &Value| text_at(answer, CLAUDE_CONTEXT).to_owned();
+    let first = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        first.contains("src/a.rs from your request are free now"),
+        "{first}"
+    );
+    assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+    release("free-b", &["src/b.rs"]);
+    acknowledge();
+    let second = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        second.contains("src/a.rs, src/b.rs from your request are free now"),
+        "{second}"
+    );
+    assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+    // Past five paths the prompt counts the rest.
+    release(
+        "free-more",
+        &["src/c.rs", "src/d.rs", "src/e.rs", "src/f.rs"],
+    );
+    acknowledge();
+    let third = context(&hub.hook("claude", &other, &prompt));
+    assert!(
+        third.contains(
+            "src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs, and 1 more from your request"
+        ),
+        "{third}"
+    );
 }
 
 /// A tool call that edits nothing still renews the lead session's lease, silently, so a busy
@@ -1628,7 +1941,10 @@ async fn observed_shell_changes_without_work_ask_for_a_start_every_time() {
         );
     }
     // The observed paths are held as this session's intents, as a check after the edit does.
-    let held = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let held = hub
+        .store
+        .live_intents(&crate::repository_scope::github(REPO, None), unix_now(), 10)
+        .unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].paths, ["src/gadget.rs", "src/widget.rs"]);
     assert_eq!(held[0].via, ["hook:claude"]);
@@ -2024,9 +2340,12 @@ async fn a_lapsed_hold_is_told_to_its_lead_once_on_its_next_tool_call() {
         hub.hook_raw("claude", &lead, &read(Some("sub-1"))),
         json!({})
     );
-    // Only Claude Code's tool events are known to take added context.
-    assert_eq!(hub.hook_raw("codex", &lead, &read(None)), json!({}));
-    let answer = hub.hook_raw("claude", &lead, &read(None));
+    // Copilot CLI's own event names have no field for added context.
+    let mut cli = fixture("copilot-postToolUse");
+    cli["sessionId"] = json!(session);
+    assert_eq!(hub.hook_raw("copilot", &lead, &cli), json!({}));
+    // Every host that sends the tool event by this name takes the notice, not only Claude Code.
+    let answer = hub.hook_raw("codex", &lead, &read(None));
     assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     let text = text_at(&answer, CLAUDE_CONTEXT);
     assert!(text.contains("its next edit is refused"), "{answer}");
@@ -2577,13 +2896,24 @@ mod merged_prompts {
         let id = w.merged_work();
         w.close_issue(completed());
         w.prompt(LEAD);
-        // A turn that asks its person something leaves the Work open.
+        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        assert_eq!(
+            w.outcome(&id),
+            (WorkState::Finished, OutcomeProvenance::HubObservedMerge)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_asks_still_completes_merged_work_it_leads() {
+        let mut w = world().await;
+        let id = w.merged_work();
+        w.close_issue(completed());
+        w.prompt(LEAD);
         w.turn_end(
             LEAD,
-            json!({"asked_nothing": false, "asks": "Shall I merge it?"}),
+            json!({"asked_nothing": false, "asks": "Shall I start the next one?"}),
         );
-        assert_eq!(w.outcome(&id).0, WorkState::Active);
-        w.turn_end(LEAD, json!({"asked_nothing": true}));
+        // The merge settled the task; the ask is still recorded as the session's wait.
         assert_eq!(
             w.outcome(&id),
             (WorkState::Finished, OutcomeProvenance::HubObservedMerge)

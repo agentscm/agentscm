@@ -402,6 +402,11 @@ impl Api {
         Ok(full.body)
     }
 
+    /// The App identified by its JWT.
+    pub(super) async fn authenticated_app(&self, jwt: &str) -> Gh<Value> {
+        self.get(jwt, "/app").await?.ok("app")
+    }
+
     pub async fn installations(&self, jwt: &str) -> Gh<Vec<(i64, String)>> {
         let paged = self
             .paged(jwt, "/app/installations", None, MAX_REPO_PAGES, None)

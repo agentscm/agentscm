@@ -11,9 +11,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentscm::change_capture::claude_code::{
-    ActionCaptureConfig, ActionRuleV1, CaptureRequest, HookCaptureOutcome, NativeActionOutcome,
-    NativeResultSourceV1, capture_hook, capture_native_hook, capture_provider_usage,
-    deferred_native_hook, import_jsonl,
+    self, ActionCaptureConfig, ActionRuleV1, CaptureRequest, HookCaptureOutcome,
+    NativeActionOutcome, NativeResultSourceV1, capture_hook, capture_native_hook,
+    capture_provider_usage, deferred_native_hook, import_jsonl,
 };
 use agentscm::change_capture::codex;
 use agentscm::change_capture::spool::ProviderHistoryCursorV1;
@@ -929,6 +929,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             prompt,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::NoCurrentAuthorizedWork,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -944,6 +945,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             prompt,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::NoCurrentAuthorizedWork,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -961,6 +963,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -976,6 +979,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert_eq!(
         deferred_native_hook(
             pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -992,6 +996,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert!(
         deferred_native_hook(
             changed_pre,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &ActionCaptureConfig {
                 source: git_request(repo.path()),
@@ -1278,6 +1283,7 @@ fn deferred_alias_gap_keeps_original_target_across_resumed_generation() {
     assert_eq!(
         deferred_native_hook(
             deferred,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &actions,
             &spool,
@@ -1288,6 +1294,7 @@ fn deferred_alias_gap_keeps_original_target_across_resumed_generation() {
     assert_eq!(
         deferred_native_hook(
             deferred,
+            AgentHarnessV1::ClaudeCode,
             DeferredReasonV1::TargetLookupUnavailable,
             &actions,
             &spool,
@@ -5581,6 +5588,7 @@ fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session
     let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"OPENING_PROMPT_917"}"#;
     deferred_native_hook(
         prompt,
+        AgentHarnessV1::ClaudeCode,
         DeferredReasonV1::NoCurrentAuthorizedWork,
         &ActionCaptureConfig {
             source: git_request(repo.path()),
@@ -6155,6 +6163,382 @@ fn a_tool_claim_ends_when_no_start_can_follow_and_expires_when_its_other_phase_n
 
 const CODEX_SESSION: &str = "11111111-2222-7333-8444-555555555555";
 
+fn claude_history_line(kind: &str, id: &str, content: serde_json::Value) -> String {
+    serde_json::json!({
+        "type":kind,"sessionId":"session_fixture","timestamp":"2026-11-01T10:00:01Z",
+        "uuid":id,"message":{"content":content}
+    })
+    .to_string()
+        + "\n"
+}
+
+fn claude_history_header() -> String {
+    serde_json::json!({"type":"queue-operation","sessionId":"session_fixture"}).to_string() + "\n"
+}
+
+#[test]
+fn claude_incremental_history_preserves_prior_repeated_messages_and_each_work() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("session_fixture.jsonl");
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let mut history = claude_history_header()
+        + &claude_history_line("user", "prompt-1", serde_json::json!("same prompt"))
+        + &claude_history_line("user", "prompt-2", serde_json::json!("same prompt"))
+        + &claude_history_line(
+            "assistant",
+            "reply-1",
+            serde_json::json!([
+                {"type":"thinking","thinking":"PRIVATE_THINKING_817"},
+                {"type":"text","text":"prior visible reply"}
+            ]),
+        );
+    for flag in ["isSidechain", "isMeta", "isCompactSummary"] {
+        let mut line: serde_json::Value = serde_json::from_str(&claude_history_line(
+            "user",
+            flag,
+            serde_json::json!("PRIVATE_WRAPPER_818"),
+        ))
+        .unwrap();
+        line[flag] = serde_json::json!(true);
+        if flag == "isSidechain" {
+            line["sessionId"] = serde_json::json!("foreign-child");
+        }
+        history.push_str(&(line.to_string() + "\n"));
+    }
+    history.push_str(&claude_history_line(
+        "system",
+        "instructions",
+        serde_json::json!("PRIVATE_SYSTEM_819"),
+    ));
+    fs::write(&path, history).unwrap();
+    let first = claude_code::capture_transcript(&path, &request, &spool).unwrap();
+    assert!(first.complete);
+    assert_eq!(first.report.events, 3);
+    assert_eq!(first.report.private_blocks_ignored, 1);
+    assert_eq!(
+        claude_code::capture_transcript(&path, &request, &spool)
+            .unwrap()
+            .records,
+        0
+    );
+
+    let next = claude_history_line(
+        "assistant",
+        "reply-2",
+        serde_json::json!("later visible reply"),
+    );
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(next.trim_end().as_bytes()).unwrap();
+    let partial = claude_code::capture_transcript(&path, &request, &spool).unwrap();
+    assert!(!partial.complete);
+    assert_eq!(partial.records, 0);
+    file.write_all(b"\n").unwrap();
+    assert_eq!(
+        claude_code::capture_transcript(&path, &request, &spool)
+            .unwrap()
+            .report
+            .events,
+        1
+    );
+
+    let mut other = request.clone();
+    other.work_id = "wrk_other".into();
+    assert_eq!(
+        claude_code::capture_transcript(&path, &other, &spool)
+            .unwrap()
+            .report
+            .events,
+        4
+    );
+    for work in [&request.work_id, &other.work_id] {
+        let events = codex_work_events(&spool, work);
+        let prompts: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == CapturedEventKindV1::UserPrompt)
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert_ne!(prompts[0].event_id, prompts[1].event_id);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                .count(),
+            2
+        );
+    }
+    let retained = retained_bytes(spool.root());
+    for private in [
+        "PRIVATE_THINKING_817",
+        "PRIVATE_WRAPPER_818",
+        "PRIVATE_SYSTEM_819",
+    ] {
+        assert!(!contains_bytes(&retained, private.as_bytes()));
+    }
+    let mut opted_out = request;
+    opted_out.work_id = "wrk_metadata".into();
+    opted_out.capture_mode = CaptureModeV1::MetadataOnly;
+    opted_out.live_capture_mode = CaptureModeV1::MetadataOnly;
+    claude_code::capture_transcript(&path, &opted_out, &spool).unwrap();
+    assert!(
+        codex_work_events(&spool, &opted_out.work_id)
+            .iter()
+            .all(|event| event.artifact.is_none())
+    );
+}
+
+#[test]
+fn claude_history_discovery_and_reader_require_the_exact_main_session() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let root = temp.path().join("projects");
+    let project = root.join("synthetic-project");
+    let subagent = project.join("subagents");
+    fs::create_dir_all(&subagent).unwrap();
+    let path = project.join("session_fixture.jsonl");
+    let history = serde_json::json!({"type":"file-history-snapshot"}).to_string()
+        + "\n"
+        + &claude_history_line("user", "prompt-1", serde_json::json!("visible"));
+    fs::write(subagent.join("session_fixture.jsonl"), &history).unwrap();
+    assert!(
+        claude_code::find_transcript(&root, "session_fixture")
+            .unwrap()
+            .is_none()
+    );
+    fs::write(&path, &history).unwrap();
+    assert_eq!(
+        claude_code::find_transcript(&root, "session_fixture").unwrap(),
+        Some(path.canonicalize().unwrap())
+    );
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    assert_eq!(
+        claude_code::capture_transcript(&path, &request, &spool)
+            .unwrap()
+            .report
+            .events,
+        1
+    );
+    let alias = project.join("other.jsonl");
+    fs::write(&alias, &history).unwrap();
+    assert!(claude_code::capture_transcript(&alias, &request, &spool).is_err());
+    fs::write(&path, claude_history_header()).unwrap();
+    assert!(claude_code::capture_transcript(&path, &request, &spool).is_err());
+    fs::rename(&path, project.join("old.jsonl")).unwrap();
+    fs::write(&path, &history).unwrap();
+    assert!(claude_code::capture_transcript(&path, &request, &spool).is_err());
+    let second_project = root.join("second-project");
+    fs::create_dir(&second_project).unwrap();
+    fs::write(second_project.join("session_fixture.jsonl"), &history).unwrap();
+    assert!(claude_code::find_transcript(&root, "session_fixture").is_err());
+}
+
+#[test]
+fn claude_history_replay_after_cursor_loss_keeps_one_occurrence() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("session_fixture.jsonl");
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    fs::write(
+        &path,
+        claude_history_header()
+            + &claude_history_line("user", "prompt-1", serde_json::json!("visible prompt"))
+            + &claude_history_line("assistant", "reply-1", serde_json::json!("visible reply")),
+    )
+    .unwrap();
+    claude_code::capture_transcript(&path, &request, &spool).unwrap();
+    let state_path = spool
+        .root()
+        .join("sessions")
+        .join(format!("{:x}.json", Sha256::digest(b"session_fixture")));
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["visible_history"] = serde_json::json!({});
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let gate = Arc::new(Barrier::new(3));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (gate, root, path, request) = (
+                gate.clone(),
+                spool.root().to_owned(),
+                path.clone(),
+                request.clone(),
+            );
+            thread::spawn(move || {
+                let spool = LocalSpool::open(root).unwrap();
+                gate.wait();
+                claude_code::capture_transcript(&path, &request, &spool).unwrap()
+            })
+        })
+        .collect();
+    gate.wait();
+    for reader in readers {
+        let report = reader.join().unwrap();
+        assert!(report.complete);
+        assert_eq!(report.report.events, 0);
+    }
+    assert_eq!(codex_work_events(&spool, &request.work_id).len(), 2);
+}
+
+#[test]
+fn claude_history_native_tool_phases_deduplicate_without_suppressing_actions() {
+    let repo = git_fixture();
+    for source_first in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let request = capture_request(CaptureModeV1::LocalConversation);
+        let actions = ActionCaptureConfig {
+            source: git_request(&repo.path().canonicalize().unwrap()),
+            setup_digest: "1".repeat(64),
+            managed_invocations: Vec::new(),
+            rules: vec![ActionRuleV1 {
+                native_tool: "Bash".into(),
+                kind: ActionKindV1::Execution,
+                coverage: CoverageV1::Partial,
+                result_source: NativeResultSourceV1::ProcessExitCode,
+                recipe_digest: None,
+            }],
+        };
+        let path = temp.path().join("session_fixture.jsonl");
+        fs::write(&path, claude_history_header()
+            + &claude_history_line("assistant", "tool-start", serde_json::json!([
+                {"type":"tool_use","id":"exec-1","name":"Bash","input":{"command":"false"}}
+            ]))
+            + &claude_history_line("user", "tool-end", serde_json::json!([
+                {"type":"tool_result","tool_use_id":"exec-1","is_error":true,"content":"failed"}
+            ]))).unwrap();
+        if source_first {
+            claude_code::capture_transcript(&path, &request, &spool).unwrap();
+        }
+        for event in ["PreToolUse", "PostToolUse"] {
+            let input = serde_json::to_vec(&serde_json::json!({"hook_event_name":event,"session_id":"session_fixture",
+                "tool_name":"Bash","tool_use_id":"exec-1","tool_input":{"command":"false"},"tool_response":{"exit_code":1,"stdout":"failed"}})).unwrap();
+            let report = capture_native_hook(&input, &request, &actions, &spool).unwrap();
+            assert_eq!(
+                report.event,
+                if source_first {
+                    HookCaptureOutcome::Duplicate
+                } else {
+                    HookCaptureOutcome::Stored
+                }
+            );
+            assert!(matches!(
+                report.action,
+                NativeActionOutcome::Started(_) | NativeActionOutcome::Finished(_)
+            ));
+        }
+        claude_code::capture_transcript(&path, &request, &spool).unwrap();
+        let events = codex_work_events(&spool, &request.work_id);
+        assert_eq!(
+            events.iter().filter(|event| event.tool.is_some()).count(),
+            2
+        );
+        if source_first {
+            assert!(events.iter().any(|event| {
+                event
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.completion == Some(ToolCompletionV1::Failed))
+            }));
+        }
+        assert_eq!(
+            spool
+                .pending(100)
+                .unwrap()
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope,
+                    CaptureEnvelopeV1::ActionStart(_) | CaptureEnvelopeV1::ActionFinish(_)
+                ))
+                .count(),
+            2
+        );
+        let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"source will flush this"}"#;
+        assert_eq!(
+            capture_hook(prompt, &request, &spool).unwrap(),
+            HookCaptureOutcome::Duplicate
+        );
+    }
+}
+
+#[test]
+fn claude_history_refuses_foreign_body_before_retention_and_falls_back_to_hooks() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("session_fixture.jsonl");
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let foreign = claude_history_line("user", "foreign", serde_json::json!("FOREIGN_PRIVATE_823"))
+        .replace("session_fixture", "foreign-session");
+    fs::write(&path, claude_history_header() + &foreign).unwrap();
+    assert!(claude_code::capture_transcript(&path, &request, &spool).is_err());
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"FOREIGN_PRIVATE_823"
+    ));
+    let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"source owns this"}"#;
+    assert_eq!(
+        capture_hook(prompt, &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    let mut wrong_harness = request;
+    wrong_harness.harness = AgentHarnessV1::Codex;
+    assert!(claude_code::capture_transcript(&path, &wrong_harness, &spool).is_err());
+}
+
+#[test]
+fn automatic_native_history_has_stable_occurrence_ids_across_generations() {
+    for harness in [AgentHarnessV1::ClaudeCode, AgentHarnessV1::Codex] {
+        let temp = TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let mut request = if harness == AgentHarnessV1::ClaudeCode {
+            capture_request(CaptureModeV1::SharedConversation)
+        } else {
+            codex_request(CaptureModeV1::SharedConversation)
+        };
+        let path = temp
+            .path()
+            .join(format!("{}.jsonl", request.observed_session_id));
+        let history = if harness == AgentHarnessV1::ClaudeCode {
+            claude_history_header()
+                + &claude_history_line("user", "prompt-1", serde_json::json!("same prompt"))
+                + &claude_history_line("user", "prompt-2", serde_json::json!("same prompt"))
+        } else {
+            codex_history_header(0)
+                + &codex_history_message(1, "UserMessage", "prompt-1", "same prompt")
+                + &codex_history_message(2, "UserMessage", "prompt-2", "same prompt")
+        };
+        fs::write(&path, history).unwrap();
+        let capture = |request: &CaptureRequest| {
+            if harness == AgentHarnessV1::ClaudeCode {
+                claude_code::capture_transcript(&path, request, &spool).unwrap()
+            } else {
+                codex::capture_rollout(&path, request, &spool).unwrap()
+            }
+        };
+        assert_eq!(capture(&request).report.events, 2);
+        let first = codex_work_events(&spool, &request.work_id);
+        assert_eq!(first.len(), 2);
+        assert!(
+            first
+                .iter()
+                .all(|event| event.event_id.starts_with("evt:history:"))
+        );
+        assert_ne!(first[0].event_id, first[1].event_id);
+        request.generation += 1;
+        // Requeue pending history under the current authorization fence. Its stable identities
+        // let the Hub present one occurrence if an earlier generation was already delivered.
+        assert_eq!(capture(&request).report.events, 2);
+        for event in first {
+            assert_eq!(
+                codex_work_events(&spool, &request.work_id)
+                    .iter()
+                    .filter(|item| item.event_id == event.event_id)
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
 fn codex_request(mode: CaptureModeV1) -> CaptureRequest {
     CaptureRequest {
         // A usage observation names real Work.
@@ -6173,6 +6557,575 @@ fn codex_fixture(name: &str) -> Vec<u8> {
             .join(name),
     )
     .unwrap()
+}
+
+fn codex_history_line(ordinal: u64, kind: &str, payload: serde_json::Value) -> String {
+    serde_json::json!({"timestamp":"2026-11-01T10:00:01Z","ordinal":ordinal,"type":kind,"payload":payload}).to_string() + "\n"
+}
+
+fn codex_history_message(ordinal: u64, kind: &str, id: &str, text: &str) -> String {
+    codex_history_line(
+        ordinal,
+        "event_msg",
+        serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,"turn_id":"turn_1",
+            "item":{"type":kind,"id":id,"phase":"commentary","content":[{"type":"Text","text":text}]}
+        }),
+    )
+}
+
+fn codex_history_header(own_from: u64) -> String {
+    codex_history_line(
+        0,
+        "session_meta",
+        serde_json::json!({"id":CODEX_SESSION,"subagent_history_start_ordinal":own_from}),
+    )
+}
+
+fn codex_work_events(spool: &LocalSpool, work: &str) -> Vec<CapturedEventV1> {
+    spool
+        .pending(100)
+        .unwrap()
+        .into_iter()
+        .filter_map(|envelope| match envelope {
+            CaptureEnvelopeV1::EventBatch(batch) if batch.work_id == work => Some(batch.events),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn codex_incremental_history_preserves_repeated_messages_partial_lines_and_each_work() {
+    use std::io::Write;
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("history.jsonl");
+    let request = codex_request(CaptureModeV1::SharedConversation);
+    let initial = codex_history_header(0)
+        + &codex_history_message(1, "UserMessage", "prompt_1", "same prompt")
+        + &codex_history_message(2, "UserMessage", "prompt_2", "same prompt")
+        + &codex_history_message(3, "AgentMessage", "comment_1", "visible explanation")
+        + &codex_history_line(
+            4,
+            "event_msg",
+            serde_json::json!({"type":"item_completed","item":{"type":"Reasoning","content":[{"text":"PRIVATE_REASONING"}]}}),
+        );
+    fs::write(&path, initial).unwrap();
+    let first = codex::capture_rollout(&path, &request, &spool).unwrap();
+    assert!(first.complete);
+    assert_eq!(first.report.events, 3);
+    let repeated = codex::capture_rollout(&path, &request, &spool).unwrap();
+    assert_eq!((repeated.report.events, repeated.records), (0, 0));
+    let next = codex_history_message(5, "AgentMessage", "comment_2", "later explanation");
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(next.trim_end().as_bytes()).unwrap();
+    let partial = codex::capture_rollout(&path, &request, &spool).unwrap();
+    assert!(!partial.complete);
+    assert_eq!(partial.report.events, 0);
+    file.write_all(b"\n").unwrap();
+    assert_eq!(
+        codex::capture_rollout(&path, &request, &spool)
+            .unwrap()
+            .report
+            .events,
+        1
+    );
+    let mut other = request.clone();
+    other.work_id = format!("wrk_{}", "2".repeat(32));
+    let copied = codex::capture_rollout(&path, &other, &spool).unwrap();
+    assert!(copied.complete);
+    assert_eq!(copied.report.events, 4);
+    for work in [&request.work_id, &other.work_id] {
+        let events = codex_work_events(&spool, work);
+        let prompts: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == CapturedEventKindV1::UserPrompt)
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert_ne!(prompts[0].event_id, prompts[1].event_id);
+    }
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"PRIVATE_REASONING"
+    ));
+}
+
+#[test]
+fn codex_incremental_history_refuses_replacement_truncation_and_foreign_sessions() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("history.jsonl");
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let history =
+        codex_history_header(0) + &codex_history_message(1, "UserMessage", "p1", "visible");
+    fs::write(&path, &history).unwrap();
+    codex::capture_rollout(&path, &request, &spool).unwrap();
+    fs::write(&path, codex_history_header(0)).unwrap();
+    assert!(codex::capture_rollout(&path, &request, &spool).is_err());
+    fs::rename(&path, temp.path().join("old.jsonl")).unwrap();
+    fs::write(&path, &history).unwrap();
+    assert!(codex::capture_rollout(&path, &request, &spool).is_err());
+    let mut other = request;
+    other.observed_session_id = "another-native-session".into();
+    assert!(codex::capture_rollout(&path, &other, &spool).is_err());
+}
+
+#[test]
+fn codex_incremental_history_skips_inherited_source_and_discovery_requires_exact_native_file() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let root = temp.path().join("sessions");
+    let date = root.join("2026/11/01");
+    fs::create_dir_all(&date).unwrap();
+    let path = date.join(format!("rollout-fixture-{CODEX_SESSION}.jsonl"));
+    fs::write(
+        &path,
+        codex_history_header(2)
+            + &codex_history_message(1, "UserMessage", "parent_prompt", "INHERITED_PRIVATE")
+            + &codex_history_message(2, "UserMessage", "own_prompt", "own prompt"),
+    )
+    .unwrap();
+    assert_eq!(
+        codex::find_rollout(&root, CODEX_SESSION).unwrap(),
+        Some(path.canonicalize().unwrap())
+    );
+    let report = codex::capture_rollout(
+        &path,
+        &codex_request(CaptureModeV1::LocalConversation),
+        &spool,
+    )
+    .unwrap();
+    assert_eq!(report.report.events, 1);
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"INHERITED_PRIVATE"
+    ));
+    fs::copy(
+        &path,
+        date.join(format!("rollout-other-{CODEX_SESSION}.jsonl")),
+    )
+    .unwrap();
+    assert!(codex::find_rollout(&root, CODEX_SESSION).is_err());
+    let link = temp.path().join("link.jsonl");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(
+        codex::capture_rollout(
+            &link,
+            &codex_request(CaptureModeV1::LocalConversation),
+            &spool
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn codex_rollout_and_native_tools_share_phases_in_both_orders_without_losing_actions() {
+    for source_first in [false, true] {
+        let repo = git_fixture();
+        let temp = TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let request = codex_request(CaptureModeV1::LocalConversation);
+        let actions = ActionCaptureConfig {
+            source: git_request(&repo.path().canonicalize().unwrap()),
+            setup_digest: "1".repeat(64),
+            managed_invocations: Vec::new(),
+            rules: vec![ActionRuleV1 {
+                native_tool: "Bash".into(),
+                kind: ActionKindV1::Execution,
+                coverage: CoverageV1::Partial,
+                result_source: NativeResultSourceV1::ProcessExitCode,
+                recipe_digest: None,
+            }],
+        };
+        let path = temp.path().join("history.jsonl");
+        fs::write(&path, codex_history_header(0) + &codex_history_line(1,"event_msg",serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,
+            "item":{"type":"CommandExecution","id":"exec-1","command":"true","status":"completed","exit_code":0,"aggregated_output":"done"}
+        }))).unwrap();
+        if source_first {
+            codex::capture_rollout(&path, &request, &spool).unwrap();
+        }
+        for event in ["PreToolUse", "PostToolUse"] {
+            let input = serde_json::to_vec(&serde_json::json!({"hook_event_name":event,"session_id":CODEX_SESSION,
+                "tool_name":"Bash","tool_use_id":"exec-1","tool_input":{"command":"true"},"tool_response":{"exit_code":0,"stdout":"done"}})).unwrap();
+            let report = capture_native_hook(&input, &request, &actions, &spool).unwrap();
+            assert_eq!(
+                report.event,
+                if source_first {
+                    HookCaptureOutcome::Duplicate
+                } else {
+                    HookCaptureOutcome::Stored
+                }
+            );
+            assert!(matches!(
+                report.action,
+                NativeActionOutcome::Started(_) | NativeActionOutcome::Finished(_)
+            ));
+        }
+        codex::capture_rollout(&path, &request, &spool).unwrap();
+        let events = codex_work_events(&spool, &request.work_id);
+        assert_eq!(
+            events.iter().filter(|event| event.tool.is_some()).count(),
+            2
+        );
+        let pending = spool.pending(100).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope,
+                    CaptureEnvelopeV1::ActionStart(_) | CaptureEnvelopeV1::ActionFinish(_)
+                ))
+                .count(),
+            2
+        );
+        // Native compact receipts still replay after a history-first phase supplied its event.
+        let post = serde_json::to_vec(&serde_json::json!({"hook_event_name":"PostToolUse","session_id":CODEX_SESSION,
+            "tool_name":"Bash","tool_use_id":"exec-1","tool_input":{"command":"true"},"tool_response":{"exit_code":0,"stdout":"done"}})).unwrap();
+        assert_eq!(
+            capture_native_hook(&post, &request, &actions, &spool)
+                .unwrap()
+                .event,
+            HookCaptureOutcome::Duplicate
+        );
+    }
+}
+
+#[test]
+fn codex_question_reader_clears_questions_on_any_reply_from_the_person() {
+    use std::io::Write;
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("history.jsonl");
+    fs::write(&path, codex_history_header(0) + &codex_history_line(1,"event_msg",serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_question",
+        "content":[],"delivery":"async","questions":[{"title":"PRIVATE_QUESTION_TITLE","options":["Yes","No"]}]}
+    }))).unwrap();
+    let mut cursor = None;
+    let first = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(first.complete && first.reliable);
+    assert_eq!(first.snapshot.pending.len(), 1);
+    assert_eq!(first.snapshot.pending[0].asks, None);
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    // A plain message that quotes the question and adds an answer clears it.
+    file.write_all(
+        codex_history_message(
+            2,
+            "UserMessage",
+            "plain_reply",
+            "> PRIVATE_QUESTION_TITLE\n\nYes, continue the task",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let plain = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(plain.complete && plain.reliable);
+    assert!(plain.snapshot.pending.is_empty());
+    // A structured reply clears only the question it names.
+    file.write_all(codex_history_line(3, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_two",
+        "content":[],"delivery":"async","questions":[{"title":"First","options":["Yes","No"]},{"title":"Second","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let two = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(two.snapshot.pending.len(), 2);
+    let answer = serde_json::json!([{"questionItemId":two.snapshot.pending[0].id,"answer":"Yes"}]);
+    let text =
+        format!("<send_user_message_question_reply>{answer}</send_user_message_question_reply>");
+    file.write_all(codex_history_message(4, "UserMessage", "answer", &text).as_bytes())
+        .unwrap();
+    let answered = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(answered.complete && answered.reliable);
+    assert_eq!(answered.snapshot.pending.len(), 1);
+    assert_eq!(answered.snapshot.pending[0].id, two.snapshot.pending[1].id);
+    // A question asked after a user message stays pending; the next message clears both.
+    file.write_all(codex_history_line(5, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_later",
+        "content":[],"delivery":"async","questions":[{"title":"Later","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let later = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(later.snapshot.pending.len(), 2);
+    file.write_all(codex_history_message(6, "UserMessage", "any", "carry on").as_bytes())
+        .unwrap();
+    let cleared = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(cleared.complete && cleared.reliable);
+    assert!(cleared.snapshot.pending.is_empty());
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let captured = codex::capture_rollout(
+        &path,
+        &codex_request(CaptureModeV1::SharedConversation),
+        &spool,
+    )
+    .unwrap();
+    assert!(captured.complete && captured.questions_complete);
+    let bodies = retained_bytes(spool.root());
+    assert!(contains_bytes(&bodies, b"PRIVATE_QUESTION_TITLE"));
+    assert!(!contains_bytes(
+        &bodies,
+        b"send_user_message_question_reply"
+    ));
+    // A structured reply beside a plain-text block still clears only the question it names.
+    file.write_all(codex_history_line(9, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_pair",
+        "content":[],"delivery":"async","questions":[{"title":"Alpha","options":["Yes","No"]},{"title":"Beta","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let pair = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert_eq!(pair.snapshot.pending.len(), 2);
+    let named = serde_json::json!([{"questionItemId":pair.snapshot.pending[1].id,"answer":"No"}]);
+    file.write_all(
+        codex_history_line(10, "event_msg", serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,"turn_id":"turn_1",
+            "item":{"type":"UserMessage","id":"mixed","phase":"commentary","content":[
+                {"type":"Text","text":format!("<send_user_message_question_reply>{named}</send_user_message_question_reply>")},
+                {"type":"Text","text":"plain note without a quote"}
+            ]}
+        })).as_bytes(),
+    )
+    .unwrap();
+    let mixed = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(mixed.complete && mixed.reliable);
+    assert_eq!(mixed.snapshot.pending.len(), 1);
+    assert!(
+        mixed
+            .snapshot
+            .pending
+            .iter()
+            .all(|q| q.id != pair.snapshot.pending[1].id)
+    );
+    // A message with no text blocks, or no content at all, still clears every pending question.
+    for (ordinal, content) in [
+        (
+            11,
+            serde_json::json!([{"type":"Image","url":"synthetic://image"}]),
+        ),
+        (12, serde_json::json!([])),
+    ] {
+        let still = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+        assert!(!still.snapshot.pending.is_empty());
+        file.write_all(
+            codex_history_line(ordinal, "event_msg", serde_json::json!({
+                "type":"item_completed","thread_id":CODEX_SESSION,"turn_id":"turn_1",
+                "item":{"type":"UserMessage","id":format!("bare_{ordinal}"),"phase":"commentary","content":content}
+            })).as_bytes(),
+        )
+        .unwrap();
+        let bare = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+        assert!(bare.complete && bare.reliable);
+        assert!(bare.snapshot.pending.is_empty());
+        file.write_all(codex_history_line(ordinal + 10, "event_msg", serde_json::json!({
+            "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":format!("again_{ordinal}"),
+            "content":[],"delivery":"async","questions":[{"title":"Again","options":["Yes","No"]}]}
+        })).as_bytes()).unwrap();
+    }
+    file.write_all(codex_history_line(40, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":CODEX_SESSION,"item":{"type":"AgentMessage","id":"call_null",
+        "questions":[{"title":"Another question","options":["Yes","No"]}]}
+    })).as_bytes()).unwrap();
+    let pending = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    let invalid =
+        serde_json::json!([{"questionItemId":pending.snapshot.pending[0].id,"answer":null}]);
+    file.write_all(
+        codex_history_message(
+            41,
+            "UserMessage",
+            "invalid_answer",
+            &format!(
+                "<send_user_message_question_reply>{invalid}</send_user_message_question_reply>"
+            ),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let invalid = codex::poll_questions(&path, CODEX_SESSION, &mut cursor).unwrap();
+    assert!(invalid.complete);
+    assert!(!invalid.reliable);
+    assert_eq!(invalid.snapshot.pending.len(), 2);
+}
+
+#[test]
+fn codex_rollout_replays_after_queue_before_cursor_crash_and_concurrent_scans() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("history.jsonl");
+    let request = codex_request(CaptureModeV1::SharedConversation);
+    fs::write(
+        &path,
+        codex_history_header(0)
+            + &codex_history_message(1, "UserMessage", "p1", "repeatable prompt")
+            + &codex_history_message(2, "AgentMessage", "a1", "repeatable answer"),
+    )
+    .unwrap();
+    codex::capture_rollout(&path, &request, &spool).unwrap();
+    // Model a crash after the immutable batches were queued, before the cursor was replaced.
+    let state_path = spool.root().join("sessions").join(format!(
+        "{:x}.json",
+        Sha256::digest(CODEX_SESSION.as_bytes())
+    ));
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["visible_history"] = serde_json::json!({});
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let gate = Arc::new(Barrier::new(3));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (gate, root, path, request) = (
+                gate.clone(),
+                spool.root().to_owned(),
+                path.clone(),
+                request.clone(),
+            );
+            thread::spawn(move || {
+                let spool = LocalSpool::open(root).unwrap();
+                gate.wait();
+                codex::capture_rollout(&path, &request, &spool).unwrap()
+            })
+        })
+        .collect();
+    gate.wait();
+    for reader in readers {
+        let report = reader.join().unwrap();
+        assert!(report.complete);
+        assert_eq!(report.report.events, 0);
+    }
+    assert_eq!(codex_work_events(&spool, &request.work_id).len(), 2);
+}
+
+#[test]
+fn codex_rollout_authority_waits_for_tool_flush_without_losing_native_action() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: vec![ActionRuleV1 {
+            native_tool: "Bash".into(),
+            kind: ActionKindV1::Execution,
+            coverage: CoverageV1::Partial,
+            result_source: NativeResultSourceV1::ProcessExitCode,
+            recipe_digest: None,
+        }],
+    };
+    let path = temp.path().join("history.jsonl");
+    fs::write(&path, codex_history_header(0)).unwrap();
+    codex::capture_rollout(&path, &request, &spool).unwrap();
+    for event in ["PreToolUse", "PostToolUse"] {
+        let input = serde_json::to_vec(&serde_json::json!({"hook_event_name":event,"session_id":CODEX_SESSION,
+            "tool_name":"Bash","tool_use_id":"failed-1","tool_input":{"command":"false"},"tool_response":{"stdout":"failed"}})).unwrap();
+        assert_eq!(
+            capture_native_hook(&input, &request, &actions, &spool)
+                .unwrap()
+                .event,
+            HookCaptureOutcome::Duplicate
+        );
+    }
+    assert!(codex_work_events(&spool, &request.work_id).is_empty());
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(codex_history_line(1,"event_msg",serde_json::json!({"type":"item_completed","thread_id":CODEX_SESSION,
+        "item":{"type":"CommandExecution","id":"failed-1","command":"false","status":"failed","exit_code":1,"aggregated_output":"failed"}})).as_bytes()).unwrap();
+    codex::capture_rollout(&path, &request, &spool).unwrap();
+    let events = codex_work_events(&spool, &request.work_id);
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|event| {
+        event
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.completion == Some(ToolCompletionV1::Failed))
+    }));
+    assert_eq!(
+        spool
+            .pending(100)
+            .unwrap()
+            .iter()
+            .filter(|item| matches!(
+                item,
+                CaptureEnvelopeV1::ActionStart(_) | CaptureEnvelopeV1::ActionFinish(_)
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn codex_history_and_question_scans_advance_bounded_pages() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::MetadataOnly);
+    let path = temp.path().join("history.jsonl");
+    let mut history = codex_history_header(0);
+    for ordinal in 1..=1001 {
+        history.push_str(&codex_history_line(
+            ordinal,
+            "turn_context",
+            serde_json::json!({"model":"fixture"}),
+        ));
+    }
+    fs::write(&path, history).unwrap();
+    let first = codex::capture_rollout(&path, &request, &spool).unwrap();
+    assert_eq!(first.records, 1000);
+    assert!(!first.complete);
+    let last = codex::capture_rollout(&path, &request, &spool).unwrap();
+    assert_eq!(last.records, 2);
+    assert!(last.complete);
+    let mut cursor = None;
+    assert!(
+        !codex::poll_questions(&path, CODEX_SESSION, &mut cursor)
+            .unwrap()
+            .complete
+    );
+    assert!(
+        codex::poll_questions(&path, CODEX_SESSION, &mut cursor)
+            .unwrap()
+            .complete
+    );
+}
+
+#[test]
+fn codex_first_page_failure_keeps_gap_and_enables_trusted_hooks() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let path = temp.path().join("history.jsonl");
+    fs::write(&path, codex_history_header(0) + &codex_history_line(1, "event_msg", serde_json::json!({
+        "type":"item_completed","thread_id":"another-session",
+        "item":{"type":"UserMessage","id":"foreign","content":[{"text":"FOREIGN_PRIVATE_BODY"}]}
+    }))).unwrap();
+    assert!(codex::capture_rollout(&path, &request, &spool).is_err());
+    let state_path = spool.root().join("sessions").join(format!(
+        "{:x}.json",
+        Sha256::digest(CODEX_SESSION.as_bytes())
+    ));
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    let cursor = state["visible_history"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(cursor["file"]["offset"], 0);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: Vec::new(),
+    };
+    let input = serde_json::to_vec(
+        &serde_json::json!({"hook_event_name":"PreToolUse","session_id":CODEX_SESSION,
+        "tool_name":"Bash","tool_use_id":"later-tool","tool_input":{"command":"true"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        capture_native_hook(&input, &request, &actions, &spool)
+            .unwrap()
+            .event,
+        HookCaptureOutcome::Stored
+    );
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"FOREIGN_PRIVATE_BODY"
+    ));
 }
 
 fn pending_usage(spool: &LocalSpool) -> Vec<UsageRecord> {
@@ -6512,4 +7465,787 @@ fn codex_import_refuses_another_session_and_skips_a_parent_copy() {
     let retained = retained_bytes(spool.root());
     assert!(contains_bytes(&retained, b"OWN_REPLY_911"));
     assert!(!contains_bytes(&retained, b"PARENT_REPLY_910"));
+}
+
+fn start_proof_result(request: &CaptureRequest) -> serde_json::Value {
+    serde_json::json!({"isError":false,"structuredContent":{"claim_acquired":true,
+        "work":{"item":{"id":request.work_id,"generation":request.generation,
+        "repository":"acme/widgets"}}}})
+}
+
+fn codex_start_proof_item(request: &CaptureRequest) -> serde_json::Value {
+    serde_json::json!({"type":"McpToolCall","id":"start-call","server":"agentscm",
+        "tool":"agentscm_start","arguments":{"session":request.observed_session_id},
+        "status":"completed","result":start_proof_result(request)})
+}
+
+#[test]
+fn native_codex_start_proof_requires_exact_tool_session_work_repository_and_success() {
+    let request = codex_request(CaptureModeV1::SharedConversation);
+    for case in [
+        "valid",
+        "session",
+        "work",
+        "generation",
+        "repository",
+        "failed",
+        "error",
+        "claim",
+        "server",
+        "tool",
+        "text",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let path = temp.path().join("source.jsonl");
+        let mut item = codex_start_proof_item(&request);
+        match case {
+            "session" => item["arguments"]["session"] = serde_json::json!("another-native"),
+            "work" => {
+                item["result"]["structuredContent"]["work"]["item"]["id"] =
+                    serde_json::json!("wrk_other")
+            }
+            "generation" => {
+                item["result"]["structuredContent"]["work"]["item"]["generation"] =
+                    serde_json::json!(request.generation + 1)
+            }
+            "repository" => {
+                item["result"]["structuredContent"]["work"]["item"]["repository"] =
+                    serde_json::json!("acme/other")
+            }
+            "failed" => item["status"] = serde_json::json!("failed"),
+            "error" => item["result"]["isError"] = serde_json::json!(true),
+            "claim" => {
+                item["result"]["structuredContent"]["claim_acquired"] = serde_json::json!(false)
+            }
+            "server" => item["server"] = serde_json::json!("other"),
+            "tool" => item["tool"] = serde_json::json!("other"),
+            "text" => {
+                item = serde_json::json!({"type":"UserMessage","id":"text",
+                "content":[{"type":"Text","text":item.to_string()}]})
+            }
+            _ => {}
+        }
+        fs::write(
+            &path,
+            codex_history_header(0)
+                + &codex_history_line(
+                    1,
+                    "event_msg",
+                    serde_json::json!({"type":"item_completed","item":item}),
+                ),
+        )
+        .unwrap();
+        let report = codex::verify_history_start(&path, &request, "acme/widgets", &spool).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.authorized, case == "valid", "{case}");
+        assert!(spool.pending(100).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn native_codex_start_proof_excludes_inherited_records_and_invalidates_changed_sources() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let path = temp.path().join("source.jsonl");
+    let request = codex_request(CaptureModeV1::SharedConversation);
+    let start = codex_history_line(
+        1,
+        "event_msg",
+        serde_json::json!({"type":"item_completed",
+        "item":codex_start_proof_item(&request)}),
+    );
+    fs::write(&path, codex_history_header(2) + &start).unwrap();
+    assert!(
+        !codex::verify_history_start(&path, &request, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+    fs::rename(&path, temp.path().join("inherited.jsonl")).unwrap();
+    fs::write(&path, codex_history_header(0) + &start).unwrap();
+    assert!(
+        codex::verify_history_start(&path, &request, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+    assert_eq!(
+        codex::verify_history_start(&path, &request, "acme/widgets", &spool)
+            .unwrap()
+            .records,
+        0
+    );
+    assert!(
+        !codex::verify_history_start(&path, &request, "acme/other", &spool)
+            .unwrap()
+            .authorized
+    );
+    let mut other = request.clone();
+    other.work_id = "wrk_other".into();
+    assert!(
+        !codex::verify_history_start(&path, &other, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+    other = request.clone();
+    other.generation += 1;
+    assert!(
+        !codex::verify_history_start(&path, &other, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+    fs::rename(&path, temp.path().join("old.jsonl")).unwrap();
+    fs::write(&path, codex_history_header(0)).unwrap();
+    assert!(
+        !codex::verify_history_start(&path, &request, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+    let mut foreign = request.clone();
+    foreign.observed_session_id = "foreign-native".into();
+    assert!(codex::verify_history_start(&path, &foreign, "acme/widgets", &spool).is_err());
+}
+
+fn claude_start_proof_call(session: &str, id: &str) -> serde_json::Value {
+    serde_json::json!({"type":"tool_use","id":id,"name":"mcp__agentscm__agentscm_start",
+        "input":{"session":session}})
+}
+
+fn claude_start_proof_reply(request: &CaptureRequest, id: &str) -> serde_json::Value {
+    serde_json::json!({"type":"tool_result","tool_use_id":id,"content":[{"type":"text",
+        "text":start_proof_result(request).to_string()}]})
+}
+
+#[test]
+fn native_claude_start_proof_requires_same_session_correlated_successful_tool_records() {
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    for case in [
+        "valid",
+        "plugin",
+        "other-plugin",
+        "session",
+        "uncorrelated",
+        "failed",
+        "sidechain",
+        "text",
+        "work",
+        "generation",
+        "repository",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let path = temp.path().join("session_fixture.jsonl");
+        let mut call = claude_start_proof_call(
+            if case == "session" {
+                "foreign-native"
+            } else {
+                "session_fixture"
+            },
+            "start-call",
+        );
+        if case == "plugin" {
+            call["name"] = serde_json::json!("mcp__plugin_agentscm_agentscm__agentscm_start");
+        } else if case == "other-plugin" {
+            call["name"] = serde_json::json!("mcp__plugin_other_agentscm__agentscm_start");
+        }
+        let mut result_request = request.clone();
+        if case == "work" {
+            result_request.work_id = "wrk_other".into();
+        }
+        if case == "generation" {
+            result_request.generation += 1;
+        }
+        let mut reply = claude_start_proof_reply(
+            &result_request,
+            if case == "uncorrelated" {
+                "another-call"
+            } else {
+                "start-call"
+            },
+        );
+        if case == "failed" {
+            reply["is_error"] = serde_json::json!(true);
+        }
+        if case == "repository" {
+            let mut result = start_proof_result(&request);
+            result["structuredContent"]["work"]["item"]["repository"] =
+                serde_json::json!("acme/other");
+            reply["content"][0]["text"] = serde_json::json!(result.to_string());
+        }
+        let mut call_line: serde_json::Value = serde_json::from_str(&claude_history_line(
+            "assistant",
+            "call",
+            serde_json::json!([call]),
+        ))
+        .unwrap();
+        if case == "sidechain" {
+            call_line["isSidechain"] = serde_json::json!(true);
+        }
+        if case == "text" {
+            call_line["message"]["content"] =
+                serde_json::json!([{"type":"text", "text":call_line.to_string()}]);
+        }
+        fs::write(
+            &path,
+            claude_history_header()
+                + &(call_line.to_string() + "\n")
+                + &claude_history_line("user", "reply", serde_json::json!([reply])),
+        )
+        .unwrap();
+        let report =
+            claude_code::verify_history_start(&path, &request, "acme/widgets", &spool).unwrap();
+        assert!(report.complete);
+        assert_eq!(
+            report.authorized,
+            matches!(case, "valid" | "plugin"),
+            "{case}"
+        );
+        assert!(spool.pending(100).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn native_claude_start_proof_keeps_only_metadata_across_pages_and_late_result() {
+    let temp = TempDir::new().unwrap();
+    let spool_path = temp.path().join("spool");
+    let spool = LocalSpool::open(&spool_path).unwrap();
+    let path = temp.path().join("session_fixture.jsonl");
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let mut history = claude_history_header()
+        + &claude_history_line(
+            "assistant",
+            "call",
+            serde_json::json!([claude_start_proof_call("session_fixture", "start-call")]),
+        );
+    for index in 0..998 {
+        history.push_str(&claude_history_line(
+            "user",
+            &format!("filler-{index}"),
+            serde_json::json!("PRIVATE_PROOF_BODY_583"),
+        ));
+    }
+    fs::write(&path, &history).unwrap();
+    let first = claude_code::verify_history_start(&path, &request, "acme/widgets", &spool).unwrap();
+    assert!(!first.authorized);
+    assert_eq!(first.records, 1_000);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            claude_history_line(
+                "user",
+                "reply",
+                serde_json::json!([claude_start_proof_reply(&request, "start-call")]),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let reopened = LocalSpool::open(&spool_path).unwrap();
+    let next =
+        claude_code::verify_history_start(&path, &request, "acme/widgets", &reopened).unwrap();
+    assert!(next.authorized && next.complete);
+    assert_eq!(next.records, 1);
+    assert!(!contains_bytes(
+        &retained_bytes(&spool_path),
+        b"PRIVATE_PROOF_BODY_583"
+    ));
+    fs::write(&path, claude_history_header()).unwrap();
+    assert!(
+        !claude_code::verify_history_start(&path, &request, "acme/widgets", &spool)
+            .unwrap()
+            .authorized
+    );
+}
+
+#[test]
+fn native_terminal_history_failure_is_durable_and_new_generation_can_retry() {
+    for harness in [AgentHarnessV1::ClaudeCode, AgentHarnessV1::Codex] {
+        let temp = TempDir::new().unwrap();
+        let spool_path = temp.path().join("spool");
+        let spool = LocalSpool::open(&spool_path).unwrap();
+        let mut request = if harness == AgentHarnessV1::ClaudeCode {
+            capture_request(CaptureModeV1::LocalConversation)
+        } else {
+            codex_request(CaptureModeV1::LocalConversation)
+        };
+        let path = temp
+            .path()
+            .join(format!("{}.jsonl", request.observed_session_id));
+        let original = if harness == AgentHarnessV1::ClaudeCode {
+            claude_history_header()
+                + &claude_history_line("user", "first", serde_json::json!("before failure"))
+        } else {
+            codex_history_header(0)
+                + &codex_history_message(1, "UserMessage", "first", "before failure")
+        };
+        fs::write(&path, &original).unwrap();
+        let capture = |request: &CaptureRequest, spool: &LocalSpool| {
+            if harness == AgentHarnessV1::ClaudeCode {
+                claude_code::capture_transcript(&path, request, spool)
+            } else {
+                codex::capture_rollout(&path, request, spool)
+            }
+        };
+        capture(&request, &spool).unwrap();
+        fs::rename(&path, temp.path().join("old.jsonl")).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(capture(&request, &spool).is_err());
+        assert!(claude_code::history_failed(&request, &spool).unwrap());
+        let reopened = LocalSpool::open(&spool_path).unwrap();
+        assert!(claude_code::history_failed(&request, &reopened).unwrap());
+        let prompt = serde_json::to_vec(&serde_json::json!({"hook_event_name":"UserPromptSubmit",
+            "session_id":request.observed_session_id,"prompt_id":"after-failure","prompt":"trusted later prompt"})).unwrap();
+        assert_eq!(
+            capture_hook(&prompt, &request, &reopened).unwrap(),
+            HookCaptureOutcome::Stored
+        );
+        assert!(capture(&request, &reopened).is_err());
+        let events = codex_work_events(&reopened, &request.work_id);
+        assert!(events.iter().any(|event| event.gap.is_some()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == CapturedEventKindV1::UserPrompt)
+                .count(),
+            2
+        );
+        request.generation += 1;
+        assert!(!claude_code::history_failed(&request, &reopened).unwrap());
+        assert_eq!(capture(&request, &reopened).unwrap().report.events, 1);
+    }
+}
+
+#[test]
+fn native_history_abandon_waits_for_source_pages_before_enabling_hooks() {
+    use std::os::fd::AsRawFd;
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let directory = fs::File::open(spool.root().join("sessions")).unwrap();
+    // Hold the same source-page exclusion used by both readers, simulating a timed-out page.
+    assert_eq!(
+        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let (spool, request) = (spool.clone(), request.clone());
+        thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result =
+                claude_code::abandon_visible_history(&request, &spool, "source-unavailable");
+            done_tx.send(result).unwrap();
+        })
+    };
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(!claude_code::history_failed(&request, &spool).unwrap());
+    assert_eq!(
+        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert!(claude_code::history_failed(&request, &spool).unwrap());
+}
+
+#[test]
+fn native_history_fallback_preserves_retained_tool_phase_deduplication() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let path = temp.path().join("session_fixture.jsonl");
+    fs::write(&path, claude_history_header()
+        + &claude_history_line("assistant", "start", serde_json::json!([
+            {"type":"tool_use","id":"retained-tool","name":"Bash","input":{"command":"true"}}
+        ]))
+        + &claude_history_line("user", "finish", serde_json::json!([
+            {"type":"tool_result","tool_use_id":"retained-tool","content":"done"}
+        ]))).unwrap();
+    claude_code::capture_transcript(&path, &request, &spool).unwrap();
+    claude_code::abandon_visible_history(&request, &spool, "source-unavailable").unwrap();
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: Vec::new(),
+    };
+    for event in ["PreToolUse", "PostToolUse"] {
+        let input = serde_json::to_vec(&serde_json::json!({"hook_event_name":event,
+            "session_id":"session_fixture","tool_name":"Bash","tool_use_id":"retained-tool",
+            "tool_input":{"command":"true"},"tool_response":{"stdout":"done"}}))
+        .unwrap();
+        assert_eq!(
+            capture_native_hook(&input, &request, &actions, &spool)
+                .unwrap()
+                .event,
+            HookCaptureOutcome::Duplicate
+        );
+    }
+    assert_eq!(
+        codex_work_events(&spool, &request.work_id)
+            .iter()
+            .filter(|event| event.tool.is_some())
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn transient_native_history_io_does_not_permanently_disable_recovery() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = codex_request(CaptureModeV1::LocalConversation);
+    let path = temp.path().join("not-written-yet.jsonl");
+    assert!(matches!(
+        codex::capture_rollout(&path, &request, &spool),
+        Err(agentscm::change_capture::CaptureError::Io(_))
+    ));
+    assert!(!claude_code::history_failed(&request, &spool).unwrap());
+    fs::write(&path, codex_history_header(0)).unwrap();
+    assert!(
+        codex::capture_rollout(&path, &request, &spool)
+            .unwrap()
+            .complete
+    );
+}
+
+#[test]
+fn associated_fallback_context_reaches_two_works_without_moving_actions_or_current_route() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let mut other = request.clone();
+    other.work_id = "wrk_other".into();
+    for work in [&request, &other] {
+        claude_code::abandon_visible_history(work, &spool, "source-terminal").unwrap();
+    }
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: vec![ActionRuleV1 {
+            native_tool: "Bash".into(),
+            kind: ActionKindV1::Execution,
+            coverage: CoverageV1::Partial,
+            result_source: NativeResultSourceV1::ProcessExitCode,
+            recipe_digest: None,
+        }],
+    };
+    let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"same available prompt"}"#;
+    capture_native_hook(prompt, &request, &actions, &spool).unwrap();
+    let association_path = spool
+        .root()
+        .join("associations")
+        .join(format!("{:x}.json", Sha256::digest(b"session_fixture")));
+    let current = fs::read(&association_path).unwrap();
+    assert_eq!(
+        claude_code::capture_associated_hook(prompt, &other, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    for event in ["PreToolUse", "PostToolUse"] {
+        let input = serde_json::to_vec(&serde_json::json!({"hook_event_name":event,
+            "session_id":"session_fixture","tool_name":"Bash","tool_use_id":"fanout-tool",
+            "tool_input":{"command":"true"},"tool_response":{"exit_code":0,"stdout":"done"}}))
+        .unwrap();
+        capture_native_hook(&input, &request, &actions, &spool).unwrap();
+        assert_eq!(
+            claude_code::capture_associated_hook(&input, &request, &spool).unwrap(),
+            HookCaptureOutcome::Duplicate
+        );
+        assert_eq!(
+            claude_code::capture_associated_hook(&input, &other, &spool).unwrap(),
+            HookCaptureOutcome::Stored
+        );
+        assert_eq!(
+            claude_code::capture_associated_hook(&input, &other, &spool).unwrap(),
+            HookCaptureOutcome::Duplicate
+        );
+    }
+    let reply = br#"{"hook_event_name":"MessageDisplay","session_id":"session_fixture","message_id":"fanout-reply","delta":"available reply","index":0,"final":true}"#;
+    capture_native_hook(reply, &request, &actions, &spool).unwrap();
+    claude_code::capture_associated_hook(reply, &other, &spool).unwrap();
+    assert_eq!(fs::read(&association_path).unwrap(), current);
+    for work in [&request, &other] {
+        let events = codex_work_events(&spool, &work.work_id);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == CapturedEventKindV1::UserPrompt)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.tool.is_some()).count(),
+            2
+        );
+    }
+    let pending = spool.pending(100).unwrap();
+    let starts = pending
+        .iter()
+        .filter_map(|envelope| match envelope {
+            CaptureEnvelopeV1::ActionStart(start) => Some(start),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].work_id, request.work_id);
+    assert_eq!(
+        pending
+            .iter()
+            .filter(|envelope| matches!(envelope, CaptureEnvelopeV1::ActionFinish(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn associated_fallback_keeps_history_tool_phases_and_cross_repository_spools_independent() {
+    let temp = TempDir::new().unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let first = LocalSpool::open(temp.path().join("repo-one")).unwrap();
+    let second = LocalSpool::open(temp.path().join("repo-two")).unwrap();
+    let path = temp.path().join("session_fixture.jsonl");
+    fs::write(&path, claude_history_header()
+        + &claude_history_line("assistant", "old-tool", serde_json::json!([
+            {"type":"tool_use","id":"retained-fanout-tool","name":"Bash","input":{"command":"true"}}
+        ]))).unwrap();
+    claude_code::capture_transcript(&path, &request, &first).unwrap();
+    for spool in [&first, &second] {
+        claude_code::abandon_visible_history(&request, spool, "source-terminal").unwrap();
+    }
+    let tool = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"retained-fanout-tool","tool_input":{"command":"true"}}"#;
+    assert_eq!(
+        claude_code::capture_associated_hook(tool, &request, &first).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+    assert_eq!(
+        claude_code::capture_associated_hook(tool, &request, &second).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    for spool in [&first, &second] {
+        let events = codex_work_events(spool, &request.work_id);
+        assert_eq!(
+            events.iter().filter(|event| event.tool.is_some()).count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn associated_identity_pins_preserve_default_route_deferred_attribution_and_local_floor() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("spool");
+    let spool = LocalSpool::open(&root).unwrap();
+    assert_eq!(
+        spool
+            .pin_associated_session_identity(
+                "session_fixture",
+                "canonical_fixture",
+                "wrk_other",
+                1,
+                Some("parent_other"),
+                CaptureModeV1::LocalConversation
+            )
+            .unwrap(),
+        (
+            Some("parent_other".into()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+    assert!(
+        fs::read_dir(root.join("associations"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "canonical_fixture",
+                "wrk_default",
+                1,
+                Some("parent_default"),
+                CaptureModeV1::SharedConversation
+            )
+            .unwrap(),
+        (
+            Some("parent_default".into()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+    let current_path = root
+        .join("associations")
+        .join(format!("{:x}.json", Sha256::digest(b"session_fixture")));
+    let current = fs::read(&current_path).unwrap();
+    assert_eq!(
+        spool
+            .pin_associated_session_identity(
+                "session_fixture",
+                "canonical_fixture",
+                "wrk_other",
+                2,
+                Some("parent_new_generation"),
+                CaptureModeV1::MetadataOnly
+            )
+            .unwrap(),
+        (
+            Some("parent_new_generation".into()),
+            CaptureModeV1::MetadataOnly
+        )
+    );
+    let reopened = LocalSpool::open(&root).unwrap();
+    assert_eq!(
+        reopened
+            .pin_associated_session_identity(
+                "session_fixture",
+                "canonical_fixture",
+                "wrk_other",
+                1,
+                Some("changed_parent"),
+                CaptureModeV1::SharedConversation
+            )
+            .unwrap(),
+        (
+            Some("parent_other".into()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+    assert_eq!(fs::read(&current_path).unwrap(), current);
+    reopened
+        .retain_deferred(&DeferredHookV1 {
+            occurrence_id: "evt:after-fanout".into(),
+            reserved_sequence: Some(1),
+            session_id: "session_fixture".into(),
+            hook_event_name: "SessionEnd".into(),
+            observed_at: 0,
+            reason: DeferredReasonV1::TargetLookupUnavailable,
+            input_digest: "1".repeat(64),
+            event_kind: Some(CapturedEventKindV1::SessionEnded),
+            tool_kind: None,
+            source: None,
+            recipe_digest: None,
+            action_kind: None,
+        })
+        .unwrap();
+    let deferred = fs::read_dir(root.join("deferred"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let deferred: serde_json::Value = serde_json::from_slice(&fs::read(deferred).unwrap()).unwrap();
+    assert_eq!(deferred["target"]["work_id"], "wrk_default");
+    // A later import/default route also inherits the native session's original local-only mode.
+    reopened
+        .remember_session_association(
+            "session_fixture",
+            "canonical_fixture",
+            "wrk_import",
+            1,
+            None,
+            CaptureModeV1::SharedConversation,
+        )
+        .unwrap();
+    let imported: serde_json::Value =
+        serde_json::from_slice(&fs::read(&current_path).unwrap()).unwrap();
+    assert_eq!(imported["capture_mode"], "local_conversation");
+    assert_eq!(
+        reopened
+            .pin_session_identity(
+                "session_fixture",
+                "canonical_fixture",
+                "wrk_default",
+                1,
+                None,
+                CaptureModeV1::SharedConversation
+            )
+            .unwrap(),
+        (
+            Some("parent_default".into()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+}
+
+#[test]
+fn associated_identity_pins_adopt_legacy_identity_and_bound_new_associations() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    spool
+        .remember_session_association(
+            "session_fixture",
+            "session_fixture",
+            "wrk_legacy",
+            1,
+            Some("legacy_parent"),
+            CaptureModeV1::MetadataOnly,
+        )
+        .unwrap();
+    assert_eq!(
+        spool
+            .pin_associated_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_legacy",
+                1,
+                Some("new_parent"),
+                CaptureModeV1::SharedConversation
+            )
+            .unwrap(),
+        (Some("legacy_parent".into()), CaptureModeV1::MetadataOnly)
+    );
+    for index in 1..256 {
+        spool
+            .pin_associated_session_identity(
+                "session_fixture",
+                "session_fixture",
+                &format!("wrk_{index}"),
+                1,
+                None,
+                CaptureModeV1::SharedConversation,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        spool.pin_associated_session_identity(
+            "session_fixture",
+            "session_fixture",
+            "wrk_excess",
+            1,
+            None,
+            CaptureModeV1::LocalConversation
+        ),
+        Err(agentscm::change_capture::CaptureError::Limit(_))
+    ));
+    assert_eq!(
+        spool
+            .pin_associated_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_legacy",
+                1,
+                None,
+                CaptureModeV1::SharedConversation
+            )
+            .unwrap(),
+        (Some("legacy_parent".into()), CaptureModeV1::MetadataOnly)
+    );
 }

@@ -25,7 +25,8 @@ src/client_cli/computer.rs let value: Value = serde_json::from_str(&text).ok()?;
 # src/client_config.rs: connections.json
 src/client_config.rs serde_json::from_str(text).map_err(|_| invalid("connections.json is not valid"))?;
 
-# src/client_mcp.rs: JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged
+# src/client_mcp.rs: JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged; the outgoing request body selects a bounded inbox-wait timeout
+src/client_mcp.rs let wait = serde_json::from_slice::<Value>(body)
 src/client_mcp.rs let message = serde_json::from_slice(&line)?;
 src/client_mcp.rs let message = serde_json::from_slice::<Value>(&line).ok();
 src/client_mcp.rs let message: Value = match serde_json::from_slice(&line) {
@@ -43,11 +44,13 @@ src/demo_cli.rs let reply: Value = serde_json::from_str(&reply.text().await.unwr
 src/git_export/remote/network.rs serde_json::from_slice(&bytes).map_err(|_| invalid("invalid Git credential file"))?;
 
 # src/hook_cli.rs: the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, the Cursor reply this hook keeps in a local file, a helper process's answer
+src/hook_cli.rs .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
 src/hook_cli.rs Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| {
 src/hook_cli.rs let mut payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 src/hook_cli.rs .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
 src/hook_cli.rs let snapshot: AdvisorySnapshot = serde_json::from_slice(&bytes).ok()?;
 src/hook_cli.rs serde_json::from_str(text.trim()).ok()
+src/hook_cli.rs serde_json::from_value(payload["questions"].clone())
 
 # src/hook_relay.rs: frames between the hook and the local relay; the Hub's reply inside stays untyped JSON
 src/hook_relay.rs let mut head: Head = serde_json::from_slice(&head).map_err(|_| unavailable())?;
@@ -66,6 +69,9 @@ src/intent_cli.rs let state: State = serde_json::from_str(&std::fs::read_to_stri
 src/intent_cli.rs serde_json::from_str(&text).unwrap_or(Value::Null)
 src/intent_cli.rs serde_json::from_str(text)
 
+# src/message_wait.rs: the locally constructed waiter request body
+src/message_wait.rs serde_json::from_str(&wait_body(session, agent)).expect("wait body is JSON");
+
 # src/pipeline_cli.rs: an operator's input file
 src/pipeline_cli.rs Ok(serde_json::from_slice(&bytes)?)
 
@@ -74,6 +80,9 @@ src/promise_cli.rs serde_json::from_slice(&bytes).map_err(|_| invalid("promise i
 
 # src/publish_cli.rs: the manifest this client built, checked before it is sent
 src/publish_cli.rs serde_json::from_value::<Manifest>(manifest.clone())?
+
+# src/quickstart/hub_setup.rs: the local GitHub App credentials file
+src/quickstart/hub_setup.rs .and_then(|text| serde_json::from_str(&text).ok())
 
 # src/skill_cli.rs: a command-line argument, the caller's detail file
 src/skill_cli.rs Some(serde_json::from_slice(&bytes)?)

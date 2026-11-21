@@ -139,6 +139,25 @@ fn capture_cli_command(
     command
 }
 
+/// Native hooks retain before returning, but their detached worker acknowledges later. Observe
+/// that worker's durable progress instead of firing extra hooks or retrying delivery ourselves.
+async fn wait_for_capture_delivery(spool: &std::path::Path) {
+    let spool = agentscm::change_capture::LocalSpool::open(spool).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let pending = spool.pending(100).unwrap();
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "detached capture delivery did not acknowledge {} retained envelopes",
+            pending.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 impl Hub {
     async fn start() -> Self {
         let directory = TempDir::new().unwrap();
@@ -341,6 +360,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
                     .collect(),
                 depends_on: vec![],
                 related_work: vec![],
+                finished_paths: None,
             },
             unix_now(),
         )
@@ -354,6 +374,15 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     assert_eq!(target["work_id"], work.id);
     assert_eq!(target["generation"], work.generation);
     assert_eq!(target["session_id"], "http-change-record");
+    let exact = format!("{current_path}&work_id={}", work.id);
+    let (status, same) = hub.get(&exact, Some(&writer_secret)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same, target);
+    let other = exact.replace("session_id=http-change-record", "session_id=unrelated");
+    assert_eq!(
+        hub.get(&other, Some(&writer_secret)).await.0,
+        StatusCode::NOT_FOUND
+    );
 
     let start = ActionStartV1 {
         schema_version: 1,
@@ -727,6 +756,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
         "{}",
         String::from_utf8_lossy(&post.stderr)
     );
+    wait_for_capture_delivery(&spool).await;
     let latest = hub
         .store
         .change_record(&writer_token, &work.id, unix_now())
@@ -839,6 +869,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
             String::from_utf8_lossy(&replay.stderr)
         );
     }
+    wait_for_capture_delivery(&moved_spool).await;
     let replayed = hub
         .store
         .change_record(&writer_token, &work.id, unix_now())
@@ -1066,6 +1097,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    wait_for_capture_delivery(&spool).await;
     let before_outage = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1148,6 +1180,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         }));
         assert!(replay.status.success());
     }
+    wait_for_capture_delivery(&spool).await;
     let after_recipe = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1371,6 +1404,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         }));
         assert!(replay.status.success());
     }
+    wait_for_capture_delivery(&spool).await;
     let after_signal = hub
         .store
         .change_record(&writer_token, &work.id, now + 2)
@@ -1404,6 +1438,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         "{}",
         String::from_utf8_lossy(&ended.stderr)
     );
+    wait_for_capture_delivery(&spool).await;
     let after_outage = hub
         .store
         .change_record(&writer_token, &work.id, now + 3)
@@ -1753,7 +1788,11 @@ mod shared_bodies {
             let admin = user(&*store, 900, "hub-admin");
             // Uploads need the repository to share agent conversations.
             store
-                .set_setting("conversation_sharing:repo:77", "on", "test")
+                .set_setting(
+                    "conversation_sharing:repo:github.com/@repo-id:77",
+                    "on",
+                    "test",
+                )
                 .unwrap();
             let (owner_token, owner_secret) = token(&*store, &owner, "writer", false);
             let (_, sibling_secret) = token(&*store, &owner, "sibling", false);
@@ -1763,17 +1802,6 @@ mod shared_bodies {
             let helper = user(&*store, 12, "helper");
             let (helper_token, helper_secret) = token(&*store, &helper, "helper", false);
             let (_, helper_read_only_secret) = token(&*store, &helper, "helper-reader", true);
-            // Positive-path fixtures opt each author in explicitly. Repository enablement alone
-            // is intentionally insufficient.
-            for author in [&owner, &helper] {
-                store
-                    .set_setting(
-                        &format!("conversation_sharing:opt_out:{author}:77"),
-                        "0",
-                        author,
-                    )
-                    .unwrap();
-            }
             let work = store
                 .work_start(
                     &owner_token,
@@ -1891,7 +1919,7 @@ mod shared_bodies {
         fn share(&self, on: bool) {
             self.store
                 .set_setting(
-                    "conversation_sharing:repo:77",
+                    "conversation_sharing:repo:github.com/@repo-id:77",
                     if on { "on" } else { "off" },
                     "test",
                 )
@@ -2225,10 +2253,9 @@ mod shared_bodies {
                 .await,
             StatusCode::FORBIDDEN
         );
-        // Hub administration does not substitute for the uploader's own consent.
         assert_eq!(
             f.put(&f.admin_secret, &undeclared_sha, undeclared).await,
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
             assert_eq!(
@@ -2528,17 +2555,23 @@ mod shared_bodies {
         );
         assert_eq!(f.row().state, SharedBodyState::Declared);
         f.share(true);
-        // Notice-only and invalid legacy choices do not become consent after re-enablement.
+        // An unreadable choice opts the person out, also after re-enablement.
         f.store
             .set_setting(
-                &format!("conversation_sharing:opt_out:{}:77", f.owner),
+                &format!(
+                    "conversation_sharing:opt_out:{}:github.com/@repo-id:77",
+                    f.owner
+                ),
                 "invalid",
                 &f.owner,
             )
             .unwrap();
         f.store
             .set_setting(
-                &format!("conversation_sharing:notified:{}:77", f.owner),
+                &format!(
+                    "conversation_sharing:notified:{}:github.com/@repo-id:77",
+                    f.owner
+                ),
                 "1",
                 &f.owner,
             )
@@ -2605,7 +2638,7 @@ mod shared_bodies {
             .unwrap()
             .parse::<Value>()
             .unwrap();
-        assert_eq!(other["sharing"], false, "another person has not opted in");
+        assert_eq!(other["sharing"], true, "another person still shares");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2674,7 +2707,7 @@ mod shared_bodies {
                 "session_id": SESSION, "sequence": 1, "event_id": "http-setup-event",
                 "kind": "session_started", "observed_at": 100, "digest": f.sha,
                 "size_bytes": f.body.len(), "availability": "local", "expires_at": null,
-                "author": "owner"
+                "author": "owner", "generation": f.generation, "harness": "claude_code"
             })
         );
         // Declared but never uploaded: nothing to read.
@@ -2800,6 +2833,103 @@ mod shared_bodies {
             f.read(&f.member_secret, &f.sha).await.status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_body_occurrences_keep_identity_and_survive_migration() {
+        let f = Fixture::start().await;
+        let mut batch = f.batch("repeated-message");
+        batch.events[0].sequence = 2;
+        batch.events[0].event_id = "second-occurrence".into();
+        batch.events[0].kind = CapturedEventKindV1::ToolFinished;
+        batch.events[0].tool = Some(agentscm::change_record::ToolFactV1 {
+            kind: agentscm::change_record::ToolKindV1::Other,
+            request_id: Some("native-call-2".into()),
+            name: Some("lookup".into()),
+            completion: Some(agentscm::change_record::ToolCompletionV1::Returned),
+        });
+        f.store
+            .change_ingest(&f.owner_token(), &batch, unix_now())
+            .unwrap();
+        let (_, page) = f.list(&f.owner_secret, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["digest"], entries[1]["digest"]);
+        assert_ne!(entries[0]["event_id"], entries[1]["event_id"]);
+        assert_eq!(entries[1]["generation"], f.generation);
+        assert_eq!(entries[1]["harness"], "claude_code");
+        assert_eq!(entries[1]["tool"]["request_id"], "native-call-2");
+        // Exercise the migration on retained pre-migration events and accepted batches.
+        let db = rusqlite::Connection::open(f._directory.path().join("hub.sqlite")).unwrap();
+        db.execute_batch("DROP TABLE hub_change_conversation_occurrences")
+            .unwrap();
+        db.execute_batch(include_str!(
+            "../../src/hub/migrations/named/conversation_occurrences.sqlite.sql"
+        ))
+        .unwrap();
+        let (_, restored) = f.list(&f.owner_secret, "").await;
+        assert_eq!(restored, page);
+        f.share(false);
+        assert_eq!(f.list(&f.member_secret, "").await.1["entries"], json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_does_not_guess_an_ambiguous_occurrence_author() {
+        let f = Fixture::start().await;
+        let mut repeated = f.batch("repeat-before-migration");
+        repeated.events[0].sequence = 2;
+        repeated.events[0].event_id = "repeated-event".into();
+        f.store
+            .change_ingest(&f.owner_token(), &repeated, unix_now())
+            .unwrap();
+        let helper = f.token_of(&f.helper_secret);
+        f.declare_as(&helper, HELPER_SESSION, 1, &[&f.body]);
+        f.store
+            .work_start(
+                &helper,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: Some(f.work_id.clone()),
+                    source: None,
+                    request_key: None,
+                    title: "join the named session".into(),
+                    description: None,
+                    session: SESSION.into(),
+                    role: WorkRole::Helper,
+                    scope: vec![],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        repeated.operation_id = "duplicate-by-another-author".into();
+        f.store
+            .change_ingest(&helper, &repeated, unix_now())
+            .unwrap();
+        let db = rusqlite::Connection::open(f._directory.path().join("hub.sqlite")).unwrap();
+        for reverse in [false, true] {
+            db.execute_batch(&format!("PRAGMA reverse_unordered_selects={}; DROP TABLE hub_change_conversation_occurrences", i32::from(reverse))).unwrap();
+            db.execute_batch(include_str!(
+                "../../src/hub/migrations/named/conversation_occurrences.sqlite.sql"
+            ))
+            .unwrap();
+            let (_, restored) = f.list(&f.admin_secret, "").await;
+            let entries = restored["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 2, "retain exact original declarations only");
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["event_id"] != "repeated-event")
+            );
+            assert!(entries.iter().any(|entry| entry["author"] == "owner"));
+            assert!(entries.iter().any(|entry| entry["author"] == "helper"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3792,22 +3922,27 @@ mod shared_bodies {
                 .unwrap();
         }
 
-        /// A hook for a session with no Work: it captures nothing of its own but delivers.
-        fn deliver(&self) {
-            let payload = json!({
-                "hook_event_name": "SessionStart",
-                "session_id": "unrelated-native-session",
-                "source": "startup",
-                "timestamp": "2026-10-24T10:00:00Z",
-                "cwd": self.root,
-            });
-            let output = run_capture_cli(
-                &self.config,
-                &self.home,
-                &["change-capture".into(), "hook-claude".into()],
-                Some(&serde_json::to_vec(&payload).unwrap()),
+        /// Run one delivery traversal to completion. These tests queue their own fixture batch
+        /// and test delivery/acknowledgement, not the native hook's detached scheduling.
+        fn deliver(&self, success: bool) {
+            let output = self.cli(&[
+                "change-capture",
+                "deliver-worker",
+                "--root",
+                &self.root.display().to_string(),
+            ]);
+            assert_eq!(
+                output.status.success(),
+                success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
             );
-            assert!(output.status.success());
+            if !success {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("capture Hub body upload returned status 503")
+                );
+            }
         }
 
         /// Compacts what the Hub acknowledged and frees the shared bodies upkeep could then free
@@ -3844,13 +3979,13 @@ mod shared_bodies {
 
         // The Hub accepts the events but cannot store the body: the envelope must stay pending.
         f.backend.fail_put.store(true, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(false);
         assert_eq!(checkout.pending(), 1);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
 
         f.backend.fail_put.store(false, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Available);
         assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
@@ -3869,7 +4004,7 @@ mod shared_bodies {
         );
         let checkout = Checkout::new(&f);
         checkout.queue(&f);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Deleted);
         assert!(f.object().is_none());
@@ -3884,7 +4019,7 @@ mod shared_bodies {
         checkout.queue(&f);
 
         f.backend.fail_put.store(true, Ordering::SeqCst);
-        checkout.deliver();
+        checkout.deliver(false);
         assert_eq!(checkout.pending(), 1);
         assert_eq!(f.puts.load(Ordering::SeqCst), 1);
 
@@ -3895,7 +4030,7 @@ mod shared_bodies {
             StatusCode::NO_CONTENT
         );
         assert_eq!(f.puts.load(Ordering::SeqCst), 2);
-        checkout.deliver();
+        checkout.deliver(true);
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.puts.load(Ordering::SeqCst), 2);
         assert_eq!(f.row().state, SharedBodyState::Available);
@@ -3915,7 +4050,7 @@ mod shared_bodies {
             "metadata-only",
         ]);
         assert!(switched.status.success());
-        off.deliver();
+        off.deliver(true);
         assert_eq!(off.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
@@ -3927,7 +4062,7 @@ mod shared_bodies {
         let missing = Checkout::new(&f);
         missing.queue(&f);
         std::fs::remove_file(missing.spool.join("artifacts").join(&f.sha)).unwrap();
-        missing.deliver();
+        missing.deliver(true);
         assert_eq!(missing.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Declared);
         assert!(f.object().is_none());
@@ -4168,6 +4303,7 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    wait_for_capture_delivery(&private.path().join("spool")).await;
     let record = hub
         .store
         .change_record(&token, &work.id, unix_now())

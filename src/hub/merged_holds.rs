@@ -429,15 +429,18 @@ fn work_facts_in(
     ))
 }
 
-fn release_key(repository_id: i64) -> String {
-    format!("merged_release:repo:{repository_id}")
+fn release_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "merged_release:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// Whether the repository opted in to releasing the hold of Work its merged pull request
 /// finished. Off unless the stored value is exactly `on`; a missing or unreadable value is off.
-pub fn merged_release_enabled(store: &dyn Store, repository_id: i64) -> bool {
+pub fn merged_release_enabled(store: &dyn Store, host: &str, repository_id: i64) -> bool {
     store
-        .get_setting(&release_key(repository_id))
+        .get_setting(&release_key(host, repository_id))
         .ok()
         .flatten()
         .as_deref()
@@ -448,19 +451,20 @@ pub fn merged_release_enabled(store: &dyn Store, repository_id: i64) -> bool {
 /// may.
 pub fn set_merged_release(
     store: &dyn Store,
+    host: &str,
     repository_id: i64,
     enabled: bool,
     actor: &str,
 ) -> super::Result<()> {
     let value = if enabled { "on" } else { "off" };
-    store.set_setting(&release_key(repository_id), value, actor)
+    store.set_setting(&release_key(host, repository_id), value, actor)
 }
 
 /// The audience under which a policy release is claimed, once per Work ever.
 const POLICY_RELEASE: &str = "policy_release";
 
 /// The audience under which the Hub's completion of merged Work is claimed, once per Work ever.
-const HUB_COMPLETE: &str = "hub_complete";
+pub(super) const HUB_COMPLETE: &str = "hub_complete";
 
 /// After a refused policy release: keeps the `policy_release` claim when a re-read shows the
 /// Work's hold is gone (someone else released it), else gives the claim back so a later run can
@@ -514,7 +518,7 @@ pub fn release_settled(
 ) -> super::Result<Vec<String>> {
     use super::work_transition::{WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest};
     let mut released = Vec::new();
-    if read.is_empty() || !merged_release_enabled(store, repo.repository_id) {
+    if read.is_empty() || !merged_release_enabled(store, &repo.host, repo.repository_id) {
         return Ok(released);
     }
     // A closure this poll did not read again may be stale (the issue reopened), so only Work whose
@@ -562,6 +566,8 @@ pub fn release_settled(
                     "Released by repository policy: pull request #{pull} merged and closed #{issue} as completed."
                 ),
                 superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
             };
             let actor = WorkTransitionActor::Policy {
                 owner: &owner,
@@ -638,7 +644,7 @@ pub fn complete_merged(
         let Some(pull) = completes_on_merge(facts) else {
             continue;
         };
-        if complete_one(store, repo, item, pull, true, now) {
+        if complete_one(store, repo, item, pull, true, None, now) {
             completed.push(item.id.clone());
         }
     }
@@ -652,6 +658,36 @@ pub fn complete_led_merged(
     store: &dyn Store,
     principal: &Principal,
     session: &str,
+    now: i64,
+) -> Vec<String> {
+    complete_led_merged_for(store, principal, session, None, now)
+}
+
+/// A native callback retains its original transport identity through the policy transaction.
+pub fn complete_led_merged_with_transport(
+    store: &dyn Store,
+    principal: &Principal,
+    native: &str,
+    incarnation: Option<&str>,
+    now: i64,
+) -> Vec<String> {
+    let Ok(session) = store.session_name_for(&principal.token_id, Some(native), now) else {
+        return Vec::new();
+    };
+    complete_led_merged_for(
+        store,
+        principal,
+        &session,
+        Some((&principal.token_id, Some(native), incarnation)),
+        now,
+    )
+}
+
+fn complete_led_merged_for(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    guard: Option<(&str, Option<&str>, Option<&str>)>,
     now: i64,
 ) -> Vec<String> {
     if principal.read_only {
@@ -685,7 +721,7 @@ pub fn complete_led_merged(
         .filter(|item| {
             work_facts_in(store, principal, &repo, item, now)
                 .and_then(|facts| completes_on_merge(&facts))
-                .is_some_and(|pull| complete_one(store, &repo, item, pull, false, now))
+                .is_some_and(|pull| complete_one(store, &repo, item, pull, false, guard, now))
         })
         .map(|item| item.id)
         .collect()
@@ -699,6 +735,7 @@ fn complete_one(
     item: &WorkItem,
     pull: u64,
     quiet_only: bool,
+    guard: Option<(&str, Option<&str>, Option<&str>)>,
     now: i64,
 ) -> bool {
     use super::work_lifecycle::ActivityStatus;
@@ -729,11 +766,6 @@ fn complete_one(
         {
             return Ok(false);
         }
-        // Once ever, claimed before the transition so two callers cannot both complete, and so
-        // Work reopened after the Hub completed it is left to its lead.
-        if !store.claim_merge_prompt(&item.id, HUB_COMPLETE, now)? {
-            return Ok(false);
-        }
         let request = WorkTransitionRequest {
             work_id: item.id.clone(),
             operation_id: format!(
@@ -746,23 +778,15 @@ fn complete_one(
             transition: WorkTransitionKind::Complete,
             reason: format!("Completed by the Hub: it observed pull request #{pull} merge."),
             superseded_by: None,
+            participants: Vec::new(),
+            paths: Vec::new(),
         };
         let actor = WorkTransitionActor::Policy {
             owner: &owner,
             repository: &repo.full_name,
             repository_id: repo.repository_id,
         };
-        let done = store.work_transition(&actor, &request, now);
-        if done.is_err() {
-            // The claim stays only when a re-read shows the Work is no longer open (someone
-            // finished it); otherwise it is given back so a later call can complete it.
-            let still_open = store
-                .work_operational(&reader, &OperationalSelect::One(&item.id), now)
-                .map_or(true, |o| o.work.first().is_some_and(open));
-            if still_open {
-                let _ = store.unclaim_merge_prompt(&item.id, HUB_COMPLETE);
-            }
-        }
+        let done = store.work_transition_with_guard(&actor, &request, guard, now);
         done.map(|_| true)
     };
     match attempt() {
@@ -990,6 +1014,117 @@ pub fn annotate_conflicts(
                 " {obsolete} it without a join request: agentscm_work_recovery_preview with work_id {id}, remedy release and your session, then send the apply call it returns (agentscm_work_transition).",
                 id = conflict.work_id
             ));
+        }
+    }
+}
+
+/// Whose reads `annotate_findings` makes: an agent's token, or a signed-in person in one
+/// connected repository.
+pub enum FindingsReader<'a> {
+    Agent(&'a Principal),
+    Person {
+        user: &'a User,
+        repository: &'a ConnectedRepository,
+    },
+}
+
+/// Adds what the Work stage read establishes to the findings of the first
+/// `MAX_RECOVERY_PAGE` Work (by id) that carry one it can use: names the merged pull request on
+/// a `hidden_hold`, and appends `no_pr_link` to a `lapsed_hold` or `abandoned_session` Work whose
+/// link is known absent. A Work that cannot be read, a repository that is not connected, a limit
+/// on the read or an unreadable link adds nothing, so absence is never claimed without a read.
+/// This is a later read than the recovery transaction, not part of its snapshot.
+pub fn annotate_findings(
+    store: &dyn Store,
+    reader: &FindingsReader<'_>,
+    recovery: &mut super::work_recovery::WorkRecoveryV1,
+    now: i64,
+) {
+    use super::work_recovery::{FindingKind, FindingV1, MAX_RECOVERY_PAGE};
+    let wants = |work: &super::work_recovery::RecoveryWorkV1| {
+        work.findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                FindingKind::HiddenHold | FindingKind::LapsedHold | FindingKind::AbandonedSession
+            )
+        })
+    };
+    let mut ids: Vec<String> = recovery
+        .work
+        .iter()
+        .filter(|work| wants(work))
+        .map(|work| work.work_id.clone())
+        .collect();
+    ids.sort();
+    ids.truncate(MAX_RECOVERY_PAGE);
+    if ids.is_empty() {
+        return;
+    }
+    let (principal, lifecycle);
+    match reader {
+        FindingsReader::Agent(caller) => {
+            let Ok(Some(_)) = super::sync::find_repository(
+                store,
+                &caller.owner.identity.host,
+                &caller.repository,
+                caller.repository_id,
+            ) else {
+                return;
+            };
+            principal = (*caller).clone();
+            lifecycle = WorkLifecycleReader::Token(&principal.token_id);
+        }
+        FindingsReader::Person { user, repository } => {
+            let Ok(Some(connection)) = store.connection(&repository.connection) else {
+                return;
+            };
+            principal = repository_principal(&connection.provider, repository);
+            lifecycle = WorkLifecycleReader::Person {
+                owner: user,
+                repository: &repository.full_name,
+                repository_id: repository.repository_id,
+            };
+        }
+    }
+    let items: Vec<WorkItem> = ids
+        .iter()
+        .filter_map(|id| store.work_get_scoped(&lifecycle, id, now).ok().flatten())
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let pairs: Vec<_> = items.iter().map(|i| (i, OutcomeValue::None)).collect();
+    let (stages, _, unsettled) = work_stages_detailed(store, &principal, &lifecycle, &pairs, now);
+    for work in &mut recovery.work {
+        let Some(stage) = stages.get(&work.work_id) else {
+            continue;
+        };
+        for finding in &mut work.findings {
+            if finding.kind == FindingKind::HiddenHold
+                && stage.stage == WorkStage::PullRequestMerged
+                && let Some(number) = stage.pull_request
+            {
+                finding.name_merged_pull(number);
+            }
+        }
+        let retained = work.findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                FindingKind::LapsedHold | FindingKind::AbandonedSession
+            )
+        });
+        // `Working` is only reached from a link read as absent with no limit; a declared link
+        // or another open candidate still leaves the Work unsettled.
+        // A declared link (kept apart from the explicit target) is a link too, merged or not.
+        if retained
+            && stage.stage == WorkStage::Working
+            && !unsettled.contains(&work.work_id)
+            && matches!(
+                store.work_declared_links_scoped(&lifecycle, &work.work_id, now),
+                Ok(Some(links)) if links.is_empty()
+            )
+        {
+            work.findings.push(FindingV1::no_pr_link());
         }
     }
 }

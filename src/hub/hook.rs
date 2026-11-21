@@ -18,6 +18,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::{agent_name, unknown};
@@ -33,9 +34,9 @@ use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
-    done_pausing_for, others_for, record_hook_ms,
+    done_pausing_native, others_for, record_hook_ms,
 };
-use super::session_waiting::{WaitReason, Waiting, holder};
+use super::session_waiting::{QuestionSnapshot, WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
@@ -59,6 +60,9 @@ const MAX_ROOT_BYTES: usize = 1024;
 /// Sessions that were already told coordination is unknown; cleared when it grows past the bound.
 static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const MAX_NOTED: usize = 10_000;
+/// Partial releases a session was already told, as a digest of request and released set; cleared
+/// when it grows past the bound.
+static PARTIAL_SHOWN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Tools that change a file; names are compared lowercase.
 const EDIT_TOOLS: [&str; 8] = [
     "edit",
@@ -133,6 +137,10 @@ enum Kind {
     /// The session stopped to wait for its person, or on its own background work; its next call
     /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
+    /// A complete, ordered snapshot of the native session's outstanding async questions.
+    Questions,
+    /// The native source cannot currently establish its outstanding questions.
+    QuestionsUnavailable,
     /// A subagent started or stopped: only its session's roster follows it. It renews nothing
     /// and ends no wait, because a host also reports the agents it runs for itself, such as
     /// one that suggests the next prompt after a turn has ended.
@@ -165,7 +173,7 @@ enum Shape {
     Unreadable,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Call {
     agent: Agent,
     kind: Kind,
@@ -183,6 +191,7 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    questions: Option<QuestionSnapshot>,
     /// This client's hook can carry added context at a prompt or checked tool call (Claude
     /// Code, Codex, Cursor, Copilot's PascalCase hooks); Copilot CLI's and generic hooks cannot.
     context_hook: bool,
@@ -201,7 +210,7 @@ struct Call {
     /// it. Never more than the client's word: another process may have changed the same files.
     observed: Option<Observed>,
     /// How an otherwise silent tool call tells a lead its hold lapsed, where the host's event
-    /// takes added context (Claude Code's `PreToolUse` and `PostToolUse`).
+    /// takes added context (`PreToolUse` and `PostToolUse` of the hosts that send those names).
     notice: Option<Shape>,
 }
 
@@ -289,7 +298,7 @@ impl Observed {
 /// A subagent a session started, from the hook client's `subagent` object on the call that
 /// started it: its id and type, a short excerpt of what it was started to do, and whether the
 /// call returned while it still runs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Launched {
     id: String,
     agent_type: Option<String>,
@@ -350,6 +359,34 @@ impl Outcome {
             owner_notices: Vec::new(),
         }
     }
+}
+
+/// Current native memory effects share one short serialization point. Register is DB-only;
+/// a successor's memory facts can only be installed by another guarded effect after it.
+async fn native_effect<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    native: Option<&str>,
+    incarnation: Option<&str>,
+    effect: impl FnOnce(&super::onboarding::Observations, &dyn Store, &Principal) -> super::Result<T>
+    + Send
+    + 'static,
+) -> super::Result<T> {
+    let store = state.store.clone();
+    let observations = state.onboarding.clone();
+    let principal = principal.clone();
+    let native = native.map(str::to_owned);
+    let incarnation = incarnation.map(str::to_owned);
+    blocking(state, move || {
+        observations.native_effect(
+            &*store,
+            &principal,
+            native.as_deref(),
+            incarnation.as_deref(),
+            || effect(&observations, &*store, &principal),
+        )
+    })
+    .await
 }
 
 async fn hook(
@@ -417,52 +454,112 @@ async fn hook(
             )
         }
     };
-    // The session is moving again, so its person no longer holds it up. Only a session that
-    // waits costs the authentication. Any token of the same person ends the wait of a session
-    // its host named (the session's token may have been renewed meanwhile); another person's
-    // call cannot.
-    if let Some((native, all)) = call.ends_wait()
-        && state.onboarding.waiting().has_session(native)
-        && let Ok(Ok(principal)) =
-            timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
+    // Ordinary activity authenticates only when there is a known wait. An explicit clear
+    // must persist even before the first native snapshot arrives, so it always authenticates.
+    if failure.is_none()
+        && call.kind != Kind::Done
+        && let Some((native, all)) = call.ends_wait()
+        && (call.cleared || state.onboarding.waiting().has_session(native))
     {
-        call.end_wait(
-            state.onboarding.waiting(),
-            holder(&principal, native),
-            native,
-            all,
-        );
-        if all {
-            state
-                .onboarding
-                .subagents()
-                .answered(&principal.token_id, native);
+        let end = async {
+            let principal = authenticate(&state, token.clone(), repo.clone()).await?;
+            let incarnation =
+                super::cooperation::incarnation(&parts.headers, Some(native)).map_err(reason)?;
+            let store = state.store.clone();
+            let onboarding = state.onboarding.clone();
+            let call = call.clone();
+            let native = native.to_owned();
+            blocking(&state, move || {
+                onboarding.native_effect(
+                    &*store,
+                    &principal,
+                    Some(&native),
+                    incarnation.as_deref(),
+                    || {
+                        call.end_wait(
+                            onboarding.waiting(),
+                            &*store,
+                            &principal,
+                            &native,
+                            all,
+                            incarnation.as_deref(),
+                        )?;
+                        if all {
+                            onboarding
+                                .subagents()
+                                .answered(&principal.token_id, &native);
+                        }
+                        Ok(())
+                    },
+                )
+            })
+            .await
+            .map_err(reason)
+        };
+        match timeout_at(deadline, end).await {
+            Ok(Ok(())) => {}
+            failed if call.cleared => {
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    _ => error_envelope::from_code(ErrorCode::Unavailable),
+                };
+                outcome.text = error.hook_note();
+                outcome.status = "unknown";
+                failure = Some(error);
+            }
+            _ => {}
         }
     }
-    if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
+    if failure.is_none()
+        && matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
     {
         let delivery = async {
             // The touch already read the inbox; only a call that did not touch reads it here.
             if let Some((principal, session, page)) = delivered {
+                let incarnation =
+                    super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                        .map_err(reason)?;
+                native_effect(
+                    &state,
+                    &principal,
+                    call.session.as_deref(),
+                    incarnation.as_deref(),
+                    |_, _, _| Ok(()),
+                )
+                .await
+                .map_err(reason)?;
                 return Ok((principal, session, page.map_err(reason)?));
             }
             let principal = authenticate(&state, Some(token), repo).await?;
             let store = state.store.clone();
             let requested = call.session.clone();
             let id = principal.token_id.clone();
+            let incarnation =
+                super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                    .map_err(reason)?;
+            let observations = state.onboarding.clone();
+            let scope = principal.clone();
             let (session, page) = blocking(&state, move || {
-                let now = unix_now();
-                let session = store.session_name_for(&id, requested.as_deref(), now)?;
-                let page = store.coordination_inbox(
-                    &id,
-                    &CoordinationInboxQuery {
-                        session: Some(session.clone()),
-                        ..Default::default()
+                observations.native_effect(
+                    &*store,
+                    &scope,
+                    requested.as_deref(),
+                    incarnation.as_deref(),
+                    || {
+                        let now = unix_now();
+                        let session = store.session_name_for(&id, requested.as_deref(), now)?;
+                        let page = store.coordination_inbox(
+                            &id,
+                            &CoordinationInboxQuery {
+                                session: Some(session.clone()),
+                                ..Default::default()
+                            },
+                            now,
+                        )?;
+                        Ok((session, page))
                     },
-                    now,
-                )?;
-                Ok((session, page))
+                )
             })
             .await
             .map_err(reason)?;
@@ -478,6 +575,7 @@ async fn hook(
                 };
                 // A subagent's context ends when it returns, so a request shown there is lost
                 // with it: point it at its lead instead, and never hold its edits for a reply.
+                let mut partial_keys = Vec::new();
                 if call.child {
                     let waiting = page.requests.iter().filter(open).count();
                     if waiting > 0 {
@@ -507,6 +605,30 @@ async fn hook(
                         // A prompt repeats every turn, so it carries only what this session must
                         // answer, and a requester's own request only while it has news the
                         // requester has not acknowledged.
+                        // A partial release shows once per released set, so a further release shows
+                        // again but an unchanged one does not repeat on every prompt. The set is
+                        // marked only once the text is kept (see `partial_keys` below).
+                        let partial = own
+                            && call.kind == Kind::Prompt
+                            && request.requested_paths == Some(RequestedPathsHold::Held)
+                            && !request.released_paths.is_empty()
+                            && {
+                                let key = format!(
+                                    "{}\0{session}\0{}\0{}",
+                                    principal.token_id,
+                                    request.id,
+                                    request.released_paths.join("\0")
+                                );
+                                let key = format!("{:x}", Sha256::digest(key));
+                                let new = !PARTIAL_SHOWN
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .contains(&key);
+                                if new {
+                                    partial_keys.push(key);
+                                }
+                                new
+                            };
                         let unacknowledged = !request.acknowledgements.iter().any(|receipt| {
                             receipt.target_work_id.is_none()
                                 && receipt.agent.token == principal.token_id
@@ -519,6 +641,7 @@ async fn hook(
                             // ended intent), so it shows whether or not the requester acked.
                             && !(own
                                 && (released
+                                    || partial
                                     || (unacknowledged && !request.responses.is_empty())))
                         {
                             continue;
@@ -533,14 +656,30 @@ async fn hook(
                                         });
                                     format!(" Reply {}{note}.", response_kind_name(reply.kind))
                                 });
+                            let partial_paths = if request.requested_paths
+                                == Some(RequestedPathsHold::Held)
+                                && !request.released_paths.is_empty()
+                            {
+                                let listed = super::mcp::bounded_paths(&request.released_paths);
+                                let incomplete = if request.released_paths_complete {
+                                    ""
+                                } else {
+                                    " (more may be free)"
+                                };
+                                format!(
+                                    " {listed} from your request are free now{incomplete}; start on them alone with agentscm_start."
+                                )
+                            } else {
+                                String::new()
+                            };
                             let paths = if released {
                                 " The requested paths are released: retry agentscm_start."
                             } else {
-                                ""
+                                &partial_paths
                             };
                             outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         } else {
-                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline (release_paths frees finished files). Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
@@ -565,21 +704,64 @@ async fn hook(
                     && matches!(call.shape, Shape::Hook(_) | Shape::Snake | Shape::Camel)
                     && outcome.deny.is_none()
                     && !call.child;
-                super::agent_messages::note_hook(
-                    &principal.token_id,
-                    &session,
-                    &call.via,
-                    !call.child,
-                    call.context_hook,
-                    unix_now(),
-                );
+                let note = call.clone();
+                let native = session.clone();
+                let incarnation =
+                    super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                        .ok()
+                        .flatten();
+                if let Err(error) = native_effect(
+                    &state,
+                    &principal,
+                    call.session.as_deref(),
+                    incarnation.as_deref(),
+                    move |_, _, principal| {
+                        super::agent_messages::note_hook(
+                            &principal.token_id,
+                            &native,
+                            &note.via,
+                            !note.child,
+                            note.context_hook,
+                            unix_now(),
+                        );
+                        Ok(())
+                    },
+                )
+                .await
+                {
+                    let error = reason(error);
+                    outcome.text = error.hook_note();
+                    outcome.status = "unknown";
+                    failure = Some(error);
+                }
                 // An unknown reply loses its text after the session's first, so it takes nothing.
                 // A take that finishes past the deadline is offered again later (REOFFER_SECS).
                 let merged_scope = (principal.clone(), session.clone());
                 if context && outcome.status != "unknown" {
                     let (store, via) = (state.store.clone(), call.via.clone());
+                    let incarnation =
+                        super::cooperation::incarnation(&parts.headers, call.session.as_deref())
+                            .ok()
+                            .flatten();
                     let taken = blocking(&state, move || {
-                        super::agent_messages::take(&*store, &principal, &session, &via, unix_now())
+                        if let Some(incarnation) = incarnation {
+                            super::cooperation::offer_on_call(
+                                &*store,
+                                &principal,
+                                &session,
+                                &incarnation,
+                                unix_now(),
+                            )
+                            .map(|offer| offer.map(|offer| offer.text))
+                        } else {
+                            super::agent_messages::take(
+                                &*store,
+                                &principal,
+                                &session,
+                                &via,
+                                unix_now(),
+                            )
+                        }
                     });
                     if let Ok(Ok(Some(text))) = timeout_at(deadline, taken).await {
                         outcome.text.push('\n');
@@ -628,6 +810,16 @@ async fn hook(
                             }
                         }
                     }
+                }
+                // Marked only now that the text is kept: a failed delivery clears it, and the
+                // next prompt shows the release again.
+                if outcome.status != "unknown" && !partial_keys.is_empty() {
+                    let mut shown_set =
+                        PARTIAL_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
+                    if shown_set.len() > MAX_NOTED {
+                        shown_set.clear();
+                    }
+                    shown_set.extend(partial_keys);
                 }
             }
             failed if outcome.status != "unknown" => {
@@ -819,6 +1011,7 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            questions: None,
             context_hook: false,
             prompt_shown: false,
             agent_type: None,
@@ -830,16 +1023,15 @@ impl Call {
         }
     }
 
-    /// Claude Code's tool events take added context, so a lapse notice can ride on them.
-    fn noticed(mut self, agent: Agent, event: &str) -> Self {
+    /// These tool events take added context on every host that sends them by these names, so a
+    /// lapse notice can ride on them.
+    fn noticed(mut self, event: &str) -> Self {
         let event = match event {
             "PreToolUse" => "PreToolUse",
             "PostToolUse" => "PostToolUse",
             _ => return self,
         };
-        if agent == Agent::Claude {
-            self.notice = Some(Shape::Hook(event));
-        }
+        self.notice = Some(Shape::Hook(event));
         self
     }
 
@@ -960,11 +1152,15 @@ impl Call {
 
     /// Keeps the roster of the session's subagents: the one that made this call, and the one
     /// this call started. Best effort and silent.
-    fn note_subagents(&self, state: &HubState, principal: &Principal) {
+    fn note_subagents(
+        &self,
+        observations: &super::onboarding::Observations,
+        principal: &Principal,
+    ) {
         let Some(native) = self.session.as_deref() else {
             return;
         };
-        let (roster, now) = (state.onboarding.subagents(), unix_now());
+        let (roster, now) = (observations.subagents(), unix_now());
         match self.asker.as_deref() {
             Some(id) if self.stopped => roster.ended(principal, native, id, now),
             Some(id) => {
@@ -986,6 +1182,108 @@ impl Call {
         }
     }
 
+    async fn note_subagents_guarded(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        incarnation: Option<&str>,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, _, principal| {
+                call.note_subagents(observations, principal);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn note_onboarding_guarded(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        client: Option<&str>,
+        incarnation: Option<&str>,
+        epoch: u64,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        let client = client.map(str::to_owned);
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, _, principal| {
+                let agent = call.via.strip_prefix("hook:").unwrap_or("");
+                if call.kind == Kind::Start {
+                    observations.restart(
+                        principal,
+                        client.as_deref(),
+                        agent,
+                        call.session.as_deref(),
+                        epoch,
+                    );
+                } else {
+                    observations.native(
+                        principal,
+                        client.as_deref(),
+                        agent,
+                        call.session.as_deref(),
+                        call.kind == Kind::Done,
+                        epoch,
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The domain end may have committed before a successor starts. All later native
+    /// projections therefore share one guarded cleanup; no late callback addresses its rows.
+    async fn finish_native_done(
+        &self,
+        state: &HubState,
+        principal: &Principal,
+        incarnation: Option<&str>,
+    ) -> super::Result<()> {
+        let call = self.clone();
+        let fence = incarnation.map(str::to_owned);
+        native_effect(
+            state,
+            principal,
+            self.session.as_deref(),
+            incarnation,
+            move |observations, store, principal| {
+                if let Some(native) = call.session.as_deref() {
+                    if fence.as_deref() == Some(super::session_lifecycle::EXPECT_NO_LIFECYCLE) {
+                        let canonical = store.session_name_for(
+                            &principal.token_id,
+                            Some(native),
+                            unix_now(),
+                        )?;
+                        super::agent_messages::note_end(&principal.token_id, &canonical);
+                    }
+                    call.end_wait(
+                        observations.waiting(),
+                        store,
+                        principal,
+                        native,
+                        true,
+                        fence.as_deref(),
+                    )?;
+                    observations.subagents().forget(&principal.token_id, native);
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
     /// The wait this call ends, if any: the session's, and whether the call ends every wait
     /// there (the person typed, or the session started or ended) or only one its caller asked.
     /// An end still keeps a turn's end that asks its person something ([`Self::end_wait`]).
@@ -993,19 +1291,48 @@ impl Call {
         let all = match self.kind {
             Kind::Start | Kind::Prompt | Kind::Done => true,
             Kind::Check | Kind::Activity(_) => false,
-            Kind::Ignore | Kind::Waiting(_) | Kind::Subagent | Kind::Fail(_) => return None,
+            Kind::Ignore
+            | Kind::Waiting(_)
+            | Kind::Questions
+            | Kind::QuestionsUnavailable
+            | Kind::Subagent
+            | Kind::Fail(_) => {
+                return None;
+            }
         };
         Some((self.session.as_deref()?, all))
     }
 
     /// Ends the wait of `native` that [`Self::ends_wait`] names. A session's end keeps a turn's
     /// end that asks its person something, unless the person cleared that session and moved on.
-    fn end_wait(&self, waiting: &Waiting, holder: &str, native: &str, all: bool) {
-        if self.kind == Kind::Done && !self.cleared {
+    fn end_wait(
+        &self,
+        waiting: &Waiting,
+        store: &dyn Store,
+        principal: &Principal,
+        native: &str,
+        all: bool,
+        incarnation: Option<&str>,
+    ) -> super::Result<()> {
+        let holder = holder(principal, native);
+        if self.cleared {
+            if incarnation.is_some() {
+                waiting.cleared_with_transport(
+                    store,
+                    principal,
+                    native,
+                    incarnation,
+                    unix_now(),
+                )?;
+            } else {
+                waiting.cleared(store, principal, native, unix_now())?;
+            }
+        } else if self.kind == Kind::Done {
             waiting.ended(holder, native);
         } else {
             waiting.clear(holder, native, self.asker.as_deref(), all);
         }
+        Ok(())
     }
 
     fn task(mut self, task: Option<&str>) -> Self {
@@ -1064,6 +1391,11 @@ impl Call {
         call
     }
 
+    /// A natively wired client's own hook: its own route, or the generic one under its name.
+    fn native_client(&self) -> bool {
+        self.agent != Agent::Generic || crate::clients::generic_native(&self.via)
+    }
+
     /// Whether the reply can carry text to the agent, so a handoff can be delivered with it.
     fn reports(&self) -> bool {
         !matches!(self.shape, Shape::Silent | Shape::Pre | Shape::Allow)
@@ -1078,6 +1410,8 @@ impl Call {
         onboarding_epoch: u64,
         delivered: &mut Option<Delivered>,
     ) -> Result<Outcome, ErrorEnvelope> {
+        let incarnation =
+            super::cooperation::incarnation(headers, self.session.as_deref()).map_err(reason)?;
         let client = super::onboarding::client(headers);
         let completion_reporting = super::insights::completion_enabled(headers);
         let call = |paths: Vec<String>| SessionCall {
@@ -1095,10 +1429,27 @@ impl Call {
                 _ => ErrorCode::InvalidRequest,
             })),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
-            Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Ignore => Ok(Outcome::clean()),
+            Kind::Prompt => {
+                if incarnation.is_some() {
+                    let principal = authenticate(state, token, repo).await?;
+                    native_effect(
+                        state,
+                        &principal,
+                        self.session.as_deref(),
+                        incarnation.as_deref(),
+                        |_, _, _| Ok(()),
+                    )
+                    .await
+                    .map_err(reason)?;
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Subagent => {
                 if let Ok(principal) = authenticate(state, token, repo).await {
-                    self.note_subagents(state, &principal);
+                    self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                        .await
+                        .map_err(reason)?;
                 }
                 Ok(Outcome::clean())
             }
@@ -1108,7 +1459,9 @@ impl Call {
                 let mut lapsed = None;
                 if self.session.is_some() {
                     let principal = authenticate(state, token, repo).await?;
-                    self.note_subagents(state, &principal);
+                    self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                        .await
+                        .map_err(reason)?;
                     let store = state.store.clone();
                     let heartbeat = call(Vec::new());
                     let heartbeat = SessionCall {
@@ -1118,8 +1471,15 @@ impl Call {
                         ..heartbeat
                     };
                     let id = principal.token_id.clone();
+                    let fence = incarnation.clone();
                     let found = blocking(state, move || {
-                        store.session_activity(&id, &heartbeat, phase, unix_now())
+                        store.session_activity_with_transport(
+                            &id,
+                            &heartbeat,
+                            phase,
+                            fence.as_deref(),
+                            unix_now(),
+                        )
                     })
                     .await
                     .map_err(reason)?;
@@ -1147,6 +1507,38 @@ impl Call {
                 }
                 Ok(outcome)
             }
+            Kind::Questions | Kind::QuestionsUnavailable => {
+                let principal = authenticate(state, token, repo).await?;
+                let native = self.session.as_deref().ok_or_else(|| {
+                    reason(HubError::Invalid("missing native question session".into()))
+                })?;
+                let snapshot = if self.kind == Kind::Questions {
+                    Some(self.questions.clone().ok_or_else(|| {
+                        reason(HubError::Invalid("invalid native question snapshot".into()))
+                    })?)
+                } else {
+                    None
+                };
+                let store = state.store.clone();
+                let onboarding = state.onboarding.clone();
+                let native = native.to_owned();
+                blocking(state, move || {
+                    let now = unix_now();
+                    let session =
+                        store.session_name_for(&principal.token_id, Some(&native), now)?;
+                    match snapshot {
+                        Some(snapshot) => onboarding
+                            .waiting()
+                            .questions(&*store, &principal, &native, &session, &snapshot, now),
+                        None => onboarding
+                            .waiting()
+                            .questions_unavailable(&*store, &principal, &native, &session, now),
+                    }
+                })
+                .await
+                .map_err(reason)?;
+                Ok(Outcome::clean())
+            }
             Kind::Waiting(reason) => {
                 // Best effort and silent, like activity: a failure must not delay the prompt the
                 // person is about to see. A wait no session names could never be ended, so it is
@@ -1154,49 +1546,60 @@ impl Call {
                 if let Some(native) = self.session.clone()
                     && let Ok(principal) = authenticate(state, token, repo).await
                 {
-                    self.note_subagents(state, &principal);
-                    let store = state.store.clone();
-                    let id = principal.token_id.clone();
+                    let call = self.clone();
                     let requested = native.clone();
-                    let recorded = blocking(state, move || {
-                        store.session_name_for(&id, Some(&requested), unix_now())
-                    })
-                    .await
-                    .and_then(|session| {
-                        let waiting = state.onboarding.waiting();
-                        let agent = self.via.strip_prefix("hook:").unwrap_or("");
-                        // The host's notice says only that a dialog is on screen: it must not
-                        // replace the wait that says whose dialog it is and what it asks.
-                        if self.prompt_shown {
-                            return waiting.notice(
-                                &principal,
-                                &native,
+                    let recorded = native_effect(
+                        state,
+                        &principal,
+                        Some(&native),
+                        incarnation.as_deref(),
+                        move |observations, store, principal| {
+                            call.note_subagents(observations, principal);
+                            let session = store.session_name_for(
+                                &principal.token_id,
+                                Some(&requested),
+                                unix_now(),
+                            )?;
+                            let waiting = observations.waiting();
+                            let agent = call.via.strip_prefix("hook:").unwrap_or("");
+                            // The host's notice says only that a dialog is on screen: it must not
+                            // replace the wait that says whose dialog it is and what it asks.
+                            if call.prompt_shown {
+                                waiting.notice(
+                                    principal,
+                                    &requested,
+                                    &session,
+                                    agent,
+                                    unix_now(),
+                                )?;
+                                observations.permissions().confirm(
+                                    holder(principal, &requested),
+                                    &requested,
+                                    unix_now(),
+                                );
+                                return Ok(());
+                            }
+                            waiting.record(
+                                principal,
+                                &requested,
                                 &session,
                                 agent,
+                                reason,
+                                call.asker.as_deref(),
+                                call.asks.as_deref(),
                                 unix_now(),
-                            );
-                        }
-                        waiting.record(
-                            &principal,
-                            &native,
-                            &session,
-                            agent,
-                            reason,
-                            self.asker.as_deref(),
-                            self.asks.as_deref(),
-                            unix_now(),
-                        )
-                    });
+                            )
+                        },
+                    )
+                    .await;
                     if let Err(error) = recorded {
                         eprintln!("hub: waiting hook not recorded: {error}");
-                    } else if self.prompt_shown {
-                        let requests = state.onboarding.permissions();
-                        requests.confirm(holder(&principal, &native), &native, unix_now());
                     }
-                    // A turn that ended asking nothing is done with the Work it leads whose pull
-                    // request merged. A turn that asks its person something leaves it open.
-                    if reason == WaitReason::Finished {
-                        complete_led_merged(state, &principal, &native).await;
+                    // A merge settles the Work the session leads, whether or not its turn asks
+                    // its person something; the ask stays a wait. A dialog shown mid-turn is not
+                    // held up for it.
+                    if !matches!(reason, WaitReason::Permission | WaitReason::Question) {
+                        complete_led_merged(state, &principal, &native, incarnation.clone()).await;
                     }
                 }
                 Ok(Outcome::clean())
@@ -1204,7 +1607,9 @@ impl Call {
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
-                self.note_subagents(state, &principal);
+                self.note_subagents_guarded(state, &principal, incarnation.as_deref())
+                    .await
+                    .map_err(reason)?;
                 let applied = self.applied();
                 let observed = self.observed_line();
                 // Files changed by a shell call: the call has ended, whatever the check finds.
@@ -1217,8 +1622,15 @@ impl Call {
                         report: false,
                         ..call(Vec::new())
                     };
+                    let fence = incarnation.clone();
                     let _ = blocking(state, move || {
-                        store.session_activity(&id, &ended, CallPhase::End, unix_now())
+                        store.session_activity_with_transport(
+                            &id,
+                            &ended,
+                            CallPhase::End,
+                            fence.as_deref(),
+                            unix_now(),
+                        )
                     })
                     .await;
                 }
@@ -1251,6 +1663,7 @@ impl Call {
                     state,
                     &principal,
                     call(self.paths.clone()),
+                    incarnation.clone(),
                     read_inbox(principal.token_id.clone()),
                 )
                 .await;
@@ -1339,12 +1752,25 @@ impl Call {
                     && !self.child
                     && !holdable.is_empty()
                     && let Some(native) = self.session.as_deref()
-                    && state.onboarding.start_nudges().first(
-                        &principal.repository,
-                        &principal.token_id,
-                        native,
-                        unix_now(),
-                    )
+                    && {
+                        let native = native.to_owned();
+                        native_effect(
+                            state,
+                            &principal,
+                            self.session.as_deref(),
+                            incarnation.as_deref(),
+                            move |observations, _, principal| {
+                                Ok(observations.start_nudges().first(
+                                    &principal.repository,
+                                    &principal.token_id,
+                                    &native,
+                                    unix_now(),
+                                ))
+                            },
+                        )
+                        .await
+                        .map_err(reason)?
+                    }
                 {
                     super::session::count_undeclared();
                     let why = self.undeclared_text(&principal.repository, &holdable);
@@ -1376,28 +1802,31 @@ impl Call {
                     };
                 }
                 // Native edit tools only: a shell call's observed change must not verify them.
-                if !applied && (self.agent != Agent::Generic || self.via == "hook:gemini") {
-                    state.onboarding.native(
+                if !applied && self.native_client() {
+                    self.note_onboarding_guarded(
+                        state,
                         &principal,
                         client,
-                        self.via.strip_prefix("hook:").unwrap_or(""),
-                        self.session.as_deref(),
-                        false,
+                        incarnation.as_deref(),
                         onboarding_epoch,
-                    );
+                    )
+                    .await
+                    .map_err(reason)?;
                 }
                 Ok(outcome)
             }
             Kind::Start => {
                 let principal = authenticate(state, token, repo).await?;
-                if self.agent != Agent::Generic || self.via == "hook:gemini" {
-                    state.onboarding.restart(
+                if self.native_client() {
+                    self.note_onboarding_guarded(
+                        state,
                         &principal,
                         client,
-                        self.via.strip_prefix("hook:").unwrap_or(""),
-                        self.session.as_deref(),
+                        incarnation.as_deref(),
                         onboarding_epoch,
-                    );
+                    )
+                    .await
+                    .map_err(reason)?;
                 }
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
@@ -1425,10 +1854,15 @@ impl Call {
                 })
                 .await;
                 let inbox = read_inbox(principal.token_id.clone());
-                let (advice, (session, page)) =
-                    announce_reading(state, &principal, call(Vec::new()), inbox)
-                        .await
-                        .map_err(reason)?;
+                let (advice, (session, page)) = announce_reading(
+                    state,
+                    &principal,
+                    call(Vec::new()),
+                    incarnation.clone(),
+                    inbox,
+                )
+                .await
+                .map_err(reason)?;
                 *delivered = Some((principal.clone(), session, page));
                 let own = advice.touched.intent.as_ref().map(|i| i.id.as_str());
                 // The touch is committed; a failed listing must not report the whole call as unknown.
@@ -1471,11 +1905,6 @@ impl Call {
                     }
                     head.push_str(notice.line());
                 }
-                let mut text = if head.is_empty() {
-                    listing
-                } else {
-                    format!("{head}\n{listing}")
-                };
                 let store = state.store.clone();
                 let setup = state.onboarding.clone();
                 let scope = principal.clone();
@@ -1506,29 +1935,22 @@ impl Call {
                 };
                 let (current_status, operator_context) =
                     tokio::join!(current_status, operator_context);
-                // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
-                text.push('\n');
-                match current_status {
-                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
-                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
-                }
-                if let Some(block) = super::context_source::render(&operator_context) {
+                let current_status = current_status.ok().and_then(std::result::Result::ok);
+                let mut text = render_start_summary(
+                    current_status.as_ref(),
+                    briefing.as_ref().ok().map(|(briefing, overview, catchup)| {
+                        (briefing, overview, catchup.as_ref())
+                    }),
+                    &head,
+                    &listing,
+                    &operator_context,
+                );
+                // A read-only token's MCP instructions name no write tool, so they carry no rules;
+                // the one rule a reader needs comes here for Claude Code, which gets no others.
+                if principal.read_only && self.agent == Agent::Claude {
                     text.push('\n');
-                    text.push_str(&block);
+                    text.push_str(super::agent_rules::REQUIRED_RULES[5]);
                 }
-                text.push('\n');
-                text.push_str(&match briefing {
-                    Ok((briefing, overview, catchup)) => format!(
-                        "{}\n{}\n{}",
-                        render_briefing(&briefing),
-                        render_overview(&overview),
-                        render_catchup(catchup.as_ref())
-                    ),
-                    Err(_) => format!(
-                        "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
-                        unknown("shared work could not be listed")
-                    ),
-                });
                 // Only while a requested briefing waits for an agent.
                 if !principal.read_only
                     && super::narrative::pending(state, &principal)
@@ -1547,28 +1969,31 @@ impl Call {
             }
             Kind::Done => {
                 let principal = authenticate(state, token, repo).await?;
-                state.onboarding.native(
+                // Readiness is an observation of this authenticated native end, independent
+                // of whether coordination writes finish. Its guarded blocking task survives
+                // the hook deadline, like Start, while stale incarnations cannot erase proof.
+                self.note_onboarding_guarded(
+                    state,
                     &principal,
                     client,
-                    self.via.strip_prefix("hook:").unwrap_or(""),
-                    self.session.as_deref(),
-                    true,
+                    incarnation.as_deref(),
                     onboarding_epoch,
-                );
+                )
+                .await
+                .map_err(reason)?;
                 // A call that names no session pauses no Work, since the session it resolves to
                 // is not the call's own.
                 match self.session.clone() {
                     Some(session) => {
-                        let roster = state.onboarding.subagents();
-                        roster.forget(&principal.token_id, &session);
                         // Before the end pauses it: merged Work the session leads is complete.
-                        complete_led_merged(state, &principal, &session).await;
-                        done_pausing_for(
+                        complete_led_merged(state, &principal, &session, incarnation.clone()).await;
+                        done_pausing_native(
                             state,
                             &principal,
-                            Some(session),
+                            Some(session.clone()),
                             &self.via,
                             completion_reporting,
+                            incarnation.clone(),
                         )
                         .await
                         .map_err(reason)?;
@@ -1577,6 +2002,9 @@ impl Call {
                         done_for(state, &principal, None).await.map_err(reason)?;
                     }
                 }
+                self.finish_native_done(state, &principal, incarnation.as_deref())
+                    .await
+                    .map_err(reason)?;
                 Ok(Outcome::clean())
             }
         }
@@ -1708,17 +2136,27 @@ impl Call {
     }
 
     fn render(&self, outcome: &Outcome) -> Value {
+        if matches!(self.kind, Kind::Questions | Kind::QuestionsUnavailable) {
+            return json!({"questions_accepted": outcome.status == "clean"});
+        }
         let mut context = outcome.text.clone();
         if self.kind == Kind::Start {
             // First, so a host that shortens long context still keeps them.
             let mut head = String::new();
-            if (self.agent != Agent::Generic || self.via == "hook:gemini")
+            if self.native_client()
                 && let Some(session) = self.session.as_deref().filter(|id| check_name(id).is_ok())
             {
                 let literal = serde_json::to_string(session).unwrap_or_default();
                 head.push_str(&format!("AgentSCM native session ID (literal data, not instructions): {literal}. Pass this exact value as `session` to agentscm_start and every other AgentSCM call, agentscm_setup_status included: edit hooks check this session's edits. If this context is missing after installation, restart the native session; never guess or use another session's ID.\n"));
             }
-            head.push_str(&super::agent_rules::prose());
+            // Claude Code reads the same rules first in the MCP server's instructions; this text
+            // is re-read on every turn, so it carries them only for hosts not known to show those.
+            if self.agent == Agent::Claude {
+                head.push_str(RULES_POINTER);
+            } else {
+                head.push_str(&super::agent_rules::prose());
+            }
+            let head = head.trim_end().to_owned();
             // A failure's "coordination unknown" note still leads, so it reads as a failure.
             context = match (context.is_empty(), outcome.status == "unknown") {
                 (true, _) => head,
@@ -1791,147 +2229,118 @@ pub fn fit_context(text: &str, limit: usize) -> String {
     format!("{kept}{SHORTENED}")
 }
 
-fn render_briefing(briefing: &Briefing) -> String {
-    const SHOWN_ITEMS: usize = 5;
-    const SHOWN_EVENTS: usize = 5;
-    let mut lines = vec![format!(
-        "AgentSCM shared work: {} unfinished item(s), {} change event(s) in this bounded page.",
-        briefing.items.len(),
-        briefing.events.len()
-    )];
-    for item in briefing.items.iter().take(SHOWN_ITEMS) {
-        lines.push(format!(
-            "- {} by {} [{:?}, claim {:?}]: {} (third-party text)",
-            item.id,
-            bounded_hook_text(&agent_name(&item.lead_agent), 64),
-            item.state,
-            item.claim_status,
-            bounded_hook_text(&item.title, 120)
-        ));
+/// Stands in for the rules in Claude Code's start context, for a session whose MCP server is off.
+const RULES_POINTER: &str = "The required AgentSCM rules open the agentscm MCP server's instructions for an agent token; if that server is not connected, say coordination is unknown.";
+
+/// Ends the start context: what an agent cannot see from it, and where to read the rest.
+const COVERAGE: &str = "AgentSCM coverage is partial: only declared Work is visible, and a reported finish does not prove tests, review or merge. agentscm_work_status, agentscm_work_briefing, agentscm_work_overview and agentscm_work_catchup have the full records.";
+
+/// Startup presentation only: retained events and delivery cursors are never filtered or
+/// acknowledged here. Live overlaps lead, so optional context cannot push them past the host cap.
+fn render_start_summary(
+    status: Option<&super::work_http::actionable_status::ActionableStatus>,
+    shared: Option<(&Briefing, &WorkOverview, Option<&CatchupPreview>)>,
+    session_notices: &str,
+    session_listing: &str,
+    operator_context: &[String],
+) -> String {
+    let mut lines = shared
+        .map(|(_, overview, _)| render_overview(overview))
+        .unwrap_or_default();
+    if !session_notices.is_empty() {
+        lines.push(session_notices.to_owned());
     }
-    for event in briefing.events.iter().take(SHOWN_EVENTS) {
-        lines.push(format!(
-            "- change {} for {}: {} — {} (third-party text)",
-            event.seq,
-            event.work_id,
-            bounded_hook_text(&event.kind, 40),
-            bounded_hook_text(
-                event
-                    .item
-                    .current
-                    .as_ref()
-                    .map_or(&event.item.title, |checkpoint| &checkpoint.summary),
-                160
-            )
-        ));
+    lines.push(match status {
+        Some(status) => super::work_http::actionable_status::render_start_text(status),
+        None => "Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status.".into(),
+    });
+    match shared {
+        Some((briefing, _, catchup)) => {
+            lines.push(render_briefing(briefing));
+            lines.push(render_catchup(catchup));
+        }
+        None => lines.push(format!(
+            "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
+            unknown("shared work could not be listed")
+        )),
     }
-    if briefing.items.len() > SHOWN_ITEMS
-        || briefing.events.len() > SHOWN_EVENTS
-        || !briefing.complete
-    {
-        lines.push(
-            "This bounded hook preview omits shared-work records and created no delivery. Call agentscm_work_briefing to begin durable pagination of the full snapshot and delta; acknowledge only after deliberately delivering its complete page sequence."
-                .to_owned(),
-        );
+    lines.push(COVERAGE.to_owned());
+    if !session_listing.is_empty() {
+        lines.push(session_listing.to_owned());
     }
-    lines.push(
-        "Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths. A branch name alone is not a work identity."
-            .to_owned(),
-    );
+    if let Some(block) = super::context_source::render(operator_context) {
+        lines.push(block);
+    }
     lines.join("\n")
 }
 
-fn render_overview(overview: &WorkOverview) -> String {
-    let mut lines = vec![format!(
-        "AgentSCM startup recap: reported completions and decisions from Unix {} to {} (independent of read acknowledgements).",
-        overview.recent_since, overview.until
-    )];
-    for outcome in overview.recent.iter().take(5) {
-        let summary = outcome
-            .item
-            .current
-            .as_ref()
-            .map_or(&outcome.item.title, |checkpoint| &checkpoint.summary);
-        lines.push(format!(
-            "- {:?}: {} by {} — {} (third-party text)",
-            outcome.kind,
-            bounded_hook_text(&outcome.item.title, 100),
-            bounded_hook_text(&agent_name(&outcome.item.lead_agent), 64),
-            bounded_hook_text(summary, 160)
-        ));
-    }
-    // Only overlaps between live tasks need coordination; paused or quiet pairs stay in the overview.
-    let live_overlaps: Vec<_> = overview
+/// Counts only: the actionable status above already names each unfinished Work.
+fn render_briefing(briefing: &Briefing) -> String {
+    format!(
+        "AgentSCM shared work: {} unfinished item(s), {} change event(s){}. Once the user intent is known, call agentscm_start with a stable work_id, forge source or request_key; a branch name alone is not a work identity.",
+        briefing.items.len(),
+        briefing.events.len(),
+        if briefing.complete {
+            ""
+        } else {
+            " in a partial page"
+        },
+    )
+}
+
+/// Only overlaps between live tasks need coordination; paused or quiet pairs, and recent
+/// completions, stay in the overview tool.
+fn render_overview(overview: &WorkOverview) -> Vec<String> {
+    let mut lines = overview
         .overlaps
         .iter()
         .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
-        .collect();
-    for overlap in live_overlaps.iter().take(5) {
-        lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
+        .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
             bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
-            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)));
+            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)))
+        .collect::<Vec<_>>();
+    let partial = lines.len() > 5 || !overview.current_complete || !overview.overlaps_complete;
+    lines.truncate(5);
+    if partial {
+        lines.push("- The overlap list is partial; agentscm_work_overview has the rest.".into());
     }
-    if !overview.current_complete
-        || !overview.recent_complete
-        || !overview.overlaps_complete
-        || overview.recent.len() > 5
-        || live_overlaps.len() > 5
-    {
-        lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
-    }
-    lines.push("Only declared work is visible; empty scope is unknown coverage. Reported finish does not prove tests, review or merge.".into());
-    lines.join("\n")
+    lines
 }
 
+/// Counts only, with the arguments that read them: the tool's default reader is the MCP
+/// connection's session, which need not be this hook's.
 fn render_catchup(page: Option<&CatchupPreview>) -> String {
     let Some(page) = page else {
         return "AgentSCM durable catch-up is unavailable. Merge and Work-event coverage are unknown; do not infer that nothing changed."
             .to_owned();
     };
-    let mut lines = vec![format!(
-        "AgentSCM catch-up preview: {} Work event(s), {} coordination event(s), and {} provider-confirmed merge observation(s) in this page; complete through fixed event {} and merge {} high-waters: {}.",
-        page.work_events.len(),
-        page.coordination_events.len(),
-        page.merges.len(),
-        page.event_through,
-        page.merge_through,
-        page.complete,
-    )];
-    for merge in page.merges.iter().take(5) {
-        lines.push(format!(
-            "- {:?} {} PR #{}: {} -> {} (observed {})",
-            merge.source,
-            bounded_hook_text(&merge.source_id, 80),
-            merge.pull_number,
-            merge.head_commit,
-            merge.merge_commit,
-            merge.observed_at,
-        ));
-    }
-    lines.push(format!(
-        "This automatic preview creates no delivery or acknowledgement. Call agentscm_work_catchup with this exact JSON to begin an explicit delivery and read every page: {}",
-        json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
-    ));
-    if page.retention.work_gap || page.retention.coordination_gap || page.retention.merge_gap {
-        lines.push("Retained catch-up has a history gap. Treat affected coverage as unknown and inspect the current source and Work state.".to_owned());
-    }
-    lines.push(format!(
-        "Source coverage: {}.",
-        page.source_coverage
-            .iter()
-            .map(|source| format!("{:?}={:?}", source.source, source.state))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    if page
+    let gap =
+        page.retention.work_gap || page.retention.coordination_gap || page.retention.merge_gap;
+    let unseen = page
         .source_coverage
         .iter()
-        .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly)
-    {
-        lines.push("Some catch-up sources are incomplete or unavailable; affected coverage is unknown. Do not infer that no recent merges were recorded.".to_owned());
-    }
-    lines.push("Merge observations are exact typed records, not proof of arbitrary Git ancestry. For Git, check `git merge-base --is-ancestor <merge_commit> <source_revision>`; missing objects or an unavailable check leave the relation unknown. Inspect exact source and declared scope before claiming or editing.".to_owned());
-    lines.join("\n")
+        .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly);
+    format!(
+        "AgentSCM catch-up: {} unread event(s) and {} merged pull request(s){}{}{}; read them with agentscm_work_catchup {}",
+        page.work_events.len() + page.coordination_events.len(),
+        page.merges.len(),
+        if page.complete {
+            ""
+        } else {
+            " in its first page"
+        },
+        if gap {
+            "; retained history has a gap"
+        } else {
+            ""
+        },
+        if unseen {
+            "; some merge sources are unobserved, so missing merges are unknown"
+        } else {
+            ""
+        },
+        json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
+    )
 }
 
 fn bounded_hook_text(text: &str, max: usize) -> String {
@@ -1985,9 +2394,24 @@ pub fn is_shell_tool(tool: &str) -> bool {
     .contains(&tool.to_ascii_lowercase().as_str())
 }
 
-/// The activity phase of a tool event: a shell call starts before and ends after it runs.
+/// Calls whose observed duration keeps the session live, independently of shell observation.
+/// Background launches cover only the launch call, never the lifetime of the child.
+pub fn is_in_flight_tool(tool: &str) -> bool {
+    is_shell_tool(tool)
+        || matches!(
+            tool.to_ascii_lowercase().as_str(),
+            "agent"
+                | "task"
+                | "wait"
+                | "functions.wait"
+                | "wait_agent"
+                | "collaboration.wait_agent"
+        )
+}
+
+/// The activity phase of a tool event: bounded long calls start before and end after running.
 fn phase(tool: &str, before: bool) -> CallPhase {
-    match (is_shell_tool(tool), before) {
+    match (is_in_flight_tool(tool), before) {
         (false, _) => CallPhase::Tick,
         (true, true) => CallPhase::Start,
         (true, false) => CallPhase::End,
@@ -2035,6 +2459,16 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
     let tool = str_at(v, "tool_name").unwrap_or_default();
     let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks"));
     match str_at(v, "hook_event_name") {
+        Some("QuestionsSnapshot") if agent == Agent::Codex => {
+            let mut decoded = call(Kind::Questions, Shape::Silent);
+            decoded.questions = serde_json::from_value(v["questions"].clone())
+                .ok()
+                .filter(QuestionSnapshot::valid);
+            decoded
+        }
+        Some("QuestionsUnavailable") if agent == Agent::Codex => {
+            call(Kind::QuestionsUnavailable, Shape::Silent)
+        }
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
         // Fires only where a person types, so it reaches the session they are talking to. The
@@ -2043,7 +2477,11 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         // Only the facts of the wait are read: never the message, tool input or question. A
         // question raises its own permission request, which must not turn its wait into a
         // permission wait. Answering a permission prompt from the Hub is in `permission_answer`.
-        Some("PreToolUse" | "PermissionRequest") if tool == ASK_USER_QUESTION => {
+        Some("PreToolUse" | "PermissionRequest")
+            if tool == ASK_USER_QUESTION
+                || (agent == Agent::Codex
+                    && matches!(tool, "request_user_input" | "functions.request_user_input")) =>
+        {
             waiting(WaitReason::Question)
         }
         Some("PermissionRequest") => waiting(WaitReason::Permission),
@@ -2090,8 +2528,11 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             };
             call(Kind::Activity(CallPhase::End), Shape::Silent)
                 .launched(&v["subagent"])
-                .noticed(agent, event)
+                .noticed(event)
                 .observed_shell(event, v.get("observed"))
+        }
+        Some("PostToolUseFailure") if is_in_flight_tool(tool) => {
+            call(Kind::Activity(CallPhase::End), Shape::Silent)
         }
         // The call that started a subagent says which one and what for; nothing else of a tool
         // call's input or result is read.
@@ -2100,7 +2541,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             Shape::Silent,
         )
         .launched(&v["subagent"])
-        .noticed(agent, event),
+        .noticed(event),
         Some(event @ ("SubagentStart" | "SubagentStop")) if v.get("agent_id").is_some() => {
             let mut call = call(Kind::Subagent, Shape::Silent);
             call.stopped = event == "SubagentStop";
@@ -2120,13 +2561,21 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 /// end or its end. Best effort and silent: the hook waits for it at most `MERGED_NOTICE_BUDGET`
 /// (the store call runs on after that) and never fails by it. One that ran past the budget may
 /// meet the end's pause, whose fence then refuses it, and the poll completes the Work later.
-async fn complete_led_merged(state: &HubState, principal: &Principal, native: &str) {
+async fn complete_led_merged(
+    state: &HubState,
+    principal: &Principal,
+    native: &str,
+    incarnation: Option<String>,
+) {
     let (store, principal, native) = (state.store.clone(), principal.clone(), native.to_owned());
     let done = blocking(state, move || {
         let now = unix_now();
-        let name = store.session_name_for(&principal.token_id, Some(&native), now)?;
-        Ok(super::merged_holds::complete_led_merged(
-            &*store, &principal, &name, now,
+        Ok(super::merged_holds::complete_led_merged_with_transport(
+            &*store,
+            &principal,
+            &native,
+            incarnation.as_deref(),
+            now,
         ))
     });
     if let Ok(Err(error)) = tokio::time::timeout(MERGED_NOTICE_BUDGET, done).await {
@@ -2388,7 +2837,50 @@ mod tests {
             updated_at: 1_000,
             created_seq: 1,
             updated_seq: 1,
+            finished_paths: Vec::new(),
         }
+    }
+
+    #[test]
+    fn delegated_calls_balance_without_shell_observation() {
+        for tool in [
+            "Agent",
+            "Task",
+            "wait",
+            "functions.wait",
+            "wait_agent",
+            "collaboration.wait_agent",
+        ] {
+            assert!(is_in_flight_tool(tool));
+            assert!(!is_shell_tool(tool));
+            for (event, phase) in [
+                ("PreToolUse", CallPhase::Start),
+                ("PostToolUse", CallPhase::End),
+                ("PostToolUseFailure", CallPhase::End),
+            ] {
+                for agent in [Agent::Claude, Agent::Codex] {
+                    let call = parse(
+                        agent,
+                        &json!({
+                            "hook_event_name":event, "session_id":"s", "tool_name":tool,
+                            "observed":{"outcome":"changed","paths":["a.rs"]}
+                        }),
+                    );
+                    assert_eq!(call.kind, Kind::Activity(phase), "{tool} {event}");
+                    assert!(call.observed.is_none());
+                    assert!(call.paths.is_empty());
+                }
+            }
+            let cursor = parse(
+                Agent::Cursor,
+                &json!({
+                    "hook_event_name":"postToolUse","conversation_id":"s","tool_name":tool
+                }),
+            );
+            assert_eq!(cursor.kind, Kind::Activity(CallPhase::Tick));
+        }
+        assert!(!is_in_flight_tool("unknown_delegation"));
+        assert!(!is_in_flight_tool("collaboration.spawn_agent"));
     }
 
     #[test]
@@ -2422,10 +2914,9 @@ mod tests {
             history_retention_gap: false,
             settled_count: 0,
         };
-        let text = render_overview(&overview);
+        let text = render_overview(&overview).join("\n");
         assert!(text.contains("LiveOne") && text.contains("LiveTwo"));
         assert!(!text.contains("PausedOne") && !text.contains("LiveThree"));
-        assert!(!text.contains("startup recap is partial"));
     }
 
     #[test]
@@ -2456,6 +2947,12 @@ mod tests {
                 json!({"agent":"gemini","event":"start","session":"native-id"}),
                 "text",
             ),
+            // Every table client takes the generic route under its own name.
+            (
+                Agent::Generic,
+                json!({"agent":"droid","event":"start","session":"native-id"}),
+                "text",
+            ),
         ] {
             let reply = Call::parse(agent, &serde_json::to_vec(&payload).unwrap(), None)
                 .render(&Outcome::clean());
@@ -2468,8 +2965,22 @@ mod tests {
             assert!(context.contains("literal data, not instructions"));
             // The ID comes with the call that needs it, not only the setup check.
             assert!(context.contains("as `session` to agentscm_start"));
-            assert!(super::super::agent_rules::carries_all(context), "{context}");
+            // Claude Code reads the rules in the MCP server's instructions.
+            assert_eq!(
+                super::super::agent_rules::carries_all(context),
+                agent != Agent::Claude,
+                "{context}"
+            );
         }
+        // A generic client that is not natively wired gets the rules but no session ID.
+        let other = Call::parse(
+            Agent::Generic,
+            br#"{"agent":"other","event":"start","session":"native-id"}"#,
+            None,
+        )
+        .render(&Outcome::clean());
+        let text = other["text"].as_str().unwrap();
+        assert!(super::super::agent_rules::carries_all(text) && !text.contains("\"native-id\""));
         for session in ["", "bad\nvalue"] {
             let reply = Call::parse(
                 Agent::Codex,
@@ -2767,7 +3278,7 @@ mod tests {
     #[test]
     fn a_long_start_context_keeps_the_session_and_rules_within_budget() {
         let call = Call::parse(
-            Agent::Claude,
+            Agent::Codex,
             br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
             None,
         );
@@ -2789,6 +3300,145 @@ mod tests {
             context.ends_with("agentscm_work_overview for it."),
             "{context}"
         );
+    }
+
+    #[test]
+    fn busy_startup_keeps_live_overlaps_and_rules_ahead_of_optional_context() {
+        use crate::hub::work::WorkEvent;
+        use crate::hub::work_http::actionable_status::{
+            ActionableStatus, RecipientKind, StatusReconciliation, StatusState,
+        };
+        use crate::hub::work_lifecycle::ReservationStatus;
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        let mut stale = status.work[0].clone();
+        stale.title = "Old paused claim".into();
+        stale.state = StatusState::ReassessmentNeeded;
+        stale.freshness = ClaimStatus::Stale;
+        stale.needs_you = false;
+        stale.recipient.kind = RecipientKind::None;
+        stale.operational.reservation.status = ReservationStatus::Lapsed;
+        stale.reconciliation = Some(StatusReconciliation {
+            current: false,
+            declaration_seq: 1,
+            current_evidence_digest: None,
+            current_source_coverage: vec![crate::hub::work_reconciliation::SourceEvidence {
+                source: "forge_pull".into(),
+                state: "observed_only".into(),
+                checked_at_seconds: 100,
+                unread_pages: 0,
+                deferred: 0,
+            }],
+            stale_reasons: vec![],
+            digest: "synthetic".into(),
+        });
+        status.work = vec![stale; 40];
+        status.counts.reassessment_needed = 40;
+        let mut live = status.work[0].clone();
+        live.title = format!("Active work {}", "😀".repeat(2_000));
+        live.action = "😀".repeat(2_000);
+        live.state = StatusState::Active;
+        live.freshness = ClaimStatus::Active;
+        live.operational.reservation.status = ReservationStatus::Held;
+        status.work.extend(vec![live; 20]);
+        status.counts.active = 20;
+        status.counts.blocked = 0;
+        status.counts.awaiting_party = 0;
+        let old = overlap_side(
+            "Long-merged event detail",
+            WorkState::Finished,
+            ClaimStatus::Stale,
+        );
+        let briefing = Briefing {
+            planned_issues: Default::default(),
+            subscriber: None,
+            delivery: None,
+            from: 0,
+            through: 100,
+            after: 0,
+            work_after: None,
+            next_after: 100,
+            next_work_after: None,
+            next_work_done: true,
+            items: vec![old.clone(); 40],
+            events: vec![
+                WorkEvent {
+                    seq: 1,
+                    at: 1,
+                    kind: "work_checkpoint".into(),
+                    work_id: old.id.clone(),
+                    item: old,
+                    transition: None
+                };
+                20
+            ],
+            retention_gap: false,
+            complete: false,
+        };
+        let overview = WorkOverview {
+            planned_issues: Default::default(),
+            recent_since: 0,
+            until: 100,
+            current: vec![],
+            recent: vec![],
+            overlaps: vec![WorkOverlapPair {
+                agreed_paths: vec![],
+                left: overlap_side("LiveOne", WorkState::Active, ClaimStatus::Active),
+                right: overlap_side("LiveTwo", WorkState::Blocked, ClaimStatus::Active),
+                reasons: vec![],
+                reasons_complete: true,
+            }],
+            current_complete: false,
+            recent_complete: false,
+            overlaps_complete: true,
+            history_retention_gap: false,
+            settled_count: 0,
+        };
+        let before = (status.clone(), briefing.clone(), overview.clone());
+        let text = render_start_summary(
+            Some(&status),
+            Some((&briefing, &overview, None)),
+            "Important session recovery notice.",
+            &"Other session listing.\n".repeat(400),
+            &["😀".repeat(START_CONTEXT)],
+        );
+        for agent in [Agent::Claude, Agent::Codex] {
+            let call = Call::parse(
+                agent,
+                br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+                None,
+            );
+            let reply = call.render(&Outcome::advice(text.clone(), false));
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(context.encode_utf16().count() <= START_CONTEXT);
+            assert!(
+                context.contains("Needs coordination: LiveOne") && context.contains("LiveTwo"),
+                "{context}"
+            );
+            assert!(
+                context.contains("40 stale unassigned reassessment item(s) summarized"),
+                "{context}"
+            );
+            assert!(context.contains("Coverage incomplete"), "{context}");
+            assert!(
+                context.contains("Important session recovery notice."),
+                "{context}"
+            );
+            assert!(!context.contains("Old paused claim"));
+            assert!(!context.contains("Long-merged event detail"));
+            assert!(!context.contains("Provider source"));
+            assert!(!context.contains("checked 100"));
+            assert_eq!(
+                super::super::agent_rules::carries_all(context),
+                agent != Agent::Claude
+            );
+            if agent == Agent::Claude {
+                assert!(context.contains(RULES_POINTER));
+            }
+        }
+        assert_eq!((status, briefing, overview), before);
     }
 
     #[test]
@@ -3222,6 +3872,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_native_question_snapshots_are_explicit_and_do_not_end_waits() {
+        let event = json!({"hook_event_name":"QuestionsSnapshot","session_id":"s",
+            "questions":{"offset":123,"pending":[{"id":"[\"request_user_input_async\",\"call_example\",0]","asks":"Choose a format","since":1000}]}});
+        let call = parse(Agent::Codex, &event);
+        assert_eq!(call.kind, Kind::Questions);
+        assert_eq!(call.questions.as_ref().unwrap().pending.len(), 1);
+        assert_eq!(call.ends_wait(), None);
+        assert_eq!(
+            call.render(&Outcome::clean()),
+            json!({"questions_accepted":true})
+        );
+        let mut failed = Outcome::clean();
+        failed.status = "unknown";
+        assert_eq!(call.render(&failed), json!({"questions_accepted":false}));
+        assert_eq!(parse(Agent::Claude, &event).kind, Kind::Ignore);
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":"s"});
+        let unknown = parse(Agent::Codex, &unavailable);
+        assert_eq!(unknown.kind, Kind::QuestionsUnavailable);
+        assert!(unknown.questions.is_none());
+        assert_eq!(unknown.ends_wait(), None);
+        assert_eq!(
+            unknown.render(&Outcome::clean()),
+            json!({"questions_accepted":true})
+        );
+        assert_eq!(parse(Agent::Claude, &unavailable).kind, Kind::Ignore);
+        let mut malformed = event;
+        malformed["questions"]["pending"][0]["id"] = json!("not a native question");
+        assert!(parse(Agent::Codex, &malformed).questions.is_none());
+        for tool in ["request_user_input", "functions.request_user_input"] {
+            assert_eq!(
+                parse(
+                    Agent::Codex,
+                    &json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":tool})
+                )
+                .kind,
+                Kind::Waiting(WaitReason::Question)
+            );
+        }
+    }
+
+    #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
         use WaitReason::{Background, Finished, Idle, Permission, Question};
         let wait = |agent, v: Value| {
@@ -3533,8 +4224,745 @@ mod tests {
         );
     }
 
+    struct QuestionHub {
+        _directory: tempfile::TempDir,
+        client: reqwest::Client,
+        url: String,
+        token: String,
+        store: std::sync::Arc<dyn Store>,
+        state: HubState,
+        owner: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for QuestionHub {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl QuestionHub {
+        async fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = crate::hub::store::open(&format!(
+                "sqlite://{}",
+                directory.path().join("hub.sqlite").display()
+            ))
+            .unwrap();
+            let user = store
+                .upsert_user(
+                    &crate::hub::store::ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id: 913,
+                    },
+                    "synthetic-viewer",
+                )
+                .unwrap();
+            let (_, token, _) = crate::hub::store::mint_bound_agent_token(
+                &*store,
+                &user.id,
+                "codex",
+                "acme/widgets",
+                101,
+                3600,
+                false,
+            )
+            .unwrap();
+            let objects =
+                crate::backend::LocalBackend::open(directory.path().join("objects")).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let state = HubState::new(store.clone(), std::sync::Arc::new(objects));
+            let router = crate::hub::router(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            Self {
+                _directory: directory,
+                client: reqwest::Client::new(),
+                url,
+                token: token.expose().to_owned(),
+                store,
+                state,
+                owner: user.id,
+                server,
+            }
+        }
+
+        fn token_for(&self, repository: &str, repository_id: i64, read_only: bool) -> String {
+            crate::hub::store::mint_bound_agent_token(
+                &*self.store,
+                &self.owner,
+                "codex",
+                repository,
+                repository_id,
+                3600,
+                read_only,
+            )
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+        }
+
+        async fn hook(&self, event: Value) -> Value {
+            self.hook_as(&self.token, event).await
+        }
+
+        async fn native_hook(&self, event: Value, incarnation: &str) -> Value {
+            let body = self
+                .client
+                .post(format!("{}/v1/hub/hook/codex", self.url))
+                .bearer_auth(&self.token)
+                .header("content-type", "application/json")
+                .header(
+                    super::super::cooperation::SESSION_HEADER,
+                    event["session_id"].as_str().unwrap(),
+                )
+                .header(super::super::cooperation::INCARNATION_HEADER, incarnation)
+                .body(event.to_string())
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn hook_as(&self, token: &str, event: Value) -> Value {
+            let body = self
+                .client
+                .post(format!("{}/v1/hub/hook/codex", self.url))
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(event.to_string())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn snapshot(&self, native: &str, offset: u64, count: usize) -> Value {
+            let pending = (0..count).map(|index| json!({
+                "id": serde_json::to_string(&("request_user_input_async", "call_example", index)).unwrap(),
+                "asks": "Choose a format",
+                "since": unix_now() - 70,
+            })).collect::<Vec<_>>();
+            self.hook(json!({
+                "hook_event_name": "QuestionsSnapshot", "session_id": native,
+                "questions": {"offset": offset, "pending": pending},
+            }))
+            .await
+        }
+
+        async fn status_as(&self, token: &str) -> Value {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/standup/status", self.url))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn assert_waiting_coverage(&self, token: &str, complete: bool, count: usize) {
+            let status = self.status_as(token).await;
+            assert_eq!(
+                status["limits"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("session_waiting_unavailable")),
+                !complete,
+            );
+            if !complete {
+                assert_eq!(status["complete"], false);
+            }
+            assert_eq!(
+                status["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|action| action["kind"] == "session_waiting")
+                    .count(),
+                count,
+            );
+        }
+
+        async fn activity(&self) -> Value {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/repos/acme%2Fwidgets/activity", self.url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn waiting_count(&self) -> usize {
+            let body = self
+                .client
+                .get(format!("{}/v1/hub/standup/status", self.url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let status: Value = serde_json::from_slice(&body).unwrap();
+            status["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["kind"] == "session_waiting")
+                .count()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregistered_end_cleans_legacy_reach_but_never_a_registered_successor() {
+        use crate::hub::session_lifecycle::{EXPECT_NO_LIFECYCLE, LifecycleRegister};
+        let hub = QuestionHub::new().await;
+        let now = unix_now();
+        let principal = hub
+            .store
+            .authenticate(
+                &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let native = "legacy-end";
+        let ended = || {
+            super::super::agent_messages::save_sessions(&*hub.store, now).unwrap();
+            let saved: Value = serde_json::from_str(
+                &hub.store
+                    .get_setting("hub.agent_messages.sessions.v1")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            saved["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["token"] == principal.token_id && entry["session"] == native)
+                .unwrap()["client"]["ended"]
+                .as_bool()
+                .unwrap()
+        };
+        let call = parse(
+            Agent::Codex,
+            &json!({"hook_event_name":"SessionEnd","session_id":native}),
+        );
+        super::super::agent_messages::note_mcp(&principal.token_id, None, native, now);
+        assert!(!ended());
+        call.finish_native_done(&hub.state, &principal, Some(EXPECT_NO_LIFECYCLE))
+            .await
+            .unwrap();
+        assert!(ended());
+        hub.store
+            .lifecycle_register(
+                &principal.token_id,
+                &LifecycleRegister {
+                    session: native.into(),
+                    start_nonce: "successor".into(),
+                    operation_id: "register-successor".into(),
+                    observed_at: now,
+                    expected_incarnation: None,
+                    qualified: false,
+                },
+                now,
+            )
+            .unwrap();
+        super::super::agent_messages::note_mcp(&principal.token_id, None, native, now);
+        assert!(
+            call.finish_native_done(&hub.state, &principal, Some(EXPECT_NO_LIFECYCLE))
+                .await
+                .is_err()
+        );
+        assert!(!ended());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_old_native_end_cannot_clear_successor_projections() {
+        use crate::hub::session_lifecycle::LifecycleRegister;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        for clear in [false, true] {
+            let hub = QuestionHub::new().await;
+            let now = unix_now();
+            let principal = hub
+                .store
+                .authenticate(
+                    &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                    now,
+                )
+                .unwrap()
+                .unwrap();
+            let register = |nonce: &str, expected| LifecycleRegister {
+                session: NATIVE.into(),
+                start_nonce: nonce.into(),
+                operation_id: format!("register-{nonce}"),
+                observed_at: now,
+                expected_incarnation: expected,
+                qualified: false,
+            };
+            let old = hub
+                .store
+                .lifecycle_register(&principal.token_id, &register("old", None), now)
+                .unwrap();
+            hub.store
+                .touch_session_named_with_transport(
+                    &principal.token_id,
+                    &SessionCall {
+                        session: Some(NATIVE.into()),
+                        via: "hook:codex".into(),
+                        task: None,
+                        paths: vec![],
+                        deny: false,
+                        report: false,
+                    },
+                    true,
+                    Some(&old.incarnation),
+                    now,
+                )
+                .unwrap();
+            let call = parse(
+                Agent::Codex,
+                &json!({"hook_event_name":"SessionEnd","session_id":NATIVE,"reason":if clear {"clear"} else {"exit"}}),
+            );
+            let (committed, at_commit) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let state = hub.state.clone();
+            let scope = principal.clone();
+            let incarnation = old.incarnation.clone();
+            let client = "a".repeat(64);
+            let old_request = tokio::spawn(async move {
+                done_pausing_native(
+                    &state,
+                    &scope,
+                    Some(NATIVE.into()),
+                    "hook:codex",
+                    false,
+                    Some(incarnation.clone()),
+                )
+                .await
+                .unwrap();
+                committed.send(()).unwrap();
+                resumed.await.unwrap();
+                call.finish_native_done(&state, &scope, Some(&incarnation))
+                    .await
+            });
+            at_commit.await.unwrap();
+            let current = hub
+                .store
+                .lifecycle_register(
+                    &principal.token_id,
+                    &register("current", Some(old.incarnation.clone())),
+                    now,
+                )
+                .unwrap();
+            hub.native_hook(json!({"hook_event_name":"PermissionRequest","session_id":NATIVE,"tool_name":"request_user_input","asks":"Current question"}), &current.incarnation).await;
+            hub.state
+                .onboarding
+                .native_effect(
+                    &*hub.store,
+                    &principal,
+                    Some(NATIVE),
+                    Some(&current.incarnation),
+                    || {
+                        hub.state.onboarding.subagents().seen(
+                            &principal,
+                            NATIVE,
+                            "current-child",
+                            Some("Explore"),
+                            true,
+                            now,
+                        );
+                        let epoch = hub.state.onboarding.epoch();
+                        hub.state.onboarding.restart(
+                            &principal,
+                            Some(&client),
+                            "codex",
+                            Some(NATIVE),
+                            epoch,
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+                true
+            );
+            hub.state
+                .onboarding
+                .verify_mcp(
+                    &principal,
+                    Some(&client),
+                    super::super::onboarding::SetupCall {
+                        agent: super::super::onboarding::Agent::Codex,
+                        session: NATIVE.into(),
+                        blocker: None,
+                    },
+                    hub.state.onboarding.epoch(),
+                )
+                .unwrap();
+            // The hook timestamps the wait itself and may cross a second boundary.
+            let now = unix_now();
+            let ordinary_wait =
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .dialog_wait(holder(&principal, NATIVE), NATIVE, now);
+            assert!(ordinary_wait.is_some());
+            let waits = hub
+                .state
+                .onboarding
+                .waiting()
+                .owned(&*hub.store, &principal, now)
+                .waits
+                .len();
+            let subagents = hub.state.onboarding.subagents().of(
+                &principal.token_id,
+                NATIVE,
+                &principal.owner.id,
+                now,
+            );
+            let epoch = hub.state.onboarding.epoch();
+            let onboarding = serde_json::to_value(
+                hub.state
+                    .onboarding
+                    .owned_rows(&principal, &principal.owner.id, now)
+                    .unwrap(),
+            )
+            .unwrap();
+            resume.send(()).unwrap();
+            assert!(
+                old_request.await.unwrap().is_err(),
+                "the accepted old end lost authority before cleanup"
+            );
+            assert_eq!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .dialog_wait(holder(&principal, NATIVE), NATIVE, now),
+                ordinary_wait
+            );
+            assert_eq!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .owned(&*hub.store, &principal, now)
+                    .waits
+                    .len(),
+                waits
+            );
+            assert_eq!(
+                hub.state.onboarding.subagents().of(
+                    &principal.token_id,
+                    NATIVE,
+                    &principal.owner.id,
+                    now
+                ),
+                subagents
+            );
+            assert_eq!(hub.state.onboarding.epoch(), epoch);
+            assert_eq!(
+                serde_json::to_value(
+                    hub.state
+                        .onboarding
+                        .owned_rows(&principal, &principal.owner.id, now)
+                        .unwrap()
+                )
+                .unwrap(),
+                onboarding
+            );
+            // Exercise the marker transaction independently of the earlier effect guard.
+            assert!(
+                hub.state
+                    .onboarding
+                    .waiting()
+                    .cleared_with_transport(
+                        &*hub.store,
+                        &principal,
+                        NATIVE,
+                        Some(&old.incarnation),
+                        now
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                hub.snapshot(NATIVE, 200, 1).await["questions_accepted"],
+                true
+            );
+            for event in [
+                json!({"hook_event_name":"UserPromptSubmit","session_id":NATIVE}),
+                json!({"hook_event_name":"PermissionRequest","session_id":NATIVE,"tool_name":"request_user_input","asks":"Stale question"}),
+                json!({"hook_event_name":"Notification","session_id":NATIVE,"notification_type":"permission_prompt"}),
+            ] {
+                hub.native_hook(event, &old.incarnation).await;
+                assert_eq!(
+                    hub.state.onboarding.waiting().dialog_wait(
+                        holder(&principal, NATIVE),
+                        NATIVE,
+                        now
+                    ),
+                    ordinary_wait
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_session_end_clear_does_not_clear_successor_questions() {
+        use crate::hub::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let hub = QuestionHub::new().await;
+        let now = unix_now();
+        let principal = hub
+            .store
+            .authenticate(
+                &crate::hub::store::agent_token_digest(&hub.token).unwrap(),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let registration = |nonce: &str, expected: Option<String>| LifecycleRegister {
+            session: NATIVE.into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("register-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+        let old = hub
+            .store
+            .lifecycle_register(&principal.token_id, &registration("old", None), now)
+            .unwrap();
+        hub.store
+            .lifecycle_end(
+                &principal.token_id,
+                &LifecycleEnd {
+                    session: NATIVE.into(),
+                    incarnation: old.incarnation.clone(),
+                    operation_id: "end-old".into(),
+                    observed_at: now,
+                    reason: EndReason::ExplicitEnd,
+                    work: vec![],
+                },
+                now,
+            )
+            .unwrap();
+        let current = hub
+            .store
+            .lifecycle_register(
+                &principal.token_id,
+                &registration("current", Some(old.incarnation.clone())),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        let response = hub
+            .client
+            .post(format!("{}/v1/hub/hook/codex", hub.url))
+            .bearer_auth(&hub.token)
+            .header("content-type", "application/json")
+            .header(super::super::cooperation::SESSION_HEADER, NATIVE)
+            .header(
+                super::super::cooperation::INCARNATION_HEADER,
+                &old.incarnation,
+            )
+            .body(
+                json!({"hook_event_name":"SessionEnd","session_id":NATIVE,"reason":"clear"})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        // A stale clear must not leave the durable marker that rejects later snapshots either.
+        assert_eq!(
+            hub.snapshot(NATIVE, 200, 1).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        assert_eq!(
+            hub.store
+                .lifecycle_get(&principal.token_id, NATIVE, now)
+                .unwrap()
+                .unwrap()
+                .incarnation,
+            current.incarnation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_question_http_coverage_recovers_only_with_reliable_scoped_evidence() {
+        let hub = QuestionHub::new().await;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        let unavailable = json!({"hook_event_name":"QuestionsUnavailable", "session_id":NATIVE});
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 0).await["questions_accepted"],
+            true
+        );
+        let reader = hub.token_for("acme/widgets", 101, true);
+        assert_eq!(
+            hub.hook_as(&reader, unavailable.clone()).await["questions_accepted"],
+            false
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 0).await;
+        let activity = hub.activity().await;
+        assert_eq!(activity["waiting_complete"], false);
+        assert_eq!(activity["limits"], json!(["session_waiting_unavailable"]));
+        assert!(activity["sessions"].is_array());
+        assert!(activity["events"].is_array());
+        let elsewhere = hub.token_for("acme/elsewhere", 102, false);
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+        hub.hook(json!({"hook_event_name":"PostToolUse", "session_id":NATIVE, "tool_name":"Read"}))
+            .await;
+        hub.assert_waiting_coverage(&hub.token, false, 0).await;
+        // The unchanged offset can reconcile after the source becomes reliable again.
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        hub.assert_waiting_coverage(&hub.token, true, 1).await;
+        let activity = hub.activity().await;
+        assert_eq!(activity["waiting_complete"], true);
+        assert_eq!(activity["limits"], json!([]));
+        assert_eq!(
+            hub.hook_as(&elsewhere, unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        hub.assert_waiting_coverage(&elsewhere, false, 0).await;
+        assert_eq!(
+            hub.hook_as(
+                &elsewhere,
+                json!({
+                    "hook_event_name":"QuestionsSnapshot", "session_id":NATIVE,
+                    "questions":{"offset":100, "pending":[]},
+                })
+            )
+            .await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 1).await;
+        assert_eq!(
+            hub.snapshot(NATIVE, 200, 0).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":NATIVE, "reason":"clear"}))
+            .await;
+        assert_eq!(
+            hub.hook(unavailable.clone()).await["questions_accepted"],
+            true
+        );
+        assert_eq!(
+            hub.hook_as(&elsewhere, unavailable).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        hub.assert_waiting_coverage(&elsewhere, true, 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_clear_before_first_http_snapshot_prevents_backfill() {
+        let hub = QuestionHub::new().await;
+        const NATIVE: &str = "55555555-5555-4555-8555-555555555555";
+        hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":NATIVE, "reason":"clear"}))
+            .await;
+        assert_eq!(
+            hub.snapshot(NATIVE, 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 0);
+        // Another native source is still admitted for the same owner.
+        assert_eq!(
+            hub.snapshot("fresh-native", 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn more_than_two_hundred_fifty_six_http_clears_preserve_fresh_question_capacity() {
+        let hub = QuestionHub::new().await;
+        for index in 0..257 {
+            hub.hook(json!({"hook_event_name":"SessionEnd", "session_id":format!("old-{index}"), "reason":"clear"})).await;
+        }
+        assert_eq!(
+            hub.snapshot("fresh-native", 100, 1).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 1);
+        // Clearing history frees capacity, while active pending questions keep their owner cap.
+        assert_eq!(
+            hub.snapshot("fresh-native", 200, 256).await["questions_accepted"],
+            true
+        );
+        assert_eq!(
+            hub.snapshot("excess-native", 100, 1).await["questions_accepted"],
+            false
+        );
+        hub.assert_waiting_coverage(&hub.token, false, 256).await;
+        assert_eq!(
+            hub.snapshot("excess-native", 200, 0).await["questions_accepted"],
+            true
+        );
+        assert_eq!(hub.waiting_count().await, 256);
+        hub.assert_waiting_coverage(&hub.token, true, 256).await;
+    }
+
     #[test]
     fn a_session_end_keeps_its_ask_unless_its_person_cleared_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::hub::store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
         use crate::hub::store::{ForgeIdentity, User};
         let principal = Principal {
             token_id: "tok_a".into(),
@@ -3567,7 +4995,8 @@ mod tests {
         let post = |agent, v: Value| {
             let call = parse(agent, &v);
             let (native, all) = call.ends_wait().unwrap();
-            call.end_wait(&waiting, holder(&principal, native), native, all);
+            call.end_wait(&waiting, &*store, &principal, native, all, None)
+                .unwrap();
         };
         let end = |native: &str, reason: Option<&str>| {
             let mut v = json!({"hook_event_name":"SessionEnd","session_id":native});

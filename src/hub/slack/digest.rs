@@ -232,6 +232,7 @@ impl Slack {
     fn delivering(&self, state: &HubState, who: &Principal) -> Result<bool> {
         let settings = digest_http::settings(
             &*state.store,
+            &who.owner.identity.host,
             &who.repository,
             who.repository_id,
             &who.owner.id,
@@ -301,7 +302,13 @@ impl Slack {
         let who = self.principal(state, binding)?;
         let repository_id = who.repository_id.ok_or(HubError::Unauthorized)?;
         if action_id == STOP {
-            digest_http::set_opted_out(&*state.store, &who.owner.id, repository_id, true)?;
+            digest_http::set_opted_out(
+                &*state.store,
+                &who.owner.identity.host,
+                &who.owner.id,
+                repository_id,
+                true,
+            )?;
             return Ok(format!(
                 "Weekly digests for {} are off for you. Run agentscm digest opt-in in a checkout of it to get them again.",
                 sanitize(&who.repository, TEXT_CHARS)
@@ -362,6 +369,8 @@ impl Slack {
             transition,
             reason: reason.to_owned(),
             superseded_by: None,
+            participants: Vec::new(),
+            paths: Vec::new(),
         };
         let actor = WorkTransitionActor::Person {
             user: &who.owner,

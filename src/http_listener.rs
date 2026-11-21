@@ -147,9 +147,9 @@ pub(crate) mod tests {
     /// Sends a request line, then one header line every 50 ms for three seconds; returns
     /// how long the server took to close the connection and what it sent.
     pub(crate) async fn trickle_headers(address: SocketAddr, path: &str) -> (Duration, Vec<u8>) {
+        let started = Instant::now();
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
-        let started = Instant::now();
         let line = format!("GET {path} HTTP/1.1\r\n");
         tokio::spawn(async move {
             let _ = writer.write_all(line.as_bytes()).await;
@@ -264,7 +264,10 @@ pub(crate) mod tests {
     async fn a_connection_that_never_sends_is_closed() {
         let limit = Duration::from_millis(300);
         let address = listen_limited(limit, 8).await;
-        let elapsed = closed_after(tokio::net::TcpStream::connect(address).await.unwrap()).await;
+        // The server can start its timer before the client resumes from connect.
+        let started = Instant::now();
+        closed_after(tokio::net::TcpStream::connect(address).await.unwrap()).await;
+        let elapsed = started.elapsed();
         assert!(elapsed >= limit, "{elapsed:?}");
     }
 

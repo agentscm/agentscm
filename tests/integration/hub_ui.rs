@@ -1,5 +1,4 @@
-//! The status page route: served without credentials, with a strict CSP; the built files are
-//! embedded only with the `ui` feature.
+//! Headless native routes and the optional server dashboard remain distinct.
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
@@ -38,6 +37,7 @@ async fn health_says_demo_only_for_a_demo_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "ui")]
 async fn ui_is_served_with_a_content_security_policy() {
     let dir = TempDir::new().unwrap();
     let base = serve(&dir, false).await;
@@ -93,4 +93,61 @@ async fn ui_is_served_with_a_content_security_policy() {
         }
     }
     assert_eq!(get("/ui/other").await.unwrap().status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(feature = "ui"))]
+async fn headless_hub_has_no_dashboard_but_keeps_an_auth_landing() {
+    let dir = TempDir::new().unwrap();
+    let base = serve(&dir, false).await;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .unwrap();
+    for path in [
+        "/",
+        "/ui",
+        "/ui/",
+        "/ui/app.js",
+        "/ui/app.css",
+        "/ui/manifest.webmanifest",
+        "/ui/icon-192.png",
+        "/ui/icon-512.png",
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+    }
+    let response = client
+        .get(format!("{base}{}", agentscm::hub::ui::landing()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("Return to your terminal or application")
+    );
+}
+
+#[test]
+#[cfg(all(unix, not(feature = "ui")))]
+fn headless_open_and_front_door_do_not_create_a_service() {
+    let dir = TempDir::new().unwrap();
+    for args in [vec!["open"], vec!["serve", "--front-door"]] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .arg("--data-dir")
+            .arg(dir.path().join("store"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("dashboard"));
+        assert!(!dir.path().join("config/agentscm/front-door").exists());
+        assert!(!dir.path().join("store").exists());
+    }
 }

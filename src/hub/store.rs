@@ -33,6 +33,11 @@ use super::insights::{
     WorkInsight,
 };
 use super::intent::{Announced, Intent, NewIntent};
+use super::notices::{
+    DependencyNoticeAck, DependencyRefresh, NewOwnerNotice, NoticeAcknowledgement, NoticeOffer,
+    NoticeOfferRequest, NoticeReceipt, NoticeRefreshPage, NoticeTransportReport, OwnerNotice,
+    OwnerNoticeDeliveryProof, OwnerNoticePage, OwnerNoticeRecipientStatus,
+};
 use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1, PromiseHistoryPageV1,
@@ -41,6 +46,9 @@ use super::promise::{
 };
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, SessionEnd, Touched};
+use super::session_lifecycle::{
+    LifecycleEnd, LifecycleEndResult, LifecycleRegister, LifecycleView,
+};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
@@ -139,6 +147,76 @@ pub struct Principal {
     pub expires_at: i64,
     pub read_only: bool,
     pub owner: User,
+}
+
+/// Statements (PostgreSQL form; `$1` the repository's id scope, `$2` its name scope) that move
+/// rows a token without a repository id wrote under a repository's name, before that repository
+/// was connected under the name, to the repository's id scope, where that token now reads them.
+/// A key already taken under the id scope keeps its row; the name-scoped one is left unread.
+pub(super) const ADOPT_NAME_SCOPE: [&str; 10] = [
+    "UPDATE hub_intents SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_intent_paths SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_handoffs SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_contested_edits SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_duplicate_starts SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_hook_overhead SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_publications SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_skill_evidence SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    // One row per key moves: names that differ only in case would otherwise collide.
+    "UPDATE hub_candidate_heads SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)
+     AND repository_scope = (SELECT MIN(h.repository_scope) FROM hub_candidate_heads h
+         WHERE lower(h.repository_scope) = lower($2) AND h.branch = hub_candidate_heads.branch)
+     AND NOT EXISTS (SELECT 1 FROM hub_candidate_heads h
+         WHERE h.repository_scope = $1 AND h.branch = hub_candidate_heads.branch)",
+    "UPDATE hub_skill_adoptions SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)
+     AND repository_scope = (SELECT MIN(a.repository_scope) FROM hub_skill_adoptions a
+         WHERE lower(a.repository_scope) = lower($2))
+     AND NOT EXISTS (SELECT 1 FROM hub_skill_adoptions a WHERE a.repository_scope = $1)",
+];
+
+/// [`principal_scope`] from a request handler; the store is read only for a token with no
+/// repository id.
+pub(super) async fn scope_of(state: &super::HubState, who: &Principal) -> Result<String> {
+    if who.repository_id.is_some() {
+        return Ok(repository_scope(
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        ));
+    }
+    let (store, who) = (state.store.clone(), who.clone());
+    super::http::blocking(state, move || principal_scope(&*store, &who)).await
+}
+
+/// The key the token's repository rows are stored under (see [`repository_scope`]). A token
+/// minted without a repository id takes the id of the repository connected under its name on its
+/// owner's host, as its forge reads do (`sync::find_repository`); with none, its name.
+pub fn principal_scope(store: &dyn Store, who: &Principal) -> Result<String> {
+    let host = &who.owner.identity.host;
+    let repository_id = match who.repository_id {
+        Some(id) => Some(id),
+        None => store
+            .repository_named(host, &who.repository)?
+            .map(|repo| repo.repository_id),
+    };
+    Ok(repository_scope(host, &who.repository, repository_id))
+}
+
+impl super::connection::ConnectedRepository {
+    /// The key this repository's rows are stored under; see [`repository_scope`].
+    pub fn repository_scope(&self) -> String {
+        repository_scope(&self.host, &self.full_name, Some(self.repository_id))
+    }
+}
+
+/// The key one repository's rows are stored under: its forge host and stable repository id, or
+/// its host and name when the caller has no id. Two repositories with the same name, on two hosts
+/// or one after another on one host, never share a key, and a renamed repository keeps its own.
+pub fn repository_scope(host: &str, repository: &str, repository_id: Option<i64>) -> String {
+    format!(
+        "{host}/{}",
+        super::catchup::repository_namespace(repository, repository_id)
+    )
 }
 
 /// A token as its owner sees it; never holds the secret or digest.
@@ -446,10 +524,206 @@ pub trait Store: Send + Sync {
         call: &SessionCall,
         named: bool,
         now: i64,
+    ) -> Result<Touched> {
+        self.touch_session_named_with_transport(token, call, named, None, now)
+    }
+    fn touch_session_named_with_transport(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<Touched>;
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;
+    /// Native transport fences never renew activity on registration or replay.
+    fn lifecycle_register(
+        &self,
+        token: &str,
+        request: &LifecycleRegister,
+        now: i64,
+    ) -> Result<LifecycleView>;
+    fn lifecycle_check(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<LifecycleView>>;
+    /// Check native effect authority and persist its opaque wait-clear marker atomically.
+    /// Caller holds native-effect and waiting-map locks before entering the transaction.
+    fn clear_native_wait_with_transport(
+        &self,
+        token: &str,
+        session: &str,
+        incarnation: Option<&str>,
+        setting_key: &str,
+        now: i64,
+    ) -> Result<()>;
+    /// Exact raw native ID lookup for state/retry; canonical domain ambiguity does not hide it.
+    fn lifecycle_get(&self, token: &str, session: &str, now: i64) -> Result<Option<LifecycleView>>;
+    /// Read-only projection through domain aliases; multiple native lifecycles remain unknown.
+    fn lifecycle_domain_get(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<LifecycleView>>;
+    fn lifecycle_fences(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Vec<super::session_lifecycle::WorkFence>>;
+    fn lifecycle_end(
+        &self,
+        token: &str,
+        request: &LifecycleEnd,
+        now: i64,
+    ) -> Result<LifecycleEndResult>;
+    /// Refresh changes semantic notices only; offering and recipient acknowledgement are separate.
+    fn notice_refresh(
+        &self,
+        token: &str,
+        query: &DependencyRefresh,
+        now: i64,
+    ) -> Result<NoticeRefreshPage>;
+    fn notice_offer(
+        &self,
+        token: &str,
+        query: &NoticeOfferRequest,
+        now: i64,
+    ) -> Result<Option<NoticeOffer>>;
+    fn notice_transport(
+        &self,
+        token: &str,
+        report: &NoticeTransportReport,
+        now: i64,
+    ) -> Result<NoticeReceipt>;
+    fn dependency_notice_ack(
+        &self,
+        token: &str,
+        ack: &DependencyNoticeAck,
+        now: i64,
+    ) -> Result<NoticeAcknowledgement>;
+    fn notice_pending(&self, token: &str, session: &str, now: i64) -> Result<Vec<NoticeReceipt>>;
+    fn notice_record(
+        &self,
+        token: &str,
+        source: &super::notices::NoticeSource,
+        recipient: &super::notices::NoticeRecipient,
+        now: i64,
+    ) -> Result<NoticeReceipt>;
+    fn notice_resolve(
+        &self,
+        token: &str,
+        session: &str,
+        source: &super::notices::NoticeSource,
+        now: i64,
+    ) -> Result<bool>;
+    #[allow(clippy::too_many_arguments)]
+    fn notice_message_update(
+        &self,
+        token: &str,
+        session: &str,
+        setting_key: &str,
+        expected: Option<&str>,
+        replacement: &str,
+        source: &super::notices::NoticeSource,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<Option<super::agent_messages::Mode>>;
+    fn notice_owner_refresh(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<NoticeRefreshPage>;
+    fn notice_owner_pending(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        now: i64,
+    ) -> Result<Vec<NoticeReceipt>>;
+    fn notice_message_receipts(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        messages: &[super::agent_messages::Message],
+        now: i64,
+    ) -> Result<Vec<super::agent_messages::MessageReceipt>>;
+    fn notice_owner_terminal(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        work_ids: &[String],
+        now: i64,
+    ) -> Result<Vec<String>>;
+    /// Create an immutable owner-recipient mailbox record. The authenticated token supplies the
+    /// sender and repository scope; the recipient is deliberately independent of token/session/Work.
+    fn owner_notice_put(
+        &self,
+        token: &str,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Create a Hub-produced attestation invalidation notice. The recipient comes from the
+    /// forge's current pull-request author identity, independently of any active Work.
+    fn owner_notice_invalidation_put(
+        &self,
+        repository: &str,
+        repository_id: i64,
+        notice: &NewOwnerNotice,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Delivery may only be reported by the creating token. It is distinct from recipient
+    /// acknowledgement and action, and requires a channel-specific durable proof identity.
+    fn owner_notice_delivered(
+        &self,
+        token: &str,
+        id: &str,
+        proof: &OwnerNoticeDeliveryProof,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Atomically reserves one outbound transport attempt for the addressed owner's binding.
+    /// Only a proven no-dispatch result permits another claim; uncertainty is terminal for
+    /// automatic delivery so the Hub never blindly duplicates a possibly-sent message.
+    fn owner_notice_delivery_claim(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        channel: &str,
+        now: i64,
+    ) -> Result<Option<super::notices::OwnerNoticeDeliveryClaim>>;
+    fn owner_notice_delivery_report(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        report: &super::notices::OwnerNoticeDeliveryReport,
+        now: i64,
+    ) -> Result<OwnerNotice>;
+    /// Pure, deterministic recipient mailbox read through the existing repository-role gate.
+    fn owner_notice_list(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<OwnerNoticePage>;
+    /// Read one notice only as its sender or recipient. Unknown and unauthorized ids are
+    /// deliberately indistinguishable.
+    fn owner_notice_get(&self, token: &str, id: &str, now: i64) -> Result<OwnerNotice>;
+    /// Only the addressed owner may acknowledge or report action. Action implies acknowledgement,
+    /// while neither state implies transport delivery.
+    fn owner_notice_recipient_status(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        status: OwnerNoticeRecipientStatus,
+        now: i64,
+    ) -> Result<OwnerNotice>;
     /// `end_session`, and in the same transaction pause the active Work the session leads, with
     /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
     /// Work with no session row is still paused. If the pause fails nothing is written, so the
@@ -462,6 +736,16 @@ pub trait Store: Send + Sync {
         token: &str,
         session: Option<&str>,
         via: &str,
+        now: i64,
+    ) -> Result<SessionEnd> {
+        self.end_session_pausing_with_transport(token, session, via, None, now)
+    }
+    fn end_session_pausing_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        via: &str,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<SessionEnd>;
     /// Asks the live session intent holding exactly the file `path` to hand it over to the
@@ -487,6 +771,17 @@ pub trait Store: Send + Sync {
         note: Option<&str>,
         via: Via,
         now: i64,
+    ) -> Result<Asked> {
+        self.ask_handoff_with_transport(token, session, path, note, (via, None), now)
+    }
+    fn ask_handoff_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        note: Option<&str>,
+        transport: (Via, Option<&str>),
+        now: i64,
     ) -> Result<Asked>;
     /// The holder's answer to the oldest open request for `path` addressed to the token (to its
     /// session `session`, if given). Accepting moves the file to the requester's session; a
@@ -511,13 +806,25 @@ pub trait Store: Send + Sync {
         answer: (bool, Option<&str>),
         via: Via,
         now: i64,
+    ) -> Result<Answered> {
+        self.answer_handoff_with_transport(token, session, path, answer, (via, None), now)
+    }
+    fn answer_handoff_with_transport(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        answer: (bool, Option<&str>),
+        transport: (Via, Option<&str>),
+        now: i64,
     ) -> Result<Answered>;
-    /// The newest handoffs in `repository` (most recent first, at most `limit`) in which a
-    /// token owned by `owner` is the requester or the holder, in any state.
+    /// The newest handoffs in the repository with `scope` (see [`repository_scope`]; most recent
+    /// first, at most `limit`) in which a token owned by `owner` is the requester or the holder,
+    /// in any state.
     fn handoffs_of_owner(
         &self,
         owner: &str,
-        repository: &str,
+        scope: &str,
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
@@ -549,8 +856,9 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<Pickup>>;
-    /// Live intents in `repository`, ordered by id, at most `limit`.
-    fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
+    /// Live intents of the repository with `scope` (see [`repository_scope`]), ordered by id,
+    /// at most `limit`.
+    fn live_intents(&self, scope: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// Live intents in the principal's repository and forge scope, ordered by id.
     fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// `intent_notice` and `pr_notice` events addressed to the token's intents with seq > `after`, oldest first, at most `limit`.
@@ -604,6 +912,14 @@ pub trait Store: Send + Sync {
     fn connection(&self, id: &str) -> Result<Option<Connection>>;
     /// The `pat` connection for `host`, if any.
     fn pat_connection(&self, host: &str) -> Result<Option<Connection>>;
+    /// Update an App slug from a verified read. True also covers an identical concurrent update.
+    fn refresh_connection_app_slug(
+        &self,
+        id: &str,
+        app_id: i64,
+        previous: Option<&str>,
+        slug: &str,
+    ) -> Result<bool>;
     /// `enabled` or `auth_failed`; an event only when status or detail changes.
     fn set_connection_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<()>;
     /// An event only when the flag changes; unknown connection is `Invalid`.
@@ -614,6 +930,38 @@ pub trait Store: Send + Sync {
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()>;
     /// Insert a hub-wide setting once across replicas and return its retained value.
     fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String>;
+    /// Persist unknown coverage and its largest reliably observed rejected offset. Zero means
+    /// unavailable coverage without a reliable snapshot; upserts never lower the retry floor.
+    fn native_question_coverage_mark(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+        rejected_offset: u64,
+    ) -> Result<()>;
+    /// The retry floor for one unresolved source; zero is unknown coverage without an offset.
+    fn native_question_coverage_floor(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: &str,
+    ) -> Result<Option<u64>>;
+    /// Indexed existence check for unresolved coverage in one owner's repository.
+    fn native_question_coverage_unavailable(
+        &self,
+        owner: &str,
+        scope: &str,
+        native: Option<&str>,
+    ) -> Result<bool>;
+    /// Resolve through an accepted offset in one repository, or across repositories after a
+    /// verified native clear (`through_offset: None`). False means a newer barrier remains.
+    fn native_question_coverage_resolve(
+        &self,
+        owner: &str,
+        scope: Option<&str>,
+        native: &str,
+        through_offset: Option<u64>,
+    ) -> Result<bool>;
     /// Unix seconds; no event.
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()>;
     /// Keyed by (host, repository_id): a rename updates the row. A repository already held by
@@ -699,12 +1047,12 @@ pub trait Store: Send + Sync {
     fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
     /// Rows of `repo` that may show a success (state `success` or an uncertain post) as
     /// `(number, context, row)`, by number then context, at most `limit`. Rows on a context in
-    /// `enabled`, and rows of a pull request whose newest publication in `full_name` is merged,
-    /// are left out: neither is a retire candidate.
+    /// `enabled`, and rows of a pull request whose newest publication in the repository with
+    /// `scope` (see [`repository_scope`]) is merged, are left out: neither is a retire candidate.
     fn forge_checks_showing_success(
         &self,
         repo: &str,
-        full_name: &str,
+        scope: &str,
         enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>>;
@@ -803,12 +1151,12 @@ pub trait Store: Send + Sync {
         complete: bool,
     ) -> Result<()>;
     fn external_reconciled(&self, repo: &str, commit_sha: &str) -> Result<Option<(i64, bool)>>;
-    /// Publications of `repository` (a full name, matched case-insensitively) with a merge
+    /// Publications of the repository with `scope` (see [`repository_scope`]) with a merge
     /// commit, last updated at or after `oldest` (unix seconds), by id, ids above `after`, at
     /// most `limit`.
     fn merged_publications(
         &self,
-        repository: &str,
+        scope: &str,
         after: &str,
         oldest: i64,
         limit: usize,
@@ -829,12 +1177,14 @@ pub trait Store: Send + Sync {
         binding: Option<&str>,
         now: i64,
     ) -> Result<Create>;
-    fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
-    /// Publications of `repository` (matched exactly, as [`Store::publication`]), newest first by
-    /// `created_at`, then `id`, strictly older than the `before` publication, at most `limit`.
+    /// The publication `id` when it belongs to the repository with `scope` (see
+    /// [`repository_scope`]).
+    fn publication(&self, scope: &str, id: &str) -> Result<Option<Publication>>;
+    /// Publications of the repository with `scope`, newest first by `created_at`, then `id`,
+    /// strictly older than the `before` publication, at most `limit`.
     fn publications(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
@@ -844,20 +1194,15 @@ pub trait Store: Send + Sync {
     /// reads more than that window; the result says where it stopped.
     fn publication_search(
         &self,
-        repository: &str,
+        scope: &str,
         before: Option<&str>,
         search: &str,
         limit: usize,
     ) -> Result<PublicationSearch>;
-    /// The newest publication of each pull request number above `after` in `repository`
-    /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
-    /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
-    fn pull_publications(
-        &self,
-        repository: &str,
-        after: i64,
-        limit: usize,
-    ) -> Result<Vec<Publication>>;
+    /// The newest publication of each pull request number above `after` in the repository with
+    /// `scope` (see [`repository_scope`]), omitting pull requests whose newest publication is
+    /// merged, by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
+    fn pull_publications(&self, scope: &str, after: i64, limit: usize) -> Result<Vec<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Propose or atomically apply a repair for one exact retained publication-projection failure.
@@ -931,13 +1276,41 @@ pub trait Store: Send + Sync {
         start: &WorkStart,
         named: bool,
         now: i64,
+    ) -> Result<WorkStartResult> {
+        self.work_start_named_with_transport(token, start, named, None, now)
+    }
+    fn work_start_named_with_transport(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
-    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.work_start_auto_with_transport(token, start, None, now)
+    }
+    fn work_start_auto_with_transport(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<WorkStartResult>;
     fn work_checkpoint(
         &self,
         token: &str,
         checkpoint: &WorkCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.work_checkpoint_with_transport(token, checkpoint, None, now)
+    }
+    fn work_checkpoint_with_transport(
+        &self,
+        token: &str,
+        checkpoint: &WorkCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     /// Scoped read. Person callers must first check the current repository role; no token is minted.
@@ -1026,6 +1399,15 @@ pub trait Store: Send + Sync {
         token: &str,
         update: &super::work_reconciliation::WorkDeclarationsUpdate,
         now: i64,
+    ) -> Result<super::work_reconciliation::WorkDeclarationsResult> {
+        self.work_declarations_set_with_transport(token, update, None, now)
+    }
+    fn work_declarations_set_with_transport(
+        &self,
+        token: &str,
+        update: &super::work_reconciliation::WorkDeclarationsUpdate,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<super::work_reconciliation::WorkDeclarationsResult>;
     /// Release, retain, finish or reopen Work as its lead, owner or an administrator. One
     /// transaction, idempotent by `operation_id`, fenced by generation and `updated_seq`.
@@ -1033,6 +1415,31 @@ pub trait Store: Send + Sync {
         &self,
         actor: &WorkTransitionActor<'_>,
         request: &WorkTransitionRequest,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        self.work_transition_with_transport(actor, request, None, now)
+    }
+    fn work_transition_with_transport(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        incarnation: Option<&str>,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        let guard = match actor {
+            WorkTransitionActor::Agent { token } => {
+                Some((*token, request.session.as_deref(), incarnation))
+            }
+            _ => None,
+        };
+        self.work_transition_with_guard(actor, request, guard, now)
+    }
+    /// A native-triggered policy effect keeps policy authority but must fence its originating session.
+    fn work_transition_with_guard(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        guard: Option<(&str, Option<&str>, Option<&str>)>,
         now: i64,
     ) -> Result<WorkTransitionResult>;
     /// The `WorkOperationalV1` projection of the selected Work, ordered by id and bounded to
@@ -1199,19 +1606,22 @@ pub trait Store: Send + Sync {
         author: &str,
         retry_at: i64,
     ) -> Result<()>;
-    fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>>;
+    /// The adoption of the repository with `scope` (see [`repository_scope`]); every skill
+    /// table is keyed by the scope.
+    fn skill_adoption(&self, scope: &str) -> Result<Option<SkillAdoption>>;
     /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
     /// replaces a `default_branch` row, which any `default_branch` row replaces.
     fn skill_adoption_put(&self, adoption: &SkillAdoption) -> Result<SkillAdoption>;
     /// Drops the repository's adoption from `source`, or from every source when `None`.
-    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()>;
+    fn skill_adoption_clear(&self, scope: &str, source: Option<&str>) -> Result<()>;
     fn skill_evidence_add(&self, row: &EvidenceRow) -> Result<()>;
     /// A run's evidence in recorded order.
-    fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;
-    /// Runs of `repo`, most recently active first, optionally one branch or one run id.
+    fn skill_evidence(&self, scope: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;
+    /// Runs of the repository with `scope`, most recently active first, optionally one branch
+    /// or one run id.
     fn skill_run_heads(
         &self,
-        repo: &str,
+        scope: &str,
         branch: Option<&str>,
         run_id: Option<&str>,
         limit: usize,
@@ -1290,6 +1700,16 @@ pub trait Store: Send + Sync {
         token: &str,
         session: &str,
         now: i64,
+    ) -> Result<Option<WorkItem>> {
+        self.capture_work_for_session_at(token, session, None, now)
+    }
+    /// The same authorization fence, optionally restricted to an explicitly associated Work.
+    fn capture_work_for_session_at(
+        &self,
+        token: &str,
+        session: &str,
+        work_id: Option<&str>,
+        now: i64,
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
@@ -1305,6 +1725,16 @@ pub trait Store: Send + Sync {
         token: &str,
         call: &SessionCall,
         phase: super::work_lifecycle::CallPhase,
+        now: i64,
+    ) -> Result<Option<String>> {
+        self.session_activity_with_transport(token, call, phase, None, now)
+    }
+    fn session_activity_with_transport(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: super::work_lifecycle::CallPhase,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<Option<String>>;
     /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
@@ -1369,11 +1799,29 @@ pub trait Store: Send + Sync {
         token: &str,
         ack: &CoordinationAck,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_ack_with_transport(token, ack, None, now)
+    }
+    fn coordination_ack_with_transport(
+        &self,
+        token: &str,
+        ack: &CoordinationAck,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn work_overlap_start(
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapStart,
+        now: i64,
+    ) -> Result<WorkStartResult> {
+        self.work_overlap_start_with_transport(token, request, None, now)
+    }
+    fn work_overlap_start_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapStart,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkStartResult>;
     fn work_overlap_preflight(
@@ -1386,6 +1834,15 @@ pub trait Store: Send + Sync {
         &self,
         token: &str,
         request: &super::work_overlap::WorkOverlapCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        self.work_overlap_checkpoint_with_transport(token, request, None, now)
+    }
+    fn work_overlap_checkpoint_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapCheckpoint,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     /// Target lead consent alone grants no permission; requester acceptance is separately fenced.
@@ -1416,6 +1873,15 @@ pub trait Store: Send + Sync {
         token: &str,
         request: &super::work_overlap::WorkOverlapConsentRequest,
         now: i64,
+    ) -> Result<super::work_overlap::WorkOverlapConsentView> {
+        self.work_overlap_consent_with_transport(token, request, None, now)
+    }
+    fn work_overlap_consent_with_transport(
+        &self,
+        token: &str,
+        request: &super::work_overlap::WorkOverlapConsentRequest,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<super::work_overlap::WorkOverlapConsentView>;
     /// Bounded current consent state, visible to the requester and affected current leads.
     fn work_overlap_consents(
@@ -1430,17 +1896,44 @@ pub trait Store: Send + Sync {
         token: &str,
         reply: &CoordinationReply,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_reply_with_transport(token, reply, None, now)
+    }
+    fn coordination_reply_with_transport(
+        &self,
+        token: &str,
+        reply: &CoordinationReply,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn coordination_resolve(
         &self,
         token: &str,
         resolve: &CoordinationResolve,
         now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_resolve_with_transport(token, resolve, None, now)
+    }
+    fn coordination_resolve_with_transport(
+        &self,
+        token: &str,
+        resolve: &CoordinationResolve,
+        incarnation: Option<&str>,
+        now: i64,
     ) -> Result<CoordinationRequest>;
     fn coordination_withdraw(
         &self,
         token: &str,
         withdraw: &CoordinationWithdraw,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        self.coordination_withdraw_with_transport(token, withdraw, None, now)
+    }
+    fn coordination_withdraw_with_transport(
+        &self,
+        token: &str,
+        withdraw: &CoordinationWithdraw,
+        incarnation: Option<&str>,
         now: i64,
     ) -> Result<CoordinationRequest>;
     fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()>;
@@ -2312,6 +2805,18 @@ fn name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
 }
 
+pub(super) fn validate_native_question_coverage_keys(keys: &[&str]) -> Result<()> {
+    if keys.iter().any(|key| {
+        key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(invalid("invalid native question coverage key"));
+    }
+    Ok(())
+}
+
 fn invalid(message: &str) -> HubError {
     HubError::Invalid(message.to_owned())
 }
@@ -2658,6 +3163,78 @@ mod tests {
             MIGRATIONS
                 .iter()
                 .all(|migration| !migration.sqlite.contains("authorization_binding"))
+        );
+    }
+}
+
+/// The most Work items plus coordination requests a rename repairs inside the sync transaction.
+/// // ponytail: a fixed ceiling; beyond it the rename is recorded and `agentscm work
+/// repair-repository` is the path, since the repair rewrites every row in one write transaction.
+pub(super) const MAX_ONLINE_RENAME_REPAIR_ROWS: i64 = 500;
+
+/// What became of the online Work repair after a repository rename, as recorded on the
+/// `repository_renamed` event: a fixed code, never raw error text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RenameRepair {
+    Applied,
+    /// Nothing was recorded under the former name, so there was nothing to move.
+    None,
+    Skipped(&'static str),
+}
+
+impl RenameRepair {
+    pub(super) fn event_fields(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Applied => ("applied", None),
+            Self::None => ("none", None),
+            Self::Skipped(reason) => ("skipped", Some(reason)),
+        }
+    }
+}
+
+/// The `work_repair_reason` for a repair that failed. Only a refusal (an invalid
+/// repair or a unique-index collision) is a `conflict`; a busy store, a lock
+/// timeout, a deadlock or any other failure is `unavailable`. The store error
+/// mapping keeps no error code on `HubError::Unavailable`, so a
+/// collision is recognised by the text the store mappings leave (SQLite's
+/// `UNIQUE constraint failed`, PostgreSQL's `SQLSTATE 23505` suffix).
+pub(super) fn rename_repair_failure_reason(error: &super::HubError) -> &'static str {
+    match error {
+        super::HubError::Invalid(_) => "conflict",
+        super::HubError::Unavailable(message)
+            if message.contains("UNIQUE constraint failed")
+                || message.contains("SQLSTATE 23505") =>
+        {
+            "conflict"
+        }
+        _ => "unavailable",
+    }
+}
+
+#[cfg(test)]
+mod rename_repair_reason_tests {
+    use super::rename_repair_failure_reason as reason;
+    use crate::hub::HubError;
+
+    #[test]
+    fn only_refusals_and_collisions_are_conflicts() {
+        assert_eq!(reason(&HubError::Invalid("x".into())), "conflict");
+        assert_eq!(
+            reason(&HubError::Unavailable(
+                "UNIQUE constraint failed: t.c".into()
+            )),
+            "conflict"
+        );
+        assert_eq!(
+            reason(&HubError::Unavailable("db error (SQLSTATE 23505)".into())),
+            "conflict"
+        );
+        assert_eq!(reason(&HubError::Busy), "unavailable");
+        assert_eq!(
+            reason(&HubError::Unavailable(
+                "canceling statement due to lock timeout".into()
+            )),
+            "unavailable"
         );
     }
 }

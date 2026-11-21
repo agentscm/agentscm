@@ -7,6 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
 use serde_json::json;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 use super::catchup::{CatchupAck, CatchupAckResult, CatchupPage, CatchupQuery};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
@@ -31,6 +34,8 @@ use super::{HubError, HubState};
 
 #[path = "actionable_status.rs"]
 pub mod actionable_status;
+
+static CATCHUP_WAITERS: Semaphore = Semaphore::const_new(32);
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -618,6 +623,12 @@ async fn recovery(
                 now,
             )?;
             super::merged_holds::annotate_conflicts(&*store, &principal, &mut recovery, now);
+            super::merged_holds::annotate_findings(
+                &*store,
+                &super::merged_holds::FindingsReader::Agent(&principal),
+                &mut recovery,
+                now,
+            );
             Ok(recovery)
         })
         .await?,
@@ -702,15 +713,66 @@ async fn catchup(
     query: std::result::Result<Query<CatchupQuery>, QueryRejection>,
 ) -> Result<Json<CatchupPage>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    Ok(Json(poll_catchup(&state, &principal, query).await?))
+}
+
+/// Long-polling is only a latency optimization. Each preview and the eventual delivery read the
+/// database, so another Hub process is observed without an in-process wake signal.
+pub(super) async fn poll_catchup(
+    state: &HubState,
+    principal: &super::store::Principal,
+    query: CatchupQuery,
+) -> Result<CatchupPage, HubError> {
+    query.validate()?;
+    let wait = CATCHUP_WAITERS
+        .try_acquire()
+        .ok()
+        .filter(|_| query.wait_seconds > 0);
+    let deadline = Instant::now()
+        + Duration::from_secs(if wait.is_some() {
+            query.wait_seconds
+        } else {
+            0
+        });
+    if wait.is_some() {
+        loop {
+            let store = state.store.clone();
+            let token = principal.token_id.clone();
+            let subscriber = query.subscriber.clone();
+            let preview = blocking(state, move || {
+                store.work_catchup_preview(
+                    &token,
+                    &super::catchup::CatchupPreviewQuery { subscriber },
+                    unix_now(),
+                )
+            })
+            .await;
+            match preview {
+                Ok(preview)
+                    if !preview.work_events.is_empty()
+                        || !preview.coordination_events.is_empty()
+                        || !preview.merges.is_empty()
+                        || !preview.owner_notices.is_empty() =>
+                {
+                    break;
+                }
+                Err(HubError::Busy) if Instant::now() < deadline => {}
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < deadline => {}
+                Ok(_) => break,
+            }
+            tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_secs(1))).await;
+        }
+    }
     let store = state.store.clone();
-    Ok(Json(
-        blocking(&state, move || {
-            let mut page = store.work_catchup(&principal.token_id, &query, unix_now())?;
-            page.show(Viewer(&principal.owner.id));
-            Ok(page)
-        })
-        .await?,
-    ))
+    let token = principal.token_id.clone();
+    let owner = principal.owner.id.clone();
+    blocking(state, move || {
+        let mut page = store.work_catchup(&token, &query, unix_now())?;
+        page.show(Viewer(&owner));
+        Ok(page)
+    })
+    .await
 }
 
 async fn catchup_ack(

@@ -4,43 +4,72 @@ title: "Install"
 
 # Install
 
-> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
+> **Alpha: try it, don't depend on it.** The CLI, APIs and storage may change between releases
+> without migration. See the [changelog](../CHANGELOG.md) for known limits.
 
-Choose a version from [Releases](https://github.com/agentscm/agentscm/releases). In the examples
-below, replace `<version>` with that version without its leading `v`. Container images are
-versioned; alpha releases do not publish a `latest` image tag. For reproducible installs, keep the
-selected version or image digest in your deployment configuration.
-
-These docs describe the branch or tag you are viewing. A command present on `main` may not be in
-a published binary yet. Use the documentation at the matching release tag, or
-[build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
-
-The installed `agentscm client mcp` proxy hosts a local hook relay with its own HTTPS pool,
-without another daemon or setup step. Restart agent MCP sessions after upgrading to regain
-pooling; see [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for matching rules and limits.
-
-Want to try AgentSCM before configuring an agent or Hub? From a Git repository, follow the
-[scripted demo](scripted-demo.md). It needs no account, Docker or forge and writes nothing to the
-repository.
-
-The full quickstart agent setup runs on macOS and Linux. The Windows CLI is an alpha port and does
-not configure agent integrations. A managed Hub runs natively only on Apple Silicon macOS; other
-hosts need Docker or a Hub that already runs. See the [platform details](#platforms).
-
-## Set up this computer
-
-Run one command, once per computer. It is not per repository.
+One command sets up this computer, once, for all your projects. It runs a coordination Hub for you
+and your agents, signs you in, and connects every coding agent it finds: Claude Code, Codex,
+Cursor, GitHub Copilot and Gemini CLI. It writes nothing to your repositories.
 
 ```sh
 npx agentscm
 ```
 
-This runs a Hub on this computer for you and your agents, signs you in and sets up every coding
+You need macOS or Linux, Node.js 18 or newer, and Git. On [Windows](#windows) the CLI runs but does
+not set up agents yet. Want to look first? [See it in action](scripted-demo.md): one command, no
+account and nothing to set up.
+
+## Let your coding agent set it up
+
+Copy this prompt into Claude Code, Codex or another coding agent, in any folder. The agent runs the
+setup and checks the result; you only step in to approve things in your browser. To join a Hub your
+team already runs, use the [team prompt](team-member-onboarding.md#or-paste-one-prompt-into-your-agent)
+instead.
+
+```text wrap
+Install AgentSCM on this computer for me. AgentSCM lets my coding agents, you included, see who is working on which files so they don't overwrite each other's work. Follow the steps in order. When a step fails, stop and show me the exact output; do not work around it.
+
+Rules for the whole task:
+- Do not use sudo, and do not edit configuration files by hand.
+- Do not sign in for me or approve a browser page for me, and never read, print or copy a token.
+- Run each command as written. If a command or flag is refused, show me the error instead of trying a different one.
+
+1. Check this computer and tell me the result of each:
+   - It runs macOS or Linux.
+   - `node --version` prints 18 or newer.
+   - `git --version` prints a version.
+   If any check fails, tell me what to install and stop.
+
+2. Find my GitHub login with `gh api user -q .login`. If `gh` is missing or not signed in, ask me for my GitHub login. It becomes the administrator of my Hub. Use it as LOGIN below.
+
+3. Run `npx agentscm --yes --local --github-login LOGIN`. You have no terminal for its questions, so `--yes` takes the recommended answers and `--local` runs the Hub on this computer. On Linux or an Intel Mac, first check that Docker is running, and add `--hub-runtime docker`.
+
+4. The setup needs me twice in the browser: once to create and install a GitHub App for my Hub, and once to sign in. Whenever it prints a link or a code, show it to me, tell me what to do there, and wait until I say I am done. If it exits after printing the GitHub App link, run the same command again once I have installed the app. If it tells me to run a command in my own terminal, give me that exact command and wait.
+
+5. When it finishes, show me its summary, including any agent it could not set up. Then tell me to fully quit and reopen my coding agents, and in Codex to run `/hooks` once and trust the AgentSCM hooks. After that, inside any repository, I can ask an agent: "Get started with AgentSCM".
+
+To undo everything later, run `npx agentscm uninstall`.
+```
+
+The prompt uses `--local` and `--github-login`, which `quickstart --help` no longer lists but which
+still work: without a terminal, quickstart needs every choice as a flag (see
+[other flags](setup-guide.md#other-flags)).
+
+## Set up this computer
+
+`npx agentscm` runs a Hub on this computer for you and your agents, signs you in and sets up every coding
 agent it finds. On the first run it opens a page on your machine where you create a GitHub App for
 your Hub (two clicks: **Create**, then **Install** on the repositories you want). It then asks for
 your GitHub login to make you the Hub administrator and signs you in through your browser. Quickstart
 does not ask more questions while it configures agents, though each agent host may show its own
 trust prompts. See the [guided setup](setup-guide.md) for the full flow.
+
+When you run quickstart in a checkout whose GitHub origin belongs to an organization, quickstart asks GitHub to confirm the organization and suggests it as the App owner. A configured App owner takes precedence, and you can change the owner on the setup page. If GitHub cannot confirm the organization, the page uses its configured or personal default.
+
+The managed native Hub serves setup, sign-in and coordination APIs without a dashboard.
+Browser controls for sending human messages and choosing their consent mode require a
+UI-enabled Hub, such as the container or an explicit `--features ui` source build. Connecting
+to an existing team Hub keeps that Hub's web interface.
 
 To join a Hub that already runs, give its URL. The command signs you in through your browser:
 
@@ -48,7 +77,8 @@ To join a Hub that already runs, give its URL. The command signs you in through 
 npx agentscm --hub-url https://hub.example.com
 ```
 
-Either way it finds Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI and sets each one
+Either way it finds Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI, Factory Droid, Qwen
+Code, Junie CLI and Crush and sets each one
 up for all your projects, so a fresh clone works with no further setup. Nothing is written to
 your repositories. It asks no question while it sets up the agents.
 
@@ -67,7 +97,7 @@ These options are shown in `agentscm quickstart --help`:
 | --- | --- |
 | `--hub-url URL` | Join the Hub at URL instead of running one here. |
 | `--yes` | Take the recommended answers; never ask. |
-| `--only AGENT` | Set up only this agent: `claude`, `codex`, `cursor`, `copilot` or `gemini` (repeatable). |
+| `--only AGENT` | Set up only this agent: `claude`, `codex`, `cursor`, `copilot`, `gemini`, `droid`, `qwen`, `junie` or `crush` (repeatable). |
 | `--dry-run` | Print what it would do and write nothing. |
 | `--json` | Print one JSON result on stdout and progress on stderr (not on Windows). |
 
@@ -76,6 +106,14 @@ documented in the [setup guide](setup-guide.md#other-flags).
 
 To try agents against a Hub on this computer without a GitHub App or any forge sign-in, see
 [agent tokens for a local Hub without a forge](local-agent-token.md).
+
+### Hosted beta feedback
+
+On a Hub where you accepted beta enrollment, local Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI startup hooks can offer the parent agent an optional short product report after completed Work. The Hub checks current enrollment, access and the completed Work's lead before accepting it. Ordinary installation does not enroll you or turn on CLI telemetry. Other agents and Windows do not have this feedback adapter.
+
+Feedback needs Python 3.10 or later on `PATH`; it silently skips unavailable connections, known helpers and ineligible reporters, without changing task completion. It reads no transcripts, makes no model call and keeps no retry queue. Reports are not anonymous; omit secrets, personal data and customer details. Helpers without host markers are instructed to skip; this is not a security boundary. An installed hook is not live host qualification: verify delivery and one genuine accepted report on the selected host/model before relying on collection. Migrate separately installed feedback hooks before using the bundled adapter, preserving their other context hooks and immutable files used by active sessions, then restart your agents.
+
+Before downgrading to a release without this adapter, remove only the startup-hook entries whose commands invoke `feedback start --client` from Cursor's `.cursor/hooks.json`, Gemini's `.gemini/settings.json` and Copilot's `hooks/agentscm-client.json` in its user configuration directory (`COPILOT_HOME`, or `.copilot` under your home directory). Check any checkout-scoped copies too. Keep every other hook. Restore the prior Claude Code and Codex plugin bundles through their normal setup, then restart affected sessions; retain immutable bundles while an active session uses them. An older binary cannot execute these feedback commands or recognize them for removal.
 
 ### Share your local Hub over Tailscale
 
@@ -103,13 +141,14 @@ The Hub is only as available as your computer.
 Deploying a Hub on a server is your job, and it is not supported in the alpha. Ask your coding
 agent to follow [hosted setup](hosted.md) with you. Then everyone joins with `--hub-url`.
 
-Flags shown by `npx agentscm --help`:
+Flags shown by `npx agentscm quickstart --help` (`npx agentscm --help` prints the program's own
+command list instead; `install.sh --help` shows these flags):
 
 | Flag | What it does |
 |---|---|
 | `--hub-url URL` | Connect to the hub that already runs at URL. |
 | `--yes` | Answer every question with the recommended choice (needed without a terminal). |
-| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`); repeat for more. Default: every detected agent on supported Unix hosts. |
+| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot`, `gemini`, `droid`, `qwen`, `junie` or `crush`); repeat for more. Default: every detected agent on supported Unix hosts. |
 | `--dry-run` | Print what would be written and stop without writing. |
 | `--json` | Print one JSON object on stdout when done (`agents.installed`, `agents.skipped`, `agents.needs_user`, `hub`, `hub_up`, `signed_in`); the progress text goes to stderr. Not on Windows. |
 
@@ -117,10 +156,49 @@ These flags still work but are hidden from help, and will go in a later release:
 
 ### If you are an agent installing AgentSCM for someone
 
-Run `npx agentscm@<version> --yes --json` (add `--hub-url URL` to join a Hub) in their terminal.
+Follow the [prompt above](#let-your-coding-agent-set-it-up) to run a Hub on their computer. To
+join a Hub, run `npx agentscm@<version> --yes --json --hub-url URL` in their terminal.
 When it needs a sign-in it prints a link; show the link to the person and wait for them to finish.
 Then tell them to fully quit and reopen their agents, and, for Codex, to run `/hooks` and trust the
 AgentSCM hooks. Do not set up a Hub or sign in for them without being asked.
+
+## Versions and upgrades
+
+Choose a version from [Releases](https://github.com/agentscm/agentscm/releases); the header of this
+site shows the latest one. In the examples below, replace `<version>` with that version without its
+leading `v`. Container images are versioned; alpha releases do not publish a `latest` image tag.
+For reproducible installs, keep the selected version or image digest in your deployment
+configuration.
+
+These docs follow the `main` branch, so a command described here may not be in a published binary
+yet. Use the documentation at the matching release tag, or
+[build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
+
+Replacing the AgentSCM executable alone leaves installed plugins and agent configuration in place. A full quickstart refreshes the integrations it sets up. To refresh one agent on macOS or Linux, run `agentscm client setup --agent AGENT` in a connected checkout, using one of these names:
+
+- Claude Code (`claude`), Codex (`codex`), Cursor (`cursor`)
+- GitHub Copilot (`copilot`), Gemini CLI (`gemini`), Factory Droid (`droid`)
+- Qwen Code (`qwen`), Junie CLI (`junie`), Crush (`crush`)
+
+Fully quit and reopen the agent after setup and follow any host trust prompts. On macOS and Linux, the Claude Code startup hook can detect an older user-scope AgentSCM plugin in Claude Code's local registry and display the setup command as a warning.
+
+The installed `agentscm client mcp` proxy hosts a local hook relay with its own HTTPS pool,
+without another daemon or setup step. Restart agent MCP sessions after upgrading to regain
+pooling; see [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for matching rules and limits.
+
+On macOS, verified installer setup also manages a deterministic resident using the same native
+executable and launchd. It retries native reports, observes qualified exits and refreshes declared
+dependencies, without running a model, starting agents or serving a dashboard. Native hook waiters
+remain responsible for delivery. `agentscm client service stop` persists a stopped choice;
+`start` enables it explicitly, and `status` reports installed/running version differences and recovery.
+An npx version change alone does not replace an already running resident: rerun setup/quickstart
+for the handoff. Source/manual setup does not newly enable startup; use `client service start`
+explicitly on macOS or `client run` in a Unix foreground session. Linux managed startup is not
+implemented and Windows keeps next-call behavior. See [computer controls](connect-this-computer.md).
+
+The full quickstart agent setup runs on macOS and Linux. The Windows CLI is an alpha port and does
+not configure agent integrations. A managed Hub runs natively only on Apple Silicon macOS; other
+hosts need Docker or a Hub that already runs. See the [platform details](#platforms).
 
 ## Ways to get the program
 
@@ -196,7 +274,10 @@ with empty `.lock` files and a `connections.json` that lists no connections. The
 purpose: AgentSCM commands coordinate through them, and removing one while another command runs
 could let two commands change the same files at once. The folder can also keep `telemetry.json`
 (your telemetry choice and an installation id), `hook-notes/` markers, an empty `tokens/` folder
-and, after `agentscm open`, `front-door/` (run `agentscm open --stop` first). To remove everything,
+and, after an older `agentscm open`, `front-door/` (run `agentscm open --stop` first). Native
+release binaries no longer serve or start a local dashboard. Setup, authentication, sharing
+controls and recovery remain in the CLI; a separately hosted Hub/container can retain its UI.
+To remove everything,
 delete the folder when no AgentSCM command is running.
 
 Earlier versions on macOS had a menu bar app and could leave two things behind: a Start at Login
@@ -205,7 +286,7 @@ entry (`~/Library/LaunchAgents/com.counterbranch.agentscm.tray.plist`) and a lau
 removes both. So does `agentscm tray`, which opens nothing now and exists only for this cleanup on
 macOS, and the next setup run (`npx agentscm`) removes the launcher app.
 
-For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
+For an optional Slack app in your own workspace, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
 
 ## Coding agents in every project
 
@@ -229,6 +310,16 @@ does not stop to ask before each call.
 | Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
 | GitHub Copilot | `$COPILOT_HOME/hooks/agentscm-client.json` (`~/.copilot`) | `$COPILOT_HOME/mcp-config.json` | `$COPILOT_HOME/skills/coordinate-edits/` |
+| Factory Droid | `~/.factory/hooks.json` | `~/.factory/mcp.json` | `~/.factory/skills/coordinate-edits/` |
+| Qwen Code | `$QWEN_HOME/settings.json` (`~/.qwen`) | `$QWEN_HOME/settings.json` | `$QWEN_HOME/skills/coordinate-edits/` |
+| Junie CLI | `~/.junie/config.json` | `~/.junie/mcp/mcp.json` | `~/.junie/skills/coordinate-edits/` |
+| Crush | `crush.json` in `$CRUSH_GLOBAL_CONFIG`, else `$XDG_CONFIG_HOME/crush` (`~/.config/crush`) | the same `crush.json`, under `mcp` | `skills/coordinate-edits/` in that folder |
+
+Factory Droid, Qwen Code, Junie CLI and Crush are set up for all your projects only:
+`client setup --checkout-only` refuses them. Droid stops reading the hooks in
+`~/.factory/settings.json` once `~/.factory/hooks.json` exists, so setup refuses to create that
+file while `settings.json` has hooks; move them into `hooks.json` first. Junie CLI runs hooks
+only in its Early Access build. Crush also reads a `crushrc` file; setup writes only `crush.json`.
 
 In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
 that run `agentscm hook AGENT --client-connection`, and the block between
@@ -259,8 +350,10 @@ install afterwards has no AgentSCM hooks until you set it up. Two things find it
   ```
 
 An agent counts as installed when its program is on `PATH` (`claude`, `codex`, `cursor` or
-`cursor-agent`, `copilot`, `gemini`) or, for Cursor, GitHub Copilot and Gemini CLI, when its
-configuration directory exists (`~/.cursor`, `$COPILOT_HOME` or `~/.copilot`, `~/.gemini`). No
+`cursor-agent`, `copilot`, `gemini`, `droid`, `qwen`, `junie`, `crush`) or, for every agent but
+Claude Code and Codex, when its configuration directory exists (`~/.cursor`, `$COPILOT_HOME` or
+`~/.copilot`, `~/.gemini`, `~/.factory`, `$QWEN_HOME` or `~/.qwen`, `~/.junie`, the Crush folder
+above). No
 hook reports it at session start, so nothing tells you until you run one of those commands.
 
 For GitHub Copilot, the two user files above are the ones both Copilot CLI and VS Code's Copilot
@@ -292,7 +385,7 @@ The CLI platform and the managed hub runtime are separate. Quickstart defaults t
 
 The Windows binary (`x86_64-pc-windows-msvc`) is statically linked to the C runtime, so it needs no Visual C++ redistributable. Install it with `npx agentscm` in PowerShell, or download it by hand as described below.
 
-It supports the setup guide (`agentscm quickstart` and `agentscm uninstall`, without the collision check, which needs the Unix process runner, and without setting up coding agents, since `agentscm client setup` is Linux and macOS only), the command hook that Cursor and Copilot call (`agentscm hook`), `agentscm init-repo`, the hub client and the hub (`agentscm hub serve`, `hub login`, `hub token`), and `agentscm intent`. The native workspace and ledger, `agentscm collisions`, the Git snapshot, export and reconcile bridge, command checks (which need Docker), the team service and the recovery commands are Linux and macOS only.
+It supports the setup guide (`agentscm quickstart` and `agentscm uninstall`, without setting up coding agents, since `agentscm client setup` is Linux and macOS only), the command hook that Cursor and Copilot call (`agentscm hook`), `agentscm init-repo`, the hub client and the hub (`agentscm hub serve`, `hub login`, `hub token`), and `agentscm intent`. The native workspace and ledger, `agentscm collisions`, the Git snapshot, export and reconcile bridge, command checks (which need Docker), the team service and the recovery commands are Linux and macOS only.
 
 This is an alpha port. It is built and tested in CI on Windows, but few people have run it by hand. `agentscm uninstall` cannot delete the `agentscm.exe` that is running it; it says so and leaves that file for you to delete.
 
@@ -307,20 +400,8 @@ If you download a binary from the release page instead of using `npx agentscm` o
 
 ## Verify by hand
 
-The examples below apply to releases originally published by `agentscm/agentscm`.
-Historical releases keep the signer recorded when they were published, even if their download
-URLs redirect after the organization rename. For `0.1.0-alpha.8`, the binary's verification command is:
-
-```sh
-GH_HOST=github.com gh attestation verify agentscm-<target> --repo counterbranch/agentscm \
-  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.1.0-alpha.8 --deny-self-hosted-runners
-```
-
-Use the matching release's documentation or installer for other historical versions. Select its
-recorded identity before verifying; do not guess the signer from a redirect or retry another
-identity after failure. Historical attestation API lookup after rename requires operator
-qualification; a lookup failure is not permission to omit provenance.
+Download a release's files, check the checksum, and verify where the binary was built with
+`gh attestation verify`. Replace `<version>` with the release version without its leading `v`.
 
 On Linux and macOS:
 
@@ -351,6 +432,22 @@ gh attestation verify agentscm-x86_64-pc-windows-msvc.exe --repo agentscm/agents
 The signer-workflow, source-ref and deny-self-hosted-runners restrictions match the installers; the installers select GitHub.com for both authentication and verification. Without the signer and ref restrictions, an attestation from another workflow or branch could pass.
 
 `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. The Windows asset name ends in `.exe`.
+
+### Releases published before the organization rename
+
+Releases `0.1.0-alpha.1` through `0.1.0-alpha.8` were signed while the repository was
+`counterbranch/agentscm`; every release from `0.1.0-alpha.9` on is signed by `agentscm/agentscm`.
+The early attestations keep their original signer even though their download links now redirect,
+so verify one of them against `counterbranch/agentscm` with its own tag, for example:
+
+```sh
+GH_HOST=github.com gh attestation verify agentscm-<target> --repo counterbranch/agentscm \
+  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0-alpha.8 --deny-self-hosted-runners
+```
+
+Do not guess the signer from a redirect or retry with the other one after a failure, and do not
+skip the provenance check if the lookup fails.
 
 ## Publishing to npm (maintainers)
 

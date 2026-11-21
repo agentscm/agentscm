@@ -4,7 +4,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DeviceAuth } from '../../src/devices.ts'
 import type { ActionableStatus } from '../../src/actionableStatus.ts'
-import { RepositoriesPage } from '../../src/pages/Repositories.tsx'
+import { RepositoriesPage, workingNow } from '../../src/pages/Repositories.tsx'
 import type { WorkItem, WorkOverview } from '../../src/standup.ts'
 
 // Load shared evidence only at test runtime; the UI Docker build copies only ui/.
@@ -375,6 +375,40 @@ describe('All repositories', () => {
     expect(rail.textContent).toContain('Names show for the repository you have open. Open another to see who is in it.')
     const catchUp = within(rail).getByRole('link', { name: /Catch up on api/ })
     expect(catchUp.getAttribute('href')).toBe('#activity')
+  })
+
+  it('uses matching shared status for quiet Work and preserves blockers and named waits', async () => {
+    stubList({ repositories: [ROW('example-org/api', { agents: 1 })], unchecked: 0, complete: true })
+    const items = [
+      ITEM('active', { state: 'paused', claim_status: 'stale', generation: 2, updated_seq: 20 }),
+      ITEM('blocked', { state: 'paused', claim_status: 'stale', generation: 2, updated_seq: 20 }),
+      ITEM('wait', { state: 'handover', claim_status: 'stale', generation: 2, updated_seq: 20 }),
+      ITEM('mismatch', { generation: 3, updated_seq: 20 }),
+    ]
+    const value: ActionableStatus = { ...statusFixture, complete: false, work: items.map((i, n) => ({ ...statusFixture.work[0]!, work_id: i.id, generation: 2, updated_seq: 20, state: n === 1 ? 'blocked' : n === 2 ? 'awaiting_party' : 'active' })) }
+    const ready = { kind: 'ready' as const, value, fetchedAt: 0, refreshError: null, retry: () => {} }
+    const { rerender } = render(<RepositoriesPage auth={AUTH} current="example-org/api" overview={OVERVIEW(items)} status={ready} />)
+    const rail = await screen.findByRole('complementary', { name: 'Working now' })
+    const people = Array.from(rail.querySelectorAll('.rp-person'))
+    expect(people.map((p) => p.querySelector('small')?.textContent)).toEqual(['Task blocked', 'Task wait', 'Task active'])
+    expect(people.map((p) => p.querySelector('.rp-pt')?.textContent)).toEqual(['Blocked', 'Awaiting a named party', 'Active'])
+    expect(people[0]!.classList.contains('is-bad')).toBe(true)
+    expect(people[2]!.classList.contains('is-warn')).toBe(false)
+    expect(rail.textContent).toContain('Coverage is incomplete')
+    expect(rail.textContent).not.toContain('Task mismatch')
+    expect(rail.textContent).not.toContain('paused')
+    rerender(<RepositoriesPage auth={AUTH} current="example-org/api" overview={OVERVIEW(items)} status={{ kind: 'error', message: 'offline', retry: () => {} }} />)
+    expect(rail.querySelectorAll('.rp-person')).toHaveLength(0)
+    expect(rail.textContent).toContain('Shared status is unavailable')
+    expect(rail.textContent).not.toContain('Nobody')
+  })
+
+  it('keeps rail ordering deterministic and omits retired or unmatched Work', () => {
+    const items = [ITEM('b', { generation: 1, updated_seq: 1, last_checkin_at: 1 }), ITEM('a', { generation: 1, updated_seq: 1, last_checkin_at: 1 }), ITEM('retired', { generation: 1, updated_seq: 1 }), ITEM('missing')]
+    const value: ActionableStatus = { ...statusFixture, work: items.slice(0, 3).map((i) => ({ ...statusFixture.work[0]!, work_id: i.id, generation: 1, updated_seq: 1, state: i.id === 'retired' ? 'retired' : 'active' })) }
+    expect(workingNow(OVERVIEW(items), value).map((i) => i.id)).toEqual(['a', 'b'])
+    value.work[0]!.updated_seq = 2
+    expect(workingNow(OVERVIEW(items), value).map((i) => i.id)).toEqual(['a'])
   })
 
   it('says nobody is working yet when there is no open repository, or only stale work', async () => {

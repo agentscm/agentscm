@@ -786,7 +786,10 @@ async fn a_fast_forward_merge_is_recorded_from_the_published_head() {
     env.poll().await;
     let merged = env
         .store
-        .publication(REPO, &env.publication)
+        .publication(
+            &crate::repository_scope::connected(&*env.store, REPO),
+            &env.publication,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(merged.merge_commit.as_deref(), Some(env.commit.as_str()));
@@ -1041,7 +1044,10 @@ async fn a_publication_to_another_host_is_never_reconciled_against_a_same_number
     env.poll().await;
     assert_eq!(env.status_posts(), 1);
     assert!(env.statuses().iter().all(|(sha, _, _)| *sha == env.commit));
-    let foreign = env.store.pull_publications(REPO, 1, 1).unwrap();
+    let foreign = env
+        .store
+        .pull_publications(&crate::repository_scope::connected(&*env.store, REPO), 1, 1)
+        .unwrap();
     assert_eq!(
         foreign.len(),
         1,

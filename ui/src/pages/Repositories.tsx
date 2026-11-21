@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { statusForWork, statusLabel, type ActionableStatus } from '../actionableStatus.ts'
 import { AskAgent } from '../AskAgent.tsx'
 import { Combobox } from '../Combobox.tsx'
 import { agentSetupPrompt } from '../connectAgent.ts'
@@ -10,7 +11,7 @@ import { RefusalNotice } from '../Refusal.tsx'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import { SectionTabs, type WebChoice } from '../TopNav.tsx'
 import { Ago, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
-import { usePoll } from '../usePoll.ts'
+import { usePoll, type Poll } from '../usePoll.ts'
 import { ValueMetricsSection } from '../ValueMetrics.tsx'
 import type { Load } from './Computers.tsx'
 import { workTabHref } from './Work.tsx'
@@ -38,13 +39,14 @@ const joinNodes = (items: ReactNode[]): ReactNode[] =>
  * names who is working in the open repository, from the work overview already polled for it. Opening a repository asks
  * for its read token as the repository menu does, and goes to its Dashboard once the token is in; a refusal stays here.
  */
-export function RepositoriesPage({ auth, web, current, overview = null, token = '' }: { auth: Load<DeviceAuth | null>; web?: WebChoice; current: string | null; overview?: WorkOverview | null; token?: string }) {
+export function RepositoriesPage({ auth, web, current, overview = null, token = '', status }: { auth: Load<DeviceAuth | null>; web?: WebChoice; current: string | null; overview?: WorkOverview | null; token?: string; status?: Poll<ActionableStatus> }) {
   const session = auth.kind === 'ready' && auth.value?.kind === 'browser' ? auth.value.session : null
   // The list the web sign-in just fetched shows at once; the poll takes over once it is EVERY_MS old.
   const seed = session && web?.list ? { key: session.login, ...web.list } : null
   // The overview behind Working now polls every few seconds; when its working set changes, refresh the slow list at
   // once so the headline never contradicts that card for up to EVERY_MS.
-  const liveSet = `${current}:${workingNow(overview).map((i) => i.id).sort().join(',')}`
+  const shared = status === undefined ? undefined : status.kind === 'ready' ? status.value : null
+  const liveSet = `${current}:${workingNow(overview, shared).map((i) => `${i.id}:${statusForWork(i, shared)?.state ?? i.state}`).sort().join(',')}`
   const [seen, setSeen] = useState(liveSet)
   const [bump, setBump] = useState(0)
   if (seen !== liveSet) {
@@ -135,7 +137,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
             </div>
           ) : null}
         </div>
-        {showRail && <Rail current={current} overview={overview} rows={v!.rows} />}
+        {showRail && <Rail current={current} overview={overview} rows={v!.rows} status={status} />}
       </div>
     </div>
   )
@@ -388,20 +390,24 @@ function Done({ repo, overview, token }: { repo: string; overview: WorkOverview;
   )
 }
 
-const STATE_ORDER: Record<string, number> = { blocked: 0, handover: 1, paused: 2, active: 3 }
-/** Work that is live: not finished, and its lead still holds the claim or the claim is unknown. */
-export const workingNow = (ov: WorkOverview | null): WorkItem[] =>
-  (ov?.current ?? [])
-    .filter((i) => i.state !== 'finished' && i.claim_status !== 'stale')
-    .sort((a, b) => (STATE_ORDER[a.state] ?? 9) - (STATE_ORDER[b.state] ?? 9) || b.last_checkin_at - a.last_checkin_at)
+const STATE_ORDER: Record<string, number> = { blocked: 0, handover: 1, awaiting_party: 1, paused: 2, reassessment_needed: 2, active: 3 }
+/** Shared state includes quiet Work with an observed open PR; absent projection rows remain unknown. */
+export const workingNow = (ov: WorkOverview | null, shared?: ActionableStatus | null): WorkItem[] => {
+  const state = (i: WorkItem) => shared === undefined ? i.state : statusForWork(i, shared)?.state
+  return (ov?.current ?? [])
+    .filter((i) => shared === undefined ? i.state !== 'finished' && i.claim_status !== 'stale' : !!state(i) && state(i) !== 'retired')
+    .sort((a, b) => (STATE_ORDER[state(a) ?? ''] ?? 9) - (STATE_ORDER[state(b) ?? ''] ?? 9) || b.last_checkin_at - a.last_checkin_at || a.id.localeCompare(b.id))
+}
 
 const WORD: Record<string, { text: string; tone: 'bad' | 'warn' }> = { blocked: { text: 'blocked', tone: 'bad' }, handover: { text: 'handover', tone: 'warn' }, paused: { text: 'paused', tone: 'warn' } }
 const SHOWN = 6
 
 /** Who is working in the open repository, then the other repositories with an agent connected, then a way to its Catch up page. */
-function Rail({ current, overview, rows }: { current: string | null; overview: WorkOverview | null; rows: RepositoryRow[] }) {
+function Rail({ current, overview, rows, status }: { current: string | null; overview: WorkOverview | null; rows: RepositoryRow[]; status?: Poll<ActionableStatus> }) {
   const head = useId()
-  const items = current ? workingNow(overview) : []
+  const shared = status === undefined ? undefined : status.kind === 'ready' ? status.value : null
+  const items = current ? workingNow(overview, shared) : []
+  const unknown = current && shared ? (overview?.current ?? []).filter((i) => !statusForWork(i, shared)).length : 0
   const elsewhere = rows.filter((r) => r.agents > 0 && r.repository !== current)
   return (
     <aside className="rp-rail" aria-label="Working now">
@@ -411,13 +417,17 @@ function Rail({ current, overview, rows }: { current: string | null; overview: W
           <h2 id={head}>Working now in {current ? nameOf(current) : 'this repository'}</h2>
           {items.length > 0 && <span className="rp-live" aria-hidden="true" />}
         </div>
+        {status && status.kind !== 'ready' && <p className="rp-note">{status.kind === 'loading' ? 'Checking shared status…' : 'Shared status is unavailable.'}</p>}
+        {status?.kind === 'ready' && status.refreshError && <p className="rp-note">Showing the last shared status that loaded.</p>}
+        {shared && (!shared.complete || unknown > 0 || !overview?.current_complete) && <p className="rp-note">Coverage is incomplete; missing Work status remains unknown.</p>}
         {items.length > 0 ? (
           <>
             <ul className="rp-people" aria-labelledby={head}>
               {items.slice(0, SHOWN).map((i) => {
-                const w = WORD[i.state]
+                const projected = statusForWork(i, shared)
+                const w = shared === undefined ? WORD[i.state] : projected ? { text: statusLabel(projected.state), tone: projected.state === 'blocked' ? 'bad' : projected.state === 'active' ? '' : 'warn' } : undefined
                 return (
-                  <li key={i.id} className={`rp-person${w ? ` is-${w.tone}` : ''}`}>
+                  <li key={i.id} className={`rp-person${w?.tone ? ` is-${w.tone}` : ''}`}>
                     <span className="rp-av" aria-hidden="true" title={`${i.owner_login} with ${i.lead_agent}`}>{(i.owner_login[0] ?? '?').toUpperCase()}</span>
                     <b>{i.owner_login}</b>
                     <span className="rp-pt">{w ? w.text : <Ago at={i.last_checkin_at} />}</span>
@@ -429,7 +439,7 @@ function Rail({ current, overview, rows }: { current: string | null; overview: W
             {items.length > SHOWN && <p className="rp-note">and {items.length - SHOWN} more</p>}
           </>
         ) : (
-          <p className="rp-empty">Nobody yet. People and their agents appear here the moment they connect.</p>
+          <p className="rp-empty">{shared === undefined ? 'Nobody yet. People and their agents appear here the moment they connect.' : 'No current Work status to show.'}</p>
         )}
         {elsewhere.length > 0 && (
           <>

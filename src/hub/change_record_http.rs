@@ -133,6 +133,7 @@ async fn action_finish(
 #[serde(deny_unknown_fields)]
 struct CurrentTargetQuery {
     session_id: String,
+    work_id: Option<String>,
 }
 
 async fn current_target(
@@ -150,14 +151,18 @@ async fn current_target(
     let target = blocking(&state, move || {
         let now = unix_now();
         let session_id = store.session_name_for(&token, Some(&query.session_id), now)?;
-        Ok(store
-            .capture_work_for_session(&token, &session_id, now)?
-            .map(|item| CaptureTargetV1 {
-                version: 1,
-                work_id: item.id,
-                generation: item.generation,
-                session_id,
-            }))
+        let item = store.capture_work_for_session_at(
+            &token,
+            &session_id,
+            query.work_id.as_deref(),
+            now,
+        )?;
+        Ok(item.map(|item| CaptureTargetV1 {
+            version: 1,
+            work_id: item.id,
+            generation: item.generation,
+            session_id,
+        }))
     })
     .await?
     .ok_or_else(ApiError::not_found)?;
@@ -236,10 +241,11 @@ pub(super) async fn conversation_page(
     let token = principal.token_id.clone();
     let admin = state.login.is_admin_user(&principal.owner);
     let repository_id = principal.repository_id;
+    let host = principal.owner.identity.host.clone();
     let entries = blocking(state, move || {
         let audience = if admin {
             ConversationAudience::Everyone
-        } else if super::conversation_sharing::repository_shares(&*store, repository_id)? {
+        } else if super::conversation_sharing::repository_shares(&*store, &host, repository_id)? {
             ConversationAudience::Sharing
         } else {
             ConversationAudience::Own
@@ -300,6 +306,7 @@ pub(super) async fn conversation_body(
     let admin = state.login.is_admin_user(&principal.owner);
     let token = principal.token_id.clone();
     let repository_id = principal.repository_id;
+    let host = principal.owner.identity.host.clone();
     blocking(
         state,
         move || -> Result<Result<Vec<u8>, ApiError>, HubError> {
@@ -307,8 +314,8 @@ pub(super) async fn conversation_body(
             let Some(mut access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
                 return Ok(Err(ApiError::not_found()));
             };
-            let all =
-                admin || super::conversation_sharing::repository_shares(&*store, repository_id)?;
+            let all = admin
+                || super::conversation_sharing::repository_shares(&*store, &host, repository_id)?;
             if all && !admin {
                 // Opting out hides what the author shared before, as in the listing. A reader is
                 // then told what they are told for a digest nobody declared.
@@ -317,6 +324,7 @@ pub(super) async fn conversation_body(
                     if row.author == access.caller
                         || super::conversation_sharing::person_shares(
                             &*store,
+                            &host,
                             &row.author,
                             repository_id,
                         )?
@@ -507,7 +515,12 @@ async fn upload_body(
         // Off means off: nothing more is stored once the repository stops sharing, keeps no
         // bodies, or this person opts out, whatever the client still holds.
         if retention == 0
-            || !super::conversation_sharing::person_shares(&*store, &author, repository_id)?
+            || !super::conversation_sharing::person_shares(
+                &*store,
+                &repository.host,
+                &author,
+                repository_id,
+            )?
         {
             return Ok(Err(ApiError::new(StatusCode::FORBIDDEN, "sharing_off")));
         }
@@ -640,7 +653,12 @@ async fn missing_bodies(
         let digests = digests.clone();
         blocking(&state, move || {
             let shares = hub.shared_conversation_retention_days(&repository)? > 0
-                && super::conversation_sharing::person_shares(&*store, &author, repository_id)?;
+                && super::conversation_sharing::person_shares(
+                    &*store,
+                    &repository.host,
+                    &author,
+                    repository_id,
+                )?;
             Ok(store
                 .shared_bodies_own(&token, &work_id, &digests, unix_now())?
                 .map(|rows| (rows, shares)))

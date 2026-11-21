@@ -22,11 +22,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(unix)]
 mod explorer;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 mod front_door;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 mod intent_review;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 mod workflow_library;
 
 const MAX_CONCURRENCY: usize = 256;
@@ -48,7 +48,7 @@ struct AppState {
     #[cfg(unix)]
     explorer: Option<Arc<agentscm::repo_explorer::Explorer>>,
     /// Set by `--front-door`: every connected checkout, chosen per request.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "ui"))]
     front_door: Option<Arc<front_door::FrontDoor>>,
 }
 
@@ -105,7 +105,7 @@ pub struct ServeOptions {
     pub explorer_repo: Option<PathBuf>,
     pub explorer_repository: Option<String>,
     pub explorer_spool: Option<PathBuf>,
-    /// Serve the Hub page and every connected checkout on loopback (`agentscm open`).
+    /// Serve the legacy local dashboard on loopback in UI-enabled builds.
     pub front_door: bool,
 }
 
@@ -123,6 +123,12 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         explorer_spool,
         front_door,
     } = options;
+    #[cfg(not(feature = "ui"))]
+    if front_door {
+        return Err(Error::Invalid(
+            "this native build has no local dashboard; use client status for connections".into(),
+        ));
+    }
     if front_door
         && (public
             || collisions.is_some()
@@ -198,7 +204,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         None => None,
     };
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "ui"))]
     let door = front_door
         .then(front_door::FrontDoor::new)
         .transpose()?
@@ -211,10 +217,10 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         timeline,
         #[cfg(unix)]
         explorer,
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "ui"))]
         front_door: door.clone(),
     };
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "ui"))]
     if let Some(door) = door {
         return serve_front_door(state, door, bind).await;
     }
@@ -227,7 +233,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 
 /// Bind the front door (the requested port, else any free one), publish its discovery record,
 /// serve until stopped, then revoke the Hub tokens it minted.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 async fn serve_front_door(
     state: AppState,
     door: Arc<front_door::FrontDoor>,
@@ -1252,7 +1258,7 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "ui"))]
             front_door: None,
         };
         let permit = reserve_work(&state).unwrap();
@@ -1276,7 +1282,7 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "ui"))]
             front_door: None,
         };
         let permit = reserve_work(&state).unwrap();
@@ -1306,7 +1312,7 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "ui"))]
             front_door: None,
         };
         let (started_tx, started_rx) = mpsc::channel();

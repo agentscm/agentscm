@@ -219,6 +219,8 @@ async fn ack(
     Ok(Json(result))
 }
 
+pub(super) const REPLY_ROLE_DENIED: &str = "Only the current affected Work lead can reply. As requester, read the coordination inbox for the lead's response, then resolve or withdraw your request when appropriate.";
+
 async fn reply(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
@@ -230,7 +232,11 @@ async fn reply(
             .coordination_reply(&principal.token_id, &request, unix_now())
             .map(|result| shown(result, &principal.owner.id))
     })
-    .await?;
+    .await
+    .map_err(|error| match error {
+        HubError::Unauthorized => ApiError::forbidden().with_message(REPLY_ROLE_DENIED),
+        other => other.into(),
+    })?;
     CHANGED.notify_waiters();
     Ok(Json(result))
 }
@@ -327,6 +333,8 @@ struct PersonReply {
     expected_updated_seq: i64,
     kind: CoordinationResponseKind,
     note: Option<String>,
+    #[serde(default)]
+    release_paths: Vec<String>,
 }
 
 /// The web sign-in (`via: "hub"`) or a connected app's credential (the app's `via`).
@@ -351,6 +359,7 @@ async fn person_reply(
             expected_updated_seq: body.expected_updated_seq,
             kind: body.kind,
             note: body.note,
+            release_paths: body.release_paths,
             via,
         };
         store
@@ -422,6 +431,10 @@ struct PersonTransition {
     reason: String,
     #[serde(default)]
     superseded_by: Option<String>,
+    #[serde(default)]
+    participants: Vec<super::work_transition::ParticipantRef>,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 /// A signed-in person releases, retains or ends Work they own, or, as a Hub administrator,
@@ -456,6 +469,8 @@ async fn person_transition(
         transition: body.transition,
         reason: body.reason,
         superseded_by: body.superseded_by,
+        participants: body.participants,
+        paths: body.paths,
     };
     let store = state.store.clone();
     let mut result = blocking(&state, move || {
@@ -513,6 +528,9 @@ struct PersonRecovery {
     after: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Page every owner's Work; only a Hub administrator may.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 /// What a signed-in person can recover in one repository: their own Work, and anyone's as a
@@ -531,11 +549,13 @@ async fn person_recovery(
         after: body.after,
         limit: body.limit,
         session: None,
+        all_owners: body.all_owners,
     };
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            super::work_recovery::inspect(
+            let now = unix_now();
+            let mut recovery = super::work_recovery::inspect(
                 &*store,
                 &super::work_recovery::RecoveryCaller::Person {
                     user: &user,
@@ -544,8 +564,18 @@ async fn person_recovery(
                     is_admin,
                 },
                 &query,
-                unix_now(),
-            )
+                now,
+            )?;
+            super::merged_holds::annotate_findings(
+                &*store,
+                &super::merged_holds::FindingsReader::Person {
+                    user: &user,
+                    repository: &repository,
+                },
+                &mut recovery,
+                now,
+            );
+            Ok(recovery)
         })
         .await
         .map_err(person_error)?,
@@ -769,12 +799,17 @@ async fn person_handoffs(
     human: HumanSession,
     query: std::result::Result<Query<HandoffQuery>, QueryRejection>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let me = human.web_user()?.id.clone();
+    let user = human.web_user()?;
+    let me = user.id.clone();
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    super::store::validate_repository(&query.repository)?;
+    let repo =
+        super::login::devices::read_check(&state, user, &query.repository, "handoffs").await?;
+    let scope = repo.repository_scope();
     let store = state.store.clone();
     let owner = me.clone();
     let rows = blocking(&state, move || {
-        store.handoffs_of_owner(&owner, &query.repository, unix_now(), PERSON_HANDOFFS)
+        store.handoffs_of_owner(&owner, &scope, unix_now(), PERSON_HANDOFFS)
     })
     .await
     .map_err(person_error)?;

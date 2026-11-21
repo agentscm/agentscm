@@ -16,7 +16,7 @@ use reqwest::Method;
 
 use crate::hub_cli::{self, Provider, call, clean};
 
-mod binary;
+pub(crate) mod binary;
 pub(crate) mod detect;
 mod hub_local;
 mod hub_native;
@@ -25,7 +25,7 @@ mod hub_setup;
 mod launcher;
 #[cfg(target_os = "macos")]
 mod login_item;
-mod manifest;
+pub(crate) mod manifest;
 pub(crate) mod process;
 
 use crate::prompt::Ui;
@@ -179,7 +179,7 @@ To run it without one, pass --yes and choose with flags: --local (recommended) o
 --hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --init, --tray";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush (repeatable) or --no-agents, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -328,6 +328,17 @@ async fn wait_healthy(url: &str, limit: Duration) -> bool {
 
 // ---- the flow ----
 
+/// Outcome of this run's checkout setup step. A previous connection can survive a skipped step.
+#[cfg(unix)]
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckoutStatus {
+    #[default]
+    NotAttempted,
+    Connected,
+    Skipped,
+}
+
 /// What is true about live warnings when the run ends.
 #[derive(Default)]
 struct Live {
@@ -335,6 +346,8 @@ struct Live {
     hub_up: bool,
     /// The repository this checkout is connected to.
     repo: Option<String>,
+    #[cfg(unix)]
+    checkout_status: CheckoutStatus,
     /// Agents set up in this checkout.
     agents: Vec<String>,
     /// Agents set up for all projects, connected or not.
@@ -392,7 +405,10 @@ impl Live {
             ),
             (Some(_), None) if !self.wanted_agents => off(
                 "no coding agent was set up",
-                &format!("run `{cli} quickstart --agent claude|codex|cursor|copilot|gemini`"),
+                &format!(
+                    "run `{cli} quickstart --agent {}`",
+                    agentscm::clients::names_joined("|")
+                ),
             ),
             (Some(_), None) => off(
                 "this checkout isn't connected to the hub",
@@ -445,6 +461,10 @@ fn dry_run(args: &QuickstartArgs) -> Result<()> {
         "ask which hub to use, or skip live warnings".to_owned()
     };
     println!("  {hub}");
+    #[cfg(target_os = "macos")]
+    println!(
+        "  on an installer invocation or existing resident, hand off native maintenance to this version and preserve an explicit stopped choice"
+    );
     #[cfg(unix)]
     {
         let agents: Vec<&str> = if args.no_agents {
@@ -491,25 +511,21 @@ fn json_stdout() -> Result<std::fs::File> {
     }
 }
 
-fn requested_agents(args: &QuickstartArgs) -> Vec<String> {
-    #[cfg(unix)]
-    return args
+#[cfg(unix)]
+fn json_report(cx: &Cx<'_>) -> serde_json::Value {
+    let mut installed = Vec::new();
+    for agent in &cx.live.installed {
+        let name = agent.name();
+        if !installed.contains(&name) {
+            installed.push(name);
+        }
+    }
+    let skipped: Vec<_> = cx
+        .args
         .agent
         .iter()
-        .map(|agent| agent.name().to_owned())
-        .collect();
-    #[cfg(not(unix))]
-    return {
-        let _ = args;
-        Vec::new()
-    };
-}
-
-fn json_report(cx: &Cx<'_>) -> serde_json::Value {
-    let installed = &cx.live.agents;
-    let skipped: Vec<String> = requested_agents(cx.args)
-        .into_iter()
-        .filter(|agent| !installed.contains(agent))
+        .filter(|agent| !cx.live.installed.contains(agent))
+        .map(|agent| agent.name())
         .collect();
     let needs_user: Vec<&str> = [
         cx.live.pending_local.as_deref(),
@@ -521,9 +537,11 @@ fn json_report(cx: &Cx<'_>) -> serde_json::Value {
     .collect();
     serde_json::json!({
         "agents": { "installed": installed, "skipped": skipped, "needs_user": needs_user },
+        "checkout": { "status": cx.live.checkout_status },
         "hub": cx.live.hub,
         "hub_up": cx.live.hub_up,
         "signed_in": cx.live.hub.as_deref().is_some_and(|hub| hub_cli::has_session(Some(hub)).unwrap_or(false)),
+        "resident": crate::client_service::status().ok(),
     })
 }
 
@@ -546,9 +564,6 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
-    }
-    if args.tray && !cfg!(target_os = "macos") {
-        return Err(invalid("--tray is currently supported only on macOS"));
     }
     // Validate the complete private input before acquiring the lease or performing any install
     // write. Supplying this flag is the only way quickstart enables the optional Slack adapter.
@@ -604,6 +619,7 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         }
     }
     agents_stage(&mut cx).await;
+    let resident_changed = resident_stage(&mut cx).await;
     init_stage(&mut cx);
     // The menu bar app was removed: take away the launcher an earlier setup wrote.
     #[cfg(target_os = "macos")]
@@ -638,7 +654,8 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         || program_fingerprint(&cx.home) != original_program
         || sessions_file.as_deref().map(file_hash) != original_sessions
         || !cx.init_written.is_empty()
-        || launcher_removed;
+        || launcher_removed
+        || resident_changed;
     summary(&cx, changed, &command);
     println!("{}", cx.live.line(&command));
     #[cfg(unix)]
@@ -663,6 +680,41 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         ));
     }
     Ok(0)
+}
+
+async fn resident_stage(cx: &mut Cx<'_>) -> bool {
+    let result = async {
+        if !crate::client_service::auto_setup_requested()? {
+            println!("Native maintenance is not enabled by this source/manual setup; use `agentscm client service start` on macOS or `agentscm client run` in a Unix foreground session. Hooks and MCP retain their normal next-call behavior.");
+            return Ok(false);
+        }
+        let (_, exe) = program_plan(&cx.home).ok_or_else(|| invalid("could not identify the resident executable"))?;
+        if cfg!(target_os = "macos") {
+            let bin_dir = binary::bin_dir(&cx.home);
+            cx.manifest.bin_parent_created |= bin_dir.parent().is_some_and(|parent| !parent.exists());
+            cx.manifest.bin_dir = Some(bin_dir);
+        }
+        // Retain the binary recovery record before starting a process that depends on it.
+        if !cx.manifest.is_empty() { cx.manifest.save()?; }
+        println!("Native maintenance retries reports, observes qualified host exits and refreshes declared dependencies. It runs no model, starts no coding agent and serves no dashboard.");
+        let outcome = crate::client_service::setup(&exe).await?;
+        if outcome.managed_startup_supported {
+            println!("Native maintenance: {}. Control it with `agentscm client service start|stop|status`.", if outcome.running { "running" } else { "kept stopped by your saved choice" });
+        } else {
+            println!("Managed native maintenance is not qualified on this platform. Unix users can explicitly run `agentscm client run`; hooks and MCP retain next-call behavior.");
+        }
+        Ok::<bool, Error>(outcome.changed)
+    }.await;
+    match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            println!(
+                "Native maintenance setup did not finish: {error}. Program and recovery state were retained; run `agentscm client service status` before retrying setup."
+            );
+            cx.failure = Some(format!("native maintenance setup did not finish: {error}"));
+            false
+        }
+    }
 }
 
 fn record_fingerprint(path: &Path) -> (Option<String>, Option<u32>) {
@@ -962,7 +1014,12 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 .into(),
         );
     }
-    let repo = cx.found.remote.as_ref().map(|r| r.repo.clone());
+    let repo = cx
+        .found
+        .remote
+        .as_ref()
+        .filter(|remote| remote.forge == Forge::Github)
+        .map(|remote| remote.repo.as_str());
     let started = match runtime {
         HubRuntime::Docker => {
             if !cx.found.docker {
@@ -981,7 +1038,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.github_login.as_deref(),
                 cx.tty,
                 &cx.home,
-                repo.as_deref(),
+                repo,
                 &mut cx.manifest,
                 &hub_local::Options {
                     runtime,
@@ -1029,7 +1086,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.github_login.as_deref(),
                 cx.tty,
                 &cx.home,
-                repo.as_deref(),
+                repo,
                 &mut cx.manifest,
                 &hub_native::Options {
                     executable: stable,
@@ -1300,6 +1357,9 @@ async fn connect_checkout(
     if let Err(error) = result {
         println!("This checkout isn't connected yet: {}.", short(&error));
         cx.live.agents.clear();
+        cx.live.checkout_status = CheckoutStatus::Skipped;
+    } else {
+        cx.live.checkout_status = CheckoutStatus::Connected;
     }
 }
 
@@ -1366,7 +1426,7 @@ pub struct RetiredTrayArgs {
 pub fn retired_tray() -> Result<()> {
     println!("The AgentSCM menu bar app has been removed.");
     #[cfg(unix)]
-    println!("Open the Hub page with `agentscm open`.");
+    println!("Check this computer with `agentscm client status` or `agentscm client doctor`.");
     #[cfg(target_os = "macos")]
     {
         let _lifecycle = crate::client_cli::lifecycle_lock()?;
@@ -1426,21 +1486,33 @@ fn summary(cx: &Cx<'_>, changed: bool, command: &str) {
 pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     let ui = Ui { yes: args.yes };
     let _quickstart_lease = manifest::acquire_lease()?;
-    let Some(mut m) = Manifest::load()? else {
+    let saved_manifest = Manifest::load()?;
+    let resident_present = crate::client_service::has_receipt()?;
+    if saved_manifest.is_none() && !resident_present {
         println!("Nothing to undo: nothing was installed by quickstart.");
         return Ok(());
-    };
+    }
+    let mut m = saved_manifest.unwrap_or_else(Manifest::fresh);
     if !args.yes && !std::io::stdin().is_terminal() {
         return Err(invalid(
             "agentscm uninstall asks before it removes anything, and there is no terminal here. Pass --yes (and --remove-hub-data to delete the local hub's data).",
         ));
     }
     let home = home_dir()?;
+    if resident_present && m.bin_dir.is_none() {
+        // A direct service start also retains its executable in this fixed installer directory.
+        m.bin_dir = Some(binary::bin_dir(&home));
+    }
     let programs = m
         .bin_dir
         .as_ref()
         .map(|d| (d.clone(), binary::installed(d)));
     println!("Will undo what quickstart did:");
+    if resident_present {
+        println!(
+            "  - stop the native maintenance resident and remove its owned startup entry; keep its stopped preference and pending evidence"
+        );
+    }
     for root in &m.clients {
         println!(
             "  - disconnect {} with `client remove`: take out its agents' hooks, MCP entries and skills, and delete and revoke the agent token setup created",
@@ -1474,7 +1546,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         );
         #[cfg(target_os = "macos")]
-        println!("  - remove the owned AgentSCM tray login setting when removing its program");
+        println!(
+            "  - remove the Start at Login entry an earlier version's menu bar app left, if there is one"
+        );
     }
     if let Some(l) = &m.local_hub {
         println!(
@@ -1509,6 +1583,10 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         println!("Nothing changed.");
         return Ok(());
     }
+    // Verify legacy cleanup before changing the resident or retiring credentials/programs.
+    #[cfg(unix)]
+    crate::open_cli::stop().await?;
+    crate::client_service::uninstall().await?;
     // What could not be undone stays in the record, with the command to finish by hand.
     let mut left = Manifest {
         created_at: m.created_at,
@@ -1677,7 +1755,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             println!("Removed the program files in {}.", shown(&dir, &home));
             #[cfg(target_os = "macos")]
             println!(
-                "Tray login is disabled. If its menu is still open, choose Quit AgentSCM Tray."
+                "If an earlier version's AgentSCM menu bar icon is still showing, choose Quit AgentSCM Tray from it."
             );
         }
     }
@@ -1830,10 +1908,11 @@ mod tests {
             "--no-agents",
             "--slack-config-file",
             "--init",
-            "--tray",
         ] {
             assert!(NEEDS_TERMINAL.contains(flag), "{flag}");
         }
+        let agents = format!("--agent {} ", agentscm::clients::names_joined("|"));
+        assert!(NEEDS_TERMINAL.contains(&agents), "{agents}");
     }
 
     #[test]
@@ -1926,7 +2005,7 @@ mod tests {
         live.hub_up = true;
         assert!(
             live.line("agentscm")
-                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini`)")
+                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini|droid|qwen|junie|crush`)")
         );
         live.wanted_agents = true;
         assert!(

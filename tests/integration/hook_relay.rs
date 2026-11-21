@@ -433,8 +433,8 @@ async fn a_second_host_takes_over_when_the_owners_stdio_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_then_dead_is_not_resent_and_wedged_calls_keep_the_hook_deadlines() {
     for (event, kill, budget) in [
-        ("PreToolUse", true, Duration::from_secs(3)),
-        ("PreToolUse", false, Duration::from_secs(3)),
+        ("PreToolUse", true, Duration::from_millis(2500)),
+        ("PreToolUse", false, Duration::from_millis(2500)),
         ("SessionStart", false, Duration::from_millis(4500)),
     ] {
         let fixture = Fixture::new().await;
@@ -550,8 +550,14 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_relay_pool() {
             .partition(|s| s.uri == "/v1/hub/hook/claude?repo=acme%2Fwidgets");
         assert_eq!(hooks.len(), 1);
         assert!(
-            rest.iter()
-                .all(|s| s.uri == "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"),
+            rest.iter().all(|s| matches!(
+                s.uri.as_str(),
+                "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"
+                    | "/v1/hub/whoami"
+                    | "/v1/hub/cooperation/state"
+                    | "/v1/hub/cooperation/register"
+                    | "/v1/hub/cooperation/end"
+            )),
             "{:?}",
             rest.iter().map(|s| &s.uri).collect::<Vec<_>>()
         );

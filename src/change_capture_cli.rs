@@ -3,14 +3,14 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentscm::change_capture::claude_code::{self, CaptureRequest};
 use agentscm::change_capture::{
     CaptureError, ConfiguredRecipeReconcileRequest, ConfiguredRecipeRunRequest, DeferredReasonV1,
     GitSourceRequest, LocalSpool, ObservedCommandRequest, ObservedStop, RecipeReconcileOutcome,
-    codex, export_spool_archive, inspect_spool, reconcile_retained_configured_recipe,
+    codex, export_spool_archive, inspect_spool, native_hooks, reconcile_retained_configured_recipe,
     run_configured_recipe_with_cancellation, run_observed_command,
 };
 use agentscm::change_record::{
@@ -57,6 +57,9 @@ pub enum ChangeCaptureCommand {
     ReconcileRecipe(ReconcileRecipeArgs),
     /// Consume one Claude Code native hook payload from stdin without blocking the host session.
     HookClaude,
+    /// Drain retained capture in a bounded process independent of the native hook.
+    #[command(hide = true)]
+    DeliverWorker(DeliverWorkerArgs),
     /// Import the visible portion of one explicitly selected Claude Code session log.
     ImportClaude(ImportArgs),
     /// Import the visible portion and token usage of one explicitly selected Codex session file.
@@ -124,6 +127,15 @@ pub struct StatusArgs {
     /// Canonical Git checkout with a retained capture binding.
     #[arg(long, default_value = ".")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct DeliverWorkerArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Remaining terminal attempts in this traversal; only fresh native wakes replenish it.
+    #[arg(long)]
+    remaining_attempts: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -295,7 +307,8 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::Export(args) => export(args),
         ChangeCaptureCommand::RunRecipe(args) => run_recipe(args).await,
         ChangeCaptureCommand::ReconcileRecipe(args) => reconcile_recipe(args).await,
-        ChangeCaptureCommand::HookClaude => hook_claude().await,
+        ChangeCaptureCommand::HookClaude => legacy_capture_hook().await,
+        ChangeCaptureCommand::DeliverWorker(args) => deliver_worker_command(args).await,
         ChangeCaptureCommand::ImportClaude(args) => import(args, AgentHarnessV1::ClaudeCode),
         ChangeCaptureCommand::ImportCodex(args) => import(args, AgentHarnessV1::Codex),
         ChangeCaptureCommand::Observe(args) => observe(args),
@@ -335,6 +348,256 @@ async fn conversation(args: ConversationArgs) -> Result<i32> {
     Ok(0)
 }
 
+async fn legacy_capture_hook() -> ! {
+    let capture = tokio::task::spawn_blocking(|| -> Result<i32> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(hook_claude())
+    });
+    let code = match tokio::time::timeout(Duration::from_millis(18_500), capture).await {
+        Ok(Ok(Ok(code))) => code,
+        _ => {
+            eprintln!("AgentSCM local capture warning: the native hook could not finish in time");
+            0
+        }
+    };
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // Runtime shutdown otherwise waits for a capture task blocked on a spool lock.
+    std::process::exit(code)
+}
+
+const DELIVERY_WORKER_BUDGET: Duration = Duration::from_secs(20);
+const DELIVERY_WORKER_LIFE: Duration = Duration::from_secs(30);
+
+async fn deliver_worker_command(args: DeliverWorkerArgs) -> Result<i32> {
+    let started = tokio::time::Instant::now();
+    let (done, stopped) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("capture-delivery-deadline".into())
+        .spawn(move || {
+            if matches!(
+                stopped.recv_timeout(DELIVERY_WORKER_LIFE.saturating_sub(started.elapsed())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                // Only this disposable worker exits; durable spool writes recover normally.
+                std::process::exit(0);
+            }
+        })?;
+    let result = delivery_worker(
+        &args.root,
+        args.remaining_attempts,
+        started + DELIVERY_WORKER_BUDGET,
+    )
+    .await;
+    let _ = done.send(());
+    result.map(|()| 0)
+}
+
+fn delivery_worker_paths(root: &Path) -> Result<(PathBuf, PathBuf)> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let directory = crate::hub_cli::config_dir()?.join("agentscm/capture-delivery");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Invalid(
+            "capture delivery directory is not private".into(),
+        ));
+    }
+    let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    Ok((
+        directory.join(format!("{key}.lock")),
+        directory.join(format!("{key}.requested")),
+    ))
+}
+
+fn delivery_worker_lock(path: &Path) -> Result<Option<File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Invalid(
+            "capture delivery lock is not private".into(),
+        ));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn launch_delivery_worker(
+    root: &Path,
+    lock: &Path,
+    remaining_attempts: Option<usize>,
+) -> Result<()> {
+    let Some(probe) = delivery_worker_lock(lock)? else {
+        return Ok(());
+    };
+    drop(probe);
+    let mut worker = std::process::Command::new(std::env::current_exe()?);
+    worker
+        .args([
+            "--no-telemetry",
+            "change-capture",
+            "deliver-worker",
+            "--root",
+        ])
+        .arg(root);
+    if let Some(remaining) = remaining_attempts {
+        worker
+            .arg("--remaining-attempts")
+            .arg(remaining.to_string());
+    }
+    worker
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    spawn_delivery_worker(worker)?;
+    Ok(())
+}
+
+fn spawn_delivery_worker(mut worker: std::process::Command) -> Result<u32> {
+    let (started, result) = std::sync::mpsc::sync_channel(1);
+    // Start the waiter first: failing to create it must not leave an unwatched child.
+    std::thread::Builder::new()
+        .name("capture-delivery-reaper".into())
+        .spawn(move || match worker.spawn() {
+            Ok(mut child) => {
+                let _ = started.send(Ok(child.id()));
+                // The worker's existing lifetime budget also bounds this waiter.
+                let _ = child.wait();
+            }
+            Err(error) => {
+                let _ = started.send(Err(error));
+            }
+        })?;
+    Ok(result
+        .recv()
+        .map_err(|_| Error::Invalid("capture delivery worker did not start".into()))??)
+}
+
+fn schedule_delivery(root: &Path) -> Result<()> {
+    let (lock, requested) = delivery_worker_paths(root)?;
+    // Atomic replacement cannot lose a wake to a worker unlinking its previous marker.
+    crate::hub_cli::write_private(&requested, "")?;
+    launch_delivery_worker(root, &lock, None)
+}
+
+async fn delivery_worker(
+    root: &Path,
+    remaining_attempts: Option<usize>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let root = crate::client_config::canonical_root(root)?;
+    let (lock_path, requested) = delivery_worker_paths(&root)?;
+    let Some(lock) = delivery_worker_lock(&lock_path)? else {
+        return Ok(());
+    };
+    let result = drain_delivery(&root, &requested, deadline, remaining_attempts).await;
+    drop(lock);
+    // A hook that saw the lock held left this marker instead of spawning another process.
+    let next = if requested.try_exists()? {
+        launch_delivery_worker(&root, &lock_path, None)
+    } else if let Ok(Some(remaining)) = &result {
+        // Continuation is not a fresh wake: carry its decreasing allowance to the successor.
+        launch_delivery_worker(&root, &lock_path, Some(*remaining))
+    } else {
+        Ok(())
+    };
+    let _ = result?;
+    next
+}
+
+async fn drain_delivery(
+    root: &Path,
+    requested: &Path,
+    deadline: tokio::time::Instant,
+    remaining_attempts: Option<usize>,
+) -> Result<Option<usize>> {
+    let mut advanced = false;
+    let mut attempted = std::collections::BTreeSet::new();
+    // Consume only the wake that started this traversal. A hook arriving while it runs must
+    // leave a fresh wake even when the cursor subsequently wraps through older refusals.
+    let fresh = match fs::remove_file(requested) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let allowance = if fresh { None } else { remaining_attempts };
+    let mut remaining = None;
+    loop {
+        // Re-read the binding, origin and token before every pass; hooks grant no upload authority.
+        let Some((binding, spool, connection)) =
+            change_capture_client::binding_for_payload(&json!({"cwd": root}))?
+        else {
+            return Ok(None);
+        };
+        let remaining = match &mut remaining {
+            Some(remaining) => remaining,
+            empty @ None => {
+                let usage = spool.usage().map_err(capture_error)?;
+                empty.insert(
+                    allowance
+                        .unwrap_or(usage.records)
+                        .min(usage.limits.max_records),
+                )
+            }
+        };
+        if *remaining == 0 {
+            return Ok(None);
+        }
+        // The shared delivery cursor advances past refusals. Traverse until it wraps, so a
+        // blocked page cannot hide healthy later records or make this worker retry forever.
+        // The final fixed-size page may include an already attempted tail after wrapping.
+        let page = spool.delivery_page(10).map_err(capture_error)?;
+        let Some(first) = page.first() else {
+            return Ok(None);
+        };
+        if attempted.contains(&delivery_identity(first)) {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(advanced.then_some(*remaining));
+        }
+        let hub = change_capture_client::CaptureHub::new(connection)?;
+        // Delivery already bounds a pass to five seconds. Stop between passes so its terminal
+        // attempt count is known; the separate watchdog still bounds a stuck process.
+        let report =
+            change_capture_client::deliver_pending_with(&binding.root, &spool, &hub).await?;
+        let completed = report.delivered + report.blocked;
+        if completed == 0 {
+            return Ok(None);
+        }
+        advanced = true;
+        *remaining = remaining.saturating_sub(completed);
+        attempted.extend(page.iter().take(completed).map(delivery_identity));
+    }
+}
+
+fn delivery_identity(envelope: &CaptureEnvelopeV1) -> (&'static str, String) {
+    let (kind, identity) = match envelope {
+        CaptureEnvelopeV1::EventBatch(value) => ("event", &value.operation_id),
+        CaptureEnvelopeV1::ActionStart(value) => ("start", &value.operation_id),
+        CaptureEnvelopeV1::ActionFinish(value) => ("finish", &value.operation_id),
+        CaptureEnvelopeV1::Usage(value) => ("usage", &value.observation_id),
+    };
+    (kind, identity.clone())
+}
+
 async fn hook_claude() -> Result<i32> {
     const MAX_HOOK_BYTES: u64 = 1024 * 1024;
     let mut input = Vec::new();
@@ -354,6 +617,12 @@ async fn hook_claude() -> Result<i32> {
             return Ok(0);
         }
     };
+    if crate::client_session::hook_agent("claude", &payload).await != Some("claude") {
+        eprintln!(
+            "AgentSCM local capture skipped: inherited hook belongs to another or unknown host"
+        );
+        return Ok(0);
+    }
     let (binding, spool, connection) = match change_capture_client::binding_for_payload(&payload) {
         Ok(Some(bound)) => bound,
         Ok(None) => return Ok(0),
@@ -374,7 +643,7 @@ async fn hook_claude() -> Result<i32> {
         &binding,
         &spool,
         hub.as_ref(),
-        None,
+        NativeCapture::default(),
     )
     .await
     {
@@ -383,15 +652,294 @@ async fn hook_claude() -> Result<i32> {
     Ok(0)
 }
 
+fn codex_history_root() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|home| home.join("sessions"))
+}
+
+fn history_root(harness: AgentHarnessV1, checkout: &std::path::Path) -> Option<PathBuf> {
+    match harness {
+        AgentHarnessV1::Codex => codex_history_root(),
+        AgentHarnessV1::ClaudeCode => crate::client_plugin::claude_config_dir(checkout)
+            .ok()
+            .map(|root| root.join("projects")),
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => None,
+    }
+}
+
+fn find_history(root: &std::path::Path, session: &str, harness: AgentHarnessV1) -> Option<PathBuf> {
+    match harness {
+        AgentHarnessV1::Codex => codex::find_rollout(root, session).ok().flatten(),
+        AgentHarnessV1::ClaudeCode => claude_code::find_transcript(root, session).ok().flatten(),
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => None,
+    }
+}
+
+fn contained_history(path: &std::path::Path, root: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        && root
+            .canonicalize()
+            .ok()
+            .zip(path.canonicalize().ok())
+            .is_some_and(|(root, path)| path.starts_with(root))
+}
+
+/// A caller-supplied session is only a candidate; its own native tool receipt proves the start.
+/// Callers select a non-symlink source under the harness's configured history root first.
+async fn native_start_proven(
+    config: &std::path::Path,
+    association: &crate::client_session::CaptureAssociation,
+    path: &std::path::Path,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if !matches!(
+        association.harness,
+        AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex
+    ) {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+    let scope = format!("{:?}\0{}", association.harness, association.session);
+    let proofs = config.join("agentscm").join("native-start-proofs");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    if builder.create(&proofs).is_err()
+        || !fs::symlink_metadata(&proofs)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    let directory = proofs.join(format!("{:x}", Sha256::digest(scope.as_bytes())));
+    let Ok(spool) = LocalSpool::open(directory) else {
+        return false;
+    };
+    let request = CaptureRequest {
+        operation_prefix: "native-start-proof".into(),
+        work_id: association.work_id.clone(),
+        generation: association.generation,
+        observed_session_id: association.session.clone(),
+        canonical_session_id: association.session.clone(),
+        parent_session_id: None,
+        capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
+        harness: association.harness,
+    };
+    loop {
+        let read = tokio::task::spawn_blocking({
+            let (path, request, repo, spool) = (
+                path.to_path_buf(),
+                request.clone(),
+                association.repo.clone(),
+                spool.clone(),
+            );
+            move || match request.harness {
+                AgentHarnessV1::Codex => {
+                    codex::verify_history_start(&path, &request, &repo, &spool)
+                }
+                AgentHarnessV1::ClaudeCode => {
+                    claude_code::verify_history_start(&path, &request, &repo, &spool)
+                }
+                AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => {
+                    Err(CaptureError::Invalid(
+                        "this harness has no native history reader".into(),
+                    ))
+                }
+            }
+        });
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(Ok(Ok(report))) if report.authorized => {
+                if !association.native_start_verified {
+                    let mut verified = association.clone();
+                    verified.native_start_verified = true;
+                    if crate::client_session::record_capture(config, &verified).is_err() {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            Ok(Ok(Ok(report)))
+                if !report.complete
+                    && report.records > 0
+                    && tokio::time::Instant::now() < deadline => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The MCP lifetime observes visible history even when the host emits no tool hook.
+pub(crate) async fn watch_session(config: PathBuf, session: String) {
+    let mut source = None;
+    let mut questions = None;
+    let mut warned = false;
+    let mut observed = None;
+    let mut retry_at = tokio::time::Instant::now();
+    loop {
+        let associations = crate::client_session::capture_associations(&config, &session);
+        let Some(first) = associations.first() else {
+            return;
+        };
+        let harness = first.harness;
+        let Some(root) = history_root(harness, &first.checkout) else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        if source.is_none() && now >= retry_at {
+            let native = session.clone();
+            source = tokio::task::spawn_blocking(move || find_history(&root, &native, harness))
+                .await
+                .ok()
+                .flatten();
+        }
+        let stamp = source
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+        let state = (stamp, associations.clone());
+        // Unchanged history still retries delivery and permission changes, without polling every Hub each tick.
+        if now >= retry_at || observed.as_ref() != Some(&state) {
+            observed = Some(state);
+            retry_at = now + Duration::from_secs(30);
+            if let Ok(connections) = crate::client_config::load() {
+                let mut proven = Vec::new();
+                for association in associations
+                    .iter()
+                    .filter(|association| association.harness == harness)
+                {
+                    let verified = match &source {
+                        Some(path) => {
+                            native_start_proven(
+                                &config,
+                                association,
+                                path,
+                                tokio::time::Instant::now() + Duration::from_secs(2),
+                            )
+                            .await
+                        }
+                        None => false,
+                    };
+                    if verified || association.native_start_verified {
+                        proven.push((association, verified));
+                    }
+                }
+                let question_report = if harness == AgentHarnessV1::Codex
+                    && proven.iter().any(|(_, verified)| *verified)
+                {
+                    if let Some(path) = source.clone() {
+                        let (native, mut cursor) = (session.clone(), questions.take());
+                        let (report, cursor) = tokio::task::spawn_blocking(move || {
+                            let started = std::time::Instant::now();
+                            let report = loop {
+                                let report =
+                                    codex::poll_questions(&path, &native, &mut cursor).ok();
+                                if report
+                                    .as_ref()
+                                    .is_none_or(|report| report.complete || report.records == 0)
+                                    || started.elapsed() >= Duration::from_secs(2)
+                                {
+                                    break report;
+                                }
+                            };
+                            (report, cursor)
+                        })
+                        .await
+                        .unwrap_or((None, None));
+                        questions = cursor;
+                        if report.as_ref().is_some_and(|report| !report.complete) {
+                            retry_at = now;
+                        }
+                        report
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut sent_questions = std::collections::HashSet::new();
+                for (association, source_verified) in proven {
+                    let Some((connection, _)) = crate::client_config::connection_for_checkout(
+                        &connections,
+                        &association.checkout,
+                    )
+                    .filter(|(connection, _)| {
+                        connection.hub == association.hub
+                            && connection.repo.eq_ignore_ascii_case(&association.repo)
+                            && crate::client_config::is_current_in(
+                                connection,
+                                &association.checkout,
+                            )
+                    }) else {
+                        continue;
+                    };
+                    if harness == AgentHarnessV1::Codex
+                        && sent_questions.insert((connection.hub.clone(), connection.repo.clone()))
+                        && crate::hook_cli::forward_questions(
+                            connection,
+                            &session,
+                            question_report
+                                .as_ref()
+                                .filter(|report| {
+                                    source_verified && report.complete && report.reliable
+                                })
+                                .map(|report| &report.snapshot),
+                        )
+                        .await
+                        .is_err()
+                        && !warned
+                    {
+                        eprintln!(
+                            "AgentSCM: pending native questions could not be delivered; retrying"
+                        );
+                        warned = true;
+                    }
+                    if !source_verified {
+                        continue;
+                    }
+                    let payload = json!({"hook_event_name":"NativeHistory", "session_id": session,
+                        "transcript_path":source});
+                    let input = payload.to_string().into_bytes();
+                    plugin_capture_for_work(
+                        harness,
+                        &input,
+                        &payload,
+                        association.checkout.clone(),
+                        connection.clone(),
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        Some(association),
+                    )
+                    .await;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// The harness whose hook events capture records for the hook client's `agent`, when `payload`
 /// is one of them.
-pub(crate) fn captured_harness(agent: &str, payload: &Value) -> Option<AgentHarnessV1> {
-    let event = payload.get("hook_event_name").and_then(Value::as_str)?;
+pub(crate) fn captured_harness(
+    agent: &str,
+    payload: &Value,
+    event_hint: Option<&str>,
+) -> Option<AgentHarnessV1> {
+    let event = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     match agent {
         "claude" if change_capture_client::is_claude_capture_event(event) => {
             Some(AgentHarnessV1::ClaudeCode)
         }
         "codex" if codex::HOOK_EVENTS.contains(&event) => Some(AgentHarnessV1::Codex),
+        "cursor" | "copilot" | "gemini" => native_hooks::normalize(agent, payload, event_hint)
+            .ok()
+            .flatten()
+            .filter(|hook| !hook.events.is_empty())
+            .map(|hook| hook.harness),
         _ => None,
     }
 }
@@ -404,15 +952,69 @@ pub(crate) async fn plugin_capture(
     harness: AgentHarnessV1,
     input: &[u8],
     payload: &Value,
-    checkout: std::path::PathBuf,
+    checkout: PathBuf,
     connection: crate::client_config::Connection,
     deadline: tokio::time::Instant,
+) -> (
+    Option<String>,
+    Option<agentscm::change_record::CaptureTargetV1>,
+) {
+    let mut target = None;
+    let context = plugin_capture_inner(
+        harness,
+        input,
+        payload,
+        checkout,
+        connection,
+        NativeCapture {
+            deadline: Some(deadline),
+            association: None,
+            resolved_target: Some(&mut target),
+        },
+    )
+    .await;
+    (context, target)
+}
+
+pub(crate) async fn plugin_capture_for_work(
+    harness: AgentHarnessV1,
+    input: &[u8],
+    payload: &Value,
+    checkout: PathBuf,
+    connection: crate::client_config::Connection,
+    deadline: tokio::time::Instant,
+    association: Option<&crate::client_session::CaptureAssociation>,
 ) -> Option<String> {
+    plugin_capture_inner(
+        harness,
+        input,
+        payload,
+        checkout,
+        connection,
+        NativeCapture {
+            deadline: Some(deadline),
+            association,
+            resolved_target: None,
+        },
+    )
+    .await
+}
+
+async fn plugin_capture_inner(
+    harness: AgentHarnessV1,
+    input: &[u8],
+    payload: &Value,
+    checkout: PathBuf,
+    connection: crate::client_config::Connection,
+    options: NativeCapture<'_>,
+) -> Option<String> {
+    let deadline = options.deadline?;
+    let association = options.association;
     let hub = change_capture_client::CaptureHub::new(connection.clone()).ok()?;
     let session_start =
         payload.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart");
     // Only a session start creates a binding, so a session keeps the mode it started under.
-    let answer = if session_start {
+    let answer = if session_start || association.is_some() {
         tokio::time::timeout_at(deadline, change_capture_client::hub_sharing(&hub))
             .await
             .unwrap_or(SharingAnswer::NoAnswer)
@@ -420,13 +1022,14 @@ pub(crate) async fn plugin_capture(
         SharingAnswer::NoAnswer
     };
     let create = answer.sharing().is_some_and(|answer| answer.sharing);
+    let explicit = association.is_some();
     let found = tokio::task::spawn_blocking({
         let (checkout, connection) = (checkout.clone(), connection.clone());
         move || {
             let followed = change_capture_client::followed_binding(&checkout, &connection, create);
-            // A binding with hooks of its own has them for Claude Code only, so this hook is the
-            // one that captures Codex for it.
-            if harness == AgentHarnessV1::Codex && matches!(followed, Ok(None)) {
+            // A binding with hooks of its own has them for Claude Code only. The other native
+            // clients use their installed plugin hook while retaining the binding's mode.
+            if (harness != AgentHarnessV1::ClaudeCode || explicit) && matches!(followed, Ok(None)) {
                 let own = change_capture_client::binding_for_payload(&json!({"cwd": checkout}))
                     .ok()
                     .flatten()
@@ -467,15 +1070,22 @@ pub(crate) async fn plugin_capture(
         &binding,
         &spool,
         Some(&hub),
-        Some(deadline),
+        options,
     )
     .await
 }
 
-/// Records one native hook event for `binding` and delivers what is pending. Fails open: every
+/// Records one native hook event for `binding` and schedules pending delivery. Fails open: every
 /// problem is a warning. Returns the session-start context, if any. Past `deadline` a Hub call is
-/// given up: an unresolved target leaves a sanitized deferred fact, and pending records wait for
-/// the next hook.
+/// given up: an unresolved target leaves a sanitized deferred fact, and retained records are
+/// offered to the separate delivery worker.
+#[derive(Default)]
+struct NativeCapture<'a> {
+    deadline: Option<tokio::time::Instant>,
+    association: Option<&'a crate::client_session::CaptureAssociation>,
+    resolved_target: Option<&'a mut Option<agentscm::change_record::CaptureTargetV1>>,
+}
+
 async fn capture_native(
     harness: AgentHarnessV1,
     input: &[u8],
@@ -483,11 +1093,12 @@ async fn capture_native(
     binding: &change_capture_client::CaptureBinding,
     spool: &LocalSpool,
     hub: Option<&change_capture_client::CaptureHub>,
-    deadline: Option<tokio::time::Instant>,
+    options: NativeCapture<'_>,
 ) -> Option<String> {
     // A hook without its own deadline keeps the host's (20 seconds for the capture hook).
-    let deadline =
-        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(18));
+    let deadline = options
+        .deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(18));
     let session_id = match payload
         .get("session_id")
         .and_then(serde_json::Value::as_str)
@@ -518,21 +1129,10 @@ async fn capture_native(
             }
         },
     };
-    let deliver = || async {
-        match hub {
-            // Delivery leaves time for the session-start notice and the reply.
-            Some(hub) => tokio::time::timeout_at(
-                deadline - Duration::from_millis(400),
-                change_capture_client::deliver_pending_with(&binding.root, spool, hub),
-            )
-            .await
-            .unwrap_or_else(|_| Err(Error::Invalid("capture delivery ran out of time".into()))),
-            None => Err(Error::Invalid("capture Hub client unavailable".into())),
-        }
-    };
+    let deliver = || async { schedule_delivery(&binding.root) };
     // Upkeep runs beside the Hub lookups, and this event is written only after it, so a spool
-    // that filled with what the Hub has accepted makes room first; delivery, which can take the
-    // rest of the hook's time, comes after. Session start and turn end tidy from 80% of a limit;
+    // that filled with what the Hub has accepted makes room first; a separate process delivers
+    // pending records afterwards. Session start and turn end tidy from 80% of a limit;
     // any other event only a full spool, so a spool that stays past 80% does not cost every
     // tool hook a pass.
     let tidy = matches!(
@@ -546,7 +1146,14 @@ async fn capture_native(
     let (target, sharing) = match hub {
         Some(hub) => tokio::time::timeout_at(deadline, async {
             tokio::join!(
-                change_capture_client::resolve_target_with(binding, hub, &session_id),
+                change_capture_client::resolve_work_target_with(
+                    binding,
+                    hub,
+                    &session_id,
+                    options
+                        .association
+                        .map(|association| association.work_id.as_str())
+                ),
                 change_capture_client::hub_sharing(hub)
             )
         })
@@ -568,8 +1175,9 @@ async fn capture_native(
     let event = payload.get("hook_event_name").and_then(Value::as_str);
     let session_start = event == Some("SessionStart");
     let claude = harness == AgentHarnessV1::ClaudeCode;
+    let codex_harness = harness == AgentHarnessV1::Codex;
     // A Codex model request is token usage, not an event of the session.
-    let model_request = !claude && event == Some("PostModelRequest");
+    let model_request = codex_harness && event == Some("PostModelRequest");
     if session_start {
         sweep_session_files();
     }
@@ -579,11 +1187,17 @@ async fn capture_native(
     let start_lines = |mode: CaptureModeV1| {
         change_capture_client::session_start_lines(mode, binding, sharing, full)
     };
-    let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
-        Ok(Some(target)) => target,
+        Ok(Some(target))
+            if options.association.is_none_or(|association| {
+                association.work_id == target.work_id && association.generation == target.generation
+            }) =>
+        {
+            target
+        }
+        Ok(Some(_)) => return None,
         // Usage belongs to Work: without a target it is not kept and leaves no deferred fact.
-        _ if model_request => {
+        _ if model_request || event == Some("NativeHistory") => {
             let _ = deliver().await;
             return None;
         }
@@ -596,12 +1210,9 @@ async fn capture_native(
             {
                 hold_prompt(&session_file(binding, &session_id), input);
             }
-            // Replies before the claim are not the Work's: recovery starts after them.
-            if claude {
-                skip_transcript(&replies, payload, false);
-            }
             let retained = claude_code::deferred_native_hook(
                 input,
+                harness,
                 DeferredReasonV1::NoCurrentAuthorizedWork,
                 &actions,
                 spool,
@@ -621,6 +1232,7 @@ async fn capture_native(
         Err(_) => {
             let retained = claude_code::deferred_native_hook(
                 input,
+                harness,
                 DeferredReasonV1::TargetLookupUnavailable,
                 &actions,
                 spool,
@@ -638,11 +1250,14 @@ async fn capture_native(
             return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
     };
+    if let Some(resolved) = options.resolved_target {
+        *resolved = Some(target.clone());
+    }
     let live_parent = payload
         .get("parent_session_id")
         .and_then(serde_json::Value::as_str);
-    let (parent_session_id, capture_mode) = spool
-        .pin_session_identity(
+    let pin = if options.association.is_some() {
+        spool.pin_associated_session_identity(
             &session_id,
             &target.session_id,
             &target.work_id,
@@ -650,6 +1265,17 @@ async fn capture_native(
             live_parent,
             live_mode,
         )
+    } else {
+        spool.pin_session_identity(
+            &session_id,
+            &target.session_id,
+            &target.work_id,
+            target.generation,
+            live_parent,
+            live_mode,
+        )
+    };
+    let (parent_session_id, capture_mode) = pin
         .unwrap_or_else(|_| {
             eprintln!(
                 "AgentSCM local capture warning: pinned session identity is unavailable; using the live binding"
@@ -672,6 +1298,107 @@ async fn capture_native(
         live_capture_mode: live_mode,
         harness,
     };
+    let source_root = binding
+        .claude_history_root
+        .clone()
+        .filter(|_| claude)
+        .or_else(|| history_root(harness, &binding.root));
+    let failed_before = match claude_code::history_failed(&request, spool) {
+        Ok(failed) => failed,
+        Err(_) => return None,
+    };
+    let mut proof_available = false;
+    let rollout = if let Some(root) = source_root {
+        let path = match payload.get("transcript_path").and_then(Value::as_str) {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                contained_history(&path, &root).then_some(path)
+            }
+            None => find_history(&root, &session_id, harness),
+        };
+        let association = options.association.cloned().unwrap_or_else(|| {
+            crate::client_session::CaptureAssociation {
+                session: session_id.clone(),
+                harness,
+                hub: binding.hub.clone(),
+                repo: binding.repository.clone(),
+                checkout: binding.root.clone(),
+                work_id: request.work_id.clone(),
+                generation: request.generation,
+                native_start_verified: false,
+            }
+        });
+        let path = match (path, crate::hub_cli::config_dir()) {
+            (Some(path), Ok(config))
+                if native_start_proven(&config, &association, &path, deadline).await =>
+            {
+                Some(path)
+            }
+            _ => None,
+        };
+        proof_available = path.is_some();
+        match path {
+            Some(path) if !failed_before => {
+                let mut captured = false;
+                loop {
+                    let read = tokio::task::spawn_blocking({
+                        let (path, request, spool) = (path.clone(), request.clone(), spool.clone());
+                        move || match harness {
+                            AgentHarnessV1::ClaudeCode => {
+                                claude_code::capture_transcript(&path, &request, &spool)
+                            }
+                            AgentHarnessV1::Codex => {
+                                codex::capture_rollout(&path, &request, &spool)
+                            }
+                            AgentHarnessV1::Cursor
+                            | AgentHarnessV1::Copilot
+                            | AgentHarnessV1::GeminiCli => Err(CaptureError::Invalid(
+                                "this harness has no native history reader".into(),
+                            )),
+                        }
+                    });
+                    match tokio::time::timeout_at(deadline, read).await {
+                        Ok(Ok(Ok(report))) => {
+                            captured = true;
+                            if report.complete
+                                || report.records == 0
+                                || tokio::time::Instant::now() >= deadline
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Ok(Err(_))) => {
+                            eprintln!(
+                                "AgentSCM local capture warning: native visible history could not be retained"
+                            );
+                            break;
+                        }
+                        _ => {
+                            // The bounded reader may still finish; do not duplicate its messages through hooks.
+                            captured = true;
+                            break;
+                        }
+                    }
+                }
+                captured
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if options.association.is_some_and(|association| {
+        !(proof_available || failed_before && association.native_start_verified)
+    }) {
+        // Missing or timed-out proof is temporary uncertainty, not a terminal source error.
+        return None;
+    }
+    // A failing page may already have captured this prompt; only later hooks use fallback.
+    let failed_now = !failed_before && claude_code::history_failed(&request, spool).unwrap_or(true);
+    if event == Some("NativeHistory") {
+        let _ = deliver().await;
+        return None;
+    }
     if model_request {
         let usage = payload
             .as_object()
@@ -684,9 +1411,28 @@ async fn capture_native(
         let _ = deliver().await;
         return None;
     }
+    if options.association.is_some() {
+        let lifecycle = matches!(event, Some("SessionStart" | "SessionEnd"));
+        if !failed_now && (failed_before || lifecycle) {
+            if codex_harness
+                && event == Some("Stop")
+                && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
+                && claude_code::capture_associated_hook(&reply, &request, spool).is_err()
+            {
+                eprintln!("AgentSCM local capture warning: associated turn reply was not retained");
+            }
+            if claude_code::capture_associated_hook(input, &request, spool).is_err() {
+                eprintln!(
+                    "AgentSCM local capture warning: associated native context was not retained"
+                );
+            }
+        }
+        let _ = deliver().await;
+        return None;
+    }
     // Prompts held before the claim come first, and only into a shared conversation.
     let held = take_held_prompts(&session_file(binding, &session_id));
-    if capture_mode == CaptureModeV1::SharedConversation {
+    if capture_mode == CaptureModeV1::SharedConversation && !rollout && !failed_now {
         for prompt in held {
             if claude_code::capture_native_hook(&prompt, &request, &actions, spool).is_err() {
                 eprintln!(
@@ -695,20 +1441,44 @@ async fn capture_native(
             }
         }
     }
-    if claude {
-        // A session first seen with Work (or on an older build) recovers only replies from now on.
-        skip_transcript(&replies, payload, true);
-        if event == Some("MessageDisplay") {
-            note_fragment(&replies, payload);
-        }
-    } else if event == Some("Stop")
+    if codex_harness
+        && !rollout
+        && !failed_now
+        && event == Some("Stop")
         && let Some(reply) = payload.as_object().and_then(codex::last_message_hook)
         && claude_code::capture_native_hook(&reply, &request, &actions, spool).is_err()
     {
         // Codex names a turn's last reply only when the turn ends; it comes before that end.
         eprintln!("AgentSCM local capture warning: the turn's last reply was not retained");
     }
-    match claude_code::capture_native_hook(input, &request, &actions, spool) {
+    let native = if (rollout || failed_now)
+        && matches!(event, Some("UserPromptSubmit" | "MessageDisplay"))
+    {
+        Ok(claude_code::NativeHookReport {
+            event: claude_code::HookCaptureOutcome::Ignored,
+            action: claude_code::NativeActionOutcome::NotApplicable,
+            warnings: Vec::new(),
+        })
+    } else if !matches!(harness, AgentHarnessV1::ClaudeCode | AgentHarnessV1::Codex)
+        && matches!(
+            event,
+            Some("PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        )
+        && payload.get("tool_use_id").and_then(Value::as_str).is_none()
+    {
+        // These hosts can report tool observations without a tool-call identity. Preserve the
+        // observations, but do not manufacture a phase pair or source-bound action receipt.
+        claude_code::capture_hook(input, &request, spool).map(|event| {
+            claude_code::NativeHookReport {
+                event,
+                action: claude_code::NativeActionOutcome::NotApplicable,
+                warnings: Vec::new(),
+            }
+        })
+    } else {
+        claude_code::capture_native_hook(input, &request, &actions, spool)
+    };
+    match native {
         Ok(report) => {
             for warning in report.warnings {
                 eprintln!("AgentSCM local capture warning: {warning}");
@@ -726,23 +1496,6 @@ async fn capture_native(
                 CaptureError::Json(_) => "JSON could not be parsed",
             }
         ),
-    }
-    if claude
-        && event == Some("Stop")
-        && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
-    {
-        for (hash, reply) in missed_replies(&replies, std::path::Path::new(transcript), &session_id)
-        {
-            if claude_code::capture_native_hook(&reply, &request, &actions, spool).is_ok() {
-                note_replies(&replies, |seen| {
-                    seen.hashes.insert(hash);
-                });
-            } else {
-                eprintln!(
-                    "AgentSCM local capture warning: a reply recovered from the transcript was not retained"
-                );
-            }
-        }
     }
     // A captured Claude Code session reports its token counts and model names by default: a
     // binding with no history root of its own uses Claude Code's projects folder. Either way the
@@ -780,15 +1533,8 @@ async fn capture_native(
             );
         }
     }
-    match deliver().await {
-        Ok(report) if report.blocked > 0 => eprintln!(
-            "AgentSCM local capture warning: {} retained record(s) remain blocked by current Hub authorization or work generation",
-            report.blocked
-        ),
-        Ok(_) => {}
-        Err(_) => {
-            eprintln!("AgentSCM local capture warning: retained records remain pending delivery")
-        }
+    if deliver().await.is_err() {
+        eprintln!("AgentSCM local capture warning: retained records remain pending delivery");
     }
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
@@ -829,7 +1575,7 @@ const HELD_PROMPTS: usize = 8;
 const HELD_PROMPT_BYTES: usize = 64 * 1024;
 const HELD_PROMPT_SECONDS: u64 = 24 * 60 * 60;
 
-/// A private file per checkout and session (held prompts, seen replies); its name reveals neither.
+/// A private held-prompt file per checkout and session; its name reveals neither.
 fn session_file(
     binding: &change_capture_client::CaptureBinding,
     session_id: &str,
@@ -937,179 +1683,6 @@ fn take_held_prompts(path: &Option<PathBuf>) -> Vec<Vec<u8>> {
         let _ = fs::remove_file(path);
         held.into_iter().map(String::into_bytes).collect()
     })
-}
-
-/// Replies already captured in a session, by text, and how far its transcript has been read.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SeenReplies {
-    offset: u64,
-    hashes: std::collections::BTreeSet<String>,
-    /// Fragments of replies still being displayed, by message id, joined until the final one.
-    #[serde(default)]
-    partial: std::collections::BTreeMap<String, String>,
-}
-
-/// Replies being assembled at once, and the size of each.
-const PARTIAL_REPLIES: usize = 64;
-const PARTIAL_REPLY_BYTES: usize = 1 << 20;
-
-/// Transcript bytes read per Stop, and replies remembered per session.
-const TRANSCRIPT_READ_BYTES: u64 = 8 << 20;
-const SEEN_REPLIES: usize = 4096;
-
-/// Ignores whitespace: the transcript joins a reply's text blocks differently from the hooks.
-fn text_hash(text: &str) -> String {
-    use sha2::Digest;
-    let text: String = text.split_whitespace().collect();
-    sha2::Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Updates the session's seen replies; `change` gets the saved state, or None for a new session.
-fn update_replies(
-    path: &Option<PathBuf>,
-    change: impl FnOnce(Option<SeenReplies>) -> Option<SeenReplies>,
-) {
-    let Some(path) = path else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    locked(path, || {
-        let saved = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let Some(mut seen) = change(saved) else {
-            return;
-        };
-        while seen.hashes.len() > SEEN_REPLIES {
-            let first = seen.hashes.iter().next().cloned();
-            first.map(|first| seen.hashes.remove(&first));
-        }
-        while seen.partial.len() > PARTIAL_REPLIES {
-            let first = seen.partial.keys().next().cloned();
-            first.map(|first| seen.partial.remove(&first));
-        }
-        if let Ok(text) = serde_json::to_string(&seen) {
-            let _ = crate::hub_cli::write_private(path, &text);
-        }
-    });
-}
-
-fn note_replies(path: &Option<PathBuf>, change: impl FnOnce(&mut SeenReplies)) {
-    update_replies(path, |seen| {
-        let mut seen = seen.unwrap_or_default();
-        change(&mut seen);
-        Some(seen)
-    });
-}
-
-/// Records a displayed reply fragment; the final one marks the whole reply as seen.
-fn note_fragment(path: &Option<PathBuf>, payload: &Value) {
-    let (Some(id), Some(delta)) = (
-        payload.get("message_id").and_then(Value::as_str),
-        payload.get("delta").and_then(Value::as_str),
-    ) else {
-        return;
-    };
-    let last = payload.get("final") == Some(&Value::Bool(true));
-    note_replies(path, |seen| {
-        let mut text = seen.partial.remove(id).unwrap_or_default();
-        if text.len() + delta.len() <= PARTIAL_REPLY_BYTES {
-            text.push_str(delta);
-        }
-        if last {
-            seen.hashes.insert(text_hash(&text));
-        } else {
-            seen.partial.insert(id.to_owned(), text);
-        }
-    });
-}
-
-/// Moves transcript recovery to the transcript's end: always (`only_new` false), or only for a
-/// session with no saved state yet.
-fn skip_transcript(path: &Option<PathBuf>, payload: &Value, only_new: bool) {
-    let Some(length) = payload
-        .get("transcript_path")
-        .and_then(Value::as_str)
-        .and_then(|transcript| fs::metadata(transcript).ok())
-        .map(|metadata| metadata.len())
-    else {
-        return;
-    };
-    update_replies(path, |saved| match saved {
-        Some(_) if only_new => None,
-        saved => {
-            let mut seen = saved.unwrap_or_default();
-            seen.offset = length;
-            Some(seen)
-        }
-    });
-}
-
-/// The session's assistant replies in its transcript that no MessageDisplay hook delivered (a
-/// hook the host stopped loses its reply), as MessageDisplay inputs keyed by transcript entry, so
-/// a repeat is a duplicate. Reads on from where the last Stop stopped.
-fn missed_replies(
-    seen_path: &Option<PathBuf>,
-    transcript: &std::path::Path,
-    session_id: &str,
-) -> Vec<(String, Vec<u8>)> {
-    use std::io::{BufRead, Seek};
-    let mut found = Vec::new();
-    note_replies(seen_path, |seen| {
-        let Ok(mut file) = File::open(transcript) else {
-            return;
-        };
-        let length = file.metadata().map_or(0, |metadata| metadata.len());
-        // A shorter transcript is another file: read it from the start.
-        if seen.offset > length {
-            seen.offset = 0;
-        }
-        if file.seek(std::io::SeekFrom::Start(seen.offset)).is_err() {
-            return;
-        }
-        let mut reader = BufReader::new(file.take(TRANSCRIPT_READ_BYTES));
-        let mut line = Vec::new();
-        while let Ok(read) = reader.read_until(b'\n', &mut line) {
-            // Only whole lines count; a line still being written is read next time.
-            if read == 0 || line.last() != Some(&b'\n') {
-                break;
-            }
-            seen.offset += read as u64;
-            if let Ok(entry) = serde_json::from_slice::<Value>(&line) {
-                let text = (entry["type"] == "assistant" && entry["isSidechain"] != true)
-                    .then(|| entry["message"]["content"].as_array())
-                    .flatten()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|block| block["type"] == "text")
-                            .filter_map(|block| block["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n\n")
-                    })
-                    .filter(|text| !text.trim().is_empty());
-                if let (Some(text), Some(uuid)) = (text, entry["uuid"].as_str())
-                    && !seen.hashes.contains(&text_hash(&text))
-                {
-                    let reply = json!({
-                        "hook_event_name": "MessageDisplay",
-                        "session_id": session_id,
-                        "message_id": format!("transcript:{uuid}"),
-                        "timestamp": entry["timestamp"],
-                        "delta": text,
-                        "index": 0,
-                        "final": true,
-                    });
-                    found.extend(serde_json::to_vec(&reply).map(|reply| (text_hash(&text), reply)));
-                }
-            }
-            line.clear();
-        }
-    });
-    found
 }
 
 /// Upkeep (`LocalSpool::upkeep`) that fails open. Answers whether the spool is still full, where
@@ -1362,6 +1935,11 @@ fn import(args: ImportArgs, harness: AgentHarnessV1) -> Result<i32> {
                 codex::import_rollout(input, &request, &spool).map_err(capture_error)?;
             (report, Some(usage))
         }
+        AgentHarnessV1::Cursor | AgentHarnessV1::Copilot | AgentHarnessV1::GeminiCli => {
+            return Err(Error::Invalid(
+                "this harness has no native history importer".into(),
+            ));
+        }
     };
     let mut output = json!({
         "batches": report.batches,
@@ -1550,51 +2128,822 @@ fn capture_error(error: agentscm::change_capture::CaptureError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn delivery_worker_returns_before_exit_and_reaps_child() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let (input, release) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r line"])
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let pid = super::spawn_delivery_worker(command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = false;
+        let mut release = Some(release);
+        loop {
+            // SAFETY: writable siginfo_t; WNOWAIT observes only this child's status without
+            // reaping it or signalling a PID that the OS might subsequently reuse.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                assert!(released, "the worker must remain alive until released");
+                assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+                break;
+            }
+            assert_eq!(result, 0);
+            if !released {
+                assert_eq!(
+                    info.si_signo, 0,
+                    "worker exited before its input was released"
+                );
+                drop(release.take());
+                released = true;
+            }
+            assert!(Instant::now() < deadline, "exited worker was not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn delivery_worker_reports_spawn_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = std::process::Command::new(directory.path().join("missing-worker"));
+        assert!(matches!(
+            super::spawn_delivery_worker(command),
+            Err(agentscm::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn delivery_lock_coalesces_wakes_and_rejects_unsafe_files() {
+        use super::*;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        crate::client_config::in_isolated_config_home(|config| {
+            let root = config.join("repo");
+            let (path, requested) = delivery_worker_paths(&root).unwrap();
+            let lock = delivery_worker_lock(&path).unwrap().unwrap();
+            assert!(delivery_worker_lock(&path).unwrap().is_none());
+            schedule_delivery(&root).unwrap();
+            schedule_delivery(&root).unwrap();
+            assert!(requested.exists());
+            // Removing a previous request and replacing it while the worker holds the lock
+            // leaves the fresh request visible after release.
+            fs::remove_file(&requested).unwrap();
+            schedule_delivery(&root).unwrap();
+            drop(lock);
+            assert!(requested.exists());
+            assert!(delivery_worker_lock(&path).unwrap().is_some());
+
+            let alias = path.with_extension("alias");
+            fs::hard_link(&path, &alias).unwrap();
+            assert!(delivery_worker_lock(&path).is_err());
+            fs::remove_file(&alias).unwrap();
+            symlink(&path, &alias).unwrap();
+            assert!(delivery_worker_lock(&alias).is_err());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(delivery_worker_lock(&path).is_err());
+        });
+    }
+
+    fn delivery_fixture(
+        config: &Path,
+        status: u16,
+        slow_after_page: bool,
+    ) -> (std::path::PathBuf, LocalSpool) {
+        let (root, spool, _) =
+            delivery_fixture_reply(config, status, slow_after_page, move |_| status);
+        (root, spool)
+    }
+
+    fn delivery_fixture_reply(
+        config: &Path,
+        label: u16,
+        slow_after_page: bool,
+        reply: impl Fn(&Value) -> u16 + Send + 'static,
+    ) -> (
+        std::path::PathBuf,
+        LocalSpool,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = config.join(format!("repo-{label}"));
+        fs::create_dir(&root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let root = root.canonicalize().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let received = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut headers = Vec::new();
+                let mut byte = [0; 1];
+                while !headers.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                    headers.push(byte[0]);
+                }
+                let length = String::from_utf8_lossy(&headers)
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<u64>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = Vec::new();
+                (&mut stream).take(length).read_to_end(&mut body).unwrap();
+                let status = reply(&serde_json::from_slice(&body).unwrap());
+                let count = received.fetch_add(1, Ordering::Relaxed);
+                if slow_after_page && count >= 10 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        let token = config.join("token");
+        crate::hub_cli::write_private(&token, "synthetic-token").unwrap();
+        let spool = LocalSpool::open(config.join(format!("spool-{label}"))).unwrap();
+        let mut saved = binding(&root);
+        saved.spool = spool.root().to_owned();
+        saved.spool_identity = Some(spool.identity());
+        saved.hub = url.clone();
+        saved.spool_limits = agentscm::change_capture::SpoolLimits::default();
+        saved.action_rules = serde_json::from_value(json!([{
+            "native_tool":"Bash", "kind":"execution", "coverage":"partial",
+            "result_source":"unverified", "recipe_digest":null
+        }]))
+        .unwrap();
+        crate::hub_cli::write_private(
+            &config.join("agentscm/change-capture.json"),
+            &json!({"version":5,"bindings":[saved]}).to_string(),
+        )
+        .unwrap();
+        crate::hub_cli::write_private(&config.join("agentscm/connections.json"), &json!({"version":1,"connections":[{
+            "root":root,"origin_host":"github.com","hub":url,"repo":"acme/widgets","token_file":token
+        }]}).to_string()).unwrap();
+        (root, spool, requests)
+    }
+
+    #[test]
+    fn delivery_deadline_includes_setup_and_reserves_last_pass_and_handoff_time() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        assert!(
+            DELIVERY_WORKER_BUDGET + change_capture_client::DELIVERY_DEADLINE
+                < DELIVERY_WORKER_LIFE
+        );
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool, requests) = delivery_fixture_reply(config, 200, false, |_| 200);
+            spool.append(&batch(1)).unwrap();
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            // Setup has already spent the budget; the drain must not start a fresh clock.
+            let started = tokio::time::Instant::now() - DELIVERY_WORKER_BUDGET;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    started + DELIVERY_WORKER_BUDGET,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(requests.load(Ordering::Relaxed), 0);
+            assert_eq!(spool.pending(100).unwrap(), vec![batch(1)]);
+        });
+    }
+
+    #[test]
+    fn delivery_progress_schedules_a_successor_at_its_budget() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool) = delivery_fixture(config, 200, true);
+            for n in 0..30 {
+                spool.append(&batch(n)).unwrap();
+            }
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    None,
+                ))
+                .unwrap();
+            assert!(
+                remaining.is_some(),
+                "terminal progress must keep a large backlog draining"
+            );
+            assert!(
+                !requested.exists(),
+                "a continuation must not create a fresh native wake"
+            );
+            let pending = spool.pending(100).unwrap().len();
+            assert!(pending > 0 && pending < 30, "pending: {pending}");
+        });
+    }
+
+    #[test]
+    fn delivery_refusal_or_error_retains_records_without_self_chaining() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            for status in [401, 403, 500] {
+                let (root, spool) = delivery_fixture(config, status, false);
+                let envelope = batch(1);
+                spool.append(&envelope).unwrap();
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(drain_delivery(
+                        &root,
+                        &requested,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        None,
+                    ));
+                assert_eq!(result.is_ok(), status != 500);
+                assert!(!requested.exists());
+                assert_eq!(spool.pending(100).unwrap(), vec![envelope]);
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_traverses_blocked_pages_before_healthy_records_and_stops_at_cursor_wrap() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        crate::client_config::in_isolated_config_home(|config| {
+            for blocked in [15, 25] {
+                let (root, spool, requests) =
+                    delivery_fixture_reply(config, blocked, false, move |body| {
+                        let number: u16 = body["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("op:")
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if number < blocked { 403 } else { 200 }
+                    });
+                for n in 0..25 {
+                    let mut envelope = batch(n);
+                    let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope else {
+                        unreachable!()
+                    };
+                    batch.operation_id = format!("op:{n:03}");
+                    batch.events[0].sequence = n as u64 + 1;
+                    spool.append(&envelope).unwrap();
+                }
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let remaining = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(drain_delivery(
+                        &root,
+                        &requested,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        None,
+                    ))
+                    .unwrap();
+                assert_eq!(remaining, None);
+                assert_eq!(spool.pending(100).unwrap().len(), usize::from(blocked));
+                assert!(
+                    !requested.exists(),
+                    "blocked leftovers must not schedule a successor"
+                );
+                // A final ten-record page can wrap into five refused records already tried.
+                assert_eq!(requests.load(Ordering::Relaxed), 30);
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_preserves_a_new_wake_when_refused_records_wrap() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let requested = config.join("wake-during-pass");
+            let fresh = requested.clone();
+            let (root, spool, _) = delivery_fixture_reply(config, 403, false, move |_| {
+                crate::hub_cli::write_private(&fresh, "").unwrap();
+                403
+            });
+            spool.append(&batch(1)).unwrap();
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(remaining, None);
+            assert!(
+                requested.exists(),
+                "a wake arriving during traversal must survive cursor wrap"
+            );
+        });
+    }
+
+    #[test]
+    fn delivery_continuations_cross_a_slow_refused_prefix_with_a_finite_attempt_allowance() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        crate::client_config::in_isolated_config_home(|config| {
+            for blocked in [20, 25] {
+                let (root, spool, requests) =
+                    delivery_fixture_reply(config, blocked, false, move |body| {
+                        // One page exceeds the injected worker budget without timing out any request.
+                        std::thread::sleep(Duration::from_millis(75));
+                        let number: u16 = body["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("op:")
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if number < blocked { 403 } else { 200 }
+                    });
+                for n in 0..25 {
+                    let mut envelope = batch(n);
+                    let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope else {
+                        unreachable!()
+                    };
+                    batch.operation_id = format!("op:{n:03}");
+                    batch.events[0].sequence = n as u64 + 1;
+                    spool.append(&envelope).unwrap();
+                }
+                let (_, requested) = delivery_worker_paths(&root).unwrap();
+                crate::hub_cli::write_private(&requested, "").unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let initial = spool.usage().unwrap().records;
+                let mut remaining = None;
+                let mut workers = 0;
+                loop {
+                    let previous = remaining.unwrap_or(initial);
+                    remaining = runtime
+                        .block_on(drain_delivery(
+                            &root,
+                            &requested,
+                            tokio::time::Instant::now() + Duration::from_millis(500),
+                            remaining,
+                        ))
+                        .unwrap();
+                    workers += 1;
+                    assert!(
+                        !requested.exists(),
+                        "continuation must carry its allowance, not a fresh wake"
+                    );
+                    if workers == 1 {
+                        assert!(
+                            remaining.is_some(),
+                            "a fully refused first page must still reach the tail"
+                        );
+                        assert_eq!(spool.pending(100).unwrap().len(), 25);
+                    }
+                    match remaining {
+                        Some(next) => assert!(next < previous),
+                        None => break,
+                    }
+                    assert!(workers < 4, "an all-refused traversal must finish");
+                }
+                assert_eq!(spool.pending(100).unwrap().len(), usize::from(blocked));
+                assert!(requests.load(Ordering::Relaxed) <= initial + 9);
+            }
+        });
+    }
+
+    #[test]
+    fn a_fresh_delivery_wake_replenishes_an_inherited_continuation_allowance() {
+        use super::*;
+        crate::client_config::in_isolated_config_home(|config| {
+            let (root, spool) = delivery_fixture(config, 200, false);
+            for n in 0..25 {
+                spool.append(&batch(n)).unwrap();
+            }
+            let (_, requested) = delivery_worker_paths(&root).unwrap();
+            // A native hook wins the race after a predecessor chose its continuation argument.
+            crate::hub_cli::write_private(&requested, "").unwrap();
+            let remaining = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(drain_delivery(
+                    &root,
+                    &requested,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Some(1),
+                ))
+                .unwrap();
+            assert_eq!(remaining, None);
+            assert!(spool.pending(100).unwrap().is_empty());
+            assert!(!requested.exists());
+        });
+    }
+
+    #[tokio::test]
+    async fn native_start_proof_does_not_trust_a_candidates_claimed_chat() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        let association = crate::client_session::CaptureAssociation {
+            session: "11111111-1111-4111-8111-111111111111".into(),
+            harness: AgentHarnessV1::Codex,
+            hub: "https://hub.example".into(),
+            repo: "acme/widgets".into(),
+            checkout: temp.path().to_path_buf(),
+            work_id: format!("wrk_{}", "1".repeat(32)),
+            generation: 1,
+            native_start_verified: false,
+        };
+        crate::client_session::record_capture(temp.path(), &association).unwrap();
+        let header = json!({"type":"session_meta", "ordinal":0,
+            "payload":{"id":association.session,"subagent_history_start_ordinal":0}});
+        fs::write(&source, format!("{header}\n")).unwrap();
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+        let proofs = temp.path().join("agentscm").join("native-start-proofs");
+        assert!(!proofs.exists());
+        assert!(!native_start_proven(temp.path(), &association, &source, deadline()).await);
+        let proof = fs::read_dir(&proofs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let state = fs::read_dir(proof.join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let state: Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+        assert!(
+            state["history_starts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|cursor| cursor["authorized"] == false)
+        );
+        assert!(
+            !crate::client_session::capture_associations(temp.path(), &association.session)[0]
+                .native_start_verified
+        );
+        let start = json!({"type":"event_msg", "ordinal":1,
+            "payload":{"type":"item_completed", "thread_id":association.session,
+                "item":{"type":"McpToolCall","id":"start-1","server":"agentscm","tool":"agentscm_start",
+                    "status":"completed","arguments":{"session":association.session},
+                    "result":{"isError":false,"structuredContent":{"claim_acquired":true,
+                        "work":{"item":{"id":association.work_id,"generation":1,"repository":association.repo}}}}}}});
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{start}"
+        )
+        .unwrap();
+        assert!(native_start_proven(temp.path(), &association, &source, deadline()).await);
+        assert!(
+            crate::client_session::capture_associations(temp.path(), &association.session)[0]
+                .native_start_verified
+        );
+        let other = crate::client_session::CaptureAssociation {
+            generation: 2,
+            ..association
+        };
+        assert!(!native_start_proven(temp.path(), &other, &source, deadline()).await);
+    }
+
     use super::{recipe_exit_status, session_start_output};
 
     #[test]
-    fn stop_recovers_only_replies_no_hook_delivered_and_reads_each_line_once() {
+    fn history_paths_stay_in_the_configured_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let seen = Some(dir.path().join("seen"));
-        let transcript = dir.path().join("t.jsonl");
-        let line = |uuid: &str, texts: &[&str]| {
-            let blocks: Vec<_> = texts
-                .iter()
-                .map(|text| serde_json::json!({"type": "text", "text": text}))
-                .collect();
-            format!(
-                "{}\n",
-                serde_json::json!({"type": "assistant", "uuid": uuid, "timestamp": "2026-11-09T10:00:00Z",
-                    "message": {"content": blocks}})
+        let root = dir.path().join("history");
+        std::fs::create_dir(&root).unwrap();
+        let good = root.join("session.jsonl");
+        let outside = dir.path().join("outside.jsonl");
+        std::fs::write(&good, "{}\n").unwrap();
+        std::fs::write(&outside, "{}\n").unwrap();
+        assert!(super::contained_history(&good, &root));
+        assert!(!super::contained_history(&outside, &root));
+        assert!(!super::contained_history(&root, &root));
+        let link = root.join("link.jsonl");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(!super::contained_history(&link, &root));
+    }
+
+    #[test]
+    fn associated_proof_uncertainty_retries_and_new_failure_does_not_replay_current_reply() {
+        use super::{CaptureRequest, claude_code};
+        crate::client_config::in_isolated_config_home(|config| {
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, true);
+            let history = config.join("history");
+            std::fs::create_dir(&history).unwrap();
+            let transcript = history.join("session_fixture.jsonl");
+            let bound = CaptureBinding {
+                hub: url.clone(),
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(history),
+                ..binding(config)
+            };
+            let association = crate::client_session::CaptureAssociation {
+                session: "session_fixture".into(),
+                harness: AgentHarnessV1::ClaudeCode,
+                hub: url,
+                repo: "acme/widgets".into(),
+                checkout: config.to_path_buf(),
+                work_id: "wrk_11111111111111111111111111111111".into(),
+                generation: 1,
+                native_start_verified: true,
+            };
+            let request = CaptureRequest {
+                operation_prefix: "fixture".into(),
+                work_id: association.work_id.clone(),
+                generation: 1,
+                observed_session_id: association.session.clone(),
+                canonical_session_id: association.session.clone(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::LocalConversation,
+                live_capture_mode: CaptureModeV1::LocalConversation,
+                harness: AgentHarnessV1::ClaudeCode,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let send = |event: &str, extra: Value, expired: bool| {
+                let mut payload = json!({"hook_event_name":event,"session_id":"session_fixture",
+                    "transcript_path":transcript});
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let input = payload.to_string();
+                runtime.block_on(super::capture_native(
+                    AgentHarnessV1::ClaudeCode,
+                    input.as_bytes(),
+                    &payload,
+                    &bound,
+                    &spool,
+                    Some(&hub),
+                    super::NativeCapture {
+                        deadline: Some(
+                            tokio::time::Instant::now()
+                                + if expired {
+                                    std::time::Duration::ZERO
+                                } else {
+                                    std::time::Duration::from_secs(5)
+                                },
+                        ),
+                        association: Some(&association),
+                        resolved_target: None,
+                    },
+                ));
+            };
+            // A temporarily missing source is not evidence of permanent failure.
+            send("NativeHistory", json!({}), false);
+            assert!(!claude_code::history_failed(&request, &spool).unwrap());
+            let line = |kind: &str, session: &str, id: &str, content: Value| {
+                json!({"type":kind,"sessionId":session,"uuid":id,
+                    "timestamp":"2026-11-01T10:00:01Z","message":{"content":content}})
+                .to_string()
+                    + "\n"
+            };
+            let result = json!({"isError":false,"structuredContent":{"claim_acquired":true,
+                "work":{"item":{"id":association.work_id,"generation":1,"repository":association.repo}}}});
+            let valid = line(
+                "assistant",
+                "session_fixture",
+                "start",
+                json!([{"type":"tool_use",
+                "id":"start-call","name":"mcp__plugin_agentscm_agentscm__agentscm_start",
+                "input":{"session":"session_fixture"}}]),
+            ) + &line(
+                "user",
+                "session_fixture",
+                "result",
+                json!([{"type":"tool_result",
+                    "tool_use_id":"start-call","content":[{"type":"text","text":result.to_string()}]}]),
+            ) + &line(
+                "assistant",
+                "session_fixture",
+                "known",
+                json!([{"type":"text","text":"known reply"}]),
+            );
+            std::fs::write(&transcript, &valid).unwrap();
+            send("NativeHistory", json!({}), true);
+            assert!(!claude_code::history_failed(&request, &spool).unwrap());
+            assert!(runtime.block_on(super::native_start_proven(
+                config,
+                &association,
+                &transcript,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+            )));
+            std::fs::write(
+                &transcript,
+                valid
+                    + &line(
+                        "assistant",
+                        "foreign-native",
+                        "foreign",
+                        json!([{"type":"text","text":"foreign reply"}]),
+                    ),
             )
-        };
-        let shown = |delta: &str, last: bool| {
-            super::note_fragment(
-                &seen,
-                &serde_json::json!({"message_id": "m1", "delta": delta, "final": last}),
+            .unwrap();
+            send(
+                "MessageDisplay",
+                json!({"message_id":"triggering-reply","delta":"known reply","index":0,"final":true}),
+                false,
+            );
+            assert!(claude_code::history_failed(&request, &spool).unwrap());
+            let count = || {
+                spool
+                    .pending(100)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|envelope| match envelope {
+                        CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                        _ => vec![],
+                    })
+                    .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                    .count()
+            };
+            assert_eq!(count(), 1);
+            send(
+                "MessageDisplay",
+                json!({"message_id":"future-reply","delta":"later live reply","index":0,"final":true}),
+                false,
+            );
+            assert_eq!(count(), 2);
+            assert!(
+                std::fs::read_dir(spool.root().join("associations"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn failed_claude_history_stop_never_replays_source_and_live_replies_continue() {
+        crate::client_config::in_isolated_config_home(|config| {
+            use std::io::Write;
+            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+            let (hub, url) = loopback(config, true);
+            let history = config.join("history");
+            std::fs::create_dir(&history).unwrap();
+            let transcript = history.join("session_fixture.jsonl");
+            let bound = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(history),
+                ..binding(config)
+            };
+            let line = |kind: &str, session: &str, id: &str, content: Value| {
+                json!({"type":kind,"sessionId":session,"uuid":id,
+                    "timestamp":"2026-11-01T10:00:01Z","message":{"content":content}})
+                .to_string()
+                    + "\n"
+            };
+            let result = json!({"isError":false,"structuredContent":{"claim_acquired":true,
+                "work":{"item":{"id":"wrk_11111111111111111111111111111111",
+                    "generation":1,"repository":"acme/widgets"}}}});
+            std::fs::write(&transcript,
+                line("assistant", "session_fixture", "start", json!([{"type":"tool_use",
+                    "id":"start-call","name":"mcp__plugin_agentscm_agentscm__agentscm_start",
+                    "input":{"session":"session_fixture"}}]))
+                + &line("user", "session_fixture", "result", json!([{"type":"tool_result",
+                    "tool_use_id":"start-call","content":[{"type":"text","text":result.to_string()}]}]))
+                + &line("assistant", "session_fixture", "known", json!([{"type":"text",
+                    "text":"KNOWN_VISIBLE_REPLY_261"}]))
+            ).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let send = |event: &str, extra: Value| {
+                let mut payload = json!({"hook_event_name":event,"session_id":"session_fixture",
+                    "transcript_path":transcript});
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let input = payload.to_string();
+                runtime.block_on(super::capture_native(
+                    AgentHarnessV1::ClaudeCode,
+                    input.as_bytes(),
+                    &payload,
+                    &bound,
+                    &spool,
+                    Some(&hub),
+                    super::NativeCapture::default(),
+                ));
+            };
+            send("NativeHistory", json!({}));
+            let assistant_count = || {
+                spool
+                    .pending(100)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|envelope| match envelope {
+                        CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                        _ => vec![],
+                    })
+                    .filter(|event| event.kind == CapturedEventKindV1::AssistantMessage)
+                    .count()
+            };
+            assert_eq!(assistant_count(), 1);
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap(),
+                "{}",
+                line(
+                    "assistant",
+                    "foreign-native",
+                    "foreign",
+                    json!([{"type":"text",
+                    "text":"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262"}])
+                )
+                .trim_end()
             )
-        };
-        // "delivered" arrived through MessageDisplay in two fragments; "lost" did not.
-        std::fs::write(&transcript, line("old", &["before this build"])).unwrap();
-        let payload = serde_json::json!({"transcript_path": transcript});
-        super::skip_transcript(&seen, &payload, true);
-        shown("Deliv", false);
-        shown("ered.", true);
-        let mut text = std::fs::read_to_string(&transcript).unwrap();
-        text += &(line("a", &["Deliv", "ered."])
-            + &line("b", &["lost"])
-            + "{\"type\":\"user\"}\n"
-            + "{\"partial");
-        std::fs::write(&transcript, text).unwrap();
-        // State saved already: skipping only for a new session leaves it alone.
-        super::skip_transcript(&seen, &payload, true);
-        let replies = super::missed_replies(&seen, &transcript, "s");
-        assert_eq!(replies.len(), 1);
-        let reply: serde_json::Value = serde_json::from_slice(&replies[0].1).unwrap();
-        assert_eq!(reply["hook_event_name"], "MessageDisplay");
-        assert_eq!(reply["delta"], "lost");
-        assert_eq!(reply["message_id"], "transcript:b");
-        assert!(super::missed_replies(&seen, &transcript, "s").is_empty());
+            .unwrap();
+            send("Stop", json!({}));
+            send("Stop", json!({}));
+            assert_eq!(assistant_count(), 1);
+            send(
+                "MessageDisplay",
+                json!({"message_id":"live-after-failure","delta":"LIVE_REPLY_263",
+                "index":0,"final":true}),
+            );
+            assert_eq!(assistant_count(), 2);
+            for entry in std::fs::read_dir(spool.root().join("artifacts")).unwrap() {
+                let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(b"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262".len())
+                        .any(|window| window == b"FOREIGN_REPLY_MUST_NOT_BE_RETAINED_262")
+                );
+            }
+        });
     }
 
     #[test]
@@ -1755,7 +3104,7 @@ mod tests {
                 binding,
                 spool,
                 hub,
-                None,
+                super::NativeCapture::default(),
             ))
     }
 
@@ -1985,9 +3334,110 @@ mod tests {
                 binding,
                 spool,
                 Some(hub),
-                None,
+                super::NativeCapture::default(),
             ));
         assert_eq!(context, None);
+    }
+
+    #[test]
+    fn additional_native_harnesses_keep_unpaired_tool_facts_and_model_without_history_or_usage() {
+        use super::{NativeCapture, capture_native, find_history, history_root, native_hooks};
+        crate::client_config::in_isolated_config_home(|config| {
+            let (hub, url) = loopback(config, true);
+            let history = history_under(&config.join("unrelated-history"));
+            let bound = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::LocalConversation,
+                claude_history_root: Some(config.join("unrelated-history")),
+                ..binding(config)
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for (agent, hint, payload, kind) in [
+                (
+                    "cursor",
+                    None,
+                    json!({"hook_event_name":"postToolUse","conversation_id":"session_fixture",
+                    "tool_name":"Shell","tool_output":"visible output","transcript_path":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "copilot",
+                    Some("postToolUse"),
+                    json!({"sessionId":"session_fixture","toolName":"bash",
+                    "toolResult":{"resultType":"success","textResultForLlm":"visible output"},"transcriptPath":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "gemini",
+                    None,
+                    json!({"hook_event_name":"AfterTool","session_id":"session_fixture",
+                    "tool_name":"run_shell_command","tool_response":{"output":"visible output"},"transcript_path":history}),
+                    CapturedEventKindV1::ToolFinished,
+                ),
+                (
+                    "gemini",
+                    None,
+                    json!({"hook_event_name":"BeforeModel","session_id":"session_fixture",
+                    "llm_request":{"model":"gemini-example","messages":["excluded-context"]},
+                    "llm_response":{"usageMetadata":{"totalTokenCount":42}},"transcript_path":history}),
+                    CapturedEventKindV1::SetupObserved,
+                ),
+            ] {
+                let hook = native_hooks::normalize(agent, &payload, hint)
+                    .unwrap()
+                    .unwrap();
+                assert!(history_root(hook.harness, config).is_none());
+                assert!(find_history(config, "session_fixture", hook.harness).is_none());
+                let directory = tempfile::tempdir_in(config).unwrap();
+                let spool =
+                    LocalSpool::open_with_limits(directory.path().join("spool"), SMALL).unwrap();
+                for event in hook.events {
+                    runtime.block_on(capture_native(
+                        hook.harness,
+                        &serde_json::to_vec(&event).unwrap(),
+                        &event,
+                        &bound,
+                        &spool,
+                        Some(&hub),
+                        NativeCapture::default(),
+                    ));
+                }
+                let pending = spool.pending(100).unwrap();
+                let mut found = false;
+                for envelope in pending {
+                    envelope.validate().unwrap();
+                    let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
+                        panic!(
+                            "unpaired observations must produce neither usage nor action receipts"
+                        );
+                    };
+                    assert_eq!(batch.session.harness, hook.harness);
+                    for event in batch.events {
+                        if event.kind != kind {
+                            continue;
+                        }
+                        found = true;
+                        if kind == CapturedEventKindV1::ToolFinished {
+                            assert!(event.tool.as_ref().unwrap().request_id.is_none());
+                            let body = spool
+                                .read_artifact(event.artifact.as_ref().unwrap())
+                                .unwrap();
+                            assert!(String::from_utf8(body).unwrap().contains("visible output"));
+                        } else {
+                            assert_eq!(
+                                event.setup.unwrap().model.as_deref(),
+                                Some("gemini-example")
+                            );
+                            assert!(event.artifact.is_none());
+                        }
+                    }
+                }
+                assert!(found, "missing normalized {agent} observation");
+            }
+        });
     }
 
     fn codex_model_request() -> Value {
@@ -2112,7 +3562,7 @@ mod tests {
                 binding,
                 &spool,
                 Some(hub),
-                None,
+                super::NativeCapture::default(),
             ));
         let pending = spool.pending(100).unwrap();
         pending

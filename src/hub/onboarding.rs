@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::session::check_name;
-use super::store::{Principal, unix_now};
+use super::store::{Principal, Store, unix_now};
 use super::{HubError, HubState, Result};
 
 pub const CLIENT_HEADER: &str = "x-agentscm-client";
@@ -34,10 +34,27 @@ pub enum Agent {
     Cursor,
     Copilot,
     Gemini,
+    Droid,
+    Qwen,
+    Junie,
+    Crush,
 }
 
 impl Agent {
-    /// The name `from_name` reads.
+    /// Every agent, in the order of [`crate::clients::CLIENTS`].
+    pub const ALL: [Self; 9] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Cursor,
+        Self::Copilot,
+        Self::Gemini,
+        Self::Droid,
+        Self::Qwen,
+        Self::Junie,
+        Self::Crush,
+    ];
+
+    /// The name `from_name` reads, which is also its wire name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -45,18 +62,15 @@ impl Agent {
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
             Self::Gemini => "gemini",
+            Self::Droid => "droid",
+            Self::Qwen => "qwen",
+            Self::Junie => "junie",
+            Self::Crush => "crush",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
-            "copilot" => Some(Self::Copilot),
-            "gemini" => Some(Self::Gemini),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|agent| agent.name() == name)
     }
 }
 
@@ -275,6 +289,7 @@ pub struct Observations(
     StartNudges,
     super::permission_answer::Requests,
     super::session_subagents::Subagents,
+    Mutex<()>,
 );
 
 /// Native sessions already told once to declare their Work, by repository, agent token and
@@ -337,6 +352,25 @@ pub fn client(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl Observations {
+    /// Serialize current native effects before checking their incarnation. Every current
+    /// native writer uses this mutex; registration only takes the database lifecycle lock.
+    /// Lock order is this guard, waiting snapshots/rows, then database transaction. Never
+    /// acquire this guard from a database transaction or hold it across an await.
+    pub(super) fn native_effect<T>(
+        &self,
+        store: &dyn Store,
+        principal: &Principal,
+        native: Option<&str>,
+        incarnation: Option<&str>,
+        effect: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _serial = self.6.lock().map_err(|_| HubError::Busy)?;
+        if let Some(native) = native {
+            store.lifecycle_check(&principal.token_id, native, incarnation, unix_now())?;
+        }
+        effect()
+    }
+
     pub(super) fn waiting(&self) -> &super::session_waiting::Waiting {
         &self.2
     }
@@ -742,6 +776,9 @@ impl Observations {
         call: SetupCall,
         epoch: u64,
     ) -> Result<Status> {
+        // A successor's MCP proof publishes under the same lock as native end cleanup.
+        // No database transaction is held here; update_fenced remains conservative on epoch.
+        let _serial = self.6.lock().map_err(|_| HubError::Busy)?;
         let client = client.ok_or_else(|| {
             HubError::Invalid(
                 "Restart the checkout-bound AgentSCM MCP transport to verify setup".into(),
@@ -762,6 +799,19 @@ impl Observations {
 mod tests {
     use super::*;
     use crate::hub::store::{ForgeIdentity, User};
+
+    #[test]
+    fn onboarding_names_every_native_client_by_its_wire_name() {
+        let names: Vec<&str> = Agent::ALL.iter().map(|agent| agent.name()).collect();
+        assert_eq!(names, crate::clients::names().collect::<Vec<_>>());
+        for agent in Agent::ALL {
+            assert_eq!(Agent::from_name(agent.name()), Some(agent));
+            assert_eq!(
+                serde_json::to_value(agent).unwrap(),
+                serde_json::json!(agent.name())
+            );
+        }
+    }
 
     #[test]
     fn a_session_is_told_to_declare_its_work_once_a_day() {

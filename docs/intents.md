@@ -54,9 +54,22 @@ Two current Work leads can agree to share named files while keeping separate res
    because a checkout whose Git remote does not name the token's repository is ignored
    silently (see Limits).
 
+   This recipe is for Claude Code only. Cursor, GitHub Copilot (CLI and VS Code) and Devin
+   document that they also run the hooks in a repository's `.claude/settings.json`, with
+   their own payloads and tool names, so there this hook would report their edits as Claude
+   Code's or miss them. Cursor and Devin also document reading `~/.claude/settings.json`,
+   and a local run of Cursor's command-line agent ran hooks from it. Copilot documents its
+   own user hooks under `~/.copilot/` instead, and VS Code's migration guide says not to
+   assume Copilot discovers `~/.claude/settings.json`. Do not use the recipe where one of
+   those agents also runs. For a supported client (`claude`, `codex`, `cursor`, `copilot`,
+   `gemini`, `droid`, `qwen`, `junie` or `crush`), use `agentscm client setup --agent <agent>`
+   instead; for Claude Code it installs a plugin, not settings hooks.
+
 Setting this up for a whole team, or for agents other than Claude Code (Codex, Cursor, Copilot)? Use
 [`agentscm init-repo`](agents.md): it commits shared instructions for each agent, and each developer then runs
-`agentscm client setup` to add that machine's hooks and MCP server.
+`agentscm client setup` to add that machine's hooks and MCP server. Gemini CLI support there
+means Google's Gemini CLI: Google documents that unpaid-tier and Google One users moved to
+Antigravity CLI on 2026-06-18, and AgentSCM has not assessed Antigravity CLI's hooks.
 
 Optional: `AGENTSCM_MACHINE` names the computer in warnings (default: none; the host name is never sent),
 and `AGENTSCM_TASK` sets the task text (default: `work on <branch>`).
@@ -64,9 +77,9 @@ and `AGENTSCM_TASK` sets the task text (default: `work on <branch>`).
 ## Without installing anything: MCP and hook endpoints
 
 The hub also serves the same coordination to agents directly: an MCP client
-calls `POST /mcp` (six tools: `agentscm_start`, `agentscm_check`, `agentscm_status`,
-`agentscm_done`, and `agentscm_ask` and `agentscm_handoff` for the experimental
-handoff), and an agent's hooks can post their hook JSON to
+calls `POST /mcp` (the coordination tools `agentscm_start`, `agentscm_check`, `agentscm_status`
+and `agentscm_done`, `agentscm_ask` and `agentscm_handoff` for the experimental handoff, and
+the Hub's Work and read tools; see [the Hub's MCP tools](hub.md#agent-sessions-mcp-and-hook-endpoints)), and an agent's hooks can post their hook JSON to
 `POST /v1/hub/hook/{claude,codex,cursor,copilot,generic}`, which always answers
 in that agent's own format. Sessions there expire 20 minutes after their last
 call (30 minutes at most per hold). The first time in a session an agent is about
@@ -74,8 +87,9 @@ to edit a file another agent holds, the edit is refused once with a factual
 reason (where the agent's hook can refuse: Claude Code, Codex, Copilot); a repeat
 of the edit passes while that holder keeps the file (a new holder is refused once again), and the refused agent can ask the holder to hand the file
 over (`agentscm_ask`, answered with `agentscm_handoff`; experimental, see
-[Handoff](hub.md#handoff)). Elsewhere the hub adds a note: Cursor's hook cannot refuse, so it
-gets the note just after the edit, and an agent that only has MCP gets advice. See
+[Handoff](hub.md#handoff)). Elsewhere the hub adds a note: AgentSCM wires Cursor's hook to run
+after the edit (Cursor documents a `preToolUse` deny, which AgentSCM does not use yet), so
+Cursor gets the note just after the edit, and an agent that only has MCP gets advice. See
 [Agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints) for the routes
 and per-agent behaviour. The `agentscm intent` commands below still use the
 intent routes, and work as before.
@@ -138,7 +152,10 @@ should resume). The edit proceeds either way.
 
 - `agentscm intent` only advises and always exits 0. Through the hub's hook endpoints, the
   first contested edit in a session is refused once per hold on Claude Code, Codex and Copilot,
-  and a repeat goes through while that hold lasts. Nothing is locked.
+  and a repeat goes through while that hold lasts. Nothing is locked. Copilot documents that
+  a `preToolUse` hook which runs past its timeout lets the tool call go ahead, so on Copilot
+  a Hub slower than the 5-second timeout `agentscm client setup` sets lets a contested edit
+  through without a refusal.
 - When Work ends or is released, the hub releases the intents it held. If the stored intent
   id was released, the next `intent check` mints a new id, keeps the session's paths and
   retries once. An intent from this command is advisory and reserves nothing; the hub

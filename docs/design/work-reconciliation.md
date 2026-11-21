@@ -4,7 +4,7 @@ title: "Work and pull request reconciliation"
 
 # Work and pull request reconciliation
 
-> **Experimental implementation of issue #312.** Provider facts, caller declarations, reported outcomes and scope ownership remain separate. A merge never completes Work or releases its reservation. Synthetic tests exercise SQLite and PostgreSQL; live forge and deployed harness behavior remain unqualified.
+> **Experimental implementation of issue #312.** Provider facts, caller declarations, reported outcomes and scope ownership remain separate. Reconciliation itself never completes Work or releases its reservation because of a merge; only the Hub's sync poll does, through its [completion of merged Work](../standup.md#completion-of-merged-work) (on by default: every pull request of the Work merged, a source issue was closed as completed by it, and no live session holds the Work) and the opt-in [automatic release](../standup.md#automatic-release-of-a-merged-works-hold). Synthetic tests exercise SQLite and PostgreSQL; live forge and deployed harness behavior remain unqualified.
 
 Use the durable version-2 declarations and reconciliation surfaces for structured prerequisites. The existing version-1 report remains compatible for older clients. Reading either report never acknowledges a delivery or applies a reconciliation.
 
@@ -35,7 +35,7 @@ No link is inferred, with a limit, when:
 
 Fork pull requests and merges before the Work existed are never candidates. An inferred link compares no heads: the report carries `branch_link_head_not_compared`, the head relation stays unknown, and the link never satisfies a prerequisite. In stage reads, an explicit link that cannot be read is never inferred over: the stage is `unknown` and `stage_limits` carries `work_link_unavailable`.
 
-The same inference feeds the Work stage in status and overview, and `recent_merges` beside the overview (see [stand-up](../standup.md#work-stage-inferred-links-and-recent-merges)). A provider-observed merge is separate from the reported outcome and never completes Work or releases its reservation.
+The same inference feeds the Work stage in status and overview, and `recent_merges` beside the overview (see [stand-up](../standup.md#work-stage-inferred-links-and-recent-merges)). A provider-observed merge is separate from the reported outcome: these reads never complete Work or release its reservation. The Hub's sync poll can, as [completion of merged Work](../standup.md#completion-of-merged-work) describes, and records that outcome with the provenance `hub_observed_merge`, never `agent_report`.
 
 ## Provider identity and uncertain evidence
 

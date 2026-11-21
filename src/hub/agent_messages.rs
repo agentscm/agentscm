@@ -54,7 +54,11 @@ use super::access::Level;
 use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::HumanSession;
-use super::store::{Principal, Store, new_id, unix_now, validate_repository};
+use super::notices::{
+    AttemptOutcome, DependencyRefresh, NoticeOfferRequest, NoticeReceipt, NoticeRecipient,
+    NoticeSource, SourceKind,
+};
+use super::store::{Principal, Store, User, new_id, unix_now, validate_repository};
 use super::{HubError, HubState, Result};
 
 /// Messages kept per person and repository; a new one beyond it drops the oldest.
@@ -174,15 +178,18 @@ impl Drop for WaitSlot {
     }
 }
 
-/// The agent whose waiter holds a wait, which says how fast it wakes its session.
+/// The native delivery mechanism used by the session's waiter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Waker {
-    /// Claude Code's background hook: the session wakes within about a second.
+    /// Claude Code's background hook attempts delivery with the native wake exit status.
     #[default]
     Claude,
-    /// Codex's: it queues the notice, which Codex starts as a turn within about ten seconds.
+    /// Codex's waiter queues a pointer from a qualified live host; uptake is not guaranteed.
     Codex,
+    /// Copilot CLI's asynchronous notification hook returns context that can wake an idle
+    /// session. It waits only after a notification fires, until one notice is returned.
+    Copilot,
 }
 
 impl Waker {
@@ -191,6 +198,7 @@ impl Waker {
         match self {
             Self::Claude => "wake:claude",
             Self::Codex => "wake:codex",
+            Self::Copilot => "wake:copilot",
         }
     }
 }
@@ -230,7 +238,7 @@ pub struct Message {
     /// The sender's login.
     pub from: String,
     pub state: MessageState,
-    /// How it first reached the session: `wake:claude`, `wake:codex`, `hook:<agent>` or `mcp`.
+    /// How it first reached the session: `wake:<agent>`, `hook:<agent>` or `mcp`.
     pub via: Option<String>,
     /// The mode of its latest offer.
     pub mode: Option<Mode>,
@@ -297,12 +305,100 @@ impl Reach {
     }
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptCoverage {
+    Ledger,
+    LegacyUnknown,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageTransportAttempt {
+    pub outcome: AttemptOutcome,
+    pub created_at: i64,
+    pub reported_at: Option<i64>,
+}
+
+/// Historical delivery evidence, independent of the message's explicit answer.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageReceipt {
+    pub coverage: ReceiptCoverage,
+    pub delivery_id: Option<String>,
+    pub pointer_offer_recorded_at: Option<i64>,
+    pub transport_attempts: Vec<MessageTransportAttempt>,
+    pub presentation: &'static str,
+    pub resolved_at: Option<i64>,
+}
+
+impl MessageReceipt {
+    pub fn unknown(coverage: ReceiptCoverage) -> Self {
+        Self {
+            coverage,
+            delivery_id: None,
+            pointer_offer_recorded_at: None,
+            transport_attempts: vec![],
+            presentation: "unknown",
+            resolved_at: None,
+        }
+    }
+
+    pub(super) fn from_snapshot(id: &str, snapshot: &str, message: &Message) -> Result<Self> {
+        let invalid = || HubError::Unavailable("Message receipt history unavailable.".into());
+        if snapshot.len() > 64 * 1024 {
+            return Err(invalid());
+        }
+        let receipt: NoticeReceipt = serde_json::from_str(snapshot).map_err(|_| invalid())?;
+        let time = |value: i64| (0..=8_640_000_000_000).contains(&value);
+        if receipt.id != id
+            || !id.strip_prefix("ntc_").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || receipt.source.kind != SourceKind::HumanMessage
+            || receipt.source.id != message.id
+            || receipt.source.version != "1"
+            || receipt.recipient.token != message.token
+            || receipt.recipient.session != message.session
+            || receipt.recipient.work_id.is_some()
+            || receipt.recipient.generation.is_some()
+            || receipt.attempts.len() > super::notices::MAX_ATTEMPTS
+            || receipt.offered_at.is_some_and(|value| !time(value))
+            || receipt.resolved_at.is_some_and(|value| !time(value))
+            || receipt.attempts.iter().any(|attempt| {
+                !time(attempt.created_at) || attempt.reported_at.is_some_and(|value| !time(value))
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            coverage: ReceiptCoverage::Ledger,
+            delivery_id: Some(receipt.id),
+            pointer_offer_recorded_at: receipt.offered_at,
+            transport_attempts: receipt
+                .attempts
+                .into_iter()
+                .map(|attempt| MessageTransportAttempt {
+                    outcome: attempt.outcome,
+                    created_at: attempt.created_at,
+                    reported_at: attempt.reported_at,
+                })
+                .collect(),
+            presentation: "unknown",
+            resolved_at: receipt.resolved_at,
+        })
+    }
+}
+
 /// A message as the Hub page reads it.
 #[derive(Serialize)]
 struct MessageView {
     #[serde(flatten)]
     message: Message,
     not_picked_up: bool,
+    receipt: MessageReceipt,
 }
 
 impl MessageView {
@@ -311,6 +407,7 @@ impl MessageView {
         Self {
             message,
             not_picked_up,
+            receipt: MessageReceipt::unknown(ReceiptCoverage::LegacyUnknown),
         }
     }
 }
@@ -375,6 +472,44 @@ fn edit<T>(
         save(store, key, &messages, actor)?;
     }
     Ok(out)
+}
+
+fn edit_message<T>(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    source: &NoticeSource,
+    incarnation: Option<&str>,
+    mut change: impl FnMut(&mut Vec<Message>) -> Result<T>,
+) -> Result<(T, Mode)> {
+    let _held = WRITE.lock().unwrap_or_else(PoisonError::into_inner);
+    let repository = principal.repository_id.ok_or(HubError::Unauthorized)?;
+    let key = messages_key(&principal.owner.id, repository);
+    for _ in 0..3 {
+        let before = store.get_setting(&key)?;
+        let mut messages: Vec<Message> = before
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| HubError::Unavailable("Message state unavailable.".into()))?
+            .unwrap_or_default();
+        let out = change(&mut messages)?;
+        let replacement = serde_json::to_string(&messages)
+            .map_err(|_| HubError::Unavailable("Message encoding failed.".into()))?;
+        if let Some(mode) = store.notice_message_update(
+            &principal.token_id,
+            session,
+            &key,
+            before.as_deref(),
+            &replacement,
+            source,
+            incarnation,
+            unix_now(),
+        )? {
+            return Ok((out, mode));
+        }
+    }
+    Err(HubError::Busy)
 }
 
 fn pushed(messages: &mut Vec<Message>, message: Message) {
@@ -471,6 +606,48 @@ fn reach_of(token: &str, session: &str, now: i64) -> Reach {
         .map_or(Reach::Unreachable, |client| client.reach(now))
 }
 
+/// Project durable lifecycle truth without changing cached transport observations. Missing
+/// lifecycle is legacy evidence; an ambiguous/unavailable projection cannot promise reach.
+fn lifecycle_client(
+    store: &dyn Store,
+    token: &str,
+    session: &str,
+    mut client: Client,
+    now: i64,
+) -> Client {
+    match store.lifecycle_domain_get(token, session, now) {
+        Ok(Some(view)) if view.state == super::session_lifecycle::LifecycleState::Terminal => {
+            client.ended = true;
+            client.waited_at = None;
+            client.waker = None;
+            client.open_waits = 0;
+            client.wait_left_at = None;
+        }
+        Err(_) => {
+            client.top_level = false;
+            client.hook_context = false;
+            client.mcp = false;
+            client.ended = false;
+            client.waited_at = None;
+            client.waker = None;
+            client.open_waits = 0;
+            client.wait_left_at = None;
+        }
+        Ok(_) => {}
+    }
+    client
+}
+
+fn lifecycle_reach(store: &dyn Store, token: &str, session: &str, now: i64) -> Reach {
+    let client = SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&(token.to_owned(), session.to_owned()))
+        .cloned()
+        .unwrap_or_default();
+    lifecycle_client(store, token, session, client, now).reach(now)
+}
+
 type Clients = BTreeMap<(String, String), Client>;
 /// Per agent token and Hub session name.
 static SESSIONS: Mutex<Clients> = Mutex::new(BTreeMap::new());
@@ -537,12 +714,40 @@ pub(super) fn restore_sessions(store: &dyn Store, now: i64) {
     else {
         return;
     };
-    let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
-    for fact in saved.sessions.into_iter().take(MAX_SESSIONS) {
-        if fact.expires_at > now {
-            map.entry((fact.token, fact.session)).or_insert(fact.client);
-            bounded(&mut map, |client| client.seen_at);
+    let mut verified = Vec::new();
+    for mut fact in saved.sessions.into_iter().take(MAX_SESSIONS) {
+        if fact.expires_at <= now {
+            continue;
         }
+        // This lookup authenticates the current token even when no lifecycle was registered.
+        // Legacy facts preserve next-call visibility; errors never restore an unverified token.
+        let lifecycle = match store.lifecycle_domain_get(&fact.token, &fact.session, now) {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => continue,
+        };
+        if lifecycle
+            .is_some_and(|view| view.state == super::session_lifecycle::LifecycleState::Terminal)
+        {
+            fact.client.ended = true;
+            fact.client.waited_at = None;
+            fact.client.waker = None;
+        }
+        verified.push(fact);
+    }
+    let mut map = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    for fact in verified {
+        if fact.client.ended {
+            map.entry((fact.token, fact.session))
+                .and_modify(|client| {
+                    client.ended = true;
+                    client.open_waits = 0;
+                    client.wait_left_at = None;
+                })
+                .or_insert(fact.client);
+        } else {
+            map.entry((fact.token, fact.session)).or_insert(fact.client);
+        }
+        bounded(&mut map, |client| client.seen_at);
     }
 }
 
@@ -690,6 +895,7 @@ fn render(message: &Message) -> String {
 /// The checked reply to an agent's answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answered {
+    pub newly_acknowledged: bool,
     pub state: MessageState,
     /// On `accepted`: what to act on, from the Hub's own record.
     pub accepted: Option<(Mode, Message)>,
@@ -698,6 +904,11 @@ pub struct Answered {
 impl Answered {
     /// The tool result an agent reads.
     pub fn text(&self, id: &str) -> String {
+        if !self.newly_acknowledged && self.state == MessageState::Accepted {
+            return format!(
+                "AgentSCM Hub message {id}: acknowledgement already recorded; newly_acknowledged=false. No new action is authorized by this replay."
+            );
+        }
         let state = serde_json::to_value(self.state)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1004,22 +1215,32 @@ pub fn answer(
     status: Answer,
     now: i64,
 ) -> Result<Answered> {
-    let repository_id = principal.repository_id.ok_or(HubError::Unauthorized)?;
-    if principal.read_only {
+    answer_with_transport(store, principal, session, id, status, None, now)
+}
+
+pub fn answer_with_transport(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    id: &str,
+    status: Answer,
+    incarnation: Option<&str>,
+    now: i64,
+) -> Result<Answered> {
+    if principal.read_only || principal.repository_id.is_none() {
         return Err(HubError::Unauthorized);
     }
-    let owner = &principal.owner.id;
-    let mode = effective_mode(store, owner, repository_id)?;
-    if status == Answer::Accepted && mode == Mode::Ignore {
-        return Err(HubError::invalid_or_changed(
-            "Your person is not taking Hub messages now (mode ignore): do not act on this message."
-                .into(),
-        ));
-    }
-    let state = edit(
+    let source = NoticeSource {
+        kind: SourceKind::HumanMessage,
+        id: id.into(),
+        version: "1".into(),
+    };
+    let (state, mode) = edit_message(
         store,
-        &messages_key(owner, repository_id),
-        owner,
+        principal,
+        session,
+        &source,
+        incarnation,
         |messages| {
             let message = messages
                 .iter_mut()
@@ -1030,6 +1251,14 @@ pub fn answer(
                             .into(),
                     )
                 })?;
+            if matches!(
+                (message.state, status),
+                (MessageState::Accepted, Answer::Accepted)
+                    | (MessageState::Declined, Answer::Declined)
+                    | (MessageState::Done, Answer::Done)
+            ) {
+                return Ok((message.state, message.clone(), false));
+            }
             let next = match (message.state, status) {
                 (MessageState::Delivered, Answer::Accepted) => MessageState::Accepted,
                 (MessageState::Delivered | MessageState::Accepted, Answer::Declined) => {
@@ -1061,6 +1290,7 @@ pub fn answer(
                     )));
                 }
             };
+            let newly_acknowledged = message.read_at.is_none();
             message.state = next;
             // A message answered before read times were kept was read at that answer.
             message
@@ -1070,11 +1300,12 @@ pub fn answer(
             if next == MessageState::Done {
                 message.done_at = Some(now);
             }
-            Ok((next, message.clone()))
+            Ok((next, message.clone(), newly_acknowledged))
         },
-    )??;
-    let (state, message) = state;
+    )?;
+    let (state, message, newly_acknowledged) = state;
     Ok(Answered {
+        newly_acknowledged,
         state,
         accepted: (state == MessageState::Accepted).then_some((mode, message)),
     })
@@ -1135,6 +1366,10 @@ struct WaitBody {
     /// Whose waiter this is; Claude Code's, which sends none, by default.
     #[serde(default)]
     agent: Waker,
+    #[serde(default)]
+    cooperation_protocol: Option<u32>,
+    #[serde(default)]
+    incarnation: Option<String>,
 }
 
 /// The session's background hook waits here for a message, with its agent token: 200 `{text}`
@@ -1161,6 +1396,16 @@ async fn wait(
         principal.token_id.clone(),
         principal.owner.id.clone(),
     );
+    let modern = match (body.cooperation_protocol, body.incarnation.as_deref()) {
+        (Some(super::notices::PROTOCOL), Some(incarnation)) => Some(incarnation.to_owned()),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_version",
+            ));
+        }
+    };
     let (reported, waker) = (body.session.clone(), body.agent);
     let (session, mode) = blocking(&state, move || {
         Ok((
@@ -1171,6 +1416,9 @@ async fn wait(
     .await?;
     if mode == Mode::Ignore {
         return Ok(StatusCode::GONE.into_response());
+    }
+    if let Some(incarnation) = modern {
+        return wait_current(state, principal, reported, incarnation, waker).await;
     }
     // A waiter that names the shared `default` names no one conversation, so it could wake any of
     // the token's. A real session the Hub bound to it keeps its waiter.
@@ -1238,6 +1486,221 @@ async fn wait(
     })
 }
 
+/// Protocol-1 delivery uses the same source ledger across waits and ordinary native calls.
+async fn wait_current(
+    state: HubState,
+    principal: Principal,
+    session: String,
+    incarnation: String,
+    waker: Waker,
+) -> std::result::Result<Response, ApiError> {
+    if session == super::session::DEFAULT_SESSION {
+        return Ok(StatusCode::FORBIDDEN.into_response());
+    }
+    let (checked_store, checked_token, checked_session, checked_incarnation) = (
+        state.store.clone(),
+        principal.token_id.clone(),
+        session.clone(),
+        incarnation.clone(),
+    );
+    blocking(&state, move || {
+        checked_store.lifecycle_check(
+            &checked_token,
+            &checked_session,
+            Some(&checked_incarnation),
+            unix_now(),
+        )
+    })
+    .await?;
+    let mut slot = match WaitSlot::open(&principal.owner.id, &principal.token_id, &session) {
+        Ok(slot) => slot,
+        Err(Refused::Full) => return Ok(StatusCode::TOO_MANY_REQUESTS.into_response()),
+        Err(Refused::Waiting) => return Ok(StatusCode::CONFLICT.into_response()),
+    };
+    note_wait(&principal.token_id, &session, waker, unix_now());
+    let text = waited(Instant::now() + Duration::from_secs(WAIT_SECS),
+        || reach_of(&principal.token_id, &session, unix_now()) == Reach::Ended,
+        || {
+            let (state, principal, session, incarnation) = (state.clone(), principal.clone(), session.clone(), incarnation.clone());
+            async move {
+                let store = state.store.clone();
+                blocking(&state, move || {
+                    let now = unix_now();
+                    // Refresh is observation only; it never renews session or Work activity.
+                    let mut after = None;
+                    let mut refresh_complete = false;
+                    for _ in 0..16 {
+                        let page = store.notice_refresh(&principal.token_id, &DependencyRefresh {
+                            session: session.clone(), incarnation: incarnation.clone(), after, limit: 100,
+                        }, now)?;
+                        if !page.coverage_complete {
+                            return Err(HubError::Unavailable("Dependency refresh has incomplete source fanout; inspect the dependency mailbox.".into()));
+                        }
+                        if page.complete {refresh_complete = true; break;}
+                        after = page.next_after;
+                        if after.is_none() {break;}
+                    }
+                    if !refresh_complete {
+                        return Err(HubError::Unavailable("Dependency refresh exceeds this wait's bounded pages; continue through the scoped refresh route.".into()));
+                    }
+                    let domain=store.session_name_for(&principal.token_id,Some(&session),now)?;
+                    record_current_sources(&*store, &principal, &domain, now)?;
+                    let offer = store.notice_offer(&principal.token_id, &NoticeOfferRequest {
+                        session, incarnation, automatic: true,
+                    }, now)?;
+                    offer.map(|offer| serde_json::to_string(&offer)
+                        .map_err(|_| HubError::Unavailable("Notice encoding failed.".into()))).transpose()
+                }).await
+            }
+        }).await;
+    let text = text?;
+    slot.asks_again =
+        text.is_none() && reach_of(&principal.token_id, &session, unix_now()) != Reach::Ended;
+    drop(slot);
+    Ok(match text {
+        Some(text) => Json(
+            serde_json::from_str::<Value>(&text)
+                .map_err(|_| HubError::Unavailable("Notice decoding failed.".into()))?,
+        )
+        .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// Source facts remain in their existing domains; only a bounded pointer is recorded here.
+pub(super) fn record_current_sources(
+    store: &dyn Store,
+    principal: &Principal,
+    session: &str,
+    now: i64,
+) -> Result<()> {
+    if let Some(repository) = principal.repository_id
+        && effective_mode(store, &principal.owner.id, repository)? != Mode::Ignore
+    {
+        let _ = deliver(store, principal, session, "notice", now, due)?;
+        for message in load(store, &messages_key(&principal.owner.id, repository))? {
+            if message.token != principal.token_id
+                || message.session != session
+                || message.state != MessageState::Delivered
+            {
+                continue;
+            }
+            store.notice_record(
+                &principal.token_id,
+                &NoticeSource {
+                    kind: SourceKind::HumanMessage,
+                    id: message.id,
+                    version: "1".into(),
+                },
+                &NoticeRecipient {
+                    token: principal.token_id.clone(),
+                    session: session.into(),
+                    work_id: None,
+                    generation: None,
+                },
+                now,
+            )?;
+        }
+    }
+    let inbox = store.coordination_inbox(
+        &principal.token_id,
+        &CoordinationInboxQuery {
+            session: Some(session.into()),
+            ..Default::default()
+        },
+        now,
+    )?;
+    for request in &inbox.requests {
+        if !matches!(
+            request.status,
+            CoordinationStatus::Pending | CoordinationStatus::Responded
+        ) {
+            continue;
+        }
+        if request.requester.token == principal.token_id
+            && request.requester.session == session
+            && !request.responses.is_empty()
+            && !request.acknowledgements.iter().any(|ack| {
+                ack.target_work_id.is_none()
+                    && ack.agent == request.requester
+                    && ack.through_seq >= request.updated_seq
+            })
+        {
+            let source = coordination_reply_source(request)?;
+            store.notice_record(
+                &principal.token_id,
+                &source,
+                &NoticeRecipient {
+                    token: principal.token_id.clone(),
+                    session: session.into(),
+                    work_id: None,
+                    generation: None,
+                },
+                now,
+            )?;
+        }
+        for target in &request.targets {
+            if target.lead.token != principal.token_id || target.lead.session != session {
+                continue;
+            }
+            let answered = request.acknowledgements.iter().any(|ack| {
+                ack.target_work_id.as_deref() == Some(&target.work_id)
+                    && ack.generation == target.generation
+                    && ack.agent == target.lead
+                    && ack.through_seq >= request.updated_seq
+            }) || request.responses.iter().any(|reply| {
+                reply.target_work_id == target.work_id
+                    && reply.target_generation == target.generation
+                    && reply.responder == target.lead
+            });
+            if answered {
+                continue;
+            }
+            let source = coordination_source(request, target)?;
+            store.notice_record(
+                &principal.token_id,
+                &source,
+                &NoticeRecipient {
+                    token: target.lead.token.clone(),
+                    session: target.lead.session.clone(),
+                    work_id: Some(target.work_id.clone()),
+                    generation: Some(target.generation),
+                },
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn coordination_source(
+    request: &super::coordination::CoordinationRequest,
+    target: &super::coordination::CoordinationTarget,
+) -> Result<NoticeSource> {
+    use sha2::{Digest, Sha256};
+    // Acknowledgement-only sequence changes cannot create another automatic turn.
+    let meaning = serde_json::to_vec(&(&request.proposal, target, &request.responses))
+        .map_err(|_| HubError::Unavailable("Coordination encoding failed.".into()))?;
+    Ok(NoticeSource {
+        kind: SourceKind::Coordination,
+        id: request.id.clone(),
+        version: format!("{:x}", Sha256::digest(meaning)),
+    })
+}
+
+pub(super) fn coordination_reply_source(
+    request: &super::coordination::CoordinationRequest,
+) -> Result<NoticeSource> {
+    use sha2::{Digest, Sha256};
+    let meaning = serde_json::to_vec(&(&request.proposal, &request.targets, &request.responses))
+        .map_err(|_| HubError::Unavailable("Coordination encoding failed.".into()))?;
+    Ok(NoticeSource {
+        kind: SourceKind::Coordination,
+        id: request.id.clone(),
+        version: format!("reply:{:x}", Sha256::digest(meaning)),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryQuery {
@@ -1277,8 +1740,12 @@ async fn scoped(
 ) -> std::result::Result<(super::store::User, i64, Vec<(String, String)>), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
-    let repo =
-        super::login::devices::mint_check(state, &user, repository, "agent_messages", need).await?;
+    // A page polls the list; changes ask the forge every time.
+    let repo = if need == Level::Read {
+        super::login::devices::read_check(state, &user, repository, "agent_messages").await?
+    } else {
+        super::login::devices::mint_check(state, &user, repository, "agent_messages", need).await?
+    };
     let (store, owner, repository_id) = (state.store.clone(), user.id.clone(), repo.repository_id);
     let tokens = blocking(state, move || {
         let now = unix_now();
@@ -1300,31 +1767,39 @@ async fn scoped(
 
 fn page(
     store: &dyn Store,
-    user_id: &str,
+    user: &User,
+    repository: &str,
     repository_id: i64,
     tokens: &[(String, String)],
 ) -> Result<Page> {
+    let user_id = &user.id;
     let now = unix_now();
     let ids: Vec<String> = tokens.iter().map(|(id, _)| id.clone()).collect();
     let mut sessions: Vec<SessionView> = clients_of(&ids)
         .into_iter()
-        .map(|((token, session), client)| SessionView {
-            token_name: tokens
-                .iter()
-                .find(|(id, _)| *id == token)
-                .map(|(_, name)| name.clone())
-                .unwrap_or_default(),
-            token,
-            session,
-            tier: client.tier(now),
-            reach: client.reach(now),
-            client,
+        .map(|((token, session), client)| {
+            let client = lifecycle_client(store, &token, &session, client, now);
+            SessionView {
+                token_name: tokens
+                    .iter()
+                    .find(|(id, _)| *id == token)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default(),
+                token,
+                session,
+                tier: client.tier(now),
+                reach: client.reach(now),
+                client,
+            }
         })
         .collect();
     sessions.sort_by_key(|s| std::cmp::Reverse(s.client.seen_at));
     let mut messages = load(store, &messages_key(user_id, repository_id))?;
     messages.retain(|m| ids.contains(&m.token));
     messages.reverse();
+    messages.truncate(MAX_MESSAGES);
+    let receipts =
+        store.notice_message_receipts(user, repository, repository_id, &messages, now)?;
     Ok(Page {
         mode: effective_mode(store, user_id, repository_id)?,
         default_mode: load_mode(store, &mode_key(user_id, None))?,
@@ -1332,7 +1807,11 @@ fn page(
         sessions,
         messages: messages
             .into_iter()
-            .map(|m| MessageView::at(m, now))
+            .zip(receipts)
+            .map(|(m, receipt)| MessageView {
+                receipt,
+                ..MessageView::at(m, now)
+            })
             .collect(),
     })
 }
@@ -1347,7 +1826,7 @@ async fn list(
         scoped(&state, &human, &query.repository, Level::Read).await?;
     let store = state.store.clone();
     let page = blocking(&state, move || {
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &query.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1380,7 +1859,7 @@ async fn set_mode(
             .unwrap_or_default();
         // An empty value reads as unset.
         store.set_setting(&key, &value, &user.id)?;
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &body.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1456,7 +1935,7 @@ async fn send(
                 ));
             }
         }
-        let reach = reach_of(&body.token, &body.session, now);
+        let reach = lifecycle_reach(&*store, &body.token, &body.session, now);
         let message = Message {
             id: new_id("msg")?,
             token: body.token,
@@ -1513,7 +1992,7 @@ async fn withdraw(
                 }
             }
         })?;
-        page(&*store, &user.id, repository_id, &tokens)
+        page(&*store, &user, &query.repository, repository_id, &tokens)
     })
     .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
@@ -1545,6 +2024,97 @@ mod tests {
     }
 
     #[test]
+    fn message_receipt_projection_preserves_transport_without_inventing_an_answer() {
+        let m = message("msg_history", 0);
+        let mut receipt = NoticeReceipt::new(
+            "octo/repo",
+            NoticeSource {
+                kind: SourceKind::HumanMessage,
+                id: m.id.clone(),
+                version: "1".into(),
+            },
+            NoticeRecipient {
+                token: m.token.clone(),
+                session: m.session.clone(),
+                work_id: None,
+                generation: None,
+            },
+            0,
+        );
+        receipt.offered_at = Some(0);
+        receipt.resolved_at = Some(8_640_000_000_000);
+        receipt.read_at = Some(99);
+        receipt.withdrawn = true;
+        for outcome in [
+            AttemptOutcome::NotAttempted,
+            AttemptOutcome::ProvenNoDispatch,
+            AttemptOutcome::PossiblyEnqueued,
+            AttemptOutcome::Unknown,
+            AttemptOutcome::TransportReported,
+        ] {
+            receipt.attempts.push(super::super::notices::NoticeAttempt {
+                id: "private-attempt".into(),
+                incarnation: "private-incarnation".into(),
+                generation: Some(1),
+                outcome,
+                created_at: 2,
+                reported_at: Some(0),
+            });
+        }
+        let snapshot = serde_json::to_string(&receipt).unwrap();
+        let projected = MessageReceipt::from_snapshot(&receipt.id, &snapshot, &m).unwrap();
+        let wire = serde_json::to_value(projected).unwrap();
+        assert_eq!(wire["pointer_offer_recorded_at"], 0);
+        assert_eq!(wire["resolved_at"], 8_640_000_000_000_i64);
+        assert_eq!(wire["presentation"], "unknown");
+        assert_eq!(wire["transport_attempts"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            wire["transport_attempts"][2]["outcome"],
+            "possibly_enqueued"
+        );
+        for attempt in wire["transport_attempts"].as_array().unwrap() {
+            assert_eq!(attempt.as_object().unwrap().len(), 3);
+            assert_eq!(attempt["reported_at"], 0);
+        }
+        assert!(wire.get("read_at").is_none());
+        assert!(wire.get("withdrawn").is_none());
+        assert_eq!(m.read_at, None);
+        for (field, value) in [
+            (
+                "source",
+                serde_json::json!({"kind":"dependency", "id":m.id, "version":"1"}),
+            ),
+            (
+                "recipient",
+                serde_json::json!({"token":m.token, "session":m.session, "work_id":"wrk_other", "generation":1}),
+            ),
+            ("offered_at", serde_json::json!(8_640_000_000_001_i64)),
+            ("resolved_at", serde_json::json!(-1)),
+        ] {
+            let mut invalid = serde_json::to_value(&receipt).unwrap();
+            invalid[field] = value;
+            assert!(MessageReceipt::from_snapshot(&receipt.id, &invalid.to_string(), &m).is_err());
+        }
+        receipt.attempts.resize(9, receipt.attempts[0].clone());
+        assert!(
+            MessageReceipt::from_snapshot(
+                &receipt.id,
+                &serde_json::to_string(&receipt).unwrap(),
+                &m
+            )
+            .is_err()
+        );
+        let unknown = serde_json::to_value(MessageView::at(m, 0)).unwrap();
+        assert_eq!(
+            unknown["receipt"],
+            serde_json::json!({
+                "coverage":"legacy_unknown", "delivery_id":null, "pointer_offer_recorded_at":null,
+                "transport_attempts":[], "presentation":"unknown", "resolved_at":null,
+            })
+        );
+    }
+
+    #[test]
     fn the_list_keeps_the_newest() {
         let mut messages = Vec::new();
         for at in 0..=MAX_MESSAGES as i64 {
@@ -1562,6 +2132,7 @@ mod tests {
         assert!(text.contains("agentscm_hub_message") && text.contains("status accepted"));
         assert!(!text.contains("auto") && !text.contains("manual"), "{text}");
         let accepted = |mode| Answered {
+            newly_acknowledged: true,
             state: MessageState::Accepted,
             accepted: Some((mode, message("msg_1", 0))),
         };
@@ -1573,6 +2144,7 @@ mod tests {
         assert!(manual.contains("Work wrk_1") && manual.contains("release"));
         assert!(accepted(Mode::Auto).text("msg_1").contains("act on it now"));
         let done = Answered {
+            newly_acknowledged: true,
             state: MessageState::Done,
             accepted: None,
         }
@@ -1619,9 +2191,10 @@ mod tests {
             m.not_picked_up(m.due_at()),
             "its deadline still tells the person"
         );
-        for offered_again in [Waker::Claude.via(), "hook:codex"] {
+        for offered_again in [Waker::Claude.via(), Waker::Copilot.via(), "hook:codex"] {
             m.via = Some(offered_again.into());
             assert!(due(&m, 100 + REOFFER_SECS + 1), "{offered_again}");
+            assert!(!wakes(&m, 100 + REOFFER_SECS + 1), "never wake repeatedly");
         }
     }
 
@@ -1670,6 +2243,8 @@ mod tests {
         assert_eq!(client.reach(100), Reach::WakeNow);
         client.waker = Some(Waker::Codex);
         assert_eq!(client.reach(100), Reach::WakeSoon);
+        client.waker = Some(Waker::Copilot);
+        assert_eq!(client.reach(100), Reach::WakeNow);
         client.waker = Some(Waker::Claude);
         client.open_waits = 0;
         client.wait_left_at = Some(100);
@@ -1734,15 +2309,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_copilot_notification_wait_is_not_a_permanent_wake_capability() {
+        let (token, session) = ("tok_copilot_reach", "copilot_reach");
+        let reach = || reach_of(token, session, unix_now());
+        note_hook(token, session, "hook:copilot", true, false, unix_now());
+        assert_eq!(reach(), Reach::NextStep, "no notification waiter yet");
+        let slot = WaitSlot::open("u_copilot_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Copilot, unix_now());
+        assert_eq!(reach(), Reach::WakeNow);
+        drop(slot);
+        assert_eq!(reach(), Reach::NextStep, "one notice ends its waiter");
+        let slot = WaitSlot::open("u_copilot_reach", token, session).unwrap();
+        note_wait(token, session, Waker::Copilot, unix_now());
+        assert_eq!(reach(), Reach::WakeNow, "another notification rearms it");
+        note_end(token, session);
+        assert_eq!(reach(), Reach::Ended);
+        drop(slot);
+        note_hook(token, session, "hook:copilot", false, false, unix_now());
+        assert_eq!(reach(), Reach::Ended, "a helper cannot resume its parent");
+        note_hook(token, session, "hook:copilot", true, false, unix_now());
+        assert_eq!(reach(), Reach::NextStep, "resume alone opens no wait");
+    }
+
+    #[test]
+    fn wait_bodies_name_only_supported_delivery_mechanisms() {
+        let legacy: WaitBody = serde_json::from_value(serde_json::json!({"session": "s"})).unwrap();
+        assert_eq!(legacy.agent, Waker::Claude);
+        for (name, agent, via) in [
+            ("claude", Waker::Claude, "wake:claude"),
+            ("codex", Waker::Codex, "wake:codex"),
+            ("copilot", Waker::Copilot, "wake:copilot"),
+        ] {
+            let body: WaitBody =
+                serde_json::from_value(serde_json::json!({"session": "s", "agent": name})).unwrap();
+            assert_eq!(body.agent, agent);
+            assert_eq!(body.agent.via(), via);
+            assert_eq!(serde_json::to_value(agent).unwrap(), name);
+        }
+        for unknown in ["cursor", "gemini", "generic", "unknown"] {
+            assert!(
+                serde_json::from_value::<WaitBody>(
+                    serde_json::json!({"session": "s", "agent": unknown})
+                )
+                .is_err()
+            );
+        }
+    }
+
     /// Each step keeps its own time: the first delivery and its way, the agent's first answer,
     /// its done. A re-offer by another way changes neither the first delivery nor its way.
     #[test]
     fn each_step_of_a_message_keeps_its_own_time() {
         let (_dir, store) = temp_store();
-        let alice = principal("tok_a", "u_times");
-        sent(&*store, "u_times", message("msg_1", 0));
+        let alice = message_principal(&*store, "times");
+        let mut notice = message("msg_1", 0);
+        notice.token = alice.token_id.clone();
+        sent(&*store, &alice.owner.id, notice);
         let stored =
-            |store: &dyn Store| load(store, &messages_key("u_times", 7)).unwrap()[0].clone();
+            |store: &dyn Store| load(store, &messages_key(&alice.owner.id, 7)).unwrap()[0].clone();
         assert!(
             take(&*store, &alice, "s", Waker::Claude.via(), 10)
                 .unwrap()
@@ -1768,6 +2393,26 @@ mod tests {
             (Some(200), Some(300), Some(300))
         );
         assert!(!m.not_picked_up(10_000));
+    }
+
+    fn message_principal(store: &dyn Store, login: &str) -> Principal {
+        use crate::hub::store::{ForgeIdentity, agent_token_digest, mint_bound_agent_token};
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 77,
+                },
+                login,
+            )
+            .unwrap();
+        let (_, secret, _) =
+            mint_bound_agent_token(store, &user.id, "laptop", "o/r", 7, 3600, false).unwrap();
+        store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
     }
 
     fn principal(token: &str, owner: &str) -> Principal {
@@ -1813,8 +2458,10 @@ mod tests {
     #[test]
     fn an_accepted_message_can_be_declined_and_a_refusal_says_why() {
         let (_dir, store) = temp_store();
-        let alice = principal("tok_a", "u1");
-        sent(&*store, "u1", message("msg_1", 0));
+        let alice = message_principal(&*store, "reader");
+        let mut notice = message("msg_1", 0);
+        notice.token = alice.token_id.clone();
+        sent(&*store, &alice.owner.id, notice);
         assert!(take(&*store, &alice, "s", "mcp", 10).unwrap().is_some());
         let reply = |id: &str, status: Answer| answer(&*store, &alice, "s", id, status, 11);
         assert_eq!(
@@ -1830,13 +2477,273 @@ mod tests {
             assert_eq!(envelope.code, "invalid_or_changed", "{envelope:?}");
             envelope.message
         };
-        for status in [Answer::Accepted, Answer::Declined, Answer::Done] {
+        assert!(!reply("msg_1", Answer::Declined).unwrap().newly_acknowledged);
+        for status in [Answer::Accepted, Answer::Done] {
             assert!(
                 reason("msg_1", status).starts_with("This Hub message is already declined"),
                 "{status:?}"
             );
         }
         assert!(reason("msg_9", Answer::Accepted).starts_with("No Hub message with that id"));
+    }
+
+    fn registered_message_session(store: &dyn Store, who: &Principal) -> String {
+        let now = unix_now();
+        store
+            .lifecycle_register(
+                &who.token_id,
+                &super::super::session_lifecycle::LifecycleRegister {
+                    session: "s".into(),
+                    start_nonce: "message-test".into(),
+                    operation_id: "message-register".into(),
+                    observed_at: now,
+                    expected_incarnation: None,
+                    qualified: false,
+                },
+                now,
+            )
+            .unwrap()
+            .incarnation
+    }
+
+    #[test]
+    fn modern_calls_hold_existing_and_new_human_notices_during_ignore() {
+        let (_dir, store) = temp_store();
+        let who = message_principal(&*store, "message-reader");
+        let incarnation = registered_message_session(&*store, &who);
+        let now = unix_now();
+        let mut first = message("msg_existing", now);
+        first.token = who.token_id.clone();
+        sent(&*store, &who.owner.id, first);
+        record_current_sources(&*store, &who, "s", now).unwrap();
+        let original = store.notice_pending(&who.token_id, "s", now).unwrap();
+        assert_eq!(original.len(), 1);
+        store
+            .set_setting(
+                &mode_key(&who.owner.id, Some(7)),
+                "\"ignore\"",
+                &who.owner.id,
+            )
+            .unwrap();
+        let mut second = message("msg_queued", now);
+        second.token = who.token_id.clone();
+        sent(&*store, &who.owner.id, second);
+        assert!(
+            super::super::cooperation::offer_on_call(&*store, &who, "s", &incarnation, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .notice_pending(&who.token_id, "s", now)
+                .unwrap()
+                .is_empty()
+        );
+        let messages = load(&*store, &messages_key(&who.owner.id, 7)).unwrap();
+        assert_eq!(messages[1].state, MessageState::Queued);
+        // Other domains still offer their current pointer while human messages are held.
+        let operational = store
+            .notice_record(
+                &who.token_id,
+                &NoticeSource {
+                    kind: SourceKind::Operational,
+                    id: "synthetic-status".into(),
+                    version: "1".into(),
+                },
+                &NoticeRecipient {
+                    token: who.token_id.clone(),
+                    session: "s".into(),
+                    work_id: None,
+                    generation: None,
+                },
+                now,
+            )
+            .unwrap();
+        let other = store
+            .notice_offer(
+                &who.token_id,
+                &NoticeOfferRequest {
+                    session: "s".into(),
+                    incarnation: incarnation.clone(),
+                    automatic: false,
+                },
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.delivery_id, operational.id);
+        store
+            .notice_resolve(&who.token_id, "s", &operational.source, now)
+            .unwrap();
+        store
+            .set_setting(
+                &mode_key(&who.owner.id, Some(7)),
+                "\"manual\"",
+                &who.owner.id,
+            )
+            .unwrap();
+        let restored = store
+            .notice_offer(
+                &who.token_id,
+                &NoticeOfferRequest {
+                    session: "s".into(),
+                    incarnation: incarnation.clone(),
+                    automatic: true,
+                },
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.delivery_id, original[0].id,
+            "Ignore did not withdraw or spend the original attempt"
+        );
+        answer_with_transport(
+            &*store,
+            &who,
+            "s",
+            "msg_existing",
+            Answer::Accepted,
+            Some(&incarnation),
+            now,
+        )
+        .unwrap();
+        edit(
+            &*store,
+            &messages_key(&who.owner.id, 7),
+            &who.owner.id,
+            |messages| messages[1].state = MessageState::Withdrawn,
+        )
+        .unwrap();
+        assert!(
+            super::super::cooperation::offer_on_call(&*store, &who, "s", &incarnation, now)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn modern_automatic_offer_only_names_a_message_already_admitted_for_acceptance() {
+        use super::super::notices::NoticeReceipt;
+        let (_dir, store) = temp_store();
+        let who = message_principal(&*store, "batch-reader");
+        let incarnation = registered_message_session(&*store, &who);
+        let now = unix_now();
+        let recipient = NoticeRecipient {
+            token: who.token_id.clone(),
+            session: "s".into(),
+            work_id: None,
+            generation: None,
+        };
+        let mut candidates = (0..16)
+            .map(|n| {
+                let mut message = message(&format!("msg_batch_{n}"), now);
+                message.token = who.token_id.clone();
+                let receipt = NoticeReceipt::new(
+                    &who.repository,
+                    NoticeSource {
+                        kind: SourceKind::HumanMessage,
+                        id: message.id.clone(),
+                        version: "1".into(),
+                    },
+                    recipient.clone(),
+                    now,
+                );
+                (receipt.id, message)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let (_, unadmitted) = candidates.remove(0);
+        let unadmitted_id = unadmitted.id.clone();
+        for (_, message) in candidates.into_iter().take(PER_DELIVERY) {
+            sent(&*store, &who.owner.id, message);
+        }
+        sent(&*store, &who.owner.id, unadmitted);
+        record_current_sources(&*store, &who, "s", now).unwrap();
+        assert_eq!(
+            store.notice_pending(&who.token_id, "s", now).unwrap().len(),
+            PER_DELIVERY
+        );
+        let offered = store
+            .notice_offer(
+                &who.token_id,
+                &NoticeOfferRequest {
+                    session: "s".into(),
+                    incarnation: incarnation.clone(),
+                    automatic: true,
+                },
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let receipt = store
+            .notice_pending(&who.token_id, "s", now)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.id == offered.delivery_id)
+            .unwrap();
+        assert_ne!(
+            receipt.source.id, unadmitted_id,
+            "the queued fourth source sorts first but must not spend budget"
+        );
+        answer_with_transport(
+            &*store,
+            &who,
+            "s",
+            &receipt.source.id,
+            Answer::Accepted,
+            Some(&incarnation),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&*store, &messages_key(&who.owner.id, 7))
+                .unwrap()
+                .last()
+                .unwrap()
+                .state,
+            MessageState::Queued
+        );
+    }
+
+    #[test]
+    fn acceptance_uses_mode_selected_by_the_message_transaction() {
+        let (_dir, store) = temp_store();
+        let who = message_principal(&*store, "consent-reader");
+        let now = unix_now();
+        let mut notice = message("msg_consent", now);
+        notice.token = who.token_id.clone();
+        sent(&*store, &who.owner.id, notice);
+        store
+            .set_setting(&mode_key(&who.owner.id, Some(7)), "\"auto\"", &who.owner.id)
+            .unwrap();
+        take(&*store, &who, "s", "mcp", now).unwrap();
+        let source = NoticeSource {
+            kind: SourceKind::HumanMessage,
+            id: "msg_consent".into(),
+            version: "1".into(),
+        };
+        // Change consent after the message read but before its transaction. The returned
+        // authority must be the newly locked mode, not the delivery's earlier Auto mode.
+        let (message, mode) = edit_message(&*store, &who, "s", &source, None, |messages| {
+            store.set_setting(
+                &mode_key(&who.owner.id, Some(7)),
+                "\"manual\"",
+                &who.owner.id,
+            )?;
+            messages[0].state = MessageState::Accepted;
+            Ok(messages[0].clone())
+        })
+        .unwrap();
+        assert_eq!(mode, Mode::Manual);
+        let text = Answered {
+            newly_acknowledged: true,
+            state: MessageState::Accepted,
+            accepted: Some((mode, message)),
+        }
+        .text("msg_consent");
+        assert!(text.contains("their yes"), "{text}");
+        assert!(!text.contains("act on it now"), "{text}");
     }
 
     fn wake_check(
@@ -2293,14 +3200,116 @@ mod tests {
         assert!(Instant::now() >= deadline);
     }
 
+    #[test]
+    fn terminal_without_a_waiter_projects_ended_without_hiding_a_successor() {
+        use super::super::session_lifecycle::{EndReason, LifecycleEnd, LifecycleRegister};
+        let (_dir, store) = temp_store();
+        let now = unix_now();
+        let principal = minted(&*store, now, 909, "terminal-projection", "acme/widgets");
+        let native = "native-page-projection";
+        let register = |nonce: &str, expected| LifecycleRegister {
+            session: native.into(),
+            start_nonce: nonce.into(),
+            operation_id: format!("register-{nonce}"),
+            observed_at: now,
+            expected_incarnation: expected,
+            qualified: false,
+        };
+        let old = store
+            .lifecycle_register(&principal.token_id, &register("old", None), now)
+            .unwrap();
+        note_hook(&principal.token_id, native, "hook:codex", true, true, now);
+        assert_eq!(reach_of(&principal.token_id, native, now), Reach::NextStep);
+        store
+            .lifecycle_end(
+                &principal.token_id,
+                &LifecycleEnd {
+                    session: native.into(),
+                    incarnation: old.incarnation.clone(),
+                    operation_id: "project-end".into(),
+                    observed_at: now,
+                    reason: EndReason::ExplicitEnd,
+                    work: vec![],
+                },
+                now,
+            )
+            .unwrap();
+        let tokens = [(principal.token_id.clone(), "codex".into())];
+        let page_at = || {
+            page(
+                &*store,
+                &principal.owner,
+                &principal.repository,
+                101,
+                &tokens,
+            )
+            .unwrap()
+        };
+        let ended = page_at();
+        assert_eq!(ended.sessions.len(), 1);
+        assert_eq!(ended.sessions[0].reach, Reach::Ended);
+        assert!(ended.sessions[0].client.ended);
+        assert_eq!(
+            lifecycle_reach(&*store, &principal.token_id, native, now),
+            Reach::Ended
+        );
+        assert_eq!(
+            reach_of(&principal.token_id, native, now),
+            Reach::NextStep,
+            "projection never mutates cached observations"
+        );
+        store
+            .lifecycle_register(
+                &principal.token_id,
+                &register("successor", Some(old.incarnation)),
+                now,
+            )
+            .unwrap();
+        note_mcp(&principal.token_id, None, native, now);
+        let resumed = page_at();
+        assert_eq!(resumed.sessions[0].reach, Reach::NextStep);
+        assert!(!resumed.sessions[0].client.ended);
+        assert_eq!(
+            lifecycle_reach(&*store, &principal.token_id, native, now),
+            Reach::NextStep
+        );
+        assert!(store.revoke_agent_token(&principal.token_id).unwrap());
+        assert_eq!(
+            lifecycle_reach(&*store, &principal.token_id, native, now),
+            Reach::Unreachable
+        );
+        let unknown = page_at();
+        assert_eq!(unknown.sessions[0].reach, Reach::Unreachable);
+        assert_eq!(unknown.sessions[0].tier, "unknown");
+        SESSIONS
+            .lock()
+            .unwrap()
+            .remove(&(principal.token_id, native.into()));
+    }
+
     /// A restart keeps each session's facts until they expire, never that a waiter waits, and the
     /// saved list is taken once.
     #[test]
     fn session_facts_survive_a_restart_until_they_expire() {
         let (_dir, store) = temp_store();
         let now = unix_now();
-        let fresh = ("tok_saved".to_owned(), "s_fresh".to_owned());
-        let old = ("tok_saved".to_owned(), "s_old".to_owned());
+        let principal = minted(&*store, now, 908, "saved-reader", "acme/widgets");
+        let fresh = (principal.token_id.clone(), "s_fresh".to_owned());
+        let old = (principal.token_id.clone(), "s_old".to_owned());
+        let lifecycle = store
+            .lifecycle_register(
+                &fresh.0,
+                &super::super::session_lifecycle::LifecycleRegister {
+                    session: fresh.1.clone(),
+                    start_nonce: "saved-start".into(),
+                    operation_id: "saved-register".into(),
+                    observed_at: now,
+                    expected_incarnation: None,
+                    qualified: false,
+                },
+                now,
+            )
+            .unwrap();
         note_hook(&fresh.0, &fresh.1, "hook:claude", true, true, now);
         note_hook(
             &old.0,
@@ -2328,10 +3337,113 @@ mod tests {
         assert_eq!(back.reach(now + 60), Reach::NextStep);
         assert!(!map.contains_key(&old), "a fact past its expiry is dropped");
         drop(map);
+        store
+            .lifecycle_end(
+                &fresh.0,
+                &super::super::session_lifecycle::LifecycleEnd {
+                    session: fresh.1.clone(),
+                    incarnation: lifecycle.incarnation,
+                    operation_id: "saved-end".into(),
+                    observed_at: now + 70,
+                    reason: super::super::session_lifecycle::EndReason::ExplicitEnd,
+                    work: vec![],
+                },
+                now + 70,
+            )
+            .unwrap();
+        save_sessions(&*store, now + 70).unwrap();
+        SESSIONS.lock().unwrap().remove(&fresh);
+        restore_sessions(&*store, now + 80);
+        assert!(
+            SESSIONS.lock().unwrap().get(&fresh).unwrap().ended,
+            "durable terminal beats stale saved live facts"
+        );
         assert_eq!(store.get_setting(SAVED_KEY).unwrap().as_deref(), Some(""));
         SESSIONS.lock().unwrap().remove(&fresh);
         restore_sessions(&*store, now + 120);
         assert!(!SESSIONS.lock().unwrap().contains_key(&fresh), "taken once");
+    }
+
+    #[test]
+    fn legacy_session_facts_restore_only_while_the_token_and_saved_fact_are_valid() {
+        let (_dir, store) = temp_store();
+        let now = unix_now();
+        let who = minted(&*store, now, 909, "legacy-saved", "acme/widgets");
+        let revoked = minted(&*store, now, 910, "revoked-saved", "acme/widgets");
+        let hook = (who.token_id.clone(), "legacy_hook".to_owned());
+        let mcp = (who.token_id.clone(), "legacy_mcp".to_owned());
+        let expired_fact = (who.token_id.clone(), "legacy_old".to_owned());
+        let revoked_fact = (revoked.token_id.clone(), "legacy_revoked".to_owned());
+        note_hook(&hook.0, &hook.1, "hook:claude", true, true, now);
+        note_mcp(&mcp.0, None, &mcp.1, now);
+        note_hook(
+            &expired_fact.0,
+            &expired_fact.1,
+            "hook:claude",
+            true,
+            true,
+            now - SAVED_FOR_SECS,
+        );
+        note_mcp(&revoked_fact.0, None, &revoked_fact.1, now);
+        // Saving a real open wait must still restore only ordinary next-call visibility.
+        let slot = WaitSlot::open(&who.owner.id, &hook.0, &hook.1).unwrap();
+        note_wait(&hook.0, &hook.1, Waker::Claude, now);
+        save_sessions(&*store, now).unwrap();
+        drop(slot);
+        assert!(
+            store
+                .lifecycle_get(&hook.0, &hook.1, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.revoke_agent_token(&revoked.token_id).unwrap());
+        assert!(
+            store
+                .lifecycle_get(&revoked_fact.0, &revoked_fact.1, now)
+                .is_err()
+        );
+        {
+            let mut map = SESSIONS.lock().unwrap();
+            for key in [&hook, &mcp, &expired_fact, &revoked_fact] {
+                map.remove(key);
+            }
+        }
+        restore_sessions(&*store, now + 60);
+        {
+            let map = SESSIONS.lock().unwrap();
+            let restored = map
+                .get(&hook)
+                .expect("valid legacy hook visibility survives restart");
+            assert!(restored.top_level && restored.hook_context);
+            assert_eq!(restored.open_waits, 0);
+            assert_eq!(restored.wait_left_at, None);
+            assert_eq!(restored.reach(now + 60), Reach::NextStep);
+            let restored = map
+                .get(&mcp)
+                .expect("valid legacy MCP visibility survives restart");
+            assert!(restored.mcp);
+            assert_eq!(restored.reach(now + 60), Reach::NextStep);
+            assert!(!map.contains_key(&expired_fact));
+            assert!(!map.contains_key(&revoked_fact));
+        }
+        assert!(
+            store
+                .lifecycle_get(&hook.0, &hook.1, now + 60)
+                .unwrap()
+                .is_none(),
+            "restore did not register a native lifecycle or grant process-exit qualification"
+        );
+        save_sessions(&*store, now + 60).unwrap();
+        {
+            let mut map = SESSIONS.lock().unwrap();
+            map.remove(&hook);
+            map.remove(&mcp);
+        }
+        // The saved facts still fit the 24-hour bound, but their one-hour token has expired.
+        restore_sessions(&*store, now + 7200);
+        let map = SESSIONS.lock().unwrap();
+        assert!(!map.contains_key(&hook));
+        assert!(!map.contains_key(&mcp));
     }
 
     #[test]

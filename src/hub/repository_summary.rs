@@ -205,6 +205,7 @@ mod tests {
             updated_at: 1_000,
             created_seq: 1,
             updated_seq: 1,
+            finished_paths: Vec::new(),
         }
     }
 

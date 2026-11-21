@@ -14,10 +14,12 @@ starting the hub. Its value names an existing regular JSON file no larger than 6
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "bindings": [
     {
       "hub_repository": "acme/widgets",
+      "hub_host": "github.com",
+      "hub_repository_id": 12345,
       "native_repository": "0123456789abcdef0123456789abcdef",
       "data_dir": "/operator/selected/existing/native-store"
     }
@@ -26,11 +28,32 @@ starting the hub. Its value names an existing regular JSON file no larger than 6
 ```
 
 The file is strict: unknown fields, unsupported versions, invalid identities, duplicate hub
-repositories, more than 32 bindings and missing native stores stop hub startup. `data_dir` comes
-only from this startup file. Requests cannot supply a path or URL. Startup checks that the current
+repository identities, more than 32 bindings and missing native stores stop hub startup.
+`hub_host` is the lowercase forge hostname used by the Hub (including its port when configured),
+without a scheme or path. `hub_repository_id` is the forge's positive numeric repository ID,
+not the Hub's `rep_` row ID. Confirm both against the connected repository and its forge before
+adding a binding. `hub_repository` remains a validated display label; the mapping key is the
+host and stable repository ID. Renames retain the mapping, while a different host or ID does not
+select it, even when the display name matches. Duplicate host/ID pairs are refused across labels.
+`data_dir` comes only from this startup file. Requests cannot supply a path or URL. Startup
+checks that the current
 native authority identity equals `native_repository` and that the native root, authority database,
 access lock and object directory already exist. It does not create a native store or workflow
 journal.
+
+Version 1 configuration files are refused at startup because a display name alone cannot pin
+a forge repository. To migrate, stop the Hub, retain a private copy of the old operator file,
+confirm the host and stable forge repository ID for every binding, add `hub_host` and
+`hub_repository_id`, set the file's top-level `version` to `2`, and restart the Hub. Check the
+intended repository's status/list reads and a separate repository's unavailable response before
+relying on the mapping. Native stores and workflow journals need no migration. The HTTP/MCP
+response envelope remains version 1.
+
+For rollback without native workflow reads, unset `AGENTSCM_WORKFLOW_BINDINGS_FILE` and restart
+the Hub; other Hub features continue to work and workflow reads become unavailable. Keep the
+version 2 file for a later restart. Do not restore name-only bindings to work around identity
+validation. If rolling back the Hub binary, leave this optional feature disabled until the binary
+supports host/ID-scoped bindings.
 
 An authenticated agent or read-only token can request:
 
@@ -41,7 +64,9 @@ GET /v1/hub/skill-workflows/{run_id}
 
 The run route accepts no query fields. The collection route accepts only an optional `before`
 cursor (a previous page's `next_cursor`) and an optional `q` search text of at most 200 bytes.
-The hub uses the token's repository as the only mapping key. Before
+The hub resolves the token's forge repository scope through the same host/stable-ID helper used
+by other repository reads. A legacy token without an ID resolves the connected repository on its
+owner's host; if none is connected, it cannot select a version 2 binding. Before
 each journal read it reopens the native authority and compares its identity with the configured
 identity. A missing, unreadable or replaced authority returns an unavailable envelope without a
 retained projection. The retained run must also name the configured native identity.

@@ -29,8 +29,11 @@ pub fn routes() -> Router<HubState> {
         )
 }
 
-fn deploy_workflow_key(repository_id: i64) -> String {
-    format!("deploy_workflow:repo:{repository_id}")
+fn deploy_workflow_key(host: &str, repository_id: i64) -> String {
+    format!(
+        "deploy_workflow:repo:{}",
+        super::store::repository_scope(host, "", Some(repository_id))
+    )
 }
 
 /// A workflow file the forge names in a run's `path`: `.github/workflows/NAME.yml` or `.yaml`.
@@ -48,10 +51,15 @@ fn valid_workflow_path(path: &str) -> bool {
 }
 
 /// The workflow whose successful run on a merge commit counts as that commit's deployment,
-/// keyed by the forge's repository id so a rename keeps it.
-pub(super) fn deploy_workflow(store: &dyn Store, repository_id: i64) -> Result<Option<String>> {
+/// keyed by the forge host and repository id so a rename keeps it and another host's repository
+/// with the same id does not share it.
+pub(super) fn deploy_workflow(
+    store: &dyn Store,
+    host: &str,
+    repository_id: i64,
+) -> Result<Option<String>> {
     Ok(store
-        .get_setting(&deploy_workflow_key(repository_id))?
+        .get_setting(&deploy_workflow_key(host, repository_id))?
         .filter(|path| valid_workflow_path(path)))
 }
 
@@ -68,8 +76,11 @@ pub(super) async fn watched(
     if state.sync.external_runs_enabled(&repo.full_name) {
         return Ok(true);
     }
-    let (store, id) = (state.store.clone(), repo.repository_id);
-    blocking(state, move || Ok(deploy_workflow(&*store, id)?.is_some())).await
+    let (store, host, id) = (state.store.clone(), repo.host.clone(), repo.repository_id);
+    blocking(state, move || {
+        Ok(deploy_workflow(&*store, &host, id)?.is_some())
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -78,13 +89,13 @@ struct SetDeployWorkflow {
     workflow: Option<String>,
 }
 
-/// The forge id of the token's connected repository; `not_connected` when there is none.
+/// The forge host and id of the token's connected repository; `not_connected` when there is none.
 async fn connected_id(
     state: &HubState,
     principal: &Principal,
-) -> std::result::Result<i64, ApiError> {
+) -> std::result::Result<(String, i64), ApiError> {
     match connected(state, principal).await? {
-        Some((_, repository)) => Ok(repository.repository_id),
+        Some((_, repository)) => Ok((repository.host, repository.repository_id)),
         None => Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected")),
     }
 }
@@ -98,8 +109,12 @@ async fn view_deploy_workflow(
     // A repository the Hub has not connected has no deploy workflow.
     let workflow = match connected(&state, &principal).await? {
         Some((_, repository)) => {
-            let (store, id) = (state.store.clone(), repository.repository_id);
-            blocking(&state, move || deploy_workflow(&*store, id)).await?
+            let (store, host, id) = (
+                state.store.clone(),
+                repository.host,
+                repository.repository_id,
+            );
+            blocking(&state, move || deploy_workflow(&*store, &host, id)).await?
         }
         None => None,
     };
@@ -117,7 +132,7 @@ async fn set_deploy_workflow(
     JsonBody(body): JsonBody<SetDeployWorkflow>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     scope(&principal, &repo)?;
-    let id = connected_id(&state, &principal).await?;
+    let (host, id) = connected_id(&state, &principal).await?;
     if body
         .workflow
         .as_deref()
@@ -128,14 +143,9 @@ async fn set_deploy_workflow(
         ));
     }
     let admin = state.login.is_admin_user(&principal.owner)
-        || super::login::devices::mint_access(
-            &state,
-            &principal.owner,
-            &principal.repository,
-            "deploy_workflow",
-        )
-        .await?
-        .1;
+        || super::login::devices::token_access(&state, &principal, "deploy_workflow")
+            .await?
+            .1;
     if !admin {
         return Err(ApiError::forbidden()
             .with_message("Only a repository admin or a Hub admin names the deploy workflow."));
@@ -148,8 +158,8 @@ async fn set_deploy_workflow(
     let saved = blocking(&state, move || {
         // An empty value reads as none: the settings table keeps no deletes.
         let value = workflow.unwrap_or_default();
-        store.set_setting(&deploy_workflow_key(id), &value, &actor)?;
-        deploy_workflow(&*store, id)
+        store.set_setting(&deploy_workflow_key(&host, id), &value, &actor)?;
+        deploy_workflow(&*store, &host, id)
     })
     .await?;
     Ok(Json(
@@ -873,9 +883,9 @@ async fn pass(
 ) -> Gh<()> {
     let oldest = unix_now() - state.sync.config()?.activity_days * 86_400;
     let (after_number, after_id) = state.sync.external_cursor(&repo.id);
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let unmerged = blocking(state, move || {
-        store.pull_publications(&name, after_number, MAX_PER_PASS)
+        store.pull_publications(&scope, after_number, MAX_PER_PASS)
     })
     .await?;
     let full = unmerged.len() >= MAX_PER_PASS;
@@ -914,9 +924,9 @@ async fn pass(
         .sync
         .set_external_cursor(&repo.id, (if full { last } else { 0 }, after_id.clone()));
 
-    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let (store, scope) = (state.store.clone(), repo.repository_scope());
     let merged = blocking(state, move || {
-        store.merged_publications(&name, &after_id, oldest, MAX_PER_PASS)
+        store.merged_publications(&scope, &after_id, oldest, MAX_PER_PASS)
     })
     .await?;
     let next = match merged.last() {
@@ -988,8 +998,8 @@ async fn commit_runs(
     let name = repo.full_name.as_str();
     let (runs, runs_done) = api.workflow_runs(token, name, sha).await?;
     let (deployments, deployments_done) = api.deployments(token, name, sha).await?;
-    let (store, id) = (state.store.clone(), repo.repository_id);
-    let deploy_path = blocking(state, move || deploy_workflow(&*store, id)).await?;
+    let (store, host, id) = (state.store.clone(), repo.host.clone(), repo.repository_id);
+    let deploy_path = blocking(state, move || deploy_workflow(&*store, &host, id)).await?;
     let mut found = Vec::new();
     let mut workflow_deploys = Vec::new();
     let mut complete = runs_done && deployments_done;
@@ -1063,6 +1073,30 @@ mod tests {
             provider_updated_at: at,
             html_url: Some("https://github.com/acme/widgets/actions/runs/7".into()),
         }
+    }
+
+    #[test]
+    fn equal_repository_ids_on_distinct_hosts_keep_deploy_workflows_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let path = ".github/workflows/deploy.yml";
+        store
+            .set_setting(&deploy_workflow_key("github.com", 101), path, "usr_admin")
+            .unwrap();
+        assert_eq!(
+            deploy_workflow(&*store, "github.com", 101)
+                .unwrap()
+                .as_deref(),
+            Some(path)
+        );
+        assert_eq!(
+            deploy_workflow(&*store, "ghe.example.invalid", 101).unwrap(),
+            None
+        );
     }
 
     #[test]

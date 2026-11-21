@@ -2,8 +2,9 @@
 use super::*;
 use crate::backend::LocalBackend;
 use crate::hub::connection::NewConnection;
-use crate::hub::store::{self, ForgeIdentity, mint_bound_agent_token};
+use crate::hub::store::{self, ForgeIdentity, User, mint_bound_agent_token};
 use crate::hub::validation_evidence::{ValidationSummaryConfig, persist_bundle};
+use crate::hub::work_transition::WorkLifecycleReader;
 use crate::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
 use crate::local_validation::fetch::HostedTestTransport;
 use crate::local_validation::*;
@@ -23,6 +24,7 @@ struct Fixture {
     repo: ConnectedRepository,
     forge: fake::FakeGithub,
     agent: String,
+    pull_owner: User,
     source: std::path::PathBuf,
     remote: std::path::PathBuf,
     base: String,
@@ -77,6 +79,24 @@ impl Fixture {
         revoked_at_ms: Option<u64>,
         exemptions: [Option<Vec<String>>; 2],
         changed_path: Option<&str>,
+    ) -> Self {
+        Self::build(
+            key_expiry,
+            max_age_seconds,
+            revoked_at_ms,
+            exemptions,
+            changed_path,
+            false,
+        )
+        .await
+    }
+    async fn build(
+        key_expiry: u64,
+        max_age_seconds: u64,
+        revoked_at_ms: Option<u64>,
+        exemptions: [Option<Vec<String>>; 2],
+        changed_path: Option<&str>,
+        app: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
@@ -190,6 +210,13 @@ impl Fixture {
                 ("publisher".into(), 7, [42].into()),
             );
             s.pushers.insert("synthetic-token".into(), [42].into());
+            if app {
+                s.installations.push(fake::Installation {
+                    id: 99,
+                    account: "acme".into(),
+                    repos: vec![42],
+                });
+            }
         });
         let store = store::open(&format!(
             "sqlite://{}",
@@ -206,16 +233,26 @@ impl Fixture {
                 "publisher",
             )
             .unwrap();
+        let pull_owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                "octocat",
+            )
+            .unwrap();
         let conn = store
             .insert_connection(
                 &NewConnection {
                     id: store::new_connection_id().unwrap(),
                     provider: "github".into(),
                     host: "github.com".into(),
-                    kind: "pat".into(),
-                    app_id: None,
-                    app_slug: None,
-                    acts_as: Some("publisher".into()),
+                    kind: if app { "app" } else { "pat" }.into(),
+                    app_id: app.then_some(fake::APP_ID),
+                    app_slug: app.then(|| fake::APP_SLUG.into()),
+                    acts_as: (!app).then(|| "publisher".into()),
                 },
                 &owner.id,
             )
@@ -240,9 +277,35 @@ impl Fixture {
             false,
         )
         .unwrap();
+        let secrets = root.path().join("secrets");
+        if app {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            crate::hub::sync::prepare_secrets_dir(&secrets, true).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .mode(0o600)
+                .write(true)
+                .create_new(true)
+                .open(secrets.join(format!("{}.json", conn.id)))
+                .unwrap();
+            write!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "app_id": fake::APP_ID,
+                    "slug": fake::APP_SLUG,
+                    "client_id": "synthetic",
+                    "client_secret": fake::CLIENT_SECRET,
+                    "webhook_secret": fake::WEBHOOK_SECRET,
+                    "pem": fake::private_pem(),
+                })
+            )
+            .unwrap();
+        }
         let config = crate::hub::sync::SyncConfig::from_lookup(
             "http://127.0.0.1:7332",
-            root.path().join("secrets"),
+            secrets,
             30,
             |name| match name {
                 "AGENTSCM_GITHUB_API_URL" => Some(forge.base.clone()),
@@ -255,6 +318,9 @@ impl Fixture {
             Arc::new(LocalBackend::open(root.path().join("objects")).unwrap()),
         )
         .with_sync(crate::hub::sync::Sync::new(config).unwrap());
+        if app {
+            crate::hub::sync::start(&hub).await.unwrap();
+        }
         Self {
             root,
             hub,
@@ -262,6 +328,7 @@ impl Fixture {
             repo,
             forge,
             agent,
+            pull_owner,
             source,
             remote,
             base,
@@ -430,6 +497,163 @@ impl Fixture {
                 .head_sha = self.head.clone()
         });
     }
+
+    fn notices(&self) -> Vec<crate::hub::notices::OwnerNotice> {
+        self.hub
+            .store
+            .owner_notice_list(
+                &WorkLifecycleReader::Person {
+                    owner: &self.pull_owner,
+                    repository: &self.repo.full_name,
+                    repository_id: self.repo.repository_id,
+                },
+                None,
+                100,
+                super::super::store::unix_now(),
+            )
+            .unwrap()
+            .notices
+    }
+
+    fn transition_trusted_config(&mut self, cause: InvalidationCause) {
+        git(&self.source, &["checkout", "-q", &self.base]);
+        match cause {
+            InvalidationCause::Policy => {
+                self.policies[0].epoch += 1;
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("policy.json"),
+                    serde_json::to_vec(&self.policies[0]).unwrap(),
+                )
+                .unwrap();
+            }
+            InvalidationCause::Recipe => {
+                self.recipe.commands[0].timeout_secs += 1;
+                self.policies[0].recipe_sha256 = self.recipe.sha256().unwrap();
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("recipe.json"),
+                    serde_json::to_vec(&self.recipe).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("policy.json"),
+                    serde_json::to_vec(&self.policies[0]).unwrap(),
+                )
+                .unwrap();
+            }
+            InvalidationCause::Registry => {
+                self.registry.epoch += 1;
+                fs::write(
+                    self.source.join(CONFIG_DIR).join("registry.json"),
+                    serde_json::to_vec(&self.registry).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        git(&self.source, &["add", CONFIG_DIR]);
+        git(
+            &self.source,
+            &["commit", "-qm", "trusted config transition"],
+        );
+        self.base = git(&self.source, &["rev-parse", "HEAD"]);
+        git(
+            &self.source,
+            &[
+                "push",
+                self.remote.to_str().unwrap(),
+                &format!("{}:refs/heads/main", self.base),
+            ],
+        );
+        self.forge.with(|s| {
+            s.repos
+                .get_mut(&42)
+                .unwrap()
+                .branches
+                .iter_mut()
+                .find(|branch| branch.name == "main")
+                .unwrap()
+                .sha = self.base.clone();
+        });
+        git(&self.source, &["checkout", "-q", &self.head]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_transitions_notice_only_affected_current_attestations() {
+    for cause in [
+        InvalidationCause::Policy,
+        InvalidationCause::Recipe,
+        InvalidationCause::Registry,
+    ] {
+        let mut f = Fixture::new().await;
+        let now = Fixture::now();
+        f.submit(0, now, false);
+        f.submit(1, now + 1, false);
+        f.run().await.unwrap();
+        assert!(f.notices().is_empty());
+
+        f.transition_trusted_config(cause);
+        f.run().await.unwrap();
+        let notices = f.notices();
+        assert_eq!(notices.len(), 1, "{cause:?}");
+        assert!(notices[0].body.contains(cause.label()));
+        assert!(notices[0].body.contains("Pull request #1"));
+        assert!(notices[0].body.contains("local-validation/unit"));
+        if cause == InvalidationCause::Registry {
+            assert!(notices[0].body.contains("local-validation/static"));
+        }
+
+        // Scoped transitions leave the other requirement valid; every replay is idempotent.
+        f.run().await.unwrap();
+        assert_eq!(f.notices(), notices, "{cause:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_invalidation_is_deferred_until_current_inventory_reports_ready() {
+    let mut f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    f.forge.with(|s| {
+        s.repos
+            .get_mut(&42)
+            .unwrap()
+            .pulls
+            .get_mut(&1)
+            .unwrap()
+            .draft = true;
+    });
+    f.transition_trusted_config(InvalidationCause::Policy);
+    f.run().await.unwrap();
+    assert!(f.notices().is_empty());
+
+    f.forge.with(|s| {
+        s.repos
+            .get_mut(&42)
+            .unwrap()
+            .pulls
+            .get_mut(&1)
+            .unwrap()
+            .draft = false;
+    });
+    f.run().await.unwrap();
+    assert_eq!(f.notices().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_or_unavailable_evidence_never_becomes_an_invalidation_notice() {
+    {
+        let mut stale = Fixture::new().await;
+        stale.submit(0, Fixture::now(), false);
+        stale.advance();
+        stale.run().await.unwrap();
+        assert!(stale.notices().is_empty());
+    }
+
+    let unavailable = Fixture::new().await;
+    unavailable.submit(0, Fixture::now(), false);
+    fs::remove_dir_all(unavailable.root.path().join("objects")).unwrap();
+    unavailable.run().await.unwrap();
+    assert!(unavailable.notices().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -946,29 +1170,47 @@ async fn expiry_after_preparation_or_success_invalidates_and_releases() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn app_identity_owns_and_updates_one_summary() {
-    let mut f = Fixture::new().await;
-    f.conn.kind = "app".into();
-    f.conn.app_slug = Some(fake::APP_SLUG.into());
-    f.forge.with(|s| {
-        s.installations.push(fake::Installation {
-            id: 99,
-            account: "acme".into(),
-            repos: vec![42],
-        });
-        s.installation_tokens.insert("synthetic-token".into(), 99);
+async fn app_rename_updates_the_existing_validation_summary_on_poll() {
+    let f = Fixture::build(
+        i64::MAX as u64,
+        3600,
+        None,
+        [None, None],
+        Some("change"),
+        true,
+    )
+    .await;
+    let now = Fixture::now();
+    f.submit(0, now, false);
+    assert_eq!(crate::hub::sync::poll_once(&f.hub).await.unwrap().len(), 1);
+    let id = f.journal().comment_id.unwrap();
+    let original = f.forge.with(|s| {
+        let comment = &mut s.repos.get_mut(&42).unwrap().comments.get_mut(&1).unwrap()[0];
+        assert_eq!(comment.author, format!("{}[bot]", fake::APP_SLUG));
+        comment.author = "renamed-app[bot]".into();
+        s.app_slug = Some("renamed-app".into());
+        comment.body.clone()
     });
-    f.submit(0, Fixture::now(), false);
-    f.run().await.unwrap();
-    let id = f.journal().comment_id;
-    f.submit(1, Fixture::now(), false);
-    f.run().await.unwrap();
-    assert_eq!(f.journal().comment_id, id);
-    assert_eq!(f.counts().0, 1);
+    f.submit(1, now + 1, false);
+    assert_eq!(crate::hub::sync::poll_once(&f.hub).await.unwrap().len(), 1);
+    assert_eq!(f.journal().comment_id, Some(id));
+    let stored = f.hub.store.connection(&f.conn.id).unwrap().unwrap();
+    assert_eq!(stored.app_slug.as_deref(), Some("renamed-app"));
     f.forge.with(|s| {
-        assert_eq!(
-            s.repos[&42].comments[&1][0].author,
-            format!("{}[bot]", fake::APP_SLUG)
+        let repo = &s.repos[&42];
+        assert_eq!(repo.comments[&1].len(), 1);
+        assert_ne!(repo.comments[&1][0].body, original);
+        assert_eq!(repo.comments[&1][0].author, "renamed-app[bot]");
+        assert!(s.requests.iter().any(|request| {
+            request.method == "PATCH"
+                && request.path_and_query == format!("/repos/acme/widgets/issues/comments/{id}")
+        }));
+        assert!(
+            repo.statuses
+                .iter()
+                .rev()
+                .take(2)
+                .all(|(_, status)| status["state"] == "success")
         )
     });
 }

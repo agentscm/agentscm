@@ -4,17 +4,28 @@ title: "Documentation"
 
 # Documentation
 
-> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See
-> the [project README](../README.md) for product status
-> and the [changelog](../CHANGELOG.md) for known limits.
+AgentSCM shows people and their coding agents who is working on what, what changed and what needs
+attention next, alongside your existing Git repositories and GitHub or GitLab.
+
+> **Alpha: try it, don't depend on it.** The CLI, APIs and storage may change between releases
+> without migration. See the [project README](../README.md) for product status and the
+> [changelog](../CHANGELOG.md) for known limits.
 
 ## Start here
 
-- [Try the scripted demo](scripted-demo.md): no account or Docker, no repository changes.
-- [Install and connect agents](install.md): run a local Hub or join one that already runs; review platform limits first.
-- [Agent tokens for a local Hub without a forge](local-agent-token.md): try agents against your own Hub with no GitHub or GitLab sign-in.
-- [Guided setup](setup-guide.md): what quickstart detects, changes and leaves for you to confirm.
-- [Concepts](concepts.md): the Hub, intents, hooks and native workflows in plain English.
+- [See it in action](scripted-demo.md): one command shows three agents sharing your repository.
+  No account, Docker or setup.
+- [Install](install.md): set up this computer once, for every project and coding agent on it. Or
+  [let your coding agent set it up](install.md#let-your-coding-agent-set-it-up).
+- [Join your team's Hub](team-member-onboarding.md): connect to a Hub someone already runs.
+- [How it works](concepts.md): the Hub, intents, hooks and Work, in plain English.
+
+## More ways to set up
+
+- [Guided setup](setup-guide.md): what quickstart detects, changes and leaves for you to confirm,
+  and every flag.
+- [Agent tokens for a local Hub without a forge](local-agent-token.md): try agents against your own
+  Hub with no GitHub or GitLab sign-in.
 
 ## Coordinate work
 
@@ -32,10 +43,10 @@ title: "Documentation"
 - [Continuity preparation](continuity.md): retain local task context, run checks and save exact PR/MR drafts through a GitHub or GitLab disconnection.
 - [Stand-up and catch-up](standup.md): durable ownership, checkpoints, blockers and handovers.
 - [Agreed overlaps and behavior dependencies](design/work-overlaps.md): explicit named-file consent, structured prerequisites and bounded both-lead notices.
-- [Open this computer](connect-this-computer.md): local checkouts, available evidence and shared work in one page.
+- [This computer](connect-this-computer.md): native setup, sign-in, sharing controls, diagnostics and recovery.
 - [Repository explorer](repository-explorer.md): committed files, history and diffs without fetching or changing source.
 - [Change walkthroughs](change-walkthrough.md): versioned authored explanations with exact before/after source and compact CLI context.
-- [Change capture](change-capture.md): bounded action records and optional conversation sharing; Codex capture is narrower than Claude Code.
+- [Change capture](change-capture.md): bounded action records, visible parent history and optional conversation sharing.
 - [Work insights](work-insights.md): reported timing, usage and publication observations.
 - [Agent source selection](advanced/agent-source-workflow.md): inspect and expand source selectively; fewer working-file bytes do not establish model-cost savings.
 
