@@ -245,6 +245,14 @@ async fn record(
     };
     // One record at a time per repository, so two runs for one commit cannot both create one.
     let _guard = state.sync.lock_repo(&repository.id).await;
+    // A transfer that committed while this waited would leave `conn` the old App's.
+    if super::sync::moved_away(&state, &conn, &repository).await? {
+        return Err(
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable").with_message(
+                "the repository moved to another connection while this request waited; retry",
+            ),
+        );
+    }
     let want = Want {
         sha: &request.commit,
         environment: &environment,
@@ -1422,6 +1430,7 @@ mod route_tests {
     struct Hub {
         base: String,
         store: Arc<dyn Store>,
+        state: HubState,
         client: reqwest::Client,
         _dir: TempDir,
     }
@@ -1448,11 +1457,12 @@ mod route_tests {
                 .with_sync(Sync::new(config).unwrap());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let app = router(state);
+            let app = router(state.clone());
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             Self {
                 base,
                 store,
+                state,
                 client: reqwest::Client::new(),
                 _dir: dir,
             }
@@ -1611,5 +1621,106 @@ mod route_tests {
         assert_eq!(off["connected"], true);
         assert_eq!(off["supported"], true);
         assert_eq!(off["watched"], false);
+    }
+
+    /// A record that waited for the repository lock while a transfer committed stops rather
+    /// than writes with the old connection's credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_stops_when_its_repository_moved_while_it_waited() {
+        let hub = Hub::start(None).await;
+        hub.connect("github", "github.com", "acme/widgets", 100);
+        let old = format!("con_{}", "1".repeat(32));
+        let new = format!("con_{}", "3".repeat(32));
+        hub.store
+            .insert_connection(
+                &NewConnection {
+                    id: new.clone(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "app".into(),
+                    app_id: Some(3),
+                    app_slug: Some("other".into()),
+                    acts_as: None,
+                },
+                "test",
+            )
+            .unwrap();
+        let repository = hub
+            .store
+            .repository_by_id("github.com", 100)
+            .unwrap()
+            .unwrap();
+        // `Hub::token` mints read-only; recording needs a writable token.
+        let owner = hub
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 100,
+                },
+                "contributor100",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*hub.store,
+            &owner.id,
+            "writer",
+            "acme/widgets",
+            100,
+            3600,
+            false,
+        )
+        .unwrap();
+
+        let guard = hub.state.sync.lock_repo(&repository.id).await;
+        let request = hub
+            .client
+            .post(format!(
+                "{}/v1/hub/repos/acme%2Fwidgets/deployments",
+                hub.base
+            ))
+            .bearer_auth(secret.expose())
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"commit": "a".repeat(40), "environment": "prod",
+                    "status": "success"})
+                .to_string(),
+            )
+            .send();
+        let reply = tokio::spawn(request);
+        // The map, this guard and the waiting request each hold the lock.
+        while hub.state.sync.repo_lock_handles(&repository.id) < 3 {
+            tokio::task::yield_now().await;
+        }
+        let moved = hub
+            .store
+            .transfer_repository(&repository.id, &old, &new, Some(8), "test", true)
+            .unwrap();
+        assert!(moved.moved, "{moved:?}");
+        drop(guard);
+        let response = reply.await.unwrap().unwrap();
+        let status = response.status().as_u16();
+        let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (503, Some("unavailable")),
+            "{body}"
+        );
+        assert_eq!(
+            body["message"],
+            "the repository moved to another connection while this request waited; retry"
+        );
+        assert_eq!(body["retryable"], true);
+        let runs = hub
+            .store
+            .external_runs(
+                &repository.id,
+                &"a".repeat(40),
+                super::ExternalKind::Deployment,
+                10,
+            )
+            .unwrap();
+        assert!(runs.is_empty(), "{runs:?}");
     }
 }

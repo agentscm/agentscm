@@ -1208,6 +1208,260 @@ fn events_of(store: &dyn Store, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+fn a_repository_transfer_is_a_compare_and_swap_that_resets_only_its_rows(db: &Db) {
+    use agentscm::hub::connection::RepositoryTransfer;
+    use agentscm::hub::validation_evidence::{
+        PublicationPhase, ValidationPublication, ValidationSummaryConfig,
+    };
+    let store = db.open();
+    let old = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let new = store
+        .insert_connection(
+            &NewConnection {
+                app_id: Some(43),
+                ..app("github.com")
+            },
+            "usr_admin",
+        )
+        .unwrap();
+    let pat_con = store
+        .insert_connection(&pat("github.com", "robot"), "usr_admin")
+        .unwrap();
+    let up = |con: &str, id: i64, name: &str| {
+        store
+            .upsert_repository(con, "github.com", id, name, None, Some(7))
+            .unwrap()
+    };
+    let (repo, other, theirs) = (
+        up(&old.id, 1, "acme/widgets"),
+        up(&old.id, 2, "acme/other"),
+        up(&new.id, 3, "acme/gadgets"),
+    );
+    store.set_pulls_etag(&repo.id, Some("\"e\"")).unwrap();
+    store
+        .configure_validation_summary(&ValidationSummaryConfig {
+            repository: repo.id.clone(),
+            connection: old.id.clone(),
+            enabled: true,
+        })
+        .unwrap();
+    let state = |phase| {
+        serde_json::to_string(&ValidationPublication {
+            revision: 1,
+            evidence_generation: 0,
+            connection: old.id.clone(),
+            phase,
+            operation_id: "a".repeat(64),
+            body_sha256: "b".repeat(64),
+            source_sha256: "c".repeat(64),
+            comment_id: None,
+            status_slots: Vec::new(),
+        })
+        .unwrap()
+    };
+    let check = NewForgeCheck {
+        head_sha: "f".repeat(40),
+        state: "pending".into(),
+        binding_digest: None,
+        description: "waiting".into(),
+    };
+    for r in [&repo, &other] {
+        store
+            .set_outbound_comment(&r.id, 5, 11, &"d".repeat(64))
+            .unwrap();
+        store
+            .reserve_forge_check(&r.id, 5, "ctx", None, &check, 10)
+            .unwrap();
+        store
+            .complete_forge_check(&r.id, 5, "ctx", 1, "posted", 10)
+            .unwrap();
+        db.exec(&format!(
+            "INSERT INTO hub_validation_publication (repository, proposal, revision, state)
+                 VALUES ('{}', 1, 1, '{}');
+             INSERT INTO hub_validation_proposals (repository, proposal, generation)
+                 VALUES ('{0}', 1, 0);
+             INSERT INTO hub_observations (repository, kind, key, data, observed_at)
+                 VALUES ('{0}', 'branch', 'main', '{{}}', 1);",
+            r.id,
+            state(PublicationPhase::Attempting)
+        ))
+        .unwrap();
+    }
+    let group = NewMergeGroup {
+        head_sha: "f".repeat(40),
+        head_ref: "gh-readonly-queue/main/pr-5".into(),
+        base_ref: "main".into(),
+        base_sha: "1".repeat(40),
+        pr_number: 5,
+        pr_head_sha: "2".repeat(40),
+        context: "ctx".into(),
+    };
+    store
+        .observe_merge_group(&repo.id, &group, None, 10)
+        .unwrap();
+    store
+        .reserve_merge_group_check(&repo.id, &group.head_sha, 0, &check, 10)
+        .unwrap();
+    store
+        .complete_merge_group_check(&repo.id, &group.head_sha, 1, "posted", 10)
+        .unwrap();
+    let rows = |table: &str, id: &str| {
+        db.count(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE repository = '{id}'"
+        ))
+    };
+    let counts = RepositoryTransfer {
+        outbound: 1,
+        forge_checks: 1,
+        merge_group_posts: 1,
+        publications: 1,
+        mid_write: 1,
+        ..Default::default()
+    };
+
+    // A target that is not another App connection on the host is invalid.
+    for bad in [&old.id, &pat_con.id, &"con_unknown".to_owned()] {
+        assert!(
+            store
+                .transfer_repository(&repo.id, &old.id, bad, Some(70), "usr_admin", true)
+                .is_err()
+        );
+    }
+    // A publication mid-write refuses, and a preview only counts.
+    for apply in [false, true] {
+        assert_eq!(
+            store
+                .transfer_repository(&repo.id, &old.id, &new.id, Some(70), "usr_admin", apply)
+                .unwrap(),
+            counts
+        );
+    }
+    db.exec(&format!(
+        "UPDATE hub_validation_publication SET state = '{}' WHERE repository = '{}'",
+        state(PublicationPhase::Idle),
+        repo.id
+    ))
+    .unwrap();
+    // A forge check or merge-group check mid-write refuses as well.
+    for table in ["hub_forge_checks", "hub_merge_groups"] {
+        let set = |phase: &str| {
+            db.exec(&format!(
+                "UPDATE {table} SET phase = '{phase}' WHERE repository = '{}'",
+                repo.id
+            ))
+            .unwrap();
+        };
+        set("attempting");
+        assert_eq!(
+            store
+                .transfer_repository(&repo.id, &old.id, &new.id, Some(70), "usr_admin", true)
+                .unwrap(),
+            counts,
+            "{table}"
+        );
+        assert_eq!(
+            store.repository_row(&repo.id).unwrap().unwrap().connection,
+            old.id,
+            "{table}"
+        );
+        assert_eq!(rows(table, &repo.id), 1, "{table}");
+        set("posted");
+    }
+    assert!(events_of(&*store, "repository_transferred").is_empty());
+    // The wrong expect_from changes nothing.
+    let stale = store
+        .transfer_repository(&repo.id, &pat_con.id, &new.id, Some(70), "usr_admin", true)
+        .unwrap();
+    assert_eq!(
+        stale,
+        RepositoryTransfer {
+            connection_changed: true,
+            mid_write: 0,
+            ..counts.clone()
+        }
+    );
+    assert_eq!(store.repository_row(&repo.id).unwrap().unwrap(), {
+        let mut same = repo.clone();
+        same.pulls_etag = Some("\"e\"".into());
+        same
+    });
+    assert!(events_of(&*store, "repository_transferred").is_empty());
+
+    let done = store
+        .transfer_repository(&repo.id, &old.id, &new.id, Some(70), "usr_admin", true)
+        .unwrap();
+    assert_eq!(
+        done,
+        RepositoryTransfer {
+            moved: true,
+            mid_write: 0,
+            ..counts
+        }
+    );
+    let moved = store.repository_row(&repo.id).unwrap().unwrap();
+    assert_eq!(
+        (
+            moved.connection.as_str(),
+            moved.installation_id,
+            moved.pulls_etag
+        ),
+        (new.id.as_str(), Some(70), None)
+    );
+    assert_eq!(
+        store.validation_summary_config(&repo.id).unwrap(),
+        Some(ValidationSummaryConfig {
+            repository: repo.id.clone(),
+            connection: new.id.clone(),
+            enabled: false,
+        })
+    );
+    for table in [
+        "hub_outbound",
+        "hub_forge_checks",
+        "hub_validation_publication",
+    ] {
+        assert_eq!(rows(table, &repo.id), 0, "{table}");
+        assert_eq!(rows(table, &other.id), 1, "{table}");
+    }
+    for kept in [
+        "hub_validation_proposals",
+        "hub_observations",
+        "hub_merge_groups",
+    ] {
+        assert_eq!(rows(kept, &repo.id), 1, "{kept}");
+    }
+    let group = store
+        .merge_group(&repo.id, &group.head_sha)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            group.check,
+            group.generation,
+            group.ended_reason,
+            group.pr_number
+        ),
+        (None, 3, None, 5)
+    );
+    assert_eq!(store.repository_row(&other.id).unwrap().unwrap(), other);
+    assert_eq!(store.repository_row(&theirs.id).unwrap().unwrap(), theirs);
+    assert_eq!(
+        events_of(&*store, "repository_transferred"),
+        [
+            json!({"repository_id": 1, "full_name": "acme/widgets", "from": old.id,
+            "to": new.id, "installation_id": 70, "by": "usr_admin"})
+        ]
+    );
+    // Its own connection is no longer another one.
+    assert!(
+        store
+            .transfer_repository(&repo.id, &old.id, &new.id, Some(70), "usr_admin", true)
+            .is_err()
+    );
+}
+
 fn connections_and_repositories(db: &Db) {
     let store = db.open();
     let con = store
@@ -4525,6 +4779,7 @@ conformance!(
     upgrade_from_migration_1,
     upgrade_from_hub_settings_migration,
     connections_and_repositories,
+    a_repository_transfer_is_a_compare_and_swap_that_resets_only_its_rows,
     observations,
     provider_context_events_are_digest_summaries_of_retained_bytes,
     deliveries_outbound_and_notices,

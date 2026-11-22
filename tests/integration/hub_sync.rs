@@ -3090,6 +3090,416 @@ async fn a_pat_that_changed_owner_stops_startup_and_a_shared_repository_stays_wi
     sync::start(&env.state).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_discovery_reports_a_repository_another_connection_holds_and_leaves_it_there() {
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    env.fake.with(|s| {
+        s.repos.insert(102, Repo::new(102, "acme/shared"));
+        s.pats.get_mut(PAT).unwrap().2.insert(102);
+    });
+    // The PAT connection gets there first.
+    let pat = env.store.pat_connection(&env.host()).unwrap().unwrap();
+    let (status, body) = env
+        .post(
+            &format!("/v1/hub/connections/{}/repositories", pat.id),
+            Some(&admin),
+            json!({"full_name": "acme/shared"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let app = env.connect_app().await;
+    env.fake.with(|s| {
+        s.installations.push(Installation {
+            id: 7,
+            account: "acme".into(),
+            repos: vec![102],
+        });
+    });
+    let (status, reply) = env
+        .post(
+            &format!("/v1/hub/connections/{app}/refresh"),
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["held_elsewhere"],
+        json!([{"repository": "acme/shared", "held_by": pat.id}])
+    );
+    let shared = env
+        .store
+        .repository_named(&env.host(), "acme/shared")
+        .unwrap()
+        .unwrap();
+    assert_eq!(shared.connection, pat.id);
+    assert!(env.store.repositories(&app).unwrap().is_empty());
+}
+
+const SECOND_APP_ID: i64 = 5151;
+
+/// Writes `body` to `<secrets>/<name>` with mode 0600, as an operator stages credentials.
+fn stage(env: &Env, name: &str, body: &Value) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.secrets.join(name);
+    std::fs::write(&path, body.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+/// A second App, installed on `acme/widgets` and on `acme/shared` (102), which the PAT holds.
+fn second_app(env: &Env) {
+    env.fake.with(|s| {
+        let mut widgets = Repo::new(REPO_ID, REPO);
+        widgets.private = true;
+        s.repos.insert(REPO_ID, widgets);
+        s.repos.insert(102, Repo::new(102, "acme/shared"));
+        s.pats.get_mut(PAT).unwrap().2.insert(102);
+        s.second_app = Some(fake_github::FakeApp {
+            id: SECOND_APP_ID,
+            slug: "adopted-app".into(),
+            permissions: json!({"contents": "read", "metadata": "read", "statuses": "read"}),
+            events: vec!["pull_request".into(), "push".into()],
+            installations: vec![Installation {
+                id: 70,
+                account: "acme".into(),
+                repos: vec![REPO_ID, 102],
+            }],
+        });
+        s.hook_configs.insert(
+            SECOND_APP_ID,
+            json!({"url": "https://other-hub.example/v1/hub/webhooks/github/con_old"}),
+        );
+    });
+}
+
+fn hook_patches(env: &Env) -> usize {
+    env.fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path_and_query == "/app/hook/config")
+            .count()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adopting_an_existing_app_previews_then_registers_it_and_repoints_its_webhook() {
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    second_app(&env);
+    let pat = env.store.pat_connection(&env.host()).unwrap().unwrap();
+    let (status, body) = env
+        .post(
+            &format!("/v1/hub/connections/{}/repositories", pat.id),
+            Some(&admin),
+            json!({"full_name": "acme/shared"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let staged = stage(
+        &env,
+        "adopt.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem()}),
+    );
+    let adopt = "/v1/hub/github/apps/adopt";
+
+    // Only a signed-in person, and only a plain .json name that is not a connection's own file.
+    // (The OAuth shim signs in administrators only; the route's admin check is the one every
+    // connection route uses.)
+    assert_eq!(
+        env.post(adopt, None, json!({"file": "adopt.json"})).await.0,
+        401
+    );
+    stage(
+        &env,
+        "con_x.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem()}),
+    );
+    let before = env.fake.with(|s| s.requests.len());
+    for bad in [
+        "../adopt.json",
+        "con_x.json",
+        "a/b.json",
+        "adopt",
+        "..json",
+        "",
+    ] {
+        let (status, body) = env.post(adopt, Some(&admin), json!({"file": bad})).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (400, Some("invalid_request")),
+            "{bad}"
+        );
+    }
+    // A link to a valid file is refused too: it could reach a key outside the directory.
+    std::os::unix::fs::symlink(&staged, env.secrets.join("linked.json")).unwrap();
+    let (status, body) = env
+        .post(adopt, Some(&admin), json!({"file": "linked.json"}))
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("invalid_request")),
+        "{body}"
+    );
+    std::fs::remove_file(env.secrets.join("linked.json")).unwrap();
+    assert_eq!(env.fake.with(|s| s.requests.len()), before);
+
+    // The file must name the App GitHub authenticates.
+    env.fake.with(|s| s.app_id = Some(999));
+    stage(
+        &env,
+        "mismatch.json",
+        &json!({"app_id": fake_github::APP_ID, "pem": fake_github::private_pem()}),
+    );
+    let (status, body) = env
+        .post(
+            adopt,
+            Some(&admin),
+            json!({"file": "mismatch.json", "confirm": true}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("invalid_request")),
+        "{body}"
+    );
+    env.fake.with(|s| s.app_id = None);
+
+    // The preview names the App and the webhook move, and changes nothing.
+    let (status, preview) = env
+        .post(adopt, Some(&admin), json!({"file": "adopt.json"}))
+        .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(
+        (
+            preview["app_id"].clone(),
+            preview["app_slug"].clone(),
+            preview["bot_login"].clone(),
+            preview["confirmed"].clone(),
+            preview["connection"].clone(),
+            preview["webhook_updated"].clone(),
+        ),
+        (
+            json!(SECOND_APP_ID),
+            json!("adopted-app"),
+            json!("adopted-app[bot]"),
+            json!(false),
+            Value::Null,
+            json!(false)
+        )
+    );
+    assert_eq!(preview["permissions"]["statuses"], "read");
+    assert_eq!(preview["events"], json!(["pull_request", "push"]));
+    assert_eq!(
+        preview["webhook_current_url"],
+        "https://other-hub.example/v1/hub/webhooks/github/con_old"
+    );
+    assert_eq!(
+        preview["webhook_url"],
+        format!("{}/v1/hub/webhooks/github/{{connection}}", env.url)
+    );
+    let warnings = preview["warnings"].to_string();
+    assert!(
+        warnings.contains("every installation") && warnings.contains("statuses: write"),
+        "{warnings}"
+    );
+    assert_eq!(env.store.connections().unwrap().len(), 1);
+    assert!(staged.exists());
+    assert_eq!(hook_patches(&env), 0);
+
+    // Confirming registers the connection, moves the file and repoints the webhook.
+    let (status, text) = env
+        .raw(
+            Method::POST,
+            adopt,
+            Some(&admin),
+            Some(json!({"file": "adopt.json", "confirm": true})),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+    let done: Value = serde_json::from_str(&text).unwrap();
+    let connection = done["connection"].as_str().unwrap().to_owned();
+    let hook_url = format!("{}/v1/hub/webhooks/github/{connection}", env.url);
+    assert_eq!(
+        (
+            done["confirmed"].clone(),
+            done["webhook_updated"].clone(),
+            done["webhook_url"].clone()
+        ),
+        (json!(true), json!(true), json!(hook_url))
+    );
+    assert!(!staged.exists());
+    let own = env.secrets.join(format!("{connection}.json"));
+    assert!(is_mode_0600(&own));
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&own).unwrap()).unwrap();
+    let secret = stored["webhook_secret"].as_str().unwrap().to_owned();
+    assert!(secret.len() >= 32);
+    assert_eq!(stored["slug"], "adopted-app");
+    let config = env.fake.with(|s| s.hook_configs[&SECOND_APP_ID].clone());
+    assert_eq!(
+        config,
+        json!({"url": hook_url, "content_type": "json", "secret": secret})
+    );
+    assert!(
+        !text.contains(&secret) && !text.contains("PRIVATE KEY"),
+        "{text}"
+    );
+    let row = env.store.connection(&connection).unwrap().unwrap();
+    assert_eq!(
+        (row.kind.as_str(), row.app_id, row.app_slug.as_deref()),
+        ("app", Some(SECOND_APP_ID), Some("adopted-app"))
+    );
+
+    // The same App again is refused, in a preview too.
+    stage(
+        &env,
+        "again.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem()}),
+    );
+    for confirm in [false, true] {
+        let (status, body) = env
+            .post(
+                adopt,
+                Some(&admin),
+                json!({"file": "again.json", "confirm": confirm}),
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (409, Some("already_connected"))
+        );
+    }
+    assert_eq!(env.store.connections().unwrap().len(), 2);
+
+    // Refresh connects what no connection holds and leaves the PAT's repository with it.
+    let (status, reply) = env
+        .post(
+            &format!("/v1/hub/connections/{connection}/refresh"),
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["held_elsewhere"],
+        json!([{"repository": "acme/shared", "held_by": pat.id}])
+    );
+    let held: Vec<String> = env
+        .store
+        .repositories(&connection)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.full_name)
+        .collect();
+    assert_eq!(held, [REPO]);
+
+    // Deliveries signed with the stored secret verify; others do not.
+    let payload = json!({"zen": "synthetic"});
+    let deliver = |secret: &str| {
+        let (url, connection, secret) = (env.url.clone(), connection.clone(), secret.to_owned());
+        let payload = payload.clone();
+        async move { fake_github::deliver(&url, &connection, "ping", "a-1", &payload, &secret).await }
+    };
+    assert_eq!(deliver(fake_github::WEBHOOK_SECRET).await, 401);
+    assert_eq!(deliver(&secret).await, 202);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cli_previews_an_adoption_and_registers_it_with_yes() {
+    let env = Env::start_with(true).await;
+    second_app(&env);
+    let staged = stage(
+        &env,
+        "adopt.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem(),
+            "webhook_secret": "kept-secret-synthetic"}),
+    );
+    let config = TempDir::new().unwrap();
+    let hub = env.url.clone();
+    let (ok, _, stderr) = cli(&config, &["login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+
+    let (ok, stdout, stderr) = cli(&config, &["github", "adopt", "adopt.json"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("app adopted-app (id 5151) acts as adopted-app[bot]")
+            && stdout.contains("webhook now https://other-hub.example/")
+            && stdout.contains("warning: Repointing the webhook"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("nothing changed"), "{stderr}");
+    assert!(staged.exists() && hook_patches(&env) == 0);
+    assert!(!cli(&config, &["github", "adopt", "../adopt.json"]).0);
+
+    let (ok, stdout, stderr) = cli(&config, &["github", "adopt", "adopt.json", "--yes"]);
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("webhook repointed"), "{stderr}");
+    assert!(!stdout.contains("kept-secret-synthetic"), "{stdout}");
+    let connection = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("connection "))
+        .unwrap()
+        .to_owned();
+    // A secret already in the file is the one GitHub is given.
+    let config = env.fake.with(|s| s.hook_configs[&SECOND_APP_ID].clone());
+    assert_eq!(config["secret"], "kept-secret-synthetic");
+    assert!(env.store.connection(&connection).unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adoption_whose_webhook_repoint_fails_keeps_the_connection_and_says_why() {
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    second_app(&env);
+    stage(
+        &env,
+        "adopt.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem(),
+            "webhook_secret": "staged-secret-synthetic"}),
+    );
+    env.fake.with(|s| s.refuse_next_hook_config = true);
+    let (status, text) = env
+        .raw(
+            Method::POST,
+            "/v1/hub/github/apps/adopt",
+            Some(&admin),
+            Some(json!({"file": "adopt.json", "confirm": true})),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+    let done: Value = serde_json::from_str(&text).unwrap();
+    let connection = done["connection"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (done["confirmed"].clone(), done["webhook_updated"].clone()),
+        (json!(true), json!(false))
+    );
+    assert!(
+        done["webhook_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "{done}"
+    );
+    assert_eq!(
+        done["webhook_url"],
+        format!("{}/v1/hub/webhooks/github/{connection}", env.url)
+    );
+    assert!(
+        !text.contains("staged-secret-synthetic") && !text.contains("PRIVATE KEY"),
+        "{text}"
+    );
+    assert!(env.store.connection(&connection).unwrap().is_some());
+    assert_eq!(
+        env.fake
+            .with(|s| s.hook_configs[&SECOND_APP_ID]["url"].clone()),
+        "https://other-hub.example/v1/hub/webhooks/github/con_old"
+    );
+    // The connection's own file holds the secret an operator sets by hand.
+    let own = env.secrets.join(format!("{connection}.json"));
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&own).unwrap()).unwrap();
+    assert_eq!(stored["webhook_secret"], "staged-secret-synthetic");
+}
+
 // ---- CLI ----
 
 fn cli(config: &TempDir, args: &[&str]) -> (bool, String, String) {
@@ -5483,4 +5893,469 @@ async fn enabling_validation_summaries_names_the_app_and_refuses_a_read_only_one
             .unwrap()
             .enabled
     );
+}
+
+// ---- moving a repository to another App connection ----
+
+/// The manifest App holds `acme/widgets` and `acme/other` (103); the adopted second App holds
+/// `acme/gadgets` (104) and is also installed on `acme/widgets`. Returns both connections.
+async fn two_apps(env: &Env) -> (String, String) {
+    let first = env.connect_app().await;
+    env.fake.with(|s| {
+        let mut widgets = Repo::new(REPO_ID, REPO);
+        widgets.private = true;
+        s.repos.insert(REPO_ID, widgets);
+        s.repos.insert(103, Repo::new(103, "acme/other"));
+        s.repos.insert(104, Repo::new(104, "acme/gadgets"));
+        s.installations.push(Installation {
+            id: 7,
+            account: "acme".into(),
+            repos: vec![REPO_ID, 103],
+        });
+        s.second_app = Some(fake_github::FakeApp {
+            id: SECOND_APP_ID,
+            slug: "adopted-app".into(),
+            permissions: json!({"statuses": "write", "pull_requests": "write",
+                "issues": "write", "contents": "read", "metadata": "read"}),
+            events: vec!["pull_request".into(), "push".into()],
+            installations: vec![Installation {
+                id: 70,
+                account: "acme".into(),
+                repos: vec![REPO_ID, 104],
+            }],
+        });
+    });
+    env.refresh(&first).await;
+    stage(
+        env,
+        "adopt.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem()}),
+    );
+    let admin = env.admin.clone();
+    let (status, done) = env
+        .post(
+            "/v1/hub/github/apps/adopt",
+            Some(&admin),
+            json!({"file": "adopt.json", "confirm": true}),
+        )
+        .await;
+    assert_eq!(status, 200, "{done}");
+    let second = done["connection"].as_str().unwrap().to_owned();
+    env.refresh(&second).await;
+    (first, second)
+}
+
+fn named(env: &Env, full_name: &str) -> ConnectedRepository {
+    env.store
+        .repository_named(&env.host(), full_name)
+        .unwrap()
+        .unwrap()
+}
+
+fn publication(
+    connection: &str,
+    revision: i64,
+    phase: agentscm::hub::validation_evidence::PublicationPhase,
+) -> agentscm::hub::validation_evidence::ValidationPublication {
+    agentscm::hub::validation_evidence::ValidationPublication {
+        revision,
+        evidence_generation: 0,
+        connection: connection.into(),
+        phase,
+        operation_id: "a".repeat(64),
+        body_sha256: "b".repeat(64),
+        source_sha256: "c".repeat(64),
+        comment_id: None,
+        status_slots: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transferring_a_repository_previews_then_moves_only_it() {
+    use agentscm::hub::connection::{ForgeCheckReserve, NewForgeCheck, NewMergeGroup};
+    use agentscm::hub::validation_evidence::PublicationPhase::{Attempting, Idle, Preparing};
+
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    let (first, second) = two_apps(&env).await;
+    let pat = env.store.pat_connection(&env.host()).unwrap().unwrap();
+    let repo = env.repo();
+    let (other, gadgets) = (named(&env, "acme/other"), named(&env, "acme/gadgets"));
+    assert_eq!(
+        (repo.connection.as_str(), other.connection.as_str()),
+        (first.as_str(), first.as_str())
+    );
+    assert_eq!(gadgets.connection, second);
+
+    // What the old App wrote: summaries on, a publication mid-write, a comment and status,
+    // a forge check and a merge-group post. `acme/other` has its own comment.
+    let (status, body) = env
+        .post(
+            &format!("/v1/hub/admin/repos/{}/validation-summary", repo.id),
+            Some(&admin),
+            json!({"enabled": true}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let store = &env.store;
+    let now = unix_now();
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 0, &publication(&first, 1, Preparing))
+            .unwrap()
+    );
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 1, &publication(&first, 2, Attempting))
+            .unwrap()
+    );
+    store
+        .set_outbound_comment(&repo.id, 5, 11, &"d".repeat(64))
+        .unwrap();
+    store
+        .set_outbound_status(&repo.id, 5, &"e".repeat(40), "status")
+        .unwrap();
+    store
+        .set_outbound_comment(&other.id, 5, 12, &"d".repeat(64))
+        .unwrap();
+    let check = NewForgeCheck {
+        head_sha: "f".repeat(40),
+        state: "pending".into(),
+        binding_digest: None,
+        description: "waiting".into(),
+    };
+    let context = "agentscm/validation";
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, context, None, &check, now)
+            .unwrap(),
+        ForgeCheckReserve::Reserved(1)
+    );
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, context, 1, "posted", now)
+            .unwrap()
+    );
+    let group = NewMergeGroup {
+        head_sha: "f".repeat(40),
+        head_ref: "gh-readonly-queue/main/pr-5".into(),
+        base_ref: "main".into(),
+        base_sha: "1".repeat(40),
+        pr_number: 5,
+        pr_head_sha: "2".repeat(40),
+        context: context.into(),
+    };
+    store
+        .observe_merge_group(&repo.id, &group, None, now)
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_merge_group_check(&repo.id, &group.head_sha, 0, &check, now)
+            .unwrap(),
+        ForgeCheckReserve::Reserved(1)
+    );
+    assert!(
+        store
+            .complete_merge_group_check(&repo.id, &group.head_sha, 1, "posted", now)
+            .unwrap()
+    );
+
+    let path = format!("/v1/hub/admin/repos/{}/connection", repo.id);
+    let preview_path = |to: &str| format!("{path}?to={to}");
+    let unchanged = |env: &Env| {
+        let now = env.repo();
+        assert_eq!(
+            (now.connection, now.installation_id),
+            (first.clone(), Some(7))
+        );
+        assert!(env.store.outbound(&repo.id, 5).unwrap().is_some());
+        assert!(
+            env.store
+                .validation_summary_config(&repo.id)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(env.events("repository_transferred").is_empty());
+    };
+
+    // Only an administrator's session.
+    assert_eq!(env.get(&preview_path(&second), None).await.0, 401);
+    let move_body = json!({"to": second, "expect_from": first});
+    assert_eq!(env.post(&path, None, move_body.clone()).await.0, 401);
+
+    // The target must be another App connection that can see the repository.
+    for to in [first.as_str(), pat.id.as_str(), "con_unknown"] {
+        let (status, body) = env.get(&preview_path(to), Some(&admin)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (400, Some("invalid_request")),
+            "{to}"
+        );
+        let body = json!({"to": to, "expect_from": first});
+        assert_eq!(env.post(&path, Some(&admin), body).await.0, 400, "{to}");
+    }
+    let (status, body) = env
+        .get(
+            &format!(
+                "/v1/hub/admin/repos/rep_{}/connection?to={second}",
+                "0".repeat(32)
+            ),
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let installed = |repos: Vec<i64>| {
+        env.fake.with(|s| {
+            s.second_app.as_mut().unwrap().installations[0].repos = repos;
+        });
+    };
+    installed(vec![104]);
+    let (status, body) = env.get(&preview_path(&second), Some(&admin)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("forge_permission_missing")),
+        "{body}"
+    );
+    assert_eq!(
+        env.post(&path, Some(&admin), move_body.clone()).await.0,
+        403
+    );
+    installed(vec![REPO_ID, 104]);
+    unchanged(&env);
+
+    // The preview names both sides, the target's publisher, what resets, and why it waits.
+    let (status, preview) = env.get(&preview_path(&second), Some(&admin)).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(
+        (
+            preview["repository"]["id"].clone(),
+            preview["from"].clone(),
+            preview["to"].clone(),
+            preview["validation_summary_enabled"].clone(),
+            preview["transferred"].clone(),
+        ),
+        (
+            json!(repo.id),
+            json!({"connection": first, "kind": "app", "app_slug": fake_github::APP_SLUG}),
+            json!({"connection": second, "app_slug": "adopted-app", "installation_id": 70}),
+            json!(true),
+            json!(false),
+        )
+    );
+    assert_eq!(preview["publisher"]["identity"], "adopted-app[bot]");
+    assert_eq!(preview["publisher"]["permissions"]["statuses"], "write");
+    assert_eq!(
+        preview["resets"],
+        json!({"outbound": 1, "forge_checks": 1, "merge_group_posts": 1, "publications": 1})
+    );
+    assert_eq!(preview["blocked"], json!(["write_in_progress"]));
+    assert_eq!(
+        preview["warnings"].as_array().unwrap().len(),
+        2,
+        "{preview}"
+    );
+    assert!(
+        preview["warnings"]
+            .to_string()
+            .contains("enable them again")
+    );
+    unchanged(&env);
+
+    // A publication mid-write blocks the move.
+    let (status, body) = env.post(&path, Some(&admin), move_body.clone()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("publication_conflict")),
+        "{body}"
+    );
+    unchanged(&env);
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 2, &publication(&first, 3, Idle))
+            .unwrap()
+    );
+
+    // With summaries on, a target without statuses: write is refused.
+    let statuses = |granted: &str| {
+        env.fake.with(|s| {
+            s.second_app.as_mut().unwrap().permissions["statuses"] = json!(granted);
+        });
+    };
+    statuses("read");
+    let (status, preview) = env.get(&preview_path(&second), Some(&admin)).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["blocked"], json!(["statuses_write_missing"]));
+    let (status, body) = env.post(&path, Some(&admin), move_body.clone()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("forge_permission_missing")),
+        "{body}"
+    );
+    assert_eq!(body["publisher"]["permissions"]["statuses"], "read");
+    unchanged(&env);
+    statuses("write");
+
+    // A stale expect_from is the compare-and-swap failing.
+    let stale = json!({"to": second, "expect_from": pat.id});
+    let (status, body) = env.post(&path, Some(&admin), stale).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("already_connected")),
+        "{body}"
+    );
+    unchanged(&env);
+
+    // The move: only this repository, keeping its id; the old App's rows go.
+    let (status, done) = env.post(&path, Some(&admin), move_body.clone()).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["transferred"], true);
+    let moved = env.repo();
+    assert_eq!(
+        (
+            moved.id.as_str(),
+            moved.connection.as_str(),
+            moved.installation_id
+        ),
+        (repo.id.as_str(), second.as_str(), Some(70))
+    );
+    assert_eq!(named(&env, "acme/other"), other);
+    assert_eq!(named(&env, "acme/gadgets"), gadgets);
+    let config = store.validation_summary_config(&repo.id).unwrap().unwrap();
+    assert_eq!(
+        (config.connection.as_str(), config.enabled),
+        (second.as_str(), false)
+    );
+    assert_eq!(store.outbound(&repo.id, 5).unwrap(), None);
+    assert!(store.outbound(&other.id, 5).unwrap().is_some());
+    assert_eq!(store.forge_check(&repo.id, 5, context).unwrap(), None);
+    assert_eq!(store.validation_publication(&repo.id, 1).unwrap(), None);
+    let group = store
+        .merge_group(&repo.id, &group.head_sha)
+        .unwrap()
+        .unwrap();
+    assert_eq!((group.check, group.generation), (None, 3));
+    let event = env.events("repository_transferred");
+    assert_eq!(
+        (event.len(), &event[0]["from"], &event[0]["to"]),
+        (1, &json!(first), &json!(second))
+    );
+    assert!(event[0]["by"].as_str().unwrap().starts_with("usr_"));
+    // Moving it again needs the new connection as expect_from.
+    let (status, _) = env.post(&path, Some(&admin), move_body).await;
+    assert_eq!(status, 400);
+
+    // Discovery on the old connection reports it held elsewhere and leaves it there.
+    let (status, reply) = env
+        .post(
+            &format!("/v1/hub/connections/{first}/refresh"),
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["held_elsewhere"],
+        json!([{"repository": REPO, "held_by": second}])
+    );
+    assert_eq!(env.repo().connection, second);
+
+    // The old App's deliveries for the repository are dropped; the new App's are read.
+    add_pull(&env, 5, &["src/a.rs"]);
+    let payload = json!({"action": "opened", "number": 5, "repository": {"id": REPO_ID},
+        "pull_request": {"number": 5}});
+    let hook = |connection: &str, delivery: &str, secret: &str| {
+        let (url, connection) = (env.url.clone(), connection.to_owned());
+        let (delivery, secret, payload) = (delivery.to_owned(), secret.to_owned(), payload.clone());
+        async move {
+            fake_github::deliver(
+                &url,
+                &connection,
+                "pull_request",
+                &delivery,
+                &payload,
+                &secret,
+            )
+            .await
+        }
+    };
+    assert_eq!(hook(&first, "t-1", fake_github::WEBHOOK_SECRET).await, 202);
+    eventually("the old App's job", || {
+        env.state.webhook_jobs_pending() == 0
+    })
+    .await;
+    assert!(env.observed("pull_request").is_empty());
+    let file = env.secrets.join(format!("{second}.json"));
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    let secret = stored["webhook_secret"].as_str().unwrap();
+    assert_eq!(hook(&second, "t-2", secret).await, 202);
+    eventually("the new App's read", || {
+        env.observed("pull_request").contains("5")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cli_previews_a_transfer_and_moves_with_yes() {
+    let env = Env::start().await;
+    let (first, second) = two_apps(&env).await;
+    let admin = env.admin.clone();
+    let (status, listed) = env.get("/v1/hub/admin/repositories", Some(&admin)).await;
+    assert_eq!(status, 200, "{listed}");
+    let repo = env.repo();
+    let row = listed["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["full_name"] == REPO)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (row["id"].clone(), row["connection"].clone()),
+        (json!(repo.id), json!(first))
+    );
+
+    let config = TempDir::new().unwrap();
+    let hub = env.url.clone();
+    let (ok, _, stderr) = cli(&config, &["login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    let args = [
+        "connections",
+        "transfer-repo",
+        repo.id.as_str(),
+        "--to",
+        second.as_str(),
+    ];
+    let (ok, stdout, stderr) = cli(&config, &args);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "acme/widgets from {first} ({}) to {second} (adopted-app, installation 70)",
+            fake_github::APP_SLUG
+        )) && stdout.contains("publisher adopted-app[bot]")
+            && stdout.contains("warning: The new App cannot edit"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("nothing changed"), "{stderr}");
+    assert_eq!(env.repo().connection, first);
+    assert!(
+        !cli(
+            &config,
+            &[
+                "connections",
+                "transfer-repo",
+                "acme/widgets",
+                "--to",
+                &second
+            ]
+        )
+        .0
+    );
+
+    let mut yes = args.to_vec();
+    yes.push("--yes");
+    let (ok, _, stderr) = cli(&config, &yes);
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("transferred"), "{stderr}");
+    assert_eq!(env.repo().connection, second);
 }

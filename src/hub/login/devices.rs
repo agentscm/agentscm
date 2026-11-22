@@ -1633,7 +1633,7 @@ async fn admin_repositories(
     human.admin()?;
     let store = state.store.clone();
     let rows = blocking(&state, move || {
-        let providers: std::collections::HashMap<String, String> = store
+        let providers: std::collections::HashMap<_, _> = store
             .connections()?
             .into_iter()
             .map(|conn| (conn.id, conn.provider))
@@ -1645,7 +1645,7 @@ async fn admin_repositories(
     let repositories: Vec<_> = usage
         .iter()
         .map(|repo| {
-            json!({"full_name": repo.full_name, "host": repo.host,
+            json!({"id": repo.id, "full_name": repo.full_name, "host": repo.host,
                 "provider": providers.get(&repo.connection), "connection": repo.connection,
                 "devices": repo.devices, "agent_tokens": repo.agent_tokens})
         })

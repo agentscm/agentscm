@@ -172,6 +172,16 @@ pub enum GithubCommand {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Register an existing GitHub App from a credentials file in the Hub's secrets directory.
+    /// Prints what would change; `--yes` registers it and repoints the App's webhook.
+    Adopt {
+        /// The file's name in the secrets directory, such as `my-app.json`.
+        file: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        hub: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -205,6 +215,19 @@ pub enum ConnectionCommand {
         id: String,
         /// owner/name
         repo: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Move one repository to another GitHub App connection. Prints what would change;
+    /// `--yes` moves it.
+    TransferRepo {
+        /// The repository's `rep_` id (`id` in `GET /v1/hub/admin/repositories`).
+        repo: String,
+        /// The App connection to move it to.
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         hub: Option<String>,
     },
@@ -2486,7 +2509,10 @@ async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
 }
 
 async fn github(command: GithubCommand) -> Result<()> {
-    let GithubCommand::Setup { name, org, hub } = command;
+    let (name, org, hub) = match command {
+        GithubCommand::Setup { name, org, hub } => (name, org, hub),
+        GithubCommand::Adopt { file, yes, hub } => return adopt(file, yes, hub).await,
+    };
     let mut body = json!({"name": name});
     if let Some(org) = org {
         body["org"] = json!(org);
@@ -2501,6 +2527,43 @@ async fn github(command: GithubCommand) -> Result<()> {
         clean(connection)
     );
     println!("{}", clean(url));
+    Ok(())
+}
+
+async fn adopt(file: String, yes: bool, hub: Option<String>) -> Result<()> {
+    let body = json!({"file": file, "confirm": yes});
+    let path = "/v1/hub/github/apps/adopt";
+    let (status, reply) = admin_call(&hub, Method::POST, path, Some(body)).await?;
+    if status != 200 {
+        return Err(unexpected(status, &reply));
+    }
+    let text = |key: &str| clean(reply[key].as_str().unwrap_or("?"));
+    println!(
+        "app {} (id {}) acts as {}",
+        text("app_slug"),
+        reply["app_id"],
+        text("bot_login")
+    );
+    println!("permissions {}", clean(&reply["permissions"].to_string()));
+    println!("events {}", clean(&reply["events"].to_string()));
+    let current = reply["webhook_current_url"].as_str().unwrap_or("(none)");
+    println!("webhook now {}", clean(current));
+    println!("webhook new {}", text("webhook_url"));
+    for warning in reply["warnings"].as_array().into_iter().flatten() {
+        println!("warning: {}", clean(warning.as_str().unwrap_or("?")));
+    }
+    if reply["confirmed"] != true {
+        eprintln!("nothing changed; run again with --yes to register the App");
+        return Ok(());
+    }
+    println!("connection {}", text("connection"));
+    match reply["webhook_error"].as_str() {
+        Some(error) => eprintln!(
+            "webhook not repointed ({}); the connection polls",
+            clean(error)
+        ),
+        None => eprintln!("webhook repointed"),
+    }
     Ok(())
 }
 
@@ -2546,6 +2609,13 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
                     clean(&r["truncated"].to_string())
                 );
             }
+            for h in reply["held_elsewhere"].as_array().into_iter().flatten() {
+                println!(
+                    "{} is held by connection {}; discovery never moves it",
+                    clean(h["repository"].as_str().unwrap_or("?")),
+                    clean(h["held_by"].as_str().unwrap_or("?"))
+                );
+            }
         }
         ConnectionCommand::Outbound { id, state, hub } => {
             connection_id(&id)?;
@@ -2578,6 +2648,62 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
                 clean(reply["full_name"].as_str().unwrap_or("?"))
             );
         }
+        ConnectionCommand::TransferRepo { repo, to, yes, hub } => {
+            return transfer_repo(repo, to, yes, hub).await;
+        }
+    }
+    Ok(())
+}
+
+async fn transfer_repo(repo: String, to: String, yes: bool, hub: Option<String>) -> Result<()> {
+    connection_id(&to)?;
+    if !repo.starts_with("rep_") || !repo.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(invalid("repository must be a rep_ id"));
+    }
+    let path = format!("/v1/hub/admin/repos/{repo}/connection");
+    let (status, preview) = admin_call(&hub, Method::GET, &format!("{path}?to={to}"), None).await?;
+    if status != 200 {
+        return Err(unexpected(status, &preview));
+    }
+    let text = |value: &Value| clean(value.as_str().unwrap_or("?"));
+    let reply = if yes {
+        let from = preview["from"]["connection"].clone();
+        let body = json!({"to": to, "expect_from": from});
+        let (status, reply) = admin_call(&hub, Method::POST, &path, Some(body)).await?;
+        if status != 200 {
+            return Err(unexpected(status, &reply));
+        }
+        reply
+    } else {
+        preview
+    };
+    println!(
+        "{} from {} ({}) to {} ({}, installation {})",
+        text(&reply["repository"]["full_name"]),
+        text(&reply["from"]["connection"]),
+        reply["from"]["app_slug"]
+            .as_str()
+            .map_or("not an App".into(), clean),
+        text(&reply["to"]["connection"]),
+        text(&reply["to"]["app_slug"]),
+        reply["to"]["installation_id"]
+    );
+    println!(
+        "publisher {} permissions {}",
+        text(&reply["publisher"]["identity"]),
+        clean(&reply["publisher"]["permissions"].to_string())
+    );
+    println!("resets {}", clean(&reply["resets"].to_string()));
+    for blocked in reply["blocked"].as_array().into_iter().flatten() {
+        println!("blocked: {}", text(blocked));
+    }
+    for warning in reply["warnings"].as_array().into_iter().flatten() {
+        println!("warning: {}", text(warning));
+    }
+    if reply["transferred"] == true {
+        eprintln!("transferred");
+    } else {
+        eprintln!("nothing changed; run again with --yes to move the repository");
     }
     Ok(())
 }

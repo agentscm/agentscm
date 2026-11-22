@@ -19,7 +19,7 @@ use super::capacity::CapacityRefusal;
 use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
-    NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
+    NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound, RepositoryTransfer,
 };
 use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
@@ -975,6 +975,21 @@ pub trait Store: Send + Sync {
         node_id: Option<&str>,
         installation_id: Option<i64>,
     ) -> Result<ConnectedRepository>;
+    /// Moves repository `repo` from `expect_from` to App connection `to` (another connection
+    /// on its host) with `installation_id`, in one transaction, only when `apply` and nothing
+    /// is mid-write. The move deletes the repository's outbound, forge-check and validation
+    /// publication rows, clears its merge-group posts (bumping their generation), and keeps
+    /// its validation summary row disabled under `to`; everything else stays. Appends
+    /// `repository_transferred` with `actor`. Without `apply` it only counts.
+    fn transfer_repository(
+        &self,
+        repo: &str,
+        expect_from: &str,
+        to: &str,
+        installation_id: Option<i64>,
+        actor: &str,
+        apply: bool,
+    ) -> Result<RepositoryTransfer>;
     /// Oldest first, at most 1000.
     fn repositories(&self, connection: &str) -> Result<Vec<ConnectedRepository>>;
     /// `full_name` compares ASCII-case-insensitively.
