@@ -379,6 +379,9 @@ pub struct FakeState {
     pub lose_next_status_reply: bool,
     /// Commit-status contexts whose writes are refused with this HTTP status (kept, not consumed).
     pub reject_status_contexts: HashMap<String, u16>,
+    /// Refuse every comment creation with this status and rate-limit headers, as real GitHub
+    /// refuses a missing permission.
+    pub reject_comments: Option<u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
     /// Move the base after the repository has recorded this many statuses.
@@ -1393,6 +1396,13 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     let Ok(num) = num.parse::<u64>() else {
                         return not_found();
                     };
+                    if let Some(status) = state.reject_comments {
+                        return reply(
+                            status,
+                            &[("x-ratelimit-remaining".into(), "4999".into())],
+                            None,
+                        );
+                    }
                     let next = state
                         .repos
                         .values()

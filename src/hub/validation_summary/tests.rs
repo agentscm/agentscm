@@ -734,6 +734,39 @@ async fn uncertain_status_never_retries_or_creates_comment() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_status_is_recorded_with_its_context_for_admins() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    let context = f.policies[0].status_context();
+    f.forge.with(|s| {
+        s.reject_status_contexts.insert(context.clone(), 403);
+    });
+    let error = format!("{:?}", f.run().await.unwrap_err());
+    assert!(error.contains(&context), "{error}");
+    let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
+    assert_eq!(refusal["status"], 403);
+    assert_eq!(refusal["context"], context.as_str());
+    // The first write of a new attempt is the pending invalidation of its status slots.
+    assert_eq!(
+        refusal["reason"], "validation_invalidation_refused",
+        "{refusal}"
+    );
+    assert_eq!(f.counts().0, 0, "no summary comment after a refused status");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_comment_with_rate_limit_headers_is_recorded() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.forge.with(|s| s.reject_comments = Some(403));
+    assert!(f.run().await.is_err());
+    let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
+    assert_eq!(refusal["reason"], "validation_comment_refused", "{refusal}");
+    assert_eq!(refusal["status"], 403);
+    assert_eq!(refusal["context"], serde_json::Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_marker_is_never_adopted_and_wrong_signature_cannot_pass() {
     let f = Fixture::new().await;
     f.submit(0, Fixture::now(), true);
