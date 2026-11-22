@@ -2546,6 +2546,13 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
                     clean(&r["truncated"].to_string())
                 );
             }
+            for h in reply["held_elsewhere"].as_array().into_iter().flatten() {
+                println!(
+                    "{} is held by connection {}; discovery never moves it",
+                    clean(h["repository"].as_str().unwrap_or("?")),
+                    clean(h["held_by"].as_str().unwrap_or("?"))
+                );
+            }
         }
         ConnectionCommand::Outbound { id, state, hub } => {
             connection_id(&id)?;

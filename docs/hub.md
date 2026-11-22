@@ -1481,6 +1481,13 @@ an event or sent in a response. The client secret file can be given to
 person installs the app on repositories; `agentscm hub connections refresh <id>`
 (or the next poll) connects every repository its installations can see.
 
+A repository belongs to one connection: the first one that connected it.
+Discovery by another connection, such as a second app installation or a
+followed GitLab namespace, leaves it there. The refresh reply lists each such
+repository in `held_elsewhere` (`{"repository", "held_by"}`, `held_by` being the
+holding connection's id), and `agentscm hub connections refresh <id>` prints a
+line for each. Discovery never moves a repository to another connection.
+
 PAT fallback. `AGENTSCM_GITHUB_PAT_FILE` (preferred; a private regular file) or
 `AGENTSCM_GITHUB_PAT` holds a fine-grained token, with
 `AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET[_FILE]` if it should accept webhooks. At
@@ -1490,7 +1497,8 @@ as a different login than the connection records (its label would be wrong), sto
 startup; a transient failure of that check only logs, and a restart retries it.
 Repositories are added one at a time with
 `agentscm hub connections add-repo <id> owner/name`, and only if the PAT can read
-them (409 when another connection already holds the repository). A PAT acts as one
+them (409 when another connection already holds the repository; it stays with
+that connection, as it does under discovery). A PAT acts as one
 person: its comments appear as theirs.
 `AGENTSCM_GITHUB_URL` and `AGENTSCM_GITHUB_API_URL` are the ones sign-in uses.
 
@@ -1653,7 +1661,8 @@ line to stderr.
 Routes (administrators): `POST /v1/hub/github/apps`, the unauthenticated
 `GET /v1/hub/github/setup/{state}` and `GET /v1/hub/github/setup/callback` (the
 state is the capability and is single use), `GET /v1/hub/connections`,
-`POST /v1/hub/connections/{id}/refresh`, `POST /v1/hub/connections/{id}/outbound`
+`POST /v1/hub/connections/{id}/refresh` (`{reports, held_elsewhere}`; discovered repositories another
+connection holds are listed, not moved), `POST /v1/hub/connections/{id}/outbound`
 (`{"enabled": bool}`, 204) and `POST /v1/hub/connections/{id}/repositories`
 (`{"full_name"}`, PAT and GitLab token connections only; 403 when the token cannot read it, 409 when
 another connection holds it). Agent token: `GET /v1/hub/repos/{repo}/work` returns `{intents, intents_truncated,

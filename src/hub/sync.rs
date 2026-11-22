@@ -25,7 +25,7 @@ use super::connection::{ConnectedRepository, Connection, NewConnection, Observat
 use super::forge_api::ForgeApi;
 use super::forge_http::check_base_url;
 use super::github::{
-    Api, AppKey, Branch, Gh, GhError, MAX_RECENT_BRANCHES, header_str, valid_ref_name,
+    Api, AppKey, Branch, Gh, GhError, MAX_RECENT_BRANCHES, RepoInfo, header_str, valid_ref_name,
     webhook_signature_ok,
 };
 use super::gitlab;
@@ -870,18 +870,28 @@ impl PollReport {
     }
 }
 
+/// A repository discovery saw that another connection holds. Discovery never moves it.
+#[derive(Serialize)]
+struct HeldElsewhere {
+    repository: String,
+    held_by: String,
+}
+
 /// One round: every connection whose `next_poll_at` has passed.
 pub async fn poll_once(state: &HubState) -> Result<Vec<PollReport>> {
-    poll(state, None).await
+    Ok(poll(state, None).await?.0)
 }
 
 /// Discovery and a poll of one connection now, ignoring its `next_poll_at`.
 pub async fn refresh(state: &HubState, connection: &str) -> Result<Vec<PollReport>> {
-    poll(state, Some(connection)).await
+    Ok(poll(state, Some(connection)).await?.0)
 }
 
-async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
-    let mut reports = Vec::new();
+async fn poll(
+    state: &HubState,
+    only: Option<&str>,
+) -> Result<(Vec<PollReport>, Vec<HeldElsewhere>)> {
+    let (mut reports, mut held) = (Vec::new(), Vec::new());
     if state.sync.config.is_none() {
         for conn in db(state, |store| store.connections()).await? {
             catchup_connection_status(
@@ -891,7 +901,7 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
             )
             .await?;
         }
-        return Ok(reports);
+        return Ok((reports, held));
     }
     for mut conn in db(state, |store| store.connections()).await? {
         let due = match only {
@@ -899,12 +909,12 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
             None => conn.next_poll_at <= unix_now(),
         };
         if due {
-            reports.extend(poll_connection(state, &mut conn).await?);
+            reports.extend(poll_connection(state, &mut conn, &mut held).await?);
         }
     }
     let before = now_ms() - TOMBSTONE_KEEP_MS;
     db(state, move |store| store.prune_tombstones(before)).await?;
-    Ok(reports)
+    Ok((reports, held))
 }
 
 /// What to do after a failed call. Returns true when the connection should stop for now.
@@ -1004,7 +1014,12 @@ async fn catchup_connection_status(
     Ok(())
 }
 
-async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<PollReport>> {
+/// Adds to `held` each repository discovery found under another connection.
+async fn poll_connection(
+    state: &HubState,
+    conn: &mut Connection,
+    held: &mut Vec<HeldElsewhere>,
+) -> Result<Vec<PollReport>> {
     catchup_connection_status(
         state,
         conn,
@@ -1014,7 +1029,7 @@ async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<
     let mut reports = Vec::new();
     let mut marked = false;
     let found = match conn.kind.as_str() {
-        "app" => Some(poll_app(state, conn).await.map(|()| 0)),
+        "app" => Some(poll_app(state, conn).await.map(|found| (0, found))),
         _ => match followed_namespace(state, conn).await? {
             Some(namespace) => Some(follow_namespace(state, conn, namespace).await),
             None => None,
@@ -1022,7 +1037,8 @@ async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<
     };
     if let Some(found) = found {
         match found {
-            Ok(unread) => {
+            Ok((unread, found)) => {
+                held.extend(found);
                 mark_enabled(state, conn).await?;
                 marked = true;
                 // A connection-level report: the namespace listing passed its page cap.
@@ -1123,7 +1139,7 @@ async fn follow_rename(
 }
 
 /// Refresh the bot identity before this poll can reconcile any repository.
-async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<()> {
+async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<Vec<HeldElsewhere>> {
     let jwt = state.sync.jwt(conn).await?;
     let app = state.sync.api()?.authenticated_app(&jwt).await?;
     let app_id = app["id"]
@@ -1148,30 +1164,49 @@ async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<()> {
     discover(state, conn, &jwt).await
 }
 
-/// Connects every repository the app's installations can see.
-async fn discover(state: &HubState, conn: &Connection, jwt: &str) -> Gh<()> {
+/// Connects every repository the app's installations can see; returns those another connection holds.
+async fn discover(state: &HubState, conn: &Connection, jwt: &str) -> Gh<Vec<HeldElsewhere>> {
     let sync = &state.sync;
     let api = sync.api()?;
+    let mut held = Vec::new();
     for (installation, _) in api.installations(jwt).await? {
         let token = sync.token(conn, Some(installation)).await?;
         let repos = api.installation_repos(&token).await?;
-        let (id, host) = (conn.id.clone(), conn.host.clone());
-        db(state, move |store| {
-            for repo in repos {
-                store.upsert_repository(
-                    &id,
-                    &host,
-                    repo.repository_id,
-                    &repo.full_name,
-                    repo.node_id.as_deref(),
-                    Some(installation),
-                )?;
-            }
-            Ok(())
-        })
-        .await?;
+        held.extend(connect_all(state, conn, repos, Some(installation)).await?);
     }
-    Ok(())
+    Ok(held)
+}
+
+/// Upserts each repository under `conn`. One another connection already holds stays with it
+/// and is returned.
+async fn connect_all(
+    state: &HubState,
+    conn: &Connection,
+    repos: Vec<RepoInfo>,
+    installation: Option<i64>,
+) -> Result<Vec<HeldElsewhere>> {
+    let (id, host) = (conn.id.clone(), conn.host.clone());
+    db(state, move |store| {
+        let mut held = Vec::new();
+        for repo in repos {
+            let row = store.upsert_repository(
+                &id,
+                &host,
+                repo.repository_id,
+                &repo.full_name,
+                repo.node_id.as_deref(),
+                installation,
+            )?;
+            if row.connection != id {
+                held.push(HeldElsewhere {
+                    repository: row.full_name,
+                    held_by: row.connection,
+                });
+            }
+        }
+        Ok(held)
+    })
+    .await
 }
 
 /// The GitLab namespace the embedder has this connection follow, if any.
@@ -1190,12 +1225,13 @@ async fn followed_namespace(
 }
 
 /// Connects every project of `namespace`, as [`discover`] does an installation's
-/// repositories; returns the listing's pages left unread past its cap. Detaches nothing.
+/// repositories; returns the listing's pages left unread past its cap and the projects another
+/// connection holds. Detaches nothing.
 async fn follow_namespace(
     state: &HubState,
     conn: &Connection,
     namespace: gitlab::Namespace,
-) -> Gh<u32> {
+) -> Gh<(u32, Vec<HeldElsewhere>)> {
     let (gitlab::Namespace::Group(id) | gitlab::Namespace::User(id)) = namespace;
     let (Ok(ForgeApi::Gitlab(api)), true) = (state.sync.forge(conn), id > 0) else {
         return Err(GhError::Failed(
@@ -1204,23 +1240,7 @@ async fn follow_namespace(
     };
     let token = state.sync.token(conn, None).await?;
     let (projects, unread) = api.namespace_projects(&token, namespace).await?;
-    let (id, host) = (conn.id.clone(), conn.host.clone());
-    db(state, move |store| {
-        for project in projects {
-            // A project another connection already holds stays with it.
-            store.upsert_repository(
-                &id,
-                &host,
-                project.repository_id,
-                &project.full_name,
-                project.node_id.as_deref(),
-                None,
-            )?;
-        }
-        Ok(())
-    })
-    .await?;
-    Ok(unread)
+    Ok((unread, connect_all(state, conn, projects, None).await?))
 }
 
 /// Stored pull request observations by number.
@@ -3305,9 +3325,9 @@ async fn refresh_connection(
     human.admin()?;
     state.sync.configured()?;
     let conn = known(&state, id).await?;
-    let reports = refresh(&state, &conn.id).await?;
+    let (reports, held) = poll(&state, Some(&conn.id)).await?;
     let reports: Vec<Value> = reports.iter().map(PollReport::to_json).collect();
-    Ok(Json(json!({"reports": reports})))
+    Ok(Json(json!({"reports": reports, "held_elsewhere": held})))
 }
 
 #[derive(Deserialize)]

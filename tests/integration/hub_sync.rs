@@ -3090,6 +3090,53 @@ async fn a_pat_that_changed_owner_stops_startup_and_a_shared_repository_stays_wi
     sync::start(&env.state).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_discovery_reports_a_repository_another_connection_holds_and_leaves_it_there() {
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    env.fake.with(|s| {
+        s.repos.insert(102, Repo::new(102, "acme/shared"));
+        s.pats.get_mut(PAT).unwrap().2.insert(102);
+    });
+    // The PAT connection gets there first.
+    let pat = env.store.pat_connection(&env.host()).unwrap().unwrap();
+    let (status, body) = env
+        .post(
+            &format!("/v1/hub/connections/{}/repositories", pat.id),
+            Some(&admin),
+            json!({"full_name": "acme/shared"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let app = env.connect_app().await;
+    env.fake.with(|s| {
+        s.installations.push(Installation {
+            id: 7,
+            account: "acme".into(),
+            repos: vec![102],
+        });
+    });
+    let (status, reply) = env
+        .post(
+            &format!("/v1/hub/connections/{app}/refresh"),
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["held_elsewhere"],
+        json!([{"repository": "acme/shared", "held_by": pat.id}])
+    );
+    let shared = env
+        .store
+        .repository_named(&env.host(), "acme/shared")
+        .unwrap()
+        .unwrap();
+    assert_eq!(shared.connection, pat.id);
+    assert!(env.store.repositories(&app).unwrap().is_empty());
+}
+
 // ---- CLI ----
 
 fn cli(config: &TempDir, args: &[&str]) -> (bool, String, String) {
