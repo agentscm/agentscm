@@ -348,14 +348,6 @@ impl Fixture {
         })
     }
 
-    /// Where the Open Hub button of `user`'s latest message goes.
-    fn link(&self, user: &str) -> String {
-        let message = self.sent_body(user);
-        let elements = message["blocks"][2]["elements"].as_array().unwrap();
-        let open = elements.iter().find(|e| e["action_id"] == OPEN).unwrap();
-        open["url"].as_str().unwrap().to_owned()
-    }
-
     fn state_of_messages(&self) -> Vec<String> {
         let db = self.slack();
         let db = db.database().unwrap();
@@ -468,21 +460,15 @@ async fn ingress_checks_signature_workspace_app_and_request_shape() {
 /// The body of a handoff message as an earlier version sent it: the Hub link with the two
 /// answers before it, whose value names the holder token, session `a` and `PATH`.
 fn old_handoff_body(holder: &str, headline: &str, guidance: &str) -> Value {
-    let mut body = message(
-        headline,
-        &[("File", PATH.to_owned())],
-        guidance,
-        "https://hub.example.test/ui/#box-contested",
-    );
+    let mut body = message(headline, &[("File", PATH.to_owned())], guidance);
     let value = json!({"t": holder, "s": "a", "p": PATH}).to_string();
-    let elements = body["blocks"][2]["elements"].as_array_mut().unwrap();
-    elements.insert(
-        0,
-        json!({"type":"button","action_id":NO,"text":plain_text("Keep it",30),"value":value}),
-    );
-    elements.insert(
-        0,
-        json!({"type":"button","action_id":YES,"text":plain_text("Hand it over",30),"value":value}),
+    body["blocks"].as_array_mut().unwrap().insert(
+        2,
+        json!({"type":"actions","elements":[
+            {"type":"button","action_id":YES,"text":plain_text("Hand it over",30),"value":value},
+            {"type":"button","action_id":NO,"text":plain_text("Keep it",30),"value":value},
+            {"type":"button","action_id":OPEN,"url":"https://hub.example.test/ui/#box-contested"}
+        ]}),
     );
     body
 }
@@ -532,7 +518,7 @@ async fn owner_invalidation_posts_one_restricted_channel_message_and_records_pro
         messages,
         [json!({
             "channel":"CNOTICE",
-            "text":"<@U1> Local validation for pull request #42 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "text":"<@U1> Local validation for pull request #42 must be refreshed.",
             "unfurl_links":false,
             "unfurl_media":false
         })]
@@ -680,7 +666,7 @@ async fn owner_invalidation_falls_back_to_one_direct_message_without_a_channel()
     assert_eq!(messages[0]["channel"], "U1");
     assert_eq!(
         messages[0]["text"],
-        "Local validation for pull request #43 must be refreshed. <https://hub.example.test/ui/#home|Open AgentSCM>"
+        "Local validation for pull request #43 must be refreshed."
     );
 }
 
@@ -723,7 +709,7 @@ async fn addressed_notice_uses_channel_only_by_opt_in_and_never_copies_its_text(
         messages,
         [json!({
             "channel":"CNOTICE",
-            "text":"<@U1> You have an AgentSCM repository notice. <https://hub.example.test/ui/#home|Open AgentSCM>",
+            "text":"<@U1> You have an AgentSCM repository notice. Ask your agent to list your AgentSCM notices.",
             "unfurl_links":false,
             "unfurl_media":false
         })]
@@ -765,7 +751,7 @@ async fn addressed_notice_uses_channel_only_by_opt_in_and_never_copies_its_text(
     assert_eq!(private["channel"], "U1");
     assert_eq!(
         private["text"],
-        "You have a private AgentSCM notice. <https://hub.example.test/ui/#home|Open AgentSCM>"
+        "You have a private AgentSCM notice. Ask your agent to list your AgentSCM notices."
     );
 }
 
@@ -836,7 +822,7 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     );
     assert_eq!(
         notice["text"],
-        "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub."
+        "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in its session."
     );
     assert!(
         f.calls
@@ -849,7 +835,7 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
     let update = f.update().await;
     assert_eq!(update["channel"], "D1");
     assert_eq!(update["ts"], "1.2");
-    // The header, fields and link to the Hub stay; the handoff buttons and guidance become the
+    // The header and fields stay; the handoff buttons and guidance become the
     // outcome.
     let kinds: Vec<_> = update["blocks"]
         .as_array()
@@ -857,11 +843,7 @@ async fn an_old_handoff_message_still_hands_over_with_its_button() {
         .iter()
         .map(|b| b["type"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["header", "section", "actions", "context"]);
-    assert_eq!(
-        update["blocks"][2]["elements"],
-        json!([open_button("https://hub.example.test/ui/#box-contested")])
-    );
+    assert_eq!(kinds, ["header", "section", "context"]);
     assert_eq!(
         rendered(&update),
         "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
@@ -957,7 +939,7 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     let update = f.update().await;
     assert_eq!(
-        update["blocks"][3]["elements"][0]["text"],
+        update["blocks"][2]["elements"][0]["text"],
         "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
 }
@@ -979,7 +961,7 @@ async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
             .any(|(path, _)| path == "/api/chat.update")
     );
     assert_eq!(
-        f.update().await["blocks"][3]["elements"][0]["text"],
+        f.update().await["blocks"][2]["elements"][0]["text"],
         "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
 }
@@ -1078,12 +1060,7 @@ async fn a_slack_outage_is_waited_out_and_the_message_then_arrives() {
 async fn startup_fails_old_queued_messages_but_keeps_wait_messages() {
     let f = Fixture::new().await;
     f.seed("old", 0, json!({"text": "x", "blocks": []}));
-    let wait = message(
-        status::WAIT_HEADLINE,
-        &[("Waiting", "x".to_owned())],
-        "g",
-        "https://hub.example.test/ui/#box-needs",
-    );
+    let wait = message(status::WAIT_HEADLINE, &[("Waiting", "x".to_owned())], "g");
     f.seed("wait", 0, wait);
     let reopened = Slack::from_file(&f.dir.path().join("config")).unwrap();
     let states: Vec<(String, String)> = reopened
@@ -1163,7 +1140,7 @@ async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
     let notice = f.call("/api/chat.postEphemeral").await;
     assert_eq!(
         notice["text"],
-        "The Hub did not accept that answer. Nothing changed. Answer in the Hub instead."
+        "The Hub did not accept that answer. Nothing changed. Answer in your agent session instead."
     );
 
     // Alice's read-only token no longer works: the click names that and who can fix it.
@@ -1179,7 +1156,7 @@ async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
     let notice = f.call("/api/chat.postEphemeral").await;
     assert_eq!(
         notice["text"],
-        "Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in the Hub."
+        "Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in your agent session."
     );
     assert_eq!(
         (notice["channel"].as_str(), notice["user"].as_str()),
@@ -1270,50 +1247,20 @@ fn agents_are_named_the_way_the_hub_names_them() {
 #[test]
 fn a_message_names_its_subject_once_and_keeps_text_as_typed() {
     let fields = [("File", "src/a.rs".to_owned())];
-    let link = "https://hub.example.test/ui/#inbox";
     // A header that already names the file is the whole notification.
     assert_eq!(
-        message("bob’s Codex edited src/a.rs", &fields, "g", link)["text"],
+        message("bob’s Codex edited src/a.rs", &fields, "g")["text"],
         "bob’s Codex edited src/a.rs"
     );
     assert_eq!(
-        message("Your agent kept a file", &fields, "g", link)["text"],
+        message("Your agent kept a file", &fields, "g")["text"],
         "Your agent kept a file: src/a.rs"
     );
     // `:rocket:` in a path or name is not turned into an emoji.
-    let body = message(
-        "h :rocket:",
-        &[("File", ":tada:".to_owned())],
-        ":smile:",
-        link,
-    );
+    let body = message("h :rocket:", &[("File", ":tada:".to_owned())], ":smile:");
     assert_eq!(body["blocks"][0]["text"]["emoji"], false);
     assert_eq!(body["blocks"][1]["fields"][0]["emoji"], false);
-    assert_eq!(body["blocks"][3]["elements"][0]["emoji"], false);
-}
-
-#[test]
-fn a_clicked_message_keeps_only_a_link_that_points_into_this_hub() {
-    let hub = "https://hub.example.test/ui/";
-    let actions = |url: &str| {
-        json!({"type":"actions","elements":[
-            {"type":"button","action_id":YES,"value":"{}","text":plain_text("Hand it over",30)},
-            open_button(url)]})
-    };
-    let expected =
-        json!({"type":"actions","elements":[open_button("https://hub.example.test/ui/#inbox")]});
-    assert_eq!(
-        kept(&actions("https://hub.example.test/ui/#inbox"), hub),
-        Some(expected)
-    );
-    assert_eq!(
-        kept(&actions("https://elsewhere.example.test/"), hub),
-        Some(json!({"type":"actions","elements":[open_button(hub)]}))
-    );
-    // Without a link the buttons just go.
-    let none = json!({"type":"actions","elements":[
-        {"type":"button","action_id":NO,"value":"{}","text":plain_text("Keep it",30)}]});
-    assert_eq!(kept(&none, hub), None);
+    assert_eq!(body["blocks"][2]["elements"][0]["emoji"], false);
 }
 
 #[test]
@@ -1322,7 +1269,6 @@ fn message_text_cannot_mention_or_link() {
         "<!channel> & <http://x|y>",
         &[("File", "<@U1>".into())],
         "<!here>",
-        "https://hub.example.test/ui/",
     );
     assert_eq!(
         body["text"],
@@ -1345,7 +1291,7 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
         ("Their agent", who.clone()),
     ];
     let headline = format!("Another agent edited {hostile}");
-    let body = message(&headline, &fields, &hostile, "https://hub.example.test/ui/");
+    let body = message(&headline, &fields, &hostile);
     let blocks = body["blocks"].as_array().unwrap();
     let header = blocks[0]["text"]["text"].as_str().unwrap();
     assert!(header.chars().count() <= 150);
@@ -1357,7 +1303,7 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
         assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
     }
     assert!(section[0]["text"].as_str().unwrap().ends_with("\n+7 more"));
-    assert_eq!(blocks[2]["elements"].as_array().unwrap().len(), 1);
+    assert_eq!(blocks[2]["type"], "context");
     let text = body["text"].as_str().unwrap();
     assert!(!text.contains('<') && !text.contains('>'));
     assert!(!rendered(&body).contains('\u{7}'));
@@ -1459,7 +1405,7 @@ async fn entry_blocked_is_once_per_episode_even_after_restart_and_job_expiry() {
     let now = unix_now();
     scan_status(&f, now);
     scan_status(&f, now + 1);
-    let repeated = status_checkpoint(&f, &f.alice, &blocked, "blocker");
+    status_checkpoint(&f, &f.alice, &blocked, "blocker");
     scan_status(&f, now + 2);
     assert_eq!(entry_states(&f), ["queued"]);
     let (job, episode, cycle): (String, String, i64) = f
@@ -1490,14 +1436,7 @@ async fn entry_blocked_is_once_per_episode_even_after_restart_and_job_expiry() {
         assert!(visible.contains("Answer the blocker where your agent is running"));
         assert!(visible.contains(REPO));
         assert!(visible.contains("Claude Code session "));
-        assert_eq!(
-            message["blocks"][2]["elements"][0]["url"],
-            format!("https://hub.example.test/ui/#work/{}", repeated.id)
-        );
-        assert_eq!(
-            message["blocks"][2]["elements"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(message["blocks"][2]["type"], "context");
     }
     let restarted = restarted_slack(&f);
     tokio::task::block_in_place(|| {
@@ -1554,7 +1493,7 @@ async fn entry_blocked_handover_uses_shared_owner_not_the_new_lead_or_other_read
     })).unwrap(), unix_now())).unwrap().item;
     assert_eq!(claimed.owner, work.owner);
     let blocked = status_checkpoint(&f, &f.bob, &claimed, "blocker");
-    let offered = tokio::task::block_in_place(|| {
+    tokio::task::block_in_place(|| {
         f.store()
             .work_checkpoint(
                 &f.bob,
@@ -1596,10 +1535,6 @@ async fn entry_blocked_handover_uses_shared_owner_not_the_new_lead_or_other_read
     assert!(rendered(body).contains("Blocked on: Synthetic status change"));
     assert!(rendered(body).contains("Codex session "));
     assert!(rendered(body).contains("Resolve the reported blocker"));
-    assert_eq!(
-        body["blocks"][2]["elements"][0]["url"],
-        format!("https://hub.example.test/ui/#work/{}", offered.id)
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2583,12 +2518,7 @@ async fn a_new_lead_generation_suppresses_the_former_recipients_reminder() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_status_answers_unknown_privately_and_does_not_block_coordination_collection() {
     let f = Fixture::configured(Some(policy()), false).await;
-    let queued = message(
-        "h",
-        &[("File", PATH.to_owned())],
-        "g",
-        "https://hub.example.test/ui/",
-    );
+    let queued = message("h", &[("File", PATH.to_owned())], "g");
     f.seed("queued", 0, queued);
     f.post(
         status_event("EvUNAVAILABLE", "U1", "status").to_string(),

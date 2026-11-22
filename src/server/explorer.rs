@@ -46,20 +46,6 @@ pub(super) fn open(
     }
 }
 
-/// An explorer for one connected checkout, with its capture spool when one is bound to it.
-#[cfg(feature = "ui")]
-pub(super) fn open_checkout(
-    root: &std::path::Path,
-    repository: &str,
-    spool: Option<PathBuf>,
-) -> Result<Arc<Explorer>> {
-    let git = GitExplorer::open(root, repository)?;
-    let evidence = spool
-        .map(|path| EvidenceExplorer::open(path, repository.to_owned()))
-        .transpose()?;
-    Ok(Arc::new(Explorer { git, evidence }))
-}
-
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/local/explorer/{operation}", get(read))
 }
@@ -142,29 +128,11 @@ async fn read(
     State(state): State<AppState>,
     Path(operation): Path<String>,
     RawQuery(raw): RawQuery,
-    #[cfg(feature = "ui")] selected: Option<axum::Extension<super::front_door::Selected>>,
 ) -> Response {
     let Some(operation) = Operation::parse(&operation) else {
         return failure(StatusCode::NOT_FOUND, "Unknown repository explorer read.");
     };
-    // The front door picks the checkout per request; `serve --explorer-repo` has exactly one.
-    #[cfg(feature = "ui")]
-    let explorer = match (&selected, &state.front_door) {
-        (Some(axum::Extension(selected)), Some(front_door)) => {
-            match front_door.explorer(selected) {
-                Ok(explorer) => Some(explorer),
-                Err(error) => {
-                    eprintln!("repository explorer open failed: {error:?}");
-                    return failure(
-                        StatusCode::NOT_FOUND,
-                        "This checkout could not be opened for browsing. Check that it still exists, then reload.",
-                    );
-                }
-            }
-        }
-        _ => state.explorer.clone(),
-    };
-    #[cfg(not(feature = "ui"))]
+    // `serve --explorer-repo` configures exactly one checkout.
     let explorer = state.explorer.clone();
     let Some(explorer) = explorer else {
         return failure(
@@ -190,8 +158,6 @@ async fn read(
             "Private capture is not connected. Configure --explorer-spool to read retained evidence on this computer.",
         );
     }
-    #[cfg(feature = "ui")]
-    let front_door = state.front_door.clone();
     let result = blocking(state, move |_| {
         let value = project(&explorer, operation, &fields, limit)?;
         let body = serde_json::to_string(&value)?;
@@ -210,13 +176,6 @@ async fn read(
         ),
         Err(error) => {
             // A rejected query says nothing about the checkout; other failures may mean it moved.
-            #[cfg(feature = "ui")]
-            if error.status != StatusCode::BAD_REQUEST
-                && let (Some(axum::Extension(selected)), Some(front_door)) =
-                    (&selected, &front_door)
-            {
-                front_door.forget_explorer(selected);
-            }
             // Git and filesystem diagnostics can contain local paths or private
             // data. Their detailed text stays in the local service diagnostics.
             eprintln!("repository explorer read failed: {:?}", error.message);

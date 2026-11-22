@@ -4,7 +4,7 @@
 
 ## Platform
 
-web
+CLI, MCP and HTTP API
 
 ## Users
 
@@ -12,11 +12,11 @@ People working with coding agents who need to catch up on shared work, inspect a
 
 ## Product Purpose
 
-AgentSCM combines source control with a coordination Hub. Its web views connect work ownership, intent, source, observed actions and retained evidence so people can resume work or review a change without reconstructing every agent session. The primary questions are: who owns the work, what changed, what ran against which source, what remains unknown, and what decision comes next?
+AgentSCM combines source control with a coordination Hub. Its records connect work ownership, intent, source, observed actions and retained evidence so people can resume work or review a change without reconstructing every agent session. The primary questions are: who owns the work, what changed, what ran against which source, what remains unknown, and what decision comes next?
 
 ## Operating Context
 
-The main path works alongside existing Git repositories, coding agents and GitHub or GitLab. Durable work and live file activity are separate views. The shared coordination dashboard reads Hub records; `agentscm open` also connects the browser to selected checkouts and private evidence on this computer. Local settings and workflow-library writes require the connected page's own authorization. Experimental native workflow execution and landing authority remain a separate opt-in path; Git and forge merges retain their existing authority.
+The main path works alongside existing Git repositories, coding agents and GitHub or GitLab. Durable work and live file activity are separate records. Agents and the CLI read Hub records through MCP and HTTP. Experimental native workflow execution and landing authority remain a separate opt-in path; Git and forge merges retain their existing authority.
 
 ## Capabilities and Constraints
 
@@ -30,15 +30,10 @@ The main path works alongside existing Git repositories, coding agents and GitHu
 - Claim freshness and reported work state are separate. Stale and unknown claims remain claimed.
 - Current work and historical changes share one bounded, fixed-watermark traversal. Page counts and filters describe only the current page.
 - The work overview is a separate repository-wide, bounded snapshot. It returns unfinished work, recent outcomes, and server-computed declared-scope overlaps with explicit completeness flags.
-- Retained-history compaction makes a requested recent window incomplete when the removed events cannot be placed against that time range; the interface keeps that uncertainty visible.
+- Retained-history compaction makes a requested recent window incomplete when the removed events cannot be placed against that time range; the response keeps that uncertainty visible.
 - An empty overlap list is an all-clear only when the server marks the overlap slice complete. Declared-scope overlap is a coordination signal, not proof of a source conflict.
-- Scope conflicts can create durable directed requests for the affected leads. Leads receive, acknowledge and reply through authenticated MCP or HTTP flows; the Hub dashboard only reads the queue.
+- Scope conflicts can create durable directed requests for the affected leads. Leads receive, acknowledge and reply through authenticated MCP or HTTP flows. Reading the queue does not acknowledge or answer a request.
 - Request status distinguishes pending receipt, pending replies, responses, resolution and withdrawal. Detection remains separate because an overlap does not itself prove a request was delivered.
-- The visible overview and the fresh first page of directed requests refresh about every 15 seconds. Paging holds a fixed request watermark until the user explicitly returns to a fresh first page; refresh failures keep and label the last loaded data.
-- Detected and per-target overlap reasons are bounded. When more path pairs exist, the view says they were omitted and points people to the declared scopes rather than presenting the visible reasons as exhaustive.
-- Request receipt and response histories are also bounded. The queue marks omitted history, relies on the server's request status, and avoids inferring an outstanding receipt or reply from a clipped projection.
-- Directed requests use compact summaries with full returned paths, receipts, responses and notes available by expansion. Detected overlaps, other attention signals and recent decisions are collapsed secondary evidence with visible counts, preserving access without making the default view a long feed.
-- Reading in the dashboard never acknowledges a briefing or mutates work.
 - Checkpoints do not prove execution, review, acceptance or landing.
 - The current implementation is alpha; real-client and production deployment qualification are separate.
 
@@ -53,5 +48,5 @@ Preserve AgentSCM's name and logo. Use plain, direct language that makes ownersh
 - Keep long histories out of the default view.
 - Make uncertainty visible without treating stale work as available.
 - Explain why work needs coordination and identify both involved agents and their declared scopes.
-- Keep directed requests and replies durable and inspectable without making a dashboard read acknowledge or answer them.
+- Keep directed requests and replies durable and inspectable without making a read acknowledge or answer them.
 - Reveal technical detail when requested.

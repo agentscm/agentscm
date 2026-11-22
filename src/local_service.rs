@@ -1,6 +1,7 @@
-//! The discovery record of this user's local front door (`agentscm serve --front-door`).
+//! The discovery record left by an older version's local dashboard, read only so that
+//! `agentscm open --stop` can stop it.
 //!
-//! The running service writes one owner-only record under the user's config directory and removes
+//! That service wrote one owner-only record under the user's config directory and removed
 //! it on shutdown. The record holds the address and a per-process admin secret that can only mint
 //! single-use browser connection codes; it never grants reads by itself.
 
@@ -39,91 +40,6 @@ pub(crate) fn valid_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-#[cfg(feature = "ui")]
-pub(crate) fn random_hex(bytes: usize) -> Result<String> {
-    let mut random = vec![0_u8; bytes];
-    getrandom::fill(&mut random)
-        .map_err(|_| agentscm::Error::Invalid("random source unavailable".into()))?;
-    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Create the private directory with owner-only permissions.
-#[cfg(feature = "ui")]
-pub(crate) fn ensure_dir() -> Result<PathBuf> {
-    let dir = dir()?;
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(dir)
-}
-
-/// The short host name, which the page shows to identify this computer.
-#[cfg(feature = "ui")]
-pub(crate) fn computer_name() -> String {
-    #[cfg(unix)]
-    let name = {
-        let mut buffer = [0_u8; 256];
-        // SAFETY: the buffer is valid for its length; a name that fills it is cut at the end.
-        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0 {
-            let end = buffer
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(buffer.len());
-            String::from_utf8_lossy(&buffer[..end]).into_owned()
-        } else {
-            String::new()
-        }
-    };
-    #[cfg(not(unix))]
-    let name = std::env::var("COMPUTERNAME").unwrap_or_default();
-    let short = name.split('.').next().unwrap_or_default();
-    let clean: String = short
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(63)
-        .collect();
-    if clean.is_empty() {
-        "This computer".into()
-    } else {
-        clean
-    }
-}
-
-/// Publish this process's record; dropping the guard removes it if it is still ours.
-#[cfg(feature = "ui")]
-pub(crate) fn publish(record: &ServiceRecord) -> Result<RecordGuard> {
-    ensure_dir()?;
-    let path = record_path()?;
-    crate::hub_cli::write_private(&path, &serde_json::to_string(record)?)?;
-    Ok(RecordGuard {
-        path,
-        instance: record.instance.clone(),
-    })
-}
-
-#[cfg(feature = "ui")]
-pub(crate) struct RecordGuard {
-    path: PathBuf,
-    instance: String,
-}
-
-#[cfg(feature = "ui")]
-impl Drop for RecordGuard {
-    fn drop(&mut self) {
-        // A newer service may have replaced the record; leave its record alone.
-        if load()
-            .ok()
-            .flatten()
-            .is_some_and(|record| record.instance == self.instance)
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
 }
 
 /// The published record, if one exists, is owner-only and names a live process. A record left
@@ -215,13 +131,5 @@ mod tests {
         assert!(!loopback_base("http://example.com:80"));
         assert!(!loopback_base("http://127.0.0.1:80/path"));
         assert!(!loopback_base("http://127.0.0.1"));
-    }
-
-    #[test]
-    #[cfg(feature = "ui")]
-    fn computer_name_is_a_short_safe_label() {
-        let name = computer_name();
-        assert!(!name.is_empty() && name.len() <= 63);
-        assert!(!name.contains('.') && !name.contains('/'));
     }
 }

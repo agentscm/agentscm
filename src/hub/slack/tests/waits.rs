@@ -80,7 +80,7 @@ async fn a_wait_past_the_grace_is_one_message_however_many_passes_see_it() {
         "{sent:?}"
     );
     assert!(sent[0].1.contains("Retry the job?"), "{sent:?}");
-    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#box-needs");
+    assert_eq!(f.sent_body("U1")["blocks"][2]["type"], "context");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

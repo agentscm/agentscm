@@ -223,7 +223,7 @@ You sign in once per computer, not once per repository or per day:
    If you lose it, your agents are told why and what to ask for.
 4. `agentscm hub whoami` shows who this computer is signed in as, and
    `agentscm hub devices list|rename|revoke` manages your computers.
-5. If you signed in before this existed, the next connect, renewal or `agentscm open` while that sign-in
+5. If you signed in before this existed, the next connect or renewal while that sign-in
    is still live signs this computer in without asking.
 
 See [connect this computer](connect-this-computer.md#sign-in-once-per-computer) for the details

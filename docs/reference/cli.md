@@ -478,10 +478,10 @@ agentscm telemetry configure --clear-endpoint
 ## Demo
 
 ```sh
-agentscm demo [--no-open]
+agentscm demo
 ```
 
-`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints the scripted results in the terminal. It never writes to the repository. Its last line names `agentscm quickstart` (or `npx agentscm`) for setup. Native builds have no dashboard or browser launch; builds with the `ui` feature additionally print a demonstration page link, and `--no-open` suppresses opening it.
+`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints the scripted results in the terminal. It never writes to the repository. Its last line names `agentscm quickstart` (or `npx agentscm`) for setup.
 
 ## Agent wiring
 
@@ -581,8 +581,8 @@ and `command/v1` review context plus paired `--docker` and `--docker-socket` fla
 `skill-workflow recover RUN_ID STEP_ID --docker PATH --docker-socket SOCKET` to reconcile an
 interrupted command without replaying it. See the guide for recipe binding and cleanup limits.
 
-Execution and recovery are local CLI operations. The native API, operator-mapped hub/MCP and
-dashboard inspect retained runs. The optional [Claude Code loop](../advanced/claude-code-workflows.md)
+Execution and recovery are local CLI operations. The native API and operator-mapped hub/MCP
+inspect retained runs. The optional [Claude Code loop](../advanced/claude-code-workflows.md)
 adds `skill-workflow configure`, `check`, `claude-stop` and `require`. Configured native targets
 require an exact-current finalized graph receipt; a standalone successful run is not an approval.
 

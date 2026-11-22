@@ -1673,30 +1673,6 @@ impl HubAuth {
         }
     }
 
-    /// The request that mints a token for `repository`. A computer's tokens get the Hub's
-    /// lifetime (24 hours, or 30 minutes read-only); a session asks for `ttl_seconds`.
-    #[cfg(feature = "ui")]
-    pub(crate) fn mint(
-        &self,
-        hub: &str,
-        name: &str,
-        repository: &str,
-        ttl_seconds: i64,
-        read_only: bool,
-    ) -> (String, Value) {
-        match self {
-            Self::Device(_) => (
-                format!("{hub}/v1/hub/device/tokens"),
-                json!({"name": name, "repository": repository, "read_only": read_only}),
-            ),
-            Self::Session(_) => (
-                format!("{hub}/v1/hub/tokens"),
-                json!({"name": name, "repository": repository, "ttl_seconds": ttl_seconds,
-                    "read_only": read_only}),
-            ),
-        }
-    }
-
     /// Where the owner revokes one of their tokens by id.
     pub(crate) fn revoke_url(&self, hub: &str, id: &str) -> String {
         match self {

@@ -314,7 +314,7 @@ fn refused(status: StatusCode, message: &str) -> Response {
     let body = format!(
         "<h1>This app can't connect</h1><p>{}</p><p><a href=\"{}\">Return to AgentSCM</a></p>",
         escape(message),
-        super::super::ui::landing()
+        super::super::landing::landing()
     );
     page(status, "Can't connect", &body, None)
 }

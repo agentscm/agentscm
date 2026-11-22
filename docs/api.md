@@ -6,8 +6,7 @@ title: "Read-only HTTP API"
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
 
-`agentscm serve` exposes a read-only JSON API and `/health`. It has no web interface (the
-coordination hub's read-only status page is separate: see [the hub guide](hub.md#status-page)).
+`agentscm serve` exposes a read-only JSON API and `/health`. It has no web interface.
 The CLI and this API are the supported surface. `GET /v1/collisions` belongs to the main path;
 the revision, diff and workflow routes read the experimental native store (see
 [advanced](advanced/README.md)).
@@ -45,7 +44,7 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 
 ## Hub: people answering for their own agent
 
-Browser-session routes for the Hub's Inbox page; the web sign-in cookie, and for a change its
+Browser-session routes for a person answering for their own agent; the web sign-in cookie, and for a change its
 `x-csrf-token`. Each names one of the signed-in person's own writable agent tokens; another
 person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 [Hub guide](hub.md) for the bodies and replies.
@@ -364,7 +363,7 @@ read-only tokens; recording needs an agent token. Each returns structured JSON b
 ## Local template and timeline reads
 
 The `/v1/local` routes return exactly the JSON that the matching CLI command prints, without the
-CLI's `ok` envelope, so a local status page can show
+CLI's `ok` envelope, for
 [reusable workflow templates](advanced/reusable-workflows.md) and the
 [workspace snapshot timeline](workspace-timeline.md). They are read-only: only GET is routed (other
 methods get 405). Capture, fork, configure, check, resume and cancel stay in the CLI and the local

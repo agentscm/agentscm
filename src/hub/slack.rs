@@ -119,7 +119,6 @@ pub struct Slack {
     app: String,
     expected_bot: String,
     team: String,
-    hub_url: String,
     signing: String,
     bot: String,
     bindings: Vec<Binding>,
@@ -213,7 +212,6 @@ pub(super) fn secret(path: &Path) -> Result<String> {
 }
 
 struct ValidatedConfig {
-    hub_url: String,
     callback_url: String,
     signing: String,
     bot: String,
@@ -252,7 +250,6 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
         return Err(invalid());
     }
     let url = origin(&config.hub_url)?;
-    let hub_url = url.join("ui/").map_err(|_| invalid())?.to_string();
     let callback_url = url.join("v1/hub/slack").map_err(|_| invalid())?.to_string();
     let signing = secret(&config.signing_secret_file)?;
     let bot = secret(&config.bot_token_file)?;
@@ -302,7 +299,6 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
         validate_private_metadata(&metadata, 128 * 1024 * 1024)?;
     }
     Ok(ValidatedConfig {
-        hub_url,
         callback_url,
         signing,
         bot,
@@ -346,17 +342,11 @@ fn listed(lines: &[String]) -> String {
     shown.join("\n")
 }
 
-/// The button that opens the Hub at `url`.
-fn open_button(url: &str) -> Value {
-    json!({"type":"button","action_id":OPEN,"text":plain_text("Open Hub",30),"url":url})
-}
-
 /// A direct message, all plain text (never mrkdwn): a header, two-column label/value
-/// fields, a button to the Hub page `link` is about, and one line of guidance. The
+/// fields and one line of guidance. The
 /// notification text is the header, followed by the first field's first line unless the
 /// header already says it.
-fn message(headline: &str, fields: &[(&str, String)], guidance: &str, link: &str) -> Value {
-    let elements = vec![open_button(link)];
+fn message(headline: &str, fields: &[(&str, String)], guidance: &str) -> Value {
     let subject = fields
         .first()
         .and_then(|(_, value)| value.lines().next())
@@ -376,16 +366,13 @@ fn message(headline: &str, fields: &[(&str, String)], guidance: &str, link: &str
         "blocks": [
             {"type":"header","text":plain_text(headline,150)},
             {"type":"section","fields":fields},
-            {"type":"actions","elements":elements},
             {"type":"context","elements":[plain_text(guidance,500)]},
         ],
     })
 }
 
-/// A clicked message's header, fields and link to the Hub (or the text of an older message),
-/// rebuilt as plain text; its handoff buttons and guidance are dropped for the outcome. The
-/// link stays only if it still points into this Hub.
-fn kept(block: &Value, hub_url: &str) -> Option<Value> {
+/// Rebuild the header and fields of a clicked message as plain text.
+fn kept(block: &Value) -> Option<Value> {
     let text = block.pointer("/text/text").and_then(Value::as_str);
     match (block["type"].as_str()?, text) {
         ("header", Some(text)) => Some(json!({"type":"header","text":plain_text(text,150)})),
@@ -399,14 +386,6 @@ fn kept(block: &Value, hub_url: &str) -> Option<Value> {
                 .map(|text| plain_lines(text, 2000))
                 .collect();
             (!fields.is_empty()).then(|| json!({"type":"section","fields":fields}))
-        }
-        ("actions", _) => {
-            let link = block["elements"]
-                .as_array()?
-                .iter()
-                .find(|element| element["action_id"] == OPEN)?;
-            let url = link["url"].as_str().filter(|url| url.starts_with(hub_url));
-            Some(json!({"type":"actions","elements":[open_button(url.unwrap_or(hub_url))]}))
         }
         _ => None,
     }
@@ -520,7 +499,6 @@ impl Slack {
             app: config.app_id,
             expected_bot: config.bot_id,
             team: config.team_id,
-            hub_url: validated.hub_url,
             signing: validated.signing,
             bot: validated.bot,
             bindings,
@@ -681,23 +659,6 @@ impl Slack {
         Ok(())
     }
 
-    /// The Hub page at hash route `route`, as the UI's `#box-needs` anchor names it.
-    fn link(&self, route: &str) -> String {
-        format!("{}#{route}", self.hub_url)
-    }
-
-    fn work_link(&self, id: &str) -> String {
-        let plain = !id.is_empty()
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
-        if plain {
-            self.link(&format!("work/{id}"))
-        } else {
-            self.hub_url.clone()
-        }
-    }
-
     /// The oldest due message whose person is still authorized, marked as sending; a message
     /// for a revoked binding fails instead.
     fn next_message(&self, state: &HubState) -> Result<Option<(String, String, Value, i64)>> {
@@ -812,7 +773,6 @@ impl Slack {
                 else {
                     continue;
                 };
-                let link = self.link("home");
                 let text = if notice.source_kind == OwnerNoticeSourceKind::AttestationInvalidation {
                     let number = notice
                         .source_id
@@ -822,25 +782,22 @@ impl Slack {
                         .unwrap_or("unknown");
                     if binding.config.owner_notice_channel.is_some() {
                         format!(
-                            "<@{}> Local validation for pull request #{} must be refreshed. <{}|Open AgentSCM>",
-                            binding.config.slack_user, number, link
+                            "<@{}> Local validation for pull request #{} must be refreshed.",
+                            binding.config.slack_user, number
                         )
                     } else {
                         format!(
-                            "Local validation for pull request #{} must be refreshed. <{}|Open AgentSCM>",
-                            number, link
+                            "Local validation for pull request #{} must be refreshed.",
+                            number
                         )
                     }
                 } else if public {
                     format!(
-                        "<@{}> You have an AgentSCM repository notice. <{}|Open AgentSCM>",
-                        binding.config.slack_user, link
+                        "<@{}> You have an AgentSCM repository notice. Ask your agent to list your AgentSCM notices.",
+                        binding.config.slack_user
                     )
                 } else {
-                    format!(
-                        "You have a private AgentSCM notice. <{}|Open AgentSCM>",
-                        link
-                    )
+                    "You have a private AgentSCM notice. Ask your agent to list your AgentSCM notices.".to_owned()
                 };
                 let body = json!({
                     "channel": destination,
@@ -1058,22 +1015,22 @@ impl Refusal {
     fn sentence(&self) -> &'static str {
         match self {
             Self::Ended => {
-                "Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in the Hub."
+                "Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in your agent session."
             }
             Self::NotYours => {
-                "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub."
+                "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in its session."
             }
             Self::NotYourWork => {
-                "The Hub did not accept this: that work is not yours. Nothing changed. Open the Hub to see whose it is."
+                "The Hub did not accept this: that work is not yours. Nothing changed. Run agentscm work status to see whose it is."
             }
             Self::Busy => {
                 "The Hub is busy right now. Nothing changed; press the button again in a moment."
             }
             Self::Rejected => {
-                "The Hub did not accept that answer. Nothing changed. Answer in the Hub instead."
+                "The Hub did not accept that answer. Nothing changed. Answer in your agent session instead."
             }
             Self::Unavailable => {
-                "The Hub could not record that answer. Nothing changed; press the button again in a moment, or answer in the Hub."
+                "The Hub could not record that answer. Nothing changed; press the button again in a moment, or answer in your agent session."
             }
         }
     }
@@ -1299,11 +1256,7 @@ fn prepare(
         .pointer("/message/blocks")
         .and_then(Value::as_array)
         .map_or_else(Vec::new, |blocks| {
-            blocks
-                .iter()
-                .take(4)
-                .filter_map(|block| kept(block, &slack.hub_url))
-                .collect()
+            blocks.iter().take(4).filter_map(kept).collect()
         });
     Ok(Prepared::Update {
         channel: channel.to_owned(),

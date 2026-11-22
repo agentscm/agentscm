@@ -1,11 +1,3 @@
-# The status page, embedded into the hub binary by the build stage (`--features ui`).
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS ui
-WORKDIR /ui
-COPY ui/package.json ui/package-lock.json ./
-RUN npm ci --ignore-scripts
-COPY ui ./
-RUN npm run build
-
 FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -13,17 +5,16 @@ COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
 COPY examples/slack-manifest.json ./examples/slack-manifest.json
 COPY docs/assets/agentscm-icon.png ./docs/assets/agentscm-icon.png
-COPY --from=ui /ui/dist ./ui/dist
 COPY tools/portable-verifier ./tools/portable-verifier
 # The commit the Hub reports on /health; the build context has no .git (empty means unknown).
 ARG AGENTSCM_BUILD_COMMIT=
-RUN cargo build --locked --release --features ui
+RUN cargo build --locked --release
 
 # Test-only seeder for .github/hub-e2e.sh. `docker build .` builds only the last stage, so it never
 # builds or ships these two.
 FROM build AS e2e-seed-build
 COPY examples/hub_seed.rs ./examples/hub_seed.rs
-RUN cargo build --locked --release --features ui --example hub_seed
+RUN cargo build --locked --release --example hub_seed
 
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS e2e-seed
 RUN groupadd --gid 10001 agentscm \

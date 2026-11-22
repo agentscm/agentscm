@@ -4,24 +4,20 @@ title: "PR context"
 
 # PR context
 
-Dashboard → Where includes a read-only PR context panel. Choose an observed open
-PR to inspect its retained head, other PRs sharing exact changed paths, Work with
-overlapping declared scopes, explicitly PR-linked supported workflow records, and
-bounded provider evidence when its identity and permissions can be confirmed.
-Links open the existing Work, Skills, Inbox and Catch up views.
+PR context is a read-only projection for one observed open PR: its retained head,
+other PRs sharing exact changed paths, Work with overlapping declared scopes,
+explicitly PR-linked supported workflow records, and bounded provider evidence
+when its identity and permissions can be confirmed.
 
-The same projection is available to agents as `agentscm_pr_context` with a positive
+The projection is available to agents as `agentscm_pr_context` with a positive
 `number` and optional `expected_head` SHA. The token determines the repository.
 HTTP clients use `GET /v1/hub/repos/{repository}/pr-context?number=42`, with
 `expected_head` as an optional query parameter. Both transports use the same service.
 
 An expected head is a caller-supplied comparison, not provider authority. The
-answer compares it with the retained provider observation. The dashboard captures
-the PR list head when its panel opens; it is not a previous-session baseline. It does not contact
-the forge on demand. “Refresh context” reads the Hub again; it does not trigger
-a provider sync or rerun checks. The UI labels observations older than 15 minutes,
-missing timestamps, or times over one minute in the future as older or uncertain.
-This display heuristic does not establish provider freshness.
+answer compares it with the retained provider observation; it is not a
+previous-session baseline. A read does not contact the forge on demand, trigger
+a provider sync or rerun checks.
 
 ## What the answer establishes
 
@@ -89,7 +85,7 @@ to 16 KiB. A refresh reads retained data; it cannot make provider evidence curre
 
 ## Explicit Work relationships
 
-Work detail can open context for its explicitly recorded PR. A branch name or
+A Work item can record one explicit PR relationship. A branch name or
 shared path never creates this relationship. The current Work lead sets one
 relationship using stable repository ID, PR number and a full lowercase head SHA.
 It is a caller assertion, separate from the provider's observed head. Unknown or
@@ -97,8 +93,7 @@ name-only repository identity cannot create a link. A Work takeover preserves th
 recorded link and its original provenance; only the current lead can update it.
 
 Use `agentscm_work_pr_link` (MCP) or `agentscm work pr-link WORK_ID` (CLI) to read it.
-Supply `expected_updated_seq` to compare the Work version; the UI refuses a changed
-Work snapshot until refreshed. The optional `expected_head` compares only with the
+Supply `expected_updated_seq` to compare the Work version. The optional `expected_head` compares only with the
 recorded link. `agentscm_work_pr_link_set` or `agentscm work pr-link-set --request -`
 accepts this strict request shape:
 
@@ -119,21 +114,8 @@ relationship; omitting the field is invalid. A new operation which would leave t
 unchanged is rejected without adding a false change event; an exact stored retry
 still returns its receipt. Read-only tokens cannot change links.
 Relationship changes appear as distinct durable Work events in the existing
-Catch up flow. Catch up retains a fixed delivery; a link to the current Work view
-is not a claim that it is the historical relation. Reading never acknowledges it.
+catch-up flow. Catch-up retains a fixed delivery; the current link is not a claim
+that it is the historical relation. Reading never acknowledges it.
 
 This is explanatory context, not a verification result or a merge gate. The
 existing GitHub App permissions and merge authority are unchanged.
-
-## Local preview
-
-In `ui/`, run `npm ci`, then `MOCK=context npm run dev`. Open the printed loopback
-URL with `#token=synthetic-preview`, then Dashboard → Where. The visible banner
-identifies synthetic data. PR #42 shows context and overlap; #43 shows a context head
-different from the PR list and evidence for that earlier head; #44 simulates an
-HTTP 403 denial of the context request (not a diagnosis of App permissions); #45 shows a reported
-blocker. Drill-down stays in the existing application. Forge links use
-`example.invalid` and are deliberately not live.
-
-The fixture preview does not qualify live GitHub ingestion, permission upgrades,
-hosted verification or deployment.

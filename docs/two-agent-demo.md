@@ -8,8 +8,6 @@ title: "Two-container Hub walkthrough"
 
 This walkthrough starts a coordination [Hub](hub.md) with Docker, connects it to a GitHub repository, and demonstrates a contested-edit warning with scripted hook calls from two containers. It takes about fifteen minutes and needs Docker, a web browser signed in to GitHub, and a repository where you can install a GitHub App. It does not launch live Claude Code or Codex sessions. Everything runs on one host over loopback, which is why plain `http://` is fine here; agents on other machines need the Hub behind an `https://` proxy (see [hub](hub.md)).
 
-> Contributors with a repository checkout can skip Docker and the GitHub App: [ui/dev-seed/README.md](../ui/dev-seed/README.md) starts a throwaway, credential-free dev hub. It is not an install route for users.
-
 ## 1. Start the hub
 
 ```sh

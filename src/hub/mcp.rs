@@ -40,7 +40,6 @@ use super::session::{
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
-use super::view_settings::{ViewOverride, ViewSettings};
 use super::viewer::{Shown, Viewer, shown};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
@@ -93,13 +92,6 @@ const NO_OVERLAPS: &str =
     "AgentSCM: nothing new about these files since this session's last report.";
 const HOOKED: &str = "Edits are checked automatically by hooks in this session; call \
     agentscm_check only for files you edit outside them.";
-
-const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-const UI_MIME: &str = "text/html;profile=mcp-app";
-const OVERVIEW_URI: &str = "ui://agentscm/work-overview";
-const VALUE_URI: &str = "ui://agentscm/value-metrics";
-const OVERVIEW_HTML: &str = include_str!("mcp_views/work-overview.html");
-const VALUE_HTML: &str = include_str!("mcp_views/value-metrics.html");
 
 #[path = "contribution_receipt.rs"]
 mod contribution_receipt;
@@ -223,14 +215,6 @@ enum DoneOutcome {
     Pause,
     /// Done: completed, so its scope is freed and nobody is asked to finish it.
     Complete,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ViewSettingsArgs {
-    reset: Option<bool>,
-    enabled: Option<bool>,
-    work_overview: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -401,19 +385,6 @@ async fn mcp(
         return Ok(failure(id, INVALID_REQUEST));
     };
     let params = message.get("params");
-    let settings = if matches!(
-        method,
-        "initialize" | "tools/list" | "resources/list" | "resources/read"
-    ) {
-        let store = state.store.clone();
-        let owner = principal.owner.id.clone();
-        match blocking(&state, move || ViewSettings::effective(&*store, &owner)).await {
-            Ok(settings) => settings,
-            Err(error) => return Err(ApiError::from(error)),
-        }
-    } else {
-        ViewSettings::default()
-    };
     if principal.read_only && !read_only_call(method, params) {
         return Err(ApiError::read_only());
     }
@@ -424,7 +395,7 @@ async fn mcp(
                 super::onboarding::client(&headers),
                 params,
             );
-            initialize(params, principal.read_only, &settings, all_tools)
+            initialize(params, principal.read_only, all_tools)
         }),
         "ping" => Ok(json!({})),
         "tools/list" => {
@@ -441,10 +412,8 @@ async fn mcp(
                     Err(_) => true,
                 }
             };
-            Ok(json!({"tools": tools(principal.read_only, &settings, all_tools, skills)}))
+            Ok(json!({"tools": tools(principal.read_only, all_tools, skills)}))
         }
-        "resources/list" => Ok(resources_list(&settings)),
-        "resources/read" => resources_read(params, &settings, &principal),
         "tools/call" => {
             let foreign = query
                 .repo
@@ -553,52 +522,49 @@ fn work_reconciliation_summary(mut value: Value) -> Value {
 }
 
 fn read_only_call(method: &str, params: Option<&Value>) -> bool {
-    matches!(
-        method,
-        "initialize" | "ping" | "tools/list" | "resources/list" | "resources/read"
-    ) || (method == "tools/call"
-        && matches!(
-            params.and_then(|params| params["name"].as_str()),
-            Some(
-                "agentscm_work_dependency_notices"
-                    | "agentscm_work_overlap_consents"
-                    | "agentscm_work_status"
-                    | "agentscm_work_recovery"
-                    | "agentscm_work_recovery_preview"
-                    | "agentscm_work_briefing"
-                    | "agentscm_work_catchup"
-                    | "agentscm_work_catchup_ack"
-                    | "agentscm_briefing_read"
-                    | "agentscm_briefing_pending"
-                    | "agentscm_work_preflight"
-                    | "agentscm_work_overview"
-                    | "agentscm_show_overview"
-                    | "agentscm_work_intent"
-                    | "agentscm_work_insight"
-                    | "agentscm_work_insights"
-                    | "agentscm_work_usage_reports"
-                    | "agentscm_value_metrics"
-                    | "agentscm_contribution_receipt"
-                    | "agentscm_change_record"
-                    | "agentscm_pr_context"
-                    | "agentscm_work_pr_link"
-                    | "agentscm_work_declarations"
-                    | "agentscm_work_reconciliation"
-                    | "agentscm_shared_conversation"
-                    | "agentscm_workflow_status"
-                    | "agentscm_work_search"
-                    | "agentscm_why"
-                    | "agentscm_work_repositories"
-                    | "agentscm_publications_list"
-                    | "agentscm_workflow_runs_list"
-                    | "agentscm_coordination_inbox"
-                    | "agentscm_skill_list"
-                    | "agentscm_skill_status"
-                    | "agentscm_promises_list"
-                    | "agentscm_promise_show"
-                    | "agentscm_promise_history"
-            )
-        ))
+    matches!(method, "initialize" | "ping" | "tools/list")
+        || (method == "tools/call"
+            && matches!(
+                params.and_then(|params| params["name"].as_str()),
+                Some(
+                    "agentscm_work_dependency_notices"
+                        | "agentscm_work_overlap_consents"
+                        | "agentscm_work_status"
+                        | "agentscm_work_recovery"
+                        | "agentscm_work_recovery_preview"
+                        | "agentscm_work_briefing"
+                        | "agentscm_work_catchup"
+                        | "agentscm_work_catchup_ack"
+                        | "agentscm_briefing_read"
+                        | "agentscm_briefing_pending"
+                        | "agentscm_work_preflight"
+                        | "agentscm_work_overview"
+                        | "agentscm_work_intent"
+                        | "agentscm_work_insight"
+                        | "agentscm_work_insights"
+                        | "agentscm_work_usage_reports"
+                        | "agentscm_value_metrics"
+                        | "agentscm_contribution_receipt"
+                        | "agentscm_change_record"
+                        | "agentscm_pr_context"
+                        | "agentscm_work_pr_link"
+                        | "agentscm_work_declarations"
+                        | "agentscm_work_reconciliation"
+                        | "agentscm_shared_conversation"
+                        | "agentscm_workflow_status"
+                        | "agentscm_work_search"
+                        | "agentscm_why"
+                        | "agentscm_work_repositories"
+                        | "agentscm_publications_list"
+                        | "agentscm_workflow_runs_list"
+                        | "agentscm_coordination_inbox"
+                        | "agentscm_skill_list"
+                        | "agentscm_skill_status"
+                        | "agentscm_promises_list"
+                        | "agentscm_promise_show"
+                        | "agentscm_promise_history"
+                )
+            ))
 }
 
 fn failure(id: &Value, (code, message): (i32, &str)) -> Response {
@@ -614,51 +580,8 @@ fn failure(id: &Value, (code, message): (i32, &str)) -> Response {
     response
 }
 
-/// Which views are served, as (uri, html) pairs.
-fn views(settings: &ViewSettings) -> Vec<(&'static str, &'static str)> {
-    let mut views = Vec::new();
-    if settings.enabled && settings.work_overview {
-        views.push((OVERVIEW_URI, OVERVIEW_HTML));
-        views.push((VALUE_URI, VALUE_HTML));
-    }
-    views
-}
-
-fn resources_list(settings: &ViewSettings) -> Value {
-    let resources = views(settings).into_iter().map(|(uri, _)| {
-        let name = uri.trim_start_matches("ui://agentscm/");
-        json!({"uri": uri, "name": name, "mimeType": UI_MIME})
-    });
-    json!({"resources": resources.collect::<Vec<_>>()})
-}
-
-fn resources_read(
-    params: Option<&Value>,
-    settings: &ViewSettings,
-    _principal: &Principal,
-) -> std::result::Result<Value, (i32, &'static str)> {
-    let uri = params
-        .and_then(|p| p["uri"].as_str())
-        .ok_or(INVALID_PARAMS)?;
-    let (uri, html) = views(settings)
-        .into_iter()
-        .find(|(known, _)| *known == uri)
-        .ok_or(INVALID_PARAMS)?;
-    Ok(json!({"contents": [{"uri": uri, "mimeType": UI_MIME, "text": html}]}))
-}
-
-fn initialize(
-    params: Option<&Value>,
-    read_only: bool,
-    settings: &ViewSettings,
-    all_tools: bool,
-) -> Value {
-    // Stateless HTTP: the extension is only declared here, so resources are advertised here.
-    let ui = params.is_some_and(|p| p["capabilities"]["extensions"][UI_EXTENSION].is_object());
-    let mut capabilities = json!({"tools": {"listChanged": false}});
-    if ui && settings.enabled {
-        capabilities["resources"] = json!({"listChanged": false});
-    }
+fn initialize(params: Option<&Value>, read_only: bool, all_tools: bool) -> Value {
+    let capabilities = json!({"tools": {"listChanged": false}});
     let version = params
         .and_then(|params| params["protocolVersion"].as_str())
         .filter(|asked| VERSIONS.contains(asked))
@@ -675,20 +598,20 @@ fn initialize(
 /// read-write agent by default, skill tools included. The checkout's MCP server lists these
 /// first so a session that connects mid-start still has every tool.
 pub fn agent_tools() -> Value {
-    tools(false, &ViewSettings::default(), false, true)
+    tools(false, false, true)
 }
 
 /// Every tool a read-write agent may call, listed before `session` is added to each: its schemas
 /// list `session` only where the tool's arguments take it, as a Hub released before #530 accepts
 /// it. The local client sends `session` only to those until a Hub lists more.
 pub fn session_agent_tools() -> Value {
-    tool_list(false, &ViewSettings::default(), true, true)
+    tool_list(false, true, true)
 }
 
 /// Agents are told to pass `session` on every call, so every tool lists it; `try_args` drops it
 /// where the tool's arguments have no use for it.
-fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
-    let mut listed = tool_list(read_only, settings, all, skills);
+fn tools(read_only: bool, all: bool, skills: bool) -> Value {
+    let mut listed = tool_list(read_only, all, skills);
     for tool in listed.as_array_mut().into_iter().flatten() {
         if let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
@@ -702,7 +625,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
     listed
 }
 
-fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
+fn tool_list(read_only: bool, all: bool, skills: bool) -> Value {
     let session = json!({"type": "string", "description": "Your native session ID (the AgentSCM SessionStart context shows it). Pass it on every call; omitting it is refused while this agent token has more than one hook session or only an idle one."});
     let paths = |description: &str| json!({"type": "array", "items": {"type": "string"}, "description": description});
     let detail = |description: &str| json!({"type": "string", "enum": ["compact", "full"], "default": "compact", "description": description});
@@ -782,7 +705,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
          }), &["delivery", "expected_event_from", "expected_merge_from"])}
     );
     let narrative_properties = json!({
-        "subscriber": {"type":"string", "default":"human", "description":"human for your own dashboard, or your independent agent: subscriber; never acknowledges either."},
+        "subscriber": {"type":"string", "default":"human", "description":"human for your own subscription, or your independent agent: subscriber; never acknowledges either."},
         "task": {"type":"string", "maxLength":500, "description":"Your intended task, used for conditional implications."},
         "paths": {"type":"array", "maxItems":32, "items":{"type":"string"}},
         "scope_complete": {"type":"boolean", "default":true, "description":"False when the supplied task scope omits paths; implications retain that uncertainty."}
@@ -873,13 +796,10 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             "after":{"type":"integer","minimum":0,"maximum":super::insights::MAX_OBSERVATIONS},
             "limit":{"type":"integer","minimum":1,"maximum":MAX_USAGE_PAGE,"default":MAX_USAGE_PAGE}
         }), &["work_id"])});
-    let mut value_metrics = json!({"name":"agentscm_value_metrics",
+    let value_metrics = json!({"name":"agentscm_value_metrics",
         "description":"Reads the same deterministic observed-contribution projection as the Hub for this repository only. Unknown coverage and costs remain unknown. Bounded evidence; no provider polling or model generation. Continue using next_after when present.",
         "annotations":{"readOnlyHint":true},
         "inputSchema":schema(json!({"since":{"type":"integer","minimum":0},"until":{"type":"integer","minimum":0},"work_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50,"default":20},"after":{"type":"string","maxLength":256}}), &[])});
-    if settings.enabled && settings.work_overview {
-        value_metrics["_meta"] = json!({"ui":{"resourceUri":VALUE_URI}});
-    }
     let contribution_receipt = json!({"name":"agentscm_contribution_receipt",
         "description":"Explicitly reads a compact contribution receipt for one Work, including unresolved evidence and coverage limits. Completion is separate from provider-observed merge and never grants merge authority. Reading is repeatable and does not acknowledge evidence.",
         "annotations":{"readOnlyHint":true},
@@ -1007,13 +927,6 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             "after": {"type": "integer", "minimum": 0}, "through": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
             "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 0}}), &[])});
-    let mut show_overview = json!({"name": "agentscm_show_overview",
-        "description": "Show the full work overview only when the person asks to see it. Use agentscm_work_overview for agent reads. Views obey your settings.",
-        "annotations": {"readOnlyHint": true},
-        "inputSchema": schema(json!({}), &[])});
-    if settings.enabled && settings.work_overview {
-        show_overview["_meta"] = json!({"ui": {"resourceUri": OVERVIEW_URI}});
-    }
     let coordination_mutations = json!([
         {"name":"agentscm_coordination_ack", "description":"Acknowledge that this session received a specific coordination request version. This is a receipt, not agreement or resolution. Omit target_work_id to acknowledge a response as the requester.",
          "inputSchema":schema(json!({"session":session,"request_id":{"type":"string"},"target_work_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1}}), &["session","request_id","expected_updated_seq"])},
@@ -1066,7 +979,6 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             owner_notice_list,
             owner_notice_status,
             overview,
-            show_overview,
             briefing,
             catchup,
             catchup_ack,
@@ -1272,7 +1184,6 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "session": session}), &["path", "accept"])},
         status,
         overview,
-        show_overview,
         briefing,
         catchup,
         catchup_ack,
@@ -1335,12 +1246,6 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
         {"name": "agentscm_work_dependency_ack",
          "description": "Acknowledge a dependency notice you read after inspecting its current Work and conditions. Does not authorize execution or release holds.",
          "inputSchema": schema(json!({"session":session,"delivery_id":{"type":"string"},"work_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"declaration_seq":{"type":"integer","minimum":0},"semantic_version":{"type":"integer","minimum":1}}), &["session","delivery_id","work_id","generation","declaration_seq","semantic_version"])},
-        {"name": "agentscm_view_settings",
-         "description": "Read or change your inline work and value-metrics views. Your choices override the Hub default for your agents only. Omit arguments to read effective, hub_default and override.",
-         "inputSchema": schema(json!({
-             "reset": {"type": "boolean", "description": "Clear your own choices and follow the hub default."},
-             "enabled": {"type": "boolean", "description": "Master switch for all inline views."},
-             "work_overview": {"type": "boolean"}}), &[])},
     ]);
     if let (Some(tools), Some(mutations)) =
         (listed.as_array_mut(), coordination_mutations.as_array())
@@ -1830,14 +1735,12 @@ async fn call(
     }
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or("");
     // Enrichment is compact unless the call asked for every field.
-    let full = name == "agentscm_show_overview"
-        || params.is_some_and(|p| p["arguments"]["detail"] == "full");
+    let full = params.is_some_and(|p| p["arguments"]["detail"] == "full");
     if value["isError"] != true
         && matches!(
             name,
             "agentscm_start"
                 | "agentscm_work_overview"
-                | "agentscm_show_overview"
                 | "agentscm_work_briefing"
                 | "agentscm_work_catchup"
                 | "agentscm_briefing_read"
@@ -1868,27 +1771,8 @@ async fn call(
         &mut value,
     )
     .await;
-    if matches!(
-        name,
-        "agentscm_work_overview" | "agentscm_coordination_inbox" | "agentscm_show_overview"
-    ) {
-        let store = state.store.clone();
-        let owner = principal.owner.id.clone();
-        let settings = blocking(state, move || ViewSettings::effective(&*store, &owner))
-            .await
-            .unwrap_or_default();
-        let on = settings.enabled && settings.work_overview;
-        let hint = if on {
-            "Inline views: on (your setting). Change with agentscm_view_settings."
-        } else {
-            "Inline views: off (your setting). Change with agentscm_view_settings."
-        };
-        if let Some(content) = value["content"].as_array_mut() {
-            content.push(json!({"type": "text", "text": hint}));
-        }
-    }
     // Offer the completed-work briefing while its agent is still present, including when
-    // nobody has opened the dashboard. Progress checkpoints only deliver existing requests.
+    // the human subscriber is inactive. Progress checkpoints only deliver existing requests.
     let completed_work = name == "agentscm_work_checkpoint"
         && params.is_some_and(|params| params["arguments"]["kind"] == "finish");
     if (matches!(name, "agentscm_start" | "agentscm_work_overview") || completed_work)
@@ -2475,7 +2359,6 @@ async fn call_inner(
             | "agentscm_briefing_submit"
             | "agentscm_work_preflight"
             | "agentscm_work_overview"
-            | "agentscm_show_overview"
             | "agentscm_work_intent"
             | "agentscm_work_insight"
             | "agentscm_work_insights"
@@ -2495,7 +2378,6 @@ async fn call_inner(
             | "agentscm_shared_conversation"
             | "agentscm_work_usage"
             | "agentscm_coordination_inbox"
-            | "agentscm_view_settings"
             | "agentscm_hub_message"
             | "agentscm_coordination_ack"
             | "agentscm_coordination_reply"
@@ -2904,37 +2786,6 @@ async fn call_inner(
             },
         );
     }
-    if name == "agentscm_view_settings" {
-        let change = match try_args::<ViewSettingsArgs>(arguments) {
-            Ok(value) => value,
-            Err(error) => return Ok(invalid_args(name, &error)),
-        };
-        let store = state.store.clone();
-        let owner = principal.owner.id.clone();
-        return Ok(
-            match blocking(state, move || {
-                let change_set = ViewOverride {
-                    enabled: change.enabled,
-                    work_overview: change.work_overview,
-                };
-                if change.reset == Some(true) || change_set != ViewOverride::default() {
-                    let current = ViewSettings::load_override(&*store, &owner)?.unwrap_or_default();
-                    let next = if change.reset == Some(true) {
-                        change_set
-                    } else {
-                        current.merge(change_set)
-                    };
-                    ViewSettings::save_override(&*store, &owner, &next)?;
-                }
-                ViewSettings::report(&*store, &owner)
-            })
-            .await
-            {
-                Ok(report) => structured(&report),
-                Err(error) => work_failure(&error),
-            },
-        );
-    }
     if name == "agentscm_work_status" {
         if let Err(error) = try_args::<EmptyArgs>(arguments) {
             return Ok(invalid_args(name, &error));
@@ -2956,23 +2807,10 @@ async fn call_inner(
             },
         );
     }
-    if matches!(name, "agentscm_work_overview" | "agentscm_show_overview") {
-        let args = if name == "agentscm_show_overview" {
-            if let Err(error) = try_args::<EmptyArgs>(arguments) {
-                return Ok(invalid_args(name, &error));
-            }
-            OverviewArgs {
-                recent_since: None,
-                limit: None,
-                detail: Detail::Full,
-                after: None,
-                recent_before: None,
-            }
-        } else {
-            match try_args::<OverviewArgs>(arguments) {
-                Ok(value) => value,
-                Err(error) => return Ok(invalid_args(name, &error)),
-            }
+    if name == "agentscm_work_overview" {
+        let args = match try_args::<OverviewArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         if args
             .limit
@@ -5452,8 +5290,7 @@ mod tests {
         use super::super::agent_rules;
         for read_only in [false, true] {
             for all_tools in [false, true] {
-                let reply =
-                    super::initialize(None, read_only, &super::ViewSettings::default(), all_tools);
+                let reply = super::initialize(None, read_only, all_tools);
                 let text = reply["instructions"].as_str().unwrap();
                 for (host, budget) in agent_rules::MCP_INSTRUCTION_BUDGETS {
                     let units = text.encode_utf16().count();
@@ -5526,7 +5363,7 @@ mod tests {
 
     #[test]
     fn start_declares_new_work_so_clients_can_send_it() {
-        let tools = super::tools(false, &super::ViewSettings::default(), true, true);
+        let tools = super::tools(false, true, true);
         let start = tools
             .as_array()
             .unwrap()
@@ -5546,7 +5383,7 @@ mod tests {
     fn every_tool_lists_and_accepts_session() {
         use super::*;
         for read_only in [false, true] {
-            let tools = tools(read_only, &ViewSettings::default(), true, true);
+            let tools = tools(read_only, true, true);
             for tool in tools.as_array().unwrap() {
                 assert!(
                     tool.pointer("/inputSchema/properties/session").is_some(),
@@ -5566,7 +5403,6 @@ mod tests {
         accepts::<OverviewArgs>(json!({}));
         accepts::<BriefingArgs>(json!({}));
         accepts::<CatchupArgs>(json!({}));
-        accepts::<ViewSettingsArgs>(json!({}));
         accepts::<WorkflowStatusArgs>(json!({"run_id": "r"}));
         accepts::<WorkInsightArgs>(json!({"work_id": "w"}));
         accepts::<WorkUsageReportsArgs>(json!({"work_id": "w", "after": 100}));

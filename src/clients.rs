@@ -366,19 +366,4 @@ mod tests {
         let empty = |_: &str| Some(OsString::new());
         assert_eq!(QWEN.folder(home, empty), home.join(".qwen"));
     }
-
-    /// The Hub page lists the agents it can show setup for; a missing one is dropped there.
-    #[test]
-    fn the_hub_page_lists_every_agent() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src/connectAgent.ts");
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return; // A packaged crate has no UI sources.
-        };
-        let quoted: Vec<String> = names().map(|name| format!("'{name}'")).collect();
-        let line = format!(
-            "export const CLIENT_AGENTS = [{}] as const",
-            quoted.join(", ")
-        );
-        assert!(text.contains(&line), "{line}");
-    }
 }

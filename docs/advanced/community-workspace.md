@@ -8,7 +8,7 @@ title: "Community workspace pilot"
 
 The workspace reuses Hub GitHub/GitLab identities, repository-scoped agent
 tokens, the existing independent team roles, and the native workflow engine.
-The existing read-only token dashboard and coordination APIs remain available.
+The existing coordination APIs remain available.
 Native execution and landing controls require Unix.
 
 ## Selected pilot boundary
@@ -70,8 +70,10 @@ contributor roles. Administrators manage grants but cannot promote themselves.
 For a two-person setup, the owner can add a second administrator, who can then
 grant any additional reviewer/integrator roles to the first person.
 
-Open `/ui/#workspace` and sign in through the configured forge. Workspace
-membership is an additional access requirement. Browser operations use a
+Sign in through the configured forge with the workspace browser login
+(`GET /v1/hub/login/{provider}?workspace=1`), which returns to
+`/auth/complete/#workspace`. Workspace membership is an additional access
+requirement. Workspace API requests from that sign-in use a
 15-minute Secure, HttpOnly session cookie and an anti-forgery token, rather
 than a durable agent key in browser storage. Sessions and revocations persist
 in the workspace database. Role changes end the affected person's sessions;
@@ -110,10 +112,7 @@ Settings changes carry the generation shown by the server and a request ID.
 Concurrent edits return a conflict. After an uncertain network reply, retry
 the same ID with the same body; changing the body requires a fresh request.
 Membership, settings and native actions retain audit records without secrets.
-The browser keeps unresolved operation IDs and non-secret intent fields in
-session storage for that person and workspace. Reloading the same tab preserves
-explicit retry; closing the tab discards this local recovery journal. Server
-records remain retained. No operation is automatically replayed.
+Server records remain retained. No operation is automatically replayed.
 
 ## Register a task-only profile
 
@@ -173,9 +172,9 @@ dispatch. Failure findings remain inspectable through the run/step view.
 Fixes require new immutable source and an updated current context. A prior green
 run cannot qualify different bytes, policy, target/base or context. The queue
 serializes execution in this first slice; two people can submit work while
-another run is active. The settings page shows capacity one.
+another run is active.
 
-Approval and native landing are separate, deliberate browser actions. The
+Approval and native landing are separate, deliberate requests. The
 native authority independently rechecks the installed workflow receipt,
 current exact subject, approval and target/base in its transaction. Neither a
 green historical row nor a client-provided success field grants admission.
@@ -231,14 +230,7 @@ The synthetic joined scenario qualifies this stopped-service ordering, stable-pa
 
 The executable checkpoint is `two_git_worktrees_cold_restore_at_same_paths` in `tests/integration/hub_workspace_execution.rs`, inside the existing signed-collector/two-worktree/publication lifecycle. It restores the actual local directories, including retained signed transfer, optional server queue/source-transfer rows, both attachments, Git worktree administration, owned mirror and publication journals. The fake provider repository and effect counters remain outside the backup. The fixture uses regular files/directories and local synthetic HTTP/Git transport; custom CA files, a reverse proxy, supervisor configuration, filesystem relocation and operating-system ownership changes are not exercised. Include those configured inputs in an operator inventory, but do not infer their qualification from this fixture.
 
-Run only this checkpoint with `cargo nextest run --locked -E 'test(hub_workspace_execution::two_git_worktrees_cold_restore_at_same_paths)'`. For a bounded browser inspection of the actual running fixture before its cold checkpoint, build with the UI feature and opt in:
-
-```sh
-release_dir=$(mktemp -d)
-AGENTSCM_TEST_BROWSER_HOLD_SECONDS=600 AGENTSCM_TEST_BROWSER_RELEASE_FILE="$release_dir/release" cargo test --locked --features ui --test integration hub_workspace_execution::two_git_worktrees_cold_restore_at_same_paths -- --exact --nocapture
-```
-
-The hold prints only the local Hub UI URL; use its synthetic OAuth sign-in links. In another shell, create the selected release file to continue, or let the timer expire. The timer is capped at ten minutes; unset/zero means no hold, so normal tests do not pause. The fixture continues through restore and removes its temporary state when the test finishes. A 2026-10-22 same-host walkthrough with the built UI and installed Chromium observed synthetic OAuth sign-in, authenticated session/repository/task-only runs responses, current profile/Change/revision display, Members/Settings navigation and no server Start workflow control. It does not qualify live OAuth, vendor clients, models or remote browsers.
+Run only this checkpoint with `cargo nextest run --locked -E 'test(hub_workspace_execution::two_git_worktrees_cold_restore_at_same_paths)'`.
 
 After any interruption, inspect task status/recovery and authenticated `qualification`. A server-executed queued/running request becomes `Unknown` and is never automatically redispatched. A task-only collector reservation or transfer keeps its typed retained state and likewise must not be rerun merely because the Hub restarted. Old backups may restore revoked members, tokens, executor registrations or origin grants, so access must remain closed until later revocations are reapplied and exposed credentials are rotated.
 

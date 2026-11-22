@@ -2186,14 +2186,7 @@ async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
 async fn web_sign_in(env: &Env, user: i64) -> String {
     let done = web_callback(env, user).await;
     assert_eq!(done.status(), 302);
-    assert_eq!(
-        done.headers()[header::LOCATION],
-        if cfg!(feature = "ui") {
-            "/ui/#home"
-        } else {
-            "/auth/complete/#home"
-        }
-    );
+    assert_eq!(done.headers()[header::LOCATION], "/auth/complete/#home");
     let all: Vec<_> = done
         .headers()
         .get_all(header::SET_COOKIE)
@@ -3202,24 +3195,35 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
     let alice = users.iter().find(|u| u.login == "alice").unwrap();
     env.store.set_user_disabled(&alice.id, true).unwrap();
     assert_eq!(session(cookie.clone()).await.0, 401);
-    // A refused web sign-in lands on the Hub's page with the reason alone, which the page
-    // words itself: anyone can forge that link.
+    // A refused web sign-in lands on the Hub's sign-in page with the reason code alone, which
+    // the page words itself: anyone can forge that link.
     let refused = web_callback(&env, ALICE).await;
     assert_eq!(refused.status(), 302);
     assert_eq!(
         refused.headers()[header::LOCATION],
-        if cfg!(feature = "ui") {
-            "/ui/#/signed-in?status=refused&reason=user_disabled"
-        } else {
-            "/auth/complete/#/signed-in?status=refused&reason=user_disabled"
-        }
+        "/auth/complete/?status=refused&reason=user_disabled"
     );
     assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
-    // A page that asked to come back gets the refusal on itself.
+    let page = browser()
+        .get(format!(
+            "{}/auth/complete/?status=refused&reason=user_disabled",
+            env.hub
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    assert!(page.contains("Sign-in refused"), "{page}");
+    assert!(
+        page.contains("Your account is turned off on this Hub"),
+        "{page}"
+    );
+    // Only the Hub's own page can word the reason, so a page that asked to come back is not used.
     let refused = callback_query(&env, ALICE, "web=1&return_to=%2Fnext%2F").await;
     assert_eq!(
         refused.headers()[header::LOCATION],
-        "/next/#/signed-in?status=refused&reason=user_disabled"
+        "/auth/complete/?status=refused&reason=user_disabled"
     );
     env.store.set_user_disabled(&alice.id, false).unwrap();
     assert_eq!(session(cookie).await.0, 401);
@@ -6386,4 +6390,41 @@ async fn file_handoff_reads_require_a_current_repository_grant() {
         (403, Some("insufficient_role")),
         "{body}"
     );
+}
+
+/// The sign-in page words a refusal only from a fixed set of reason codes and never echoes the
+/// link, because anyone can forge it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sign_in_page_words_only_known_refusals_and_echoes_nothing() {
+    let env = Env::start("github").await;
+    let page = |query: &'static str| {
+        let hub = env.hub.clone();
+        async move {
+            let response = browser()
+                .get(format!("{hub}/auth/complete/{query}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers()[header::CONTENT_SECURITY_POLICY],
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            );
+            response.text().await.unwrap()
+        }
+    };
+    let plain = page("").await;
+    assert!(plain.contains("Return to your terminal"), "{plain}");
+    assert!(!plain.contains("refused"), "{plain}");
+    let denied = page("?status=refused&reason=login_denied").await;
+    assert!(denied.contains("Sign-in refused"), "{denied}");
+    assert!(denied.contains("You declined"), "{denied}");
+    // An unknown or hostile reason gets the generic sentence and is never reflected.
+    let forged = page("?status=refused&reason=%3Cscript%3Ealert(1)%3C%2Fscript%3E").await;
+    assert!(forged.contains("Sign-in didn"), "{forged}");
+    assert!(!forged.contains("script"), "{forged}");
+    assert!(!forged.contains("alert"), "{forged}");
+    let other = page("?status=refused&reason=made_up_code").await;
+    assert!(other.contains("Sign-in didn"), "{other}");
+    assert!(!other.contains("made_up_code"), "{other}");
 }

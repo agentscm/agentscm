@@ -3771,7 +3771,6 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
 
         if revocation == "cold" {
             // All production state above is real; this branch only changes the stop/restore boundary.
-            cold_restore::browser_hold(&env.base).await;
             let retained_transfer = collector.retained_transfer("transfer-success").unwrap();
             let retained_attachments = {
                 let (_, _, _, _, journal, a, b) = git_fixture.as_ref().unwrap();
@@ -5408,11 +5407,7 @@ async fn synthetic_browser_authorize_page_uses_exact_registered_loopback_callbac
     assert_eq!(selected.status().as_u16(), 302);
     assert_eq!(
         selected.headers()[header::LOCATION],
-        if cfg!(feature = "ui") {
-            "/ui/#workspace"
-        } else {
-            "/auth/complete/#workspace"
-        }
+        "/auth/complete/#workspace"
     );
     let mut wrong = authorize.clone();
     let params: Vec<_> = authorize

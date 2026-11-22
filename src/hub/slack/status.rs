@@ -180,7 +180,7 @@ fn body(text: &str) -> Value {
         "unfurl_media":false, "blocks":[{"type":"section","text":plain_lines(text, 3000)}]})
 }
 
-fn entry_message(item: &WorkItem, repository: &str, link: &str) -> Option<Value> {
+fn entry_message(item: &WorkItem, repository: &str) -> Option<Value> {
     let (headline, field, guidance, report) = match item.state {
         WorkState::Blocked => (
             "Your agent's work is blocked",
@@ -218,7 +218,6 @@ fn entry_message(item: &WorkItem, repository: &str, link: &str) -> Option<Value>
             ),
         ],
         guidance,
-        link,
     ))
 }
 fn render_status(status: &ActionableStatus) -> String {
@@ -264,7 +263,7 @@ fn render_status(status: &ActionableStatus) -> String {
         || status.actions.len() > 4
         || details.chars().count() + footer.chars().count() + 1 > 3000
     {
-        footer.push_str("\nThis private reply shortens details to at most four tasks and four personal actions; more evidence is available in the Hub.");
+        footer.push_str("\nThis private reply shortens details to at most four tasks and four personal actions; run agentscm work status for the rest.");
     }
     let room = 3000usize.saturating_sub(footer.chars().count() + 1);
     let details = plain_lines(details, room);
@@ -607,7 +606,6 @@ impl Slack {
                     }
                 }
             };
-            let link = self.link("box-needs");
             let mut db = self.database()?;
             let tx = db.transaction()?;
             let mut queued: i64 = tx.query_row(
@@ -635,8 +633,7 @@ impl Slack {
                 let body = message(
                     WAIT_HEADLINE,
                     &[("Waiting", sanitize(&action.action, 900))],
-                    "It stays stopped until you answer. The Hub lists it under Needs you.",
-                    &link,
+                    "It stays stopped until you answer in your agent session.",
                 );
                 let user = &binding.config.slack_user;
                 let new = tx.execute(
@@ -764,7 +761,7 @@ impl Slack {
             }
             Err(_) if kind == "query" => {
                 let claimed = self.database()?.execute("UPDATE status_jobs SET state='sending',attempts=attempts+1 WHERE id=?1 AND state='queued'", [&id])?;
-                return Ok((claimed == 1).then(||(id,user,body("Shared status is unavailable. No clear status was established; retry the status query or open the Hub for evidence."),attempts)));
+                return Ok((claimed == 1).then(||(id,user,body("Shared status is unavailable. No clear status was established; retry the status query or run agentscm work status."),attempts)));
             }
             Err(_) => {
                 self.database()?.execute("UPDATE status_jobs SET due=?2,attempts=attempts+1 WHERE id=?1 AND state='queued'",params![id,now+SCAN_SECONDS])?;
@@ -870,9 +867,7 @@ impl Slack {
                         self.obsolete_status_job(&id)?;
                         return Ok(None);
                     };
-                    let Some(payload) =
-                        entry_message(&item, &status.repository, &self.work_link(work_id))
-                    else {
+                    let Some(payload) = entry_message(&item, &status.repository) else {
                         self.obsolete_status_job(&id)?;
                         return Ok(None);
                     };
@@ -1084,14 +1079,13 @@ mod tests {
             "branch":null,"worktree":null,"next_action":null,"current":report,"blocker":report,
             "depends_on":[],"related_work":[],"created_at":1,"updated_at":1,"created_seq":1,"updated_seq":1
         })).unwrap();
-        let link = "https://hub.example.test/#work/wrk_synthetic";
         for state in [WorkState::Blocked, WorkState::Handover] {
             item.state = state;
-            let payload = entry_message(&item, &hostile, link).unwrap();
+            let payload = entry_message(&item, &hostile).unwrap();
             let text = payload["text"].as_str().unwrap();
             assert!(!text.contains("<@"));
             assert!(text.chars().count() <= 300);
-            assert_eq!(payload["blocks"][2]["elements"][0]["url"], link);
+            assert_eq!(payload["blocks"][2]["type"], "context");
             for field in payload["blocks"][1]["fields"].as_array().unwrap() {
                 assert_eq!(field["type"], "plain_text");
                 assert_eq!(field["emoji"], false);

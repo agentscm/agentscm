@@ -252,26 +252,6 @@ fn preflight(root: &Path, expected: &Manifest) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub(super) async fn browser_hold(base: &str) {
-    let seconds = std::env::var("AGENTSCM_TEST_BROWSER_HOLD_SECONDS")
-        .ok()
-        .map(|value| value.parse::<u64>().expect("browser hold must be seconds"))
-        .unwrap_or(0)
-        .min(600);
-    if seconds == 0 {
-        return;
-    }
-    println!("{base}/ui/#workspace");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-    let release = std::env::var_os("AGENTSCM_TEST_BROWSER_RELEASE_FILE").map(PathBuf::from);
-    while tokio::time::Instant::now() < deadline {
-        if release.as_ref().is_some_and(|path| path.is_file()) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 fn offline(storage: &EnvStorage) -> (Arc<dyn agentscm::hub::store::Store>, Arc<Workspace>) {
     let store = agentscm::hub::store::open(&format!(
         "sqlite://{}",

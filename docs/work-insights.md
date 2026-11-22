@@ -6,7 +6,7 @@ title: "Work insights"
 
 > **Alpha: not for production.** The API and storage schema may change without migration.
 
-Work insights provide a bounded, repository-scoped view of reported work duration, coordination signals, usage reports and stored publication observations. They are available to the same repository readers as the Hub dashboard. The API defaults to a seven-day window and returns at most 20 work items per page.
+Work insights provide a bounded, repository-scoped view of reported work duration, coordination signals, usage reports and stored publication observations. They are available to the same repository readers as other Hub reads. The API defaults to a seven-day window and returns at most 20 work items per page.
 
 The projections keep different kinds of evidence separate:
 
@@ -16,11 +16,11 @@ The projections keep different kinds of evidence separate:
 
 ## Observed contributions
 
-The All repositories homepage, `GET /v1/hub/session/value-metrics` (and per repository
-`GET /v1/hub/standup/value-metrics`), and
+`GET /v1/hub/session/value-metrics` (and per repository
+`GET /v1/hub/standup/value-metrics`) and
 `agentscm_value_metrics` share the deterministic `agentscm.observed.v1` projection.
-The MCP app uses that tool's structured result. Repository tokens remain limited to their
-own repository; the signed-in homepage aggregates only repositories its reader can access.
+Repository tokens remain limited to their
+own repository; the signed-in route aggregates only repositories its reader can access.
 No read runs a model, polls a provider, acknowledges context, or grants execution authority.
 
 The result separates prepared context returns and explicit acknowledgements, unresolved and
@@ -388,7 +388,7 @@ mean that commit was never checked.
 
 ## Recorded contribution projection
 
-The All repositories page, `agentscm_value_metrics` MCP tool and contribution receipts use
+The `agentscm_value_metrics` MCP tool and contribution receipts use
 `agentscm.observed.v1`. Repository tokens read only their repository. The signed-in web route
 `GET /v1/hub/session/value-metrics` checks current repository roles before aggregating; the
 repository route is `GET /v1/hub/standup/value-metrics`. Both accept `since`, `until`, `work_id`,
@@ -396,7 +396,7 @@ repository route is `GET /v1/hub/standup/value-metrics`. Both accept `since`, `u
 `repository`. Windows are at most 90 days, default seven days. Repeat the window and scope
 when paging; changed evidence can require restarting pagination.
 
-A browser `work_id` filter is resolved only among repositories the signed-in person can read
+On the signed-in route, a `work_id` filter is resolved only among repositories the signed-in person can read
 now. Other authorized repositories are skipped only when they lack that Work; unknown and
 inaccessible Work IDs both return the same not-found response. Store and authorization failures
 still propagate. A repository token continues to reject a Work outside its repository scope.
@@ -536,8 +536,8 @@ neither names anyone, the hand-over request the refusal filed does.
   person's own two agents colliding is counted in `hot_paths` and is not a pair.
 - `unattributed`: collisions whose holding side could not be named, which no pair counts.
 
-Paths and logins in collisions are what every reader of the repository already sees on the
-activity page.
+Paths and logins in collisions are what every reader of the repository already sees in the
+activity route.
 
 **Missing history is unknown, not zero.** `collisions.complete` is true only when the counts
 cover the whole period. Otherwise `known_from` is the time the counts start at and `limits` says

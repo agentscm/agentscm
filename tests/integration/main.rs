@@ -89,8 +89,6 @@ mod execution_canaries;
 mod fake_github_smoke;
 mod fake_gitlab_smoke;
 #[cfg(unix)]
-mod front_door_http;
-#[cfg(unix)]
 mod git_collisions;
 #[cfg(unix)]
 mod git_export;

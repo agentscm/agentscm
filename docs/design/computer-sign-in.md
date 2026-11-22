@@ -202,7 +202,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 ## Migration
 
 - Saved sign-ins without a credential keep working until their session ends. Connect (`client
-  setup`, auto-connect), renewal and `agentscm open` enroll one with
+  setup`, auto-connect) and renewal enroll one with
   `POST /v1/hub/devices` when they find a live session and no credential, with no prompt.
 - People who signed in before this change were never asked about auto-connect. The next
   interactive `agentscm hub` or `agentscm client` command at a terminal asks once. The answer is
@@ -215,7 +215,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 ## Threats and limits
 
 - **Stolen credential file.** It grants agent tokens for the owner's repositories until revoked or
-  idle for 90 days; it cannot sign in to the Hub's web pages, act as an administrator, or read the
+  idle for 90 days; it cannot open a browser sign-in session, act as an administrator, or read the
   forge. Mitigations: owner-only file, revocation from any of the person's computers or by an
   admin, `last_used_at` in every list. Not bound to hardware.
 - **Role loss.** Takes effect at the next renewal (at most about 24 hours, usually 12) or at once
