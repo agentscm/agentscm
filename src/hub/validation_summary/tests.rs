@@ -767,6 +767,51 @@ async fn refused_comment_with_rate_limit_headers_is_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_status_releases_the_journal_and_publishes_once_fixed() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    let context = f.policies[0].status_context();
+    f.forge.with(|s| {
+        s.reject_status_contexts.insert(context.clone(), 403);
+    });
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert!(f.run().await.is_err(), "still refused: no comment yet");
+    assert_eq!(f.counts().0, 0);
+    f.forge.with(|s| s.reject_status_contexts.clear());
+    f.run().await.unwrap();
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert_eq!(f.counts().0, 1);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1, "no duplicate summary comment");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_comment_releases_the_journal_and_publishes_once_fixed() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.forge.with(|s| s.reject_comments = Some(403));
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    let context = f.policies[0].status_context();
+    // The statuses the refused attempt sent were invalidated before the release.
+    f.forge.with(|s| {
+        let last = s.repos[&42]
+            .statuses
+            .iter()
+            .rev()
+            .find(|(_, v)| v["context"] == context.as_str())
+            .map(|(_, v)| v["state"].clone());
+        assert_eq!(last, Some("pending".into()));
+    });
+    f.forge.with(|s| s.reject_comments = None);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1, "no duplicate summary comment");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_marker_is_never_adopted_and_wrong_signature_cannot_pass() {
     let f = Fixture::new().await;
     f.submit(0, Fixture::now(), true);
