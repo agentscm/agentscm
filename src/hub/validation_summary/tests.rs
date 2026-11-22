@@ -767,6 +767,111 @@ async fn refused_comment_with_rate_limit_headers_is_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_status_releases_the_journal_and_publishes_once_fixed() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    let context = f.policies[0].status_context();
+    f.forge.with(|s| {
+        s.reject_status_contexts.insert(context.clone(), 403);
+    });
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert!(f.run().await.is_err(), "still refused: no comment yet");
+    assert_eq!(f.counts().0, 0);
+    f.forge.with(|s| s.reject_status_contexts.clear());
+    f.run().await.unwrap();
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert_eq!(f.counts().0, 1);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1, "no duplicate summary comment");
+}
+
+fn last_state(f: &Fixture, context: &str) -> Option<serde_json::Value> {
+    f.forge.with(|s| {
+        s.repos[&42]
+            .statuses
+            .iter()
+            .rev()
+            .find(|(_, v)| v["context"] == context)
+            .map(|(_, v)| v["state"].clone())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_verdict_status_releases_and_invalidates_sent_statuses() {
+    for code in [404, 422] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        // The pending invalidation is accepted; the verdict is refused.
+        f.forge.with(|s| s.reject_non_pending_statuses = Some(code));
+        assert!(f.run().await.is_err());
+        assert_eq!(f.journal().phase, PublicationPhase::Idle);
+        let refusal = last_refusal(&f.repo.id).expect("refusal recorded");
+        assert_eq!(refusal["reason"], "validation_status_refused", "{refusal}");
+        assert_eq!(refusal["status"], code);
+        for policy in &f.policies {
+            let context = policy.status_context();
+            assert_eq!(last_state(&f, &context), Some("pending".into()), "{code}");
+        }
+        f.forge.with(|s| s.reject_non_pending_statuses = None);
+        f.run().await.unwrap();
+        assert_eq!(f.counts().0, 1, "{code}");
+        assert_eq!(
+            last_state(&f, &f.policies[0].status_context()),
+            Some("success".into())
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_comment_edit_releases_and_edits_once_fixed() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1);
+    let body = || f.forge.with(|s| s.repos[&42].comments[&1][0].body.clone());
+    let before = body();
+    f.submit(1, Fixture::now(), false);
+    f.forge.with(|s| s.reject_comment_edits = Some(403));
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert_eq!(body(), before);
+    f.forge.with(|s| s.reject_comment_edits = None);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1, "edited, not duplicated");
+    assert_ne!(body(), before);
+    assert_eq!(
+        last_state(&f, &f.policies[1].status_context()),
+        Some("success".into())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_comment_releases_the_journal_and_publishes_once_fixed() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.forge.with(|s| s.reject_comments = Some(403));
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    let context = f.policies[0].status_context();
+    // The statuses the refused attempt sent were invalidated before the release.
+    f.forge.with(|s| {
+        let last = s.repos[&42]
+            .statuses
+            .iter()
+            .rev()
+            .find(|(_, v)| v["context"] == context.as_str())
+            .map(|(_, v)| v["state"].clone());
+        assert_eq!(last, Some("pending".into()));
+    });
+    f.forge.with(|s| s.reject_comments = None);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1);
+    f.run().await.unwrap();
+    assert_eq!(f.counts().0, 1, "no duplicate summary comment");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_marker_is_never_adopted_and_wrong_signature_cannot_pass() {
     let f = Fixture::new().await;
     f.submit(0, Fixture::now(), true);

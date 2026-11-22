@@ -382,6 +382,10 @@ pub struct FakeState {
     /// Refuse every comment creation with this status and rate-limit headers, as real GitHub
     /// refuses a missing permission.
     pub reject_comments: Option<u16>,
+    /// Refuse every comment edit with this status.
+    pub reject_comment_edits: Option<u16>,
+    /// Refuse every commit status write other than `pending` with this status.
+    pub reject_non_pending_statuses: Option<u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
     /// Move the base after the repository has recorded this many statuses.
@@ -1435,6 +1439,9 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     json_reply(201, created)
                 }
                 (&Method::PATCH, ["issues", "comments", cid]) => {
+                    if let Some(status) = state.reject_comment_edits {
+                        return json_reply(status, json!({"message": "refused"}));
+                    }
                     let found = cid.parse::<u64>().ok().and_then(|cid| {
                         state
                             .repos
@@ -1619,6 +1626,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     if let Some(code) = b["context"]
                         .as_str()
                         .and_then(|c| state.reject_status_contexts.get(c))
+                        .or(state
+                            .reject_non_pending_statuses
+                            .as_ref()
+                            .filter(|_| b["state"] != "pending"))
                     {
                         return json_reply(*code, json!({"message": "refused"}));
                     }
