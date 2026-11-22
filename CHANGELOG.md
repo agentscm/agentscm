@@ -2,6 +2,22 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.8.0](https://github.com/agentscm/agentscm/compare/v0.7.0...v0.8.0) - 2026-11-22
+
+### Added
+
+- *(hub)* Adopt an existing GitHub App and move a repository to it ([#675](https://github.com/agentscm/agentscm/pull/675))
+- *(hub)* Show the validation App's identity and permission refusals ([#669](https://github.com/agentscm/agentscm/pull/669))
+
+### Fixed
+
+- *(hub)* Release the validation journal after a definite GitHub refusal ([#674](https://github.com/agentscm/agentscm/pull/674))
+- *(hub)* Follow a renamed or moved GitLab project by its id ([#561](https://github.com/agentscm/agentscm/pull/561))
+
+### Other
+
+- say which checkouts default to metadata-only capture ([#660](https://github.com/agentscm/agentscm/pull/660))
+
 ## [0.7.0](https://github.com/agentscm/agentscm/compare/v0.6.1...v0.7.0) - 2026-11-20
 
 ### Added
