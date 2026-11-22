@@ -78,6 +78,7 @@ pub struct Refusal {
 /// A connected repository with how many computers and live agent tokens use it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryUsage {
+    pub id: String,
     pub full_name: String,
     pub host: String,
     pub connection: String,

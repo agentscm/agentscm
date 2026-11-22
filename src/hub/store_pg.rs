@@ -9923,7 +9923,7 @@ impl Store for PgStore {
             let rows = client.query(
                 "SELECT r.full_name, r.host, r.connection,
                         COUNT(DISTINCT CASE WHEN u.host = r.host THEN t.device_id END),
-                        COUNT(CASE WHEN u.host = r.host THEN t.id END)
+                        COUNT(CASE WHEN u.host = r.host THEN t.id END), r.id
                  FROM hub_repositories r
                  LEFT JOIN hub_agent_tokens t ON t.repository = r.full_name
                      AND NOT t.revoked AND t.expires_at > $1 AND NOT t.read_only
@@ -9940,6 +9940,7 @@ impl Store for PgStore {
                     connection: row.get(2),
                     devices: row.get(3),
                     agent_tokens: row.get(4),
+                    id: row.get(5),
                 })
                 .collect())
         })

@@ -10044,7 +10044,7 @@ impl Store for SqliteStore {
             .prepare(
                 "SELECT r.full_name, r.host, r.connection,
                         COUNT(DISTINCT CASE WHEN u.host = r.host THEN t.device_id END),
-                        COUNT(CASE WHEN u.host = r.host THEN t.id END)
+                        COUNT(CASE WHEN u.host = r.host THEN t.id END), r.id
                  FROM hub_repositories r
                  LEFT JOIN hub_agent_tokens t ON t.repository = r.full_name
                      AND t.revoked = 0 AND t.expires_at > ?1 AND t.read_only = 0
@@ -10059,6 +10059,7 @@ impl Store for SqliteStore {
                     connection: row.get(2)?,
                     devices: row.get(3)?,
                     agent_tokens: row.get(4)?,
+                    id: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
