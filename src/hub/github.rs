@@ -426,6 +426,18 @@ impl Api {
             .map(|_| ())
     }
 
+    /// `GET /repos/{full_name}/installation` with the App's JWT: the App's installation id
+    /// that can reach the repository, `None` when it has none (404).
+    pub(super) async fn repo_installation(&self, jwt: &str, full_name: &str) -> Gh<Option<i64>> {
+        let reply = self
+            .get(jwt, &format!("/repos/{full_name}/installation"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        Ok(reply.ok("app")?["id"].as_i64().filter(|id| *id > 0))
+    }
+
     pub async fn installations(&self, jwt: &str) -> Gh<Vec<(i64, String)>> {
         let paged = self
             .paged(jwt, "/app/installations", None, MAX_REPO_PAGES, None)

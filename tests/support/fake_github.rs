@@ -1161,10 +1161,14 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 else {
                     return not_found();
                 };
-                let permissions = state.installation_permissions.clone().unwrap_or_else(|| {
-                    json!({"merge_queues": "read", "statuses": "write", "pull_requests": "read",
-                        "contents": "read", "metadata": "read"})
-                });
+                // The second App's installations grant what the App asks for.
+                let permissions = match &second {
+                    Some(app) => app.permissions.clone(),
+                    None => state.installation_permissions.clone().unwrap_or_else(|| {
+                        json!({"merge_queues": "read", "statuses": "write",
+                            "pull_requests": "read", "contents": "read", "metadata": "read"})
+                    }),
+                };
                 let events = state.installation_events.clone().unwrap_or_else(|| {
                     ["merge_group", "pull_request", "push"]
                         .map(String::from)
@@ -1199,6 +1203,25 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 )
             }
             _ => not_found(),
+        };
+    }
+
+    // The calling App's installation on a repository, by JWT.
+    if let (&Method::GET, ["repos", owner, name, "installation"]) = (method, &segs[..]) {
+        let bearer = auth.as_deref().and_then(|a| a.strip_prefix("Bearer "));
+        let Some(caller) = bearer.and_then(|token| jwt_app(state, token)) else {
+            return unauthorized();
+        };
+        let full_name = format!("{owner}/{name}");
+        let repo = state.repos.values().find(|r| r.full_name == full_name);
+        return match repo.and_then(|repo| {
+            state
+                .installations_of(caller)
+                .iter()
+                .find(|i| i.repos.contains(&repo.id))
+        }) {
+            Some(i) => json_reply(200, json!({"id": i.id, "account": {"login": i.account}})),
+            None => not_found(),
         };
     }
 

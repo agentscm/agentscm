@@ -404,8 +404,8 @@ status shown; clients show `message` as is.
   anyone's; 204 or 404. Revoking a computer revokes every agent token it minted in the same
   transaction, and ends this Hub process's session from the sign-in that signed it in.
 - Administrators (session only): `GET /v1/hub/admin/devices` (every computer, with its `owner`),
-  `GET /v1/hub/admin/repositories` (each connected repository with the number of computers and
-  live agent tokens using it) and `GET /v1/hub/admin/sign-in-refusals`: refused sign-ins and
+  `GET /v1/hub/admin/repositories` (each connected repository, with its `rep_` `id`, the number of
+  computers and live agent tokens using it) and `GET /v1/hub/admin/sign-in-refusals`: refused sign-ins and
   computer mints within 30 days, at most 200, one row per person and reason (`at`, `count`,
   `provider`, `host`, `login`, `forge_user_id`, `reason`, `via` `sign_in`, `device_mint` or
   `web_read_token`; a
@@ -696,7 +696,9 @@ acting user as `by`. Tokens record the forge's stable `repository_id` and whethe
 
 GitHub sync adds, all with exact ids and appended in the change's transaction:
 `connection_created`, `connection_status` (only when status or detail
-changes), `connection_outbound`, `repository_connected` and
+changes), `connection_outbound`, `repository_transferred` (subject is the `rep_` id; data has
+`repository_id`, `full_name`, `from` and `to` connection ids, the new `installation_id` and `by`),
+`repository_connected` and
 `repository_renamed` (subject is the hub's `rep_` id; data has the forge
 `repository_id`, `full_name`, `node_id`, `installation_id`; a rename also carries `work_repair`, `applied`, `none` or `skipped`, and `work_repair_reason` when skipped: `too_many`, `conflict` for a refusal or collision, or `unavailable` for lock contention or any other failure, which the Hub does not retry),
 `pull_request_observed` and `pull_request_closed` (data is the observation plus
@@ -1504,7 +1506,8 @@ Discovery by another connection, such as a second app installation or a
 followed GitLab namespace, leaves it there. The refresh reply lists each such
 repository in `held_elsewhere` (`{"repository", "held_by"}`, `held_by` being the
 holding connection's id), and `agentscm hub connections refresh <id>` prints a
-line for each. Discovery never moves a repository to another connection.
+line for each. Discovery never moves a repository to another connection; only
+[an explicit transfer](#moving-a-repository-to-another-app-connection) does.
 
 PAT fallback. `AGENTSCM_GITHUB_PAT_FILE` (preferred; a private regular file) or
 `AGENTSCM_GITHUB_PAT` holds a fine-grained token, with
@@ -1684,11 +1687,41 @@ state is the capability and is single use), `GET /v1/hub/connections`,
 connection holds are listed, not moved), `POST /v1/hub/connections/{id}/outbound`
 (`{"enabled": bool}`, 204) and `POST /v1/hub/connections/{id}/repositories`
 (`{"full_name"}`, PAT and GitLab token connections only; 403 when the token cannot read it, 409 when
-another connection holds it). Agent token: `GET /v1/hub/repos/{repo}/work` returns `{intents, intents_truncated,
+another connection holds it), and `GET` and `POST /v1/hub/admin/repos/{repo}/connection` (see
+[the API reference](api.md#hub-moving-a-repository-to-another-app-connection)). Agent token: `GET /v1/hub/repos/{repo}/work` returns `{intents, intents_truncated,
 pull_requests, branches, connected, truncated}` for the token's repository (any
 other repository is a 404). The repository is found by the token's forge repository id
 when it has one, else by name, so a rename never serves another repository; `truncated` is what the last poll cut short, kept in
 memory.
+
+### Moving a repository to another App connection
+
+When two Apps can reach a repository and the Hub connected it through the wrong one, for
+example a read-only App that cannot post validation statuses, an administrator moves that one
+repository. Find its `rep_` id in `GET /v1/hub/admin/repositories`, then run
+`agentscm hub connections transfer-repo <rep_id> --to <con_id>`
+(`GET /v1/hub/admin/repos/{repo}/connection?to=<con_id>`). The preview changes nothing. It
+names the current and target connections and the target App's installation on the repository,
+runs the [publisher check](advanced/hub-local-validation.md#choose-one-publication-mode) against the target, and says whether
+validation summaries are enabled, how many rows the move resets, and what blocks it. Add
+`--yes` to move it: the CLI sends the connection the preview showed as `expect_from`, and the
+Hub moves the repository only if that is still its connection.
+
+The target must be another GitHub App connection on the repository's host whose App is
+installed on this repository (the same GitHub repository id). The move is refused while a
+validation publication, forge check or merge-group check of the repository is mid-write, and,
+when validation summaries are enabled, while the target installation lacks `statuses: write`.
+
+In one transaction the move points the repository at the target connection and installation,
+and deletes or resets what the old App wrote: its pull request comment and status records, its
+forge-check journal, its merge-group posts (the groups themselves stay) and the validation
+publication journal. Validation summaries stay configured but are disabled; enable them again
+under the new connection. The repository keeps its `rep_` id, so evidence receipts, proposals,
+observations, external runs, Work and tokens stay. Other repositories on both connections are
+unchanged, and the old connection keeps existing: there is no route that removes a
+connection. The new App cannot edit or remove the statuses and summary comment the old App
+posted on GitHub, so clear or accept them there. Deliveries from the old App for the
+repository are dropped, and its next discovery lists the repository in `held_elsewhere`.
 
 ## First run
 

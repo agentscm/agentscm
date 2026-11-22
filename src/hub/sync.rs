@@ -724,7 +724,7 @@ fn no_forge_people(store: &dyn Store) -> Result<bool> {
         .all(|user| user.identity.host == super::store::LOCAL_HOST))
 }
 
-fn gh_to_hub(error: GhError) -> HubError {
+pub(super) fn gh_to_hub(error: GhError) -> HubError {
     forge_to_hub("GitHub", error)
 }
 
@@ -1277,6 +1277,18 @@ fn repo_level(
     }
 }
 
+/// A transfer moved `repo` to another connection while this job waited for its lock, so
+/// `conn` must not read or post for it.
+async fn moved_away(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+) -> Result<bool> {
+    let id = repo.id.clone();
+    let row = db(state, move |store| store.repository_row(&id)).await?;
+    Ok(row.is_none_or(|row| row.connection != conn.id))
+}
+
 async fn sync_repo(
     state: &HubState,
     conn: &Connection,
@@ -1289,6 +1301,13 @@ async fn sync_repo(
         .await
         .map_err(|_| GhError::Failed("shutting down".into()))?;
     let _guard = sync.lock_repo(&repo.id).await;
+    if moved_away(state, conn, repo).await? {
+        return Ok(PollReport {
+            connection: conn.id.clone(),
+            repository: repo.full_name.clone(),
+            ..PollReport::default()
+        });
+    }
     // Token acquisition and API setup are part of the attempted source read.
     super::catchup_sync::begin(state, conn, repo).await?;
     planned_issue_health(state, conn, repo).await?;
@@ -2761,6 +2780,9 @@ async fn webhook_work(
         }
     }
     let _guard = sync.lock_repo(&repo.id).await;
+    if moved_away(state, conn, &repo).await? {
+        return Ok(());
+    }
     if event == "pull_request" {
         super::catchup_sync::begin(state, conn, &repo)
             .await

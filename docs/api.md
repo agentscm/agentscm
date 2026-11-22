@@ -160,6 +160,35 @@ others, too large or not valid, a key GitHub refuses, or an App whose id GitHub 
 differently from the file's `app_id`; 409 `already_connected` when a connection already has
 that App id; 503 `unavailable` when GitHub cannot be read.
 
+## Hub: moving a repository to another App connection
+
+`GET /v1/hub/admin/repos/{repo}/connection?to=<con_id>` previews moving one repository to
+another GitHub App connection, and `POST /v1/hub/admin/repos/{repo}/connection` with
+`{"to": "<con_id>", "expect_from": "<con_id>"}` moves it; see
+[moving a repository](hub.md#moving-a-repository-to-another-app-connection). `{repo}` is the
+`rep_` id that `GET /v1/hub/admin/repositories` lists as `id` beside each row's `full_name`,
+`host`, `provider`, `connection`, `devices` and `agent_tokens`. Administrators only (a
+session; 403 `forbidden` for anyone else, 401 without one).
+
+Reply (200), from both: `{repository: {id, full_name}, from: {connection, kind, app_slug},
+to: {connection, app_slug, installation_id}, publisher, validation_summary_enabled, resets:
+{outbound, forge_checks, merge_group_posts, publications}, blocked, warnings, transferred}`.
+`publisher` is the validation-summary publisher check run with the target App and installation.
+`resets` counts the rows the move deletes or resets. `blocked` lists `statuses_write_missing`
+(summaries are enabled and the target lacks `statuses: write`) and `write_in_progress` (a
+validation publication, forge check or merge-group check is mid-write). `warnings` always says
+the new App cannot edit or remove the old App's statuses and summary comment, and, when
+summaries are enabled, that the move disables them. The preview changes nothing and
+`transferred` is `false`; a move replies with `transferred: true`.
+
+Errors: 404 `not_found` for an unknown repository; 400 `invalid_request` when `to` is not
+another GitHub App connection on the repository's host; 403 `forge_permission_missing` when
+the target App is not installed on the repository (or its installation reaches a different
+repository id under that name) and, on `POST`, when `statuses_write_missing` blocks (the reply
+carries `publisher`); 409 `already_connected` when `expect_from` is no longer the repository's
+connection; 409 `publication_conflict` while `write_in_progress` blocks; 503 `unavailable` when
+GitHub cannot be read. A refused move changes nothing.
+
 ## Hub: Work recovery
 
 The same recovery service for agents and people. A preview never writes; every apply re-checks

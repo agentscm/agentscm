@@ -50,6 +50,30 @@ pub struct ConnectedRepository {
     pub pulls_etag: Option<String>,
 }
 
+/// What moving one repository to another connection resets, and whether it moved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryTransfer {
+    pub moved: bool,
+    /// The repository is no longer on the expected connection; nothing changed.
+    pub connection_changed: bool,
+    /// Rows the transfer deletes or resets: the old App's comment and status, forge-check
+    /// journal, merge-group posts and validation publication journal.
+    pub outbound: i64,
+    pub forge_checks: i64,
+    pub merge_group_posts: i64,
+    pub publications: i64,
+    /// Publications and forge or merge-group checks mid-write (`attempting`); while any is,
+    /// nothing moves.
+    pub mid_write: i64,
+}
+
+/// A stored validation publication that may be sending: `attempting`, or unreadable.
+pub(super) fn publication_mid_write(state: &str) -> bool {
+    use super::validation_evidence::{PublicationPhase, ValidationPublication};
+    serde_json::from_str::<ValidationPublication>(state)
+        .map_or(true, |p| p.phase == PublicationPhase::Attempting)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Observed {
     /// A newer read is already stored.
@@ -440,6 +464,18 @@ impl Event {
             "full_name": repo.full_name, "node_id": repo.node_id,
             "installation_id": repo.installation_id});
         Self::new("repository_connected", &repo.id, data)
+    }
+
+    /// `repo` as it is after the move.
+    pub(super) fn repository_transferred(
+        repo: &ConnectedRepository,
+        from: &str,
+        by: &str,
+    ) -> Result<Self> {
+        let data = json!({"repository_id": repo.repository_id, "full_name": repo.full_name,
+            "from": from, "to": repo.connection, "installation_id": repo.installation_id,
+            "by": by});
+        Self::new("repository_transferred", &repo.id, data)
     }
 
     /// `repair` says what became of the online Work repair: `("applied", None)` or

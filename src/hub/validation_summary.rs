@@ -44,6 +44,17 @@ pub(super) fn last_refusal(repo: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+/// Forgets `repo`'s refusal: a publication succeeded, or the repository moved connections.
+pub(super) fn forget_refusal(repo: &str) {
+    if let Some(refusals) = REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        refusals.remove(repo);
+    }
+}
+
 /// The HTTP status of a strict reply's error text (`"403 from repos"`) when it is definite.
 fn definite_refusal(message: &str) -> Option<u16> {
     let status = message.split(' ').next()?.parse().ok()?;
@@ -1313,13 +1324,7 @@ async fn reconcile_pull_inner(
         return Err(failed("validation journal completion changed"));
     }
     // Published, so an older refusal no longer describes this repository.
-    if let Some(refusals) = REFUSALS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-    {
-        refusals.remove(&repo.id);
-    }
+    forget_refusal(&repo.id);
     produce_invalidation_notices(hub, repo, pull, &plan.invalidations)?;
     Ok(())
 }

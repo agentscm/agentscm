@@ -35,9 +35,10 @@ use super::change_record::{
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
-    Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event, is_lower_hex,
-    observation_kinds, validate_check_key, validate_check_phase, validate_group_note,
-    validate_observation, validate_repository_row, validate_status,
+    Observation, Observed, Outbound, REPOSITORY_SELECT, RepositoryTransfer, gone_event,
+    is_lower_hex, observation_kinds, publication_mid_write, validate_check_key,
+    validate_check_phase, validate_group_note, validate_observation, validate_repository_row,
+    validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -11224,6 +11225,98 @@ impl Store for SqliteStore {
         };
         tx.commit()?;
         Ok(repo)
+    }
+
+    fn transfer_repository(
+        &self,
+        repo: &str,
+        expect_from: &str,
+        to: &str,
+        installation_id: Option<i64>,
+        actor: &str,
+        apply: bool,
+    ) -> Result<RepositoryTransfer> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut row = tx
+            .query_row(
+                &format!("{REPOSITORY_SELECT} WHERE id = ?1"),
+                [repo],
+                repository_row,
+            )
+            .optional()?
+            .ok_or_else(|| HubError::Invalid("unknown repository".into()))?;
+        let host = tx
+            .query_row(
+                "SELECT host FROM hub_connections WHERE id = ?1 AND kind = 'app'",
+                [to],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if host.as_deref() != Some(row.host.as_str()) || row.connection == to {
+            return Err(HubError::Invalid(
+                "the target must be another App connection on the repository's host".into(),
+            ));
+        }
+        let count = |sql: &str| tx.query_row(sql, [repo], |r| r.get::<_, i64>(0));
+        let states = tx
+            .prepare("SELECT state FROM hub_validation_publication WHERE repository = ?1")?
+            .query_map([repo], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = RepositoryTransfer {
+            moved: false,
+            connection_changed: row.connection != expect_from,
+            outbound: count("SELECT COUNT(*) FROM hub_outbound WHERE repository = ?1")?,
+            forge_checks: count("SELECT COUNT(*) FROM hub_forge_checks WHERE repository = ?1")?,
+            merge_group_posts: count(
+                "SELECT COUNT(*) FROM hub_merge_groups WHERE repository = ?1 AND phase IS NOT NULL",
+            )?,
+            publications: states.len() as i64,
+            mid_write: count(
+                "SELECT (SELECT COUNT(*) FROM hub_forge_checks
+                         WHERE repository = ?1 AND phase = 'attempting')
+                      + (SELECT COUNT(*) FROM hub_merge_groups
+                         WHERE repository = ?1 AND phase = 'attempting')",
+            )? + states.iter().filter(|s| publication_mid_write(s)).count() as i64,
+        };
+        if !apply || out.connection_changed || out.mid_write > 0 {
+            return Ok(out);
+        }
+        tx.execute(
+            "UPDATE hub_repositories SET connection = ?2, installation_id = ?3, pulls_etag = NULL
+             WHERE id = ?1",
+            params![repo, to, installation_id],
+        )?;
+        tx.execute(
+            "UPDATE hub_validation_summary_config SET connection = ?2, enabled = 0
+             WHERE repository = ?1",
+            params![repo, to],
+        )?;
+        for table in [
+            "hub_validation_publication",
+            "hub_outbound",
+            "hub_forge_checks",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE repository = ?1"),
+                [repo],
+            )?;
+        }
+        // Identity stays; the old App's post goes, and the generation fences its reservations.
+        tx.execute(
+            "UPDATE hub_merge_groups SET state = NULL, binding_digest = NULL, description = NULL,
+                 phase = NULL, ruleset_requirement = NULL, status_source = NULL,
+                 generation = generation + 1, updated_at = ?2
+             WHERE repository = ?1",
+            params![repo, unix_now()],
+        )?;
+        let from = std::mem::replace(&mut row.connection, to.to_owned());
+        row.installation_id = installation_id;
+        row.pulls_etag = None;
+        append(&tx, &Event::repository_transferred(&row, &from, actor)?)?;
+        tx.commit()?;
+        out.moved = true;
+        Ok(out)
     }
 
     fn repositories(&self, connection: &str) -> Result<Vec<ConnectedRepository>> {
