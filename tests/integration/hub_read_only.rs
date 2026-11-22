@@ -205,6 +205,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/v1/hub/connections/con_x/outbound".into(), r#"{"enabled":true}"#.into(), HumanOnly);
     row(&post, "/v1/hub/connections/con_x/repositories".into(), "{}".into(), HumanOnly);
     row(&post, "/v1/hub/github/apps".into(), "{}".into(), HumanOnly);
+    row(&post, "/v1/hub/github/apps/adopt".into(), r#"{"file":"a.json"}"#.into(), HumanOnly);
     // Not token routes: sign-in steps, setup pages and webhooks, each refused without their own proof.
     row(&get, "/v1/hub/github/setup/callback".into(), "".into(), Status(404));
     row(&get, "/v1/hub/github/setup/state".into(), "".into(), Status(404));

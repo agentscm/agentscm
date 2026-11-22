@@ -155,6 +155,18 @@ pub struct Installation {
     pub repos: Vec<i64>,
 }
 
+/// Another App beside the default one. It signs with the same test key, so a JWT's `iss`
+/// alone says which App calls.
+#[derive(Clone, Debug)]
+pub struct FakeApp {
+    pub id: i64,
+    pub slug: String,
+    /// `permissions` and `events` of its `GET /app`.
+    pub permissions: Value,
+    pub events: Vec<String>,
+    pub installations: Vec<Installation>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Failure {
     pub path_contains: String,
@@ -346,6 +358,11 @@ pub struct FakeState {
     pub app_id: Option<i64>,
     pub app_slug: Option<String>,
     pub installations: Vec<Installation>,
+    /// A second App, authenticated by a JWT whose `iss` is its id.
+    pub second_app: Option<FakeApp>,
+    /// App id to its webhook config (`url`, `content_type`, `secret`), as last set by
+    /// `PATCH /app/hook/config`; an App without one answers 404.
+    pub hook_configs: HashMap<i64, Value>,
     pub repos: BTreeMap<i64, Repo>,
     /// PAT to (login, id, readable repo ids).
     pub pats: HashMap<String, (String, i64, BTreeSet<i64>)>,
@@ -407,6 +424,21 @@ pub struct FakeState {
 }
 
 impl FakeState {
+    /// The installations of the App with `app`'s id; none for an unknown App.
+    fn installations_of(&self, app: i64) -> &[Installation] {
+        match &self.second_app {
+            _ if app == APP_ID => &self.installations,
+            Some(second) if second.id == app => &second.installations,
+            _ => &[],
+        }
+    }
+
+    /// Every App's installations.
+    fn all_installations(&self) -> impl Iterator<Item = &Installation> {
+        let second = self.second_app.iter().flat_map(|app| &app.installations);
+        self.installations.iter().chain(second)
+    }
+
     fn app_slug(&self) -> &str {
         self.app_slug.as_deref().unwrap_or(APP_SLUG)
     }
@@ -602,40 +634,37 @@ fn rfc3339(secs: i64) -> String {
     )
 }
 
-/// RS256 app JWT: signature against the fixture key, `iss` is the app id, not expired.
-fn jwt_valid(token: &str) -> bool {
+/// RS256 app JWT: signature against the fixture key, not expired, `iss` the id of a known
+/// App. Returns that id.
+fn jwt_app(state: &FakeState, token: &str) -> Option<i64> {
     let parts: Vec<&str> = token.split('.').collect();
     let [header, payload, signature] = parts[..] else {
-        return false;
+        return None;
     };
     let decode = |s: &str| URL_SAFE_NO_PAD.decode(s).ok();
-    let (Some(header), Some(payload), Some(signature)) =
-        (decode(header), decode(payload), decode(signature))
-    else {
-        return false;
-    };
+    let (header, payload, signature) = (decode(header)?, decode(payload)?, decode(signature)?);
     let (Ok(header), Ok(claims)) = (
         serde_json::from_slice::<Value>(&header),
         serde_json::from_slice::<Value>(&payload),
     ) else {
-        return false;
+        return None;
     };
     let signing_input = &token[..token.len() - parts[2].len() - 1];
-    let iss_ok = match &claims["iss"] {
-        Value::String(s) => s.parse::<i64>().ok() == Some(APP_ID),
-        Value::Number(n) => n.as_i64() == Some(APP_ID),
-        _ => false,
-    };
-    let (Some(exp), Some(iat)) = (claims["exp"].as_i64(), claims["iat"].as_i64()) else {
-        return false;
-    };
-    header["alg"] == "RS256"
-        && iss_ok
+    let iss = match &claims["iss"] {
+        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64(),
+        _ => None,
+    }?;
+    let known = iss == APP_ID || state.second_app.as_ref().is_some_and(|app| app.id == iss);
+    let (exp, iat) = (claims["exp"].as_i64()?, claims["iat"].as_i64()?);
+    let valid = header["alg"] == "RS256"
+        && known
         && exp > now()
         && iat <= now() + 60
         && UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &keys().public)
             .verify(signing_input.as_bytes(), &signature)
-            .is_ok()
+            .is_ok();
+    valid.then_some(iss)
 }
 
 enum Who {
@@ -668,8 +697,7 @@ fn can_read(state: &FakeState, who: &Who, repo: &Repo) -> bool {
     !repo.private
         || match who {
             Who::Installation(id) => state
-                .installations
-                .iter()
+                .all_installations()
                 .any(|i| i.id == *id && i.repos.contains(&repo.id)),
             Who::Reader(_, _, repos, _) => repos.contains(&repo.id),
         }
@@ -1088,18 +1116,38 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
     // App JWT routes.
     if let ["app", rest @ ..] = &segs[..] {
         let bearer = auth.as_deref().and_then(|a| a.strip_prefix("Bearer "));
-        if !bearer.is_some_and(jwt_valid) {
+        let Some(caller) = bearer.and_then(|token| jwt_app(state, token)) else {
             return unauthorized();
-        }
+        };
+        let second = state.second_app.clone().filter(|app| app.id == caller);
         return match (method, rest) {
-            (&Method::GET, []) => json_reply(
-                200,
-                json!({"id": state.app_id.unwrap_or(APP_ID), "slug": state.app_slug()}),
-            ),
+            (&Method::GET, []) => match second {
+                Some(app) => json_reply(
+                    200,
+                    json!({"id": app.id, "slug": app.slug, "permissions": app.permissions,
+                        "events": app.events}),
+                ),
+                None => json_reply(
+                    200,
+                    json!({"id": state.app_id.unwrap_or(APP_ID), "slug": state.app_slug()}),
+                ),
+            },
+            (&Method::GET, ["hook", "config"]) => match state.hook_configs.get(&caller) {
+                // GitHub masks the secret.
+                Some(config) => {
+                    json_reply(200, json!({"url": config["url"], "secret": "********"}))
+                }
+                None => not_found(),
+            },
+            (&Method::PATCH, ["hook", "config"]) => {
+                let config = json_body();
+                state.hook_configs.insert(caller, config.clone());
+                json_reply(200, json!({"url": config["url"], "secret": "********"}))
+            }
             (&Method::GET, ["installations"]) => json_reply(
                 200,
                 state
-                    .installations
+                    .installations_of(caller)
                     .iter()
                     .map(|i| json!({"id": i.id, "account": {"login": i.account}}))
                     .collect::<Vec<_>>()
@@ -1109,7 +1157,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 let Some(installation) = id
                     .parse::<i64>()
                     .ok()
-                    .and_then(|id| state.installations.iter().find(|i| i.id == id))
+                    .and_then(|id| state.installations_of(caller).iter().find(|i| i.id == id))
                 else {
                     return not_found();
                 };
@@ -1132,7 +1180,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 let Some(id) = id
                     .parse::<i64>()
                     .ok()
-                    .filter(|id| state.installations.iter().any(|i| i.id == *id))
+                    .filter(|id| state.installations_of(caller).iter().any(|i| i.id == *id))
                 else {
                     return not_found();
                 };
@@ -1164,8 +1212,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 return unauthorized();
             };
             let repos: Vec<Value> = state
-                .installations
-                .iter()
+                .all_installations()
                 .filter(|i| i.id == id)
                 .flat_map(|i| i.repos.iter())
                 .filter_map(|r| state.repos.get(r))

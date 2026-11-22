@@ -218,13 +218,18 @@ pub fn prepare_secrets_dir(dir: &FsPath, create: bool) -> Result<()> {
     Ok(())
 }
 
-/// What `<secrets>/<connection>.json` holds. Never logged or sent.
+/// What `<secrets>/<connection>.json` holds. Never logged or sent. A file staged for
+/// adoption needs only `app_id` and `pem`; adoption fills in the slug and a webhook secret.
 #[derive(Deserialize, Serialize)]
 struct AppFile {
     app_id: i64,
+    #[serde(default)]
     slug: String,
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     client_secret: String,
+    #[serde(default)]
     webhook_secret: String,
     pem: String,
 }
@@ -2527,6 +2532,7 @@ pub fn routes() -> Router<HubState> {
             post(gitlab_webhook).layer(DefaultBodyLimit::max(WEBHOOK_BODY_BYTES)),
         )
         .route("/v1/hub/github/apps", post(create_app))
+        .route("/v1/hub/github/apps/adopt", post(adopt_app))
         .route("/v1/hub/github/setup/callback", get(setup_callback))
         .route("/v1/hub/github/setup/{state}", get(setup_page))
         .route("/v1/hub/connections", get(list_connections))
@@ -3264,6 +3270,147 @@ async fn setup_callback(
         "<!doctype html><meta charset=utf-8><title>GitHub App created</title><p>Created app {}.{link}</p>{hint}{device}",
         escape(&file.slug)
     ))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adopt {
+    file: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+fn app_taken(store: &dyn Store, app_id: i64) -> Result<bool> {
+    Ok(store
+        .connections()?
+        .iter()
+        .any(|c| c.app_id == Some(app_id)))
+}
+
+/// Registers an existing App from a credentials file an operator placed in the secrets
+/// directory. Without `confirm` it only reports what confirming would do; the private key
+/// and the webhook secret never leave the host.
+async fn adopt_app(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<Adopt>,
+) -> ApiResult<Json<Value>> {
+    let actor = human.admin()?.user.id.clone();
+    let (config, api) = state.sync.configured()?;
+    let name = body.file;
+    // A plain file name only, never a path or a connection's own file.
+    if !simple(&name, b"-_.", 128)
+        || name.contains("..")
+        || !name.ends_with(".json")
+        || name.starts_with("con_")
+    {
+        return Err(ApiError::invalid()
+            .with_message("file must name a .json file in the secrets directory, not con_*"));
+    }
+    let staged = config.secrets.join(&name);
+    let mut file = read_private(&staged)
+        .ok()
+        .and_then(|text| serde_json::from_str::<AppFile>(&text).ok())
+        .filter(|file| file.app_id > 0)
+        .ok_or_else(|| {
+            ApiError::invalid().with_message("file is not a private, valid App credentials file")
+        })?;
+    let key = AppKey::from_pem(&file.pem)
+        .map_err(|_| ApiError::invalid().with_message("the file's private key is not valid"))?;
+    let app_id = file.app_id;
+    let already = || ApiError::new(StatusCode::CONFLICT, "already_connected");
+    if db(&state, move |store| app_taken(store, app_id)).await? {
+        return Err(already());
+    }
+    let jwt = key.jwt(app_id, unix_now())?;
+    let app = match api.authenticated_app(&jwt).await {
+        Ok(app) => app,
+        Err(GhError::Auth(_)) => {
+            return Err(ApiError::invalid().with_message("GitHub refused the file's App key"));
+        }
+        Err(error) => return Err(gh_to_hub(error).into()),
+    };
+    let slug = app["slug"].as_str().filter(|s| simple(s, b"-_", 255));
+    let (Some(slug), true) = (slug, app["id"].as_i64() == Some(app_id)) else {
+        return Err(ApiError::invalid()
+            .with_message("the App GitHub authenticated does not match the file's app_id"));
+    };
+    let current = api.hook_config(&jwt).await.map_err(gh_to_hub)?;
+    let public = check_base_url(&config.public_url).map_err(|_| ApiError::invalid())?;
+    let mut warnings = vec![
+        "Repointing the webhook moves deliveries for every installation of this App to this \
+         Hub, including any that another Hub receives now.",
+    ];
+    if app["permissions"]["statuses"] != "write" {
+        warnings.push(
+            "The App lacks statuses: write, so validation summaries cannot be enabled for \
+             its repositories.",
+        );
+    }
+    if !webhook_reachable(&public) {
+        warnings.push(
+            "GitHub cannot reach this Hub's public URL, so deliveries will fail; polling keeps \
+             the Hub current.",
+        );
+    }
+    let mut reply = json!({"app_id": app_id, "app_slug": slug, "bot_login": format!("{slug}[bot]"),
+        "permissions": app["permissions"], "events": app["events"],
+        "webhook_current_url": current.as_ref().and_then(|c| c["url"].as_str()),
+        "webhook_url": format!("{public}/v1/hub/webhooks/github/{{connection}}"),
+        "warnings": warnings, "confirmed": false, "connection": null, "webhook_updated": false});
+    if !body.confirm {
+        return Ok(Json(reply));
+    }
+
+    let connection = new_connection_id()?;
+    let url = format!("{public}/v1/hub/webhooks/github/{connection}");
+    if file.webhook_secret.is_empty() {
+        file.webhook_secret = random_hex()?;
+    }
+    file.slug = slug.to_owned();
+    let secret = file.webhook_secret.clone();
+    let text = serde_json::to_string(&file).map_err(|e| HubError::Unavailable(e.to_string()))?;
+    let own = config.secrets.join(format!("{connection}.json"));
+    let path = own.clone();
+    blocking(&state, move || write_private(&path, text.as_bytes())).await?;
+    let new = NewConnection {
+        id: connection.clone(),
+        provider: "github".into(),
+        host: config.host.clone(),
+        kind: "app".into(),
+        app_id: Some(app_id),
+        app_slug: Some(slug.to_owned()),
+        acts_as: None,
+    };
+    // shortcut: check-then-insert, as in setup_callback; two adopts of one App at the same
+    // moment could both pass.
+    let inserted = db(&state, move |store| {
+        if app_taken(store, app_id)? {
+            return Ok(false);
+        }
+        store.insert_connection(&new, &actor).map(|_| true)
+    })
+    .await;
+    if !matches!(inserted, Ok(true)) {
+        let _ = std::fs::remove_file(&own);
+        return Err(inserted.map_or_else(ApiError::from, |_| already()));
+    }
+    let _ = std::fs::remove_file(&staged);
+    state.sync.load_app(&connection)?;
+    // The connection and its secret exist before GitHub learns the URL, so the first delivery
+    // verifies. Repointing first could send deliveries to a connection never created. A failed
+    // repoint leaves a connection that polls, and the reply says so.
+    match api.set_hook_config(&jwt, &url, &secret).await {
+        Ok(()) => reply["webhook_updated"] = json!(true),
+        Err(GhError::Auth(detail) | GhError::Failed(detail) | GhError::TooLarge(detail)) => {
+            reply["webhook_error"] = json!(detail);
+        }
+        Err(GhError::Limited(_)) => reply["webhook_error"] = json!("rate limited"),
+    }
+    reply["confirmed"] = json!(true);
+    reply["connection"] = json!(connection);
+    reply["webhook_url"] = json!(url);
+    Ok(Json(reply))
 }
 
 fn label(conn: &Connection) -> String {

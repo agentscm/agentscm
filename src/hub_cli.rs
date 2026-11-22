@@ -172,6 +172,16 @@ pub enum GithubCommand {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Register an existing GitHub App from a credentials file in the Hub's secrets directory.
+    /// Prints what would change; `--yes` registers it and repoints the App's webhook.
+    Adopt {
+        /// The file's name in the secrets directory, such as `my-app.json`.
+        file: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        hub: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -2486,7 +2496,10 @@ async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
 }
 
 async fn github(command: GithubCommand) -> Result<()> {
-    let GithubCommand::Setup { name, org, hub } = command;
+    let (name, org, hub) = match command {
+        GithubCommand::Setup { name, org, hub } => (name, org, hub),
+        GithubCommand::Adopt { file, yes, hub } => return adopt(file, yes, hub).await,
+    };
     let mut body = json!({"name": name});
     if let Some(org) = org {
         body["org"] = json!(org);
@@ -2501,6 +2514,43 @@ async fn github(command: GithubCommand) -> Result<()> {
         clean(connection)
     );
     println!("{}", clean(url));
+    Ok(())
+}
+
+async fn adopt(file: String, yes: bool, hub: Option<String>) -> Result<()> {
+    let body = json!({"file": file, "confirm": yes});
+    let path = "/v1/hub/github/apps/adopt";
+    let (status, reply) = admin_call(&hub, Method::POST, path, Some(body)).await?;
+    if status != 200 {
+        return Err(unexpected(status, &reply));
+    }
+    let text = |key: &str| clean(reply[key].as_str().unwrap_or("?"));
+    println!(
+        "app {} (id {}) acts as {}",
+        text("app_slug"),
+        reply["app_id"],
+        text("bot_login")
+    );
+    println!("permissions {}", clean(&reply["permissions"].to_string()));
+    println!("events {}", clean(&reply["events"].to_string()));
+    let current = reply["webhook_current_url"].as_str().unwrap_or("(none)");
+    println!("webhook now {}", clean(current));
+    println!("webhook new {}", text("webhook_url"));
+    for warning in reply["warnings"].as_array().into_iter().flatten() {
+        println!("warning: {}", clean(warning.as_str().unwrap_or("?")));
+    }
+    if reply["confirmed"] != true {
+        eprintln!("nothing changed; run again with --yes to register the App");
+        return Ok(());
+    }
+    println!("connection {}", text("connection"));
+    match reply["webhook_error"].as_str() {
+        Some(error) => eprintln!(
+            "webhook not repointed ({}); the connection polls",
+            clean(error)
+        ),
+        None => eprintln!("webhook repointed"),
+    }
     Ok(())
 }
 

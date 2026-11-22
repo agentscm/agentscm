@@ -407,6 +407,25 @@ impl Api {
         self.get(jwt, "/app").await?.ok("app")
     }
 
+    /// `GET /app/hook/config` with the App's JWT; `None` when the App has no webhook (404).
+    pub(super) async fn hook_config(&self, jwt: &str) -> Gh<Option<Value>> {
+        let reply = self.get(jwt, "/app/hook/config").await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        reply.ok("app").map(Some)
+    }
+
+    /// `PATCH /app/hook/config`: points every installation's deliveries at `url`.
+    pub(super) async fn set_hook_config(&self, jwt: &str, url: &str, secret: &str) -> Gh<()> {
+        let body = json!({"url": url, "content_type": "json", "secret": secret});
+        let target = format!("{}/app/hook/config", self.base);
+        self.write(jwt, Method::PATCH, &target, body)
+            .await?
+            .ok("app")
+            .map(|_| ())
+    }
+
     pub async fn installations(&self, jwt: &str) -> Gh<Vec<(i64, String)>> {
         let paged = self
             .paged(jwt, "/app/installations", None, MAX_REPO_PAGES, None)

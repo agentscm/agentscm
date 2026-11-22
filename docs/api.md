@@ -131,6 +131,35 @@ included, mints no agent token and answers nothing: `POST /v1/hub/device/tokens`
 kind is read at each Hub start, for credentials already issued too; register a new app id
 rather than making a read-only app full.
 
+## Hub: adopting a GitHub App
+
+`POST /v1/hub/github/apps/adopt` registers an existing GitHub App from a credentials file in
+the Hub's secrets directory; see [adopting an existing App](hub.md#github-and-gitlab-connections-and-sync).
+Administrators only (a session; 403 `forbidden` for anyone else, 401 without one); 404
+`not_configured` without GitHub sync.
+
+Request: `{"file": "<name>.json", "confirm": false}`. `file` is a plain name in the secrets
+directory, not a path, ending in `.json` and not starting with `con_`. `confirm` defaults to
+`false`.
+
+Reply (200), with or without `confirm`: `{app_id, app_slug, bot_login, permissions, events,
+webhook_current_url, webhook_url, warnings, confirmed, connection, webhook_updated}`.
+`permissions` and `events` are what GitHub's `GET /app` reports. `webhook_current_url` is the
+App's webhook URL now, or `null`. `warnings` always says that repointing moves deliveries for
+every installation of the App to this Hub; it also says when the App lacks `statuses: write`
+or GitHub cannot reach the Hub's public URL. Without `confirm`, nothing changes:
+`confirmed` and `webhook_updated` are `false`, `connection` is `null` and `webhook_url` is
+`<public>/v1/hub/webhooks/github/{connection}`, the id being assigned on confirm. With
+`confirm`, `connection` is the new `con_` id, `webhook_url` its URL, and `webhook_updated`
+says whether GitHub accepted the new webhook URL and secret; when it did not,
+`webhook_error` says why and the connection polls. No reply carries the private key or a
+secret.
+
+Errors: 400 `invalid_request` for a bad name, a file that is missing, readable by group or
+others, too large or not valid, a key GitHub refuses, or an App whose id GitHub reports
+differently from the file's `app_id`; 409 `already_connected` when a connection already has
+that App id; 503 `unavailable` when GitHub cannot be read.
+
 ## Hub: Work recovery
 
 The same recovery service for agents and people. A preview never writes; every apply re-checks

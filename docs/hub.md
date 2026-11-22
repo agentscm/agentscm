@@ -1481,6 +1481,24 @@ an event or sent in a response. The client secret file can be given to
 person installs the app on repositories; `agentscm hub connections refresh <id>`
 (or the next poll) connects every repository its installations can see.
 
+Adopting an existing App. An App created elsewhere, for example for another Hub, can
+become a new connection. The private key never goes through the API: an operator
+places a JSON file in the secrets directory, mode 0600, with at least `app_id` and
+`pem` (the App's private key), and optionally `webhook_secret`, `client_id` and
+`client_secret`. Its name must end in `.json`, must not start with `con_` and must not
+be a path. `agentscm hub github adopt <file>` (`POST /v1/hub/github/apps/adopt`) signs
+in as the App and prints its slug, id, bot login, permissions and events, its current
+webhook URL, the URL this Hub would set, and warnings. It changes nothing. Add `--yes`
+to register it. The Hub then writes `<secrets>/<con_id>.json` (with a new webhook secret
+when the file had none), removes the staged file, records the connection, and points the
+App's webhook at `/v1/hub/webhooks/github/<con_id>` with that secret. **An App has one
+webhook URL, so this moves deliveries for every one of its installations to this Hub,
+including any another Hub receives now.** If repointing fails, the connection still
+polls and the reply says why. An App id that a connection already has is refused with
+409 `already_connected`, and an App without `statuses: write` is warned about, since
+validation summaries are refused for it. Adopting moves no repositories: the next refresh
+connects the repositories no connection holds and lists the others in `held_elsewhere`.
+
 A repository belongs to one connection: the first one that connected it.
 Discovery by another connection, such as a second app installation or a
 followed GitLab namespace, leaves it there. The refresh reply lists each such
@@ -1658,7 +1676,8 @@ to the latest of `Retry-After`, `X-RateLimit-Reset` and a minute away, and chang
 nothing else. Any other failure skips that repository for the round and writes a
 line to stderr.
 
-Routes (administrators): `POST /v1/hub/github/apps`, the unauthenticated
+Routes (administrators): `POST /v1/hub/github/apps`,
+`POST /v1/hub/github/apps/adopt` (see [the API reference](api.md#hub-adopting-a-github-app)), the unauthenticated
 `GET /v1/hub/github/setup/{state}` and `GET /v1/hub/github/setup/callback` (the
 state is the capability and is single use), `GET /v1/hub/connections`,
 `POST /v1/hub/connections/{id}/refresh` (`{reports, held_elsewhere}`; discovered repositories another
