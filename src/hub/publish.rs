@@ -1417,6 +1417,12 @@ pub(super) async fn execute(
     let (Some(publication), Some(conn)) = (publication, conn) else {
         return Err(invalid("unknown publication or connection"));
     };
+    // A transfer that committed while this run waited leaves `conn` holding the old App's
+    // credentials; the run stops with a message, and running again uses the new connection.
+    if super::sync::moved_away(&state, &conn, &repository).await? {
+        let message = "the repository moved to another connection while this run waited; run again";
+        return record(&state, &publication.id, Update::Error(Some(message.into()))).await;
+    }
     let error = match push(&state, &conn, &repository, &publication, recovery).await {
         Ok(()) | Err(Stop::Done) => None,
         Err(Stop::Hub(error)) => return Err(error),
@@ -1972,4 +1978,107 @@ async fn bound_effect(
         return Err(invalid("publication executor unavailable"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::{Create, NewPublication, derive_id, execute};
+    use crate::backend::LocalBackend;
+    use crate::hub::HubState;
+    use crate::hub::connection::NewConnection;
+    use crate::hub::store::{self, ForgeIdentity, mint_bound_agent_token, unix_now};
+
+    fn app(id: &str, app_id: i64) -> NewConnection {
+        NewConnection {
+            id: id.into(),
+            provider: "github".into(),
+            host: "github.com".into(),
+            kind: "app".into(),
+            app_id: Some(app_id),
+            app_slug: Some(format!("app-{app_id}")),
+            acts_as: None,
+        }
+    }
+
+    /// A run that waited for the repository lock while a transfer committed must not write
+    /// with the old App's connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_stops_when_its_repository_moved_to_another_connection() {
+        let dir = TempDir::new().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let (old, new) = (
+            format!("con_{}", "1".repeat(32)),
+            format!("con_{}", "2".repeat(32)),
+        );
+        store.insert_connection(&app(&old, 1), "test").unwrap();
+        store.insert_connection(&app(&new, 2), "test").unwrap();
+        let repository = store
+            .upsert_repository(&old, "github.com", 100, "acme/widgets", None, Some(7))
+            .unwrap();
+        let owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 100,
+                },
+                "contributor",
+            )
+            .unwrap();
+        let (token, _, _) = mint_bound_agent_token(
+            &*store,
+            &owner.id,
+            "agent",
+            "acme/widgets",
+            100,
+            3600,
+            false,
+        )
+        .unwrap();
+        let sha = |c: char| c.to_string().repeat(40);
+        let branch = "feature/moved";
+        let id = derive_id("acme/widgets", 1, &sha('d'), branch);
+        let manifest = serde_json::from_value(json!({
+            "revision": "a".repeat(64), "event_seq": 1, "commit": sha('d'),
+            "tree": sha('e'), "parent": sha('f'), "branch": branch, "base": "main",
+            "title": "Synthetic publication", "body": "", "message": "message\n",
+            "author": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+            "committer": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+            "changes": [{"path":"src/a.rs","mode":"100644","blob":sha('9'),
+                "sha256":"f".repeat(64),"size":5}]
+        }))
+        .unwrap();
+        let Create::Done(publication) = store
+            .create_publication(&token, &NewPublication { id, manifest }, unix_now())
+            .unwrap()
+        else {
+            panic!("publication not created");
+        };
+        let moved = store
+            .transfer_repository(&repository.id, &old, &new, Some(8), "test", true)
+            .unwrap();
+        assert!(moved.moved, "{moved:?}");
+
+        let objects = LocalBackend::open(dir.path().join("objects")).unwrap();
+        let state = HubState::new(store.clone(), Arc::new(objects));
+        // `repository` still names the old connection, as a run that loaded it before the
+        // transfer would.
+        let ran = execute(state, repository, publication, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            ran.error.as_deref(),
+            Some("the repository moved to another connection while this run waited; run again")
+        );
+        assert_eq!(ran.pr_number, None);
+    }
 }

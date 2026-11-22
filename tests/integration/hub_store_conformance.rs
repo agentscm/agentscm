@@ -1344,6 +1344,32 @@ fn a_repository_transfer_is_a_compare_and_swap_that_resets_only_its_rows(db: &Db
         repo.id
     ))
     .unwrap();
+    // A forge check or merge-group check mid-write refuses as well.
+    for table in ["hub_forge_checks", "hub_merge_groups"] {
+        let set = |phase: &str| {
+            db.exec(&format!(
+                "UPDATE {table} SET phase = '{phase}' WHERE repository = '{}'",
+                repo.id
+            ))
+            .unwrap();
+        };
+        set("attempting");
+        assert_eq!(
+            store
+                .transfer_repository(&repo.id, &old.id, &new.id, Some(70), "usr_admin", true)
+                .unwrap(),
+            counts,
+            "{table}"
+        );
+        assert_eq!(
+            store.repository_row(&repo.id).unwrap().unwrap().connection,
+            old.id,
+            "{table}"
+        );
+        assert_eq!(rows(table, &repo.id), 1, "{table}");
+        set("posted");
+    }
+    assert!(events_of(&*store, "repository_transferred").is_empty());
     // The wrong expect_from changes nothing.
     let stale = store
         .transfer_repository(&repo.id, &pat_con.id, &new.id, Some(70), "usr_admin", true)

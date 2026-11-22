@@ -1488,15 +1488,21 @@ become a new connection. The private key never goes through the API: an operator
 places a JSON file in the secrets directory, mode 0600, with at least `app_id` and
 `pem` (the App's private key), and optionally `webhook_secret`, `client_id` and
 `client_secret`. Its name must end in `.json`, must not start with `con_` and must not
-be a path. `agentscm hub github adopt <file>` (`POST /v1/hub/github/apps/adopt`) signs
+be a path or a symbolic link. `agentscm hub github adopt <file>` (`POST /v1/hub/github/apps/adopt`) signs
 in as the App and prints its slug, id, bot login, permissions and events, its current
 webhook URL, the URL this Hub would set, and warnings. It changes nothing. Add `--yes`
 to register it. The Hub then writes `<secrets>/<con_id>.json` (with a new webhook secret
-when the file had none), removes the staged file, records the connection, and points the
+when the file had none), records the connection, loads it, removes the staged file, and points the
 App's webhook at `/v1/hub/webhooks/github/<con_id>` with that secret. **An App has one
 webhook URL, so this moves deliveries for every one of its installations to this Hub,
 including any another Hub receives now.** If repointing fails, the connection still
-polls and the reply says why. An App id that a connection already has is refused with
+polls and the reply has `webhook_updated: false` and a `webhook_error`. Adopt cannot be run
+again for an App a connection already has, so repoint it by hand: in the App's settings on
+GitHub, set the webhook URL to the reply's `webhook_url` and the webhook secret to the
+`webhook_secret` in `<secrets>/<con_id>.json`. If the connection was recorded but its
+credentials did not load, the reply names it with an `error`, keeps the staged file and leaves
+the webhook alone; restarting the Hub loads it. Confirms are serialized within one Hub process;
+Hub processes sharing a store could still both register one App. An App id that a connection already has is refused with
 409 `already_connected`, and an App without `statuses: write` is warned about, since
 validation summaries are refused for it. Adopting moves no repositories: the next refresh
 connects the repositories no connection holds and lists the others in `held_elsewhere`.
@@ -1721,7 +1727,11 @@ observations, external runs, Work and tokens stay. Other repositories on both co
 unchanged, and the old connection keeps existing: there is no route that removes a
 connection. The new App cannot edit or remove the statuses and summary comment the old App
 posted on GitHub, so clear or accept them there. Deliveries from the old App for the
-repository are dropped, and its next discovery lists the repository in `held_elsewhere`.
+repository are dropped, and its next discovery lists the repository in `held_elsewhere`. A
+poll, webhook job, publication run or deployment record of the repository that was waiting
+when the move committed stops without writing: a publication records "the repository moved to
+another connection while this run waited; run again", and a deployment record is `503`
+`unavailable`, to retry.
 
 ## First run
 

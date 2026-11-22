@@ -3232,6 +3232,17 @@ async fn adopting_an_existing_app_previews_then_registers_it_and_repoints_its_we
             "{bad}"
         );
     }
+    // A link to a valid file is refused too: it could reach a key outside the directory.
+    std::os::unix::fs::symlink(&staged, env.secrets.join("linked.json")).unwrap();
+    let (status, body) = env
+        .post(adopt, Some(&admin), json!({"file": "linked.json"}))
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("invalid_request")),
+        "{body}"
+    );
+    std::fs::remove_file(env.secrets.join("linked.json")).unwrap();
     assert_eq!(env.fake.with(|s| s.requests.len()), before);
 
     // The file must name the App GitHub authenticates.
@@ -3434,6 +3445,59 @@ async fn the_cli_previews_an_adoption_and_registers_it_with_yes() {
     let config = env.fake.with(|s| s.hook_configs[&SECOND_APP_ID].clone());
     assert_eq!(config["secret"], "kept-secret-synthetic");
     assert!(env.store.connection(&connection).unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adoption_whose_webhook_repoint_fails_keeps_the_connection_and_says_why() {
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    second_app(&env);
+    stage(
+        &env,
+        "adopt.json",
+        &json!({"app_id": SECOND_APP_ID, "pem": fake_github::private_pem(),
+            "webhook_secret": "staged-secret-synthetic"}),
+    );
+    env.fake.with(|s| s.refuse_next_hook_config = true);
+    let (status, text) = env
+        .raw(
+            Method::POST,
+            "/v1/hub/github/apps/adopt",
+            Some(&admin),
+            Some(json!({"file": "adopt.json", "confirm": true})),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+    let done: Value = serde_json::from_str(&text).unwrap();
+    let connection = done["connection"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (done["confirmed"].clone(), done["webhook_updated"].clone()),
+        (json!(true), json!(false))
+    );
+    assert!(
+        done["webhook_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "{done}"
+    );
+    assert_eq!(
+        done["webhook_url"],
+        format!("{}/v1/hub/webhooks/github/{connection}", env.url)
+    );
+    assert!(
+        !text.contains("staged-secret-synthetic") && !text.contains("PRIVATE KEY"),
+        "{text}"
+    );
+    assert!(env.store.connection(&connection).unwrap().is_some());
+    assert_eq!(
+        env.fake
+            .with(|s| s.hook_configs[&SECOND_APP_ID]["url"].clone()),
+        "https://other-hub.example/v1/hub/webhooks/github/con_old"
+    );
+    // The connection's own file holds the secret an operator sets by hand.
+    let own = env.secrets.join(format!("{connection}.json"));
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&own).unwrap()).unwrap();
+    assert_eq!(stored["webhook_secret"], "staged-secret-synthetic");
 }
 
 // ---- CLI ----

@@ -139,7 +139,7 @@ Administrators only (a session; 403 `forbidden` for anyone else, 401 without one
 `not_configured` without GitHub sync.
 
 Request: `{"file": "<name>.json", "confirm": false}`. `file` is a plain name in the secrets
-directory, not a path, ending in `.json` and not starting with `con_`. `confirm` defaults to
+directory, not a path or a symbolic link, ending in `.json` and not starting with `con_`. `confirm` defaults to
 `false`.
 
 Reply (200), with or without `confirm`: `{app_id, app_slug, bot_login, permissions, events,
@@ -152,10 +152,13 @@ or GitHub cannot reach the Hub's public URL. Without `confirm`, nothing changes:
 `<public>/v1/hub/webhooks/github/{connection}`, the id being assigned on confirm. With
 `confirm`, `connection` is the new `con_` id, `webhook_url` its URL, and `webhook_updated`
 says whether GitHub accepted the new webhook URL and secret; when it did not,
-`webhook_error` says why and the connection polls. No reply carries the private key or a
+`webhook_error` says why and the connection polls (see [adopting an existing
+App](hub.md#github-and-gitlab-connections-and-sync) to repoint it by hand). When the
+connection was recorded but its credentials did not load, `error` says why and the webhook is
+left alone. No reply carries the private key or a
 secret.
 
-Errors: 400 `invalid_request` for a bad name, a file that is missing, readable by group or
+Errors: 400 `invalid_request` for a bad name, a symbolic link, a file that is missing, readable by group or
 others, too large or not valid, a key GitHub refuses, or an App whose id GitHub reports
 differently from the file's `app_id`; 409 `already_connected` when a connection already has
 that App id; 503 `unavailable` when GitHub cannot be read.
@@ -678,7 +681,9 @@ differs, one request at a time per repository, then stores the row. The reply is
 `{"recorded", "provider", "repository", "commit", "environment", "outcome", "source",
 "deployment_id"}`; `recorded` is false when nothing needed writing. A credential that may not
 write deployments is `403` `forge_permission_missing` with a message naming the permission;
-nothing is recorded. A repository the Hub has not connected is `403` `not_connected`. A forge
+nothing is recorded. A repository the Hub has not connected is `403` `not_connected`, and one
+[moved to another connection](hub.md#moving-a-repository-to-another-app-connection) while the
+request waited is `503` `unavailable` with nothing recorded, so retry. A forge
 rate limit is `429` `rate_limited`; any other forge failure is `503` `unavailable`, and a
 timeout may still have been recorded, so retry. `agentscm deployed` calls this route.
 

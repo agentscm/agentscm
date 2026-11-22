@@ -525,6 +525,14 @@ impl Sync {
         mutex.lock_owned().await
     }
 
+    /// How many handles `repo`'s lock has: the map's, each guard's and each waiter's.
+    #[cfg(test)]
+    pub(super) fn repo_lock_handles(&self, repo: &str) -> usize {
+        lock(&self.repo_locks)
+            .get(repo)
+            .map_or(0, Arc::strong_count)
+    }
+
     fn load_app(&self, connection: &str) -> Result<()> {
         let config = self
             .config
@@ -1279,7 +1287,7 @@ fn repo_level(
 
 /// A transfer moved `repo` to another connection while this job waited for its lock, so
 /// `conn` must not read or post for it.
-async fn moved_away(
+pub(super) async fn moved_away(
     state: &HubState,
     conn: &Connection,
     repo: &ConnectedRepository,
@@ -3302,6 +3310,9 @@ struct Adopt {
     confirm: bool,
 }
 
+/// Serializes adopt confirms in this process; see [`adopt_app`].
+static ADOPT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn app_taken(store: &dyn Store, app_id: i64) -> Result<bool> {
     Ok(store
         .connections()?
@@ -3330,8 +3341,11 @@ async fn adopt_app(
             .with_message("file must name a .json file in the secrets directory, not con_*"));
     }
     let staged = config.secrets.join(&name);
-    let mut file = read_private(&staged)
-        .ok()
+    // A link could point the Hub at a key file outside the secrets directory.
+    let linked = std::fs::symlink_metadata(&staged).is_ok_and(|meta| meta.file_type().is_symlink());
+    let mut file = (!linked)
+        .then(|| read_private(&staged).ok())
+        .flatten()
         .and_then(|text| serde_json::from_str::<AppFile>(&text).ok())
         .filter(|file| file.app_id > 0)
         .ok_or_else(|| {
@@ -3384,6 +3398,9 @@ async fn adopt_app(
         return Ok(Json(reply));
     }
 
+    // Held from the check to the load, so two confirms of one App in this process cannot both
+    // insert. Ceiling: Hub processes sharing one store could still both pass the check.
+    let adopting = ADOPT.lock().await;
     let connection = new_connection_id()?;
     let url = format!("{public}/v1/hub/webhooks/github/{connection}");
     if file.webhook_secret.is_empty() {
@@ -3404,8 +3421,6 @@ async fn adopt_app(
         app_slug: Some(slug.to_owned()),
         acts_as: None,
     };
-    // shortcut: check-then-insert, as in setup_callback; two adopts of one App at the same
-    // moment could both pass.
     let inserted = db(&state, move |store| {
         if app_taken(store, app_id)? {
             return Ok(false);
@@ -3417,8 +3432,17 @@ async fn adopt_app(
         let _ = std::fs::remove_file(&own);
         return Err(inserted.map_or_else(ApiError::from, |_| already()));
     }
+    reply["confirmed"] = json!(true);
+    reply["connection"] = json!(connection);
+    reply["webhook_url"] = json!(url);
+    // The connection exists now, so the reply names it even when its credentials fail to load;
+    // the staged file stays, and the webhook is left alone.
+    if let Err(error) = state.sync.load_app(&connection) {
+        reply["error"] = json!(error.to_string());
+        return Ok(Json(reply));
+    }
+    drop(adopting);
     let _ = std::fs::remove_file(&staged);
-    state.sync.load_app(&connection)?;
     // The connection and its secret exist before GitHub learns the URL, so the first delivery
     // verifies. Repointing first could send deliveries to a connection never created. A failed
     // repoint leaves a connection that polls, and the reply says so.
@@ -3429,9 +3453,6 @@ async fn adopt_app(
         }
         Err(GhError::Limited(_)) => reply["webhook_error"] = json!("rate limited"),
     }
-    reply["confirmed"] = json!(true);
-    reply["connection"] = json!(connection);
-    reply["webhook_url"] = json!(url);
     Ok(Json(reply))
 }
 

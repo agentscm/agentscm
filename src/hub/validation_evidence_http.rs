@@ -294,8 +294,9 @@ async fn transfer(
     if blocked.as_array().is_some_and(|b| !b.is_empty()) {
         return Err(write_in_progress());
     }
-    // Polls and webhook jobs take this lock and then re-read the connection, so none posts
-    // for the old App after the move.
+    // Polls, webhook jobs, publication runs and deployment records take this lock and then
+    // re-read the repository row, so one that waited behind the move stops rather than writes
+    // with the old App. Work already holding the lock finishes before the move commits.
     let _guard = state.sync.lock_repo(&plan.row.id).await;
     let store = state.store.clone();
     let (id, from, to, installation) = (

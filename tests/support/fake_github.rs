@@ -390,6 +390,8 @@ pub struct FakeState {
     pub lose_next_pull_reply: bool,
     pub malformed_next_pull_reply: bool,
     pub refuse_next_pull: bool,
+    /// Answer the next `PATCH /app/hook/config` with 422 and change nothing.
+    pub refuse_next_hook_config: bool,
     /// Create the next branch, then answer 502 with no body.
     pub lose_next_ref_reply: bool,
     /// Record the next commit status, then answer 502 with no body.
@@ -1139,6 +1141,11 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 }
                 None => not_found(),
             },
+            (&Method::PATCH, ["hook", "config"])
+                if std::mem::take(&mut state.refuse_next_hook_config) =>
+            {
+                json_reply(422, json!({"message": "Validation Failed"}))
+            }
             (&Method::PATCH, ["hook", "config"]) => {
                 let config = json_body();
                 state.hook_configs.insert(caller, config.clone());
