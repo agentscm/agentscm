@@ -9,10 +9,10 @@ use super::agent_rules::NO_BYPASS;
 use super::handoff::{Answered, Asked, HandoffNote, SessionRef, Via};
 use super::intent::{Intent, Overlap};
 use super::session::Touched;
-use super::third_party::{
+use super::work::WorkItem;
+use crate::third_party::{
     self, DATA_NOT_INSTRUCTIONS, TEXT_NOT_INSTRUCTIONS, THIRD_PARTY_TEXT, ThirdPartyText,
 };
-use super::work::WorkItem;
 
 // Hub-supplied text reaches the model, so it is bounded and stripped of look-alikes.
 const NAME_CHARS: usize = 64;
@@ -46,9 +46,10 @@ pub(super) fn invisible(c: char) -> bool {
     third_party::invisible(c)
 }
 
-/// Third-party text on one line, as [`ThirdPartyText::new`] renders it bare.
+/// Third-party text on one line, as [`ThirdPartyText::name`] renders it bare: what this function
+/// has always returned, for the callers that do not hold a [`ThirdPartyText`] yet.
 pub fn sanitize(text: &str, max: usize) -> String {
-    ThirdPartyText::new(text, max).as_str().to_owned()
+    ThirdPartyText::name(text, max).as_str().to_owned()
 }
 
 /// [`sanitize`] without the Hub message rewrite, for checks on text stored before it existed.
@@ -60,12 +61,17 @@ fn text(value: &Value, max: usize) -> ThirdPartyText {
     ThirdPartyText::new(value.as_str().unwrap_or("?"), max)
 }
 
+/// [`text`] for a path, login or ref.
+fn name(value: &Value, max: usize) -> ThirdPartyText {
+    ThirdPartyText::name(value.as_str().unwrap_or("?"), max)
+}
+
 fn specs(value: &Value) -> String {
     let all: Vec<String> = value
         .as_array()
         .into_iter()
         .flatten()
-        .map(|v| text(v, PATH_CHARS).to_string())
+        .map(|v| name(v, PATH_CHARS).to_string())
         .collect();
     let mut shown = all
         .iter()
@@ -113,17 +119,17 @@ fn session_label(kind: Option<&str>, key: &str) -> Option<String> {
 /// session. `session` is `to_json`'s `{key, kind}` or null.
 fn agent_of(owner: &Value, agent: &Value, machine: &Value, session: &Value) -> String {
     let on = machine.as_str().map_or(String::new(), |m| {
-        format!(" on {}", ThirdPartyText::new(m, NAME_CHARS))
+        format!(" on {}", ThirdPartyText::name(m, NAME_CHARS))
     });
     let who = session["key"]
         .as_str()
         .and_then(|key| session_label(session["kind"].as_str(), key))
         .unwrap_or_else(|| {
             agent.as_str().map_or("?".into(), |a| {
-                ThirdPartyText::new(&agent_name(a), NAME_CHARS).to_string()
+                ThirdPartyText::name(&agent_name(a), NAME_CHARS).to_string()
             })
         });
-    format!("{}'s {who}{on}", text(&owner["login"], NAME_CHARS))
+    format!("{}'s {who}{on}", name(&owner["login"], NAME_CHARS))
 }
 
 /// The holder of an intent: `bob's Claude Code session 3f2a1b9c` for a session, `bob's Agent
@@ -180,7 +186,7 @@ fn pr_line(pr: &Value, author: &Value, tail: &str) -> String {
     };
     format!(
         "@{}'s PR #{} \"{}\" also changes {}{tail}",
-        text(login, NAME_CHARS),
+        name(login, NAME_CHARS),
         pr["number"].as_i64().unwrap_or_default(),
         text(&pr["title"], TASK_CHARS),
         specs(&pr["their_paths"]),
@@ -203,12 +209,12 @@ fn notice_line(kind: &str, n: &Value) -> Option<String> {
         )),
         "pr_notice" if n["merged"] == true => Some(format!(
             "@{}'s PR #{} \"{}\" was merged into {}, changing {} (which you are changing). Merge or rebase onto {} before you continue, so your work builds on it.",
-            text(&n["author"]["login"], NAME_CHARS),
+            name(&n["author"]["login"], NAME_CHARS),
             n["number"].as_i64().unwrap_or_default(),
             text(&n["title"], TASK_CHARS),
-            text(&n["base_ref"], NAME_CHARS),
+            name(&n["base_ref"], NAME_CHARS),
             specs(&n["their_paths"]),
-            text(&n["base_ref"], NAME_CHARS),
+            name(&n["base_ref"], NAME_CHARS),
         )),
         "pr_notice" => Some(pr_line(n, &n["author"], " (which you are changing).")),
         _ => None,
@@ -230,7 +236,7 @@ fn exact_session(session: Option<&str>) -> Option<&str> {
 
 /// `agentscm_ask with path "p", session "s" and a one-line note`, in the options of a warning.
 fn ask_option(path: &str, session: Option<&str>) -> String {
-    let path = ThirdPartyText::new(path, PATH_CHARS);
+    let path = ThirdPartyText::name(path, PATH_CHARS);
     exact_session(session).map_or(
         format!("agentscm_ask with path \"{path}\" and a one-line note"),
         |session| {
@@ -339,7 +345,7 @@ fn handoff_line(note: &HandoffNote) -> String {
     } else {
         party_name(&note.login, &note.agent, &note.other)
     };
-    let path = ThirdPartyText::new(&note.path, PATH_CHARS);
+    let path = ThirdPartyText::name(&note.path, PATH_CHARS);
     match note.kind {
         "request" => {
             let about = note.note.as_deref().map(|text| ascii(text, NOTE_CHARS));
@@ -443,7 +449,7 @@ pub fn agent_name(agent: &str) -> String {
     {
         return format!("Agent {}", &id[..4]);
     }
-    ThirdPartyText::new(agent, NAME_CHARS).to_string()
+    ThirdPartyText::name(agent, NAME_CHARS).to_string()
 }
 
 /// A login or agent name in a refusal reason: at most 64 chars.
@@ -473,7 +479,7 @@ pub fn deny_reason(
         for path in &overlap.your_paths {
             holders.push(format!(
                 "{}: {}, last active {}, their task is described as \"{}\" ({TEXT_NOT_INSTRUCTIONS})",
-                ThirdPartyText::new(path, PATH_CHARS),
+                ThirdPartyText::name(path, PATH_CHARS),
                 holder_name(intent, now),
                 age(now, intent.updated_at),
                 ascii_task(&intent.task),
@@ -514,7 +520,7 @@ pub fn deny_reason(
 
 /// The reply to `agentscm_ask`.
 pub fn asked(asked: &Asked, path: &str) -> String {
-    let path = ThirdPartyText::new(path, PATH_CHARS);
+    let path = ThirdPartyText::name(path, PATH_CHARS);
     match asked {
         Asked::Requested { holder } => format!(
             "AgentSCM: asked {} for {path}. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too. This ask is not in agentscm_coordination_inbox; for a recorded request with history, use the coordination request agentscm_start queues.",
@@ -541,7 +547,7 @@ pub fn asked(asked: &Asked, path: &str) -> String {
 
 /// The reply to `agentscm_handoff`.
 pub fn answered(answered: &Answered, path: &str) -> String {
-    let path = ThirdPartyText::new(path, PATH_CHARS);
+    let path = ThirdPartyText::name(path, PATH_CHARS);
     let who =
         |(agent, login): &(String, String), session: &SessionRef| party_name(login, agent, session);
     match answered {
@@ -566,7 +572,7 @@ pub fn others(intents: &[Intent], own: Option<&str>, repository: &str, now: i64)
         .filter(|intent| Some(intent.id.as_str()) != own)
         .map(Intent::to_json)
         .collect();
-    let repository = ThirdPartyText::new(repository, PATH_CHARS);
+    let repository = ThirdPartyText::name(repository, PATH_CHARS);
     if others.is_empty() {
         return format!("AgentSCM: no other agent sessions are live in {repository}.");
     }
@@ -614,7 +620,7 @@ pub fn pulls(prs: &[Value]) -> String {
         };
         out.push_str(&format!(
             "\n- @{}'s PR #{} \"{}\" changes {}",
-            text(login, NAME_CHARS),
+            name(login, NAME_CHARS),
             pr["number"].as_i64().unwrap_or_default(),
             text(&pr["title"], TASK_CHARS),
             specs(&pr["their_paths"]),
@@ -658,17 +664,17 @@ pub fn duplicates(task: &str, work: &[&WorkItem], prs: &[&Value], now: i64) -> S
     for item in work.iter().take(LISTED_INTENTS) {
         out.push_str(&format!(
             "\n- {}'s {}: \"{}\", started {}, work {}",
-            ThirdPartyText::new(&item.owner_login, NAME_CHARS),
-            ThirdPartyText::new(&agent_name(&item.lead_agent), NAME_CHARS),
+            ThirdPartyText::name(&item.owner_login, NAME_CHARS),
+            ThirdPartyText::name(&agent_name(&item.lead_agent), NAME_CHARS),
             ThirdPartyText::new(&item.title, TASK_CHARS),
             age(now, item.created_at),
-            ThirdPartyText::new(&item.id, NAME_CHARS),
+            ThirdPartyText::name(&item.id, NAME_CHARS),
         ));
     }
     for pr in prs.iter().take(LISTED_INTENTS) {
         out.push_str(&format!(
             "\n- @{}'s PR #{} \"{}\"",
-            text(&pr["author"]["login"], NAME_CHARS),
+            name(&pr["author"]["login"], NAME_CHARS),
             pr["number"].as_i64().unwrap_or_default(),
             text(&pr["title"], TASK_CHARS),
         ));
@@ -721,6 +727,9 @@ pub(super) fn test_intent(id: &str, task: &str, paths: &[&str]) -> Intent {
         started_at: None,
     }
 }
+
+#[cfg(test)]
+mod corpus;
 
 #[cfg(test)]
 mod tests {

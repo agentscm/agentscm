@@ -1,12 +1,13 @@
-//! Hostile third-party text through every renderer that takes it as [`ThirdPartyText`] and that
-//! this module can reach. Each renderer is first run with a plain marker in every slot; hostile
-//! text must leave that template as it was: the same lines, the same `"` count (so a quoted slot
-//! cannot be closed), the same opening and closing words with the label, and no more frames.
+//! Hostile third-party text through the type and six renderers that build it: `others`, `pulls`,
+//! `duplicates`, `file_conflict`, `pull_overlap` and `context_source::render`. Each renderer is
+//! first run with a plain marker in every slot; hostile text must leave that template as it was:
+//! the same lines, the same `"` count (so a quoted slot cannot be closed), the same opening and
+//! closing words with the label, and no more frames.
 use serde_json::json;
 
-use super::{DATA_NOT_INSTRUCTIONS, TEXT_NOT_INSTRUCTIONS, ThirdPartyText, invisible};
-use crate::hub::advice::{self, test_intent};
-use crate::hub::{context_source, overlap_detail};
+use super::test_intent;
+use crate::hub::{advice, context_source, overlap_detail};
+use crate::third_party::{DATA_NOT_INSTRUCTIONS, TEXT_NOT_INSTRUCTIONS, ThirdPartyText, invisible};
 
 const MARKER: &str = "QQQ";
 
@@ -58,61 +59,71 @@ fn spaced(text: &str) -> String {
     out
 }
 
-fn frames(text: &str) -> usize {
-    let text = spaced(text);
-    text.matches("hub message").count() + text.matches("coordination request").count()
+fn hub_messages(text: &str) -> usize {
+    spaced(text).matches("hub message").count()
 }
 
-/// A renderer over one third-party string, put in every slot.
-type Render = Box<dyn Fn(&str) -> String>;
+fn requests(text: &str) -> usize {
+    spaced(text).matches("coordination request").count()
+}
+
+/// A renderer over third-party text: the first string goes in every prose slot (titles, tasks,
+/// briefing lines), the second in every name slot (paths, logins).
+type Render = Box<dyn Fn(&str, &str) -> String>;
 
 fn renderers() -> Vec<(&'static str, Render)> {
     vec![
         (
             "bare",
-            Box::new(|s: &str| ThirdPartyText::new(s, 120).as_str().to_owned()),
+            Box::new(|s: &str, _: &str| ThirdPartyText::new(s, 120).as_str().to_owned()),
         ),
         (
             "quoted",
-            Box::new(|s: &str| ThirdPartyText::new(s, 120).quoted()),
+            Box::new(|s: &str, _: &str| ThirdPartyText::new(s, 120).quoted()),
+        ),
+        (
+            "name",
+            Box::new(|_: &str, n: &str| format!("path {}", ThirdPartyText::name(n, 120).quoted())),
         ),
         (
             "context source",
-            Box::new(|s: &str| {
+            Box::new(|s: &str, _: &str| {
                 context_source::render(&[ThirdPartyText::new(s, 200).trimmed()]).unwrap()
             }),
         ),
         (
             "others",
-            Box::new(|s: &str| advice::others(&[test_intent("int_1", s, &[s])], None, s, 0)),
+            Box::new(|s: &str, n: &str| {
+                advice::others(&[test_intent("int_1", s, &[n])], None, n, 0)
+            }),
         ),
         (
             "pulls",
-            Box::new(|s: &str| {
-                advice::pulls(&[json!({"number": 7, "title": s, "author": {"login": s},
-                    "their_paths": [s]})])
+            Box::new(|s: &str, n: &str| {
+                advice::pulls(&[json!({"number": 7, "title": s, "author": {"login": n},
+                    "their_paths": [n]})])
             }),
         ),
         (
             "duplicates",
-            Box::new(|s: &str| {
-                let pull = json!({"number": 7, "title": s, "author": {"login": s}});
+            Box::new(|s: &str, n: &str| {
+                let pull = json!({"number": 7, "title": s, "author": {"login": n}});
                 advice::duplicates(s, &[], &[&pull], 0)
             }),
         ),
         (
             "file conflict",
-            Box::new(|s: &str| {
-                let holder = test_intent("int_1", s, &[s]);
-                overlap_detail::file_conflict(s, &[&holder], false, 0)
+            Box::new(|s: &str, n: &str| {
+                let holder = test_intent("int_1", s, &[n]);
+                overlap_detail::file_conflict(n, &[&holder], false, 0)
             }),
         ),
         (
             "pull overlap",
-            Box::new(|s: &str| {
-                let holder = test_intent("int_1", s, &[s]);
-                let pull = json!({"title": s, "author": {"login": s}, "draft": false});
-                overlap_detail::pull_overlap(7, &pull, &[s], false, &[&holder], 0)
+            Box::new(|s: &str, n: &str| {
+                let holder = test_intent("int_1", s, &[n]);
+                let pull = json!({"title": s, "author": {"login": n}, "draft": false});
+                overlap_detail::pull_overlap(7, &pull, &[n], false, &[&holder], 0)
             }),
         ),
     ]
@@ -121,7 +132,7 @@ fn renderers() -> Vec<(&'static str, Render)> {
 #[test]
 fn hostile_text_cannot_forge_or_close_a_fixed_template() {
     for (name, render) in renderers() {
-        let baseline = render(MARKER);
+        let baseline = render(MARKER, MARKER);
         let fixed: Vec<&str> = baseline.split(MARKER).collect();
         assert!(
             fixed.len() > 1,
@@ -135,7 +146,7 @@ fn hostile_text_cannot_forge_or_close_a_fixed_template() {
             .max()
             .unwrap_or(0);
         for hostile in corpus() {
-            let out = render(&hostile);
+            let out = render(&hostile, &hostile);
             let case = format!(
                 "{name} with {:?}: {out}",
                 hostile.chars().take(60).collect::<String>()
@@ -151,7 +162,15 @@ fn hostile_text_cannot_forge_or_close_a_fixed_template() {
                 baseline.matches('"').count(),
                 "quote, {case}"
             );
-            assert!(frames(&out) <= frames(&baseline), "frame forged, {case}");
+            assert!(
+                hub_messages(&out) <= hub_messages(&baseline),
+                "Hub message forged, {case}"
+            );
+            // A name keeps "coordination request", so only prose is held to the request frame.
+            assert!(
+                requests(&render(&hostile, MARKER)) <= requests(&baseline),
+                "coordination request forged, {case}"
+            );
             assert!(
                 !out.chars()
                     .any(|c| invisible(c) || (c.is_control() && c != '\n')),

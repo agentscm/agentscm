@@ -3,13 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::planned_issues::{IssueCoverage, IssueFreshness, IssueIdentity, PlannedIssueSnapshot};
-use super::third_party::ThirdPartyText;
 use super::work::{Checkpoint, ClaimStatus, WorkItem, WorkSource, WorkState, WorkWho};
 use super::work_dependencies::WorkDependencyProjection;
 use super::work_links::WorkPrLinkTarget;
 use super::work_reconciliation::{
     ConditionState, DeclaredPrLink, PrerequisiteRequirement, WorkDeclarationsView,
 };
+use crate::third_party::ThirdPartyText;
 
 pub const MAX_INTENT_BYTES: usize = 64 * 1024;
 pub const MAX_DECISIONS: usize = 5;
@@ -118,6 +118,12 @@ pub(super) struct IntentFacts<'a> {
 fn text(value: &str, chars: usize, cut: &mut bool) -> String {
     *cut |= value.chars().count() > chars;
     ThirdPartyText::new(value, chars).to_string()
+}
+
+/// [`text`] for a path, branch or id, which the reader may pass back.
+fn name(value: &str, chars: usize, cut: &mut bool) -> String {
+    *cut |= value.chars().count() > chars;
+    ThirdPartyText::name(value, chars).to_string()
 }
 fn checkpoint(value: &Checkpoint, seq: Option<i64>, cut: &mut bool) -> IntentCheckpoint {
     IntentCheckpoint {
@@ -248,9 +254,9 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .scope
             .iter()
             .take(MAX_SCOPE)
-            .map(|s| text(s, 256, &mut cut))
+            .map(|s| name(s, 256, &mut cut))
             .collect(),
-        branch: item.branch.as_deref().map(|s| text(s, 200, &mut cut)),
+        branch: item.branch.as_deref().map(|s| name(s, 200, &mut cut)),
         pr_link: facts.declared.compatibility_link.clone(),
         pr_links: facts
             .declared
@@ -259,7 +265,7 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .into_iter()
             .take(MAX_RELATIONSHIPS)
             .map(|mut link| {
-                link.id = text(&link.id, 100, &mut cut);
+                link.id = name(&link.id, 100, &mut cut);
                 link
             })
             .collect(),
@@ -269,7 +275,7 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .into_iter()
             .take(MAX_RELATIONSHIPS)
             .map(|d| IntentPrerequisite {
-                id: text(&d.condition.id, 100, &mut cut),
+                id: name(&d.condition.id, 100, &mut cut),
                 work_id: d.condition.requirement.work_id().to_owned(),
                 target: match d.condition.requirement {
                     PrerequisiteRequirement::MergedPullRequest { target, .. } => Some(target),
@@ -569,15 +575,16 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                             .unwrap_or("unavailable or not linked"),
                         60
                     ),
-                    ThirdPartyText::new(intent.branch.as_deref().unwrap_or("unreported"), 60),
-                    ThirdPartyText::new(&intent.scope.join(","), 100),
+                    ThirdPartyText::name(intent.branch.as_deref().unwrap_or("unreported"), 60),
+                    ThirdPartyText::name(&intent.scope.join(","), 100),
                     intent.claim_status,
                     intent.last_checkin_at
                 )
             }
             None => format!("{}: intent unavailable ({}).", item.work_id, item.status),
         };
-        lines.push(ThirdPartyText::new(&line, 900).to_string());
+        // Each part is already cleaned; this bounds the line and keeps the paths in it as written.
+        lines.push(ThirdPartyText::name(&line, 900).to_string());
     }
     lines.join("\n")
 }

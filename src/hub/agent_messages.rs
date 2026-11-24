@@ -888,7 +888,7 @@ fn mode_word(mode: Mode) -> &'static str {
 fn shown_note(note: &str) -> String {
     let note: String = note
         .chars()
-        .filter(|c| !super::third_party::invisible(*c) && (*c == '\n' || !c.is_control()))
+        .filter(|c| !crate::third_party::invisible(*c) && (*c == '\n' || !c.is_control()))
         .collect();
     serde_json::to_string(&note).unwrap_or_default()
 }

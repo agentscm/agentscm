@@ -38,10 +38,10 @@ use super::session::{
 };
 use super::session_waiting::{QuestionSnapshot, WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
-use super::third_party::{THIRD_PARTY_REPORT, THIRD_PARTY_TEXT, ThirdPartyText};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
 use super::{HubError, HubState};
+use crate::third_party::{THIRD_PARTY_REPORT, THIRD_PARTY_TEXT, ThirdPartyText};
 
 /// Write payloads carry file contents.
 const HOOK_BODY_BYTES: usize = 1024 * 1024;
@@ -2297,8 +2297,8 @@ fn render_overview(overview: &WorkOverview) -> Vec<String> {
         .iter()
         .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
         .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. ({THIRD_PARTY_TEXT})",
-            ThirdPartyText::new(&overlap.left.title, 80), ThirdPartyText::new(&agent_name(&overlap.left.lead_agent), 64),
-            ThirdPartyText::new(&overlap.right.title, 80), ThirdPartyText::new(&agent_name(&overlap.right.lead_agent), 64)))
+            ThirdPartyText::new(&overlap.left.title, 80), ThirdPartyText::name(&agent_name(&overlap.left.lead_agent), 64),
+            ThirdPartyText::new(&overlap.right.title, 80), ThirdPartyText::name(&agent_name(&overlap.right.lead_agent), 64)))
         .collect::<Vec<_>>();
     let partial = lines.len() > 5 || !overview.current_complete || !overview.overlaps_complete;
     lines.truncate(5);

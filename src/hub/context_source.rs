@@ -14,8 +14,8 @@ use tokio::sync::Semaphore;
 
 use super::forge_http::check_base_url;
 use super::store::Principal;
-use super::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 use super::{HubError, Result};
+use crate::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 
 pub const FILE_ENV: &str = "AGENTSCM_CONTEXT_SOURCE_FILE";
 const MAX_FILE_BYTES: u64 = 64 * 1024;

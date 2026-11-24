@@ -59,6 +59,7 @@ pub mod reviewer;
 pub mod store;
 pub mod sync;
 pub mod team;
+pub mod third_party;
 #[cfg(unix)]
 pub mod workspace;
 #[cfg(unix)]

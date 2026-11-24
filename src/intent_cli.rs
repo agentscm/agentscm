@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use agentscm::hub::store::unix_now;
-use agentscm::hub::third_party::{TEAMMATES_TEXT, invisible};
+use agentscm::third_party::{TEAMMATES_TEXT, invisible};
 use agentscm::{Error, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Method;

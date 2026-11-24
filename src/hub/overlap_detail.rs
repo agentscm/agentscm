@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::advice::holder_who;
 use super::intent::Intent;
 use super::session::DEFAULT_TASK;
-use super::third_party::{TEXT_NOT_INSTRUCTIONS, ThirdPartyText};
+use crate::third_party::{TEXT_NOT_INSTRUCTIONS, ThirdPartyText};
 
 const TITLE_CHARS: usize = 80;
 const PATH_CHARS: usize = 100;
@@ -102,7 +102,7 @@ fn path_list(paths: &[&str], rest_unknown: bool) -> String {
     let mut shown = paths
         .iter()
         .take(SHOWN_PATHS)
-        .map(|path| ThirdPartyText::new(path, PATH_CHARS).to_string())
+        .map(|path| ThirdPartyText::name(path, PATH_CHARS).to_string())
         .collect::<Vec<_>>()
         .join(", ");
     if shown.is_empty() {
@@ -128,7 +128,7 @@ pub(super) fn pull_overlap(
 ) -> String {
     let author = match pull["author"]["login"].as_str().map(str::trim) {
         None | Some("") => "an unknown author".into(),
-        Some(login) => format!("@{}", ThirdPartyText::new(login, LOGIN_CHARS)),
+        Some(login) => format!("@{}", ThirdPartyText::name(login, LOGIN_CHARS)),
     };
     let state = match pull["draft"].as_bool() {
         Some(true) => "draft",
@@ -147,7 +147,7 @@ pub(super) fn pull_overlap(
 /// The `file_conflict` action text. `answering`: a hand-off request for the file is pending and
 /// no agent repeated an edit since, so nothing is asked of a person yet.
 pub(super) fn file_conflict(path: &str, intents: &[&Intent], answering: bool, now: i64) -> String {
-    let path = ThirdPartyText::new(path, PATH_CHARS);
+    let path = ThirdPartyText::name(path, PATH_CHARS);
     let next = if answering {
         format!("The agents are answering the pending handoff for {path}.")
     } else {

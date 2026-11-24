@@ -2053,7 +2053,7 @@ pub fn render_text(recovery: &WorkRecoveryV1) -> String {
         lines.push(format!(
             "- {} \"{}\" [{}]: {} You may: {}. ({})",
             work.work_id,
-            super::third_party::ThirdPartyText::new(&work.title, 120),
+            crate::third_party::ThirdPartyText::new(&work.title, 120),
             word(&work.bucket),
             work.why,
             if permitted.is_empty() {
@@ -2061,7 +2061,7 @@ pub fn render_text(recovery: &WorkRecoveryV1) -> String {
             } else {
                 permitted.join(", ")
             },
-            super::third_party::THIRD_PARTY_TEXT,
+            crate::third_party::THIRD_PARTY_TEXT,
         ));
     }
     for work in &recovery.work {

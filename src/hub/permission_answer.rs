@@ -53,8 +53,8 @@ use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::apps::{Person, PersonReader};
 use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
 use super::store::{AgentToken, Principal, unix_now, validate_repository};
-use super::third_party::invisible;
 use super::{HubError, HubState};
+use crate::third_party::invisible;
 
 /// A person may be away for hours; the hook's own bound is a little shorter than this.
 const TTL_SECONDS: i64 = 12 * 60 * 60;
