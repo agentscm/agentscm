@@ -534,6 +534,9 @@ pub(super) fn for_inbox(
 
 /// Work a holder line names as waited on before it counts the rest.
 const SHOWN_WAITS: usize = 5;
+/// The most characters one holder line can hold, every slot full.
+#[cfg(test)]
+pub(super) const MAX_HOLDER_LINE: usize = 1200;
 
 /// Short quoted data for edit guards: one header and at most three bounded data lines, each
 /// third-party slot inside `"` it cannot close.
@@ -549,7 +552,7 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                 let mut waiting = shown_waits
                     .map(|edge| {
                         let edge = format!("{}:{:?}", edge.work_id, edge.state);
-                        ThirdPartyText::name(&edge, 80).to_string()
+                        ThirdPartyText::name(&edge, 64).to_string()
                     })
                     .collect::<Vec<_>>()
                     .join(",");

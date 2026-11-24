@@ -97,22 +97,24 @@ impl Serialize for ThirdPartyText {
 pub fn invisible(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
         | '\u{17B4}' | '\u{17B5}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
-        | '\u{2800}' | '\u{3164}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E007F}')
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{2800}' | '\u{3164}'
+        | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E00FF}' | '\u{E01F0}'..='\u{E0FFF}')
 }
 
-/// Variation selectors, which choose how the character before them is drawn and can carry hidden
+/// Variation selectors (the Mongolian free variation selectors among them), which choose how the character before them is drawn and can carry hidden
 /// bytes in a run. Cleaning drops them, so an emoji shows in its plain form, but stored text may
 /// hold them: refusing them would refuse every emoji written with U+FE0F.
 pub fn hidden(c: char) -> bool {
-    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+    matches!(c, '\u{180B}'..='\u{180D}' | '\u{180F}' | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// Whether `text`, read back from storage, is what cleaning with a bound of `max_chars` could
-/// have produced at some release: one line, no control or [`invisible`] character, no `"`, and
-/// at most the bound plus `…`. It does not ask for the current frame rewrites or for [`hidden`]
-/// characters to be gone, so text stored before either stays valid; a renderer cleans it again.
+/// Whether `text`, read back from storage, is safe to keep: one line, no control or
+/// [`invisible`] character, no `"`, and at most the bound plus `…`. It does not ask for the
+/// current frame rewrites or for [`hidden`] characters to be gone, so text stored before either
+/// stays valid and a renderer cleans it again. Text that holds a character added to [`invisible`]
+/// after it was stored fails, and its reader treats it as missing until it is fetched again.
 pub fn is_clean(text: &str, max_chars: usize) -> bool {
     text.chars().count() <= max_chars + 1
         && !text
@@ -152,10 +154,18 @@ fn renamed(text: Vec<char>, words: &[&str]) -> String {
     // Where the words end if they start at `i`: (end of the kept words, end of the last word,
     // whether the last word is plural).
     let matched = |i: usize| {
-        // A `_` before the first word makes it part of a name such as `agentscm_hub_message`.
-        if i > 0 && (letter(i - 1) || text[i - 1] == '_') {
+        // A letter right before the first word makes it another word ("GitHub message"). A run
+        // of `_` after a letter makes the match part of a name such as `agentscm_hub_message`
+        // when `_` alone also joins its words; `_Hub message_` and `AgentSCM_Hub message` match.
+        let mut k = i;
+        while k > 0 && text[k - 1] == '_' {
+            k -= 1;
+        }
+        if i > 0 && letter(i - 1) {
             return None;
         }
+        let in_name = k < i && k > 0 && letter(k - 1);
+        let mut underscores_only = true;
         let (mut j, mut kept) = (i, i);
         for (k, word) in words.iter().enumerate() {
             if k > 0 {
@@ -164,6 +174,7 @@ fn renamed(text: Vec<char>, words: &[&str]) -> String {
                     .get(j)
                     .is_some_and(|c| c.is_whitespace() || matches!(c, '-' | '_'))
                 {
+                    underscores_only &= text[j] == '_';
                     j += 1;
                 }
                 if j == kept {
@@ -178,7 +189,7 @@ fn renamed(text: Vec<char>, words: &[&str]) -> String {
         }
         let plural = lower.get(j) == Some(&'s');
         let end = j + usize::from(plural);
-        (!letter(end)).then_some((kept, end, plural))
+        (!(letter(end) || in_name && underscores_only)).then_some((kept, end, plural))
     };
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -315,6 +326,10 @@ mod tests {
             '\u{FFA0}',
             '\u{FFF9}',
             '\u{1D173}',
+            '\u{2065}',
+            '\u{1BCA0}',
+            '\u{FFF0}',
+            '\u{E0FFF}',
         ] {
             assert!(invisible(blank), "{blank:?}");
             let text = ThirdPartyText::new(&format!("x{blank}y"), 10);
@@ -323,6 +338,7 @@ mod tests {
         // Variation selectors are dropped when shown but not refused, so an emoji with U+FE0F
         // can be stored.
         assert!(!invisible('\u{FE0F}') && hidden('\u{FE0F}') && hidden('\u{E0100}'));
+        assert!(!invisible('\u{E0100}') && hidden('\u{180B}') && hidden('\u{180F}'));
         assert_eq!(
             ThirdPartyText::new("warn \u{26A0}\u{FE0F}\u{E0100}\u{E0101}", 20).as_str(),
             "warn \u{26A0}"
