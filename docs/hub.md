@@ -434,6 +434,9 @@ An operator can register one HTTP endpoint that gives agent sessions a few extra
 when a session starts and when it starts Work. `AGENTSCM_CONTEXT_SOURCE_FILE` names the private
 file that sets it; unset means no source and no change anywhere. The Hub marks the lines as
 third-party text, and a source that fails adds nothing. See [Context source](context-source.md).
+After those lines, the start context also carries up to 5 promoted
+[repository memory](memory.md#delivery-of-promoted-notes) notes, unless
+`AGENTSCM_MEMORY_DELIVERY=off` is set for `agentscm hub serve`.
 
 ## Connected apps
 
@@ -2268,8 +2271,9 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   between the two can drop it.
 - The app requests `statuses: write` (and pull requests write) whether or not outbound
   is on. Repositories removed from an installation are not yet retired.
-- Repository memory is pull only and experimental, and holds at most 100 live notes per repository
-  and 25 per person in it; unpromoted notes expire after 90 days. Nobody can
+- Repository memory is experimental and read on request, but for up to 5 promoted notes in
+  session-start context (`AGENTSCM_MEMORY_DELIVERY=off` stops that). It holds at most 100 live
+  notes per repository and 25 per person in it; unpromoted notes expire after 90 days. Nobody can
   promote a note their own agent wrote, but an agent on a person's own computer can use that
   person's saved CLI sign-in to remove notes or promote other people's (see
   [its limits](memory.md#limits)).

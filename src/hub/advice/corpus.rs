@@ -3,7 +3,8 @@
 //! `actionable_status::render_text` and `render_start_text`, the recovery conflict text
 //! (`work_recovery::conflict_next` and `render_text`), the holder intent lines
 //! (`work_intent::render_holders`), the merged-hold notice (`merged_holds::merged_line`) and the
-//! MCP completion and scope texts (`mcp::done_reason`, `mcp::bounded_paths`). The compact JSON
+//! MCP completion and scope texts (`mcp::done_reason`, `mcp::bounded_paths`), and the promoted
+//! memory notes a session's start context carries (`memory::render_delivered`). The compact JSON
 //! replies (`compact::brief`, `compact::status`) are checked string by string. Each renderer is
 //! first run with a plain marker in every slot; hostile text must leave that template as it was:
 //! the same lines, the same `"` count (so a quoted slot cannot be closed), the same opening and
@@ -23,7 +24,7 @@ use crate::hub::work_intent::{
     IntentIssueStatus, WorkIntentV1,
 };
 use crate::hub::work_recovery::{self, RecoveryConflictV1, WorkRecoveryV1};
-use crate::hub::{advice, compact, context_source, mcp, merged_holds, overlap_detail};
+use crate::hub::{advice, compact, context_source, mcp, memory, merged_holds, overlap_detail};
 use crate::third_party::{
     DATA_NOT_INSTRUCTIONS, TEXT_NOT_INSTRUCTIONS, ThirdPartyText, hidden, invisible,
 };
@@ -191,10 +192,34 @@ fn renderers() -> Vec<(&'static str, Render)> {
             Box::new(|s: &str, _: &str| mcp::done_reason(Some(s.to_owned()))),
         ),
         (
+            "delivered memory",
+            Box::new(|s: &str, n: &str| memory::render_delivered(&[promoted_note(s, n)]).unwrap()),
+        ),
+        (
             "bounded paths",
             Box::new(|_: &str, n: &str| mcp::bounded_paths(&[n.to_owned(), n.to_owned()])),
         ),
     ]
+}
+
+/// A promoted memory note whose text is `body`, written by `name`'s agent `name` in session
+/// `name` and promoted by `name`.
+fn promoted_note(body: &str, name: &str) -> memory::Note {
+    memory::Note {
+        id: format!("mem_{}", "a".repeat(32)),
+        body: body.to_owned(),
+        owner: "usr_synthetic".into(),
+        owner_login: name.to_owned(),
+        token: "tok_synthetic".into(),
+        token_name: name.to_owned(),
+        session: Some(name.to_owned()),
+        created_at: 1,
+        promotion: Some(memory::Promotion {
+            by: "usr_reviewer".into(),
+            by_login: name.to_owned(),
+            at: 2,
+        }),
+    }
 }
 
 /// A Work item titled `title`, with `name` as its next action's only word, in synthetic JSON.
@@ -376,6 +401,15 @@ fn hostile_text_cannot_forge_or_close_a_fixed_template() {
             );
             // A name keeps its blank and selector characters, as stored; prose loses them.
             assert!(!prose.chars().any(hidden), "hidden character, {case}");
+            // Memory shows its names with the prose rule, so they are held to it too.
+            if name == "delivered memory" {
+                assert!(
+                    hub_messages(&out) <= hub_messages(&baseline)
+                        && requests(&out) <= requests(&baseline)
+                        && !out.chars().any(hidden),
+                    "memory name, {case}"
+                );
+            }
             // Each slot holds at most 200 chars and `…`; no line has more than six slots.
             for line in out.lines() {
                 assert!(
@@ -479,7 +513,13 @@ fn names_come_out_as_written() {
         for (renderer, render) in renderers() {
             if matches!(
                 renderer,
-                "bare" | "quoted" | "context source" | "merged line" | "done reason"
+                "bare"
+                    | "quoted"
+                    | "context source"
+                    | "merged line"
+                    | "done reason"
+                    // Memory shows a session the writer chose, so its names get the prose rule.
+                    | "delivered memory"
             ) {
                 continue;
             }

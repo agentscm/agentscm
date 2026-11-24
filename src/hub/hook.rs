@@ -1937,8 +1937,19 @@ impl Call {
                         _ => Vec::new(),
                     }
                 };
-                let (current_status, operator_context) =
-                    tokio::join!(current_status, operator_context);
+                // Promoted memory notes, read alongside and bounded the same way; not for a
+                // subagent's session, and nothing when the read fails.
+                let memory = async {
+                    if self.child {
+                        return None;
+                    }
+                    let read = super::memory::delivered_for_principal(state, &principal);
+                    let notes = tokio::time::timeout(std::time::Duration::from_millis(500), read);
+                    let notes = notes.await.ok()?.ok()?;
+                    super::memory::render_delivered(&notes)
+                };
+                let (current_status, operator_context, memory) =
+                    tokio::join!(current_status, operator_context, memory);
                 let current_status = current_status.ok().and_then(std::result::Result::ok);
                 let mut text = render_start_summary(
                     current_status.as_ref(),
@@ -1963,6 +1974,7 @@ impl Call {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }
+                with_memory(&mut text, memory.as_deref());
                 // Claimed by `hook`, once the rendered text shows the line.
                 Ok(Outcome {
                     text,
@@ -2276,6 +2288,16 @@ fn render_start_summary(
         lines.push(block);
     }
     lines.join("\n")
+}
+
+/// Promoted memory notes, already cleaned and bounded by `memory::render_delivered`, go last:
+/// the host cap cuts the start context from its end, so they are cut before any line of the
+/// Hub's own, the rules and the narrative guidance included.
+fn with_memory(text: &mut String, memory: Option<&str>) {
+    if let Some(block) = memory {
+        text.push('\n');
+        text.push_str(block);
+    }
 }
 
 /// Counts only: the actionable status above already names each unfinished Work.
@@ -3301,6 +3323,57 @@ mod tests {
             context.ends_with("agentscm_work_overview for it."),
             "{context}"
         );
+    }
+
+    #[test]
+    fn promoted_notes_are_cut_before_the_hubs_own_start_lines() {
+        let text = render_start_summary(None, None, "", "", &[]);
+        // Five full promoted notes of astral characters, after the one rule a read-only
+        // Claude Code session gets: the cap cuts the notes, never the rule.
+        let mut text = format!("{text}\n{}", super::super::agent_rules::REQUIRED_RULES[5]);
+        let notes: Vec<_> = (0..5)
+            .map(|i| crate::hub::memory::Note {
+                id: format!("mem_{i:032x}"),
+                body: "😀".repeat(crate::hub::memory::MAX_NOTE_CHARS),
+                owner: "usr_a".into(),
+                owner_login: "😀".repeat(100),
+                token: "tok_a".into(),
+                token_name: "😀".repeat(100),
+                session: Some("😀".repeat(100)),
+                created_at: 1,
+                promotion: Some(crate::hub::memory::Promotion {
+                    by: "usr_b".into(),
+                    by_login: "😀".repeat(100),
+                    at: 2,
+                }),
+            })
+            .collect();
+        let block = crate::hub::memory::render_delivered(&notes).unwrap();
+        with_memory(&mut text, Some(&block));
+        for agent in [Agent::Claude, Agent::Codex] {
+            let call = Call::parse(
+                agent,
+                br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+                None,
+            );
+            let reply = call.render(&Outcome::advice(text.clone(), false));
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(context.encode_utf16().count() <= START_CONTEXT);
+            assert!(
+                context.contains(super::super::agent_rules::REQUIRED_RULES[5]),
+                "{context}"
+            );
+            assert!(
+                context.contains("AgentSCM repository memory: 5 of 5"),
+                "{context}"
+            );
+            assert!(
+                !context.contains(&format!("mem_{:032x}", 0)),
+                "the last note is cut"
+            );
+        }
     }
 
     #[test]

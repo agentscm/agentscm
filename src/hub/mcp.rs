@@ -1071,7 +1071,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
             "after":{"type":"string","description":"next_after from the previous page."},
             "limit":{"type":"integer","minimum":1,"maximum":super::memory::MAX_PAGE,"default":super::memory::DEFAULT_PAGE}}),&[])});
     let memory_write = json!({"name":"agentscm_memory_write",
-        "description":"Store one short note in this repository's memory for later readers. It is signed with your owner, agent and session, and nobody gets it unless they ask.",
+        "description":"Store one short note in this repository's memory for later readers. It is signed with your owner, agent and session, and nobody gets it unless they ask, or until another person promotes it, when new sessions get it at start.",
         "inputSchema":schema(json!({"body":{"type":"string","minLength":1,"maxLength":super::memory::MAX_NOTE_CHARS}}),&["body"])});
     let memory_remove = json!({"name":"agentscm_memory_remove",
         "description":"Remove one note of your owner's from this repository's memory.",
