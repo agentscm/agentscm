@@ -112,6 +112,7 @@ pub(crate) fn clean(text: &str, max: usize) -> String {
 /// (`agent_messages::REQUEST_FRAME`). The request rewrite needs all three words, so a title
 /// about coordination requests reads as written. Defence in depth: an agent acts on either only
 /// after the Hub verifies it, so look-alike letters that slip past this still fail that check.
+// ponytail: ASCII spellings only; upgrade: fold confusable letters before matching.
 fn renamed(text: Vec<char>, words: &[&str]) -> String {
     let lower: Vec<char> = text.iter().map(char::to_ascii_lowercase).collect();
     // Where the words end if they start at `i`: (end of the kept words, end of the last word).

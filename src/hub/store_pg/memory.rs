@@ -130,6 +130,8 @@ pub(super) fn list(store: &PgStore, scope: &str, query: &ListQuery) -> Result<Pa
         let limit = i64::try_from(query.limit + 1).unwrap_or(i64::MAX);
         let mut sql = format!("SELECT {COLUMNS} FROM hub_memory_notes WHERE repository_scope = $1");
         let mut values: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&scope];
+        // ponytail: ASCII-only case folding over the stored body, not the shown text, to match
+        // SQLite; upgrade: store a folded search column.
         if let Some(pattern) = &query.pattern {
             values.push(pattern);
             sql.push_str(&format!(

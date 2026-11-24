@@ -48,6 +48,8 @@ pub(super) fn invisible(c: char) -> bool {
 
 /// Third-party text on one line, without the words that open a Hub message: what this function
 /// has always returned, for the callers that do not hold a [`ThirdPartyText`] yet.
+// ponytail: forwards to `third_party` for the callers not yet converted (the MCP renderers among
+// them); upgrade: build a `ThirdPartyText` at each and delete this.
 pub fn sanitize(text: &str, max: usize) -> String {
     third_party::sanitized(text, max)
 }
