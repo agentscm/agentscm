@@ -9,7 +9,8 @@ title: "Repository memory"
 
 Repository memory is a short list of notes that agents write for later agents working in the
 same repository: a test that needs a service, a build step that is easy to miss, a decision worth
-keeping. The Hub keeps the notes for each repository separately and at most 100 at a time.
+keeping. The Hub keeps the notes for each repository separately: at most 100 at a time, and at
+most 25 of them from any one person's agents.
 
 Three rules apply to every note:
 
@@ -35,15 +36,17 @@ tool lists are unchanged. They are callable either way.
 
 | Tool | What it does |
 |---|---|
-| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose text contains it (at most 200 bytes, case-insensitive for ASCII letters, `%` and `_` taken literally). `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
-| `agentscm_memory_write` | Stores one note of 1 to 500 characters, signed with the token, its owner and the call's `session`. |
+| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose stored text contains it (at most 200 bytes, case-insensitive for ASCII letters, `%` and `_` taken literally). It matches the text as stored, which can differ from the text shown when a note holds invisible characters or the words "Hub message". An empty `q` or `after` is ignored. `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
+| `agentscm_memory_write` | Stores one note of 1 to 500 characters, signed with the token, its owner and the call's `session`. Each run of spaces, line breaks, tabs and other control characters becomes one space first, and the bound applies to that text. |
 | `agentscm_memory_remove` | Removes one note by `id` (`mem_…`). Any writing token of the note's owner may remove it. |
 
 An over-long note or search is refused (400 over HTTP, an error result over MCP); it is never
 cut. A write to a repository that already holds 100 notes is refused with
 `work_storage_capacity` (503 over HTTP) and the detail `"limit": "memory_notes"`; no note is
-evicted to make room. Remove a note of your own or ask a
-person to remove one.
+evicted to make room. Remove a note of your own or ask a person to remove one. A write by an
+agent whose person already holds 25 notes in the repository, from any of their tokens, is
+refused the same way with `"limit": "memory_notes_owner"`, so one person cannot fill the list;
+that person's agents can remove their own notes to make room.
 
 ## For people
 
@@ -69,7 +72,9 @@ bundled status page has no memory view.
 
 ## How notes are shown
 
-The Hub stores a note as written and cleans it when it shows it. The note, and the login, agent
+The Hub stores a note with each run of whitespace and control characters, line breaks and tabs
+included, turned into one space, so words stay apart on one line; everything else is stored as
+written. It cleans the note when it shows it. The note, and the login, agent
 name and session next to it, go through the Hub's third-party text type: one line, no control or
 invisible characters, `"` shown as `'`, a length bound, and the words that open a Hub message
 rewritten. The tool's text is a fixed template, one line per note, with each value in quotes it

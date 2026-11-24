@@ -2268,7 +2268,8 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   between the two can drop it.
 - The app requests `statuses: write` (and pull requests write) whether or not outbound
   is on. Repositories removed from an installation are not yet retired.
-- Repository memory is pull only and experimental; an agent on a person's own computer can use
+- Repository memory is pull only and experimental, and holds at most 100 notes per repository and
+  25 per person in it; an agent on a person's own computer can use
   that person's saved CLI sign-in to promote or remove notes (see [its limits](memory.md#limits)).
 - After a repository is renamed, intents still match by the name they were made under:
   re-mint tokens after a rename.
@@ -2368,9 +2369,9 @@ What the hub keeps, in its database and object store:
   receive the private spool's conversation bodies, tool input/output, command output, source bytes
   or host paths through this path.
 
-- Repository memory: at most 100 notes per repository of at most 500 characters each, with the
-  writing token's id and name, its owner's id and login, the agent's session and, once a person
-  promotes a note, their id, login and the time. Notes stay until removed. See
+- Repository memory: at most 100 notes per repository, 25 of them per person, of at most 500
+  characters each, with the writing token's id and name, its owner's id and login, the agent's
+  session and, once a person promotes a note, their id, login and the time. Notes stay until removed. See
   [repository memory](memory.md).
 
 - Work usage observations: at most 500 immutable reports per work item, containing bounded
