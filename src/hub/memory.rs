@@ -261,7 +261,7 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 
 fn name(text: &str) -> String {
-    ThirdPartyText::name(text, NAME_CHARS).to_string()
+    ThirdPartyText::new(text, NAME_CHARS).to_string()
 }
 
 /// A note as every reader gets it: the text and names cleaned as third-party text.
@@ -358,20 +358,20 @@ pub fn render(page: &Page) -> String {
         if let Some(promoted) = &note.promotion {
             text.push_str(&format!(
                 ", promoted by {} at {}",
-                ThirdPartyText::name(&promoted.by_login, NAME_CHARS).quoted(),
+                ThirdPartyText::new(&promoted.by_login, NAME_CHARS).quoted(),
                 promoted.at
             ));
         }
         text.push_str(&format!(
             ": {} (written by agent {} of {}",
             ThirdPartyText::new(&note.body, MAX_NOTE_CHARS).quoted(),
-            ThirdPartyText::name(&note.token_name, NAME_CHARS).quoted(),
-            ThirdPartyText::name(&note.owner_login, NAME_CHARS).quoted(),
+            ThirdPartyText::new(&note.token_name, NAME_CHARS).quoted(),
+            ThirdPartyText::new(&note.owner_login, NAME_CHARS).quoted(),
         ));
         if let Some(session) = &note.session {
             text.push_str(&format!(
                 ", session {}",
-                ThirdPartyText::name(session, NAME_CHARS).quoted()
+                ThirdPartyText::new(session, NAME_CHARS).quoted()
             ));
         }
         text.push_str(&format!(", at {})", note.created_at));
