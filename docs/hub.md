@@ -869,7 +869,10 @@ token are two agents and are. The hub records per session how it connects
 
 Sessions hold files, not directories (a `/**` spec is refused), at most 50 per
 session (a call may name at most 50); past that the call's files are kept and
-older ones dropped.
+older ones dropped. A folder is held by Work scope instead: `agentscm_start`
+`paths` and `agentscm_work_checkpoint` `scope` take `dir/**` (every file under
+`dir`), which the start keeps out of the session's file intent. A bare `dir` is
+read as a file, and `dir/` is refused.
 Lockfiles (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, any
 `*.lock`, ...), changelogs (`CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`),
 minified and generated files (`*.min.js`, `*.min.css`, `*.pb.go`,

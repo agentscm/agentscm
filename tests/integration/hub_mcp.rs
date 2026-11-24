@@ -5135,3 +5135,164 @@ async fn refused_starts_give_applicable_exact_coordination_calls() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_holds_a_folder_as_dir_glob_and_refuses_other_folder_forms() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let held = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "folder work", "session": "alice",
+                "paths": ["app/src/**", "app/README.md"]}),
+        )
+        .await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(
+        held["structuredContent"]["work"]["item"]["scope"],
+        json!(["app/README.md", "app/src/"])
+    );
+    // The session intent holds only the file; the folder is held by the Work scope.
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|intent| intent.paths == ["app/README.md".to_owned()]),
+        "{live:?}"
+    );
+    // A file at any depth under the folder is covered for its holder.
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/src/deep/a.rs"]}),
+        )
+        .await;
+    assert!(!refused, "{text}");
+    // Another Work naming a file inside the folder overlaps it.
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "file work", "session": "bob", "paths": ["app/src/deep/a.rs"]}),
+        )
+        .await;
+    assert_eq!(rival["isError"], true, "{rival}");
+    assert_eq!(
+        rival["structuredContent"]["work"]["conflict"]["kind"], "scope_overlap",
+        "{rival}"
+    );
+    // A folder with a trailing slash, another glob, or a folder given to agentscm_check is
+    // refused with the form that is accepted.
+    for (name, arguments) in [
+        (
+            "agentscm_start",
+            json!({"task": "t", "session": "carol", "paths": ["app/lib/"]}),
+        ),
+        (
+            "agentscm_start",
+            json!({"task": "t", "session": "carol", "paths": ["app/*.rs"]}),
+        ),
+        (
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/src/**"]}),
+        ),
+    ] {
+        let refusal = hub.tool_result(&alice, name, arguments).await;
+        assert_eq!(refusal["isError"], true, "{refusal}");
+        assert!(refusal.to_string().contains("dir/**"), "{name}: {refusal}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_of_folders_only_claims_both_with_no_session_file() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let held = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "folder work", "session": "alice", "branch": "feat/folders",
+                "paths": ["app/src/**", "app/test/**"]}),
+        )
+        .await;
+    assert_eq!(held["isError"], false, "{held}");
+    let content = &held["structuredContent"];
+    assert_eq!(content["claim_acquired"], true, "{held}");
+    // Readiness matches a start that names a file: only the unread source keeps it false here.
+    let file_start = hub
+        .tool_result(
+            &hub.secret(3, "carol-agent"),
+            "agentscm_start",
+            json!({"task": "file work", "session": "carol", "branch": "feat/file",
+                "paths": ["lib/a.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        content["ready_for_work"], file_start["structuredContent"]["ready_for_work"],
+        "{held}"
+    );
+    assert_eq!(
+        content["work"]["item"]["scope"],
+        json!(["app/src/", "app/test/"])
+    );
+    let text = held["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("Scope is undeclared"), "{text}");
+    // No session file intent: the folders are held by the Work scope alone.
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|intent| intent.paths.iter().all(|path| !path.starts_with("app/"))),
+        "{live:?}"
+    );
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/test/unit/a.rs"]}),
+        )
+        .await;
+    assert!(!refused, "{text}");
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/other.rs"]}),
+        )
+        .await;
+    assert!(
+        refused && text.contains("outside the declared work scope"),
+        "{text}"
+    );
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "file work", "session": "bob", "paths": ["app/src/a.rs"]}),
+        )
+        .await;
+    assert_eq!(rival["isError"], true, "{rival}");
+    assert_eq!(
+        rival["structuredContent"]["work"]["conflict"]["kind"], "scope_overlap",
+        "{rival}"
+    );
+}
