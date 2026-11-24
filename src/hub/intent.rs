@@ -165,7 +165,11 @@ pub(super) fn text(name: &str, value: &str, max: usize) -> Result<()> {
 /// The index key of a path spec: an exact repo-relative path `a/b.rs`, or a
 /// directory `a/b/**` (its descendants, not `a/b` itself) keyed `a/b/`.
 pub fn spec_key(spec: &str) -> Result<String> {
-    let bad = || invalid("path must be a repo-relative path, or a directory ending in /**");
+    let bad = || {
+        invalid(
+            "path must be a repo-relative path to a file, or a folder declared as dir/**; no other glob",
+        )
+    };
     let (path, dir) = spec
         .strip_suffix("/**")
         .map_or((spec, false), |p| (p, true));
