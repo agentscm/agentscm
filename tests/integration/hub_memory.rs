@@ -233,7 +233,7 @@ async fn reply(request: reqwest::RequestBuilder) -> (u16, Value) {
 }
 
 fn write(body: &str) -> Option<Value> {
-    Some(json!({"body": body, "session": "synthetic-session"}))
+    Some(json!({"body": body}))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -254,8 +254,18 @@ async fn agents_write_and_read_only_their_own_repository() {
     assert_eq!(status, 201, "{note}");
     assert_eq!(note["author"]["login"], "maya");
     assert_eq!(note["author"]["agent"], "claude-code");
-    assert_eq!(note["author"]["session"], "synthetic-session");
+    // The HTTP route has no bound session, so it signs the note with none and takes none.
+    assert_eq!(note["author"]["session"], Value::Null);
     assert_eq!(note["author"]["owner"], hub.user(MAYA).id.as_str());
+    let (status, refused) = hub
+        .agent(
+            Method::POST,
+            "/v1/hub/memory",
+            &maya,
+            Some(json!({"body": "x", "session": "claimed-session"})),
+        )
+        .await;
+    assert_eq!(status, 400, "{refused}");
     let body = note["body"].as_str().unwrap();
     assert!(!body.contains('"') && !body.contains('\n'), "{body}");
     assert!(!body.contains("Hub message"), "{body}");
@@ -454,7 +464,16 @@ async fn only_a_signed_in_contributor_promotes() {
     let (status, body) = hub.page(&outsider, Method::POST, &promote, true).await;
     assert_eq!(status, 403, "{body}");
 
-    // A contributor promotes, with the page's CSRF token; the list then names who and when.
+    // The person whose agent wrote the note cannot promote it, even as a contributor.
+    let author = hub.sign_in(MAYA).await;
+    let (status, body) = hub.page(&author, Method::POST, &promote, true).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("forbidden")),
+        "{body}"
+    );
+
+    // Another contributor promotes, with the page's CSRF token; the list then names who and when.
     let lee = hub.sign_in(LEE).await;
     let (status, body) = hub.page(&lee, Method::POST, &promote, false).await;
     assert_eq!((status, body["error"].as_str()), (403, Some("csrf")));
@@ -464,7 +483,8 @@ async fn only_a_signed_in_contributor_promotes() {
     assert_eq!(promoted["promoted"]["by"], hub.user(LEE).id.as_str());
     let (_, page) = hub.agent(Method::GET, "/v1/hub/memory", &maya, None).await;
     assert_eq!(page["notes"][0]["promoted"]["login"], "lee");
-    let (status, cleared) = hub.page(&lee, Method::DELETE, &promote, true).await;
+    // The author may still take a promotion back.
+    let (status, cleared) = hub.page(&author, Method::DELETE, &promote, true).await;
     assert_eq!((status, &cleared["promoted"]), (200, &Value::Null));
     let kinds: Vec<String> = hub
         .store

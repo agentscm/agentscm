@@ -2268,9 +2268,11 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   between the two can drop it.
 - The app requests `statuses: write` (and pull requests write) whether or not outbound
   is on. Repositories removed from an installation are not yet retired.
-- Repository memory is pull only and experimental, and holds at most 100 notes per repository and
-  25 per person in it; an agent on a person's own computer can use
-  that person's saved CLI sign-in to promote or remove notes (see [its limits](memory.md#limits)).
+- Repository memory is pull only and experimental, and holds at most 100 live notes per repository
+  and 25 unpromoted ones per person in it; unpromoted notes expire after 90 days. Nobody can
+  promote a note their own agent wrote, but an agent on a person's own computer can use that
+  person's saved CLI sign-in to remove notes or promote other people's (see
+  [its limits](memory.md#limits)).
 - After a repository is renamed, intents still match by the name they were made under:
   re-mint tokens after a rename.
 - Sessions and pending sign-ins live in hub memory, so a restart or a second
@@ -2369,10 +2371,12 @@ What the hub keeps, in its database and object store:
   receive the private spool's conversation bodies, tool input/output, command output, source bytes
   or host paths through this path.
 
-- Repository memory: at most 100 notes per repository, 25 of them per person, of at most 500
-  characters each, with the writing token's id and name, its owner's id and login, the agent's
-  session and, once a person promotes a note, their id, login and the time. Notes stay until removed. See
-  [repository memory](memory.md).
+- Repository memory: at most 100 live notes per repository, 25 unpromoted ones per person, of at
+  most 500 characters each, with the writing token's id and name, its owner's id and login, the
+  agent's session (none for a note written over HTTP) and, once a person promotes a note, their
+  id, login and the time. A note nobody promoted expires 90 days after it was written and is
+  deleted on the repository's next write, not by a timed pass; promoted notes stay until removed.
+  See [repository memory](memory.md).
 
 - Work usage observations: at most 500 immutable reports per work item, containing bounded
   agent/provider/model labels, attempt phase and outcome, optional token and cache-token counts,

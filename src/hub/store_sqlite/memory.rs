@@ -1,12 +1,15 @@
 //! Repository memory notes (see `crate::hub::memory`).
 use super::*;
 use crate::hub::memory::{
-    Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Note, Page, Promotion, Removed,
+    Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Note, Page, Promoted,
+    Promotion, Removed, expired_before,
 };
 
 const COLUMNS: &str = "id, body, owner, owner_login, token, token_name, session, created_at,
     promoted_by, promoted_by_login, promoted_at";
 const PROMOTED: &str = "CASE WHEN promoted_at IS NULL THEN 0 ELSE 1 END";
+/// Live notes (`memory::expired_before`), with the expiry time as `?2`.
+const LIVE: &str = "(promoted_at IS NOT NULL OR created_at > ?2)";
 
 fn note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     let promoted_by: Option<String> = row.get(8)?;
@@ -28,22 +31,24 @@ fn note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
-fn live(tx: &Transaction<'_>, scope: &str) -> Result<usize> {
+fn live(tx: &Transaction<'_>, scope: &str, now: i64) -> Result<usize> {
     let count: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM hub_memory_notes WHERE repository_scope = ?1",
-        params![scope],
+        &format!("SELECT COUNT(*) FROM hub_memory_notes WHERE repository_scope = ?1 AND {LIVE}"),
+        params![scope, expired_before(now)],
         |row| row.get(0),
     )?;
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
-fn load(tx: &Transaction<'_>, scope: &str, id: &str) -> Result<Option<Note>> {
+/// A live note of `scope`.
+fn load(tx: &Transaction<'_>, scope: &str, id: &str, now: i64) -> Result<Option<Note>> {
     Ok(tx
         .query_row(
             &format!(
-                "SELECT {COLUMNS} FROM hub_memory_notes WHERE id = ?1 AND repository_scope = ?2"
+                "SELECT {COLUMNS} FROM hub_memory_notes WHERE repository_scope = ?1 AND {LIVE}
+                 AND id = ?3"
             ),
-            params![id, scope],
+            params![scope, expired_before(now), id],
             note,
         )
         .optional()?)
@@ -62,15 +67,22 @@ pub(super) fn write(
     if who.read_only {
         return Err(HubError::Unauthorized);
     }
+    tx.execute(
+        "DELETE FROM hub_memory_notes WHERE repository_scope = ?1 AND promoted_at IS NULL
+         AND created_at <= ?2",
+        params![scope, expired_before(now)],
+    )?;
+    // Expired notes are gone, so every note left is live; promoted notes use no owner's share.
     let owned: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM hub_memory_notes WHERE repository_scope = ?1 AND owner = ?2",
+        "SELECT COUNT(*) FROM hub_memory_notes WHERE repository_scope = ?1 AND owner = ?2
+         AND promoted_at IS NULL",
         params![scope, who.owner.id],
         |row| row.get(0),
     )?;
     if usize::try_from(owned).unwrap_or(usize::MAX) >= MAX_NOTES_PER_OWNER {
         return Err(who.capacity(CapacityLimit::MemoryNotesOwner));
     }
-    if live(&tx, scope)? >= MAX_LIVE_NOTES {
+    if live(&tx, scope, now)? >= MAX_LIVE_NOTES {
         return Err(who.capacity(CapacityLimit::MemoryNotes));
     }
     let stored = Note {
@@ -106,43 +118,15 @@ pub(super) fn write(
 pub(super) fn list(store: &SqliteStore, scope: &str, query: &ListQuery) -> Result<Page> {
     let mut conn = store.conn();
     let tx = conn.transaction()?;
-    let mut sql = format!("SELECT {COLUMNS} FROM hub_memory_notes WHERE repository_scope = ?1");
-    let mut values: Vec<rusqlite::types::Value> = vec![scope.to_owned().into()];
-    // ponytail: ASCII-only case folding over the stored body, not the shown text; upgrade: store
-    // a folded search column.
-    if let Some(pattern) = &query.pattern {
-        values.push(pattern.clone().into());
-        sql.push_str(&format!(
-            " AND lower(body) LIKE ?{} ESCAPE '\\'",
-            values.len()
-        ));
-    }
-    if let Some(after) = &query.after {
-        values.extend([
-            after.promoted.into(),
-            after.created_at.into(),
-            after.id.clone().into(),
-        ]);
-        let n = values.len();
-        sql.push_str(&format!(
-            " AND ({PROMOTED}, created_at, id) < (?{}, ?{}, ?{n})",
-            n - 2,
-            n - 1
-        ));
-    }
-    let limit = i64::try_from(query.limit + 1).unwrap_or(i64::MAX);
-    values.push(limit.into());
-    sql.push_str(&format!(
-        " ORDER BY {PROMOTED} DESC, created_at DESC, id DESC LIMIT ?{}",
-        values.len()
-    ));
     let notes = tx
-        .prepare(&sql)?
-        .query_map(rusqlite::params_from_iter(values), note)?
+        .prepare(&format!(
+            "SELECT {COLUMNS} FROM hub_memory_notes WHERE repository_scope = ?1 AND {LIVE}
+             ORDER BY {PROMOTED} DESC, created_at DESC, id DESC"
+        ))?
+        .query_map(params![scope, expired_before(query.now)], note)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let live = live(&tx, scope)?;
     tx.commit()?;
-    Ok(Page::from_rows(notes, query.limit, live))
+    Ok(Page::select(notes, query))
 }
 
 pub(super) fn remove(
@@ -164,7 +148,7 @@ pub(super) fn remove(
         }
         Actor::Person { user, admin } => (user.to_owned(), None, admin),
     };
-    let Some(found) = load(&tx, scope, id)? else {
+    let Some(found) = load(&tx, scope, id, now)? else {
         return Ok(Removed::NotFound);
     };
     if found.owner != user && !admin {
@@ -190,14 +174,17 @@ pub(super) fn promote(
     person: &User,
     promoted: bool,
     now: i64,
-) -> Result<Option<Note>> {
+) -> Result<Promoted> {
     let mut conn = store.conn();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(found) = load(&tx, scope, id)? else {
-        return Ok(None);
+    let Some(found) = load(&tx, scope, id, now)? else {
+        return Ok(Promoted::NotFound);
     };
+    if promoted && found.owner == person.id {
+        return Ok(Promoted::OwnNote);
+    }
     if found.promotion.is_some() == promoted {
-        return Ok(Some(found));
+        return Ok(Promoted::Note(Box::new(found)));
     }
     let promotion = promoted.then(|| Promotion {
         by: person.id.clone(),
@@ -228,5 +215,5 @@ pub(super) fn promote(
         )?,
     )?;
     tx.commit()?;
-    Ok(Some(Note { promotion, ..found }))
+    Ok(Promoted::Note(Box::new(Note { promotion, ..found })))
 }

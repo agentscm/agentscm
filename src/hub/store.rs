@@ -830,8 +830,10 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
     /// Stores a note of repository memory under `scope`, the token's repository scope, after
-    /// rechecking that `token` is live and may write. A repository that holds
-    /// `memory::MAX_LIVE_NOTES` refuses with the `MemoryNotes` capacity limit.
+    /// rechecking that `token` is live and may write, and first deletes the repository's expired
+    /// notes (`memory::expired_before`). A repository that holds `memory::MAX_LIVE_NOTES` live notes
+    /// refuses with the `MemoryNotes` capacity limit, and an owner who holds
+    /// `memory::MAX_NOTES_PER_OWNER` live notes nobody promoted with `MemoryNotesOwner`.
     fn memory_write(
         &self,
         token: &str,
@@ -839,7 +841,8 @@ pub trait Store: Send + Sync {
         note: &super::memory::NewNote,
         now: i64,
     ) -> Result<super::memory::Note>;
-    /// One page of the notes under `scope`: promoted notes first, then newest first.
+    /// One page of the live notes under `scope` at `query.now`: promoted notes first, then
+    /// newest first, searched and paged by `memory::Page::select`.
     fn memory_list(
         &self,
         scope: &str,
@@ -856,7 +859,8 @@ pub trait Store: Send + Sync {
     ) -> Result<super::memory::Removed>;
     /// Marks one note under `scope` promoted by `person`, or clears that, recording
     /// `memory_note_promoted` or `memory_note_unpromoted` with ids only when it changes. The
-    /// caller has checked the person's access. `None` when there is no such note.
+    /// caller has checked the person's access. A person cannot promote a note they own; they can
+    /// unpromote it. An expired note is not found.
     fn memory_promote(
         &self,
         scope: &str,
@@ -864,7 +868,7 @@ pub trait Store: Send + Sync {
         person: &User,
         promoted: bool,
         now: i64,
-    ) -> Result<Option<super::memory::Note>>;
+    ) -> Result<super::memory::Promoted>;
     /// Records a person's hand-off in `repository`, then prunes that person's records older than
     /// `pickup::PICKUP_RETAIN_SECONDS` and beyond the newest `pickup::MAX_PICKUPS_PER_OWNER`.
     /// Repository names in pickup reads and matches compare without regard to case.

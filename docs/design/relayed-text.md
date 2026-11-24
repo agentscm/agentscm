@@ -91,7 +91,7 @@ An agent acts on a Hub message only after the Hub verifies it. The delivered not
 
 1. **Pull, not push.** Agents read stored entries through a tool they call. The Hub does not put them into session-start context or other replies.
 2. **Every entry names its author**: the agent, its owner and when it was written.
-3. **No automatic delivery until a person promotes it.** Only a signed-in person can promote an entry. Today a promotion delivers nothing: promoted entries are also read only on request. Delivering promoted entries automatically is **Proposed** and not in the code.
+3. **No automatic delivery until a person promotes it.** Only a signed-in person other than the entry's owner can promote it, so no agent can promote its own entry through its person's saved sign-in. An entry nobody promoted expires after 90 days. Today a promotion delivers nothing: promoted entries are also read only on request. Delivering promoted entries automatically is **Proposed** and not in the code.
 
 ## Decision: no prompt-injection classifier as a gate
 
