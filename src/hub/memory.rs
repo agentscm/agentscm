@@ -53,7 +53,13 @@ impl NewNote {
     /// dropped. Other text is kept as written and cleaned when rendered.
     pub fn new(body: &str, session: Option<&str>) -> Result<Self> {
         let body = body.trim();
-        if body.is_empty() {
+        // A body of only control or invisible characters would be shown as nothing.
+        if body.is_empty()
+            || ThirdPartyText::new(body, MAX_NOTE_CHARS)
+                .as_str()
+                .trim()
+                .is_empty()
+        {
             return Err(HubError::Invalid("note must not be empty".into()));
         }
         if body.chars().count() > MAX_NOTE_CHARS {
@@ -617,6 +623,11 @@ mod tests {
         assert!(NewNote::new(&"é".repeat(MAX_NOTE_CHARS), None).is_ok());
         assert!(NewNote::new(&"x".repeat(MAX_NOTE_CHARS + 1), None).is_err());
         assert!(NewNote::new("  \n ", None).is_err());
+        let invisible = NewNote::new("\u{200B}\u{202E}\u{0007}\u{E0041}", None).unwrap_err();
+        assert_eq!(
+            invisible.to_string(),
+            NewNote::new("", None).unwrap_err().to_string()
+        );
         assert!(NewNote::new("ok", Some(&"s".repeat(MAX_SESSION_BYTES + 1))).is_err());
         assert!(NewNote::new("ok", Some("a\nb")).is_err());
         let kept = NewNote::new("  keep \u{202E}this\n  ", Some("  ")).unwrap();
