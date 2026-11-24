@@ -353,6 +353,24 @@ fn status(root: &Path) -> io::Result<()> {
     if count == 0 {
         println!("queue empty");
     }
+    match read(&root.join("left")) {
+        Ok(text) => {
+            let fields = text.lines().collect::<Vec<_>>();
+            if fields.len() != 4 {
+                return Err(io::Error::other("malformed departure record"));
+            }
+            let since: u64 = fields[0].parse().map_err(io::Error::other)?;
+            println!(
+                "left job={} ago={}s repo={} reason={}",
+                fields[1],
+                now().saturating_sub(since),
+                fields[2],
+                fields[3]
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 fn remove_idle(root: &Path, own: &Path) -> io::Result<Vec<PathBuf>> {
@@ -513,6 +531,26 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
             return Ok(128 + SIGNAL.load(Ordering::Relaxed));
         }
         if current == 1 {
+            // Only a checkout that is gone or unreadable can never pass. Resource floors,
+            // probe timeouts and other errors may clear, so they keep the head waiting.
+            if let Err(error) = fs::read_dir(&repo)
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::NotADirectory
+                )
+            {
+                let reason = format!("checkout unreadable: {error}");
+                write(
+                    &root.join("left"),
+                    &format!("{}\n{next}\n{repo:?}\n{reason}\n", now()),
+                )?;
+                remove_job(&path)?;
+                return Err(io::Error::other(format!(
+                    "job {next} left the queue: {reason}"
+                )));
+            }
             match resources(&repo) {
                 Ok(()) => {
                     write(&metadata_path(&path), &metadata)?;
@@ -1076,6 +1114,58 @@ mod tests {
         fs::write(release, "").unwrap();
         assert!(head.wait().unwrap().success());
         assert!(follower.wait().unwrap().success());
+    }
+    #[test]
+    fn removed_checkout_leaves_queue_and_next_waiter_runs() {
+        let f = Fixture::new();
+        let started = f.root.join("started");
+        let release = f.root.join("release");
+        let next = f.root.join("next");
+        let checkout = f.root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let recorded = fs::canonicalize(&checkout).unwrap();
+        let mut holder = f.start(
+            "touch \"$1\"; while test ! -e \"$2\"; do sleep .05; done",
+            &[&started, &release],
+        );
+        f.wait(|| started.exists());
+        let dead = Command::new(&f.binary)
+            .current_dir(&checkout)
+            .arg("--run")
+            .arg(f.root.join("state"))
+            .arg(f.root.join("legacy"))
+            .arg("other")
+            .env("AGENTSCM_HEAVY_MIN_MEMORY_PERCENT", "0")
+            .env("AGENTSCM_HEAVY_MIN_DISK_BYTES", "0")
+            .args(["true"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        f.wait(|| f.ticket_count() == 2);
+        let mut second = f.start("touch \"$1\"", &[&next]);
+        f.wait(|| f.ticket_count() == 3);
+        fs::remove_dir(&checkout).unwrap();
+        fs::write(release, "").unwrap();
+        let output = dead.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("job 2 left the queue: checkout unreadable")
+        );
+        assert!(holder.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        assert!(next.exists());
+        assert_eq!(f.ticket_count(), 0);
+        let status = Command::new(&f.binary)
+            .arg("--queue")
+            .arg(f.root.join("state"))
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let text = String::from_utf8(status.stdout).unwrap();
+        assert!(text.starts_with("queue empty\nleft job=2 ago="));
+        assert!(text.contains(&format!(" repo={recorded:?} reason=checkout unreadable: ")));
     }
     #[test]
     fn metadata_symlinks_malformed_and_oversized_fail_closed() {
