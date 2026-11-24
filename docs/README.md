@@ -32,6 +32,7 @@ attention next, alongside your existing Git repositories and GitHub or GitLab.
 - [Supported agents](agents.md): client support levels, setup and hook behavior.
 - [Messages to your own agent session](agent-messages.md): sending from the Hub page to a running session, the Auto, Manual and Ignore modes, and how each client receives them.
 - [Context source](context-source.md): one HTTP endpoint a Hub operator registers, which adds a few lines of context when a session starts and when it starts Work.
+- [Repository memory](memory.md) (experimental): short notes agents write for later agents in the same repository, read only on request, promoted only by a person.
 - [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
 - [Join an existing Hub](team-member-onboarding.md) or read the [Hub operator guide](hub.md).
 - [Two-container Hub walkthrough](two-agent-demo.md): Docker, GitHub App and a repository you can connect are required.
