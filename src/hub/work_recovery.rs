@@ -25,6 +25,7 @@ use super::work_transition::{
     WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
+use crate::third_party::ThirdPartyText;
 
 pub const RECOVERY_SCHEMA_VERSION: u16 = 1;
 /// The most Work items of the caller's owner one inspection page lists.
@@ -773,7 +774,7 @@ fn decide(
                 RefusalCode::NotAuthorized,
                 format!(
                     "Only the owner {} or a Hub administrator prunes a Work's participants.",
-                    item.owner_login
+                    ThirdPartyText::name(&item.owner_login, 64)
                 ),
             );
         }
@@ -786,7 +787,7 @@ fn decide(
                     RefusalCode::NotAuthorized,
                     format!(
                         "Only the lead, the owner {} or a Hub administrator can change this Work; ask its lead or owner.",
-                        item.owner_login
+                        ThirdPartyText::name(&item.owner_login, 64)
                     ),
                 );
             }
@@ -911,7 +912,7 @@ fn resume_refusal(subject: &Subject<'_>, viewer: &RecoveryViewer) -> Option<Reme
             RefusalCode::ClaimCurrent,
             format!(
                 "This Work holds nothing, but its lead checked in recently; only its owner {} resumes it now.",
-                item.owner_login
+                ThirdPartyText::name(&item.owner_login, 64)
             ),
         )
     }
@@ -1356,18 +1357,7 @@ pub fn inspect(
                 holder_agent: agent_name(&item.lead_agent),
                 lease_expires_at: expires,
                 paths: overlap.reasons.clone(),
-                next: if mine {
-                    format!(
-                        "Your owner's {} holds these paths live. Continue in that Work, join it as helper, or have its lead hand it over; release or end it only when it is obsolete.",
-                        item.id
-                    )
-                } else {
-                    format!(
-                        "{}'s {} holds these paths live. Do not take it over: ask its lead with agentscm_ask or the coordination request a start creates, narrow your paths, or wait until the lease lapses.",
-                        item.owner_login,
-                        agent_name(&item.lead_agent)
-                    )
-                },
+                next: conflict_next(mine, &item.id, &item.owner_login, &item.lead_agent),
             }
         })
         .collect();
@@ -2017,6 +2007,22 @@ pub fn render_repair(report: &RepairReportV1) -> String {
     lines.join("\n")
 }
 
+/// What the caller can do about a live hold over its paths. The holder's login and agent are
+/// third-party names, cleaned and kept as written.
+pub(super) fn conflict_next(mine: bool, work_id: &str, owner_login: &str, agent: &str) -> String {
+    if mine {
+        format!(
+            "Your owner's {work_id} holds these paths live. Continue in that Work, join it as helper, or have its lead hand it over; release or end it only when it is obsolete."
+        )
+    } else {
+        format!(
+            "{}'s {} holds these paths live. Do not take it over: ask its lead with agentscm_ask or the coordination request a start creates, narrow your paths, or wait until the lease lapses.",
+            ThirdPartyText::name(owner_login, 64),
+            ThirdPartyText::name(&agent_name(agent), 64)
+        )
+    }
+}
+
 /// A short reading of an inspection for an agent's reply.
 pub fn render_text(recovery: &WorkRecoveryV1) -> String {
     let mut lines = Vec::new();
@@ -2053,7 +2059,7 @@ pub fn render_text(recovery: &WorkRecoveryV1) -> String {
         lines.push(format!(
             "- {} \"{}\" [{}]: {} You may: {}. ({})",
             work.work_id,
-            crate::third_party::ThirdPartyText::new(&work.title, 120),
+            ThirdPartyText::new(&work.title, 120),
             word(&work.bucket),
             work.why,
             if permitted.is_empty() {
@@ -2084,10 +2090,10 @@ pub fn render_text(recovery: &WorkRecoveryV1) -> String {
         }
     }
     for conflict in &recovery.conflicts {
-        let paths: Vec<&str> = conflict
+        let paths: Vec<String> = conflict
             .paths
             .iter()
-            .map(|pair| pair.their_path.as_str())
+            .map(|pair| ThirdPartyText::name(&pair.their_path, 100).to_string())
             .collect();
         lines.push(format!(
             "- conflict {} on {}: {}",
