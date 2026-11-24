@@ -46,10 +46,10 @@ pub(super) fn invisible(c: char) -> bool {
     third_party::invisible(c)
 }
 
-/// Third-party text on one line, as [`ThirdPartyText::name`] renders it bare: what this function
+/// Third-party text on one line, without the words that open a Hub message: what this function
 /// has always returned, for the callers that do not hold a [`ThirdPartyText`] yet.
 pub fn sanitize(text: &str, max: usize) -> String {
-    ThirdPartyText::name(text, max).as_str().to_owned()
+    third_party::sanitized(text, max)
 }
 
 /// [`sanitize`] without the Hub message rewrite, for checks on text stored before it existed.
@@ -413,7 +413,9 @@ pub(super) fn ascii(text: &str, max: usize) -> String {
 
 /// A task in a refusal reason: at most 80 chars, `task unknown` when nothing is left.
 pub fn ascii_task(text: &str) -> String {
-    let task = ascii(text, DENY_TASK_CHARS);
+    // The frame rewrite runs after the ASCII filter, which can join words by turning other
+    // characters into spaces. The filtered text is ASCII within the bound, so nothing is cut.
+    let task = ThirdPartyText::new(&ascii(text, DENY_TASK_CHARS), DENY_TASK_CHARS).to_string();
     if task.is_empty() {
         "task unknown".into()
     } else {
