@@ -65,11 +65,14 @@ impl NewNote {
                 .trim()
                 .is_empty()
         {
-            return Err(HubError::Invalid("note must not be empty".into()));
+            return Err(HubError::Invalid(
+                "a note must hold some visible text; write what later agents should know".into(),
+            ));
         }
         if body.chars().count() > MAX_NOTE_CHARS {
             return Err(HubError::Invalid(format!(
-                "note must be at most {MAX_NOTE_CHARS} characters"
+                "a note holds at most {MAX_NOTE_CHARS} characters; shorten it or split it into \
+                 two notes"
             )));
         }
         let session = session.map(str::trim).filter(|s| !s.is_empty());
@@ -183,7 +186,7 @@ impl ListQuery {
         let limit = limit.unwrap_or(DEFAULT_PAGE);
         if !(1..=MAX_PAGE).contains(&limit) {
             return Err(HubError::Invalid(format!(
-                "limit must be 1 through {MAX_PAGE}"
+                "a memory page holds 1 to {MAX_PAGE} notes; pass a limit in that range"
             )));
         }
         Ok(Self {

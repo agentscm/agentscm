@@ -54,6 +54,11 @@ impl CapacityLimit {
         }
     }
 
+    /// A limit of repository memory, whose refusals carry no Work advice.
+    pub fn is_memory(self) -> bool {
+        matches!(self, Self::MemoryNotes | Self::MemoryNotesOwner)
+    }
+
     pub fn parse(text: &str) -> Option<Self> {
         LIMITS.into_iter().find(|limit| limit.as_str() == text)
     }
@@ -91,8 +96,8 @@ impl CapacityLimit {
                 "at most {MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN} are open per agent token, {MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER} per person and {MAX_ACTIVE_COORDINATION_REQUESTS} per repository; resolve or withdraw your own open requests (agentscm_coordination_inbox lists them; agentscm_coordination_resolve or agentscm_coordination_withdraw ends one), then retry"
             )),
             Self::CoordinationUpdates => Some("resolve this coordination request with agentscm_coordination_resolve and open a new one if more coordination is needed".into()),
-            Self::MemoryNotes => Some(format!("a repository holds at most {} notes; remove one of your own owner's notes with agentscm_memory_remove, or ask a person to remove one, then retry", super::memory::MAX_LIVE_NOTES)),
-            Self::MemoryNotesOwner => Some(format!("one owner holds at most {} notes in a repository; remove one of your owner's own notes with agentscm_memory_remove, then retry", super::memory::MAX_NOTES_PER_OWNER)),
+            Self::MemoryNotes => Some(format!("a repository holds at most {} notes; remove one of your notes with agentscm_memory_remove, or ask the repository's people to remove some, then write again", super::memory::MAX_LIVE_NOTES)),
+            Self::MemoryNotesOwner => Some(format!("one person's agents hold at most {} notes in a repository; remove one of your notes with agentscm_memory_remove, then write again", super::memory::MAX_NOTES_PER_OWNER)),
         }
     }
 }

@@ -2484,6 +2484,19 @@ struct MemoryRemoveArgs {
     id: String,
 }
 
+/// A memory tool's refusal. Its own invalid input is `invalid_request` with the Hub's fixed
+/// reason, which names the bound and what to do; nothing in it is Work advice.
+fn memory_failure(error: &HubError) -> Value {
+    match error {
+        HubError::Invalid(why) => {
+            let mut envelope = error_envelope::from_code(ErrorCode::InvalidRequest);
+            envelope.message = format!("Repository memory refused the request: {why}");
+            envelope.mcp()
+        }
+        _ => hub_failure(error),
+    }
+}
+
 /// Repository memory: the list's text is the fixed template of [`super::memory::render`]; a note
 /// is signed with the calling session.
 async fn memory_call(
@@ -2506,7 +2519,7 @@ async fn memory_call(
                     value["content"] = json!([{"type": "text", "text": memory::render(&page)}]);
                     value
                 }
-                Err(error) => work_failure(&error),
+                Err(error) => memory_failure(&error),
             }
         }
         "agentscm_memory_write" => {
@@ -2520,7 +2533,7 @@ async fn memory_call(
             };
             match memory::write_for_principal(state, principal, args).await {
                 Ok(note) => structured(&NoteView::from(&note)),
-                Err(error) => work_failure(&error),
+                Err(error) => memory_failure(&error),
             }
         }
         "agentscm_memory_remove" => {
@@ -2533,7 +2546,7 @@ async fn memory_call(
                 Ok(Removed::Removed) => structured(&RemovedView { id, removed: true }),
                 Ok(Removed::NotFound) => refused("not_found"),
                 Ok(Removed::NotAuthor) => refused("forbidden"),
-                Err(error) => work_failure(&error),
+                Err(error) => memory_failure(&error),
             }
         }
         _ => return None,

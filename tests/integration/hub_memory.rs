@@ -684,3 +684,80 @@ async fn memory_tools_are_opt_in_and_render_notes_as_third_party_text() {
         1
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_tool_refusals_speak_of_memory_not_work() {
+    let hub = Hub::start().await;
+    let maya = hub.token(MAYA, "claude-code", REPO, false);
+    let check = |result: &Value, code: &str, says: &str| {
+        assert_eq!(result["isError"], true, "{result}");
+        let error = &result["structuredContent"]["error"];
+        assert_eq!(error["code"], code, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(says), "{text}");
+        assert!(!text.contains("Work"), "{text}");
+        assert_ne!(error["recovery"]["action"], "inspect_work", "{result}");
+    };
+    let long = hub
+        .tool(
+            &maya,
+            "agentscm_memory_write",
+            json!({"body": "x".repeat(501)}),
+        )
+        .await;
+    check(
+        &long,
+        "invalid_request",
+        "a note holds at most 500 characters; shorten it or split it into two notes",
+    );
+    let empty = hub
+        .tool(
+            &maya,
+            "agentscm_memory_write",
+            json!({"body": " \u{200B}\n"}),
+        )
+        .await;
+    check(
+        &empty,
+        "invalid_request",
+        "a note must hold some visible text",
+    );
+    let limit = hub
+        .tool(&maya, "agentscm_memory_list", json!({"limit": 51}))
+        .await;
+    check(
+        &limit,
+        "invalid_request",
+        "a memory page holds 1 to 50 notes",
+    );
+    let q = hub
+        .tool(&maya, "agentscm_memory_list", json!({"q": "q".repeat(201)}))
+        .await;
+    check(&q, "invalid_request", "q must be at most 200 bytes");
+    for i in 0..25 {
+        let written = hub
+            .tool(
+                &maya,
+                "agentscm_memory_write",
+                json!({"body": format!("note {i}")}),
+            )
+            .await;
+        assert_eq!(written["isError"], false, "{written}");
+    }
+    let share = hub
+        .tool(&maya, "agentscm_memory_write", json!({"body": "one more"}))
+        .await;
+    check(
+        &share,
+        "work_storage_capacity",
+        "one person's agents hold at most 25 notes in a repository; remove one of your notes with agentscm_memory_remove, then write again",
+    );
+    assert_eq!(
+        share["structuredContent"]["error"]["limit"],
+        "memory_notes_owner"
+    );
+    assert_eq!(
+        share["structuredContent"]["error"]["recovery"]["action"],
+        "none"
+    );
+}
