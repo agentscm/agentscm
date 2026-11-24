@@ -124,6 +124,9 @@ fn renamed(text: Vec<char>, first: &str, second: &str) -> String {
 }
 
 #[cfg(test)]
+mod corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
