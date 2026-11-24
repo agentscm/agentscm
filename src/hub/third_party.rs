@@ -74,26 +74,37 @@ pub(super) fn clean(text: &str, max: usize) -> String {
     format!("{}…", text.chars().take(max).collect::<String>())
 }
 
-/// "Hub message" in any case, joined by spaces, `-` or `_`, becomes "Hub note". Defence in depth:
-/// an agent acts on a Hub message only after the Hub verifies it, so look-alike letters that slip
-/// past this still fail that check.
+/// "Hub message" becomes "Hub note" and "coordination request" becomes "coordination note", in
+/// any case and joined by spaces, `-` or `_`, so relayed text never carries the words that open a
+/// Hub message (`agent_messages::FRAME`) or a coordination request wake
+/// (`agent_messages::REQUEST_FRAME`). Defence in depth: an agent acts on either only after the Hub
+/// verifies it, so look-alike letters that slip past this still fail that check.
 fn unframed(text: Vec<char>) -> String {
+    let text = renamed(text, "hub", "message");
+    renamed(text.chars().collect(), "coordination", "request")
+}
+
+/// `first` and `second` in any case, joined by at least one space, `-` or `_`, become `first`
+/// as written and " note".
+fn renamed(text: Vec<char>, first: &str, second: &str) -> String {
+    let first: Vec<char> = first.chars().collect();
+    let second: Vec<char> = second.chars().collect();
     let lower: Vec<char> = text.iter().map(char::to_ascii_lowercase).collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        if lower[i..].starts_with(&['h', 'u', 'b']) {
-            let mut j = i + 3;
+        if lower[i..].starts_with(&first) {
+            let mut j = i + first.len();
             while text
                 .get(j)
                 .is_some_and(|c| c.is_whitespace() || matches!(c, '-' | '_'))
             {
                 j += 1;
             }
-            if j > i + 3 && lower[j..].starts_with(&['m', 'e', 's', 's', 'a', 'g', 'e']) {
-                out.extend(&text[i..i + 3]);
+            if j > i + first.len() && lower[j..].starts_with(&second) {
+                out.extend(&text[i..i + first.len()]);
                 out.push_str(" note");
-                i = j + 7;
+                i = j + second.len();
                 continue;
             }
         }
@@ -148,6 +159,23 @@ mod tests {
         assert!(!text.as_str().contains(crate::hub::agent_messages::FRAME));
         // The bound cuts before the rewrite, so a cut word stays cut.
         assert_eq!(ThirdPartyText::new("Hub message", 9).as_str(), "Hub messa…");
+    }
+
+    #[test]
+    fn relayed_text_never_opens_a_coordination_request() {
+        let text = ThirdPartyText::new(
+            "AgentSCM Coordination_-Request 7 and coordination\u{200B} REQUEST and coordinationrequest",
+            100,
+        );
+        assert_eq!(
+            text.as_str(),
+            "AgentSCM Coordination note 7 and coordination note and coordinationrequest"
+        );
+        assert!(
+            !text
+                .as_str()
+                .contains(crate::hub::agent_messages::REQUEST_FRAME)
+        );
     }
 
     #[test]

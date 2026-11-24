@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
-use super::advice::sanitize;
 use super::forge_http::check_base_url;
 use super::store::Principal;
+use super::third_party::ThirdPartyText;
 use super::{HubError, Result};
 
 pub const FILE_ENV: &str = "AGENTSCM_CONTEXT_SOURCE_FILE";
@@ -232,42 +232,15 @@ fn request(moment: Moment, principal: &Principal, session: &str) -> Value {
 fn bounded(lines: &[String]) -> Vec<String> {
     lines
         .iter()
-        .map(|line| no_request_frame(sanitize(line, MAX_LINE_CHARS).trim()))
+        .map(|line| {
+            ThirdPartyText::new(line, MAX_LINE_CHARS)
+                .as_str()
+                .trim()
+                .to_owned()
+        })
         .filter(|line| !line.is_empty())
         .take(MAX_LINES)
         .collect()
-}
-
-/// "coordination request" in any case, joined by spaces, `-` or `_`, becomes "coordination
-/// note", so a line cannot open with the words of a coordination request wake
-/// (`agent_messages::REQUEST_FRAME`). `advice::sanitize` does the same for a Hub message.
-fn no_request_frame(text: &str) -> String {
-    let text: Vec<char> = text.chars().collect();
-    let lower: Vec<char> = text.iter().map(char::to_ascii_lowercase).collect();
-    let first: Vec<char> = "coordination".chars().collect();
-    let second: Vec<char> = "request".chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        if lower[i..].starts_with(&first) {
-            let mut j = i + first.len();
-            while text
-                .get(j)
-                .is_some_and(|c| c.is_whitespace() || matches!(c, '-' | '_'))
-            {
-                j += 1;
-            }
-            if j > i + first.len() && lower[j..].starts_with(&second) {
-                out.extend(&text[i..i + first.len()]);
-                out.push_str(" note");
-                i = j + second.len();
-                continue;
-            }
-        }
-        out.push(text[i]);
-        i += 1;
-    }
-    out
 }
 
 /// The block an agent reads, which the Hub writes around the source's `lines`. `None` when
