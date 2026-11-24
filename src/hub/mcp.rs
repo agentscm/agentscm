@@ -1142,7 +1142,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "kind": {"type": "string", "enum": ["progress", "decision", "blocker", "pause", "finish", "handover"]},
              "summary": {"type": "string", "description": "One or two plain sentences a teammate can read: what happened and what is next. Give hashes, test counts and tool names only when they matter."},
              "next_action": {"type": "string"},
-             "scope": {"type": "array", "items": {"type": "string"}, "description": "Narrowing releases dropped files."},
+             "scope": {"type": "array", "items": {"type": "string"}, "description": "Files, or a folder as dir/**. Narrowing releases dropped files."},
              "finished_paths": {"type": "array", "items": {"type": "string"}, "description": "Done scope entries; others may ask for them. [] clears."},
              "branch": {"type": "string", "description": "Primary; see branches."},
              "branches": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Whole list, primary first; replaces it, [] clears. Completes once each listed branch's PR merged."},
@@ -1211,7 +1211,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
          "inputSchema": schema(json!({
              "task": {"type": "string", "description": "The Work's title: a short plain phrase, under about 70 characters, naming what changes. No file paths, issue-number lists or design notes; those go in description."},
              "description": {"type": "string", "description": "What this Work changes and why, in two or three plain sentences for a teammate who was not there. Set by the start that creates the Work; a later start does not change it."},
-             "paths": paths("Repo-relative files you expect to edit."),
+             "paths": paths("Repo-relative files you expect to edit; declare a folder as dir/** (every file under it)."),
              "session": session,
              "work_id": {"type": "string", "description": "Existing durable work to resume or join."},
              "source": {"type": "object", "additionalProperties": false,
@@ -1755,6 +1755,16 @@ fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String
         deny: false,
         report: true,
     }
+}
+
+/// The files of a start's paths: session intents hold files, so a `dir/**` entry is held by the
+/// Work scope alone, which matches and overlaps it as a folder.
+fn session_files(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !path.ends_with("/**"))
+        .cloned()
+        .collect()
 }
 
 /// A tool result; reasons are hub strings and schema text, never client input.
@@ -3919,7 +3929,7 @@ async fn work_preflight(
     super::session::check(&session_call(
         session.clone(),
         Some(task.clone()),
-        paths.clone(),
+        session_files(&paths),
     ))?;
     let store = state.store.clone();
     let token = principal.token_id.clone();
@@ -4560,10 +4570,11 @@ async fn start(
 
     // Validate every legacy session/path field before a briefing receipt or durable claim can be
     // written. The actual touch still happens only after the claim succeeds.
+    super::work::normalized_scope(&paths)?;
     super::session::check(&session_call(
         session.clone(),
         Some(task.clone()),
-        paths.clone(),
+        session_files(&paths),
     ))?;
 
     // A new lead start over paths where the owner's own unfinished Work holds nothing now would
@@ -4870,7 +4881,7 @@ async fn start(
     let advice = announce_native(
         state,
         principal,
-        session_call(Some(resolved), Some(task.clone()), paths),
+        session_call(Some(resolved), Some(task.clone()), session_files(&paths)),
         named,
         incarnation,
     )
