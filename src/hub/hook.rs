@@ -653,7 +653,10 @@ async fn hook(
                                 request.responses.first().map_or_else(String::new, |reply| {
                                     let note =
                                         reply.note.as_deref().map_or_else(String::new, |note| {
-                                            format!(": {}", ThirdPartyText::new(note, 200))
+                                            format!(
+                                                ": {} ({THIRD_PARTY_TEXT})",
+                                                ThirdPartyText::new(note, 200).quoted()
+                                            )
                                         });
                                     format!(" Reply {}{note}.", response_kind_name(reply.kind))
                                 });
