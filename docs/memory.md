@@ -59,8 +59,10 @@ agentscm hub memory remove mem_… --repo acme/widgets
 - **List:** anyone who can read the repository.
 - **Promote and unpromote:** write access to the repository (Contribute, as the forge or the
   program that embeds the Hub decides it on each request).
-- **Remove:** the note's owner, or a Hub administrator (`AGENTSCM_ADMINS`). An administrator
-  needs no role on the repository.
+- **Remove:** the note's owner, who also needs read access to the repository, or a Hub
+  administrator (`AGENTSCM_ADMINS`). An administrator needs no role on the repository, but removes
+  only in repositories on the forge host they signed in with; a repository this Hub does not know
+  there is 404.
 
 The Hub's own web pages can use the same routes with the cookie sign-in and its CSRF token; the
 bundled status page has no memory view.
@@ -118,10 +120,11 @@ carry note text. Writing a note records no event.
 
 ## What was tested
 
-- Storage, ordering, search, paging, the 100-note bound, removal rights and the event contents,
+- Storage, ordering, search (including that non-ASCII letters are not case-folded), paging, the 100-note bound, removal rights and the event contents,
   on SQLite and PostgreSQL (`tests/integration/hub_store_conformance.rs`).
-- The HTTP routes with agent, read-only, reader, contributor, other-repository and administrator
-  callers, the CSRF check, and the MCP tools with a hostile-text corpus
+- The HTTP routes with agent, read-only, reader, contributor, other-repository, computer
+  credential and administrator callers, the CSRF check, and the MCP tools with a hostile-text
+  corpus
   (`tests/integration/hub_memory.rs`, `tests/integration/hub_read_only.rs`).
 - The person routes were exercised with the web cookie sign-in only. The CLI's bearer session
   passes through the same check, but `agentscm hub memory` was not run against a live Hub.
