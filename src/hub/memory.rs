@@ -49,10 +49,13 @@ pub struct NewNote {
 }
 
 impl NewNote {
-    /// Refuses an empty or over-long note and an over-long session; surrounding whitespace is
-    /// dropped. Other text is kept as written and cleaned when rendered.
+    /// Refuses an empty or over-long note and an over-long session. Each run of whitespace and
+    /// control characters (line breaks and tabs too) becomes one space, so words stay apart when
+    /// the note is shown on one line; the bounds apply to that text, which is what is stored.
+    /// Other text is kept as written and cleaned when rendered.
     pub fn new(body: &str, session: Option<&str>) -> Result<Self> {
-        let body = body.trim();
+        let body = collapse(body);
+        let body = body.as_str();
         // A body of only control or invisible characters would be shown as nothing.
         if body.is_empty()
             || ThirdPartyText::new(body, MAX_NOTE_CHARS)
@@ -78,6 +81,15 @@ impl NewNote {
             session: session.map(str::to_owned),
         })
     }
+}
+
+/// `text` with each run of whitespace and control characters as one space, trimmed.
+fn collapse(text: &str) -> String {
+    let words = text.split(|c: char| c.is_whitespace() || c.is_control());
+    words
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Who promoted a note, as they were when they did.
@@ -174,7 +186,12 @@ impl ListQuery {
         }
         Ok(Self {
             pattern: search_text(q)?.as_deref().map(like_pattern),
-            after: after.map(Cursor::parse).transpose()?,
+            // An empty cursor means the first page, as an empty search means no filter.
+            after: after
+                .map(str::trim)
+                .filter(|after| !after.is_empty())
+                .map(Cursor::parse)
+                .transpose()?,
             limit,
         })
     }
@@ -630,6 +647,21 @@ mod tests {
         );
         assert!(NewNote::new("ok", Some(&"s".repeat(MAX_SESSION_BYTES + 1))).is_err());
         assert!(NewNote::new("ok", Some("a\nb")).is_err());
+        let collapsed = NewNote::new("Run the migrations first\nthen cargo nextest", None).unwrap();
+        assert_eq!(
+            collapsed.body,
+            "Run the migrations first then cargo nextest"
+        );
+        let spaced = NewNote::new(" a\r\n\t\u{0007}  b\u{2028}c ", None).unwrap();
+        assert_eq!(spaced.body, "a b c");
+        // The bound is judged on the collapsed text.
+        let lines = format!("{}\n\n\n{}", "x".repeat(250), "y".repeat(249));
+        assert_eq!(
+            NewNote::new(&lines, None).unwrap().body.chars().count(),
+            MAX_NOTE_CHARS
+        );
+        let over = format!("{}\n{}", "x".repeat(250), "y".repeat(250));
+        assert!(NewNote::new(&over, None).is_err());
         let kept = NewNote::new("  keep \u{202E}this\n  ", Some("  ")).unwrap();
         assert_eq!(kept.body, "keep \u{202E}this");
         assert_eq!(kept.session, None);
@@ -640,6 +672,9 @@ mod tests {
         assert!(ListQuery::new(None, None, Some(0)).is_err());
         assert!(ListQuery::new(None, None, Some(MAX_PAGE + 1)).is_err());
         assert!(ListQuery::new(Some(&"q".repeat(201)), None, None).is_err());
+        for empty in ["", "  "] {
+            assert_eq!(ListQuery::new(None, Some(empty), None).unwrap().after, None);
+        }
         assert_eq!(
             ListQuery::new(None, None, None).unwrap().limit,
             DEFAULT_PAGE

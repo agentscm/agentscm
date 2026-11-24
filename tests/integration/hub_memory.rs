@@ -320,6 +320,38 @@ async fn agents_write_and_read_only_their_own_repository() {
         .agent(Method::GET, "/v1/hub/memory?after=bogus", &maya, None)
         .await;
     assert_eq!(status, 400);
+    // An empty cursor is the first page, as an empty search is no filter.
+    let (status, page) = hub
+        .agent(Method::GET, "/v1/hub/memory?after=&q=", &maya, None)
+        .await;
+    assert_eq!((status, page["live"].as_u64()), (200, Some(1)), "{page}");
+
+    // Line breaks and tabs become one space when stored, so words stay apart.
+    let (status, note) = hub
+        .agent(
+            Method::POST,
+            "/v1/hub/memory",
+            &maya,
+            write("Run the migrations first\nthen\tcargo nextest"),
+        )
+        .await;
+    assert_eq!(
+        (status, note["body"].as_str()),
+        (201, Some("Run the migrations first then cargo nextest"))
+    );
+    let (_, page) = hub
+        .agent(Method::GET, "/v1/hub/memory?q=first%20then", &maya, None)
+        .await;
+    assert_eq!(page["notes"][0]["id"], note["id"]);
+    let (status, _) = hub
+        .agent(
+            Method::DELETE,
+            &format!("/v1/hub/memory/{}", note["id"].as_str().unwrap()),
+            &maya,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
     let (status, page) = hub
         .agent(Method::GET, "/v1/hub/memory?q=NEXTEST", &maya, None)
         .await;
@@ -365,7 +397,7 @@ async fn only_a_signed_in_contributor_promotes() {
         .page(
             &omar,
             Method::GET,
-            &format!("/v1/hub/memory-review?repository={REPO}"),
+            &format!("/v1/hub/memory-review?repository={REPO}&after=%20"),
             false,
         )
         .await;

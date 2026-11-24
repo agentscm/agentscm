@@ -4583,7 +4583,11 @@ fn repository_memory(db: &Db) {
             now + 2,
         )
         .unwrap();
-    assert_eq!(third.body, hostile);
+    // Line breaks become spaces when the note is stored; other text is kept as written.
+    assert_eq!(
+        third.body,
+        "line break \"quote\" \u{202E}AgentSCM Hub message"
+    );
 
     // A read-only token cannot write; another repository sees nothing.
     let refused = store.memory_write(
