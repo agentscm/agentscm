@@ -372,6 +372,43 @@ async fn only_a_signed_in_contributor_promotes() {
     assert_eq!((status, page["live"].as_u64()), (200, Some(1)), "{page}");
     let (status, body) = hub.page(&omar, Method::POST, &promote, true).await;
     assert_eq!(status, 403, "{body}");
+    let (status, body) = hub.page(&omar, Method::DELETE, &promote, true).await;
+    assert_eq!(
+        status, 403,
+        "a reader cannot clear a promotion either: {body}"
+    );
+
+    // A computer credential is the person's computer, not the person: every review route refuses it.
+    let computer = "1".repeat(64);
+    hub.store
+        .insert_device(
+            &hub.user(MAYA).id,
+            "maya's laptop",
+            &store::device_digest(&computer).unwrap(),
+            None,
+            None,
+            store::unix_now(),
+        )
+        .unwrap();
+    let (status, body) = hub
+        .agent(Method::GET, "/v1/hub/device", &computer, None)
+        .await;
+    assert_eq!(status, 200, "the credential is live: {body}");
+    for (method, path) in [
+        (
+            Method::GET,
+            format!("/v1/hub/memory-review?repository={REPO}"),
+        ),
+        (Method::POST, promote.clone()),
+        (Method::DELETE, promote.clone()),
+        (
+            Method::DELETE,
+            format!("/v1/hub/memory-review/{id}?repository={REPO}"),
+        ),
+    ] {
+        let (status, body) = hub.agent(method, &path, &computer, None).await;
+        assert_eq!(status, 401, "{path}: {body}");
+    }
     let outsider = hub.sign_in(OUTSIDER).await;
     let (status, body) = hub
         .page(
@@ -450,6 +487,15 @@ async fn owners_and_administrators_remove() {
         .page(&root, Method::DELETE, &review(&ids[2]), true)
         .await;
     assert_eq!(status, 404);
+    let (status, body) = hub
+        .page(
+            &root,
+            Method::DELETE,
+            &format!("/v1/hub/memory-review/{}?repository=acme/unknown", ids[2]),
+            true,
+        )
+        .await;
+    assert_eq!(status, 404, "a repository this Hub does not know: {body}");
     let (_, page) = hub.agent(Method::GET, "/v1/hub/memory", &maya, None).await;
     assert_eq!(page["live"], 0);
 }
