@@ -2051,16 +2051,17 @@ pub fn render_text(recovery: &WorkRecoveryV1) -> String {
             .map(|remedy| word(&remedy.remedy))
             .collect();
         lines.push(format!(
-            "- {} \"{}\" [{}]: {} You may: {}. (third-party text)",
+            "- {} \"{}\" [{}]: {} You may: {}. ({})",
             work.work_id,
-            super::advice::sanitize(&work.title, 120),
+            super::third_party::ThirdPartyText::new(&work.title, 120),
             word(&work.bucket),
             work.why,
             if permitted.is_empty() {
                 "nothing; ask its lead or owner".to_owned()
             } else {
                 permitted.join(", ")
-            }
+            },
+            super::third_party::THIRD_PARTY_TEXT,
         ));
     }
     for work in &recovery.work {

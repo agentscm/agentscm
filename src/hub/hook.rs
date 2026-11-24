@@ -38,6 +38,7 @@ use super::session::{
 };
 use super::session_waiting::{QuestionSnapshot, WaitReason, Waiting, holder};
 use super::store::{Principal, Store, agent_token_digest, unix_now};
+use super::third_party::{THIRD_PARTY_REPORT, THIRD_PARTY_TEXT, ThirdPartyText};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
 use super::{HubError, HubState};
@@ -652,7 +653,7 @@ async fn hook(
                                 request.responses.first().map_or_else(String::new, |reply| {
                                     let note =
                                         reply.note.as_deref().map_or_else(String::new, |note| {
-                                            format!(": {}", bounded_hook_text(note, 200))
+                                            format!(": {}", ThirdPartyText::new(note, 200))
                                         });
                                     format!(" Reply {}{note}.", response_kind_name(reply.kind))
                                 });
@@ -677,9 +678,9 @@ async fn hook(
                             } else {
                                 &partial_paths
                             };
-                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} (third-party report).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM your coordination request {}: {} ({THIRD_PARTY_REPORT}).{reply}{paths} Read agentscm_coordination_inbox; acknowledge a reply with agentscm_coordination_ack without target_work_id, and resolve or withdraw the request once settled.", request.id, ThirdPartyText::new(&request.proposal.title, 120)));
                         } else {
-                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline (release_paths frees finished files). Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                            outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} ({THIRD_PARTY_REPORT}). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline (release_paths frees finished files). Reading this hook does not acknowledge receipt.", request.id, ThirdPartyText::new(&request.proposal.title, 120)));
                         }
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
@@ -2242,7 +2243,7 @@ fn render_start_summary(
     shared: Option<(&Briefing, &WorkOverview, Option<&CatchupPreview>)>,
     session_notices: &str,
     session_listing: &str,
-    operator_context: &[String],
+    operator_context: &[ThirdPartyText],
 ) -> String {
     let mut lines = shared
         .map(|(_, overview, _)| render_overview(overview))
@@ -2295,9 +2296,9 @@ fn render_overview(overview: &WorkOverview) -> Vec<String> {
         .overlaps
         .iter()
         .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
-        .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
-            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
-            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)))
+        .map(|overlap| format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. ({THIRD_PARTY_TEXT})",
+            ThirdPartyText::new(&overlap.left.title, 80), ThirdPartyText::new(&agent_name(&overlap.left.lead_agent), 64),
+            ThirdPartyText::new(&overlap.right.title, 80), ThirdPartyText::new(&agent_name(&overlap.right.lead_agent), 64)))
         .collect::<Vec<_>>();
     let partial = lines.len() > 5 || !overview.current_complete || !overview.overlaps_complete;
     lines.truncate(5);
@@ -2341,10 +2342,6 @@ fn render_catchup(page: Option<&CatchupPreview>) -> String {
         },
         json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
     )
-}
-
-fn bounded_hook_text(text: &str, max: usize) -> String {
-    super::advice::sanitize(text, max)
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -3401,7 +3398,10 @@ mod tests {
             Some((&briefing, &overview, None)),
             "Important session recovery notice.",
             &"Other session listing.\n".repeat(400),
-            &["😀".repeat(START_CONTEXT)],
+            &[ThirdPartyText::new(
+                &"😀".repeat(START_CONTEXT),
+                START_CONTEXT,
+            )],
         );
         for agent in [Agent::Claude, Agent::Codex] {
             let call = Call::parse(

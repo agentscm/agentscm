@@ -47,13 +47,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
-use super::advice::invisible;
 use super::coordination_http::not_your_agent;
 use super::handoff::Via;
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::login::apps::{Person, PersonReader};
 use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
 use super::store::{AgentToken, Principal, unix_now, validate_repository};
+use super::third_party::invisible;
 use super::{HubError, HubState};
 
 /// A person may be away for hours; the hook's own bound is a little shorter than this.
@@ -698,7 +698,7 @@ impl Default for Requests {
 /// [`MAX_DISPLAY_CHARS`]. Also says what the person would not see of what the machine sent: the
 /// length before a cut, and how many characters were dropped. A dropped character can carry
 /// words that do not show (the Unicode tag block spells ASCII invisibly) while the tool still
-/// receives them.
+/// receives them. Not `ThirdPartyText`: the person's page keeps line breaks and counts what it drops.
 fn sanitize_display(text: &str) -> (String, Option<u64>, u64) {
     let mut dropped = 0;
     let mut kept: String = text

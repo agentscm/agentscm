@@ -40,6 +40,15 @@ impl ThirdPartyText {
         format!("\"{}\"", self.0)
     }
 
+    /// Without leading or trailing whitespace, which cleaning can expose by dropping a hidden
+    /// character next to a space.
+    pub fn trimmed(self) -> Self {
+        match self.0.trim() {
+            trimmed if trimmed.len() == self.0.len() => self,
+            trimmed => Self(trimmed.to_owned()),
+        }
+    }
+
     /// Whether nothing is left after cleaning.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

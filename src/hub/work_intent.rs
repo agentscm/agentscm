@@ -2,8 +2,8 @@
 //! Stores gather facts in one read transaction. Provider freshness remains independent of read time.
 use serde::{Deserialize, Serialize};
 
-use super::advice::sanitize;
 use super::planned_issues::{IssueCoverage, IssueFreshness, IssueIdentity, PlannedIssueSnapshot};
+use super::third_party::ThirdPartyText;
 use super::work::{Checkpoint, ClaimStatus, WorkItem, WorkSource, WorkState, WorkWho};
 use super::work_dependencies::WorkDependencyProjection;
 use super::work_links::WorkPrLinkTarget;
@@ -117,7 +117,7 @@ pub(super) struct IntentFacts<'a> {
 
 fn text(value: &str, chars: usize, cut: &mut bool) -> String {
     *cut |= value.chars().count() > chars;
-    sanitize(value, chars)
+    ThirdPartyText::new(value, chars).to_string()
 }
 fn checkpoint(value: &Checkpoint, seq: Option<i64>, cut: &mut bool) -> IntentCheckpoint {
     IntentCheckpoint {
@@ -198,10 +198,11 @@ fn issue(facts: &IntentFacts<'_>) -> IntentIssue {
             .find(|i| Some(&i.identity) == out.identity.as_ref())
         {
             out.status = IntentIssueStatus::Retained;
-            out.title = Some(sanitize(&issue.title, 200));
+            out.title = Some(ThirdPartyText::new(&issue.title, 200).to_string());
             let excerpt = snapshot.issue_excerpts.get(&issue.identity.number);
-            out.excerpt =
-                excerpt.map(|e| sanitize(&e.text, super::planned_issues::EXCERPT_CHARS + 1));
+            out.excerpt = excerpt.map(|e| {
+                ThirdPartyText::new(&e.text, super::planned_issues::EXCERPT_CHARS + 1).to_string()
+            });
             out.excerpt_complete = excerpt.is_some_and(|e| !e.truncated);
         }
     }
@@ -543,16 +544,16 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                 format!(
                     "{}: why '{}'; decision '{}'; next '{}'; blocker '{}'; waiting-on '{}'; issue '{}'; branch '{}'; scope '{}'; claim {:?}; last check-in {}; more: agentscm_work_intent.",
                     item.work_id,
-                    sanitize(intent.description.as_deref().unwrap_or(&intent.title), 60),
-                    sanitize(
+                    ThirdPartyText::new(intent.description.as_deref().unwrap_or(&intent.title), 60),
+                    ThirdPartyText::new(
                         intent
                             .decisions
                             .first()
                             .map_or("unreported", |d| d.summary.as_str()),
                         60
                     ),
-                    sanitize(intent.next_action.as_deref().unwrap_or("unreported"), 60),
-                    sanitize(
+                    ThirdPartyText::new(intent.next_action.as_deref().unwrap_or("unreported"), 60),
+                    ThirdPartyText::new(
                         intent
                             .blocker
                             .as_ref()
@@ -560,7 +561,7 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                         60
                     ),
                     waiting,
-                    sanitize(
+                    ThirdPartyText::new(
                         intent
                             .issue
                             .title
@@ -568,15 +569,15 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                             .unwrap_or("unavailable or not linked"),
                         60
                     ),
-                    sanitize(intent.branch.as_deref().unwrap_or("unreported"), 60),
-                    sanitize(&intent.scope.join(","), 100),
+                    ThirdPartyText::new(intent.branch.as_deref().unwrap_or("unreported"), 60),
+                    ThirdPartyText::new(&intent.scope.join(","), 100),
                     intent.claim_status,
                     intent.last_checkin_at
                 )
             }
             None => format!("{}: intent unavailable ({}).", item.work_id, item.status),
         };
-        lines.push(sanitize(&line, 900));
+        lines.push(ThirdPartyText::new(&line, 900).to_string());
     }
     lines.join("\n")
 }
