@@ -244,7 +244,8 @@ fn install(
     let profile = pipeline_rules::read_profile_configuration(&profile_path)?;
     let exclusions = pipeline_rules::executable_exclusions(data, &git_repository)?;
     let excluded: Vec<&Path> = exclusions.iter().map(PathBuf::as_path).collect();
-    let git_identity = agentscm::execution::executable::capture(&manifest.git, &excluded)?;
+    let git_identity =
+        agentscm::execution::executable::capture_for_local_cli(&manifest.git, &excluded)?;
     profile.executable_identities(&excluded)?;
     let mut rule = PipelineRule {
         repository: manifest.repository,

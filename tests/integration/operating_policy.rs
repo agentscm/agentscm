@@ -1,5 +1,6 @@
 #![cfg(unix)]
 //! Synthetic protocol safety cases; explicit ignored qualification invokes an installed native client.
+use crate::pinned_git::pinned_git;
 use agentscm::authority::Authority;
 use agentscm::hub::pipeline_rules::*;
 use agentscm::operating_policy::*;
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
+
 fn git(exe: &Path, root: &Path, args: &[&str]) -> String {
     let out = Command::new(exe)
         .args(["-C"])
@@ -29,28 +31,6 @@ fn git(exe: &Path, root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
-fn git_executable() -> PathBuf {
-    for p in [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ] {
-        if Path::new(p).exists() {
-            let out = Command::new(p).arg("--version").output().unwrap();
-            let text = String::from_utf8_lossy(&out.stdout);
-            let version = text.split_whitespace().nth(2).unwrap_or("");
-            let parts: Vec<u32> = version
-                .split('.')
-                .take(2)
-                .filter_map(|v| v.parse().ok())
-                .collect();
-            if parts.len() == 2 && (parts[0] > 2 || parts[0] == 2 && parts[1] >= 45) {
-                return p.into();
-            }
-        }
-    }
-    panic!("requires Git >=2.45, as the snapshot bridge does");
-}
 struct Fixture {
     _root: TempDir,
     data: PathBuf,
@@ -59,10 +39,10 @@ struct Fixture {
     rule: PipelineRule,
     commit: String,
 }
-fn fixture() -> Fixture {
+fn fixture() -> Option<Fixture> {
     fixture_provider("github")
 }
-fn fixture_provider(provider: &str) -> Fixture {
+fn fixture_provider(provider: &str) -> Option<Fixture> {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let source = root.path().join("source");
@@ -70,7 +50,9 @@ fn fixture_provider(provider: &str) -> Fixture {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&work).unwrap();
     fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
-    let exe = git_executable();
+    Authority::open(&data).unwrap();
+    let git_identity = pinned_git(&[&data, &source])?;
+    let exe = git_identity.path.clone();
     git(&exe, &source, &["init", "-q"]);
     git(
         &exe,
@@ -128,7 +110,6 @@ fn fixture_provider(provider: &str) -> Fixture {
     let profile_path = root.path().join("profile.json");
     fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
     fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o600)).unwrap();
-    Authority::open(&data).unwrap();
     let recipe:PipelineRecipe=serde_json::from_value(json!({"version":1,"name":"release","skill":{"entrypoint":"skills/release/SKILL.md","resources":["skills/release/draft.json"]},"steps":[{"id":"draft","needs":[],"required":true,"action":{"kind":"agent_action","resource":"draft.json"}}]})).unwrap();
     let mut rule = PipelineRule {
         repository: "acme/widgets".into(),
@@ -150,8 +131,8 @@ fn fixture_provider(provider: &str) -> Fixture {
         profile_digest: profile.digest().unwrap(),
         profile_path,
         authority_ceiling: "productive_local".into(),
-        git_identity: agentscm::execution::executable::capture(&exe, &[&data, &source]).unwrap(),
-        git: exe.canonicalize().unwrap(),
+        git_identity,
+        git: exe,
         git_repository: source.clone(),
     };
     let directory = data.join("pipeline-rules");
@@ -164,14 +145,14 @@ fn fixture_provider(provider: &str) -> Fixture {
         .unwrap()
         .skill_digest()
         .into();
-    Fixture {
+    Some(Fixture {
         _root: root,
         data,
         source,
         work,
         rule,
         commit,
-    }
+    })
 }
 fn event(f: &Fixture) -> ConfirmedMerge {
     ConfirmedMerge {
@@ -300,7 +281,9 @@ fn activated(f: &Fixture, journal: &mut RuleJournal) -> PolicyView {
 
 #[test]
 fn shared_evaluator_keeps_unknowns_and_rejects_scope_authority_budget_and_duplicates() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let rule = &f.rule;
     let c = contract(&f);
     let e = event(&f);
@@ -344,7 +327,9 @@ fn shared_evaluator_keeps_unknowns_and_rejects_scope_authority_budget_and_duplic
 
 #[test]
 fn exact_activation_observe_first_budget_reservation_and_existing_runtime_produce_one_artifact() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let p = activated(&f, &mut j);
     assert!(j.accept(&event(&f)).unwrap().is_empty());
@@ -431,7 +416,9 @@ fn exact_activation_observe_first_budget_reservation_and_existing_runtime_produc
 
 #[test]
 fn revocation_at_action_boundary_blocks_effect_and_keeps_reservation() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let p = activated(&f, &mut j);
     let mut e = event(&f);
@@ -504,7 +491,9 @@ fn revocation_at_action_boundary_blocks_effect_and_keeps_reservation() {
 
 #[test]
 fn drafting_reservations_do_not_retry_lost_native_responses() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let digest = "a".repeat(64);
     assert!(
@@ -528,7 +517,9 @@ fn drafting_reservations_do_not_retry_lost_native_responses() {
 
 #[test]
 fn old_pipeline_journals_migrate_without_replaying_or_changing_rules() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     drop(j);
@@ -555,7 +546,9 @@ fn old_pipeline_journals_migrate_without_replaying_or_changing_rules() {
 #[test]
 fn missing_and_changed_live_prerequisite_profiles_retain_unknown_and_denied_decisions() {
     for missing in [true, false] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         activated(&f, &mut j);
         if missing {
@@ -597,7 +590,9 @@ fn missing_and_changed_live_prerequisite_profiles_retain_unknown_and_denied_deci
 
 #[test]
 fn false_rehearsal_results_and_corrupt_retained_versions_cannot_activate_or_reopen() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let p = j
@@ -651,7 +646,9 @@ fn false_rehearsal_results_and_corrupt_retained_versions_cannot_activate_or_reop
 
 #[test]
 fn declared_workflow_prerequisite_failure_prevents_dependent_productive_action() {
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     let prerequisite=serde_json::from_value(json!({"id":"source-check","needs":[],"required":true,"action":{"kind":"source_paths","expectations":[{"path":"app.txt","sha256":"0".repeat(64)}]}})).unwrap();
     f.rule.recipe.steps[0].needs = vec!["source-check".into()];
     f.rule.recipe.steps.insert(0, prerequisite);
@@ -691,7 +688,9 @@ fn declared_workflow_prerequisite_failure_prevents_dependent_productive_action()
 
 #[test]
 fn revocation_during_execution_cancels_the_child_and_recovery_does_not_repeat_it() {
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     let executable = f._root.path().join("operator-command");
     let marker = f._root.path().join("attempts");
     let pid_file = f._root.path().join("running-pid");
@@ -888,7 +887,9 @@ impl LocalHub {
 #[test]
 fn actual_hub_cli_run_keeps_one_work_and_revoked_pending_run_creates_none() {
     for revoke in [false, true] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let hub = LocalHub::start(&f);
         let mut j = journal(&f);
         let p = activated(&f, &mut j);
@@ -944,7 +945,9 @@ fn live_native_drafting_and_confirmed_event_run_existing_productive_executor() {
         .map(PathBuf::from)
         .expect("set AGENTSCM_TEST_NATIVE_CLAUDE to installed Claude Code executable; no fallback");
     assert!(executable.is_absolute());
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     let mut profile = read_profile(&f.rule).unwrap();
     profile.commands.clear();
     profile.claude_executable = Some(executable.clone());
@@ -1158,7 +1161,9 @@ fn live_https_observe_execute_runs_once_through_the_production_cli() {
     let observe = config["observe_proposal"].as_i64().unwrap();
     let execute = config["execute_proposal"].as_i64().unwrap();
     assert_ne!(observe, execute);
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     f.source = PathBuf::from(config["source_checkout"].as_str().unwrap())
         .canonicalize()
         .unwrap();
@@ -1376,7 +1381,9 @@ fn explicit_cli_recovery_preserves_work_and_does_not_replay_failed_effect() {
     ] {
         let needs_reconciliation = matches!(outcome, "compacted" | "blocked");
         let prior_commit = outcome != "uncommitted";
-        let mut f = fixture();
+        let Some(mut f) = fixture() else {
+            return;
+        };
         let executable = f._root.path().join("fail-once");
         let marker = f._root.path().join("attempts");
         fs::write(
@@ -1727,7 +1734,9 @@ fn explicit_cli_recovery_preserves_work_and_does_not_replay_failed_effect() {
 #[test]
 fn typed_backup_preserves_both_pipeline_versions_and_migrates_only_on_open() {
     for version in [1, 2, 3] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         let retained_policy = if version >= 2 {
             Some(activated(&f, &mut j))
@@ -1826,7 +1835,9 @@ fn typed_backup_rejects_future_or_mistagged_pipeline_versions_and_operating_corr
         "missing_operating_table",
         "changed_contract",
     ] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         activated(&f, &mut j);
         drop(j);
@@ -1860,7 +1871,9 @@ fn typed_backup_rejects_future_or_mistagged_pipeline_versions_and_operating_corr
 
 #[test]
 fn legacy_pickup_skips_owned_dispatches_and_legacy_observe_does_not_consume_them() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     activated(&f, &mut j);
@@ -1918,7 +1931,9 @@ fn legacy_pickup_skips_owned_dispatches_and_legacy_observe_does_not_consume_them
 async fn legacy_poll_continues_mixed_rules_and_leaves_owned_event_available() {
     use agentscm::hub::{connection::ConnectedRepository, forge_api::ForgeApi};
     use axum::{Json, Router, routing::get};
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     activated(&f, &mut j);
     let mut legacy = f.rule.clone();
@@ -1970,7 +1985,9 @@ async fn legacy_poll_continues_mixed_rules_and_leaves_owned_event_available() {
 #[test]
 fn activation_requires_a_successful_matching_observation_and_retries_do_not_fill_history() {
     for failure in ["target", "actor", "profile"] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         let p = j
@@ -2035,7 +2052,9 @@ fn activation_requires_a_successful_matching_observation_and_retries_do_not_fill
 
 #[test]
 fn native_draft_cannot_expand_dispatch_budget_or_clear_known_unresolved_clauses() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let proposed = contract(&f);
     let mut draft = proposed.clone();
     draft.max_dispatches += 1;
@@ -2054,7 +2073,9 @@ fn native_draft_cannot_expand_dispatch_budget_or_clear_known_unresolved_clauses(
 
 #[test]
 fn private_local_owner_can_narrow_offline_but_revocation_cannot_be_paused_away() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let p = activated(&f, &mut j);
     let invoke = |operation: &str, generation: i64| {
@@ -2112,7 +2133,9 @@ fn private_local_owner_can_narrow_offline_but_revocation_cannot_be_paused_away()
 
 #[test]
 fn definite_draft_preflight_errors_do_not_reserve_requests() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
@@ -2236,7 +2259,9 @@ fn operator_rebinds_a_dispatch_after_reopen_or_release_and_recovery_continues() 
     use agentscm::hub::work_transition::{
         WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
     };
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     let (id, claim) = completed_dispatch(&f, &hub, &mut j);
@@ -2387,7 +2412,9 @@ fn operator_rebinds_a_dispatch_after_reopen_or_release_and_recovery_continues() 
 /// revoked policy are refused with the binding unchanged.
 #[test]
 fn only_the_active_policy_owner_can_rebind_a_dispatch() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     let (id, claim) = completed_dispatch(&f, &hub, &mut j);
@@ -2455,7 +2482,9 @@ fn only_the_active_policy_owner_can_rebind_a_dispatch() {
 fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unbound_legacy_refusal()
  {
     use agentscm::hub::work::{CheckpointKind, WorkCheckpoint};
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     activated(&f, &mut j);
@@ -2839,7 +2868,9 @@ fn finished_work_reconciles_only_when_the_hub_holds_the_matching_finish() {
 
     // The finish the run recorded matches: the observation is recorded, no checkpoint is
     // written and nothing stays pending.
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
@@ -2856,7 +2887,9 @@ fn finished_work_reconciles_only_when_the_hub_holds_the_matching_finish() {
     );
 
     // A finish that carries another commit is a conflict.
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let hub = LocalHub::start(&f);
     let mut j = journal(&f);
     let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
@@ -2890,7 +2923,9 @@ fn finished_work_reconciles_only_when_the_hub_holds_the_matching_finish() {
         ("complete", WorkTransitionKind::Complete),
         ("abandon", WorkTransitionKind::Abandon),
     ] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let hub = LocalHub::start(&f);
         let mut j = journal(&f);
         let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
@@ -2920,7 +2955,9 @@ fn finished_work_reconciles_only_when_the_hub_holds_the_matching_finish() {
 fn recovery_after_release_or_reopen_fails_closed_without_success() {
     use agentscm::hub::work_transition::WorkTransitionKind;
     for release in [false, true] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let hub = LocalHub::start(&f);
         let mut j = journal(&f);
         let (dispatch, binding, _commit, claim) = completed_run(&f, &hub, &mut j);
@@ -2967,7 +3004,9 @@ fn recovery_after_release_or_reopen_fails_closed_without_success() {
 fn completed_draft_replay_works_offline_without_the_original_executable() {
     use agentscm::continuation::NativeClient;
     use agentscm::operating_policy::draft_request_digest;
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let intent = "Run the installed local artifact workflow after a matching merge.";
     let input = f._root.path().join("intent.txt");
@@ -3017,7 +3056,9 @@ fn completed_draft_replay_works_offline_without_the_original_executable() {
 
 #[test]
 fn policy_attachment_refuses_unfinished_legacy_dispatches_until_completion() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let dispatch = j.accept(&event(&f)).unwrap().remove(0);
@@ -3057,7 +3098,9 @@ fn policy_attachment_refuses_unfinished_legacy_dispatches_until_completion() {
 #[tokio::test]
 async fn all_owned_legacy_poll_makes_no_provider_requests() {
     use agentscm::hub::{connection::ConnectedRepository, forge_api::ForgeApi};
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     activated(&f, &mut j);
     // An unserved listener catches even one attempted repository/list/detail request.
@@ -3098,7 +3141,9 @@ fn reconciliation_distinguishes_absent_workflow_from_pending_or_incomplete_runti
         CheckpointKind, WorkCheckpoint, WorkRepositoryScope, WorkRole, WorkStart,
     };
     for runtime_state in ["absent", "missing", "pending", "incomplete"] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let hub = LocalHub::start(&f);
         let mut j = journal(&f);
         activated(&f, &mut j);

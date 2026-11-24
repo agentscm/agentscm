@@ -16,6 +16,9 @@ mod fake_gitlab;
 mod hub_error_assert;
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
+#[cfg(unix)]
+#[path = "common/pinned_git.rs"]
+mod pinned_git;
 #[path = "common/repository_scope.rs"]
 mod repository_scope;
 #[cfg(unix)]
