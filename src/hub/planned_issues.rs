@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::connection::{ConnectedRepository, Connection};
 use super::github::{Gh, GhError, Paged};
+use crate::third_party::ThirdPartyText;
 
 pub const MAX_ISSUE_PAGES: u32 = 3;
 pub const MAX_ISSUES: usize = 300;
@@ -111,7 +112,7 @@ impl PlannedIssueSnapshot {
                     .iter()
                     .any(|issue| issue.identity.number == *number)
                     && excerpt.text.len() <= EXCERPT_CHARS * 4 + 3
-                    && super::advice::sanitize(&excerpt.text, EXCERPT_CHARS + 1) == excerpt.text
+                    && crate::third_party::is_clean(&excerpt.text, EXCERPT_CHARS)
             })
             && self.issues.len() <= MAX_ISSUES
             && self
@@ -132,7 +133,7 @@ impl PlannedIssueSnapshot {
                                 d.len() <= 64
                                     && !d
                                         .chars()
-                                        .any(|c| c.is_control() || super::advice::invisible(c))
+                                        .any(|c| c.is_control() || crate::third_party::invisible(c))
                             })
                     })
             })
@@ -244,7 +245,7 @@ impl PlannedIssueSnapshot {
             };
             let excerpt = match value.get("body") {
                 Some(Value::String(body)) => {
-                    let text = super::advice::sanitize(body, EXCERPT_CHARS);
+                    let text = ThirdPartyText::new(body, EXCERPT_CHARS).to_string();
                     Some(IssueExcerpt {
                         truncated: body.chars().count() > EXCERPT_CHARS,
                         text,
@@ -522,8 +523,7 @@ impl PlannedIssuesView {
 }
 
 fn safe_label(value: &str) -> bool {
-    // `clean`, not `sanitize`: a title stored before the Hub message rewrite must stay valid.
-    !value.is_empty() && super::advice::clean(value, 200) == value
+    !value.is_empty() && crate::third_party::is_clean(value, 200)
 }
 
 fn invalid() -> GhError {
@@ -539,7 +539,7 @@ fn title(value: &Value) -> Gh<String> {
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 4096)
         .ok_or_else(invalid)?;
-    Ok(super::advice::sanitize(value, 200))
+    Ok(ThirdPartyText::new(value, 200).to_string())
 }
 
 #[cfg(test)]

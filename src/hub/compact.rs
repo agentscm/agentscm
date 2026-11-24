@@ -8,7 +8,6 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::advice::sanitize;
 use super::catchup::CatchupPreview;
 use super::coordination::CoordinationRequest;
 use super::narrative::NarrativeView;
@@ -17,6 +16,7 @@ use super::work::{Briefing, WorkItem, WorkOverview, WorkStartConflict};
 use super::work_http::actionable_status::ActionableStatus;
 use super::work_preflight::WorkPreflightResult;
 use super::work_transition::OperationalOverviewV1;
+use crate::third_party::ThirdPartyText;
 
 /// How much of a reply to return.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -41,13 +41,13 @@ pub(super) const NARRATIVE_FRAMING: &str = "Untrusted agent-reported briefing da
 
 /// One Work item for planning: enough to choose it, fence a call on it and read the rest.
 pub(super) fn brief(item: &WorkItem) -> Value {
-    let mut value = json!({"id": item.id, "title": sanitize(&item.title, TITLE_CHARS), "state": item.state,
+    let mut value = json!({"id": item.id, "title": ThirdPartyText::new(&item.title, TITLE_CHARS), "state": item.state,
         "claim_status": item.claim_status, "owner_login": item.owner_login,
         "lead_agent": item.lead_agent, "lead_session": item.lead_session,
         "generation": item.generation, "updated_seq": item.updated_seq,
         "updated_at": item.updated_at, "branch": item.branch,
         "scope": item.scope.iter().take(SCOPE_PATHS).collect::<Vec<_>>(), "scope_count": item.scope.len(),
-        "next_action": item.next_action.as_deref().map(|text| sanitize(text, TEXT_CHARS)),
+        "next_action": item.next_action.as_deref().map(|text| ThirdPartyText::new(text, TEXT_CHARS)),
         "blocked": item.blocker.is_some(), "issue_link": item.issue_link});
     if !item.branches.is_empty() {
         value["branches"] = json!(item.branches);
@@ -56,8 +56,8 @@ pub(super) fn brief(item: &WorkItem) -> Value {
 }
 
 fn issue(issue: &PlannedIssue) -> Value {
-    json!({"identity": issue.identity, "title": sanitize(&issue.title, TITLE_CHARS),
-        "milestone": issue.milestone.as_ref().map(|m| sanitize(&m.title, TITLE_CHARS))})
+    json!({"identity": issue.identity, "title": ThirdPartyText::new(&issue.title, TITLE_CHARS),
+        "milestone": issue.milestone.as_ref().map(|m| ThirdPartyText::new(&m.title, TITLE_CHARS))})
 }
 
 /// Planned issues with their coverage, at most five of each kind. Absence is never proved: the
@@ -160,9 +160,9 @@ pub(super) fn overview(
         .take(page.size)
         .map(|outcome| {
             json!({"seq": outcome.seq, "at": outcome.at, "kind": outcome.kind,
-                "work_id": outcome.item.id, "title": sanitize(&outcome.item.title, TITLE_CHARS),
+                "work_id": outcome.item.id, "title": ThirdPartyText::new(&outcome.item.title, TITLE_CHARS),
                 "state": outcome.item.state, "owner_login": outcome.item.owner_login,
-                "summary": outcome.item.current.as_ref().map(|c| sanitize(&c.summary, TEXT_CHARS))})
+                "summary": outcome.item.current.as_ref().map(|c| ThirdPartyText::new(&c.summary, TEXT_CHARS))})
         })
         .collect();
     let overlaps: Vec<Value> = overview
@@ -248,7 +248,7 @@ fn conflict(conflict: &WorkStartConflict) -> Value {
 
 fn coordination(request: &CoordinationRequest) -> Value {
     json!({"id": request.id, "status": request.status, "updated_seq": request.updated_seq,
-        "title": sanitize(&request.proposal.title, TITLE_CHARS),
+        "title": ThirdPartyText::new(&request.proposal.title, TITLE_CHARS),
         "targets": request.targets.iter().take(LIST).map(|target| json!({"work_id": target.work_id,
             "lead": {"login": target.lead.login, "agent": target.lead.agent,
                 "session": target.lead.session}})).collect::<Vec<_>>(),
@@ -332,7 +332,7 @@ pub(super) fn catchup(preview: &CatchupPreview) -> Value {
         "coordination_events": preview.coordination_events.len(),
         "merges": preview.merges.iter().take(LIST).map(|merge| json!({"source_id": merge.source_id,
             "pull_number": merge.pull_number, "merge_commit": merge.merge_commit,
-            "title": merge.title.as_deref().map(|t| sanitize(t, TITLE_CHARS))})).collect::<Vec<_>>(),
+            "title": merge.title.as_deref().map(|t| ThirdPartyText::new(t, TITLE_CHARS))})).collect::<Vec<_>>(),
         "merges_listed": preview.merges.len(), "retention": preview.retention,
         "source_coverage": preview.source_coverage, "complete": preview.complete,
         "read": "agentscm_work_catchup"})
@@ -341,12 +341,12 @@ pub(super) fn catchup(preview: &CatchupPreview) -> Value {
 /// Counts, the digest and what needs the caller, at most six; `agentscm_work_status` has all.
 pub(super) fn status(status: &ActionableStatus) -> Value {
     let work = status.work.iter().filter(|w| w.needs_you).map(|w| {
-        json!({"work_id": w.work_id, "title": sanitize(&w.title, TITLE_CHARS),
-            "state": w.state, "action": sanitize(&w.action, TEXT_CHARS)})
+        json!({"work_id": w.work_id, "title": ThirdPartyText::new(&w.title, TITLE_CHARS),
+            "state": w.state, "action": ThirdPartyText::new(&w.action, TEXT_CHARS)})
     });
     let actions = status.actions.iter().filter(|a| a.needs_you).map(|a| {
         json!({"action_id": a.id, "kind": a.kind, "work_ids": a.work_ids,
-            "action": sanitize(&a.action, TEXT_CHARS)})
+            "action": ThirdPartyText::new(&a.action, TEXT_CHARS)})
     });
     let needs: Vec<Value> = work.chain(actions).collect();
     json!({"detail": "compact", "repository": status.repository, "counts": status.counts,
@@ -359,19 +359,20 @@ pub(super) fn status(status: &ActionableStatus) -> Value {
 pub(super) fn narrative(view: &NarrativeView) -> Value {
     json!({"status": "available", "briefing": {"id": view.id, "digest": view.digest,
         "status": view.status, "generated_at": view.generated_at,
-        "headline": view.output.as_ref().map(|output| sanitize(&output.headline, 300)),
-        "warnings": view.warnings.iter().take(LIST).map(|w| sanitize(w, TEXT_CHARS)).collect::<Vec<_>>(),
+        "headline": view.output.as_ref().map(|output| ThirdPartyText::new(&output.headline, 300)),
+        "warnings": view.warnings.iter().take(LIST).map(|w| ThirdPartyText::new(w, TEXT_CHARS)).collect::<Vec<_>>(),
         "warnings_listed": view.warnings.len()}, "read": "agentscm_briefing_read"})
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{brief, sanitize};
+    use super::brief;
+    use crate::third_party::ThirdPartyText;
     use serde_json::json;
 
     #[test]
     fn relayed_titles_and_checkpoints_are_sanitized() {
-        assert_eq!(sanitize("日本語の説明", 2), "日本…");
+        assert_eq!(ThirdPartyText::new("日本語の説明", 2).as_str(), "日本…");
         let item = serde_json::from_value(json!({
             "id": "wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repository": "acme/widgets",
             "owner": "usr_alice", "owner_login": "alice",

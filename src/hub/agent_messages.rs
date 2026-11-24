@@ -70,8 +70,8 @@ const MAX_SESSIONS: usize = 1024;
 const PER_DELIVERY: usize = 3;
 /// A delivered message still unanswered after this long is offered again.
 const REOFFER_SECS: i64 = 60;
-/// The words that open every delivered message; relayed third-party text never contains them
-/// (`advice::sanitize`).
+/// The words that open every delivered message; relayed prose never carries them as words
+/// (`ThirdPartyText::new`).
 pub const FRAME: &str = "AgentSCM Hub message";
 /// Longest a session's background hook waits in one request; under the Hub's 30-second bound.
 pub const WAIT_SECS: u64 = 25;
@@ -885,8 +885,8 @@ fn mode_word(mode: Mode) -> &'static str {
 /// A person's note as an agent reads it, JSON-quoted. Line breaks stay, and a line or paragraph
 /// separator becomes one; other invisible characters, which could hide or reorder words, are
 /// dropped when it is shown, so notes stored earlier are covered too. Emoji joined by a
-/// zero-width joiner show unjoined.
-// ponytail: the joiner goes with the other invisibles; upgrade: keep U+200D between two emoji.
+/// zero-width joiner show unjoined and variation selectors are dropped, as in all relayed text
+/// (`third_party::invisible`, `third_party::hidden`); the emoji stay readable.
 fn shown_note(note: &str) -> String {
     let note: String = note
         .chars()
@@ -897,7 +897,11 @@ fn shown_note(note: &str) -> String {
                 c
             }
         })
-        .filter(|c| !crate::third_party::invisible(*c) && (*c == '\n' || !c.is_control()))
+        .filter(|c| {
+            !crate::third_party::invisible(*c)
+                && !crate::third_party::hidden(*c)
+                && (*c == '\n' || !c.is_control())
+        })
         .collect();
     serde_json::to_string(&note).unwrap_or_default()
 }
@@ -1122,7 +1126,8 @@ fn request_wake(
     elsewhere: bool,
     now: i64,
 ) -> Result<Option<String>> {
-    use super::advice::{agent_name, ascii_name, sanitize};
+    use super::advice::{agent_name, ascii_name};
+    use crate::third_party::ThirdPartyText;
     let inbox = store.coordination_inbox(
         &principal.token_id,
         &CoordinationInboxQuery {
@@ -1162,7 +1167,7 @@ fn request_wake(
             let mut files = target
                 .reasons
                 .iter()
-                .map(|reason| sanitize(&reason.your_path, 100))
+                .map(|reason| ThirdPartyText::name(&reason.your_path, 100).to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
             if files.is_empty() {
@@ -1171,7 +1176,7 @@ fn request_wake(
             // The session reads this in another repository's context, where its calls go to
             // that repository unless they name this one's checkout.
             let (place, root) = if elsewhere {
-                let repository = sanitize(&principal.repository, 140);
+                let repository = ThirdPartyText::name(&principal.repository, 140);
                 (
                     format!(" in {repository}"),
                     format!(
@@ -1897,12 +1902,14 @@ struct SendBody {
 }
 
 fn checked_note(note: &str) -> Result<()> {
-    if note.trim().is_empty()
-        || note.len() > MAX_NOTE_BYTES
+    // A note of nothing but hidden characters would be shown empty.
+    if note.chars().all(|c| {
+        c.is_whitespace() || crate::third_party::invisible(c) || crate::third_party::hidden(c)
+    }) || note.len() > MAX_NOTE_BYTES
         || note.chars().any(|c| c.is_control() && c != '\n')
     {
         return Err(HubError::Invalid(format!(
-            "note must be 1..={MAX_NOTE_BYTES} bytes without control characters"
+            "note must be 1..={MAX_NOTE_BYTES} bytes with visible text and without control characters"
         )));
     }
     Ok(())
@@ -3500,6 +3507,9 @@ mod tests {
     fn notes_are_bounded() {
         assert!(checked_note("ok\nsecond line").is_ok());
         assert!(checked_note(" ").is_err());
+        // Nothing would be shown of a note of hidden characters, so it is refused when sent.
+        assert!(checked_note("\u{200B}\u{202E} \u{FE0F}\u{3164}").is_err());
+        assert!(checked_note("ok \u{2764}\u{FE0F}").is_ok());
         assert!(checked_note("a\u{7}").is_err());
         assert!(checked_note(&"a".repeat(MAX_NOTE_BYTES + 1)).is_err());
     }

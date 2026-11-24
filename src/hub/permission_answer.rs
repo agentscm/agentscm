@@ -844,7 +844,9 @@ impl Requests {
         missing.unshown = missing
             .unshown
             .iter()
-            .map(|name| super::advice::sanitize(name.trim(), MAX_UNSHOWN_CHARS))
+            .map(|name| {
+                crate::third_party::ThirdPartyText::name(name.trim(), MAX_UNSHOWN_CHARS).to_string()
+            })
             .map(|name| {
                 if name.is_empty() {
                     UNREADABLE_NAME.to_owned()
@@ -857,8 +859,10 @@ impl Requests {
         missing.dropped = dropped;
         // Labels beside the display: one clean line each, dropped when nothing is left.
         let label = |text: Option<String>| {
-            text.map(|text| super::advice::sanitize(text.trim(), MAX_LABEL_CHARS))
-                .filter(|text| !text.is_empty())
+            text.map(|text| {
+                crate::third_party::ThirdPartyText::new(text.trim(), MAX_LABEL_CHARS).to_string()
+            })
+            .filter(|text| !text.is_empty())
         };
         let (summary, folder) = (label(summary), label(folder));
         let mut inner = self.lock()?;

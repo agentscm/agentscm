@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 
 use super::conflicts::capture;
 use super::{ActionableStatus, RecipientKind, StatusAction, StatusRecipient, StatusWork};
-use crate::hub::advice::sanitize;
 use crate::hub::intent::{key_of, overlaps};
 use crate::hub::store::{
     ForgeIdentity, Principal, Store, lower_hex_of, principal_scope, session_key,
@@ -16,6 +15,7 @@ use crate::hub::store::{
 use crate::hub::work::{CheckpointKind, ClaimStatus, WorkItem};
 use crate::hub::{HubError, Result};
 use crate::skill_workflow::supported::{self, RunState};
+use crate::third_party::ThirdPartyText;
 
 /// The signed local-validation attestation status.
 const LOCAL_VALIDATION: &str = "agentscm/local-validation";
@@ -385,8 +385,15 @@ fn held_merges(
             });
             blockers.push(Blocker {
                 number: *other,
-                login: sanitize(pr["author"]["login"].as_str().unwrap_or("unknown"), 40),
-                files: shared.iter().map(|f| sanitize(f, 160)).collect(),
+                login: ThirdPartyText::name(
+                    pr["author"]["login"].as_str().unwrap_or("unknown"),
+                    40,
+                )
+                .to_string(),
+                files: shared
+                    .iter()
+                    .map(|f| ThirdPartyText::name(f, 160).to_string())
+                    .collect(),
                 active_at: pr["updated_at"]
                     .as_str()
                     .and_then(crate::hub::github::parse_rfc3339),
@@ -711,9 +718,9 @@ pub(super) fn read(
                 (recipients, work_ids),
                 format!(
                     "{} is at its {gate} gate on branch {} and the agent that recorded it has stopped: {}",
-                    sanitize(&view.skill.name, 64),
-                    sanitize(&view.branch, 160),
-                    sanitize(&view.next_action, 400)
+                    ThirdPartyText::name(&view.skill.name, 64),
+                    ThirdPartyText::name(&view.branch, 160),
+                    ThirdPartyText::new(&view.next_action, 400)
                 ),
                 semantic,
                 viewer,

@@ -6,13 +6,12 @@
 //! Nothing is written. A count covers only the history that was read: a period that starts
 //! before the oldest retained event, or holds more events than one digest reads, is reported
 //! as incomplete with the time the counts start at, never as zero. Work titles, branch names,
-//! paths and logins are other people's text, bounded and cleaned with [`sanitize`].
+//! paths and logins are other people's text, bounded and cleaned as [`ThirdPartyText`] (titles as prose, the rest as names).
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::advice::sanitize;
 use super::intent::{Intent, key_of, overlaps};
 use super::store::{ActivityEvent, Principal, Store};
 use super::viewer::Viewer;
@@ -24,6 +23,7 @@ use super::work_lifecycle::{
 use super::work_recovery::{MAX_RECOVERY_PAGE, RecoveryRead};
 use super::work_transition::WorkLifecycleReader;
 use super::{HubError, Result};
+use crate::third_party::ThirdPartyText;
 
 pub const DIGEST_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_DAYS: u32 = 7;
@@ -177,7 +177,7 @@ pub fn read(
     let live = store.live_intents_scoped(who, now, MAX_LIVE_INTENTS)?;
     Ok(WorkDigestV1 {
         schema_version: DIGEST_SCHEMA_VERSION,
-        repository: sanitize(&who.repository, PATH_CHARS),
+        repository: ThirdPartyText::name(&who.repository, PATH_CHARS).to_string(),
         days: query.days,
         since,
         until: now,
@@ -251,11 +251,11 @@ fn stale(store: &dyn Store, who: &Principal, now: i64) -> Result<StaleWork> {
             };
             found.push(StaleItem {
                 work_id: item.id.clone(),
-                title: sanitize(&item.title, TITLE_CHARS),
+                title: ThirdPartyText::new(&item.title, TITLE_CHARS).to_string(),
                 branch: item
                     .branch
                     .as_deref()
-                    .map(|branch| sanitize(branch, PATH_CHARS)),
+                    .map(|branch| ThirdPartyText::name(branch, PATH_CHARS).to_string()),
                 state: item.state,
                 quiet_since,
                 merged: view.merge.status,
@@ -375,7 +375,7 @@ fn strings(value: &Value, max_chars: usize) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(|text| sanitize(text, max_chars))
+        .map(|text| ThirdPartyText::name(text, max_chars).to_string())
         .collect()
 }
 
@@ -401,7 +401,7 @@ pub(super) fn collisions(
         .iter()
         .map(|intent| {
             let holder = (
-                sanitize(&intent.owner.login, NAME_CHARS),
+                ThirdPartyText::name(&intent.owner.login, NAME_CHARS).to_string(),
                 Some(intent.created_at),
             );
             (intent.id.as_str(), holder)
@@ -414,7 +414,12 @@ pub(super) fn collisions(
         if kind == "intent_announced" {
             starts
                 .entry(event.event.subject.as_str())
-                .or_insert_with(|| (sanitize(&event.owner, NAME_CHARS), Some(event.event.at)));
+                .or_insert_with(|| {
+                    (
+                        ThirdPartyText::name(&event.owner, NAME_CHARS).to_string(),
+                        Some(event.event.at),
+                    )
+                });
             continue;
         }
         if !matches!(kind, "edit_denied" | "edit_repeated" | "handoff_request") {
@@ -435,7 +440,7 @@ pub(super) fn collisions(
                 for path in paths {
                     asked.insert(
                         (event.token.as_str(), session.clone(), path),
-                        sanitize(login, NAME_CHARS),
+                        ThirdPartyText::name(login, NAME_CHARS).to_string(),
                     );
                 }
             }
@@ -444,7 +449,7 @@ pub(super) fn collisions(
         edits.push(Edit {
             at: event.event.at,
             token: &event.token,
-            owner: sanitize(&event.owner, NAME_CHARS),
+            owner: ThirdPartyText::name(&event.owner, NAME_CHARS).to_string(),
             session,
             paths,
             holders: strings(&data["holders"], NAME_CHARS),
@@ -557,7 +562,7 @@ pub(super) fn collisions(
         .sort_by(|a, b| (b.refused + b.repeated, &a.path).cmp(&(a.refused + a.repeated, &b.path)));
     let hot_paths_complete = hot_paths.len() <= MAX_LISTED;
     hot_paths.truncate(MAX_LISTED);
-    let you = sanitize(you, NAME_CHARS);
+    let you = ThirdPartyText::name(you, NAME_CHARS).to_string();
     let mut pairs: Vec<CollidingPair> = pairs
         .into_iter()
         .filter(|(_, collisions)| *collisions >= PAIR_COLLISIONS)

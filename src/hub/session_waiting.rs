@@ -735,7 +735,10 @@ impl Waiting {
                 since,
                 asker: asker.map(str::to_owned),
                 asks: asks
-                    .map(|text| super::advice::sanitize(text.trim(), MAX_ASKS_CHARS))
+                    .map(|text| {
+                        crate::third_party::ThirdPartyText::new(text.trim(), MAX_ASKS_CHARS)
+                            .to_string()
+                    })
                     .filter(|text| !text.is_empty())
                     .or(said),
                 person,
@@ -939,7 +942,10 @@ impl Waiting {
                         asks: question
                             .asks
                             .as_deref()
-                            .map(|text| super::advice::sanitize(text.trim(), MAX_ASKS_CHARS))
+                            .map(|text| {
+                                crate::third_party::ThirdPartyText::new(text.trim(), MAX_ASKS_CHARS)
+                                    .to_string()
+                            })
                             .filter(|text| !text.is_empty()),
                         person: kept_by == principal.owner.id,
                         noticed: false,

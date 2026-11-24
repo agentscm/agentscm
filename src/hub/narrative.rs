@@ -1367,7 +1367,7 @@ fn compact_paths(paths: &[String], shortened: &mut bool) -> Vec<String> {
 fn safe(input: &str, max_bytes: usize, shortened: &mut bool) -> String {
     let mut output = String::new();
     for character in input.chars() {
-        if character.is_control() || super::advice::invisible(character) {
+        if character.is_control() || crate::third_party::invisible(character) {
             *shortened = true;
             continue;
         }
@@ -1449,7 +1449,7 @@ fn validate_prose(name: &str, value: &str, max_bytes: usize) -> Result<()> {
 fn unsafe_text(value: &str) -> bool {
     value
         .chars()
-        .any(|character| character.is_control() || super::advice::invisible(character))
+        .any(|character| character.is_control() || crate::third_party::invisible(character))
 }
 
 fn cache_inconsistent() -> HubError {

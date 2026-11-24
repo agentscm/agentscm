@@ -1318,7 +1318,7 @@ fn branch_advisory_at(
             .map(|peer| {
                 format!(
                     "{} [{} {}, fork {}]",
-                    agentscm::hub::advice::sanitize(&peer.name, 120),
+                    agentscm::third_party::ThirdPartyText::name(&peer.name, 120),
                     peer.kind,
                     peer.commit,
                     peer.fork.as_deref().unwrap_or("uncommitted"),
@@ -1328,7 +1328,7 @@ fn branch_advisory_at(
             .join(", ");
         lines.push(format!(
             "{}: {peers}",
-            agentscm::hub::advice::sanitize(&edit.path, 160)
+            agentscm::third_party::ThirdPartyText::name(&edit.path, 160)
         ));
         if lines.len() == 3 {
             break;
@@ -1375,7 +1375,7 @@ fn unmerged(_: &Path, _: &[EditPath], _: Instant) -> Vec<String> {
 fn conflict_note(paths: &[String]) -> String {
     let paths: Vec<String> = paths
         .iter()
-        .map(|path| agentscm::hub::advice::sanitize(path, 160))
+        .map(|path| agentscm::third_party::ThirdPartyText::name(path, 160).to_string())
         .collect();
     format!(
         "AgentSCM: unresolved Git conflict in {} in this checkout, so this edit was not checked against other agents' holds and holds nothing. Change only what resolves the conflict; the normal check returns once Git no longer reports the path as unmerged.",
