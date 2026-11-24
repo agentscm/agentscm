@@ -2,6 +2,12 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.8.1](https://github.com/agentscm/agentscm/compare/v0.8.0...v0.8.1) - 2026-11-24
+
+### Fixed
+
+- *(tools)* Drop a queued heavy job whose checkout is gone or unreadable ([#679](https://github.com/agentscm/agentscm/pull/679))
+
 ## [0.8.0](https://github.com/agentscm/agentscm/compare/v0.7.0...v0.8.0) - 2026-11-22
 
 ### Added
