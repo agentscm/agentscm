@@ -281,6 +281,7 @@ mod quickstart;
 mod repo_explorer_evidence;
 #[cfg(unix)]
 mod repo_explorer_git;
+mod reservation_replay;
 #[cfg(unix)]
 mod reviewer;
 #[cfg(unix)]
