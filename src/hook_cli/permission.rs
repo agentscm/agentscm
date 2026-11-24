@@ -440,7 +440,7 @@ fn summary(tool: &str, input: &Value) -> String {
 }
 
 /// A label as it leaves the machine: one line, secrets redacted like the display's, at most
-/// `max` characters.
+/// `max` characters. Not `ThirdPartyText`: it runs on the client and redacts secrets.
 fn one_line(text: &str, max: usize) -> String {
     let mut line = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
     redact_json(&mut line);

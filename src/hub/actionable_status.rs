@@ -21,6 +21,7 @@ use crate::hub::work_reconcile::{WorkStage, WorkStageV1};
 use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
+use crate::third_party::ThirdPartyText;
 
 #[path = "actionable_checks.rs"]
 mod checks;
@@ -571,7 +572,7 @@ fn project_work_staged(
                 |blocker| {
                     format!(
                         "Resolve the handover's reported blocker: {}",
-                        crate::hub::advice::sanitize(&blocker.summary, 240)
+                        ThirdPartyText::new(&blocker.summary, 240)
                     )
                 },
             )
@@ -1356,12 +1357,14 @@ fn waiting_actions_with_terminal(
     Ok((actions, waiting.complete))
 }
 
-/// Deterministic text used by agent-facing clients; generated prose is optional.
+/// Deterministic text used by agent-facing clients; generated prose is optional. The login and
+/// agent name are third-party names, cleaned and kept as written.
 pub fn recipient_label(recipient: &StatusRecipient) -> String {
     match (&recipient.login, recipient.kind) {
-        (Some(login), RecipientKind::Person) => login.clone(),
+        (Some(login), RecipientKind::Person) => ThirdPartyText::name(login, 64).to_string(),
         (Some(login), RecipientKind::LeadAgent) => format!(
-            "{login}’s {}",
+            "{}’s {}",
+            ThirdPartyText::name(login, 64),
             recipient
                 .agent
                 .as_deref()
@@ -1392,7 +1395,7 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
     let c = &status.counts;
     let mut lines = vec![format!(
         "{}: {} active, {} awaiting a named party, {} blocked, {} reassessment needed; {} actions need you.",
-        status.repository,
+        ThirdPartyText::name(&status.repository, 200),
         c.active,
         c.awaiting_party,
         c.blocked,
@@ -1441,8 +1444,8 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
         };
         lines.push(format!(
             "- {} [{state}; {}{claim}{stage}]: {}",
-            crate::hub::advice::sanitize(&row.title, 80),
-            crate::hub::advice::sanitize(&recipient_label(&row.recipient), 64),
+            ThirdPartyText::new(&row.title, 80),
+            ThirdPartyText::name(&recipient_label(&row.recipient), 64),
             crate::hub::advice::sanitize(&row.action, 160)
         ));
     }
@@ -1478,7 +1481,7 @@ pub fn render_text(status: &ActionableStatus) -> String {
     let c = &status.counts;
     let mut lines = vec![format!(
         "{}: {} active, {} awaiting a named party, {} blocked, {} reassessment needed; {} actions need you.",
-        status.repository,
+        ThirdPartyText::name(&status.repository, 200),
         c.active,
         c.awaiting_party,
         c.blocked,
@@ -1493,10 +1496,13 @@ pub fn render_text(status: &ActionableStatus) -> String {
             StatusState::ReassessmentNeeded => "reassessment needed",
             StatusState::Retired => "retired",
         };
-        let recipient = recipient_label(&row.recipient);
         lines.push(format!(
             "{} [{}; {}; reservation {:?}]: {}",
-            row.title, state, recipient, row.operational.reservation.status, row.action
+            ThirdPartyText::new(&row.title, 120),
+            state,
+            recipient_label(&row.recipient),
+            row.operational.reservation.status,
+            row.action
         ));
         let stage = row.stage.as_ref().map_or_else(String::new, |s| {
             let words = match (s.stage, s.pull_request) {
@@ -1522,8 +1528,8 @@ pub fn render_text(status: &ActionableStatus) -> String {
             for source in &r.current_source_coverage {
                 lines.push(format!(
                     "  Provider source {}: {}; checked {} ({} unread pages, {} deferred).",
-                    source.source,
-                    source.state,
+                    ThirdPartyText::name(&source.source, 64),
+                    ThirdPartyText::name(&source.state, 64),
                     source.checked_at_seconds,
                     source.unread_pages,
                     source.deferred

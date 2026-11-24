@@ -621,6 +621,8 @@ pub fn valid_correlation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// Error text for a log or reply, with credentials redacted and terminal escapes removed. Not
+/// `ThirdPartyText`: it redacts and keeps more of the text, for an operator to read.
 pub fn sanitize(text: &str) -> String {
     sanitize_text(text, true)
 }

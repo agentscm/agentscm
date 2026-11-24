@@ -2,7 +2,6 @@
 //! Stores gather facts in one read transaction. Provider freshness remains independent of read time.
 use serde::{Deserialize, Serialize};
 
-use super::advice::sanitize;
 use super::planned_issues::{IssueCoverage, IssueFreshness, IssueIdentity, PlannedIssueSnapshot};
 use super::work::{Checkpoint, ClaimStatus, WorkItem, WorkSource, WorkState, WorkWho};
 use super::work_dependencies::WorkDependencyProjection;
@@ -10,6 +9,7 @@ use super::work_links::WorkPrLinkTarget;
 use super::work_reconciliation::{
     ConditionState, DeclaredPrLink, PrerequisiteRequirement, WorkDeclarationsView,
 };
+use crate::third_party::ThirdPartyText;
 
 pub const MAX_INTENT_BYTES: usize = 64 * 1024;
 pub const MAX_DECISIONS: usize = 5;
@@ -117,7 +117,13 @@ pub(super) struct IntentFacts<'a> {
 
 fn text(value: &str, chars: usize, cut: &mut bool) -> String {
     *cut |= value.chars().count() > chars;
-    sanitize(value, chars)
+    ThirdPartyText::new(value, chars).to_string()
+}
+
+/// [`text`] for a path, branch or id, which the reader may pass back.
+fn name(value: &str, chars: usize, cut: &mut bool) -> String {
+    *cut |= value.chars().count() > chars;
+    ThirdPartyText::name(value, chars).to_string()
 }
 fn checkpoint(value: &Checkpoint, seq: Option<i64>, cut: &mut bool) -> IntentCheckpoint {
     IntentCheckpoint {
@@ -198,10 +204,11 @@ fn issue(facts: &IntentFacts<'_>) -> IntentIssue {
             .find(|i| Some(&i.identity) == out.identity.as_ref())
         {
             out.status = IntentIssueStatus::Retained;
-            out.title = Some(sanitize(&issue.title, 200));
+            out.title = Some(ThirdPartyText::new(&issue.title, 200).to_string());
             let excerpt = snapshot.issue_excerpts.get(&issue.identity.number);
-            out.excerpt =
-                excerpt.map(|e| sanitize(&e.text, super::planned_issues::EXCERPT_CHARS + 1));
+            out.excerpt = excerpt.map(|e| {
+                ThirdPartyText::new(&e.text, super::planned_issues::EXCERPT_CHARS + 1).to_string()
+            });
             out.excerpt_complete = excerpt.is_some_and(|e| !e.truncated);
         }
     }
@@ -247,9 +254,9 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .scope
             .iter()
             .take(MAX_SCOPE)
-            .map(|s| text(s, 256, &mut cut))
+            .map(|s| name(s, 256, &mut cut))
             .collect(),
-        branch: item.branch.as_deref().map(|s| text(s, 200, &mut cut)),
+        branch: item.branch.as_deref().map(|s| name(s, 200, &mut cut)),
         pr_link: facts.declared.compatibility_link.clone(),
         pr_links: facts
             .declared
@@ -258,7 +265,7 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .into_iter()
             .take(MAX_RELATIONSHIPS)
             .map(|mut link| {
-                link.id = text(&link.id, 100, &mut cut);
+                link.id = name(&link.id, 100, &mut cut);
                 link
             })
             .collect(),
@@ -268,7 +275,7 @@ pub(super) fn project(facts: IntentFacts<'_>) -> super::Result<WorkIntentV1> {
             .into_iter()
             .take(MAX_RELATIONSHIPS)
             .map(|d| IntentPrerequisite {
-                id: text(&d.condition.id, 100, &mut cut),
+                id: name(&d.condition.id, 100, &mut cut),
                 work_id: d.condition.requirement.work_id().to_owned(),
                 target: match d.condition.requirement {
                     PrerequisiteRequirement::MergedPullRequest { target, .. } => Some(target),
@@ -543,16 +550,16 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                 format!(
                     "{}: why '{}'; decision '{}'; next '{}'; blocker '{}'; waiting-on '{}'; issue '{}'; branch '{}'; scope '{}'; claim {:?}; last check-in {}; more: agentscm_work_intent.",
                     item.work_id,
-                    sanitize(intent.description.as_deref().unwrap_or(&intent.title), 60),
-                    sanitize(
+                    ThirdPartyText::new(intent.description.as_deref().unwrap_or(&intent.title), 60),
+                    ThirdPartyText::new(
                         intent
                             .decisions
                             .first()
                             .map_or("unreported", |d| d.summary.as_str()),
                         60
                     ),
-                    sanitize(intent.next_action.as_deref().unwrap_or("unreported"), 60),
-                    sanitize(
+                    ThirdPartyText::new(intent.next_action.as_deref().unwrap_or("unreported"), 60),
+                    ThirdPartyText::new(
                         intent
                             .blocker
                             .as_ref()
@@ -560,7 +567,7 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                         60
                     ),
                     waiting,
-                    sanitize(
+                    ThirdPartyText::new(
                         intent
                             .issue
                             .title
@@ -568,15 +575,16 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                             .unwrap_or("unavailable or not linked"),
                         60
                     ),
-                    sanitize(intent.branch.as_deref().unwrap_or("unreported"), 60),
-                    sanitize(&intent.scope.join(","), 100),
+                    ThirdPartyText::name(intent.branch.as_deref().unwrap_or("unreported"), 60),
+                    ThirdPartyText::name(&intent.scope.join(","), 100),
                     intent.claim_status,
                     intent.last_checkin_at
                 )
             }
             None => format!("{}: intent unavailable ({}).", item.work_id, item.status),
         };
-        lines.push(sanitize(&line, 900));
+        // Each part is already cleaned; this bounds the line and keeps the paths in it as written.
+        lines.push(ThirdPartyText::name(&line, 900).to_string());
     }
     lines.join("\n")
 }
