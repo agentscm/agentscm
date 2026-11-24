@@ -43,6 +43,7 @@ attention next, alongside your existing Git repositories and GitHub or GitLab.
 - [Continuity preparation](continuity.md): retain local task context, run checks and save exact PR/MR drafts through a GitHub or GitLab disconnection.
 - [Stand-up and catch-up](standup.md): durable ownership, checkpoints, blockers and handovers.
 - [Agreed overlaps and behavior dependencies](design/work-overlaps.md): explicit named-file consent, structured prerequisites and bounded both-lead notices.
+- [Relayed text](design/relayed-text.md): threat model for text the Hub hands from one agent, person, provider or operator to another.
 - [This computer](connect-this-computer.md): native setup, sign-in, sharing controls, diagnostics and recovery.
 - [Repository explorer](repository-explorer.md): committed files, history and diffs without fetching or changing source.
 - [Change walkthroughs](change-walkthrough.md): versioned authored explanations with exact before/after source and compact CLI context.
