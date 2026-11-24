@@ -39,6 +39,7 @@ mod lead_credential;
 pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;
+pub mod memory;
 pub mod merged_holds;
 pub mod narrative;
 pub mod notices;
