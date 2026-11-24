@@ -62,7 +62,13 @@ pub const fn landing() -> &'static str {
 
 #[cfg(not(feature = "ui"))]
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new().route(
+    // `hub login` sends the browser to `/#/signed-in?…`; the fragment survives this redirect.
+    Router::new()
+        .route(
+            "/",
+            get(|| async { (axum::http::StatusCode::FOUND, [(header::LOCATION, "/auth/complete/")]) }),
+        )
+        .route(
         "/auth/complete/",
         get(|| async {
             (
@@ -217,5 +223,21 @@ mod tests {
             get("/ui/", Some("\"stale\"")).await.status(),
             StatusCode::OK
         );
+    }
+}
+
+#[cfg(all(test, not(feature = "ui")))]
+mod headless_tests {
+    use super::*;
+    use tower_service::Service;
+
+    #[tokio::test]
+    async fn the_root_sends_the_browser_to_the_landing_page() {
+        let request = axum::extract::Request::get("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let reply = routes::<()>().call(request).await.unwrap();
+        assert_eq!(reply.status(), axum::http::StatusCode::FOUND);
+        assert_eq!(reply.headers()[header::LOCATION], "/auth/complete/");
     }
 }

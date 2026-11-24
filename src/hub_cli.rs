@@ -1419,8 +1419,9 @@ async fn loopback_login(
         .map_err(|_| invalid("sign-in wait failed"))??;
     let code = match returned {
         Returned::Code(code) => code,
-        Returned::Refused(_kind, message) => {
-            let _ = tokio::task::spawn_blocking(move || complete_browser(browser, false)).await;
+        Returned::Refused(kind, message) => {
+            let location = result_page(hub, None, &kind);
+            let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
             return Err(invalid(if message.is_empty() {
                 "The Hub refused the sign-in; run it again"
             } else {
@@ -1438,28 +1439,57 @@ async fn loopback_login(
         let body = json!({"code": code, "verifier": verifier});
         reply = call(client, Method::POST, &url, None, Some(body)).await;
     }
-    // Finish in the existing callback; a headless Hub has no dashboard to redirect to.
-    let signed_in = matches!(&reply, Ok((200, _)));
-    let _ = tokio::task::spawn_blocking(move || complete_browser(browser, signed_in)).await;
+    // The browser lands on the Hub's own page saying who signed in, or why not.
+    let location = match &reply {
+        Ok((200, signed)) => result_page(hub, Some(signed), ""),
+        Ok((_, refused)) => result_page(hub, None, refused["error"].as_str().unwrap_or("")),
+        Err(_) => result_page(hub, None, ""),
+    };
+    let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
     match reply? {
         (200, signed) => Ok(signed),
         (_, refused) => Err(sign_in_failed(&refused)),
     }
 }
 
-fn complete_browser(mut stream: std::net::TcpStream, signed_in: bool) {
-    let message = if signed_in {
-        "Sign-in accepted. Return to your terminal to finish setup. You can close this window."
-    } else {
-        "Sign-in did not finish. Return to your terminal for the reason and next step."
-    };
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>AgentSCM sign-in</title><h1>AgentSCM sign-in</h1><p>{message}</p></html>"
-    );
+/// The Hub page that shows how `hub login` ended: `/#/signed-in?…`. A hosted Hub's UI and a
+/// UI build (`/` → `/ui/`) render it; a headless Hub sends `/` to its plain landing page.
+/// A refusal carries only its reason code: anyone can forge the link, so the page words it.
+fn result_page(hub: &str, signed: Option<&Value>, reason: &str) -> String {
+    let mut page = reqwest::Url::parse("http://page.invalid/").expect("static URL");
+    {
+        let mut pairs = page.query_pairs_mut();
+        match signed {
+            Some(signed) => {
+                pairs.append_pair("status", "signed_in");
+                for (key, value) in [
+                    ("login", &signed["user"]["login"]),
+                    ("provider", &signed["user"]["provider"]),
+                    ("computer", &signed["device"]["name"]),
+                ] {
+                    if let Some(value) = value.as_str() {
+                        pairs.append_pair(key, value);
+                    }
+                }
+            }
+            None => {
+                let known = !reason.is_empty()
+                    && reason.len() <= 40
+                    && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+                pairs
+                    .append_pair("status", "refused")
+                    .append_pair("reason", if known { reason } else { "login_failed" });
+            }
+        }
+        pairs.append_pair("from", "cli");
+    }
+    format!("{hub}/#/signed-in?{}", page.query().unwrap_or_default())
+}
+
+fn redirect_browser(mut stream: std::net::TcpStream, location: &str) {
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Security-Policy: default-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 303 See Other\r\nLocation: {location}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
 }
 
@@ -3123,6 +3153,28 @@ mod tests {
         assert!(output.contains("https://expired.example expired=50"));
         assert!(!output.contains("private-current"));
         assert!(!output.contains("private-expired"));
+    }
+
+    #[test]
+    fn hub_login_sends_the_browser_to_the_hubs_result_page() {
+        let hub = "https://hub.example";
+        let signed = json!({"user": {"login": "sam", "provider": "github"}, "device": {"name": "Sam's laptop"}});
+        assert_eq!(
+            result_page(hub, Some(&signed), ""),
+            "https://hub.example/#/signed-in?status=signed_in&login=sam&provider=github&computer=Sam%27s+laptop&from=cli"
+        );
+        assert_eq!(
+            result_page(hub, None, "not_allowed"),
+            "https://hub.example/#/signed-in?status=refused&reason=not_allowed&from=cli"
+        );
+        // Free text from the Hub or the loopback query never reaches the page.
+        for odd in ["", "Not Allowed", "<b>x</b>", &"a".repeat(41)] {
+            assert_eq!(
+                result_page(hub, None, odd),
+                "https://hub.example/#/signed-in?status=refused&reason=login_failed&from=cli",
+                "{odd}"
+            );
+        }
     }
 
     #[test]

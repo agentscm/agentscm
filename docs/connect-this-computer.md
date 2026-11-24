@@ -18,7 +18,7 @@ source/workflow commands, local capture data or an explicitly hosted Hub's API a
 ## Sign in once per computer
 
 `agentscm hub login` signs this computer in to
-the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser finishes on a small local result page and the terminal reports the signed-in account and computer. The terminal says it is waiting, every
+the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser lands on the Hub's page saying which computer signed in, or why not, and the terminal reports the signed-in account and computer. The terminal says it is waiting, every
 30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
 display (or with `--device`, or `AGENTSCM_NO_BROWSER=1`) it shows a code to enter on another
 device instead; when the Hub's GitHub App does not allow that, it says so and uses the browser

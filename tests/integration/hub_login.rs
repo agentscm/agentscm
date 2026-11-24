@@ -2014,13 +2014,19 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     assert_eq!(status, 302);
     let loopback = headers[header::LOCATION].to_str().unwrap();
     assert!(loopback.starts_with("http://127.0.0.1:"));
-    // The CLI trades the code first and finishes in its callback, without needing a dashboard.
-    let response = env.http.get(loopback).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(!response.headers().contains_key(header::LOCATION));
+    // The CLI trades the code first, then sends the browser to the Hub's own result page.
+    let response = no_redirect().get(loopback).send().await.unwrap();
+    assert_eq!(response.status(), 303);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    let page = response.text().await.unwrap();
-    assert!(page.contains("Sign-in accepted"), "{page}");
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
+    let prefix = format!(
+        "{}/#/signed-in?status=signed_in&login=bob&provider=gitlab&computer=",
+        env.url()
+    );
+    assert!(
+        page.starts_with(&prefix) && page.ends_with("&from=cli"),
+        "{page}"
+    );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(child.wait().unwrap().success(), "{rest}");
@@ -2105,15 +2111,27 @@ async fn a_refused_browser_sign_in_ends_the_cli_wait_with_the_reason() {
         loopback.contains("/callback?error=not_allowed&message="),
         "{loopback}"
     );
-    // A refusal finishes in the callback too, with its diagnostic kept in the terminal.
-    let response = env.http.get(loopback).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(!response.headers().contains_key(header::LOCATION));
-    let page = response.text().await.unwrap();
-    assert!(page.contains("Sign-in did not finish"), "{page}");
+    // A refusal goes to the same page with its reason code only; the diagnostic stays in the terminal.
+    let response = no_redirect().get(loopback).send().await.unwrap();
+    assert_eq!(response.status(), 303);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        format!(
+            "{}/#/signed-in?status=refused&reason=not_allowed&from=cli",
+            env.url()
+        )
+        .as_str()
+    );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(!child.wait().unwrap().success());
     assert!(rest.contains("ask a Hub admin to add you"), "{rest}");
     assert!(!cli.session_file().exists());
+}
+
+fn no_redirect() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
 }
