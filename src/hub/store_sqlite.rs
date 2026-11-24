@@ -35,9 +35,10 @@ use super::change_record::{
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
-    Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event, is_lower_hex,
-    observation_kinds, validate_check_key, validate_check_phase, validate_group_note,
-    validate_observation, validate_repository_row, validate_status,
+    Observation, Observed, Outbound, REPOSITORY_SELECT, RepositoryTransfer, gone_event,
+    is_lower_hex, observation_kinds, publication_mid_write, validate_check_key,
+    validate_check_phase, validate_group_note, validate_observation, validate_repository_row,
+    validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -688,7 +689,8 @@ fn enum_name<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(value.trim_matches('"').to_owned())
 }
 
-/// SQL for "this Work's branch has a merged pull request that postdates its last check-in".
+/// SQL for "every branch of this Work has a merged pull request since it was created, and one
+/// postdates its last check-in".
 /// `item` aliases `hub_work_items`; `state`, `branch` and `snapshot` are the expressions to judge
 /// (the live row for overviews, the version for a briefing). `p` are the numbered placeholders for
 /// provider, host, catch-up repository namespace, repository key and the auto-pause summary.
@@ -704,9 +706,16 @@ fn settled_work_sql(
     format!(
         "({branch} IS NOT NULL AND {state} NOT IN ('finished','blocked')
           AND json_extract({snapshot},'$.blocker') IS NULL
+          AND NOT EXISTS (SELECT 1 FROM json_each({snapshot},'$.branches') b
+            WHERE NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges m
+              WHERE m.provider=?{provider} AND m.host=?{host} AND m.repository=?{repository}
+                AND m.repository_key=?{key} AND m.branch=b.value AND m.is_base=0
+                AND m.merged_at >= {item}.created_at))
           AND EXISTS (SELECT 1 FROM hub_catchup_branch_merges m
             WHERE m.provider=?{provider} AND m.host=?{host} AND m.repository=?{repository}
-              AND m.repository_key=?{key} AND m.branch={branch} AND m.is_base=0
+              AND m.repository_key=?{key} AND m.is_base=0
+              AND m.branch IN (SELECT {branch}
+                UNION SELECT value FROM json_each({snapshot},'$.branches'))
               AND m.merged_at >= CASE WHEN {state}='paused'
                     AND json_extract({snapshot},'$.current.summary')=?{auto_pause}
                   THEN COALESCE(json_extract({snapshot},'$.reported_at'), {item}.created_at)
@@ -5301,6 +5310,7 @@ fn start_overlap_in(
         scope,
         finished_paths: Vec::new(),
         branch: start.branch.clone(),
+        branches: Vec::new(),
         worktree: start.worktree.clone(),
         next_action: start.next_action.clone(),
         current: None,
@@ -8843,9 +8853,7 @@ fn checkpoint_overlap_in(
         item.scope = scope;
     }
     item.finished_paths = finished;
-    if checkpoint.branch.is_some() {
-        item.branch = checkpoint.branch.clone();
-    }
+    checkpoint.apply_branches(&mut item);
     if checkpoint.worktree.is_some() {
         item.worktree = checkpoint.worktree.clone();
     }
@@ -10043,7 +10051,7 @@ impl Store for SqliteStore {
             .prepare(
                 "SELECT r.full_name, r.host, r.connection,
                         COUNT(DISTINCT CASE WHEN u.host = r.host THEN t.device_id END),
-                        COUNT(CASE WHEN u.host = r.host THEN t.id END)
+                        COUNT(CASE WHEN u.host = r.host THEN t.id END), r.id
                  FROM hub_repositories r
                  LEFT JOIN hub_agent_tokens t ON t.repository = r.full_name
                      AND t.revoked = 0 AND t.expires_at > ?1 AND t.read_only = 0
@@ -10058,6 +10066,7 @@ impl Store for SqliteStore {
                     connection: row.get(2)?,
                     devices: row.get(3)?,
                     agent_tokens: row.get(4)?,
+                    id: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -11224,6 +11233,98 @@ impl Store for SqliteStore {
         };
         tx.commit()?;
         Ok(repo)
+    }
+
+    fn transfer_repository(
+        &self,
+        repo: &str,
+        expect_from: &str,
+        to: &str,
+        installation_id: Option<i64>,
+        actor: &str,
+        apply: bool,
+    ) -> Result<RepositoryTransfer> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut row = tx
+            .query_row(
+                &format!("{REPOSITORY_SELECT} WHERE id = ?1"),
+                [repo],
+                repository_row,
+            )
+            .optional()?
+            .ok_or_else(|| HubError::Invalid("unknown repository".into()))?;
+        let host = tx
+            .query_row(
+                "SELECT host FROM hub_connections WHERE id = ?1 AND kind = 'app'",
+                [to],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if host.as_deref() != Some(row.host.as_str()) || row.connection == to {
+            return Err(HubError::Invalid(
+                "the target must be another App connection on the repository's host".into(),
+            ));
+        }
+        let count = |sql: &str| tx.query_row(sql, [repo], |r| r.get::<_, i64>(0));
+        let states = tx
+            .prepare("SELECT state FROM hub_validation_publication WHERE repository = ?1")?
+            .query_map([repo], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = RepositoryTransfer {
+            moved: false,
+            connection_changed: row.connection != expect_from,
+            outbound: count("SELECT COUNT(*) FROM hub_outbound WHERE repository = ?1")?,
+            forge_checks: count("SELECT COUNT(*) FROM hub_forge_checks WHERE repository = ?1")?,
+            merge_group_posts: count(
+                "SELECT COUNT(*) FROM hub_merge_groups WHERE repository = ?1 AND phase IS NOT NULL",
+            )?,
+            publications: states.len() as i64,
+            mid_write: count(
+                "SELECT (SELECT COUNT(*) FROM hub_forge_checks
+                         WHERE repository = ?1 AND phase = 'attempting')
+                      + (SELECT COUNT(*) FROM hub_merge_groups
+                         WHERE repository = ?1 AND phase = 'attempting')",
+            )? + states.iter().filter(|s| publication_mid_write(s)).count() as i64,
+        };
+        if !apply || out.connection_changed || out.mid_write > 0 {
+            return Ok(out);
+        }
+        tx.execute(
+            "UPDATE hub_repositories SET connection = ?2, installation_id = ?3, pulls_etag = NULL
+             WHERE id = ?1",
+            params![repo, to, installation_id],
+        )?;
+        tx.execute(
+            "UPDATE hub_validation_summary_config SET connection = ?2, enabled = 0
+             WHERE repository = ?1",
+            params![repo, to],
+        )?;
+        for table in [
+            "hub_validation_publication",
+            "hub_outbound",
+            "hub_forge_checks",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE repository = ?1"),
+                [repo],
+            )?;
+        }
+        // Identity stays; the old App's post goes, and the generation fences its reservations.
+        tx.execute(
+            "UPDATE hub_merge_groups SET state = NULL, binding_digest = NULL, description = NULL,
+                 phase = NULL, ruleset_requirement = NULL, status_source = NULL,
+                 generation = generation + 1, updated_at = ?2
+             WHERE repository = ?1",
+            params![repo, unix_now()],
+        )?;
+        let from = std::mem::replace(&mut row.connection, to.to_owned());
+        row.installation_id = installation_id;
+        row.pulls_etag = None;
+        append(&tx, &Event::repository_transferred(&row, &from, actor)?)?;
+        tx.commit()?;
+        out.moved = true;
+        Ok(out)
     }
 
     fn repositories(&self, connection: &str) -> Result<Vec<ConnectedRepository>> {
@@ -12546,8 +12647,10 @@ impl Store for SqliteStore {
         let mut statement = conn.prepare(
             "SELECT w.id, m.pull_number, m.occurred_at, l.number IS NOT NULL, m.branch
              FROM hub_catchup_merges m
-             JOIN hub_work_items w ON w.branch = m.branch AND m.occurred_at >= w.created_at
-             LEFT JOIN hub_work_pr_links l ON l.work = w.id
+             JOIN hub_work_items w ON (w.branch = m.branch
+                 OR m.branch IN (SELECT value FROM json_each(w.snapshot,'$.branches')))
+               AND m.occurred_at >= w.created_at
+             LEFT JOIN hub_work_pr_links l ON l.work = w.id AND m.branch = w.branch
              WHERE m.provider=?1 AND m.host=?2 AND m.repository=?3 AND m.repository_key=?4
                AND m.same_repository_head = ?5 AND m.occurred_at >= ?6 AND m.occurred_at <= ?7
                AND w.provider=?1 AND w.host=?2 AND w.repository=?8 AND w.repository_id IS ?9

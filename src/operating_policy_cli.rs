@@ -539,6 +539,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                     ),
                     scope: None,
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: vec![SourceRef::Commit {
@@ -829,6 +830,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                 );
             }
             let request = replay.map(|r| r.request.clone()).unwrap_or_else(|| WorkCheckpoint {
+                branches: None,
                 work_id: current.id.clone(), operation_id: format!("operating-recovery-{dispatch}-{expected_generation}-s{}",current.updated_seq),
                 generation: current.generation, session: current.lead_session.clone(), expected_updated_seq: Some(current.updated_seq),
                 kind: if completed { CheckpointKind::Finish } else { CheckpointKind::Progress },

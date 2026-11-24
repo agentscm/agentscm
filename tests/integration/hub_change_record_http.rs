@@ -350,6 +350,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
                 next_action: Some("Request review of the retained receipt.".into()),
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: (0..100)

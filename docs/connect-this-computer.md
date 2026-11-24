@@ -16,10 +16,12 @@ and an explicitly hosted Hub's API and database are unaffected by that.
 
 ## Sign in once per computer
 
-`agentscm hub login` signs this computer in to
-the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser finishes on a small local result page and the terminal reports the signed-in account and computer. The terminal says it is waiting, every
-30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
-display (or with `--device`, or `AGENTSCM_NO_BROWSER=1`) it shows a code to enter on another
+`agentscm hub login` signs you and this computer in to the Hub. On a desktop it opens your
+browser to authorize sign-in. The browser then opens the Hub's sign-in result page. The terminal
+reports the signed-in account and computer or explains why sign-in failed. While waiting, the
+terminal gives a progress update every 30 seconds and explains what to do if sign-in times out
+after 3 minutes. Over SSH or without a display (or with `--device` or `AGENTSCM_NO_BROWSER=1`),
+it shows a code to enter on another
 device instead; when the Hub's GitHub App does not allow that, it says so and uses the browser
 sign-in. Every failed step names what failed, for example that the sign-in link expired or that
 the forge did not accept the code. What signing in gives you:

@@ -1161,6 +1161,7 @@ mod tests {
             participants: Vec::new(),
             scope: vec!["src/a".to_owned()],
             branch: None,
+            branches: Vec::new(),
             worktree: None,
             next_action: None,
             current: Some(Checkpoint {

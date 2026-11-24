@@ -289,6 +289,7 @@ fn dependency_transition_contract(database: &str) {
                 next_action: None,
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: vec![],

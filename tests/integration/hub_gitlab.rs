@@ -2191,3 +2191,20 @@ async fn a_namespace_listing_that_fails_still_polls_the_connected_repositories()
         "a listing answer is not a credential failure"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn validation_summary_publisher_check_never_sends_the_gitlab_token_to_github() {
+    let env = Env::start_bare().await;
+    let (status, added) = env.add_repository(REPO).await;
+    assert_eq!(status, 200, "{added}");
+    let path = format!("/v1/hub/admin/repos/{}/validation-summary", env.repo().id);
+    let admin = env.admin.clone();
+    let (status, reply) = env
+        .post(&path, Some(&admin), json!({"enabled": false}))
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    // No forge read was attempted: a read would have reported `required_rules_unreadable`.
+    assert_eq!(reply["publisher"]["permissions"], "not_inspected");
+    assert_eq!(reply["publisher"]["required_contexts"], "unknown");
+    assert_eq!(reply["publisher"]["warnings"], json!([]));
+}

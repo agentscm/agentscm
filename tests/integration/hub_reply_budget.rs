@@ -135,6 +135,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
                         next_action: Some(words(n * 10 + k + 1, 250)),
                         scope: None,
                         branch: None,
+                        branches: None,
                         worktree: None,
                         resolve_blocker: false,
                         source_refs: Vec::new(),

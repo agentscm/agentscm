@@ -29,6 +29,55 @@ const MAX_VERIFICATION_BYTES: usize = 64 * 1024 * 1024;
 fn failed(message: &str) -> GhError {
     GhError::Failed(message.into())
 }
+
+// ponytail: in memory per process, like merge-queue readiness; persist it if restarts hide too much.
+static REFUSALS: std::sync::Mutex<Option<HashMap<String, serde_json::Value>>> =
+    std::sync::Mutex::new(None);
+
+/// The last definite GitHub refusal of a validation status or comment for `repo` in this process.
+pub(super) fn last_refusal(repo: &str) -> Option<serde_json::Value> {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()?
+        .get(repo)
+        .cloned()
+}
+
+/// Forgets `repo`'s refusal: a publication succeeded, or the repository moved connections.
+pub(super) fn forget_refusal(repo: &str) {
+    if let Some(refusals) = REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        refusals.remove(repo);
+    }
+}
+
+/// The HTTP status of a strict reply's error text (`"403 from repos"`) when it is definite.
+fn definite_refusal(message: &str) -> Option<u16> {
+    let status = message.split(' ').next()?.parse().ok()?;
+    matches!(status, 403 | 404 | 422).then_some(status)
+}
+
+/// Records a definite refusal so an admin sees it without Hub logs, and returns the error.
+fn refused(repo: &str, reason: &str, context: Option<&str>, status: u16) -> GhError {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            repo.to_owned(),
+            serde_json::json!({"reason": reason, "context": context, "status": status,
+                "at": super::store::unix_now()}),
+        );
+    let message = match context {
+        Some(context) => format!("{reason}: GitHub replied {status} for status context {context}"),
+        None => format!("{reason}: GitHub replied {status}"),
+    };
+    GhError::Failed(message)
+}
 fn digest(bytes: impl AsRef<[u8]>) -> String {
     crate::store::digest(bytes.as_ref())
 }
@@ -1138,9 +1187,17 @@ async fn reconcile_pull_inner(
             &slot.context,
             "Hub validation rechecking",
         )?;
-        api.post_commit_status(token, &repo.full_name, &status)
-            .await?
-            .map_err(|_| failed("validation invalidation refused"))?;
+        send_status(
+            hub,
+            api,
+            token,
+            repo,
+            number,
+            &next,
+            &status,
+            "validation_invalidation_refused",
+        )
+        .await?;
     }
     for (slot, result, reason) in &plan.statuses {
         // Changed evidence cannot release this Attempting owner; no other controller can
@@ -1187,9 +1244,17 @@ async fn reconcile_pull_inner(
             &slot.context,
             &reason.chars().take(140).collect::<String>(),
         )?;
-        api.post_commit_status(token, &repo.full_name, &status)
-            .await?
-            .map_err(|_| failed("validation verdict refused"))?;
+        send_status(
+            hub,
+            api,
+            token,
+            repo,
+            number,
+            &next,
+            &status,
+            "validation_status_refused",
+        )
+        .await?;
     }
     let current = async {
         let current = api
@@ -1216,10 +1281,20 @@ async fn reconcile_pull_inner(
     let rendered = format!("{}{body}", marker(&next.operation_id));
     let id = match next.comment_id {
         Some(id) => {
-            if !api
+            let edited = match api
                 .edit_comment(token, &repo.full_name, id, &rendered)
-                .await?
+                .await
             {
+                Err(GhError::Auth(message) | GhError::Failed(message))
+                    if definite_refusal(&message).is_some() =>
+                {
+                    let status = definite_refusal(&message).unwrap_or_default();
+                    let error = refused(&repo.id, "validation_comment_refused", None, status);
+                    return Err(release_refused(hub, repo, number, &next, error));
+                }
+                other => other?,
+            };
+            if !edited {
                 // Definite 404: all preceding sends returned. Release this operation,
                 // then let the next complete discovery decide whether to recreate.
                 let mut idle = next.clone();
@@ -1231,8 +1306,22 @@ async fn reconcile_pull_inner(
             id
         }
         None => {
-            api.create_comment(token, &repo.full_name, number, &rendered)
-                .await?
+            // A definite refusal (usually a missing comment permission, or a locked
+            // conversation). Real GitHub sends a permission 403 with rate-limit headers, which
+            // arrives as `Failed`; without them it is `Auth`.
+            match api
+                .create_comment(token, &repo.full_name, number, &rendered)
+                .await
+            {
+                Err(GhError::Auth(message) | GhError::Failed(message))
+                    if definite_refusal(&message).is_some() =>
+                {
+                    let status = definite_refusal(&message).unwrap_or_default();
+                    let error = refused(&repo.id, "validation_comment_refused", None, status);
+                    return Err(release_refused(hub, repo, number, &next, error));
+                }
+                other => other?,
+            }
         }
     };
     let mut idle = next.clone();
@@ -1242,6 +1331,8 @@ async fn reconcile_pull_inner(
     if !cas(&*hub.store, &repo.id, number, Some(&next), &idle)? {
         return Err(failed("validation journal completion changed"));
     }
+    // Published, so an older refusal no longer describes this repository.
+    forget_refusal(&repo.id);
     produce_invalidation_notices(hub, repo, pull, &plan.invalidations)?;
     Ok(())
 }
@@ -1331,6 +1422,51 @@ fn produce_invalidation_notices(
     Ok(())
 }
 
+/// Sends one status of an Attempting operation. A definite refusal (403, 404 or 422) means
+/// GitHub applied nothing, so the attempt is released; an uncertain reply keeps it.
+#[allow(clippy::too_many_arguments)]
+async fn send_status(
+    hub: &HubState,
+    api: &Api,
+    token: &str,
+    repo: &ConnectedRepository,
+    number: i64,
+    attempt: &ValidationPublication,
+    status: &CommitStatus,
+    reason: &str,
+) -> Gh<()> {
+    match api
+        .post_commit_status(token, &repo.full_name, status)
+        .await?
+    {
+        Ok(()) => Ok(()),
+        Err(code) => {
+            let error = refused(&repo.id, reason, Some(status.context()), code);
+            Err(release_refused(hub, repo, number, attempt, error))
+        }
+    }
+}
+
+/// Releases an Attempting operation after a definite refusal, so the next reconciliation
+/// starts a fresh attempt. The released journal keeps every status slot, so that attempt's
+/// pending invalidation covers the statuses this one already sent.
+fn release_refused(
+    hub: &HubState,
+    repo: &ConnectedRepository,
+    number: i64,
+    attempt: &ValidationPublication,
+    error: GhError,
+) -> GhError {
+    debug_assert_eq!(attempt.phase, PublicationPhase::Attempting);
+    let mut idle = attempt.clone();
+    idle.revision += 1;
+    idle.phase = PublicationPhase::Idle;
+    match cas(&*hub.store, &repo.id, number, Some(attempt), &idle) {
+        Err(store) => store,
+        Ok(_) => error,
+    }
+}
+
 /// All earlier mutations returned definite success. A failed source read or changed
 /// source is not an ambiguous mutation: invalidate successes before releasing ownership.
 async fn abort_attempt(
@@ -1348,9 +1484,17 @@ async fn abort_attempt(
             &slot.context,
             "Hub validation source changed",
         )?;
-        api.post_commit_status(token, &repo.full_name, &status)
-            .await?
-            .map_err(|_| failed("validation invalidation refused"))?;
+        send_status(
+            hub,
+            api,
+            token,
+            repo,
+            number,
+            attempt,
+            &status,
+            "validation_invalidation_refused",
+        )
+        .await?;
     }
     let mut idle = attempt.clone();
     idle.revision += 1;

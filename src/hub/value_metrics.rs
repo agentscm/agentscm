@@ -1934,6 +1934,7 @@ mod tests {
             participants: vec![],
             scope: vec![],
             branch: Some("branch".into()),
+            branches: Vec::new(),
             worktree: None,
             next_action: None,
             current: Some(Checkpoint {

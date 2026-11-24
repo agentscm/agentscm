@@ -238,6 +238,7 @@ fn checkpoint(item: &WorkItem, kind: CheckpointKind, operation_id: &str) -> Work
         next_action: Some("continue".into()),
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],

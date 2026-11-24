@@ -155,6 +155,7 @@ fn history(store: &dyn Store, agent: &Agent, key: &str, started: i64, at: &[i64]
                     next_action: None,
                     scope: None,
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: vec![],

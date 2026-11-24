@@ -192,7 +192,9 @@ pub(super) fn check(call: &SessionCall) -> Result<Checked> {
         return Err(invalid("a call takes at most 50 paths"));
     }
     if call.paths.iter().any(|spec| spec.ends_with("/**")) {
-        return Err(invalid("sessions hold files, not directories"));
+        return Err(invalid(
+            "this call takes files, not folders: name each file, or declare a folder as dir/** in agentscm_start paths or agentscm_work_checkpoint scope",
+        ));
     }
     let mut keys = call
         .paths

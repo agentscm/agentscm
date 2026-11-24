@@ -238,6 +238,7 @@ impl Ctx {
                     next_action: None,
                     scope: None,
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: Vec::new(),
@@ -1292,6 +1293,105 @@ fn work_reconcile_status_stage() {
     run_both(status_stage);
 }
 
+/// A Work with two branches shows each branch's merge in its stage and in the recent merges.
+fn recent_merges_list_every_branch(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let setup_observations = agentscm::hub::onboarding::Observations::default();
+    let work = branch_work(&ctx, "w", "src/w", "feature/w");
+    let checkpoint = serde_json::from_value::<WorkCheckpoint>(json!({
+        "work_id": work.id, "operation_id": "branches-w", "generation": work.generation,
+        "expected_updated_seq": work.updated_seq,
+        "session": work.lead_session, "kind": "progress", "summary": "Two branches",
+        "branches": ["feature/w", "feature/x"]
+    }))
+    .unwrap();
+    ctx.store
+        .work_checkpoint(ctx.token(), &checkpoint, unix_now())
+        .unwrap();
+    let after = unix_now() + 5;
+    branch_merge(&ctx, 61, "feature/w", after, true);
+    let stage = || {
+        let status = agentscm::hub::work_http::actionable_status::read(
+            &*ctx.store,
+            &setup_observations,
+            &ctx.principal,
+            unix_now(),
+        )
+        .unwrap();
+        let row = status.work.iter().find(|w| w.work_id == work.id).unwrap();
+        serde_json::to_value(row.stage.as_ref().unwrap()).unwrap()
+    };
+    assert_eq!(
+        stage()["branches"],
+        json!([{"branch": "feature/w", "merged_pull_request": 61},
+            {"branch": "feature/x", "merged_pull_request": null}])
+    );
+    assert_eq!(stage()["pull_request"], 61);
+    branch_merge(&ctx, 62, "feature/x", after + 1, true);
+    assert_eq!(stage()["branches"][1]["merged_pull_request"], 62);
+
+    let listed = || {
+        let (rows, complete) = ctx
+            .store
+            .recent_branch_merges(&scope(), 0, after + 10, 20)
+            .unwrap();
+        assert!(complete);
+        let mut listed: Vec<_> = rows
+            .iter()
+            .filter(|row| row.work_id == work.id)
+            .map(|row| (row.pull_number, row.branch.clone(), row.explicit_link))
+            .collect();
+        listed.sort();
+        listed
+    };
+    let row = |number: i64, branch: &str, explicit| (number, branch.to_owned(), explicit);
+    assert_eq!(
+        listed(),
+        [row(61, "feature/w", false), row(62, "feature/x", false)]
+    );
+
+    // An explicit link and two declared links still list the extra branch's merge once.
+    use agentscm::hub::work_reconciliation::{
+        DeclaredPrLink, WorkDeclarations, WorkDeclarationsUpdate,
+    };
+    ctx.link(&work, 61, HEAD_B);
+    let current = ctx.item(&work.id);
+    let declared = |id: &str, number| DeclaredPrLink {
+        id: id.into(),
+        target: WorkPrLinkTarget {
+            repository_id: REPOSITORY_ID,
+            number,
+            head_sha: HEAD_B.into(),
+        },
+    };
+    ctx.store
+        .work_declarations_set(
+            ctx.token(),
+            &WorkDeclarationsUpdate {
+                work_id: work.id.clone(),
+                operation_id: "declare-both".into(),
+                generation: current.generation,
+                session: current.lead_session.clone(),
+                expected_updated_seq: current.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![declared("w", 61), declared("x", 62)],
+                    prerequisites: vec![],
+                },
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(
+        listed(),
+        [row(61, "feature/w", true), row(62, "feature/x", false)]
+    );
+}
+
+#[test]
+fn work_reconcile_recent_merges_list_every_branch() {
+    run_both(recent_merges_list_every_branch);
+}
+
 fn run_both(case: fn(&StoreFixture)) {
     case(&StoreFixture::sqlite());
     if let Some(fixture) = StoreFixture::postgres() {
@@ -1551,6 +1651,7 @@ fn durable_declarations(fixture: &StoreFixture) {
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],
@@ -2396,6 +2497,7 @@ fn reconciliation_actors(fixture: &StoreFixture) {
             next_action: None,
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: false,
             source_refs: vec![],
@@ -2943,6 +3045,7 @@ fn dependency_routing_removal_and_legacy_checkpoint(fixture: &StoreFixture) {
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],
@@ -2997,6 +3100,7 @@ fn dependency_routing_removal_and_legacy_checkpoint(fixture: &StoreFixture) {
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],

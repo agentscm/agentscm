@@ -25,7 +25,7 @@ use super::connection::{ConnectedRepository, Connection, NewConnection, Observat
 use super::forge_api::ForgeApi;
 use super::forge_http::check_base_url;
 use super::github::{
-    Api, AppKey, Branch, Gh, GhError, MAX_RECENT_BRANCHES, header_str, valid_ref_name,
+    Api, AppKey, Branch, Gh, GhError, MAX_RECENT_BRANCHES, RepoInfo, header_str, valid_ref_name,
     webhook_signature_ok,
 };
 use super::gitlab;
@@ -218,13 +218,18 @@ pub fn prepare_secrets_dir(dir: &FsPath, create: bool) -> Result<()> {
     Ok(())
 }
 
-/// What `<secrets>/<connection>.json` holds. Never logged or sent.
+/// What `<secrets>/<connection>.json` holds. Never logged or sent. A file staged for
+/// adoption needs only `app_id` and `pem`; adoption fills in the slug and a webhook secret.
 #[derive(Deserialize, Serialize)]
 struct AppFile {
     app_id: i64,
+    #[serde(default)]
     slug: String,
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     client_secret: String,
+    #[serde(default)]
     webhook_secret: String,
     pem: String,
 }
@@ -520,6 +525,14 @@ impl Sync {
         mutex.lock_owned().await
     }
 
+    /// How many handles `repo`'s lock has: the map's, each guard's and each waiter's.
+    #[cfg(test)]
+    pub(super) fn repo_lock_handles(&self, repo: &str) -> usize {
+        lock(&self.repo_locks)
+            .get(repo)
+            .map_or(0, Arc::strong_count)
+    }
+
     fn load_app(&self, connection: &str) -> Result<()> {
         let config = self
             .config
@@ -719,7 +732,7 @@ fn no_forge_people(store: &dyn Store) -> Result<bool> {
         .all(|user| user.identity.host == super::store::LOCAL_HOST))
 }
 
-fn gh_to_hub(error: GhError) -> HubError {
+pub(super) fn gh_to_hub(error: GhError) -> HubError {
     forge_to_hub("GitHub", error)
 }
 
@@ -870,18 +883,28 @@ impl PollReport {
     }
 }
 
+/// A repository discovery saw that another connection holds. Discovery never moves it.
+#[derive(Serialize)]
+struct HeldElsewhere {
+    repository: String,
+    held_by: String,
+}
+
 /// One round: every connection whose `next_poll_at` has passed.
 pub async fn poll_once(state: &HubState) -> Result<Vec<PollReport>> {
-    poll(state, None).await
+    Ok(poll(state, None).await?.0)
 }
 
 /// Discovery and a poll of one connection now, ignoring its `next_poll_at`.
 pub async fn refresh(state: &HubState, connection: &str) -> Result<Vec<PollReport>> {
-    poll(state, Some(connection)).await
+    Ok(poll(state, Some(connection)).await?.0)
 }
 
-async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
-    let mut reports = Vec::new();
+async fn poll(
+    state: &HubState,
+    only: Option<&str>,
+) -> Result<(Vec<PollReport>, Vec<HeldElsewhere>)> {
+    let (mut reports, mut held) = (Vec::new(), Vec::new());
     if state.sync.config.is_none() {
         for conn in db(state, |store| store.connections()).await? {
             catchup_connection_status(
@@ -891,7 +914,7 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
             )
             .await?;
         }
-        return Ok(reports);
+        return Ok((reports, held));
     }
     for mut conn in db(state, |store| store.connections()).await? {
         let due = match only {
@@ -899,12 +922,12 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
             None => conn.next_poll_at <= unix_now(),
         };
         if due {
-            reports.extend(poll_connection(state, &mut conn).await?);
+            reports.extend(poll_connection(state, &mut conn, &mut held).await?);
         }
     }
     let before = now_ms() - TOMBSTONE_KEEP_MS;
     db(state, move |store| store.prune_tombstones(before)).await?;
-    Ok(reports)
+    Ok((reports, held))
 }
 
 /// What to do after a failed call. Returns true when the connection should stop for now.
@@ -1004,7 +1027,12 @@ async fn catchup_connection_status(
     Ok(())
 }
 
-async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<PollReport>> {
+/// Adds to `held` each repository discovery found under another connection.
+async fn poll_connection(
+    state: &HubState,
+    conn: &mut Connection,
+    held: &mut Vec<HeldElsewhere>,
+) -> Result<Vec<PollReport>> {
     catchup_connection_status(
         state,
         conn,
@@ -1014,7 +1042,7 @@ async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<
     let mut reports = Vec::new();
     let mut marked = false;
     let found = match conn.kind.as_str() {
-        "app" => Some(poll_app(state, conn).await.map(|()| 0)),
+        "app" => Some(poll_app(state, conn).await.map(|found| (0, found))),
         _ => match followed_namespace(state, conn).await? {
             Some(namespace) => Some(follow_namespace(state, conn, namespace).await),
             None => None,
@@ -1022,7 +1050,8 @@ async fn poll_connection(state: &HubState, conn: &mut Connection) -> Result<Vec<
     };
     if let Some(found) = found {
         match found {
-            Ok(unread) => {
+            Ok((unread, found)) => {
+                held.extend(found);
                 mark_enabled(state, conn).await?;
                 marked = true;
                 // A connection-level report: the namespace listing passed its page cap.
@@ -1123,7 +1152,7 @@ async fn follow_rename(
 }
 
 /// Refresh the bot identity before this poll can reconcile any repository.
-async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<()> {
+async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<Vec<HeldElsewhere>> {
     let jwt = state.sync.jwt(conn).await?;
     let app = state.sync.api()?.authenticated_app(&jwt).await?;
     let app_id = app["id"]
@@ -1148,30 +1177,49 @@ async fn poll_app(state: &HubState, conn: &mut Connection) -> Gh<()> {
     discover(state, conn, &jwt).await
 }
 
-/// Connects every repository the app's installations can see.
-async fn discover(state: &HubState, conn: &Connection, jwt: &str) -> Gh<()> {
+/// Connects every repository the app's installations can see; returns those another connection holds.
+async fn discover(state: &HubState, conn: &Connection, jwt: &str) -> Gh<Vec<HeldElsewhere>> {
     let sync = &state.sync;
     let api = sync.api()?;
+    let mut held = Vec::new();
     for (installation, _) in api.installations(jwt).await? {
         let token = sync.token(conn, Some(installation)).await?;
         let repos = api.installation_repos(&token).await?;
-        let (id, host) = (conn.id.clone(), conn.host.clone());
-        db(state, move |store| {
-            for repo in repos {
-                store.upsert_repository(
-                    &id,
-                    &host,
-                    repo.repository_id,
-                    &repo.full_name,
-                    repo.node_id.as_deref(),
-                    Some(installation),
-                )?;
-            }
-            Ok(())
-        })
-        .await?;
+        held.extend(connect_all(state, conn, repos, Some(installation)).await?);
     }
-    Ok(())
+    Ok(held)
+}
+
+/// Upserts each repository under `conn`. One another connection already holds stays with it
+/// and is returned.
+async fn connect_all(
+    state: &HubState,
+    conn: &Connection,
+    repos: Vec<RepoInfo>,
+    installation: Option<i64>,
+) -> Result<Vec<HeldElsewhere>> {
+    let (id, host) = (conn.id.clone(), conn.host.clone());
+    db(state, move |store| {
+        let mut held = Vec::new();
+        for repo in repos {
+            let row = store.upsert_repository(
+                &id,
+                &host,
+                repo.repository_id,
+                &repo.full_name,
+                repo.node_id.as_deref(),
+                installation,
+            )?;
+            if row.connection != id {
+                held.push(HeldElsewhere {
+                    repository: row.full_name,
+                    held_by: row.connection,
+                });
+            }
+        }
+        Ok(held)
+    })
+    .await
 }
 
 /// The GitLab namespace the embedder has this connection follow, if any.
@@ -1190,12 +1238,13 @@ async fn followed_namespace(
 }
 
 /// Connects every project of `namespace`, as [`discover`] does an installation's
-/// repositories; returns the listing's pages left unread past its cap. Detaches nothing.
+/// repositories; returns the listing's pages left unread past its cap and the projects another
+/// connection holds. Detaches nothing.
 async fn follow_namespace(
     state: &HubState,
     conn: &Connection,
     namespace: gitlab::Namespace,
-) -> Gh<u32> {
+) -> Gh<(u32, Vec<HeldElsewhere>)> {
     let (gitlab::Namespace::Group(id) | gitlab::Namespace::User(id)) = namespace;
     let (Ok(ForgeApi::Gitlab(api)), true) = (state.sync.forge(conn), id > 0) else {
         return Err(GhError::Failed(
@@ -1204,23 +1253,7 @@ async fn follow_namespace(
     };
     let token = state.sync.token(conn, None).await?;
     let (projects, unread) = api.namespace_projects(&token, namespace).await?;
-    let (id, host) = (conn.id.clone(), conn.host.clone());
-    db(state, move |store| {
-        for project in projects {
-            // A project another connection already holds stays with it.
-            store.upsert_repository(
-                &id,
-                &host,
-                project.repository_id,
-                &project.full_name,
-                project.node_id.as_deref(),
-                None,
-            )?;
-        }
-        Ok(())
-    })
-    .await?;
-    Ok(unread)
+    Ok((unread, connect_all(state, conn, projects, None).await?))
 }
 
 /// Stored pull request observations by number.
@@ -1252,6 +1285,18 @@ fn repo_level(
     }
 }
 
+/// A transfer moved `repo` to another connection while this job waited for its lock, so
+/// `conn` must not read or post for it.
+pub(super) async fn moved_away(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+) -> Result<bool> {
+    let id = repo.id.clone();
+    let row = db(state, move |store| store.repository_row(&id)).await?;
+    Ok(row.is_none_or(|row| row.connection != conn.id))
+}
+
 async fn sync_repo(
     state: &HubState,
     conn: &Connection,
@@ -1264,6 +1309,13 @@ async fn sync_repo(
         .await
         .map_err(|_| GhError::Failed("shutting down".into()))?;
     let _guard = sync.lock_repo(&repo.id).await;
+    if moved_away(state, conn, repo).await? {
+        return Ok(PollReport {
+            connection: conn.id.clone(),
+            repository: repo.full_name.clone(),
+            ..PollReport::default()
+        });
+    }
     // Token acquisition and API setup are part of the attempted source read.
     super::catchup_sync::begin(state, conn, repo).await?;
     planned_issue_health(state, conn, repo).await?;
@@ -2507,6 +2559,7 @@ pub fn routes() -> Router<HubState> {
             post(gitlab_webhook).layer(DefaultBodyLimit::max(WEBHOOK_BODY_BYTES)),
         )
         .route("/v1/hub/github/apps", post(create_app))
+        .route("/v1/hub/github/apps/adopt", post(adopt_app))
         .route("/v1/hub/github/setup/callback", get(setup_callback))
         .route("/v1/hub/github/setup/{state}", get(setup_page))
         .route("/v1/hub/connections", get(list_connections))
@@ -2735,6 +2788,9 @@ async fn webhook_work(
         }
     }
     let _guard = sync.lock_repo(&repo.id).await;
+    if moved_away(state, conn, &repo).await? {
+        return Ok(());
+    }
     if event == "pull_request" {
         super::catchup_sync::begin(state, conn, &repo)
             .await
@@ -3246,6 +3302,160 @@ async fn setup_callback(
     ))))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adopt {
+    file: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Serializes adopt confirms in this process; see [`adopt_app`].
+static ADOPT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn app_taken(store: &dyn Store, app_id: i64) -> Result<bool> {
+    Ok(store
+        .connections()?
+        .iter()
+        .any(|c| c.app_id == Some(app_id)))
+}
+
+/// Registers an existing App from a credentials file an operator placed in the secrets
+/// directory. Without `confirm` it only reports what confirming would do; the private key
+/// and the webhook secret never leave the host.
+async fn adopt_app(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<Adopt>,
+) -> ApiResult<Json<Value>> {
+    let actor = human.admin()?.user.id.clone();
+    let (config, api) = state.sync.configured()?;
+    let name = body.file;
+    // A plain file name only, never a path or a connection's own file.
+    if !simple(&name, b"-_.", 128)
+        || name.contains("..")
+        || !name.ends_with(".json")
+        || name.starts_with("con_")
+    {
+        return Err(ApiError::invalid()
+            .with_message("file must name a .json file in the secrets directory, not con_*"));
+    }
+    let staged = config.secrets.join(&name);
+    // A link could point the Hub at a key file outside the secrets directory.
+    let linked = std::fs::symlink_metadata(&staged).is_ok_and(|meta| meta.file_type().is_symlink());
+    let mut file = (!linked)
+        .then(|| read_private(&staged).ok())
+        .flatten()
+        .and_then(|text| serde_json::from_str::<AppFile>(&text).ok())
+        .filter(|file| file.app_id > 0)
+        .ok_or_else(|| {
+            ApiError::invalid().with_message("file is not a private, valid App credentials file")
+        })?;
+    let key = AppKey::from_pem(&file.pem)
+        .map_err(|_| ApiError::invalid().with_message("the file's private key is not valid"))?;
+    let app_id = file.app_id;
+    let already = || ApiError::new(StatusCode::CONFLICT, "already_connected");
+    if db(&state, move |store| app_taken(store, app_id)).await? {
+        return Err(already());
+    }
+    let jwt = key.jwt(app_id, unix_now())?;
+    let app = match api.authenticated_app(&jwt).await {
+        Ok(app) => app,
+        Err(GhError::Auth(_)) => {
+            return Err(ApiError::invalid().with_message("GitHub refused the file's App key"));
+        }
+        Err(error) => return Err(gh_to_hub(error).into()),
+    };
+    let slug = app["slug"].as_str().filter(|s| simple(s, b"-_", 255));
+    let (Some(slug), true) = (slug, app["id"].as_i64() == Some(app_id)) else {
+        return Err(ApiError::invalid()
+            .with_message("the App GitHub authenticated does not match the file's app_id"));
+    };
+    let current = api.hook_config(&jwt).await.map_err(gh_to_hub)?;
+    let public = check_base_url(&config.public_url).map_err(|_| ApiError::invalid())?;
+    let mut warnings = vec![
+        "Repointing the webhook moves deliveries for every installation of this App to this \
+         Hub, including any that another Hub receives now.",
+    ];
+    if app["permissions"]["statuses"] != "write" {
+        warnings.push(
+            "The App lacks statuses: write, so validation summaries cannot be enabled for \
+             its repositories.",
+        );
+    }
+    if !webhook_reachable(&public) {
+        warnings.push(
+            "GitHub cannot reach this Hub's public URL, so deliveries will fail; polling keeps \
+             the Hub current.",
+        );
+    }
+    let mut reply = json!({"app_id": app_id, "app_slug": slug, "bot_login": format!("{slug}[bot]"),
+        "permissions": app["permissions"], "events": app["events"],
+        "webhook_current_url": current.as_ref().and_then(|c| c["url"].as_str()),
+        "webhook_url": format!("{public}/v1/hub/webhooks/github/{{connection}}"),
+        "warnings": warnings, "confirmed": false, "connection": null, "webhook_updated": false});
+    if !body.confirm {
+        return Ok(Json(reply));
+    }
+
+    // Held from the check to the load, so two confirms of one App in this process cannot both
+    // insert. Ceiling: Hub processes sharing one store could still both pass the check.
+    let adopting = ADOPT.lock().await;
+    let connection = new_connection_id()?;
+    let url = format!("{public}/v1/hub/webhooks/github/{connection}");
+    if file.webhook_secret.is_empty() {
+        file.webhook_secret = random_hex()?;
+    }
+    file.slug = slug.to_owned();
+    let secret = file.webhook_secret.clone();
+    let text = serde_json::to_string(&file).map_err(|e| HubError::Unavailable(e.to_string()))?;
+    let own = config.secrets.join(format!("{connection}.json"));
+    let path = own.clone();
+    blocking(&state, move || write_private(&path, text.as_bytes())).await?;
+    let new = NewConnection {
+        id: connection.clone(),
+        provider: "github".into(),
+        host: config.host.clone(),
+        kind: "app".into(),
+        app_id: Some(app_id),
+        app_slug: Some(slug.to_owned()),
+        acts_as: None,
+    };
+    let inserted = db(&state, move |store| {
+        if app_taken(store, app_id)? {
+            return Ok(false);
+        }
+        store.insert_connection(&new, &actor).map(|_| true)
+    })
+    .await;
+    if !matches!(inserted, Ok(true)) {
+        let _ = std::fs::remove_file(&own);
+        return Err(inserted.map_or_else(ApiError::from, |_| already()));
+    }
+    reply["confirmed"] = json!(true);
+    reply["connection"] = json!(connection);
+    reply["webhook_url"] = json!(url);
+    // The connection exists now, so the reply names it even when its credentials fail to load;
+    // the staged file stays, and the webhook is left alone.
+    if let Err(error) = state.sync.load_app(&connection) {
+        reply["error"] = json!(error.to_string());
+        return Ok(Json(reply));
+    }
+    drop(adopting);
+    let _ = std::fs::remove_file(&staged);
+    // The connection and its secret exist before GitHub learns the URL, so the first delivery
+    // verifies. Repointing first could send deliveries to a connection never created. A failed
+    // repoint leaves a connection that polls, and the reply says so.
+    match api.set_hook_config(&jwt, &url, &secret).await {
+        Ok(()) => reply["webhook_updated"] = json!(true),
+        Err(GhError::Auth(detail) | GhError::Failed(detail) | GhError::TooLarge(detail)) => {
+            reply["webhook_error"] = json!(detail);
+        }
+        Err(GhError::Limited(_)) => reply["webhook_error"] = json!("rate limited"),
+    }
+    Ok(Json(reply))
+}
+
 fn label(conn: &Connection) -> String {
     match conn.kind.as_str() {
         "app" => format!("GitHub App {}", conn.app_slug.as_deref().unwrap_or("?")),
@@ -3305,9 +3515,9 @@ async fn refresh_connection(
     human.admin()?;
     state.sync.configured()?;
     let conn = known(&state, id).await?;
-    let reports = refresh(&state, &conn.id).await?;
+    let (reports, held) = poll(&state, Some(&conn.id)).await?;
     let reports: Vec<Value> = reports.iter().map(PollReport::to_json).collect();
-    Ok(Json(json!({"reports": reports})))
+    Ok(Json(json!({"reports": reports, "held_elsewhere": held})))
 }
 
 #[derive(Deserialize)]

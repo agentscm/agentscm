@@ -2827,6 +2827,7 @@ mod tests {
             participants: vec![],
             scope: vec!["src/shared.rs".into()],
             branch: None,
+            branches: Vec::new(),
             worktree: None,
             next_action: None,
             current: None,

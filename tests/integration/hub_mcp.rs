@@ -2384,6 +2384,139 @@ async fn done_with_outcome_complete_finishes_the_led_work_without_fences() {
     assert!(error, "{bad}");
 }
 
+/// Starts Work on `feat/one` and returns the fields a checkpoint needs.
+async fn branch_work(hub: &Hub, secret: &str) -> (String, i64, i64) {
+    let started = hub
+        .tool_result(
+            secret,
+            "agentscm_start",
+            json!({"task": "two pull requests", "session": "session-a",
+                "paths": ["src/a.rs"], "branch": "feat/one"}),
+        )
+        .await;
+    let item = &started["structuredContent"]["work"]["item"];
+    (
+        item["id"].as_str().unwrap().to_owned(),
+        item["generation"].as_i64().unwrap(),
+        item["updated_seq"].as_i64().unwrap(),
+    )
+}
+
+fn branch_checkpoint(work: &(String, i64, i64), operation: &str, extra: Value) -> Value {
+    let mut body = json!({"work_id": work.0, "operation_id": operation, "generation": work.1,
+        "expected_updated_seq": work.2, "session": "session-a", "kind": "progress",
+        "summary": "branch list changed"});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_branches_round_trip_through_mcp() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let mut work = branch_work(&hub, &alice).await;
+    let set = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(
+                &work,
+                "branches-set",
+                json!({"branches": ["feat/one", "feat/two"]}),
+            ),
+        )
+        .await;
+    assert_eq!(set["isError"], false, "{set}");
+    let item = &set["structuredContent"]["item"];
+    assert_eq!(item["branch"], "feat/one");
+    assert_eq!(item["branches"], json!(["feat/one", "feat/two"]));
+    work.2 = item["updated_seq"].as_i64().unwrap();
+
+    let full = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert_eq!(
+        full["structuredContent"]["current"][0]["branches"],
+        json!(["feat/one", "feat/two"]),
+        "{full}"
+    );
+    let compact = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let brief = &compact["structuredContent"]["current"][0];
+    assert_eq!(brief["branch"], "feat/one");
+    assert_eq!(
+        brief["branches"],
+        json!(["feat/one", "feat/two"]),
+        "{compact}"
+    );
+
+    let cleared = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(&work, "branches-clear", json!({"branches": []})),
+        )
+        .await;
+    assert_eq!(cleared["isError"], false, "{cleared}");
+    let item = &cleared["structuredContent"]["item"];
+    assert!(item["branch"].is_null(), "{item}");
+    assert!(item.get("branches").is_none(), "{item}");
+    let compact = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    assert!(
+        compact["structuredContent"]["current"][0]
+            .get("branches")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_rejects_a_mismatched_primary() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let work = branch_work(&hub, &alice).await;
+    let refused = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(
+                &work,
+                "branches-mismatch",
+                json!({"branch": "feat/two", "branches": ["feat/one", "feat/two"]}),
+            ),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    // MCP reports the store's `HubError::Invalid` as `invalid_or_changed`; HTTP as `invalid_request`.
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_or_changed", "{refused}");
+    assert_eq!(
+        error["message"],
+        "branch must equal the first entry of branches"
+    );
+    let tools = hub
+        .rpc(
+            &alice,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await
+        .json()["result"]["tools"]
+        .clone();
+    let checkpoint = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "agentscm_work_checkpoint")
+        .unwrap();
+    let branches = &checkpoint["inputSchema"]["properties"]["branches"];
+    assert_eq!(branches["type"], "array");
+    assert_eq!(branches["maxItems"], 16);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
     let hub = Hub::start().await;
@@ -4144,14 +4277,13 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
     assert_eq!(batch["isError"], false, "{batch}");
     assert_eq!(batch["structuredContent"]["items"][0]["outcome"], "applied");
 
-    // A new start over the same paths under another identity is pointed at the released Work
+    // A new start over the same paths with no identity of its own is pointed at the released Work
     // first, and nothing is created.
     let duplicate = hub
         .tool_result(
             &alice,
             "agentscm_start",
-            json!({"task": "billing again", "session": "session-b", "request_key": "billing-2",
-                "paths": ["src/billing.rs"]}),
+            json!({"task": "billing again", "session": "session-b", "paths": ["src/billing.rs"]}),
         )
         .await;
     assert_eq!(duplicate["isError"], true, "{duplicate}");
@@ -4195,17 +4327,28 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
         same["structuredContent"].get("resolve_existing").is_none(),
         "{same}"
     );
-    // Different work goes ahead when it says so.
+    // A request key of its own is different work: it goes ahead and names the released Work.
     let different = hub
         .tool_result(
             &alice,
             "agentscm_start",
             json!({"task": "invoices", "session": "session-c", "request_key": "invoices",
-                "paths": ["src/billing.rs"], "new_work": true}),
+                "paths": ["src/billing.rs"]}),
         )
         .await;
     assert_eq!(
         different["structuredContent"]["work"]["created"], true,
+        "{different}"
+    );
+    assert_eq!(
+        different["structuredContent"]["resumable_existing"][0]["work_id"],
+        work_id.as_str(),
+        "{different}"
+    );
+    assert!(
+        different["content"]
+            .to_string()
+            .contains("went ahead under its own identity"),
         "{different}"
     );
     let invoices = different["structuredContent"]["work"]["item"]["id"]
@@ -4699,4 +4842,165 @@ async fn refused_starts_give_applicable_exact_coordination_calls() {
             assert_eq!(subset["call"]["arguments"]["paths"], json!(["two/a.rs"]));
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_holds_a_folder_as_dir_glob_and_refuses_other_folder_forms() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let held = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "folder work", "session": "alice",
+                "paths": ["app/src/**", "app/README.md"]}),
+        )
+        .await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(
+        held["structuredContent"]["work"]["item"]["scope"],
+        json!(["app/README.md", "app/src/"])
+    );
+    // The session intent holds only the file; the folder is held by the Work scope.
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|intent| intent.paths == ["app/README.md".to_owned()]),
+        "{live:?}"
+    );
+    // A file at any depth under the folder is covered for its holder.
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/src/deep/a.rs"]}),
+        )
+        .await;
+    assert!(!refused, "{text}");
+    // Another Work naming a file inside the folder overlaps it.
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "file work", "session": "bob", "paths": ["app/src/deep/a.rs"]}),
+        )
+        .await;
+    assert_eq!(rival["isError"], true, "{rival}");
+    assert_eq!(
+        rival["structuredContent"]["work"]["conflict"]["kind"], "scope_overlap",
+        "{rival}"
+    );
+    // A folder with a trailing slash, another glob, or a folder given to agentscm_check is
+    // refused with the form that is accepted.
+    for (name, arguments) in [
+        (
+            "agentscm_start",
+            json!({"task": "t", "session": "carol", "paths": ["app/lib/"]}),
+        ),
+        (
+            "agentscm_start",
+            json!({"task": "t", "session": "carol", "paths": ["app/*.rs"]}),
+        ),
+        (
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/src/**"]}),
+        ),
+    ] {
+        let refusal = hub.tool_result(&alice, name, arguments).await;
+        assert_eq!(refusal["isError"], true, "{refusal}");
+        assert!(refusal.to_string().contains("dir/**"), "{name}: {refusal}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_of_folders_only_claims_both_with_no_session_file() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let held = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "folder work", "session": "alice", "branch": "feat/folders",
+                "paths": ["app/src/**", "app/test/**"]}),
+        )
+        .await;
+    assert_eq!(held["isError"], false, "{held}");
+    let content = &held["structuredContent"];
+    assert_eq!(content["claim_acquired"], true, "{held}");
+    // Readiness matches a start that names a file: only the unread source keeps it false here.
+    let file_start = hub
+        .tool_result(
+            &hub.secret(3, "carol-agent"),
+            "agentscm_start",
+            json!({"task": "file work", "session": "carol", "branch": "feat/file",
+                "paths": ["lib/a.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        content["ready_for_work"], file_start["structuredContent"]["ready_for_work"],
+        "{held}"
+    );
+    assert_eq!(
+        content["work"]["item"]["scope"],
+        json!(["app/src/", "app/test/"])
+    );
+    let text = held["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("Scope is undeclared"), "{text}");
+    // No session file intent: the folders are held by the Work scope alone.
+    let live = hub
+        .store
+        .live_intents(
+            &crate::repository_scope::github(REPO, None),
+            unix_now(),
+            100,
+        )
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|intent| intent.paths.iter().all(|path| !path.starts_with("app/"))),
+        "{live:?}"
+    );
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/test/unit/a.rs"]}),
+        )
+        .await;
+    assert!(!refused, "{text}");
+    let (text, refused) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_check",
+            json!({"session": "alice", "paths": ["app/other.rs"]}),
+        )
+        .await;
+    assert!(
+        refused && text.contains("outside the declared work scope"),
+        "{text}"
+    );
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "file work", "session": "bob", "paths": ["app/src/a.rs"]}),
+        )
+        .await;
+    assert_eq!(rival["isError"], true, "{rival}");
+    assert_eq!(
+        rival["structuredContent"]["work"]["conflict"]["kind"], "scope_overlap",
+        "{rival}"
+    );
 }

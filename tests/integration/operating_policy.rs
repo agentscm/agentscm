@@ -1472,6 +1472,7 @@ fn explicit_cli_recovery_preserves_work_and_does_not_replay_failed_effect() {
             next_action: None,
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: true,
             source_refs: vec![],
@@ -2497,6 +2498,7 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
         next_action: Some("Inspect retained workflow artifacts and attempts".into()),
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: true,
         // Recovery requests carry the accepted commit, as the production request does.
@@ -2711,6 +2713,7 @@ fn lead_report(
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: commit
@@ -2786,6 +2789,7 @@ fn retain_unresolved_finish(
             next_action: None,
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: true,
             source_refs: vec![agentscm::hub::work::SourceRef::Commit {
@@ -3178,6 +3182,7 @@ fn reconciliation_distinguishes_absent_workflow_from_pending_or_incomplete_runti
             next_action: None,
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: true,
             source_refs: vec![],
