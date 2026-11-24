@@ -67,3 +67,5 @@ Reservations stay whole files. The motivating case would not have been separated
 - a per-file release of part of a hold (`release_paths`, [stand-up](../standup.md)).
 
 Reopen this when recorded cases show Works blocked on the same file whose changes fell in different nested items (test functions, methods) and whose edits came through attributable edit tools. A follow-up would then start with Rust only, nested items, and an unattributable edit widening the claim to the whole file, and would be planned as its own tier L issue.
+
+The offline replay for [#689](https://github.com/agentscm/agentscm/issues/689) separated the edits in two of three historical PR pairs and preserved the motivating collision. For the 13 refused edits in the Hub digest, the available evidence did not link both edits to source revisions, so how often finer reservations would have avoided a refusal remains unknown.
