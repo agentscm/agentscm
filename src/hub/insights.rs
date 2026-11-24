@@ -1031,6 +1031,7 @@ mod tests {
             participants: vec![],
             scope: vec![],
             branch: None,
+            branches: Vec::new(),
             worktree: None,
             next_action: None,
             current: None,

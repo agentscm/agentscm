@@ -23,7 +23,7 @@ use agentscm::hub::store::{
     self, ForgeIdentity, Store, agent_token_digest, mint_bound_agent_token, new_connection_id,
     unix_now,
 };
-use agentscm::hub::work::{WorkItem, WorkStart, WorkState};
+use agentscm::hub::work::{WorkCheckpoint, WorkItem, WorkStart, WorkState};
 use agentscm::hub::work_issues::WorkIssueLinkUpdate;
 use agentscm::hub::work_lifecycle::{
     LEASE_SECONDS, OutcomeProvenance, OutcomeValue, ReservationStatus,
@@ -843,6 +843,149 @@ fn every_pull_request_must_merge_before_completion(db: &Db) {
         )
         .unwrap();
     assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+/// Replaces the Work's branch list through a checkpoint.
+fn set_branches(db: &Db, w: &World, branches: &[&str]) {
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    let checkpoint = serde_json::from_value::<WorkCheckpoint>(json!({
+        "work_id": w.work, "operation_id": format!("branches-{}", item.updated_seq),
+        "generation": item.generation, "expected_updated_seq": item.updated_seq,
+        "session": SESSION, "kind": "progress", "summary": "Synthetic branch list",
+        "branches": branches
+    }))
+    .unwrap();
+    db.store
+        .work_checkpoint(&w.token, &checkpoint, unix_now())
+        .unwrap();
+}
+
+fn one_branch_completes_on_its_merge_as_before(db: &Db) {
+    let w = world(db, None);
+    unlink(db, &w);
+    let item = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap();
+    assert!(item.branches.is_empty());
+    assert!(
+        serde_json::to_value(&item)
+            .unwrap()
+            .get("branches")
+            .is_none()
+    );
+    assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+fn every_branch_must_merge_before_completion(db: &Db) {
+    let w = world(db, None);
+    unlink(db, &w);
+    set_branches(db, &w, &["feature/m", "feature/n"]);
+    assert!(complete(db, &w, lapsed()).is_empty());
+    db.store
+        .record_catchup_merge(&scope(), &merge_row(42, "feature/n", true), unix_now() + 6)
+        .unwrap();
+    assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+fn a_dropped_branch_lets_the_work_complete(db: &Db) {
+    let w = world(db, None);
+    unlink(db, &w);
+    set_branches(db, &w, &["feature/m", "feature/n"]);
+    assert!(complete(db, &w, lapsed()).is_empty());
+    set_branches(db, &w, &["feature/m"]);
+    assert_eq!(complete(db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+fn an_old_merge_of_an_added_branch_does_not_count(db_with: impl Fn() -> Db) {
+    // A merge from before the Work existed is an older use of the name.
+    let db = db_with();
+    let w = world(&db, None);
+    unlink(&db, &w);
+    let old = NewCatchupMerge {
+        occurred_at: Some(1),
+        ..merge_row(42, "feature/n", true)
+    };
+    db.store.record_catchup_merge(&scope(), &old, 2).unwrap();
+    set_branches(&db, &w, &["feature/m", "feature/n"]);
+    assert!(complete(&db, &w, lapsed()).is_empty());
+
+    // A merge after the Work started counts even though the branch was added later.
+    let db = db_with();
+    let w = world(&db, None);
+    unlink(&db, &w);
+    let created_at = db
+        .store
+        .work_get(&w.token, &w.work, unix_now())
+        .unwrap()
+        .unwrap()
+        .created_at;
+    let early = NewCatchupMerge {
+        occurred_at: Some(created_at),
+        ..merge_row(43, "feature/n", true)
+    };
+    db.store
+        .record_catchup_merge(&scope(), &early, created_at + 1)
+        .unwrap();
+    set_branches(&db, &w, &["feature/m", "feature/n"]);
+    assert_eq!(complete(&db, &w, lapsed()), vec![w.work.clone()]);
+}
+
+#[test]
+fn sqlite_one_branch_completes_on_its_merge_as_before() {
+    one_branch_completes_on_its_merge_as_before(&Db::sqlite());
+}
+
+#[test]
+fn postgres_one_branch_completes_on_its_merge_as_before() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    one_branch_completes_on_its_merge_as_before(&db);
+}
+
+#[test]
+fn sqlite_every_branch_must_merge_before_completion() {
+    every_branch_must_merge_before_completion(&Db::sqlite());
+}
+
+#[test]
+fn postgres_every_branch_must_merge_before_completion() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    every_branch_must_merge_before_completion(&db);
+}
+
+#[test]
+fn sqlite_a_dropped_branch_lets_the_work_complete() {
+    a_dropped_branch_lets_the_work_complete(&Db::sqlite());
+}
+
+#[test]
+fn postgres_a_dropped_branch_lets_the_work_complete() {
+    let Some(db) = Db::postgres() else {
+        return;
+    };
+    a_dropped_branch_lets_the_work_complete(&db);
+}
+
+#[test]
+fn sqlite_an_old_merge_of_an_added_branch_does_not_count() {
+    an_old_merge_of_an_added_branch_does_not_count(Db::sqlite);
+}
+
+#[test]
+fn postgres_an_old_merge_of_an_added_branch_does_not_count() {
+    if Db::postgres().is_none() {
+        return;
+    }
+    an_old_merge_of_an_added_branch_does_not_count(|| Db::postgres().unwrap());
 }
 
 #[test]

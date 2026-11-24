@@ -1144,7 +1144,9 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "next_action": {"type": "string"},
              "scope": {"type": "array", "items": {"type": "string"}, "description": "Files, or a folder as dir/**. Narrowing releases dropped files."},
              "finished_paths": {"type": "array", "items": {"type": "string"}, "description": "Done scope entries; others may ask for them. [] clears."},
-             "branch": {"type": "string"}, "worktree": {"type": "string"},
+             "branch": {"type": "string"},
+             "branches": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Whole list, primary first; [] clears. Completes once each branch's PR merged."},
+             "worktree": {"type": "string"},
              "resolve_blocker": {"type": "boolean", "default": false},
              "source_refs": {"type": "array", "items": {
                  "oneOf": [
@@ -1386,7 +1388,7 @@ fn overlap_tools(read_only: bool) -> Vec<Value> {
         &["title", "session", "scope"],
     );
     let checkpoint = schema(
-        json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"kind":{"type":"string","enum":["progress","decision","blocker","pause","finish","handover"]},"summary":{"type":"string"},"next_action":{"type":["string","null"]},"scope":{"type":"array","items":{"type":"string"}},"branch":{"type":["string","null"]},"worktree":{"type":["string","null"]},"resolve_blocker":{"type":"boolean"},"source_refs":{"type":"array","items":{"type":"object"}},"depends_on":{"type":"array","items":{"type":"string"}},"related_work":{"type":"array","items":{"type":"string"}}}),
+        json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"kind":{"type":"string","enum":["progress","decision","blocker","pause","finish","handover"]},"summary":{"type":"string"},"next_action":{"type":["string","null"]},"scope":{"type":"array","items":{"type":"string"}},"branch":{"type":["string","null"]},"branches":{"type":"array","items":{"type":"string"},"maxItems":16},"worktree":{"type":["string","null"]},"resolve_blocker":{"type":"boolean"},"source_refs":{"type":"array","items":{"type":"object"}},"depends_on":{"type":"array","items":{"type":"string"}},"related_work":{"type":"array","items":{"type":"string"}}}),
         &[
             "work_id",
             "operation_id",

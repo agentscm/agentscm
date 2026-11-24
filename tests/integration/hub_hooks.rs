@@ -1628,6 +1628,7 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
                     next_action: None,
                     scope: Some(vec!["src/other.rs".into()]),
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: Vec::new(),

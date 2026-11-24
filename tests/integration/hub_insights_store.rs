@@ -177,6 +177,7 @@ fn checkpoint(
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],

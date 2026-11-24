@@ -820,6 +820,7 @@ fn compaction_delivery_guard(fixture: &Fixture) {
                 next_action: None,
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: Vec::new(),
@@ -1217,6 +1218,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
                 next_action: None,
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: vec![],
@@ -2454,6 +2456,7 @@ fn why_resolves_after_compaction(fixture: &Fixture) {
                     next_action: None,
                     scope: None,
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: vec![SourceRef::CapturedEvent {
@@ -2630,6 +2633,7 @@ fn why_marks_cut_lists(fixture: &Fixture) {
                         next_action: None,
                         scope: None,
                         branch: None,
+                        branches: None,
                         worktree: None,
                         resolve_blocker: false,
                         source_refs: Vec::new(),
@@ -2778,6 +2782,7 @@ fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
                     next_action: None,
                     scope: None,
                     branch: None,
+                    branches: None,
                     worktree: None,
                     resolve_blocker: false,
                     source_refs: Vec::new(),
@@ -3347,6 +3352,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 next_action: None,
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: vec![agentscm::hub::work::SourceRef::Commit {
@@ -4048,6 +4054,7 @@ fn checkin(
                 next_action: None,
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: Vec::new(),
@@ -5019,6 +5026,72 @@ fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
     merged(fixture, 700, "feat/released", "main", true, t0 + 100);
     assert_eq!(listed(fixture, &reader, 100, t0 + 500), (vec![], 1, true));
     assert!(briefing_ids(fixture, &reader, t0 + 500).is_empty());
+}
+/// Released Work with two branches is hidden only once both have merged.
+fn settles_only_when_every_branch_merged(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(
+        fixture,
+        &token,
+        "two-branches",
+        Some("feat/one"),
+        "src/two.rs",
+        t0,
+    );
+    let checkpoint = serde_json::from_value::<WorkCheckpoint>(serde_json::json!({
+        "work_id": item.id, "operation_id": "two-branches", "generation": item.generation,
+        "expected_updated_seq": item.updated_seq,
+        "session": "session-two-branches", "kind": "progress", "summary": "Two branches",
+        "branches": ["feat/one", "feat/two"]
+    }))
+    .unwrap();
+    let item = fixture
+        .store
+        .work_checkpoint(&token, &checkpoint, t0 + 5)
+        .unwrap()
+        .item;
+    assert_eq!(item.branches, ["feat/one", "feat/two"]);
+    fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: item.id.clone(),
+                operation_id: "release-two-branches".into(),
+                generation: item.generation,
+                expected_updated_seq: item.updated_seq,
+                session: Some("session-two-branches".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "No more scope is reserved".into(),
+                superseded_by: None,
+                participants: Vec::new(),
+                paths: Vec::new(),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    merged(fixture, 801, "feat/one", "main", true, t0 + 100);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (vec![item.id.clone()], 0, true)
+    );
+    assert_eq!(
+        briefing_ids(fixture, &reader, t0 + 500),
+        vec![item.id.clone()]
+    );
+    merged(fixture, 802, "feat/two", "main", true, t0 + 150);
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500), (vec![], 1, true));
+    assert!(briefing_ids(fixture, &reader, t0 + 500).is_empty());
+}
+#[test]
+fn sqlite_settles_only_when_every_branch_merged() {
+    settles_only_when_every_branch_merged(&Fixture::sqlite());
+}
+#[test]
+fn postgres_settles_only_when_every_branch_merged() {
+    if let Some(f) = Fixture::postgres() {
+        settles_only_when_every_branch_merged(&f);
+    }
 }
 #[test]
 fn sqlite_released_work_can_still_use_legacy_branch_settling() {

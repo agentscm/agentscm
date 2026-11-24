@@ -303,6 +303,7 @@ fn checkpoint(work_id: &str, generation: i64, session: &str, seq: i64) -> WorkCh
         next_action: None,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: vec![],

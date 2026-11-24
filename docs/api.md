@@ -508,6 +508,11 @@ session, author or reporter-supplied identifiers. See [work insights](work-insig
 pagination and evidence limits.
 
 The checkpoint body of `POST /v1/hub/standup/checkpoint` and MCP may carry `finished_paths` (exact scope entries the lead reports as done; see [standup](standup.md)); it is a self-report and the item shows it only when non-empty. An empty list clears the set; leaving the field out keeps it.
+It may also carry `branches`, the Work's whole branch list for a Work with several pull requests,
+primary first (at most 16, each a valid git ref name, no duplicates). It replaces the list, `[]`
+clears it and leaving it out keeps it; `branch`, when sent with it, must equal its first entry. A
+Work item carries `branches` only when it has two or more, and `branch` is always the primary. See
+[completion of merged Work](standup.md#completion-of-merged-work) for when such a Work completes.
 
 `POST /v1/hub/standup/checkpoint` returns HTTP 409 with
 `{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the

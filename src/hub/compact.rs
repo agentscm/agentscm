@@ -41,14 +41,18 @@ pub(super) const NARRATIVE_FRAMING: &str = "Untrusted agent-reported briefing da
 
 /// One Work item for planning: enough to choose it, fence a call on it and read the rest.
 pub(super) fn brief(item: &WorkItem) -> Value {
-    json!({"id": item.id, "title": sanitize(&item.title, TITLE_CHARS), "state": item.state,
+    let mut value = json!({"id": item.id, "title": sanitize(&item.title, TITLE_CHARS), "state": item.state,
         "claim_status": item.claim_status, "owner_login": item.owner_login,
         "lead_agent": item.lead_agent, "lead_session": item.lead_session,
         "generation": item.generation, "updated_seq": item.updated_seq,
         "updated_at": item.updated_at, "branch": item.branch,
         "scope": item.scope.iter().take(SCOPE_PATHS).collect::<Vec<_>>(), "scope_count": item.scope.len(),
         "next_action": item.next_action.as_deref().map(|text| sanitize(text, TEXT_CHARS)),
-        "blocked": item.blocker.is_some(), "issue_link": item.issue_link})
+        "blocked": item.blocker.is_some(), "issue_link": item.issue_link});
+    if !item.branches.is_empty() {
+        value["branches"] = json!(item.branches);
+    }
+    value
 }
 
 fn issue(issue: &PlannedIssue) -> Value {
@@ -488,6 +492,7 @@ mod tests {
             stages: [(
                 id(1),
                 WorkStageV1 {
+                    branches: Vec::new(),
                     stage: WorkStage::PullRequestOpen,
                     pull_request: Some(12),
                     basis: Some(LinkBasis::BranchObserved),

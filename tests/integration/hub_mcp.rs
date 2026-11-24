@@ -2386,6 +2386,139 @@ async fn done_with_outcome_complete_finishes_the_led_work_without_fences() {
     assert!(error, "{bad}");
 }
 
+/// Starts Work on `feat/one` and returns the fields a checkpoint needs.
+async fn branch_work(hub: &Hub, secret: &str) -> (String, i64, i64) {
+    let started = hub
+        .tool_result(
+            secret,
+            "agentscm_start",
+            json!({"task": "two pull requests", "session": "session-a",
+                "paths": ["src/a.rs"], "branch": "feat/one"}),
+        )
+        .await;
+    let item = &started["structuredContent"]["work"]["item"];
+    (
+        item["id"].as_str().unwrap().to_owned(),
+        item["generation"].as_i64().unwrap(),
+        item["updated_seq"].as_i64().unwrap(),
+    )
+}
+
+fn branch_checkpoint(work: &(String, i64, i64), operation: &str, extra: Value) -> Value {
+    let mut body = json!({"work_id": work.0, "operation_id": operation, "generation": work.1,
+        "expected_updated_seq": work.2, "session": "session-a", "kind": "progress",
+        "summary": "branch list changed"});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_branches_round_trip_through_mcp() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let mut work = branch_work(&hub, &alice).await;
+    let set = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(
+                &work,
+                "branches-set",
+                json!({"branches": ["feat/one", "feat/two"]}),
+            ),
+        )
+        .await;
+    assert_eq!(set["isError"], false, "{set}");
+    let item = &set["structuredContent"]["item"];
+    assert_eq!(item["branch"], "feat/one");
+    assert_eq!(item["branches"], json!(["feat/one", "feat/two"]));
+    work.2 = item["updated_seq"].as_i64().unwrap();
+
+    let full = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert_eq!(
+        full["structuredContent"]["current"][0]["branches"],
+        json!(["feat/one", "feat/two"]),
+        "{full}"
+    );
+    let compact = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let brief = &compact["structuredContent"]["current"][0];
+    assert_eq!(brief["branch"], "feat/one");
+    assert_eq!(
+        brief["branches"],
+        json!(["feat/one", "feat/two"]),
+        "{compact}"
+    );
+
+    let cleared = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(&work, "branches-clear", json!({"branches": []})),
+        )
+        .await;
+    assert_eq!(cleared["isError"], false, "{cleared}");
+    let item = &cleared["structuredContent"]["item"];
+    assert!(item["branch"].is_null(), "{item}");
+    assert!(item.get("branches").is_none(), "{item}");
+    let compact = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    assert!(
+        compact["structuredContent"]["current"][0]
+            .get("branches")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_rejects_a_mismatched_primary() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let work = branch_work(&hub, &alice).await;
+    let refused = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            branch_checkpoint(
+                &work,
+                "branches-mismatch",
+                json!({"branch": "feat/two", "branches": ["feat/one", "feat/two"]}),
+            ),
+        )
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    // MCP reports the store's `HubError::Invalid` as `invalid_or_changed`; HTTP as `invalid_request`.
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_or_changed", "{refused}");
+    assert_eq!(
+        error["message"],
+        "branch must equal the first entry of branches"
+    );
+    let tools = hub
+        .rpc(
+            &alice,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await
+        .json()["result"]["tools"]
+        .clone();
+    let checkpoint = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "agentscm_work_checkpoint")
+        .unwrap();
+    let branches = &checkpoint["inputSchema"]["properties"]["branches"];
+    assert_eq!(branches["type"], "array");
+    assert_eq!(branches["maxItems"], 16);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
     let hub = Hub::start().await;

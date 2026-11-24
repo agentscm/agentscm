@@ -72,6 +72,9 @@ What the columns mean:
   Work the session leads whose pull requests all merged and whose source issue, if it has one,
   that pull request closed as completed, as the Hub's own
   [completion of merged Work](standup.md#completion-of-merged-work) does after a lease lapses.
+  A Work that carries several pull requests lists their branches in a checkpoint's `branches`,
+  and completes only when a pull request from every listed branch merged; checkpoint the list
+  without a branch to drop it.
   The outcome reads `hub_observed_merge`. A turn that asks its person something still completes
   it, since the merge settled the task, and its ask stays a wait.
   A session that is killed sends no end; its hold lapses with its lease

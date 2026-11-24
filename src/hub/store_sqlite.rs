@@ -689,7 +689,8 @@ fn enum_name<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(value.trim_matches('"').to_owned())
 }
 
-/// SQL for "this Work's branch has a merged pull request that postdates its last check-in".
+/// SQL for "every branch of this Work has a merged pull request since it was created, and one
+/// postdates its last check-in".
 /// `item` aliases `hub_work_items`; `state`, `branch` and `snapshot` are the expressions to judge
 /// (the live row for overviews, the version for a briefing). `p` are the numbered placeholders for
 /// provider, host, catch-up repository namespace, repository key and the auto-pause summary.
@@ -705,9 +706,16 @@ fn settled_work_sql(
     format!(
         "({branch} IS NOT NULL AND {state} NOT IN ('finished','blocked')
           AND json_extract({snapshot},'$.blocker') IS NULL
+          AND NOT EXISTS (SELECT 1 FROM json_each({snapshot},'$.branches') b
+            WHERE NOT EXISTS (SELECT 1 FROM hub_catchup_branch_merges m
+              WHERE m.provider=?{provider} AND m.host=?{host} AND m.repository=?{repository}
+                AND m.repository_key=?{key} AND m.branch=b.value AND m.is_base=0
+                AND m.merged_at >= {item}.created_at))
           AND EXISTS (SELECT 1 FROM hub_catchup_branch_merges m
             WHERE m.provider=?{provider} AND m.host=?{host} AND m.repository=?{repository}
-              AND m.repository_key=?{key} AND m.branch={branch} AND m.is_base=0
+              AND m.repository_key=?{key} AND m.is_base=0
+              AND m.branch IN (SELECT {branch}
+                UNION SELECT value FROM json_each({snapshot},'$.branches'))
               AND m.merged_at >= CASE WHEN {state}='paused'
                     AND json_extract({snapshot},'$.current.summary')=?{auto_pause}
                   THEN COALESCE(json_extract({snapshot},'$.reported_at'), {item}.created_at)
@@ -5302,6 +5310,7 @@ fn start_overlap_in(
         scope,
         finished_paths: Vec::new(),
         branch: start.branch.clone(),
+        branches: Vec::new(),
         worktree: start.worktree.clone(),
         next_action: start.next_action.clone(),
         current: None,
@@ -8844,9 +8853,7 @@ fn checkpoint_overlap_in(
         item.scope = scope;
     }
     item.finished_paths = finished;
-    if checkpoint.branch.is_some() {
-        item.branch = checkpoint.branch.clone();
-    }
+    checkpoint.apply_branches(&mut item);
     if checkpoint.worktree.is_some() {
         item.worktree = checkpoint.worktree.clone();
     }
@@ -12640,8 +12647,10 @@ impl Store for SqliteStore {
         let mut statement = conn.prepare(
             "SELECT w.id, m.pull_number, m.occurred_at, l.number IS NOT NULL, m.branch
              FROM hub_catchup_merges m
-             JOIN hub_work_items w ON w.branch = m.branch AND m.occurred_at >= w.created_at
-             LEFT JOIN hub_work_pr_links l ON l.work = w.id
+             JOIN hub_work_items w ON (w.branch = m.branch
+                 OR m.branch IN (SELECT value FROM json_each(w.snapshot,'$.branches')))
+               AND m.occurred_at >= w.created_at
+             LEFT JOIN hub_work_pr_links l ON l.work = w.id AND m.branch = w.branch
              WHERE m.provider=?1 AND m.host=?2 AND m.repository=?3 AND m.repository_key=?4
                AND m.same_repository_head = ?5 AND m.occurred_at >= ?6 AND m.occurred_at <= ?7
                AND w.provider=?1 AND w.host=?2 AND w.repository=?8 AND w.repository_id IS ?9
