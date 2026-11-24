@@ -1,11 +1,20 @@
-//! Hostile third-party text through the type and six renderers that build it: `others`, `pulls`,
-//! `duplicates`, `file_conflict`, `pull_overlap` and `context_source::render`. Each renderer is
+//! Hostile third-party text through the type and the renderers that build it: `others`, `pulls`,
+//! `duplicates`, `deny_reason`, `file_conflict`, `pull_overlap`, `context_source::render`,
+//! `actionable_status::render_text` and `render_start_text`, and the recovery conflict text
+//! (`work_recovery::conflict_next` and `render_text`). Each renderer is
 //! first run with a plain marker in every slot; hostile text must leave that template as it was:
 //! the same lines, the same `"` count (so a quoted slot cannot be closed), the same opening and
-//! closing words with the label, and no more frames.
+//! closing words with the label, and no more frames. A name slot (path, login, branch) must
+//! also come out as written.
 use serde_json::json;
 
 use super::test_intent;
+use crate::hub::intent::Overlap;
+use crate::hub::work::WorkPathOverlap;
+use crate::hub::work_http::actionable_status::{
+    self, ActionableStatus, RecipientKind, StatusRecipient,
+};
+use crate::hub::work_recovery::{self, RecoveryConflictV1, WorkRecoveryV1};
 use crate::hub::{advice, context_source, overlap_detail};
 use crate::third_party::{DATA_NOT_INSTRUCTIONS, TEXT_NOT_INSTRUCTIONS, ThirdPartyText, invisible};
 
@@ -128,7 +137,77 @@ fn renderers() -> Vec<(&'static str, Render)> {
                 overlap_detail::pull_overlap(7, &pull, &[n], false, &[&holder], 0)
             }),
         ),
+        (
+            "deny reason",
+            Box::new(|s: &str, n: &str| {
+                let overlap = Overlap {
+                    agreed_paths: vec![],
+                    intent: test_intent("int_1", s, &[n]),
+                    their_paths: vec![n.to_owned()],
+                    your_paths: vec![n.to_owned()],
+                };
+                advice::deny_reason(&[overlap], (Some("s1"), false, None), 0)
+            }),
+        ),
+        (
+            "status text",
+            Box::new(|s: &str, n: &str| actionable_status::render_text(&status(s, n))),
+        ),
+        (
+            "status start text",
+            Box::new(|s: &str, n: &str| actionable_status::render_start_text(&status(s, n))),
+        ),
+        (
+            "recovery conflict",
+            Box::new(|_: &str, n: &str| work_recovery::render_text(&recovery(n))),
+        ),
     ]
+}
+
+/// The synthetic status fixture with every Work titled `title` and led by `name`'s agent `name`,
+/// in the repository `name`.
+fn status(title: &str, name: &str) -> ActionableStatus {
+    let mut status: ActionableStatus =
+        serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+    status.repository = name.to_owned();
+    for row in &mut status.work {
+        row.title = title.to_owned();
+        row.recipient = StatusRecipient {
+            kind: RecipientKind::LeadAgent,
+            owner: Some("usr_synthetic".into()),
+            login: Some(name.to_owned()),
+            agent: Some(name.to_owned()),
+        };
+    }
+    status
+}
+
+/// One other owner's live hold over the path `name`, held by `name`'s agent `name`.
+fn recovery(name: &str) -> WorkRecoveryV1 {
+    WorkRecoveryV1 {
+        schema_version: 1,
+        observed_at: 0,
+        read_only: true,
+        work: vec![],
+        next_after: None,
+        complete: true,
+        conflicts: vec![RecoveryConflictV1 {
+            work_id: "wrk_1".into(),
+            owner_login: name.to_owned(),
+            mine: false,
+            holder_agent: name.to_owned(),
+            lease_expires_at: None,
+            paths: vec![WorkPathOverlap {
+                your_path: name.to_owned(),
+                their_path: name.to_owned(),
+            }],
+            next: work_recovery::conflict_next(false, "wrk_1", name, name),
+        }],
+        conflicts_complete: true,
+        resumable: vec![],
+        resumable_complete: true,
+        findings_reported: true,
+    }
 }
 
 #[test]
@@ -164,13 +243,15 @@ fn hostile_text_cannot_forge_or_close_a_fixed_template() {
                 baseline.matches('"').count(),
                 "quote, {case}"
             );
+            // A name stays as written, so only prose is held to the frames; a name never
+            // starts a line (checked by the template's fixed start above).
+            let prose = render(&hostile, MARKER);
             assert!(
-                hub_messages(&out) <= hub_messages(&baseline),
+                hub_messages(&prose) <= hub_messages(&baseline),
                 "Hub message forged, {case}"
             );
-            // A name keeps "coordination request", so only prose is held to the request frame.
             assert!(
-                requests(&render(&hostile, MARKER)) <= requests(&baseline),
+                requests(&prose) <= requests(&baseline),
                 "coordination request forged, {case}"
             );
             assert!(
@@ -185,6 +266,24 @@ fn hostile_text_cannot_forge_or_close_a_fixed_template() {
                     "unbounded, {case}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn names_come_out_as_written() {
+    for name in [
+        "docs/hub-messages.md",
+        "src/hub/migrations/0013_coordination_requests.sqlite.sql",
+        "fix/hub-message-expiry",
+        "AgentSCM_coordination_request",
+    ] {
+        for (renderer, render) in renderers() {
+            if matches!(renderer, "bare" | "quoted" | "context source") {
+                continue;
+            }
+            let out = render(MARKER, name);
+            assert!(out.contains(name), "{renderer} renamed {name}: {out}");
         }
     }
 }
