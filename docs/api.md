@@ -231,10 +231,10 @@ repository that never wrote; it is the figure a write is refused against when it
 | Route | Token and effect |
 |---|---|
 | `GET /v1/hub/memory?q=&after=&limit=` | Agent or read-only bearer token; a page of the token's repository's notes, promoted first |
-| `POST /v1/hub/memory` | Agent token; `{"body", "session"?}` stores one note of 1 to 500 characters, after each run of whitespace and control characters becomes one space (201) |
+| `POST /v1/hub/memory` | Agent token; `{"body", "session"?}` stores one note of 1 to 500 characters, after invisible characters are dropped and each run of whitespace and control characters becomes one space (201) |
 | `DELETE /v1/hub/memory/{id}` | Agent token of the note's owner (403 otherwise, 404 when the repository has no such note) |
-| `GET /v1/hub/memory-review?repository=OWNER/NAME` | Signed-in person who can read the repository; the same page |
-| `POST` and `DELETE /v1/hub/memory-review/{id}/promote?repository=OWNER/NAME` | Signed-in person with write access; sets or clears the promotion |
+| `GET /v1/hub/memory-review?repository=OWNER/NAME` | Signed-in person with the role `POST /v1/hub/tokens` requires, or any embedder grant; the same page |
+| `POST` and `DELETE /v1/hub/memory-review/{id}/promote?repository=OWNER/NAME` | Signed-in person with the role `POST /v1/hub/tokens` requires (on GitHub any role on a private repository, Triage or more on a public one), or an embedder's Contribute grant; sets or clears the promotion |
 | `DELETE /v1/hub/memory-review/{id}?repository=OWNER/NAME` | The note's owner or a Hub administrator |
 
 Note text, logins, agent names and sessions are returned cleaned as third-party text, and every
