@@ -64,7 +64,9 @@ fn hub_messages(text: &str) -> usize {
 }
 
 fn requests(text: &str) -> usize {
-    spaced(text).matches("coordination request").count()
+    spaced(text)
+        .matches("agentscm coordination request")
+        .count()
 }
 
 /// A renderer over third-party text: the first string goes in every prose slot (titles, tasks,
@@ -219,8 +221,8 @@ fn accepted_cases_are_pinned() {
         "hubmessage"
     );
     assert_eq!(
-        ThirdPartyText::new("coordination\u{200B}request", 50).as_str(),
-        "coordinationrequest"
+        ThirdPartyText::new("AgentSCM coordination\u{200B}request", 50).as_str(),
+        "AgentSCM coordinationrequest"
     );
     // Curly and single quotes stay: only `"` is a quote the templates rely on.
     assert_eq!(ThirdPartyText::new("“a” 'b'", 50).as_str(), "“a” 'b'");
