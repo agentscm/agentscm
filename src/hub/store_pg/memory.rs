@@ -123,7 +123,8 @@ pub(super) fn list(store: &PgStore, scope: &str, query: &ListQuery) -> Result<Pa
         if let Some(pattern) = &query.pattern {
             values.push(pattern);
             sql.push_str(&format!(
-                " AND lower(body) LIKE ${} ESCAPE '\\'",
+                " AND translate(body, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') \
+                 LIKE ${} ESCAPE '\\'",
                 values.len()
             ));
         }

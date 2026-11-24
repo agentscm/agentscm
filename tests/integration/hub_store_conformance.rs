@@ -4767,6 +4767,31 @@ fn repository_memory(db: &Db) {
             now,
         )
         .unwrap();
+
+    // Both stores fold ASCII letters only, so a non-ASCII letter matches exactly as written.
+    let ecole = store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("École des Mines runs the nightly build", None).unwrap(),
+            now,
+        )
+        .unwrap();
+    let found = |q: &str| {
+        store
+            .memory_list(&elsewhere, &ListQuery::new(Some(q), None, None).unwrap())
+            .unwrap()
+            .notes
+            .into_iter()
+            .map(|n| n.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(found("École"), [ecole.id.as_str()]);
+    assert_eq!(found("ÉCOLE DES"), [ecole.id.as_str()]);
+    assert!(
+        found("école").is_empty(),
+        "a non-ASCII letter is not folded"
+    );
 }
 
 macro_rules! conformance {
