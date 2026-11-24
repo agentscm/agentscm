@@ -1224,7 +1224,7 @@ fn tool_list(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) 
              "depends_on": {"type": "array", "items": {"type": "string"}},
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1, "description": "To resume paused Work or take it over: its current generation, as agentscm_work_recovery_preview reports it."},
-             "new_work": {"type": "boolean", "default": false, "description": "Start new Work although you have unfinished Work over these paths that holds nothing now; the start names that Work when this is needed. Not needed with a request_key or source of its own, which goes ahead and names that Work as advice."},
+             "new_work": {"type": "boolean", "default": false, "description": "Start new Work although you have unfinished Work over these paths that holds nothing now; the start names that Work when this is needed."},
              "started_by": {"type": "string", "maxLength": 128, "description": "When another session started this one for part of its task: that session's native session ID, as it gave it to you. The Hub then shows this session under it. Omit it when a person started this session."},
              "issue_choice": issue_choice_schema,
              "preflight": source_preflight_schema,
