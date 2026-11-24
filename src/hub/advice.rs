@@ -9,6 +9,7 @@ use super::agent_rules::NO_BYPASS;
 use super::handoff::{Answered, Asked, HandoffNote, SessionRef, Via};
 use super::intent::{Intent, Overlap};
 use super::session::Touched;
+use super::third_party::{self, ThirdPartyText};
 use super::work::WorkItem;
 
 // Hub-supplied text reaches the model, so it is bounded and stripped of look-alikes.
@@ -40,57 +41,17 @@ const REPEAT_FIRST: &str = "if their task text shows your change leaves their li
 
 /// Zero-width, bidirectional and tag characters can hide or reorder text.
 pub(super) fn invisible(c: char) -> bool {
-    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
-        | '\u{E0000}'..='\u{E007F}')
+    third_party::invisible(c)
 }
 
-/// Third-party text on one line, without control or invisible characters or `"` (-> `'`), at most `max` chars.
-/// It never carries the words that open a Hub message (`agent_messages::FRAME`).
+/// Third-party text on one line, as [`ThirdPartyText::new`] renders it bare.
 pub fn sanitize(text: &str, max: usize) -> String {
-    unframed(clean(text, max).chars().collect())
+    ThirdPartyText::new(text, max).as_str().to_owned()
 }
 
 /// [`sanitize`] without the Hub message rewrite, for checks on text stored before it existed.
 pub(super) fn clean(text: &str, max: usize) -> String {
-    let text: String = text
-        .chars()
-        .filter(|c| !c.is_control() && !invisible(*c))
-        .map(|c| if c == '"' { '\'' } else { c })
-        .collect();
-    if text.chars().count() <= max {
-        return text;
-    }
-    format!("{}…", text.chars().take(max).collect::<String>())
-}
-
-/// "Hub message" in any case, joined by spaces, `-` or `_`, becomes "Hub note". Defence in depth:
-/// an agent acts on a Hub message only after the Hub verifies it, so look-alike letters that slip
-/// past this still fail that check.
-fn unframed(text: Vec<char>) -> String {
-    let lower: Vec<char> = text.iter().map(char::to_ascii_lowercase).collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        if lower[i..].starts_with(&['h', 'u', 'b']) {
-            let mut j = i + 3;
-            while text
-                .get(j)
-                .is_some_and(|c| c.is_whitespace() || matches!(c, '-' | '_'))
-            {
-                j += 1;
-            }
-            if j > i + 3 && lower[j..].starts_with(&['m', 'e', 's', 's', 'a', 'g', 'e']) {
-                out.extend(&text[i..i + 3]);
-                out.push_str(" note");
-                i = j + 7;
-                continue;
-            }
-        }
-        out.push(text[i]);
-        i += 1;
-    }
-    out
+    third_party::clean(text, max)
 }
 
 fn text(value: &Value, max: usize) -> String {

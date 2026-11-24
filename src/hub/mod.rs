@@ -74,6 +74,7 @@ mod store_pg;
 mod store_sql;
 mod store_sqlite;
 pub mod sync;
+pub mod third_party;
 pub mod ui;
 pub mod validation_evidence;
 pub mod validation_evidence_http;
