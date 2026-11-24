@@ -297,6 +297,7 @@ fn joins_takeovers_and_starts_by_work_id_write_nothing(db: &Db) {
                 next_action: Some("next".into()),
                 scope: None,
                 branch: None,
+                branches: None,
                 worktree: None,
                 resolve_blocker: false,
                 source_refs: vec![],

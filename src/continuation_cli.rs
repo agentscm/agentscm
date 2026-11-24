@@ -981,6 +981,7 @@ fn checkpoint(
         next_action: next,
         scope: None,
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: Vec::new(),

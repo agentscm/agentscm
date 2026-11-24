@@ -658,13 +658,15 @@ fn read_branch_merges(
     Some(out)
 }
 
-/// Infer a Work's link from the observations; no branch or no observation is no link.
+/// Infer the link of one of a Work's branches from the observations; no branch or no
+/// observation is no link.
 fn infer_from(
     item: &WorkItem,
+    branch: Option<&str>,
     observed: &ObservationRead,
     merged: Option<&BranchMerges>,
 ) -> BranchInference {
-    let Some(branch) = item.branch.as_deref().filter(|b| !b.is_empty()) else {
+    let Some(branch) = branch.filter(|b| !b.is_empty()) else {
         return BranchInference::default();
     };
     let Ok(observed) = observed else {
@@ -720,9 +722,9 @@ fn infer_for_work(
     let Some(branch) = item.branch.clone().filter(|b| !b.is_empty()) else {
         return BranchInference::default();
     };
-    let merged = read_branch_merges(store, principal, &[branch]);
+    let merged = read_branch_merges(store, principal, std::slice::from_ref(&branch));
     let observed = observed.get_or_init(|| read_open_observations(store, principal));
-    infer_from(item, observed, merged.as_ref())
+    infer_from(item, Some(&branch), observed, merged.as_ref())
 }
 
 /// A Work's stage as the status shows it: working, pull request open or merged, complete.
@@ -745,6 +747,15 @@ pub struct WorkStageV1 {
     pub pull_request: Option<i64>,
     #[serde(default)]
     pub basis: Option<LinkBasis>,
+    /// Each branch's merged pull request, only for Work with two or more branches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<BranchStageV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BranchStageV1 {
+    pub branch: String,
+    pub merged_pull_request: Option<i64>,
 }
 
 impl WorkStageV1 {
@@ -753,6 +764,7 @@ impl WorkStageV1 {
             stage,
             pull_request: None,
             basis: None,
+            branches: Vec::new(),
         }
     }
 }
@@ -801,6 +813,7 @@ fn stage_for(
         stage,
         pull_request: Some(link.number),
         basis: Some(link.basis),
+        branches: Vec::new(),
     }
 }
 
@@ -839,7 +852,9 @@ pub(super) fn work_stages_detailed(
     let branches: Vec<String> = items
         .iter()
         .filter(|(_, outcome)| *outcome == OutcomeValue::None)
-        .filter_map(|(item, _)| item.branch.clone().filter(|b| !b.is_empty()))
+        .flat_map(|(item, _)| item.branch_list())
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned)
         .collect();
     let merged = if branches.is_empty() {
         Some(BranchMerges::default())
@@ -884,7 +899,8 @@ pub(super) fn work_stages_detailed(
                     })
                 }
                 Ok(None) => {
-                    let inference = infer_from(item, &observed, merged.as_ref());
+                    let inference =
+                        infer_from(item, item.branch.as_deref(), &observed, merged.as_ref());
                     limits.extend(inference.limits.iter().map(|l| (*l).to_owned()));
                     unsettled_here = !inference.limits.is_empty();
                     match inference.link {
@@ -918,10 +934,34 @@ pub(super) fn work_stages_detailed(
                 }
             };
         }
+        // Each further branch needs its own merged pull request, inferred as the primary's is.
+        let mut extra = Vec::new();
+        if finished.is_none() {
+            for branch in item.branch_list().into_iter().skip(1) {
+                let inference = infer_from(item, Some(branch), &observed, merged.as_ref());
+                limits.extend(inference.limits.iter().map(|l| (*l).to_owned()));
+                let merged_pull_request = inference.link.map(|link| link.number).filter(|number| {
+                    merged
+                        .as_ref()
+                        .and_then(|m| m.by_branch.get(branch))
+                        .is_some_and(|merges| {
+                            merges.iter().any(|m| {
+                                m.pull_number == *number
+                                    && m.occurred_at.is_some_and(|at| at >= item.created_at)
+                            })
+                        })
+                });
+                unsettled_here |= !inference.limits.is_empty() || merged_pull_request.is_none();
+                extra.push(BranchStageV1 {
+                    branch: branch.to_owned(),
+                    merged_pull_request,
+                });
+            }
+        }
         if unsettled_here {
             unsettled.insert(item.id.clone());
         }
-        let stage = stage_for(
+        let mut stage = stage_for(
             finished,
             link,
             |number| {
@@ -936,6 +976,17 @@ pub(super) fn work_stages_detailed(
                     .is_ok_and(|o| o.open_numbers.contains(&number))
             },
         );
+        if let (false, Some(primary)) = (extra.is_empty(), item.branch.clone()) {
+            let merged_pull_request = stage
+                .pull_request
+                .filter(|_| stage.stage == WorkStage::PullRequestMerged);
+            stage.branches = std::iter::once(BranchStageV1 {
+                branch: primary,
+                merged_pull_request,
+            })
+            .chain(extra)
+            .collect();
+        }
         stages.insert(item.id.clone(), stage);
     }
     (stages, limits, unsettled)
@@ -1403,6 +1454,7 @@ mod tests {
             participants: Vec::new(),
             scope: vec!["src/a".to_owned()],
             branch: None,
+            branches: Vec::new(),
             worktree: None,
             next_action: None,
             current: None,
@@ -2031,7 +2083,12 @@ mod tests {
         let mut it = item(WorkState::Active, &[], false);
         it.branch = Some("feat/x".to_owned());
         // No connected repository: nothing was observed, which is not "nothing open".
-        let inference = infer_from(&it, &Err("observation_unavailable"), None);
+        let inference = infer_from(
+            &it,
+            it.branch.as_deref(),
+            &Err("observation_unavailable"),
+            None,
+        );
         assert!(inference.link.is_none());
         assert_eq!(inference.limits[0], "observation_unavailable");
         let stage = stage_for(

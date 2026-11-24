@@ -21,6 +21,7 @@ pub const WORK_DELIVERY_RESERVATION_BYTES: i64 = 4 * 1024 * 1024;
 pub(super) const WORK_PAYLOAD_ROW_BYTES: i64 = 256;
 const MAX_RELATIONS: usize = 100;
 const MAX_REFS: usize = 100;
+pub const MAX_WORK_BRANCHES: usize = 16;
 const MAX_SCOPE: usize = 256;
 const MAX_LABEL_BYTES: usize = 255;
 const MAX_TEXT_BYTES: usize = 500;
@@ -125,6 +126,9 @@ pub struct WorkCheckpoint {
     pub next_action: Option<String>,
     pub scope: Option<Vec<String>>,
     pub branch: Option<String>,
+    /// The Work's whole branch list, primary first; replaces it when present, `[]` clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branches: Option<Vec<String>>,
     pub worktree: Option<String>,
     #[serde(default)]
     pub resolve_blocker: bool,
@@ -253,6 +257,9 @@ pub struct WorkItem {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finished_paths: Vec<String>,
     pub branch: Option<String>,
+    /// Set only for Work with two or more branches; then `branch` is its first entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<String>,
     pub worktree: Option<String>,
     pub next_action: Option<String>,
     pub current: Option<Checkpoint>,
@@ -814,10 +821,7 @@ impl WorkStart {
         option_text("next_action", &self.next_action, MAX_TEXT_BYTES)?;
         option_label("worktree", &self.worktree)?;
         if let Some(branch) = &self.branch {
-            label("branch", branch)?;
-            if !valid_ref_name(branch) {
-                return Err(invalid("branch is not a valid git ref name"));
-            }
+            branch_name(branch)?;
         }
         let scope = paths(&self.scope)?;
         relations(&self.depends_on, &self.related_work)?;
@@ -860,6 +864,26 @@ impl ForgeWorkRef {
     }
 }
 
+impl WorkItem {
+    /// `branches` when non-empty, else `branch`; primary first.
+    pub fn branch_list(&self) -> Vec<&str> {
+        if self.branches.is_empty() {
+            self.branch.as_deref().into_iter().collect()
+        } else {
+            self.branches.iter().map(String::as_str).collect()
+        }
+    }
+
+    /// Normalizes per the invariant (0/1 -> branches empty; 2+ -> branch = list[0]).
+    pub(super) fn set_branches(&mut self, mut list: Vec<String>) {
+        self.branch = list.first().cloned();
+        if list.len() < 2 {
+            list.clear();
+        }
+        self.branches = list;
+    }
+}
+
 impl WorkCheckpoint {
     /// The pause that ends a session whose Work reported no outcome. It keeps the next action and
     /// relations. Its operation id follows the Work's generation and sequence, so a repeat of the
@@ -879,6 +903,7 @@ impl WorkCheckpoint {
                 .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: false,
             source_refs: Vec::new(),
@@ -907,9 +932,24 @@ impl WorkCheckpoint {
             paths(finished)?;
         }
         if let Some(branch) = &self.branch {
-            label("branch", branch)?;
-            if !valid_ref_name(branch) {
-                return Err(invalid("branch is not a valid git ref name"));
+            branch_name(branch)?;
+        }
+        if let Some(list) = &self.branches {
+            if list.len() > MAX_WORK_BRANCHES {
+                return Err(invalid("branches has more than 16 entries"));
+            }
+            for (index, branch) in list.iter().enumerate() {
+                branch_name(branch)?;
+                if list[..index].contains(branch) {
+                    return Err(invalid("duplicate branch in branches"));
+                }
+            }
+            if self
+                .branch
+                .as_ref()
+                .is_some_and(|branch| list.first() != Some(branch))
+            {
+                return Err(invalid("branch must equal the first entry of branches"));
             }
         }
         option_label("worktree", &self.worktree)?;
@@ -920,6 +960,23 @@ impl WorkCheckpoint {
             source.validate()?;
         }
         relations(&self.depends_on, &self.related_work)
+    }
+
+    /// Applies `branches` / `branch` per the wire contract; the only writer stores call.
+    pub(super) fn apply_branches(&self, item: &mut WorkItem) {
+        if let Some(list) = &self.branches {
+            item.set_branches(list.clone());
+        } else if let Some(primary) = &self.branch {
+            let mut list = vec![primary.clone()];
+            list.extend(
+                item.branch_list()
+                    .into_iter()
+                    .skip(1)
+                    .filter(|branch| *branch != primary)
+                    .map(str::to_owned),
+            );
+            item.set_branches(list);
+        }
     }
 
     pub(super) fn state(&self) -> WorkState {
@@ -1243,6 +1300,14 @@ fn label(name: &str, value: &str) -> Result<()> {
     text(name, value, MAX_LABEL_BYTES)
 }
 
+fn branch_name(branch: &str) -> Result<()> {
+    label("branch", branch)?;
+    if !valid_ref_name(branch) {
+        return Err(invalid("branch is not a valid git ref name"));
+    }
+    Ok(())
+}
+
 fn option_label(name: &str, value: &Option<String>) -> Result<()> {
     value
         .as_deref()
@@ -1419,5 +1484,129 @@ mod tests {
             described.description.as_deref(),
             Some("Says what the Work changes and why.")
         );
+    }
+
+    mod branches {
+        use super::super::*;
+
+        fn item(branch: Option<&str>) -> WorkItem {
+            WorkItem {
+                initial_issue_choice: Default::default(),
+                issue_link: None,
+                id: "wrk_1".to_owned(),
+                repository: "example/repo".to_owned(),
+                owner: "user-1".to_owned(),
+                owner_login: "owner".to_owned(),
+                source: WorkSource::Native {
+                    request_key: "key".to_owned(),
+                },
+                title: "Synthetic".to_owned(),
+                description: None,
+                state: WorkState::Active,
+                claim_status: ClaimStatus::Active,
+                last_checkin_at: 10,
+                reported_at: None,
+                generation: 1,
+                lead_token: "token".to_owned(),
+                lead_agent: "agent".to_owned(),
+                lead_session: "session".to_owned(),
+                participants: Vec::new(),
+                scope: Vec::new(),
+                finished_paths: Vec::new(),
+                branch: branch.map(str::to_owned),
+                branches: Vec::new(),
+                worktree: None,
+                next_action: None,
+                current: None,
+                blocker: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                created_at: 1,
+                updated_at: 10,
+                created_seq: 1,
+                updated_seq: 1,
+            }
+        }
+
+        fn strings(list: &[&str]) -> Vec<String> {
+            list.iter().map(|s| (*s).to_owned()).collect()
+        }
+
+        fn checkpoint(branch: Option<&str>, branches: Option<&[&str]>) -> WorkCheckpoint {
+            let mut checkpoint = WorkCheckpoint::auto_pause(&item(None), "test");
+            checkpoint.work_id = format!("wrk_{}", "a".repeat(32));
+            checkpoint.branch = branch.map(str::to_owned);
+            checkpoint.branches = branches.map(strings);
+            checkpoint
+        }
+
+        #[test]
+        fn set_branches_keeps_one_branch_work_in_todays_shape() {
+            let mut work = item(Some("old"));
+            work.set_branches(strings(&["a"]));
+            assert_eq!(
+                (work.branch.as_deref(), work.branches.len()),
+                (Some("a"), 0)
+            );
+            work.set_branches(strings(&["a", "b"]));
+            assert_eq!(work.branch.as_deref(), Some("a"));
+            assert_eq!(work.branch_list(), ["a", "b"]);
+            work.set_branches(Vec::new());
+            assert_eq!((work.branch.as_deref(), work.branches.len()), (None, 0));
+            assert!(work.branch_list().is_empty());
+            // An old snapshot with no `branches` key reads as one-branch Work.
+            let mut value = serde_json::to_value(item(Some("a"))).unwrap();
+            assert!(value.get("branches").is_none());
+            value.as_object_mut().unwrap().remove("branches");
+            let old: WorkItem = serde_json::from_value(value).unwrap();
+            assert_eq!(old.branch_list(), ["a"]);
+        }
+
+        #[test]
+        fn branch_alone_replaces_the_primary_and_keeps_the_rest() {
+            let mut work = item(None);
+            work.set_branches(strings(&["a", "b", "c"]));
+            checkpoint(Some("c"), None).apply_branches(&mut work);
+            assert_eq!(work.branch_list(), ["c", "b"]);
+            checkpoint(None, None).apply_branches(&mut work);
+            assert_eq!(work.branch_list(), ["c", "b"]);
+            checkpoint(None, Some(&[])).apply_branches(&mut work);
+            assert!(work.branch.is_none() && work.branches.is_empty());
+        }
+
+        #[test]
+        fn branches_are_validated() {
+            let many: Vec<String> = (0..=MAX_WORK_BRANCHES).map(|i| format!("b{i}")).collect();
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            for (branch, branches, message) in [
+                (None, &many[..], "branches has more than 16 entries"),
+                (None, &["a", "a"][..], "duplicate branch in branches"),
+                (
+                    None,
+                    &["a", "bad..ref"][..],
+                    "branch is not a valid git ref name",
+                ),
+                (
+                    Some("b"),
+                    &["a", "b"][..],
+                    "branch must equal the first entry of branches",
+                ),
+                (
+                    Some("a"),
+                    &[][..],
+                    "branch must equal the first entry of branches",
+                ),
+            ] {
+                let error = checkpoint(branch, Some(branches)).validate().unwrap_err();
+                assert!(error.to_string().contains(message), "{error}");
+            }
+            assert!(checkpoint(Some("a"), Some(&["a", "b"])).validate().is_ok());
+            assert!(checkpoint(None, Some(&[])).validate().is_ok());
+            assert!(
+                checkpoint(None, Some(&many[..MAX_WORK_BRANCHES]))
+                    .validate()
+                    .is_ok()
+            );
+        }
     }
 }

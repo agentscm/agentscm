@@ -2841,6 +2841,7 @@ mod tests {
                 stage,
                 pull_request: Some(number),
                 basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+                branches: Vec::new(),
             })
         };
         let read = |item: &WorkItem, wait, stage| {
@@ -2881,6 +2882,7 @@ mod tests {
                 stage: WorkStage::Working,
                 pull_request: None,
                 basis: None,
+                branches: Vec::new(),
             }),
             open(12, WorkStage::PullRequestMerged),
             None,
@@ -2965,6 +2967,7 @@ mod tests {
                 stage: WorkStage::PullRequestOpen,
                 pull_request: Some(12),
                 basis: Some(crate::hub::work_reconcile::LinkBasis::BranchObserved),
+                branches: Vec::new(),
             }),
         );
         assert!(row.limits.contains(&"provider_coverage_unavailable".into()));
@@ -3168,6 +3171,7 @@ mod tests {
             next_action: Some("Reported next step".into()),
             scope: None,
             branch: None,
+            branches: None,
             worktree: None,
             resolve_blocker: false,
             source_refs: vec![],
@@ -4763,6 +4767,7 @@ mod tests {
                         next_action: None,
                         scope: None,
                         branch: None,
+                        branches: None,
                         worktree: None,
                         resolve_blocker: false,
                         source_refs: vec![],
@@ -5044,6 +5049,7 @@ mod tests {
                             next_action: Some("Ask owner; pull request merged".into()),
                             scope: None,
                             branch: None,
+                            branches: None,
                             worktree: None,
                             resolve_blocker: false,
                             source_refs: vec![],
@@ -5724,6 +5730,7 @@ mod tests {
             stage: WorkStage::PullRequestOpen,
             pull_request: Some(7),
             basis: None,
+            branches: Vec::new(),
         });
         assert!(render_text(&staged).contains("Stage: pull request #7 open."));
     }

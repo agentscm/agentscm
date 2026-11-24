@@ -2145,6 +2145,7 @@ mod tests {
             }],
             scope: vec!["src/a.rs".to_owned(), "src/b/".to_owned()],
             branch: None,
+            branches: Vec::new(),
             worktree: None,
             next_action: Some("write the tests".to_owned()),
             current: None,

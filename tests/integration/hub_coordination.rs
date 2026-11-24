@@ -276,6 +276,7 @@ fn checkpoint(
         next_action: Some("continue".into()),
         scope: scope.map(|paths| paths.iter().map(|path| (*path).into()).collect()),
         branch: None,
+        branches: None,
         worktree: None,
         resolve_blocker: false,
         source_refs: Vec::new(),
