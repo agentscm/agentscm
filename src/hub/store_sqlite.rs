@@ -149,6 +149,7 @@ use super::work_transition::{
 use super::{HubError, Result, store_sql};
 use crate::local_ci::DeviceAuthorization;
 
+mod memory;
 mod notices;
 mod preflight;
 mod repository_rename;
@@ -10528,6 +10529,45 @@ impl Store for SqliteStore {
         } else {
             Answered::Declined { requester, session }
         })
+    }
+
+    fn memory_write(
+        &self,
+        token: &str,
+        scope: &str,
+        note: &super::memory::NewNote,
+        now: i64,
+    ) -> Result<super::memory::Note> {
+        memory::write(self, token, scope, note, now)
+    }
+
+    fn memory_list(
+        &self,
+        scope: &str,
+        query: &super::memory::ListQuery,
+    ) -> Result<super::memory::Page> {
+        memory::list(self, scope, query)
+    }
+
+    fn memory_remove(
+        &self,
+        scope: &str,
+        id: &str,
+        by: super::memory::Actor<'_>,
+        now: i64,
+    ) -> Result<super::memory::Removed> {
+        memory::remove(self, scope, id, by, now)
+    }
+
+    fn memory_promote(
+        &self,
+        scope: &str,
+        id: &str,
+        person: &User,
+        promoted: bool,
+        now: i64,
+    ) -> Result<Option<super::memory::Note>> {
+        memory::promote(self, scope, id, person, promoted, now)
     }
 
     fn pickup_create(

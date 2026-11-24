@@ -168,6 +168,7 @@ mod hub_intents;
 mod hub_leases;
 mod hub_login;
 mod hub_mcp;
+mod hub_memory;
 #[cfg(unix)]
 mod hub_merge_queue;
 #[cfg(unix)]

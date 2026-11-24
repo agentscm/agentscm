@@ -760,6 +760,16 @@ impl HumanSession {
         }
     }
 
+    /// The person behind any sign-in: the web page's cookie or a CLI or script bearer session.
+    /// Agent tokens and computer credentials never reach here.
+    pub(super) fn person(&self) -> &User {
+        &self.0.user
+    }
+
+    pub(super) fn is_admin(&self) -> bool {
+        self.0.admin
+    }
+
     pub(super) fn admin(&self) -> std::result::Result<&Human, ApiError> {
         if self.0.admin {
             Ok(&self.0)

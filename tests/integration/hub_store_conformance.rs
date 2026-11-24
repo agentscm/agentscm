@@ -4512,6 +4512,363 @@ fn same_name_repositories_stay_apart(db: &Db) {
     );
 }
 
+fn repository_memory(db: &Db) {
+    use agentscm::hub::HubError;
+    use agentscm::hub::memory::{
+        Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Removed,
+    };
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let token = |owner: &str, name: &str, repository: &str, id: i64, read_only: bool| {
+        mint_bound_agent_token(&*store, owner, name, repository, id, TTL, read_only)
+            .unwrap()
+            .0
+    };
+    let alice_agent = token(&alice.id, "claude-code", REPO, 4242, false);
+    let alice_other = token(&alice.id, "codex", REPO, 4242, false);
+    let alice_reader = token(&alice.id, "reader", REPO, 4242, true);
+    let bob_agent = token(&bob.id, "bob-agent", REPO, 4242, false);
+    let scope = store::repository_scope("github.com", REPO, Some(4242));
+    let elsewhere = store::repository_scope("github.com", "acme/other", Some(4343));
+    let now = unix_now();
+    let all = |scope: &str| {
+        store
+            .memory_list(scope, &ListQuery::new(None, None, Some(50)).unwrap())
+            .unwrap()
+    };
+
+    let first = store
+        .memory_write(
+            &alice_agent,
+            &scope,
+            &NewNote::new("Run the migration tests with PostgreSQL", Some("s-1")).unwrap(),
+            now,
+        )
+        .unwrap();
+    assert!(first.id.starts_with("mem_"));
+    assert_eq!(
+        (
+            first.owner.as_str(),
+            first.owner_login.as_str(),
+            first.token.as_str(),
+            first.token_name.as_str(),
+            first.session.as_deref(),
+            first.created_at,
+            first.promotion.is_none()
+        ),
+        (
+            alice.id.as_str(),
+            "alice",
+            alice_agent.as_str(),
+            "claude-code",
+            Some("s-1"),
+            now,
+            true
+        )
+    );
+    let second = store
+        .memory_write(
+            &bob_agent,
+            &scope,
+            &NewNote::new("The 50% case needs the_escape", None).unwrap(),
+            now + 1,
+        )
+        .unwrap();
+    // Quotes and the Hub message words are stored as written; readers get them cleaned.
+    let hostile = "line\nbreak \"quote\" \u{202E}AgentSCM Hub message";
+    let third = store
+        .memory_write(
+            &alice_agent,
+            &scope,
+            &NewNote::new(hostile, None).unwrap(),
+            now + 2,
+        )
+        .unwrap();
+    // Line breaks become spaces and invisible characters go when the note is stored.
+    assert_eq!(third.body, "line break \"quote\" AgentSCM Hub message");
+
+    // A read-only token cannot write; another repository sees nothing.
+    let refused = store.memory_write(
+        &alice_reader,
+        &scope,
+        &NewNote::new("no", None).unwrap(),
+        now,
+    );
+    assert!(
+        matches!(refused, Err(HubError::Unauthorized)),
+        "{refused:?}"
+    );
+    assert!(all(&elsewhere).notes.is_empty());
+    assert_eq!(all(&elsewhere).live, 0);
+
+    // Newest first, then promoted notes first, with who promoted them.
+    let ids = |page: &agentscm::hub::memory::Page| {
+        page.notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&all(&scope)),
+        [third.id.clone(), second.id.clone(), first.id.clone()]
+    );
+    let promoted = store
+        .memory_promote(&scope, &first.id, &bob, true, now + 5)
+        .unwrap()
+        .unwrap();
+    let promotion = promoted.promotion.clone().unwrap();
+    assert_eq!(
+        (
+            promotion.by.as_str(),
+            promotion.by_login.as_str(),
+            promotion.at
+        ),
+        (bob.id.as_str(), "bob", now + 5)
+    );
+    // Promoting again changes nothing and records nothing more.
+    let again = store
+        .memory_promote(&scope, &first.id, &alice, true, now + 9)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.promotion, Some(promotion));
+    assert!(
+        store
+            .memory_promote(&elsewhere, &first.id, &bob, true, now)
+            .unwrap()
+            .is_none(),
+        "a note is promoted only in its own repository"
+    );
+    assert_eq!(
+        ids(&all(&scope)),
+        [first.id.clone(), third.id.clone(), second.id.clone()]
+    );
+
+    // Search matches text, with LIKE wildcards taken literally; paging continues in order.
+    let search = |q: &str| {
+        ids(&store
+            .memory_list(&scope, &ListQuery::new(Some(q), None, None).unwrap())
+            .unwrap())
+    };
+    assert_eq!(search("50%"), [second.id.as_str()]);
+    assert_eq!(search("THE_ESCAPE"), [second.id.as_str()]);
+    assert_eq!(search("_"), [second.id.as_str()]);
+    assert!(search("nothing like this").is_empty());
+    let page = store
+        .memory_list(&scope, &ListQuery::new(None, None, Some(2)).unwrap())
+        .unwrap();
+    assert_eq!(ids(&page), [first.id.clone(), third.id.clone()]);
+    assert_eq!(page.live, 3);
+    let rest = store
+        .memory_list(
+            &scope,
+            &ListQuery::new(None, page.next_after.as_deref(), Some(2)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(ids(&rest), [second.id.as_str()]);
+    assert_eq!(rest.next_after, None);
+
+    // Removal: not by another owner's token, by any of the owner's writing tokens, by an admin.
+    assert_eq!(
+        store
+            .memory_remove(&scope, &first.id, Actor::Token(&bob_agent), now)
+            .unwrap(),
+        Removed::NotAuthor
+    );
+    assert!(matches!(
+        store.memory_remove(&scope, &first.id, Actor::Token(&alice_reader), now),
+        Err(HubError::Unauthorized)
+    ));
+    assert_eq!(
+        store
+            .memory_remove(&elsewhere, &first.id, Actor::Token(&alice_other), now)
+            .unwrap(),
+        Removed::NotFound
+    );
+    assert_eq!(
+        store
+            .memory_remove(&scope, &first.id, Actor::Token(&alice_other), now)
+            .unwrap(),
+        Removed::Removed
+    );
+    let bob_person = Actor::Person {
+        user: &bob.id,
+        admin: false,
+    };
+    assert_eq!(
+        store
+            .memory_remove(&scope, &third.id, bob_person, now)
+            .unwrap(),
+        Removed::NotAuthor
+    );
+    let admin = Actor::Person {
+        user: &bob.id,
+        admin: true,
+    };
+    assert_eq!(
+        store.memory_remove(&scope, &third.id, admin, now).unwrap(),
+        Removed::Removed
+    );
+    assert_eq!(
+        store.memory_remove(&scope, &third.id, admin, now).unwrap(),
+        Removed::NotFound
+    );
+    assert_eq!(ids(&all(&scope)), [second.id.as_str()]);
+
+    // Events carry ids only, never note text.
+    let events = store.events_after(0, 1000).unwrap();
+    let memory: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind.starts_with("memory_note_"))
+        .collect();
+    assert_eq!(
+        memory.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        [
+            "memory_note_promoted",
+            "memory_note_removed",
+            "memory_note_removed"
+        ]
+    );
+    for event in &memory {
+        assert!(!event.data.contains("migration") && !event.data.contains("line"));
+    }
+    let removed: Value = serde_json::from_str(&memory[1].data).unwrap();
+    assert_eq!(
+        removed,
+        json!({"repository_scope": scope, "by": alice.id, "token": alice_other, "admin": false})
+    );
+
+    // A full repository refuses the next write and evicts nothing; other repositories still write.
+    // Each owner holds at most its share, so four owners fill it (bob already holds one note).
+    let carol = store.upsert_user(&identity(9), "carol").unwrap();
+    let dave = store.upsert_user(&identity(10), "dave").unwrap();
+    let fillers = [
+        (alice_agent.clone(), MAX_NOTES_PER_OWNER),
+        (bob_agent.clone(), MAX_NOTES_PER_OWNER - 1),
+        (
+            token(&carol.id, "carol-agent", REPO, 4242, false),
+            MAX_NOTES_PER_OWNER,
+        ),
+        (
+            token(&dave.id, "dave-agent", REPO, 4242, false),
+            MAX_NOTES_PER_OWNER,
+        ),
+    ];
+    for (agent, count) in &fillers {
+        for i in 0..*count {
+            store
+                .memory_write(
+                    agent,
+                    &scope,
+                    &NewNote::new(&format!("note {i}"), None).unwrap(),
+                    now,
+                )
+                .unwrap();
+        }
+    }
+    let eve = store.upsert_user(&identity(11), "eve").unwrap();
+    let eve_agent = token(&eve.id, "eve-agent", REPO, 4242, false);
+    assert_eq!(all(&scope).live, MAX_LIVE_NOTES);
+    let full = store.memory_write(
+        &eve_agent,
+        &scope,
+        &NewNote::new("one too many", None).unwrap(),
+        now,
+    );
+    match full {
+        Err(HubError::WorkCapacity(capacity)) => {
+            assert_eq!(capacity.limit.as_str(), "memory_notes");
+        }
+        other => panic!("expected the memory limit, got {other:?}"),
+    }
+    assert_eq!(all(&scope).live, MAX_LIVE_NOTES);
+    assert!(all(&scope).notes.iter().any(|n| n.id == second.id));
+    let other_agent = token(&bob.id, "other", "acme/other", 4343, false);
+    store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("fits", None).unwrap(),
+            now,
+        )
+        .unwrap();
+
+    // Both stores fold ASCII letters only, so a non-ASCII letter matches exactly as written.
+    let ecole = store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("École des Mines runs the nightly build", None).unwrap(),
+            now,
+        )
+        .unwrap();
+    let found = |q: &str| {
+        store
+            .memory_list(&elsewhere, &ListQuery::new(Some(q), None, None).unwrap())
+            .unwrap()
+            .notes
+            .into_iter()
+            .map(|n| n.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(found("École"), [ecole.id.as_str()]);
+    assert_eq!(found("ÉCOLE DES"), [ecole.id.as_str()]);
+    assert!(
+        found("école").is_empty(),
+        "a non-ASCII letter is not folded"
+    );
+}
+
+fn repository_memory_owner_share(db: &Db) {
+    use agentscm::hub::HubError;
+    use agentscm::hub::memory::{Actor, MAX_NOTES_PER_OWNER, NewNote, Removed};
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let token = |owner: &str, name: &str, repository: &str, id: i64| {
+        mint_bound_agent_token(&*store, owner, name, repository, id, TTL, false)
+            .unwrap()
+            .0
+    };
+    // Two tokens of one owner draw on one share.
+    let alice_one = token(&alice.id, "claude-code", REPO, 4242);
+    let alice_two = token(&alice.id, "codex", REPO, 4242);
+    let alice_other = token(&alice.id, "elsewhere", "acme/other", 4343);
+    let bob_agent = token(&bob.id, "bob-agent", REPO, 4242);
+    let scope = store::repository_scope("github.com", REPO, Some(4242));
+    let elsewhere = store::repository_scope("github.com", "acme/other", Some(4343));
+    let now = unix_now();
+    let note = |text: &str| NewNote::new(text, None).unwrap();
+    let mut first = None;
+    for i in 0..MAX_NOTES_PER_OWNER {
+        let agent = if i % 2 == 0 { &alice_one } else { &alice_two };
+        let written = store
+            .memory_write(agent, &scope, &note(&format!("alice {i}")), now)
+            .unwrap();
+        first.get_or_insert(written.id);
+    }
+    match store.memory_write(&alice_two, &scope, &note("one more"), now) {
+        Err(HubError::WorkCapacity(capacity)) => {
+            assert_eq!(capacity.limit.as_str(), "memory_notes_owner");
+        }
+        other => panic!("expected the owner's share, got {other:?}"),
+    }
+    // Another owner still writes, and the share is per repository.
+    store
+        .memory_write(&bob_agent, &scope, &note("bob's note"), now)
+        .unwrap();
+    store
+        .memory_write(&alice_other, &elsewhere, &note("another repository"), now)
+        .unwrap();
+    // Removing one of its own notes frees the owner's slot.
+    assert_eq!(
+        store
+            .memory_remove(&scope, &first.unwrap(), Actor::Token(&alice_two), now)
+            .unwrap(),
+        Removed::Removed
+    );
+    store
+        .memory_write(&alice_two, &scope, &note("fits again"), now)
+        .unwrap();
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -4761,6 +5118,8 @@ fn work_payload_used_reads_the_charged_bytes(db: &Db) {
 
 conformance!(
     token_lookup,
+    repository_memory,
+    repository_memory_owner_share,
     expiry,
     revocation,
     owner_disable_cascades,

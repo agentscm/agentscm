@@ -78,6 +78,14 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/why?path=src/x.rs".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/why?path=../x".into(), "".into(), Status(400));
     row(&get, "/v1/hub/standup/repositories".into(), "".into(), Allowed);
+    // Repository memory: a read-only token reads; writes, removal and every review route refuse it.
+    row(&get, "/v1/hub/memory?q=x".into(), "".into(), Allowed);
+    row(&post, "/v1/hub/memory".into(), r#"{"body":"n"}"#.into(), AgentOnly);
+    row(&delete, "/v1/hub/memory/mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), "".into(), AgentOnly);
+    row(&get, "/v1/hub/memory-review?repository=acme/widgets".into(), "".into(), HumanOnly);
+    row(&delete, "/v1/hub/memory-review/mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?repository=acme/widgets".into(), "".into(), HumanOnly);
+    row(&post, "/v1/hub/memory-review/mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/promote?repository=acme/widgets".into(), "".into(), HumanOnly);
+    row(&delete, "/v1/hub/memory-review/mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/promote?repository=acme/widgets".into(), "".into(), HumanOnly);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_repositories","arguments":{}}}"#.into(), Allowed);
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
@@ -144,6 +152,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_pr_context","arguments":{"number":1}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_pr_link","arguments":{"work_id":"wrk_00000000000000000000000000000001"}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_pr_link_set","arguments":{}}}"#.into(), AgentOnly);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_memory_list","arguments":{"q":"x"}}}"#.into(), Allowed);
     // Coordination and checkpoint tools mutate state.
     for tool in [
         "agentscm_work_overlap_consent",
@@ -160,6 +169,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
         "agentscm_work_ack",
         "agentscm_work_usage",
         "agentscm_skill_evidence",
+        "agentscm_memory_write",
+        "agentscm_memory_remove",
     ] {
         row(&post, "/mcp".into(), rpc(tool), AgentOnly);
     }
