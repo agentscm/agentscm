@@ -135,8 +135,8 @@ fn outstanding(status: &ActionableStatus) -> Vec<Outstanding> {
                 text: format!(
                     "{}: {} (recipient {}; claim {:?}; reservation {:?}).",
                     ThirdPartyText::new(&work.title, 160),
-                    work.action,
-                    work.recipient.login.as_deref().unwrap_or("unknown"),
+                    ThirdPartyText::new(&work.action, 180),
+                    ThirdPartyText::name(work.recipient.login.as_deref().unwrap_or("unknown"), 64),
                     work.freshness,
                     work.operational.reservation.status
                 ),

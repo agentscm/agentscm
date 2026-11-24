@@ -549,22 +549,24 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
         let line = match &item.intent {
             Some(intent) => {
                 let shown_waits = intent.waiting_on.iter().take(SHOWN_WAITS);
-                let mut waiting = shown_waits
+                let waiting = shown_waits
                     .map(|edge| {
-                        let edge = format!("{}:{:?}", edge.work_id, edge.state);
-                        ThirdPartyText::name(&edge, 64).to_string()
+                        format!(
+                            "{}:{:?}",
+                            ThirdPartyText::name(&edge.work_id, 48),
+                            edge.state
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                if intent.waiting_on.len() > SHOWN_WAITS {
-                    waiting.push_str(&format!(
-                        " and {} more",
-                        intent.waiting_on.len() - SHOWN_WAITS
-                    ));
-                }
+                // The count is the Hub's own words, so it goes after the closing quote.
+                let more = match intent.waiting_on.len().checked_sub(SHOWN_WAITS) {
+                    Some(more) if more > 0 => format!(" and {more} more"),
+                    _ => String::new(),
+                };
                 let prose = |text: &str| ThirdPartyText::new(text, 60).quoted();
                 format!(
-                    "{}: why {}; decision {}; next {}; blocker {}; waiting-on \"{}\"; issue {}; branch {}; scope {}; claim {:?}; last check-in {}; more: agentscm_work_intent.",
+                    "{}: why {}; decision {}; next {}; blocker {}; waiting-on \"{}\"{}; issue {}; branch {}; scope {}; claim {:?}; last check-in {}; more: agentscm_work_intent.",
                     ThirdPartyText::name(&item.work_id, 80),
                     prose(intent.description.as_deref().unwrap_or(&intent.title)),
                     prose(
@@ -581,6 +583,7 @@ pub(super) fn render_holders(value: &HolderIntents) -> String {
                             .map_or("none recorded", |d| d.summary.as_str())
                     ),
                     waiting,
+                    more,
                     prose(
                         intent
                             .issue
