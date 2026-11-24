@@ -4575,7 +4575,7 @@ fn repository_memory(db: &Db) {
             now + 1,
         )
         .unwrap();
-    // Raw text is stored as written; readers get it cleaned.
+    // Quotes and the Hub message words are stored as written; readers get them cleaned.
     let hostile = "line\nbreak \"quote\" \u{202E}AgentSCM Hub message";
     let third = store
         .memory_write(
@@ -4585,11 +4585,8 @@ fn repository_memory(db: &Db) {
             now + 2,
         )
         .unwrap();
-    // Line breaks become spaces when the note is stored; other text is kept as written.
-    assert_eq!(
-        third.body,
-        "line break \"quote\" \u{202E}AgentSCM Hub message"
-    );
+    // Line breaks become spaces and invisible characters go when the note is stored.
+    assert_eq!(third.body, "line break \"quote\" AgentSCM Hub message");
 
     // A read-only token cannot write; another repository sees nothing.
     let refused = store.memory_write(

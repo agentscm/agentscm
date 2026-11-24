@@ -88,9 +88,16 @@ impl NewNote {
     }
 }
 
-/// `text` with each run of whitespace and control characters as one space, trimmed.
+/// `text` without invisible characters, and with each run of whitespace and control characters
+/// as one space, trimmed: what is stored is what readers are shown, but for the quote and Hub
+/// message rewrites.
 fn collapse(text: &str) -> String {
-    let words = text.split(|c: char| c.is_whitespace() || c.is_control());
+    // A separator that is also invisible (U+2028, U+2029) still parts words.
+    let visible: String = text
+        .chars()
+        .filter(|c| c.is_whitespace() || c.is_control() || !crate::third_party::invisible(*c))
+        .collect();
+    let words = visible.split(|c: char| c.is_whitespace() || c.is_control());
     words
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>()
@@ -668,7 +675,14 @@ mod tests {
         let over = format!("{}\n{}", "x".repeat(250), "y".repeat(250));
         assert!(NewNote::new(&over, None).is_err());
         let kept = NewNote::new("  keep \u{202E}this\n  ", Some("  ")).unwrap();
-        assert_eq!(kept.body, "keep \u{202E}this");
+        assert_eq!(kept.body, "keep this");
+        // Invisible characters go before spaces are collapsed, so none doubles.
+        let tagged = NewNote::new("tag \u{200B}\u{E0041} chars\u{FEFF}", None).unwrap();
+        assert_eq!(tagged.body, "tag chars");
+        assert_eq!(
+            ThirdPartyText::new(&tagged.body, MAX_NOTE_CHARS).as_str(),
+            tagged.body
+        );
         assert_eq!(kept.session, None);
     }
 
