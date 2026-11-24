@@ -26,8 +26,8 @@ use super::login::HumanSession;
 use super::store::{
     Principal, User, like_pattern, scope_of, search_text, unix_now, validate_repository,
 };
-use super::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 use super::{HubError, HubState, Result};
+use crate::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 
 /// Notes one repository holds at a time.
 pub const MAX_LIVE_NOTES: usize = 100;
@@ -226,7 +226,7 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 
 fn name(text: &str) -> String {
-    ThirdPartyText::new(text, NAME_CHARS).to_string()
+    ThirdPartyText::name(text, NAME_CHARS).to_string()
 }
 
 /// A note as every reader gets it: the text and names cleaned as third-party text.
@@ -323,20 +323,20 @@ pub fn render(page: &Page) -> String {
         if let Some(promoted) = &note.promotion {
             text.push_str(&format!(
                 ", promoted by {} at {}",
-                ThirdPartyText::new(&promoted.by_login, NAME_CHARS).quoted(),
+                ThirdPartyText::name(&promoted.by_login, NAME_CHARS).quoted(),
                 promoted.at
             ));
         }
         text.push_str(&format!(
             ": {} (written by agent {} of {}",
             ThirdPartyText::new(&note.body, MAX_NOTE_CHARS).quoted(),
-            ThirdPartyText::new(&note.token_name, NAME_CHARS).quoted(),
-            ThirdPartyText::new(&note.owner_login, NAME_CHARS).quoted(),
+            ThirdPartyText::name(&note.token_name, NAME_CHARS).quoted(),
+            ThirdPartyText::name(&note.owner_login, NAME_CHARS).quoted(),
         ));
         if let Some(session) = &note.session {
             text.push_str(&format!(
                 ", session {}",
-                ThirdPartyText::new(session, NAME_CHARS).quoted()
+                ThirdPartyText::name(session, NAME_CHARS).quoted()
             ));
         }
         text.push_str(&format!(", at {})", note.created_at));
@@ -679,10 +679,7 @@ mod tests {
                 !text.chars().any(|c| c.is_control() && c != '\n'),
                 "{text:?}"
             );
-            assert!(
-                !text.chars().any(crate::hub::third_party::invisible),
-                "{text:?}"
-            );
+            assert!(!text.chars().any(crate::third_party::invisible), "{text:?}");
             let view = serde_json::to_value(PageView::from(&page)).unwrap();
             for field in [
                 "/notes/0/body",
