@@ -104,8 +104,11 @@ async fn headless_hub_has_no_dashboard_but_keeps_an_auth_landing() {
         .redirect(Policy::none())
         .build()
         .unwrap();
+    // `hub login` sends the browser to `/#/signed-in?…`; a headless Hub hands it to its landing page.
+    let response = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(response.status(), 302);
+    assert_eq!(response.headers()["location"], agentscm::hub::ui::landing());
     for path in [
-        "/",
         "/ui",
         "/ui/",
         "/ui/app.js",
