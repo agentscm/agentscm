@@ -25,9 +25,11 @@ pub enum CapacityLimit {
     CoordinationUpdates,
     /// Live notes of one repository's memory.
     MemoryNotes,
+    /// Live notes of one owner in one repository's memory.
+    MemoryNotesOwner,
 }
 
-const LIMITS: [CapacityLimit; 7] = [
+const LIMITS: [CapacityLimit; 8] = [
     CapacityLimit::WorkStorage,
     CapacityLimit::MergeObservations,
     CapacityLimit::CatchupDeliveries,
@@ -35,6 +37,7 @@ const LIMITS: [CapacityLimit; 7] = [
     CapacityLimit::CoordinationRequests,
     CapacityLimit::CoordinationUpdates,
     CapacityLimit::MemoryNotes,
+    CapacityLimit::MemoryNotesOwner,
 ];
 
 impl CapacityLimit {
@@ -47,6 +50,7 @@ impl CapacityLimit {
             Self::CoordinationRequests => "coordination_requests",
             Self::CoordinationUpdates => "coordination_updates",
             Self::MemoryNotes => "memory_notes",
+            Self::MemoryNotesOwner => "memory_notes_owner",
         }
     }
 
@@ -66,6 +70,9 @@ impl CapacityLimit {
             Self::CoordinationRequests => "too many coordination requests are open",
             Self::CoordinationUpdates => "one coordination request reached its update cap",
             Self::MemoryNotes => "the repository's memory holds its maximum of notes",
+            Self::MemoryNotesOwner => {
+                "this owner's notes in the repository's memory reached their share"
+            }
         }
     }
 
@@ -85,6 +92,7 @@ impl CapacityLimit {
             )),
             Self::CoordinationUpdates => Some("resolve this coordination request with agentscm_coordination_resolve and open a new one if more coordination is needed".into()),
             Self::MemoryNotes => Some(format!("a repository holds at most {} notes; remove one of your own owner's notes with agentscm_memory_remove, or ask a person to remove one, then retry", super::memory::MAX_LIVE_NOTES)),
+            Self::MemoryNotesOwner => Some(format!("one owner holds at most {} notes in a repository; remove one of your owner's own notes with agentscm_memory_remove, then retry", super::memory::MAX_NOTES_PER_OWNER)),
         }
     }
 }
@@ -147,6 +155,7 @@ impl CapacityRefusal {
             ),
             CapacityLimit::CoordinationUpdates => "Resolve the coordination request from the Inbox; each request keeps a bounded number of acknowledgements and responses.".into(),
             CapacityLimit::MemoryNotes => "Remove notes that are no longer useful with `agentscm hub memory remove`; a repository's memory holds a bounded number of notes.".into(),
+            CapacityLimit::MemoryNotesOwner => "Ask that person to remove notes they no longer need, or remove some with `agentscm hub memory remove` as a Hub administrator; each person holds a bounded share of a repository's memory.".into(),
         }
     }
 }

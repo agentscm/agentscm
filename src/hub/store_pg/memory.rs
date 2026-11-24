@@ -1,7 +1,7 @@
 //! Repository memory notes (see `crate::hub::memory`), as in SQLite.
 use super::*;
 use crate::hub::memory::{
-    Actor, ListQuery, MAX_LIVE_NOTES, NewNote, Note, Page, Promotion, Removed,
+    Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Note, Page, Promotion, Removed,
 };
 
 const COLUMNS: &str = "id, body, owner, owner_login, token, token_name, session, created_at,
@@ -75,6 +75,16 @@ pub(super) fn write(
             return Err(HubError::Unauthorized);
         }
         lock(&mut tx, scope)?;
+        // Under the repository's lock, so the owner's share holds under concurrency too.
+        let owned: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM hub_memory_notes WHERE repository_scope = $1 AND owner = $2",
+                &[&scope, &who.owner.id],
+            )?
+            .get(0);
+        if usize::try_from(owned).unwrap_or(usize::MAX) >= MAX_NOTES_PER_OWNER {
+            return Err(who.capacity(CapacityLimit::MemoryNotesOwner));
+        }
         if live(&mut tx, scope)? >= MAX_LIVE_NOTES {
             return Err(who.capacity(CapacityLimit::MemoryNotes));
         }

@@ -33,6 +33,8 @@ use crate::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 pub const MAX_LIVE_NOTES: usize = 100;
 /// Characters in one note; a longer note is refused, never cut.
 pub const MAX_NOTE_CHARS: usize = 500;
+/// Notes one owner holds in one repository at a time, so one owner cannot fill the list.
+pub const MAX_NOTES_PER_OWNER: usize = 25;
 /// Notes on one page.
 pub const MAX_PAGE: usize = 50;
 pub const DEFAULT_PAGE: usize = 20;

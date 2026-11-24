@@ -4514,7 +4514,9 @@ fn same_name_repositories_stay_apart(db: &Db) {
 
 fn repository_memory(db: &Db) {
     use agentscm::hub::HubError;
-    use agentscm::hub::memory::{Actor, ListQuery, MAX_LIVE_NOTES, NewNote, Removed};
+    use agentscm::hub::memory::{
+        Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Removed,
+    };
     let store = db.open();
     let alice = store.upsert_user(&identity(7), "alice").unwrap();
     let bob = store.upsert_user(&identity(8), "bob").unwrap();
@@ -4737,19 +4739,38 @@ fn repository_memory(db: &Db) {
     );
 
     // A full repository refuses the next write and evicts nothing; other repositories still write.
-    for i in 1..MAX_LIVE_NOTES {
-        store
-            .memory_write(
-                &alice_agent,
-                &scope,
-                &NewNote::new(&format!("note {i}"), None).unwrap(),
-                now,
-            )
-            .unwrap();
+    // Each owner holds at most its share, so four owners fill it (bob already holds one note).
+    let carol = store.upsert_user(&identity(9), "carol").unwrap();
+    let dave = store.upsert_user(&identity(10), "dave").unwrap();
+    let fillers = [
+        (alice_agent.clone(), MAX_NOTES_PER_OWNER),
+        (bob_agent.clone(), MAX_NOTES_PER_OWNER - 1),
+        (
+            token(&carol.id, "carol-agent", REPO, 4242, false),
+            MAX_NOTES_PER_OWNER,
+        ),
+        (
+            token(&dave.id, "dave-agent", REPO, 4242, false),
+            MAX_NOTES_PER_OWNER,
+        ),
+    ];
+    for (agent, count) in &fillers {
+        for i in 0..*count {
+            store
+                .memory_write(
+                    agent,
+                    &scope,
+                    &NewNote::new(&format!("note {i}"), None).unwrap(),
+                    now,
+                )
+                .unwrap();
+        }
     }
+    let eve = store.upsert_user(&identity(11), "eve").unwrap();
+    let eve_agent = token(&eve.id, "eve-agent", REPO, 4242, false);
     assert_eq!(all(&scope).live, MAX_LIVE_NOTES);
     let full = store.memory_write(
-        &bob_agent,
+        &eve_agent,
         &scope,
         &NewNote::new("one too many", None).unwrap(),
         now,
@@ -4796,6 +4817,59 @@ fn repository_memory(db: &Db) {
         found("école").is_empty(),
         "a non-ASCII letter is not folded"
     );
+}
+
+fn repository_memory_owner_share(db: &Db) {
+    use agentscm::hub::HubError;
+    use agentscm::hub::memory::{Actor, MAX_NOTES_PER_OWNER, NewNote, Removed};
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let token = |owner: &str, name: &str, repository: &str, id: i64| {
+        mint_bound_agent_token(&*store, owner, name, repository, id, TTL, false)
+            .unwrap()
+            .0
+    };
+    // Two tokens of one owner draw on one share.
+    let alice_one = token(&alice.id, "claude-code", REPO, 4242);
+    let alice_two = token(&alice.id, "codex", REPO, 4242);
+    let alice_other = token(&alice.id, "elsewhere", "acme/other", 4343);
+    let bob_agent = token(&bob.id, "bob-agent", REPO, 4242);
+    let scope = store::repository_scope("github.com", REPO, Some(4242));
+    let elsewhere = store::repository_scope("github.com", "acme/other", Some(4343));
+    let now = unix_now();
+    let note = |text: &str| NewNote::new(text, None).unwrap();
+    let mut first = None;
+    for i in 0..MAX_NOTES_PER_OWNER {
+        let agent = if i % 2 == 0 { &alice_one } else { &alice_two };
+        let written = store
+            .memory_write(agent, &scope, &note(&format!("alice {i}")), now)
+            .unwrap();
+        first.get_or_insert(written.id);
+    }
+    match store.memory_write(&alice_two, &scope, &note("one more"), now) {
+        Err(HubError::WorkCapacity(capacity)) => {
+            assert_eq!(capacity.limit.as_str(), "memory_notes_owner");
+        }
+        other => panic!("expected the owner's share, got {other:?}"),
+    }
+    // Another owner still writes, and the share is per repository.
+    store
+        .memory_write(&bob_agent, &scope, &note("bob's note"), now)
+        .unwrap();
+    store
+        .memory_write(&alice_other, &elsewhere, &note("another repository"), now)
+        .unwrap();
+    // Removing one of its own notes frees the owner's slot.
+    assert_eq!(
+        store
+            .memory_remove(&scope, &first.unwrap(), Actor::Token(&alice_two), now)
+            .unwrap(),
+        Removed::Removed
+    );
+    store
+        .memory_write(&alice_two, &scope, &note("fits again"), now)
+        .unwrap();
 }
 
 macro_rules! conformance {
@@ -5048,6 +5122,7 @@ fn work_payload_used_reads_the_charged_bytes(db: &Db) {
 conformance!(
     token_lookup,
     repository_memory,
+    repository_memory_owner_share,
     expiry,
     revocation,
     owner_disable_cascades,
