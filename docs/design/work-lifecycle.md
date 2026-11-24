@@ -495,9 +495,11 @@ the same codes for single calls.
 ### Resolving before a duplicate
 
 An MCP lead start with paths and no `work_id` first reads the owner's resumable Work over those
-paths. If one exists under another identity, the start creates and claims nothing and lists it
-with the resume call; `new_work: true` starts different work. A start whose request key or forge
-source is that Work's own goes ahead, since the store resolves it. HTTP and CLI starts are
+paths. If one exists and the start carries no request key or forge source, the start creates and
+claims nothing and lists it with the resume call; `new_work: true` starts different work. A start
+whose request key or forge source is that Work's own goes ahead, since the store resolves it. A
+start with a different request key or forge source of its own is different work: it goes ahead
+and lists that Work under `resumable_existing` with the resume call. HTTP and CLI starts are
 unchanged, so older clients keep their behavior. A start refused for any reason in MCP carries
 `recovery`: the inspection of the conflicting Work with the requested paths, cut in the compact
 default to each item's permitted calls, the live holds and the resumable ids.

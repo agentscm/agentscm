@@ -4579,14 +4579,13 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
     assert_eq!(batch["isError"], false, "{batch}");
     assert_eq!(batch["structuredContent"]["items"][0]["outcome"], "applied");
 
-    // A new start over the same paths under another identity is pointed at the released Work
+    // A new start over the same paths with no identity of its own is pointed at the released Work
     // first, and nothing is created.
     let duplicate = hub
         .tool_result(
             &alice,
             "agentscm_start",
-            json!({"task": "billing again", "session": "session-b", "request_key": "billing-2",
-                "paths": ["src/billing.rs"]}),
+            json!({"task": "billing again", "session": "session-b", "paths": ["src/billing.rs"]}),
         )
         .await;
     assert_eq!(duplicate["isError"], true, "{duplicate}");
@@ -4630,17 +4629,28 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
         same["structuredContent"].get("resolve_existing").is_none(),
         "{same}"
     );
-    // Different work goes ahead when it says so.
+    // A request key of its own is different work: it goes ahead and names the released Work.
     let different = hub
         .tool_result(
             &alice,
             "agentscm_start",
             json!({"task": "invoices", "session": "session-c", "request_key": "invoices",
-                "paths": ["src/billing.rs"], "new_work": true}),
+                "paths": ["src/billing.rs"]}),
         )
         .await;
     assert_eq!(
         different["structuredContent"]["work"]["created"], true,
+        "{different}"
+    );
+    assert_eq!(
+        different["structuredContent"]["resumable_existing"][0]["work_id"],
+        work_id.as_str(),
+        "{different}"
+    );
+    assert!(
+        different["content"]
+            .to_string()
+            .contains("went ahead under its own identity"),
         "{different}"
     );
     let invoices = different["structuredContent"]["work"]["item"]["id"]
