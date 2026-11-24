@@ -108,6 +108,8 @@ pub(super) fn list(store: &SqliteStore, scope: &str, query: &ListQuery) -> Resul
     let tx = conn.transaction()?;
     let mut sql = format!("SELECT {COLUMNS} FROM hub_memory_notes WHERE repository_scope = ?1");
     let mut values: Vec<rusqlite::types::Value> = vec![scope.to_owned().into()];
+    // ponytail: ASCII-only case folding over the stored body, not the shown text; upgrade: store
+    // a folded search column.
     if let Some(pattern) = &query.pattern {
         values.push(pattern.clone().into());
         sql.push_str(&format!(

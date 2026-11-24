@@ -886,6 +886,7 @@ fn mode_word(mode: Mode) -> &'static str {
 /// separator becomes one; other invisible characters, which could hide or reorder words, are
 /// dropped when it is shown, so notes stored earlier are covered too. Emoji joined by a
 /// zero-width joiner show unjoined.
+// ponytail: the joiner goes with the other invisibles; upgrade: keep U+200D between two emoji.
 fn shown_note(note: &str) -> String {
     let note: String = note
         .chars()

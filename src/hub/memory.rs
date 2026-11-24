@@ -5,7 +5,8 @@
 //!    into another reply.
 //! 2. Every note names its author (the person who owns the agent token, the agent and its
 //!    session, as they were at write time) and is rendered to readers as third-party text
-//!    through [`ThirdPartyText`]. The raw text is stored; it is cleaned when rendered.
+//!    through [`ThirdPartyText`]. Invisible characters and whitespace runs are removed before a
+//!    note is stored; the quote and frame-word rewrites happen when it is rendered.
 //! 3. Only a signed-in person with Contribute access to the repository can mark a note promoted.
 //!    Promotion orders a list and names who promoted it; it delivers nothing.
 //!
@@ -30,10 +31,14 @@ use super::{HubError, HubState, Result};
 use crate::third_party::{DATA_NOT_INSTRUCTIONS, ThirdPartyText};
 
 /// Notes one repository holds at a time.
+// ponytail: a fixed 100 per repository; a full list refuses writes and evicts nothing; upgrade:
+// expire or archive notes nobody has read for a while.
 pub const MAX_LIVE_NOTES: usize = 100;
 /// Characters in one note; a longer note is refused, never cut.
 pub const MAX_NOTE_CHARS: usize = 500;
 /// Notes one owner holds in one repository at a time, so one owner cannot fill the list.
+// ponytail: a fixed 25 per person, so four full shares fill the list; upgrade: a share that
+// scales with the number of people writing.
 pub const MAX_NOTES_PER_OWNER: usize = 25;
 /// Notes on one page.
 pub const MAX_PAGE: usize = 50;
@@ -260,6 +265,10 @@ pub fn validate_id(id: &str) -> Result<()> {
     }
 }
 
+/// A login, agent name or session next to a note. These use the prose rewrite, not
+/// [`ThirdPartyText::name`]: a session is whatever the writer sent, so a name here could
+/// otherwise carry the words that open a Hub message. A name that holds those words is shown
+/// rewritten (`hub-message-bot` as `hub note-bot`).
 fn name(text: &str) -> String {
     ThirdPartyText::new(text, NAME_CHARS).to_string()
 }
@@ -353,8 +362,7 @@ pub fn render(page: &Page) -> String {
         text.push_str("\nNo notes match.");
     }
     for note in &page.notes {
-        let view = NoteView::from(note);
-        text.push_str(&format!("\n- {}", view.id));
+        text.push_str(&format!("\n- {}", note.id));
         if let Some(promoted) = &note.promotion {
             text.push_str(&format!(
                 ", promoted by {} at {}",
@@ -396,6 +404,8 @@ pub struct ListArgs {
 #[serde(deny_unknown_fields)]
 pub struct WriteArgs {
     pub body: String,
+    // ponytail: over HTTP the session is what the caller says, unverified; upgrade: take it from
+    // the hook-bound session as MCP does.
     pub session: Option<String>,
 }
 
@@ -595,6 +605,8 @@ async fn set_promoted(
     let query = repository_query(query)?;
     validate_id(&id)?;
     let user = human.person().clone();
+    // ponytail: promotion needs only Contribute, the level that mints agent tokens, so a person
+    // can promote their own agent's note; upgrade: require Maintain or a second person.
     let scope = person_scope(&state, &user, &query.repository, Level::Contribute).await?;
     let store = state.store.clone();
     let note = blocking(&state, move || {

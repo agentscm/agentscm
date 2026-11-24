@@ -1445,7 +1445,7 @@ pub fn render_start_text(status: &ActionableStatus) -> String {
         lines.push(format!(
             "- {} [{state}; {}{claim}{stage}]: {}",
             ThirdPartyText::new(&row.title, 80),
-            ThirdPartyText::name(&recipient_label(&row.recipient), 64),
+            recipient_label(&row.recipient),
             crate::hub::advice::sanitize(&row.action, 160)
         ));
     }
