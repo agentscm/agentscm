@@ -435,6 +435,9 @@ An operator can register one HTTP endpoint that gives agent sessions a few extra
 when a session starts and when it starts Work. `AGENTSCM_CONTEXT_SOURCE_FILE` names the private
 file that sets it; unset means no source and no change anywhere. The Hub marks the lines as
 third-party text, and a source that fails adds nothing. See [Context source](context-source.md).
+After those lines, the start context also carries up to 5 promoted
+[repository memory](memory.md#delivery-of-promoted-notes) notes, unless
+`AGENTSCM_MEMORY_DELIVERY=off` is set for `agentscm hub serve`.
 
 ## Connected apps
 
@@ -596,6 +599,11 @@ start; until then they stop working (401 `sign_in_required`).
   token secret, shown only here; 403 `forbidden` if the forge says no; 401 if
   the session's forge token no longer works), `GET /v1/hub/tokens`,
   `DELETE /v1/hub/tokens/{id}` (own tokens only; 204 or 404).
+- Repository memory (experimental): `GET` and `POST /v1/hub/memory` and
+  `DELETE /v1/hub/memory/{id}` for agent tokens of the repository, and
+  `GET /v1/hub/memory-review`, `DELETE /v1/hub/memory-review/{id}` and `POST` and `DELETE
+  /v1/hub/memory-review/{id}/promote` (each with `?repository=OWNER/NAME`) for a signed-in person.
+  See [repository memory](memory.md#routes).
 - Administrators only (403 `forbidden` otherwise): the GitHub routes below and
   `GET /v1/hub/users`,
   `POST /v1/hub/users/{id}/disable` and `/enable` (204; 404 for an unknown
@@ -663,6 +671,7 @@ on no others:
 - `GET /v1/hub/standup/operational`, and for one Work `GET /v1/hub/standup/work/{id}/usage`,
   `/operational`, `/reconciliation` and `/pr-link`
 - `GET /v1/hub/standup/dependency-notices` and `GET /v1/hub/standup/overlap/consents`
+- `GET /v1/hub/memory` ([repository memory](memory.md))
 - `GET /v1/hub/repos/{repo}/deploy-workflow`
 - MCP `initialize`, `ping`, `tools/list`, and the tools
   `agentscm_work_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
@@ -675,7 +684,8 @@ on no others:
   `agentscm_shared_conversation`, `agentscm_workflow_status`, `agentscm_work_search`, `agentscm_why`,
   `agentscm_work_repositories`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list`, `agentscm_skill_status`,
-  `agentscm_promises_list`, `agentscm_promise_show` and `agentscm_promise_history`. Setting a pull-request
+  `agentscm_promises_list`, `agentscm_promise_show`, `agentscm_promise_history` and
+  `agentscm_memory_list`. Setting a pull-request
   link (`agentscm_work_pr_link_set`, `POST /v1/hub/standup/pr-link`) needs an ordinary agent token
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
@@ -694,6 +704,10 @@ Besides user and token creation, enabling, disabling and revocation, the log
 records `user_signed_in` (`method` browser or device, and whether the person
 is an administrator). Admin changes and self-service revocations record the
 acting user as `by`. Tokens record the forge's stable `repository_id` and whether they are `read_only`.
+
+[Repository memory](memory.md) records `memory_note_removed`, `memory_note_promoted` and
+`memory_note_unpromoted` (subject: the `mem_` id; data: `repository_scope`, `by`, and for a
+removal `token` and `admin`). They never carry note text, and writing a note records no event.
 
 GitHub sync adds, all with exact ids and appended in the change's transaction:
 `connection_created`, `connection_status` (only when status or detail
@@ -2208,6 +2222,12 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   between the two can drop it.
 - The app requests `statuses: write` (and pull requests write) whether or not outbound
   is on. Repositories removed from an installation are not yet retired.
+- Repository memory is experimental and read on request, but for up to 5 promoted notes in
+  session-start context (`AGENTSCM_MEMORY_DELIVERY=off` stops that). It holds at most 100 live
+  notes per repository and 25 per person in it; unpromoted notes expire after 90 days. Nobody can
+  promote a note their own agent wrote, but an agent on a person's own computer can use that
+  person's saved CLI sign-in to remove notes or promote other people's (see
+  [its limits](memory.md#limits)).
 - After a repository is renamed, intents still match by the name they were made under:
   re-mint tokens after a rename.
 - Sessions and pending sign-ins live in hub memory, so a restart or a second
@@ -2305,6 +2325,13 @@ What the hub keeps, in its database and object store:
   and availability, plus the retained Work fields used by the concise handoff. The Hub does not
   receive the private spool's conversation bodies, tool input/output, command output, source bytes
   or host paths through this path.
+
+- Repository memory: at most 100 live notes per repository, 25 of them per person, of at
+  most 500 characters each, with the writing token's id and name, its owner's id and login, the
+  agent's session (none for a note written over HTTP) and, once a person promotes a note, their
+  id, login and the time. A note nobody promoted expires 90 days after it was written and is
+  deleted on the repository's next write, not by a timed pass; promoted notes stay until removed.
+  See [repository memory](memory.md).
 
 - Work usage observations: at most 500 immutable reports per work item, containing bounded
   agent/provider/model labels, attempt phase and outcome, optional token and cache-token counts,

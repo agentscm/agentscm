@@ -176,7 +176,7 @@ fn valid_sha(value: &str) -> bool {
 
 /// Forge and agent text, sanitized as every relay of third-party text is.
 fn short(value: &str) -> String {
-    super::advice::sanitize(value, 240)
+    crate::third_party::ThirdPartyText::new(value, 240).to_string()
 }
 
 fn text(value: &Value, key: &str) -> String {

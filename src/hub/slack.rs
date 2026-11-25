@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::advice::{agent_name, sanitize};
+use super::advice::agent_name;
 use super::handoff::{Answered, Via};
 use super::notices::{
     AttemptOutcome, OwnerNoticeDeliveryProof, OwnerNoticeDeliveryReport, OwnerNoticeRoute,
@@ -34,6 +34,7 @@ use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_requ
 use super::store::session_key;
 use super::store::{Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
+use crate::third_party::ThirdPartyText;
 
 pub const CONFIG_ENV: &str = "AGENTSCM_SLACK_FILE";
 /// Journal rows kept at most; past this, collection waits for deliveries to drain.
@@ -331,7 +332,11 @@ fn escape(text: &str) -> String {
 }
 
 fn label(login: &str, agent: &str) -> String {
-    format!("{}’s {}", sanitize(login, NAME_CHARS), agent_name(agent))
+    format!(
+        "{}’s {}",
+        ThirdPartyText::name(login, NAME_CHARS),
+        agent_name(agent)
+    )
 }
 
 fn listed(lines: &[String]) -> String {
@@ -968,7 +973,7 @@ impl Slack {
                     && t.repository_id == who.repository_id
             })
             .ok_or(Refusal::NotYours)?;
-        let file = sanitize(path, TEXT_CHARS);
+        let file = ThirdPartyText::name(path, TEXT_CHARS).to_string();
         let answered = state.store.answer_handoff_via(
             token,
             session,

@@ -105,7 +105,7 @@ fn label(value: &str, max: usize) -> Result<()> {
         || value.len() > max
         || value
             .chars()
-            .any(|c| c.is_control() || super::advice::invisible(c))
+            .any(|c| c.is_control() || crate::third_party::invisible(c))
     {
         return Err(invalid(
             "issue choice labels must be nonempty, bounded text without controls",

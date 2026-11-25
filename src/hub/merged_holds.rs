@@ -16,6 +16,7 @@ use super::work::{MAX_WORK_PAGE, WorkItem, WorkOverviewQuery, WorkSource, WorkSt
 use super::work_lifecycle::OutcomeValue;
 use super::work_reconcile::{WorkStage, WorkStageV1, work_stages_detailed};
 use super::work_transition::{OperationalSelect, WorkLifecycleReader};
+use crate::third_party::ThirdPartyText;
 
 /// Observation kind and key prefix of one issue's closure fact.
 pub const OBSERVATION_KIND: &str = "issue_closure";
@@ -804,11 +805,11 @@ fn complete_one(
 // ponytail: ten lines, oldest Work id first; upgrade: a count line and a page when more wait.
 const MAX_START_LINES: usize = 10;
 
-fn merged_line(item: &WorkItem, pull: u64, issue: u64, ending: &str) -> String {
+pub(super) fn merged_line(item: &WorkItem, pull: u64, issue: u64, ending: &str) -> String {
     format!(
         "AgentSCM: pull request #{pull} for Work {id} \"{title}\" merged and #{issue} is closed{ending}",
         id = item.id,
-        title = super::advice::sanitize(&item.title, 80),
+        title = ThirdPartyText::new(&item.title, 80),
     )
 }
 

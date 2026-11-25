@@ -1177,6 +1177,9 @@ async fn protocol_basics() {
             "agentscm_owner_notice_status",
             "agentscm_owner_notice_send",
             "agentscm_owner_notice_acknowledge",
+            "agentscm_memory_list",
+            "agentscm_memory_write",
+            "agentscm_memory_remove",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -1233,6 +1236,9 @@ async fn protocol_basics() {
         "agentscm_work_reconciliation",
         "agentscm_work_reconciliation_apply",
         "agentscm_work_transitions",
+        "agentscm_memory_list",
+        "agentscm_memory_write",
+        "agentscm_memory_remove",
     ];
     assert_eq!(
         default_names,

@@ -542,7 +542,12 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
             if let Some(remedy) = capacity.limit.agent_remedy() {
                 let what = capacity.limit.what();
                 envelope.message = format!("{}{}: {remedy}.", what[..1].to_uppercase(), &what[1..]);
-                envelope.recovery = RecoveryAction::InspectWork.recovery();
+                // Repository memory is not Work: its remedy is the whole answer.
+                envelope.recovery = if capacity.limit.is_memory() {
+                    RecoveryAction::None.recovery()
+                } else {
+                    RecoveryAction::InspectWork.recovery()
+                };
             }
         }
         HubError::WorkOverlap(overlaps) => {
@@ -621,6 +626,8 @@ pub fn valid_correlation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// Error text for a log or reply, with credentials redacted and terminal escapes removed. Not
+/// `ThirdPartyText`: it redacts and keeps more of the text, for an operator to read.
 pub fn sanitize(text: &str) -> String {
     sanitize_text(text, true)
 }

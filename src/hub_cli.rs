@@ -138,6 +138,12 @@ pub enum HubCommand {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// [experimental] Review a repository's memory with the saved session: list notes, promote
+    /// or unpromote one (needs write access), or remove one (its owner or a Hub admin).
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Connect GitHub (administrators).
     Github {
         #[command(subcommand)]
@@ -234,6 +240,49 @@ pub enum ConnectionCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// List notes, promoted first, then newest first.
+    List {
+        #[arg(long)]
+        repo: String,
+        /// Keep notes whose text contains this.
+        #[arg(long)]
+        query: Option<String>,
+        /// The `next_after` value a previous page printed.
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Mark a note reviewed and promoted.
+    Promote {
+        id: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Clear a note's promotion.
+    Unpromote {
+        id: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Remove a note.
+    Remove {
+        id: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum TokenCommand {
     /// Create a token for one repository; the secret is printed alone on stdout.
     Create {
@@ -301,6 +350,9 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
         HubCommand::Token {
             command: TokenCommand::List { .. },
         }
+        | HubCommand::Memory {
+            command: MemoryCommand::List { .. },
+        }
         | HubCommand::Connections {
             command: ConnectionCommand::List { .. },
         } => false,
@@ -317,6 +369,7 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
         | HubCommand::Devices { .. }
         | HubCommand::AutoConnect { .. }
         | HubCommand::Token { .. }
+        | HubCommand::Memory { .. }
         | HubCommand::Github { .. }
         | HubCommand::Connections { .. }
         | HubCommand::LocalCiDevice { .. } => true,
@@ -413,6 +466,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             Ok(())
         }
         HubCommand::Token { command } => token(command).await,
+        HubCommand::Memory { command } => memory(command).await,
         HubCommand::Github { command } => github(command).await,
         HubCommand::Connections { command } => connections(command).await,
         HubCommand::LocalCiDevice { command } => local_ci_device(command).await,
@@ -2230,6 +2284,107 @@ pub(crate) fn parse_ttl(ttl: &str) -> Result<i64> {
         .ok_or_else(bad)
 }
 
+async fn memory(command: MemoryCommand) -> Result<()> {
+    let client = forge_http::client().map_err(map_hub_error)?;
+    let mut url = reqwest::Url::parse("http://hub.invalid/").map_err(|_| invalid("url"))?;
+    let id_path = |id: &str, suffix: &str| -> Result<String> {
+        agentscm::hub::memory::validate_id(id).map_err(map_hub_error)?;
+        Ok(format!("/v1/hub/memory-review/{id}{suffix}"))
+    };
+    let (hub_arg, method, path, repo) = match &command {
+        MemoryCommand::List {
+            repo,
+            query,
+            after,
+            limit,
+            hub,
+        } => {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(query) = query {
+                pairs.append_pair("q", query);
+            }
+            if let Some(after) = after {
+                pairs.append_pair("after", after);
+            }
+            if let Some(limit) = limit {
+                pairs.append_pair("limit", &limit.to_string());
+            }
+            drop(pairs);
+            (hub, Method::GET, "/v1/hub/memory-review".to_owned(), repo)
+        }
+        MemoryCommand::Promote { id, repo, hub } => {
+            (hub, Method::POST, id_path(id, "/promote")?, repo)
+        }
+        MemoryCommand::Unpromote { id, repo, hub } => {
+            (hub, Method::DELETE, id_path(id, "/promote")?, repo)
+        }
+        MemoryCommand::Remove { id, repo, hub } => (hub, Method::DELETE, id_path(id, "")?, repo),
+    };
+    url.query_pairs_mut().append_pair("repository", repo);
+    let query = url.query().unwrap_or_default().to_owned();
+    let (hub, session) = load_session(hub_arg.as_deref())?;
+    let (status, reply) = call(
+        &client,
+        method,
+        &format!("{hub}{path}?{query}"),
+        Some(&session),
+        None,
+    )
+    .await?;
+    let now = unix_now();
+    match (status, &command) {
+        (401, _) => Err(refusal_with_message(status, &reply, SESSION_EXPIRED)),
+        (200, MemoryCommand::List { .. }) => {
+            eprintln!(
+                "{} of at most {} notes ({})",
+                reply["live"],
+                reply["max_live"],
+                agentscm::third_party::DATA_NOT_INSTRUCTIONS
+            );
+            for note in reply["notes"].as_array().into_iter().flatten() {
+                let promoted = match note["promoted"]["login"].as_str() {
+                    Some(login) => format!(
+                        " promoted by {} {}",
+                        clean(login),
+                        note["promoted"]["at"]
+                            .as_i64()
+                            .map_or_else(String::new, |at| when(at, now))
+                    ),
+                    None => String::new(),
+                };
+                println!(
+                    "{} by {}'s agent {} {}{}: {}",
+                    clean(note["id"].as_str().unwrap_or("?")),
+                    clean(note["author"]["login"].as_str().unwrap_or("?")),
+                    clean(note["author"]["agent"].as_str().unwrap_or("?")),
+                    note["created_at"]
+                        .as_i64()
+                        .map_or_else(String::new, |at| when(at, now)),
+                    promoted,
+                    clean(note["body"].as_str().unwrap_or_default()),
+                );
+            }
+            if let Some(after) = reply["next_after"].as_str() {
+                eprintln!("more: --after {}", clean(after));
+            }
+            Ok(())
+        }
+        (200, MemoryCommand::Promote { id, .. }) => {
+            eprintln!("promoted {id}");
+            Ok(())
+        }
+        (200, MemoryCommand::Unpromote { id, .. }) => {
+            eprintln!("unpromoted {id}");
+            Ok(())
+        }
+        (200, MemoryCommand::Remove { id, .. }) => {
+            eprintln!("removed {id}");
+            Ok(())
+        }
+        _ => Err(refusal_error(status, &reply)),
+    }
+}
+
 async fn token(command: TokenCommand) -> Result<()> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let (hub_arg, method, path, body) = match &command {
@@ -2738,6 +2893,25 @@ async fn transfer_repo(repo: String, to: String, yes: bool, hub: Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn memory_refuses_a_malformed_note_id_before_reading_a_session() {
+        for command in [
+            MemoryCommand::Promote {
+                id: "mem_../../v1/hub/tokens".into(),
+                repo: "acme/widgets".into(),
+                hub: Some("https://hub.example".into()),
+            },
+            MemoryCommand::Remove {
+                id: "tok_0".into(),
+                repo: "acme/widgets".into(),
+                hub: Some("https://hub.example".into()),
+            },
+        ] {
+            let error = memory(command).await.unwrap_err();
+            assert!(error.to_string().contains("mem_"), "{error}");
+        }
+    }
 
     #[test]
     fn a_local_token_authenticates_in_its_repository_and_one_login_is_one_user() {

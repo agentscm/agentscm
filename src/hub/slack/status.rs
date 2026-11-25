@@ -134,9 +134,9 @@ fn outstanding(status: &ActionableStatus) -> Vec<Outstanding> {
                 },
                 text: format!(
                     "{}: {} (recipient {}; claim {:?}; reservation {:?}).",
-                    sanitize(&work.title, 160),
-                    work.action,
-                    work.recipient.login.as_deref().unwrap_or("unknown"),
+                    ThirdPartyText::new(&work.title, 160),
+                    ThirdPartyText::new(&work.action, 180),
+                    ThirdPartyText::name(work.recipient.login.as_deref().unwrap_or("unknown"), 64),
                     work.freshness,
                     work.operational.reservation.status
                 ),
@@ -199,8 +199,14 @@ fn entry_message(item: &WorkItem, repository: &str) -> Option<Value> {
     Some(message(
         headline,
         &[
-            ("Work", sanitize(&item.title, TEXT_CHARS)),
-            ("Repository", sanitize(repository, TEXT_CHARS)),
+            (
+                "Work",
+                ThirdPartyText::new(&item.title, TEXT_CHARS).to_string(),
+            ),
+            (
+                "Repository",
+                ThirdPartyText::name(repository, TEXT_CHARS).to_string(),
+            ),
             (
                 "Agent",
                 format!(
@@ -211,10 +217,11 @@ fn entry_message(item: &WorkItem, repository: &str) -> Option<Value> {
             ),
             (
                 field,
-                sanitize(
+                ThirdPartyText::new(
                     report.map_or("No note reported.", |report| &report.summary),
                     TEXT_CHARS,
-                ),
+                )
+                .to_string(),
             ),
         ],
         guidance,
@@ -227,12 +234,16 @@ fn render_status(status: &ActionableStatus) -> String {
     copy.actions.retain(|a| a.needs_you);
     copy.actions.truncate(4);
     for work in &mut copy.work {
-        work.title = sanitize(&work.title, 100);
-        work.action = sanitize(&work.action, 180);
-        work.recipient.login = work.recipient.login.as_deref().map(|s| sanitize(s, 64));
+        work.title = ThirdPartyText::new(&work.title, 100).to_string();
+        work.action = ThirdPartyText::new(&work.action, 180).to_string();
+        work.recipient.login = work
+            .recipient
+            .login
+            .as_deref()
+            .map(|s| ThirdPartyText::name(s, 64).to_string());
     }
     for action in &mut copy.actions {
-        action.action = sanitize(&action.action, 180);
+        action.action = ThirdPartyText::new(&action.action, 180).to_string();
     }
     let rendered = actionable_status::render_text(&copy);
     // The shared renderer ends with coverage and evidence. Reserve that footer before
@@ -632,7 +643,10 @@ impl Slack {
                 let id = hash(format!("wait\n{key}\n{}\n{since}", action.id).as_bytes());
                 let body = message(
                     WAIT_HEADLINE,
-                    &[("Waiting", sanitize(&action.action, 900))],
+                    &[(
+                        "Waiting",
+                        ThirdPartyText::new(&action.action, 900).to_string(),
+                    )],
                     "It stays stopped until you answer in your agent session.",
                 );
                 let user = &binding.config.slack_user;

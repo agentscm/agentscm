@@ -47,7 +47,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
-use super::advice::invisible;
 use super::coordination_http::not_your_agent;
 use super::handoff::Via;
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
@@ -55,6 +54,7 @@ use super::login::apps::{Person, PersonReader};
 use super::session_waiting::{WaitReason, Waiting, holder, wait_key};
 use super::store::{AgentToken, Principal, unix_now, validate_repository};
 use super::{HubError, HubState};
+use crate::third_party::invisible;
 
 /// A person may be away for hours; the hook's own bound is a little shorter than this.
 const TTL_SECONDS: i64 = 12 * 60 * 60;
@@ -698,7 +698,7 @@ impl Default for Requests {
 /// [`MAX_DISPLAY_CHARS`]. Also says what the person would not see of what the machine sent: the
 /// length before a cut, and how many characters were dropped. A dropped character can carry
 /// words that do not show (the Unicode tag block spells ASCII invisibly) while the tool still
-/// receives them.
+/// receives them. Not `ThirdPartyText`: the person's page keeps line breaks and counts what it drops.
 fn sanitize_display(text: &str) -> (String, Option<u64>, u64) {
     let mut dropped = 0;
     let mut kept: String = text
@@ -844,7 +844,9 @@ impl Requests {
         missing.unshown = missing
             .unshown
             .iter()
-            .map(|name| super::advice::sanitize(name.trim(), MAX_UNSHOWN_CHARS))
+            .map(|name| {
+                crate::third_party::ThirdPartyText::name(name.trim(), MAX_UNSHOWN_CHARS).to_string()
+            })
             .map(|name| {
                 if name.is_empty() {
                     UNREADABLE_NAME.to_owned()
@@ -857,8 +859,10 @@ impl Requests {
         missing.dropped = dropped;
         // Labels beside the display: one clean line each, dropped when nothing is left.
         let label = |text: Option<String>| {
-            text.map(|text| super::advice::sanitize(text.trim(), MAX_LABEL_CHARS))
-                .filter(|text| !text.is_empty())
+            text.map(|text| {
+                crate::third_party::ThirdPartyText::new(text.trim(), MAX_LABEL_CHARS).to_string()
+            })
+            .filter(|text| !text.is_empty())
         };
         let (summary, folder) = (label(summary), label(folder));
         let mut inner = self.lock()?;

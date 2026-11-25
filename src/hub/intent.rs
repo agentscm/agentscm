@@ -153,7 +153,7 @@ pub(super) fn text(name: &str, value: &str, max: usize) -> Result<()> {
         || value.len() > max
         || value
             .chars()
-            .any(|c| c.is_control() || super::advice::invisible(c))
+            .any(|c| c.is_control() || crate::third_party::invisible(c))
     {
         return Err(HubError::Invalid(format!(
             "{name} must be 1-{max} bytes without control characters"
@@ -182,7 +182,7 @@ pub fn spec_key(spec: &str) -> Result<String> {
         || spec.contains('\\')
         || spec
             .chars()
-            .any(|c| c.is_control() || super::advice::invisible(c))
+            .any(|c| c.is_control() || crate::third_party::invisible(c))
         || path.contains('*')
         || path
             .split('/')

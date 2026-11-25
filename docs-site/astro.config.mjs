@@ -30,6 +30,7 @@ export default defineConfig({
           { label: 'Supported agents', link: '/agents/' },
           { label: 'Work intents', link: '/intents/' },
           { label: 'Collision warnings', link: '/collisions/' },
+          { label: 'Repository memory', link: '/memory/' },
           { label: 'Hub', link: '/hub/' },
           { label: 'Record a deployment', link: '/record-deployments/' },
           { label: 'Join a team Hub', link: '/team-member-onboarding/' },

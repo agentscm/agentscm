@@ -114,7 +114,7 @@ fn label(value: &str) -> Result<()> {
         || value.len() > 255
         || value
             .chars()
-            .any(|c| c.is_control() || super::advice::invisible(c))
+            .any(|c| c.is_control() || crate::third_party::invisible(c))
     {
         return Err(invalid(
             "declaration labels must contain 1 to 255 visible bytes",

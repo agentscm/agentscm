@@ -153,7 +153,7 @@ pub struct Principal {
 /// rows a token without a repository id wrote under a repository's name, before that repository
 /// was connected under the name, to the repository's id scope, where that token now reads them.
 /// A key already taken under the id scope keeps its row; the name-scoped one is left unread.
-pub(super) const ADOPT_NAME_SCOPE: [&str; 10] = [
+pub(super) const ADOPT_NAME_SCOPE: [&str; 11] = [
     "UPDATE hub_intents SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_intent_paths SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_handoffs SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
@@ -162,6 +162,7 @@ pub(super) const ADOPT_NAME_SCOPE: [&str; 10] = [
     "UPDATE hub_hook_overhead SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_publications SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     "UPDATE hub_skill_evidence SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
+    "UPDATE hub_memory_notes SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)",
     // One row per key moves: names that differ only in case would otherwise collide.
     "UPDATE hub_candidate_heads SET repository_scope = $1 WHERE lower(repository_scope) = lower($2)
      AND repository_scope = (SELECT MIN(h.repository_scope) FROM hub_candidate_heads h
@@ -828,6 +829,46 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
+    /// Stores a note of repository memory under `scope`, the token's repository scope, after
+    /// rechecking that `token` is live and may write, and first deletes the repository's expired
+    /// notes (`memory::expired_before`). A repository that holds `memory::MAX_LIVE_NOTES` live notes
+    /// refuses with the `MemoryNotes` capacity limit, and an owner who holds
+    /// `memory::MAX_NOTES_PER_OWNER` live notes nobody promoted with `MemoryNotesOwner`.
+    fn memory_write(
+        &self,
+        token: &str,
+        scope: &str,
+        note: &super::memory::NewNote,
+        now: i64,
+    ) -> Result<super::memory::Note>;
+    /// One page of the live notes under `scope` at `query.now`: promoted notes first, then
+    /// newest first, searched and paged by `memory::Page::select`.
+    fn memory_list(
+        &self,
+        scope: &str,
+        query: &super::memory::ListQuery,
+    ) -> Result<super::memory::Page>;
+    /// Removes one note under `scope` for its owner (any live writing token of theirs, or the
+    /// person) or a Hub administrator, recording `memory_note_removed` with ids only.
+    fn memory_remove(
+        &self,
+        scope: &str,
+        id: &str,
+        by: super::memory::Actor<'_>,
+        now: i64,
+    ) -> Result<super::memory::Removed>;
+    /// Marks one note under `scope` promoted by `person`, or clears that, recording
+    /// `memory_note_promoted` or `memory_note_unpromoted` with ids only when it changes. The
+    /// caller has checked the person's access. A person cannot promote a note they own; they can
+    /// unpromote it. An expired note is not found.
+    fn memory_promote(
+        &self,
+        scope: &str,
+        id: &str,
+        person: &User,
+        promoted: bool,
+        now: i64,
+    ) -> Result<super::memory::Promoted>;
     /// Records a person's hand-off in `repository`, then prunes that person's records older than
     /// `pickup::PICKUP_RETAIN_SECONDS` and beyond the newest `pickup::MAX_PICKUPS_PER_OWNER`.
     /// Repository names in pickup reads and matches compare without regard to case.

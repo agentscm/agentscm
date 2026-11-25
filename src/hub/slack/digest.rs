@@ -314,7 +314,7 @@ impl Slack {
             )?;
             return Ok(format!(
                 "Weekly digests for {} are off for you. Run agentscm digest opt-in in a checkout of it to get them again.",
-                sanitize(&who.repository, TEXT_CHARS)
+                ThirdPartyText::name(&who.repository, TEXT_CHARS)
             ));
         }
         let transition = if action_id == RELEASE {
@@ -342,7 +342,7 @@ impl Slack {
             .work_get_scoped(&reader, work_id, now)?
             .filter(|item| item.owner == who.owner.id)
             .ok_or(Refusal::NotYourWork)?;
-        let title = sanitize(&item.title, TEXT_CHARS);
+        let title = ThirdPartyText::new(&item.title, TEXT_CHARS).to_string();
         if item.generation != generation || item.updated_seq != updated_seq {
             return Ok(format!(
                 "Nothing changed. '{title}' changed after this digest was sent; run agentscm work status to see where it stands."

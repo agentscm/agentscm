@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use agentscm::Result;
 use agentscm::git_collisions::{self, HistoryRequest, Request};
-use agentscm::hub::advice::sanitize;
+use agentscm::third_party::ThirdPartyText;
 use clap::Args;
 use serde_json::{Value, json};
 
@@ -160,7 +160,7 @@ fn default_git() -> PathBuf {
 
 /// Ref and file names may hold terminal escapes; drop every control character.
 fn clean(text: &str) -> String {
-    sanitize(text, 300)
+    ThirdPartyText::name(text, 300).to_string()
 }
 
 fn count(n: usize, one: &str, many: &str) -> String {

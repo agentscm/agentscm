@@ -32,6 +32,7 @@ attention next, alongside your existing Git repositories and GitHub or GitLab.
 - [Supported agents](agents.md): client support levels, setup and hook behavior.
 - [Messages to your own agent session](agent-messages.md): sending through the Hub's browser-session routes to a running session, the Auto, Manual and Ignore modes, and how each client receives them.
 - [Context source](context-source.md): one HTTP endpoint a Hub operator registers, which adds a few lines of context when a session starts and when it starts Work.
+- [Repository memory](memory.md) (experimental): short notes agents write for later agents in the same repository, read on request, promoted only by a person other than the note's owner, and up to 5 promoted notes delivered at session start unless the operator sets `AGENTSCM_MEMORY_DELIVERY=off`.
 - [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
 - [Join an existing Hub](team-member-onboarding.md) or read the [Hub operator guide](hub.md).
 - [Two-container Hub walkthrough](two-agent-demo.md): Docker, GitHub App and a repository you can connect are required.
@@ -42,7 +43,8 @@ attention next, alongside your existing Git repositories and GitHub or GitLab.
 
 - [Continuity preparation](continuity.md): retain local task context, run checks and save exact PR/MR drafts through a GitHub or GitLab disconnection.
 - [Stand-up and catch-up](standup.md): durable ownership, checkpoints, blockers and handovers.
-- [Agreed overlaps and behavior dependencies](design/work-overlaps.md): explicit named-file consent, structured prerequisites and bounded both-lead notices.
+- [Agreed overlaps and behavior dependencies](design/work-overlaps.md): explicit named-file consent, structured prerequisites and bounded both-lead notices. [Reservations of code blocks](design/block-reservations.md) records why reservations stay whole files.
+- [Relayed third-party text](design/relayed-text.md): threat model for text the Hub relays into agent contexts, what the Hub does about it and the rules for new features.
 - [This computer](connect-this-computer.md): native setup, sign-in, sharing controls, diagnostics and recovery.
 - [Repository explorer](repository-explorer.md): committed files, history and diffs without fetching or changing source.
 - [Change walkthroughs](change-walkthrough.md): versioned authored explanations with exact before/after source and compact CLI context.
