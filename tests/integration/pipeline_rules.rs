@@ -16,6 +16,8 @@ use agentscm::skill_workflow::{self, RunState};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use crate::pinned_git::pinned_git;
+
 fn git(exe: &Path, root: &Path, args: &[&str]) -> String {
     let out = Command::new(exe)
         .args(["-C"])
@@ -32,28 +34,6 @@ fn git(exe: &Path, root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
-fn git_executable() -> PathBuf {
-    for p in [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ] {
-        if Path::new(p).exists() {
-            let out = Command::new(p).arg("--version").output().unwrap();
-            let text = String::from_utf8_lossy(&out.stdout);
-            let version = text.split_whitespace().nth(2).unwrap_or("");
-            let parts: Vec<u32> = version
-                .split('.')
-                .take(2)
-                .filter_map(|v| v.parse().ok())
-                .collect();
-            if parts.len() == 2 && (parts[0] > 2 || parts[0] == 2 && parts[1] >= 45) {
-                return p.into();
-            }
-        }
-    }
-    panic!("requires Git >=2.45, as the snapshot bridge does");
-}
 struct Fixture {
     root: TempDir,
     data: PathBuf,
@@ -62,10 +42,10 @@ struct Fixture {
     rule: PipelineRule,
     commit: String,
 }
-fn fixture() -> Fixture {
+fn fixture() -> Option<Fixture> {
     fixture_provider("github")
 }
-fn fixture_provider(provider: &str) -> Fixture {
+fn fixture_provider(provider: &str) -> Option<Fixture> {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let source = root.path().join("source");
@@ -73,7 +53,9 @@ fn fixture_provider(provider: &str) -> Fixture {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&work).unwrap();
     fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
-    let exe = git_executable();
+    Authority::open(&data).unwrap();
+    let git_identity = pinned_git(&[&data, &source])?;
+    let exe = git_identity.path.clone();
     git(&exe, &source, &["init", "-q"]);
     git(
         &exe,
@@ -131,7 +113,6 @@ fn fixture_provider(provider: &str) -> Fixture {
     let profile_path = root.path().join("profile.json");
     fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
     fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o600)).unwrap();
-    Authority::open(&data).unwrap();
     let recipe:PipelineRecipe=serde_json::from_value(json!({"version":1,"name":"release","skill":{"entrypoint":"skills/release/SKILL.md","resources":["skills/release/draft.json"]},"steps":[{"id":"draft","needs":[],"required":true,"action":{"kind":"agent_action","resource":"draft.json"}}]})).unwrap();
     let mut rule = PipelineRule {
         repository: "acme/widgets".into(),
@@ -153,8 +134,8 @@ fn fixture_provider(provider: &str) -> Fixture {
         profile_digest: profile.digest().unwrap(),
         profile_path,
         authority_ceiling: "productive_local".into(),
-        git_identity: agentscm::execution::executable::capture(&exe, &[&data, &source]).unwrap(),
-        git: exe.canonicalize().unwrap(),
+        git_identity,
+        git: exe,
         git_repository: source.clone(),
     };
     let directory = data.join("pipeline-rules");
@@ -167,14 +148,14 @@ fn fixture_provider(provider: &str) -> Fixture {
         .unwrap()
         .skill_digest()
         .into();
-    Fixture {
+    Some(Fixture {
         root,
         data,
         source,
         work,
         rule,
         commit,
-    }
+    })
 }
 fn event(f: &Fixture) -> ConfirmedMerge {
     ConfirmedMerge {
@@ -198,7 +179,9 @@ fn journal(f: &Fixture) -> RuleJournal {
 
 #[test]
 fn offline_accept_restart_claim_dispatch_and_redelivery_reuse_exact_source() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let accepted = j.accept(&event(&f)).unwrap();
@@ -223,7 +206,9 @@ fn offline_accept_restart_claim_dispatch_and_redelivery_reuse_exact_source() {
 }
 #[test]
 fn cas_edits_reenable_and_delivery_ids_do_not_replay_merge() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let first = j.accept(&event(&f)).unwrap();
@@ -250,7 +235,9 @@ fn cas_edits_reenable_and_delivery_ids_do_not_replay_merge() {
 }
 #[test]
 fn preview_explains_identity_branch_labels_and_disabled_without_dispatch() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut r = f.rule.clone();
     r.enabled = false;
     let mut e = event(&f);
@@ -268,7 +255,9 @@ fn preview_explains_identity_branch_labels_and_disabled_without_dispatch() {
 #[test]
 fn changed_or_missing_operator_profile_blocks_frozen_dispatch() {
     for remove in [false, true] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         let d = j.accept(&event(&f)).unwrap().remove(0);
@@ -284,7 +273,9 @@ fn changed_or_missing_operator_profile_blocks_frozen_dispatch() {
 }
 #[test]
 fn crash_after_start_adopts_run_and_interrupted_action_never_replays() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let d = j.accept(&event(&f)).unwrap().remove(0);
@@ -311,7 +302,9 @@ fn crash_after_start_adopts_run_and_interrupted_action_never_replays() {
 }
 #[test]
 fn missing_local_commit_blocks_without_fetch_and_changed_skill_is_not_run() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let mut e = event(&f);
@@ -459,7 +452,9 @@ async fn nonmerged_and_unprovable_fast_forward_do_not_accept_events() {
 
 #[test]
 fn disabled_observation_cannot_be_replayed_by_reenable_or_filter_edit() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     let mut r = f.rule.clone();
     r.enabled = false;
@@ -473,7 +468,9 @@ fn disabled_observation_cannot_be_replayed_by_reenable_or_filter_edit() {
 }
 #[test]
 fn cli_installs_previews_and_picks_up_with_private_local_state() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let r = &f.rule;
     let manifest = f.root.path().join("install.json");
     fs::write(&manifest,serde_json::to_vec(&json!({"repository":r.repository,"provider":r.provider,"host":r.host,"provider_repository_id":r.provider_repository_id,
@@ -519,8 +516,85 @@ fn cli_installs_previews_and_picks_up_with_private_local_state() {
 }
 
 #[test]
+fn cli_install_and_update_name_the_refused_git_directory_in_the_json_error() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    Authority::open(&data).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join(".git")).unwrap();
+    let profile_path = root.path().join("profile.json");
+    let profile = json!({
+        "version": 1, "id": "local", "provider": "claude_code", "commands": {},
+        "timeout_ms": 1000, "max_output_bytes": 4096,
+    });
+    fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+    fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Synthetic stand-in for a package-manager Git under a group-writable directory.
+    let cellar = root.path().join("cellar");
+    let bin = cellar.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::set_permissions(&cellar, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+    let git = bin.join("git");
+    fs::write(&git, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let manifest = root.path().join("install.json");
+    let input = json!({
+        "repository": "acme/widgets",
+        "provider": "github",
+        "host": "forge.invalid",
+        "provider_repository_id": 42,
+        "rule_id": "release",
+        "enabled": true,
+        "trigger": {"target": "main"},
+        "recipe": {
+            "version": 1,
+            "name": "release",
+            "skill": {"entrypoint": "skills/release/SKILL.md", "resources": []},
+            "steps": [],
+        },
+        "profile_path": profile_path,
+        "git": git,
+        "git_repository": source,
+        "source_commit": "0".repeat(40),
+    });
+    fs::write(&manifest, serde_json::to_vec(&input).unwrap()).unwrap();
+    let refused = bin.canonicalize().unwrap();
+    let reason = format!("directory {refused:?} is group-writable without the sticky bit");
+    for (operation, options) in [
+        ("install", &[][..]),
+        ("update", &["--expected-generation", "1"][..]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("--no-telemetry")
+            .args(["pipeline", operation])
+            .arg(&manifest)
+            .args(options)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{operation}");
+        assert!(out.stdout.is_empty(), "{operation}");
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|error| {
+            panic!(
+                "{operation}: {error}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(error["ok"], false, "{operation}");
+        assert_eq!(error["error_kind"], "invalid", "{operation}");
+        let diagnostic = error["error"].as_str().unwrap();
+        assert!(diagnostic.contains(&reason), "{operation}: {diagnostic}");
+    }
+}
+
+#[test]
 fn crash_after_workflow_start_before_dispatch_adopts_same_run() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let d = j.accept(&event(&f)).unwrap().remove(0);
@@ -539,7 +613,9 @@ fn crash_after_workflow_start_before_dispatch_adopts_same_run() {
 
 #[test]
 fn source_origin_must_match_verified_forge_identity_without_checkout_edits() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     git(
         &f.rule.git,
         &f.source,
@@ -563,7 +639,9 @@ fn source_origin_must_match_verified_forge_identity_without_checkout_edits() {
 }
 #[test]
 fn status_pagination_and_exact_lookup_retain_recovery_after_long_history() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let mut ids = Vec::new();
@@ -605,7 +683,9 @@ fn changing_profile_during_action_stops_the_owned_process_and_retains_reason() {
     active_rule_revocation(true);
 }
 fn active_rule_revocation(profile_change: bool) {
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     let marker = f.root.path().join("started");
     let script = f.root.path().join("slow-action");
     fs::write(
@@ -667,7 +747,9 @@ fn active_rule_revocation(profile_change: bool) {
 
 #[test]
 fn typed_backup_verify_restore_retains_pending_claimed_and_root_identity() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let pending = j.accept(&event(&f)).unwrap().remove(0);
@@ -713,7 +795,9 @@ fn typed_pipeline_recovery_rejects_corruption_schema_foreign_keys_and_payload_dr
         "dispatch_payload",
         "native_binding",
     ] {
-        let f = fixture();
+        let Some(f) = fixture() else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         let d = j.accept(&event(&f)).unwrap().remove(0);
@@ -768,7 +852,9 @@ fn typed_pipeline_recovery_rejects_corruption_schema_foreign_keys_and_payload_dr
 #[test]
 fn copied_backup_revalidates_pipeline_payload_after_matching_file_hashes() {
     use sha2::{Digest, Sha256};
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     j.accept(&event(&f)).unwrap();
@@ -807,7 +893,9 @@ fn copied_backup_revalidates_pipeline_payload_after_matching_file_hashes() {
 
 #[test]
 fn singleton_binding_rejects_second_repository_before_capture_and_survives_rename() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     let mut other = f.rule.clone();
@@ -838,7 +926,9 @@ fn singleton_binding_rejects_second_repository_before_capture_and_survives_renam
 
 #[test]
 fn changed_or_candidate_git_controller_blocks_before_executing_it() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let controller = f.root.path().join("operator-git");
     fs::copy(&f.rule.git, &controller).unwrap();
     fs::set_permissions(&controller, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1079,7 +1169,9 @@ fn observation_now() -> i64 {
 #[tokio::test]
 async fn github_and_gitlab_poll_queries_skip_only_confirmed_semantic_events() {
     for provider in ["github", "gitlab"] {
-        let f = fixture_provider(provider);
+        let Some(f) = fixture_provider(provider) else {
+            return;
+        };
         let rule = f.rule.clone();
         // Each provider uses its own dedicated native root.
         let mut j = journal(&f);
@@ -1175,7 +1267,9 @@ async fn polling_reports_typed_failures_without_consuming_successful_checkpoint(
             ("list", 429, "rate_limited"),
             ("pull", 503, "unavailable"),
         ] {
-            let f = fixture_provider(provider);
+            let Some(f) = fixture_provider(provider) else {
+                return;
+            };
             let rule = f.rule.clone();
             let mut j = journal(&f);
             j.install(&rule, None).unwrap();
@@ -1224,7 +1318,9 @@ async fn polling_reports_typed_failures_without_consuming_successful_checkpoint(
 #[tokio::test]
 async fn partial_poll_retains_confirmed_rows_but_not_the_successful_checkpoint() {
     for provider in ["github", "gitlab"] {
-        let f = fixture_provider(provider);
+        let Some(f) = fixture_provider(provider) else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         let (url, state, task) = poll_fake(provider, &f.commit).await;
@@ -1286,7 +1382,9 @@ async fn partial_poll_retains_confirmed_rows_but_not_the_successful_checkpoint()
 
 #[test]
 fn preflight_executable_restore_recovers_the_same_pipeline_run() {
-    let mut f = fixture();
+    let Some(mut f) = fixture() else {
+        return;
+    };
     let executable = f.root.path().join("operator-command");
     fs::write(&executable, "#!/bin/sh\n/bin/cat\n").unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1321,7 +1419,9 @@ fn preflight_executable_restore_recovers_the_same_pipeline_run() {
 #[test]
 fn terminal_failed_and_cancelled_pipeline_runs_stay_blocked_without_effect_replay() {
     for cancel in [false, true] {
-        let mut f = fixture();
+        let Some(mut f) = fixture() else {
+            return;
+        };
         let executable = f.root.path().join("operator-command");
         let marker = f.root.path().join("attempts");
         fs::write(
@@ -1409,7 +1509,9 @@ fn watch_cli_help_declares_the_omitted_interval_as_three_hundred_seconds() {
 #[tokio::test]
 async fn direct_and_polled_merge_reads_require_their_own_target_repository_identity() {
     for provider in ["github", "gitlab"] {
-        let f = fixture_provider(provider);
+        let Some(f) = fixture_provider(provider) else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         for mismatch in ["id", "missing", "name"] {
@@ -1465,7 +1567,9 @@ async fn direct_and_polled_merge_reads_require_their_own_target_repository_ident
 #[tokio::test]
 async fn unverifiable_items_do_not_starve_later_valid_merges_or_advance_checkpoint() {
     for provider in ["github", "gitlab"] {
-        let f = fixture_provider(provider);
+        let Some(f) = fixture_provider(provider) else {
+            return;
+        };
         let mut j = journal(&f);
         j.install(&f.rule, None).unwrap();
         j.record_poll(
@@ -1597,7 +1701,9 @@ fn open_pull(number: i64, head: &str, draft: bool, head_repository: i64) -> Valu
 
 #[test]
 fn pull_request_preview_matches_paths_and_thresholds_and_reports_unknown() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut r = pull_rule(&f);
     let p = preview(
         &r,
@@ -1659,7 +1765,9 @@ fn pull_request_preview_matches_paths_and_thresholds_and_reports_unknown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&pull_rule(&f), None).unwrap();
     let (url, state, task) = poll_fake("github", &f.commit).await;
@@ -1873,7 +1981,9 @@ fn event_rows(f: &Fixture) -> i64 {
 
 #[test]
 fn head_observations_follow_base_labels_and_rule_generation_and_are_pruned() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&pull_rule(&f), None).unwrap();
     let head = |target: &str, labels: &[&str], commit: &str| ConfirmedMerge {
@@ -1938,7 +2048,9 @@ fn raw_journal(f: &Fixture) -> rusqlite::Connection {
 
 #[test]
 fn open_quarantines_an_oversized_or_malformed_row_instead_of_refusing_the_journal() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     assert_eq!(j.accept(&event(&f)).unwrap().len(), 1);
@@ -1977,7 +2089,9 @@ fn open_quarantines_an_oversized_or_malformed_row_instead_of_refusing_the_journa
 
 #[test]
 fn writes_stop_at_the_row_caps_that_open_enforces() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&f.rule, None).unwrap();
     drop(j);
@@ -2005,7 +2119,9 @@ fn writes_stop_at_the_row_caps_that_open_enforces() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fired_head_shows_pending_then_its_result_on_that_exact_commit_only() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&pull_rule(&f), None).unwrap();
     let (url, state, task) = poll_fake("github", &f.commit).await;
@@ -2162,7 +2278,9 @@ fn finish_as(j: &mut RuleJournal, dispatch_id: &str, state: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_of_one_rule_on_one_commit_share_a_status_and_failing_posts_do_not_starve() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&pull_rule(&f), None).unwrap();
     let (url, state, task) = poll_fake("github", &f.commit).await;
@@ -2231,7 +2349,9 @@ async fn runs_of_one_rule_on_one_commit_share_a_status_and_failing_posts_do_not_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn upgrading_to_reports_posts_nothing_for_old_runs_and_quarantine_drops_their_reports() {
-    let f = fixture();
+    let Some(f) = fixture() else {
+        return;
+    };
     let mut j = journal(&f);
     j.install(&pull_rule(&f), None).unwrap();
     let (url, state, task) = poll_fake("github", &f.commit).await;

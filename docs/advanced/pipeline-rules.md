@@ -68,6 +68,12 @@ compiles the graph and pins the recipe, selected resource bytes and profile
 configuration. Future accepted commits may change ordinary source inputs but
 must retain exactly those selected skill resource bytes.
 
+`pipeline install` and `pipeline update` pin the Git executable at its resolved
+path. Homebrew Git is eligible when that path passes the same ownership and
+permissions checks as any other Git installation. If a directory is refused,
+the local error names it and explains why. Point `git` at another eligible
+executable, such as `/usr/bin/git` on macOS when it meets the version requirement.
+
 ```sh
 agentscm --data-dir /srv/agentscm/state pipeline install install.json
 agentscm --data-dir /srv/agentscm/state pipeline status
