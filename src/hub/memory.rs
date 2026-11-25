@@ -37,9 +37,10 @@ pub const MAX_LIVE_NOTES: usize = 100;
 pub const NOTE_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 /// Characters in one note; a longer note is refused, never cut.
 pub const MAX_NOTE_CHARS: usize = 500;
-/// Live notes nobody promoted that one owner holds in one repository, so one owner cannot fill
-/// the list. A promoted note does not count: another person chose to keep it. The share is fixed,
-/// not divided among the people writing, so it never shrinks when someone else starts writing.
+/// Live notes one owner holds in one repository, promoted or not, so one owner cannot fill the
+/// list and a promotion or unpromotion never moves anyone past it. The share is fixed, not
+/// divided among the people writing, so it never shrinks when someone else starts writing; expiry
+/// frees it without a person.
 pub const MAX_NOTES_PER_OWNER: usize = 25;
 /// Notes on one page.
 pub const MAX_PAGE: usize = 50;
@@ -218,7 +219,12 @@ impl ListQuery {
             )));
         }
         Ok(Self {
-            needle: search_text(q)?.map(|q| q.to_lowercase()),
+            // Cleaned as the shown text is, so a quote or a selector in the search still matches.
+            needle: search_text(q)?.map(|q| {
+                ThirdPartyText::new(&q, MAX_NOTE_CHARS)
+                    .as_str()
+                    .to_lowercase()
+            }),
             // An empty cursor means the first page, as an empty search means no filter.
             after: after
                 .map(str::trim)
@@ -794,7 +800,8 @@ mod tests {
             )
         };
         assert_eq!(pick(Some("'hub note'"), None, 5).0, [10]);
-        assert!(pick(Some("hub message"), None, 5).0.is_empty());
+        // The search is cleaned as the text is, so it finds what was written too.
+        assert_eq!(pick(Some("\"Hub message\""), None, 5).0, [10]);
         assert_eq!(pick(Some("ÉCOLE"), None, 5).0, [9]);
         let (first, next, live) = pick(None, None, 2);
         assert_eq!((first, live), (vec![10, 9], 3));
@@ -818,6 +825,12 @@ mod tests {
                 .unwrap()
                 .needle,
             Some("50%_ école".into())
+        );
+        assert_eq!(
+            ListQuery::new(Some("\"Hub message\" \u{2764}\u{FE0F}"), None, None)
+                .unwrap()
+                .needle,
+            Some("'hub note' \u{2764}".into())
         );
         let id = format!("mem_{}", "b".repeat(32));
         let cursor = Cursor::parse(&format!("1:12:{id}")).unwrap();

@@ -4669,8 +4669,9 @@ fn repository_memory(db: &Db) {
     assert!(search("nothing like this").is_empty());
     // The third note is shown with `'` for `"` and "Hub note" for "Hub message".
     assert_eq!(search("'QUOTE' agentscm hub note"), [third.id.as_str()]);
-    assert!(search("hub message").is_empty());
-    assert!(search("\"quote\"").is_empty());
+    // The search is cleaned as the shown text is, so what was written finds it too.
+    assert_eq!(search("hub message"), [third.id.as_str()]);
+    assert_eq!(search("\"quote\""), [third.id.as_str()]);
     let page = store
         .memory_list(&scope, &ListQuery::new(None, None, Some(2)).unwrap())
         .unwrap();
@@ -4931,12 +4932,32 @@ fn repository_memory_owner_share(db: &Db) {
             .unwrap();
         first.get_or_insert(written.id);
     }
+    // An expired note of bob's is deleted even by a write that is refused for capacity.
+    let old = now - agentscm::hub::memory::NOTE_TTL_SECS - 10;
+    let stale = store
+        .memory_write(&bob_agent, &scope, &note("stale"), old)
+        .unwrap();
+    let mut then = agentscm::hub::memory::ListQuery::new(None, None, Some(50)).unwrap();
+    then.now = old + 1;
+    let listed_then = |store: &dyn Store| {
+        store
+            .memory_list(&scope, &then)
+            .unwrap()
+            .notes
+            .into_iter()
+            .any(|n| n.id == stale.id)
+    };
+    assert!(listed_then(&*store));
     match store.memory_write(&alice_two, &scope, &note("one more"), now) {
         Err(HubError::WorkCapacity(capacity)) => {
             assert_eq!(capacity.limit.as_str(), "memory_notes_owner");
         }
         other => panic!("expected the owner's share, got {other:?}"),
     }
+    assert!(
+        !listed_then(&*store),
+        "the refused write deleted the expired note"
+    );
     // Another owner still writes, and the share is per repository.
     store
         .memory_write(&bob_agent, &scope, &note("bob's note"), now)
@@ -4960,14 +4981,24 @@ fn repository_memory_owner_share(db: &Db) {
         }
         other => panic!("expected the owner's share, got {other:?}"),
     }
-    // A note another person promoted no longer uses its owner's share.
+    // A promoted note still uses its owner's share, so an unpromotion never moves the owner
+    // past it.
     let promoted = store
         .memory_promote(&scope, &again.id, &bob, true, now)
         .unwrap();
     assert!(matches!(promoted, Promoted::Note(_)), "{promoted:?}");
-    store
-        .memory_write(&alice_two, &scope, &note("fits after promotion"), now)
-        .unwrap();
+    assert!(
+        store
+            .memory_write(&alice_two, &scope, &note("still full"), now)
+            .is_err()
+    );
+    // Alice cannot promote her own note, but asking for a promotion it has changes nothing.
+    assert!(matches!(
+        store
+            .memory_promote(&scope, &again.id, &alice, true, now)
+            .unwrap(),
+        Promoted::Note(_)
+    ));
 }
 
 macro_rules! conformance {

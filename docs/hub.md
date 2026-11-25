@@ -2269,7 +2269,7 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - The app requests `statuses: write` (and pull requests write) whether or not outbound
   is on. Repositories removed from an installation are not yet retired.
 - Repository memory is pull only and experimental, and holds at most 100 live notes per repository
-  and 25 unpromoted ones per person in it; unpromoted notes expire after 90 days. Nobody can
+  and 25 per person in it; unpromoted notes expire after 90 days. Nobody can
   promote a note their own agent wrote, but an agent on a person's own computer can use that
   person's saved CLI sign-in to remove notes or promote other people's (see
   [its limits](memory.md#limits)).
@@ -2371,7 +2371,7 @@ What the hub keeps, in its database and object store:
   receive the private spool's conversation bodies, tool input/output, command output, source bytes
   or host paths through this path.
 
-- Repository memory: at most 100 live notes per repository, 25 unpromoted ones per person, of at
+- Repository memory: at most 100 live notes per repository, 25 of them per person, of at
   most 500 characters each, with the writing token's id and name, its owner's id and login, the
   agent's session (none for a note written over HTTP) and, once a person promotes a note, their
   id, login and the time. A note nobody promoted expires 90 days after it was written and is

@@ -10,7 +10,7 @@ title: "Repository memory"
 Repository memory is a short list of notes that agents write for later agents working in the
 same repository: a test that needs a service, a build step that is easy to miss, a decision worth
 keeping. The Hub keeps the notes for each repository separately: at most 100 live notes at a
-time, and at most 25 unpromoted ones from any one person's agents. A note nobody promoted expires
+time, and at most 25 of them from any one person's agents. A note nobody promoted expires
 90 days after it was written.
 
 Three rules apply to every note:
@@ -40,7 +40,7 @@ tool lists are unchanged. They are callable either way.
 
 | Tool | What it does |
 |---|---|
-| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose shown text, the text every reader gets, contains it (at most 200 bytes, compared after Rust's Unicode lowercasing of both, so `É` finds `é` but `SS` does not find `ß`; `%` and `_` taken literally): search for `'` rather than `"`, and for "Hub note" rather than "Hub message". SQLite and PostgreSQL search the same way. An empty `q` or `after` is ignored. `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
+| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose shown text, the text every reader gets, contains it (at most 200 bytes, compared after Rust's Unicode lowercasing of both, so `É` finds `é` but `SS` does not find `ß`; `%` and `_` taken literally). The search is cleaned as the shown text is, so `"npm ci"` finds a note shown as `'npm ci'` and "Hub message" one shown as "Hub note". SQLite and PostgreSQL search the same way. An empty `q` or `after` is ignored. `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
 | `agentscm_memory_write` | Stores one note of 1 to 500 characters, signed with the token, its owner and the calling session. Invisible characters and characters that draw nothing are dropped and each run of spaces, line breaks, tabs and other control characters becomes one space first, and the bound applies to that text. |
 | `agentscm_memory_remove` | Removes one note by `id` (`mem_…`). Any writing token of the note's owner may remove it. |
 
@@ -49,10 +49,10 @@ cut. A write to a repository that already holds 100 live notes is refused with
 `work_storage_capacity` (503 over HTTP) and the detail `"limit": "memory_notes"`; no live note
 is evicted to make room. Remove a note of your own, ask a person to remove one, or wait: notes
 nobody promoted expire 90 days after they were written. A write by an agent whose person already
-holds 25 live notes nobody promoted in the repository, from any of their tokens, is refused the
+holds 25 live notes in the repository, promoted or not, from any of their tokens, is refused the
 same way with `"limit": "memory_notes_owner"`, so one person cannot fill the list; that person's
-agents can remove their own notes to make room, and a note another person promotes stops
-counting. The share is fixed rather than divided among the people writing, so it never shrinks
+agents can remove their own notes to make room. Promoted notes count, so a promotion or an
+unpromotion never moves anyone past the share. The share is fixed rather than divided among the people writing, so it never shrinks
 when someone else starts writing.
 
 ## For people
@@ -131,7 +131,8 @@ Each note is `{"id", "body", "author": {"owner", "login", "agent", "token", "ses
 Notes live in the `hub_memory_notes` table (named migration `repository_memory`) on SQLite or
 PostgreSQL, under the repository's scope: its forge host and stable repository id, so a renamed
 repository keeps its notes. A note nobody promoted expires 90 days after it was written: from
-then it is not listed, counted, promoted or removed, and the next write to that repository
+then it is not listed, counted, promoted or removed, and the next write to that repository,
+accepted or refused for capacity,
 deletes it, with no event. Unpromoting a note older than 90 days lets it expire at once.
 Promoted notes stay until someone removes them.
 
