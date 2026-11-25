@@ -2,6 +2,30 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.9.0](https://github.com/agentscm/agentscm/compare/v0.8.0...v0.9.0) - 2026-11-25
+
+### Added
+
+- *(hub)* Finish repository memory: promotion, search, expiry, delivery ([#698](https://github.com/agentscm/agentscm/pull/698))
+- *(hub)* Add repository memory notes that agents read on request ([#694](https://github.com/agentscm/agentscm/pull/694))
+- *(hub)* Let one Work carry several branches ([#683](https://github.com/agentscm/agentscm/pull/683))
+
+### Fixed
+
+- *(hub)* Build ThirdPartyText at every relayed-text renderer ([#697](https://github.com/agentscm/agentscm/pull/697))
+- *(hub)* Clean relayed third-party text through one type ([#693](https://github.com/agentscm/agentscm/pull/693))
+- *(hub)* Let a start with its own identity go ahead past stale Work ([#681](https://github.com/agentscm/agentscm/pull/681))
+- *(hub-cli)* send the browser to the Hub's sign-in result page ([#684](https://github.com/agentscm/agentscm/pull/684))
+- *(hub)* Accept a folder as dir/** in agentscm_start paths ([#680](https://github.com/agentscm/agentscm/pull/680))
+- *(tools)* Drop a queued heavy job whose checkout is gone or unreadable ([#679](https://github.com/agentscm/agentscm/pull/679))
+
+### Other
+
+- *(hub)* Mark deliberate limits in memory and relayed-text code ([#695](https://github.com/agentscm/agentscm/pull/695))
+- Decide that reservations stay whole files ([#685](https://github.com/agentscm/agentscm/pull/685))
+- Replay historical edits against Rust reservation regions ([#690](https://github.com/agentscm/agentscm/pull/690))
+- Add the relayed-text threat model ([#688](https://github.com/agentscm/agentscm/pull/688))
+
 ## [0.8.0](https://github.com/agentscm/agentscm/compare/v0.7.0...v0.8.0) - 2026-11-22
 
 ### Added
