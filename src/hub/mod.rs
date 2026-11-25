@@ -346,6 +346,9 @@ pub struct HubState {
     slack: Option<Arc<slack::Slack>>,
     /// The operator-registered context source; `None` unless `hub serve` loaded one.
     pub context_source: Option<Arc<context_source::ContextSource>>,
+    /// Whether promoted repository memory notes reach session-start context: on by default.
+    /// `hub serve` sets it from `memory::DELIVERY_ENV`; an embedding program sets it itself.
+    pub memory_delivery: bool,
     /// Set by an embedding program to decide who may use the Hub; `None` keeps the Hub's rules.
     access: Option<Arc<dyn access::Access>>,
     /// Set by an embedding program: seconds of stand-up history each repository keeps.
@@ -373,6 +376,7 @@ impl HubState {
             body_retention: None,
             slack: None,
             context_source: None,
+            memory_delivery: true,
             access: None,
             work_history: None,
             workspace: None,

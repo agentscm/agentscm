@@ -4515,11 +4515,16 @@ fn same_name_repositories_stay_apart(db: &Db) {
 fn repository_memory(db: &Db) {
     use agentscm::hub::HubError;
     use agentscm::hub::memory::{
-        Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NewNote, Removed,
+        Actor, ListQuery, MAX_LIVE_NOTES, MAX_NOTES_PER_OWNER, NOTE_TTL_SECS, NewNote, Promoted,
+        Removed,
     };
     let store = db.open();
     let alice = store.upsert_user(&identity(7), "alice").unwrap();
     let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let promoted_note = |outcome: Promoted| match outcome {
+        Promoted::Note(note) => *note,
+        other => panic!("expected a note, got {other:?}"),
+    };
     let token = |owner: &str, name: &str, repository: &str, id: i64, read_only: bool| {
         mint_bound_agent_token(&*store, owner, name, repository, id, TTL, read_only)
             .unwrap()
@@ -4610,10 +4615,19 @@ fn repository_memory(db: &Db) {
         ids(&all(&scope)),
         [third.id.clone(), second.id.clone(), first.id.clone()]
     );
-    let promoted = store
-        .memory_promote(&scope, &first.id, &bob, true, now + 5)
-        .unwrap()
-        .unwrap();
+    // A person cannot promote a note their own agent wrote, so no agent promotes its own note
+    // through its person's sign-in; another person can.
+    assert_eq!(
+        store
+            .memory_promote(&scope, &first.id, &alice, true, now + 4)
+            .unwrap(),
+        Promoted::OwnNote
+    );
+    let promoted = promoted_note(
+        store
+            .memory_promote(&scope, &first.id, &bob, true, now + 5)
+            .unwrap(),
+    );
     let promotion = promoted.promotion.clone().unwrap();
     assert_eq!(
         (
@@ -4624,16 +4638,17 @@ fn repository_memory(db: &Db) {
         (bob.id.as_str(), "bob", now + 5)
     );
     // Promoting again changes nothing and records nothing more.
-    let again = store
-        .memory_promote(&scope, &first.id, &alice, true, now + 9)
-        .unwrap()
-        .unwrap();
+    let again = promoted_note(
+        store
+            .memory_promote(&scope, &first.id, &bob, true, now + 9)
+            .unwrap(),
+    );
     assert_eq!(again.promotion, Some(promotion));
-    assert!(
+    assert_eq!(
         store
             .memory_promote(&elsewhere, &first.id, &bob, true, now)
-            .unwrap()
-            .is_none(),
+            .unwrap(),
+        Promoted::NotFound,
         "a note is promoted only in its own repository"
     );
     assert_eq!(
@@ -4641,7 +4656,8 @@ fn repository_memory(db: &Db) {
         [first.id.clone(), third.id.clone(), second.id.clone()]
     );
 
-    // Search matches text, with LIKE wildcards taken literally; paging continues in order.
+    // Search matches the text readers are shown, with `%` and `_` taken literally; paging
+    // continues in order.
     let search = |q: &str| {
         ids(&store
             .memory_list(&scope, &ListQuery::new(Some(q), None, None).unwrap())
@@ -4651,6 +4667,11 @@ fn repository_memory(db: &Db) {
     assert_eq!(search("THE_ESCAPE"), [second.id.as_str()]);
     assert_eq!(search("_"), [second.id.as_str()]);
     assert!(search("nothing like this").is_empty());
+    // The third note is shown with `'` for `"` and "Hub note" for "Hub message".
+    assert_eq!(search("'QUOTE' agentscm hub note"), [third.id.as_str()]);
+    // The search is cleaned as the shown text is, so what was written finds it too.
+    assert_eq!(search("hub message"), [third.id.as_str()]);
+    assert_eq!(search("\"quote\""), [third.id.as_str()]);
     let page = store
         .memory_list(&scope, &ListQuery::new(None, None, Some(2)).unwrap())
         .unwrap();
@@ -4790,7 +4811,7 @@ fn repository_memory(db: &Db) {
         )
         .unwrap();
 
-    // Both stores fold ASCII letters only, so a non-ASCII letter matches exactly as written.
+    // Both stores fold case for every letter, as Rust's `to_lowercase` does.
     let ecole = store
         .memory_write(
             &other_agent,
@@ -4810,15 +4831,82 @@ fn repository_memory(db: &Db) {
     };
     assert_eq!(found("École"), [ecole.id.as_str()]);
     assert_eq!(found("ÉCOLE DES"), [ecole.id.as_str()]);
+    assert_eq!(found("école des mines"), [ecole.id.as_str()]);
     assert!(
-        found("école").is_empty(),
-        "a non-ASCII letter is not folded"
+        found("ecole").is_empty(),
+        "letters are not stripped of accents"
     );
+
+    // A note nobody promoted expires after its time to live; a promoted one does not.
+    let old = now - NOTE_TTL_SECS - 10;
+    let stale = store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("stale advice", None).unwrap(),
+            old,
+        )
+        .unwrap();
+    let kept = store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("kept advice", None).unwrap(),
+            old,
+        )
+        .unwrap();
+    promoted_note(
+        store
+            .memory_promote(&elsewhere, &kept.id, &alice, true, old + 1)
+            .unwrap(),
+    );
+    let at = |when: i64| {
+        let mut query = ListQuery::new(None, None, Some(50)).unwrap();
+        query.now = when;
+        store.memory_list(&elsewhere, &query).unwrap()
+    };
+    assert!(ids(&at(old + 2)).contains(&stale.id));
+    // Live until `created_at + NOTE_TTL_SECS`, exclusive, on both stores.
+    assert!(ids(&at(old + NOTE_TTL_SECS - 1)).contains(&stale.id));
+    assert!(!ids(&at(old + NOTE_TTL_SECS)).contains(&stale.id));
+    let listed = ids(&at(now));
+    assert!(!listed.contains(&stale.id) && listed.contains(&kept.id));
+    assert_eq!(at(now).live, at(old + 2).live - 1);
+    // An expired note can be neither promoted nor removed, and the next write deletes it.
+    assert_eq!(
+        store
+            .memory_promote(&elsewhere, &stale.id, &alice, true, now)
+            .unwrap(),
+        Promoted::NotFound
+    );
+    assert_eq!(
+        store
+            .memory_remove(&elsewhere, &stale.id, Actor::Token(&other_agent), now)
+            .unwrap(),
+        Removed::NotFound
+    );
+    store
+        .memory_write(
+            &other_agent,
+            &elsewhere,
+            &NewNote::new("fresh advice", None).unwrap(),
+            now,
+        )
+        .unwrap();
+    assert!(!ids(&at(old + 2)).contains(&stale.id), "deleted on write");
+    // The write spares the promoted note; unpromoting it lets it expire at once.
+    assert!(ids(&at(now)).contains(&kept.id));
+    promoted_note(
+        store
+            .memory_promote(&elsewhere, &kept.id, &alice, false, now)
+            .unwrap(),
+    );
+    assert!(!ids(&at(now)).contains(&kept.id));
 }
 
 fn repository_memory_owner_share(db: &Db) {
     use agentscm::hub::HubError;
-    use agentscm::hub::memory::{Actor, MAX_NOTES_PER_OWNER, NewNote, Removed};
+    use agentscm::hub::memory::{Actor, MAX_NOTES_PER_OWNER, NewNote, Promoted, Removed};
     let store = db.open();
     let alice = store.upsert_user(&identity(7), "alice").unwrap();
     let bob = store.upsert_user(&identity(8), "bob").unwrap();
@@ -4844,12 +4932,32 @@ fn repository_memory_owner_share(db: &Db) {
             .unwrap();
         first.get_or_insert(written.id);
     }
+    // An expired note of bob's is deleted even by a write that is refused for capacity.
+    let old = now - agentscm::hub::memory::NOTE_TTL_SECS - 10;
+    let stale = store
+        .memory_write(&bob_agent, &scope, &note("stale"), old)
+        .unwrap();
+    let mut then = agentscm::hub::memory::ListQuery::new(None, None, Some(50)).unwrap();
+    then.now = old + 1;
+    let listed_then = |store: &dyn Store| {
+        store
+            .memory_list(&scope, &then)
+            .unwrap()
+            .notes
+            .into_iter()
+            .any(|n| n.id == stale.id)
+    };
+    assert!(listed_then(&*store));
     match store.memory_write(&alice_two, &scope, &note("one more"), now) {
         Err(HubError::WorkCapacity(capacity)) => {
             assert_eq!(capacity.limit.as_str(), "memory_notes_owner");
         }
         other => panic!("expected the owner's share, got {other:?}"),
     }
+    assert!(
+        !listed_then(&*store),
+        "the refused write deleted the expired note"
+    );
     // Another owner still writes, and the share is per repository.
     store
         .memory_write(&bob_agent, &scope, &note("bob's note"), now)
@@ -4864,9 +4972,33 @@ fn repository_memory_owner_share(db: &Db) {
             .unwrap(),
         Removed::Removed
     );
-    store
+    let again = store
         .memory_write(&alice_two, &scope, &note("fits again"), now)
         .unwrap();
+    match store.memory_write(&alice_two, &scope, &note("full"), now) {
+        Err(HubError::WorkCapacity(capacity)) => {
+            assert_eq!(capacity.limit.as_str(), "memory_notes_owner");
+        }
+        other => panic!("expected the owner's share, got {other:?}"),
+    }
+    // A promoted note still uses its owner's share, so an unpromotion never moves the owner
+    // past it.
+    let promoted = store
+        .memory_promote(&scope, &again.id, &bob, true, now)
+        .unwrap();
+    assert!(matches!(promoted, Promoted::Note(_)), "{promoted:?}");
+    assert!(
+        store
+            .memory_write(&alice_two, &scope, &note("still full"), now)
+            .is_err()
+    );
+    // Alice cannot promote her own note, but asking for a promotion it has changes nothing.
+    assert!(matches!(
+        store
+            .memory_promote(&scope, &again.id, &alice, true, now)
+            .unwrap(),
+        Promoted::Note(_)
+    ));
 }
 
 macro_rules! conformance {

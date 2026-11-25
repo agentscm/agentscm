@@ -325,6 +325,10 @@ struct Outcome {
     /// Start only: owner finish lines in `text` not yet claimed. `hook` claims each one that
     /// survives rendering and drops the rest, so a cut line is offered again at a later start.
     owner_notices: Vec<super::merged_holds::MergedNotice>,
+    /// Start only: promoted memory notes (`memory::render_delivered`), which `Call::render` puts
+    /// after every other line, so the length cap cuts them first, and drops when the start's
+    /// coordination is unknown.
+    memory: Option<String>,
 }
 
 impl Outcome {
@@ -334,6 +338,7 @@ impl Outcome {
             status: "clean",
             deny: None,
             owner_notices: Vec::new(),
+            memory: None,
         }
     }
 
@@ -344,6 +349,7 @@ impl Outcome {
             status: "unknown",
             deny: None,
             owner_notices: Vec::new(),
+            memory: None,
         }
     }
 
@@ -358,6 +364,7 @@ impl Outcome {
             status,
             deny: None,
             owner_notices: Vec::new(),
+            memory: None,
         }
     }
 }
@@ -439,6 +446,7 @@ async fn hook(
                 status: "unknown",
                 deny: None,
                 owner_notices: Vec::new(),
+                memory: None,
             },
             Some(error),
         ),
@@ -450,6 +458,7 @@ async fn hook(
                     status: "unknown",
                     deny: None,
                     owner_notices: Vec::new(),
+                    memory: None,
                 },
                 Some(error),
             )
@@ -1659,6 +1668,7 @@ impl Call {
                     return Ok(Outcome {
                         deny: self.deny.then(|| text.clone()),
                         owner_notices: Vec::new(),
+                        memory: None,
                         text,
                         status: if applied { "fyi" } else { "stop" },
                     });
@@ -1715,6 +1725,7 @@ impl Call {
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
                             owner_notices: Vec::new(),
+                            memory: None,
                             text,
                             status: if applied { "fyi" } else { "stop" },
                         });
@@ -1792,6 +1803,7 @@ impl Call {
                         Outcome {
                             deny: Some(text.clone()),
                             owner_notices: Vec::new(),
+                            memory: None,
                             text,
                             status: "stop",
                         }
@@ -1940,6 +1952,19 @@ impl Call {
                 let (current_status, operator_context) =
                     tokio::join!(current_status, operator_context);
                 let current_status = current_status.ok().and_then(std::result::Result::ok);
+                // Promoted memory notes, read only after the status, so they never take its
+                // store permit, and bounded the same way; not for a subagent's session, and
+                // nothing when the read fails.
+                let memory = if self.child {
+                    None
+                } else {
+                    let read = super::memory::delivered_for_principal(state, &principal);
+                    tokio::time::timeout(std::time::Duration::from_millis(500), read)
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok)
+                        .and_then(|notes| super::memory::render_delivered(&notes))
+                };
                 let mut text = render_start_summary(
                     current_status.as_ref(),
                     briefing.as_ref().ok().map(|(briefing, overview, catchup)| {
@@ -1969,6 +1994,7 @@ impl Call {
                     status,
                     deny: None,
                     owner_notices,
+                    memory,
                 })
             }
             Kind::Done => {
@@ -2167,6 +2193,11 @@ impl Call {
                 (false, true) => format!("{context}\n{head}"),
                 (false, false) => format!("{head}\n{context}"),
             };
+            // Agent-written notes go after every line of the Hub's own, inbox lines included,
+            // and not at all when coordination is unknown.
+            if outcome.status != "unknown" {
+                with_memory(&mut context, outcome.memory.as_deref());
+            }
             context = fit_context(&context, START_CONTEXT);
         }
         let text = context.as_str();
@@ -2276,6 +2307,18 @@ fn render_start_summary(
         lines.push(block);
     }
     lines.join("\n")
+}
+
+/// Promoted memory notes, already cleaned and bounded by `memory::render_delivered`, go last:
+/// the host cap cuts the start context from its end, so they are cut before any line of the
+/// Hub's own, the rules and the narrative guidance included.
+fn with_memory(text: &mut String, memory: Option<&str>) {
+    if let Some(block) = memory {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(block);
+    }
 }
 
 /// Counts only: the actionable status above already names each unfinished Work.
@@ -3301,6 +3344,78 @@ mod tests {
             context.ends_with("agentscm_work_overview for it."),
             "{context}"
         );
+    }
+
+    #[test]
+    fn promoted_notes_are_cut_before_the_hubs_own_start_lines() {
+        let text = render_start_summary(None, None, "", "", &[]);
+        // Five full promoted notes of astral characters, with the one rule a read-only Claude
+        // Code session gets and an inbox line added after the start text: the cap cuts the
+        // notes, never the Hub's lines.
+        let text = format!(
+            "{text}\n{}\nAgentSCM coordination request crq_1: synthetic inbox line.",
+            super::super::agent_rules::REQUIRED_RULES[5]
+        );
+        let notes: Vec<_> = (0..5)
+            .map(|i| crate::hub::memory::Note {
+                id: format!("mem_{i:032x}"),
+                body: "😀".repeat(crate::hub::memory::MAX_NOTE_CHARS),
+                owner: "usr_a".into(),
+                owner_login: "😀".repeat(100),
+                token: "tok_a".into(),
+                token_name: "😀".repeat(100),
+                session: Some("😀".repeat(100)),
+                created_at: 1,
+                promotion: Some(crate::hub::memory::Promotion {
+                    by: "usr_b".into(),
+                    by_login: "😀".repeat(100),
+                    at: 2,
+                }),
+            })
+            .collect();
+        let block = crate::hub::memory::render_delivered(&notes).unwrap();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let call = Call::parse(
+                agent,
+                br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+                None,
+            );
+            let outcome = Outcome {
+                memory: Some(block.clone()),
+                ..Outcome::advice(text.clone(), false)
+            };
+            let reply = call.render(&outcome);
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(context.encode_utf16().count() <= START_CONTEXT);
+            assert!(
+                context.contains(super::super::agent_rules::REQUIRED_RULES[5])
+                    && context.contains("synthetic inbox line")
+                    && context.contains("native session ID"),
+                "{context}"
+            );
+            assert!(
+                context.contains("AgentSCM repository memory: 5 of 5"),
+                "{context}"
+            );
+            assert!(
+                !context.contains(&format!("mem_{:032x}", 0)),
+                "the last note is cut"
+            );
+            // When coordination is unknown the notes are left out, and the head stays.
+            let unknown = Outcome {
+                status: "unknown",
+                memory: Some(block.clone()),
+                ..Outcome::advice(format!("AgentSCM: coordination unknown.\n{text}"), false)
+            };
+            let reply = call.render(&unknown);
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(!context.contains("AgentSCM repository memory"), "{context}");
+            assert!(context.contains("native session ID"), "{context}");
+        }
     }
 
     #[test]

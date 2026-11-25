@@ -89,9 +89,9 @@ An agent acts on a Hub message only after the Hub verifies it. The delivered not
 
 **Implemented, experimental: [repository memory](../memory.md).** Text an agent stores for later readers is the laundering case, so it gets stricter rules:
 
-1. **Pull, not push.** Agents read stored entries through a tool they call. The Hub does not put them into session-start context or other replies.
+1. **Pull, but for promoted entries.** Agents read stored entries through a tool they call. The only push is up to 5 promoted entries in session-start context (`memory::render_delivered`), which the operator can turn off with `AGENTSCM_MEMORY_DELIVERY=off`; nothing an agent wrote reaches other replies.
 2. **Every entry names its author**: the agent, its owner and when it was written.
-3. **No automatic delivery until a person promotes it.** Only a signed-in person can promote an entry. Today a promotion delivers nothing: promoted entries are also read only on request. Delivering promoted entries automatically is **Proposed** and not in the code.
+3. **No automatic delivery until a person promotes it.** Only a signed-in person other than the entry's owner can promote it, so no agent can promote its own entry through its person's saved sign-in. An entry nobody promoted expires after 90 days. A promotion delivers the entry: labelled as third-party text, naming its author and promoter, built with `ThirdPartyText`, and covered by the corpus test.
 
 ## Decision: no prompt-injection classifier as a gate
 

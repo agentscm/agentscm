@@ -166,6 +166,11 @@ pub async fn serve_with(
     if state.context_source.is_some() {
         eprintln!("context source: registered");
     }
+    state.memory_delivery = super::memory::delivery_from(&lookup)?;
+    eprintln!(
+        "memory delivery: {}",
+        if state.memory_delivery { "on" } else { "off" }
+    );
     // The waits sessions reported to the previous process: the list it left when it was stopped,
     // or, when it left none, not known. Their subagents are not known either way.
     let restoring = state.clone();

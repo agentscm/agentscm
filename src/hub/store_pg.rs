@@ -10517,7 +10517,7 @@ impl Store for PgStore {
         person: &User,
         promoted: bool,
         now: i64,
-    ) -> Result<Option<super::memory::Note>> {
+    ) -> Result<super::memory::Promoted> {
         memory::promote(self, scope, id, person, promoted, now)
     }
 
