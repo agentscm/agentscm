@@ -1474,7 +1474,7 @@ async fn loopback_login(
     let code = match returned {
         Returned::Code(code) => code,
         Returned::Refused(kind, message) => {
-            let location = result_page(hub, None, &kind);
+            let location = result_page(client, hub, None, &kind).await;
             let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
             return Err(invalid(if message.is_empty() {
                 "The Hub refused the sign-in; run it again"
@@ -1493,12 +1493,12 @@ async fn loopback_login(
         let body = json!({"code": code, "verifier": verifier});
         reply = call(client, Method::POST, &url, None, Some(body)).await;
     }
-    // The browser lands on the Hub's own page saying who signed in, or why not.
-    let location = match &reply {
-        Ok((200, signed)) => result_page(hub, Some(signed), ""),
-        Ok((_, refused)) => result_page(hub, None, refused["error"].as_str().unwrap_or("")),
-        Err(_) => result_page(hub, None, ""),
+    let (signed, reason) = match &reply {
+        Ok((200, signed)) => (Some(signed), ""),
+        Ok((_, refused)) => (None, refused["error"].as_str().unwrap_or("")),
+        Err(_) => (None, ""),
     };
+    let location = result_page(client, hub, signed, reason).await;
     let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
     match reply? {
         (200, signed) => Ok(signed),
@@ -1506,10 +1506,24 @@ async fn loopback_login(
     }
 }
 
-/// The Hub page that shows how `hub login` ended: `/#/signed-in?…`. A hosted Hub's UI and a
-/// UI build (`/` → `/ui/`) render it; a headless Hub sends `/` to its plain landing page.
-/// A refusal carries only its reason code: anyone can forge the link, so the page words it.
-fn result_page(hub: &str, signed: Option<&Value>, reason: &str) -> String {
+/// Use the sign-in landing page unless a 404 indicates an older Hub with a dashboard.
+async fn result_page(
+    client: &reqwest::Client,
+    hub: &str,
+    signed: Option<&Value>,
+    reason: &str,
+) -> String {
+    let landing = format!("{hub}{}", agentscm::hub::landing::landing());
+    let dashboard = client
+        .head(&landing)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok_and(|reply| reply.status() == reqwest::StatusCode::NOT_FOUND);
+    if !dashboard && signed.is_some() {
+        return landing;
+    }
+
     let mut page = reqwest::Url::parse("http://page.invalid/").expect("static URL");
     {
         let mut pairs = page.query_pairs_mut();
@@ -1535,9 +1549,16 @@ fn result_page(hub: &str, signed: Option<&Value>, reason: &str) -> String {
                     .append_pair("reason", if known { reason } else { "login_failed" });
             }
         }
-        pairs.append_pair("from", "cli");
+        if dashboard {
+            pairs.append_pair("from", "cli");
+        }
     }
-    format!("{hub}/#/signed-in?{}", page.query().unwrap_or_default())
+    let query = page.query().unwrap_or_default();
+    if dashboard {
+        format!("{hub}/#/signed-in?{query}")
+    } else {
+        format!("{landing}?{query}")
+    }
 }
 
 fn redirect_browser(mut stream: std::net::TcpStream, location: &str) {
@@ -1777,30 +1798,6 @@ impl HubAuth {
     pub(crate) fn secret(&self) -> &str {
         match self {
             Self::Device(secret) | Self::Session(secret) => secret,
-        }
-    }
-
-    /// The request that mints a token for `repository`. A computer's tokens get the Hub's
-    /// lifetime (24 hours, or 30 minutes read-only); a session asks for `ttl_seconds`.
-    #[cfg(feature = "ui")]
-    pub(crate) fn mint(
-        &self,
-        hub: &str,
-        name: &str,
-        repository: &str,
-        ttl_seconds: i64,
-        read_only: bool,
-    ) -> (String, Value) {
-        match self {
-            Self::Device(_) => (
-                format!("{hub}/v1/hub/device/tokens"),
-                json!({"name": name, "repository": repository, "read_only": read_only}),
-            ),
-            Self::Session(_) => (
-                format!("{hub}/v1/hub/tokens"),
-                json!({"name": name, "repository": repository, "ttl_seconds": ttl_seconds,
-                    "read_only": read_only}),
-            ),
         }
     }
 
@@ -3329,26 +3326,45 @@ mod tests {
         assert!(!output.contains("private-expired"));
     }
 
-    #[test]
-    fn hub_login_sends_the_browser_to_the_hubs_result_page() {
-        let hub = "https://hub.example";
+    #[tokio::test]
+    async fn hub_login_uses_the_dashboard_result_only_when_the_landing_is_missing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(
+                "/auth/complete/",
+                axum::routing::head(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/unavailable/auth/complete/",
+                axum::routing::head(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = direct_client().unwrap();
         let signed = json!({"user": {"login": "sam", "provider": "github"}, "device": {"name": "Sam's laptop"}});
         assert_eq!(
-            result_page(hub, Some(&signed), ""),
-            "https://hub.example/#/signed-in?status=signed_in&login=sam&provider=github&computer=Sam%27s+laptop&from=cli"
+            result_page(&client, &hub, Some(&signed), "").await,
+            format!(
+                "{hub}/#/signed-in?status=signed_in&login=sam&provider=github&computer=Sam%27s+laptop&from=cli"
+            )
         );
         assert_eq!(
-            result_page(hub, None, "not_allowed"),
-            "https://hub.example/#/signed-in?status=refused&reason=not_allowed&from=cli"
+            result_page(&client, &hub, None, "not_allowed").await,
+            format!("{hub}/#/signed-in?status=refused&reason=not_allowed&from=cli")
         );
         // Free text from the Hub or the loopback query never reaches the page.
         for odd in ["", "Not Allowed", "<b>x</b>", &"a".repeat(41)] {
             assert_eq!(
-                result_page(hub, None, odd),
-                "https://hub.example/#/signed-in?status=refused&reason=login_failed&from=cli",
+                result_page(&client, &hub, None, odd).await,
+                format!("{hub}/#/signed-in?status=refused&reason=login_failed&from=cli"),
                 "{odd}"
             );
         }
+        let unavailable = format!("{hub}/unavailable");
+        assert_eq!(
+            result_page(&client, &unavailable, None, "<b>x</b>").await,
+            format!("{unavailable}/auth/complete/?status=refused&reason=login_failed")
+        );
     }
 
     #[test]

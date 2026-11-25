@@ -35,6 +35,7 @@ pub mod hook_overhead;
 pub mod http;
 pub mod insights;
 pub mod intent;
+pub mod landing;
 mod lead_credential;
 pub mod local_ci_devices;
 pub mod login;
@@ -75,13 +76,11 @@ mod store_pg;
 mod store_sql;
 mod store_sqlite;
 pub mod sync;
-pub mod ui;
 pub mod validation_evidence;
 pub mod validation_evidence_http;
 #[cfg(unix)]
 mod validation_summary;
 pub mod value_metrics;
-pub mod view_settings;
 pub mod viewer;
 pub mod why;
 pub mod work;
@@ -629,7 +628,7 @@ pub fn router_with(state: HubState, extra: Router<HubState>) -> Router {
         .merge(mcp::routes())
         .merge(publish::routes())
         .merge(sync::routes())
-        .merge(ui::routes())
+        .merge(landing::routes())
         .merge(workspace_routes)
         .merge(extra)
         .fallback(http::not_found);

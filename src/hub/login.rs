@@ -405,13 +405,13 @@ struct BrowserLogin {
     workspace: bool,
     /// Signs the browser itself in to the Hub's web pages.
     web: bool,
-    /// The Hub page a web sign-in returns to: a same-origin path, `/ui/` unless the page asked.
+    /// The Hub page a web sign-in returns to: a same-origin path, the sign-in landing unless the caller asked.
     return_to: String,
     client: IpAddr,
 }
 
 /// The page a web sign-in may return to (`?return_to=`): a same-origin path of plain segments
-/// ending in `/`, such as `/ui/` or `/next/`, and never an API route. Anything else is refused,
+/// ending in `/`, such as `/next/`, and never an API route. Anything else is refused,
 /// so the sign-in cannot be used to redirect to another site. A connected app's approval page is
 /// the one API route it may return to (see [`apps::return_path`]).
 fn web_return_path(path: &str) -> Option<&str> {
@@ -888,7 +888,7 @@ async fn browser_start(
     let web = !workspace && params.get("web").is_some_and(|value| value == "1");
     let return_to = match params.get("return_to") {
         Some(path) if web => web_return_path(path).ok_or_else(ApiError::invalid)?,
-        _ => super::ui::landing(),
+        _ => super::landing::landing(),
     }
     .to_owned();
     let cli_port = if workspace || web {
@@ -981,8 +981,8 @@ async fn callback(
 }
 
 /// A browser sign-in that fails goes back to the CLI with the reason and the message, and a web
-/// one to the Hub's page with the reason alone (anyone can forge that link, so the page words
-/// the reason itself); a workspace sign-in keeps its JSON error.
+/// one to the Hub's sign-in page with the reason code alone (anyone can forge that link, so the
+/// page words a known code itself); a workspace sign-in keeps its JSON error.
 fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> {
     if pending.workspace {
         return Err(error);
@@ -993,13 +993,13 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .query_pairs_mut()
             .append_pair("status", "refused")
             .append_pair("reason", error.code());
-        // A connected app's approval page cannot word the reason; the Hub's own page can.
-        let page = if apps::return_path(&pending.return_to) {
-            super::ui::landing()
-        } else {
-            &pending.return_to
-        };
-        let location = format!("{page}#/signed-in?{}", query.query().unwrap_or_default());
+        // Only the Hub's own sign-in page words the reason; neither a connected app's approval
+        // page nor any other return path can.
+        let location = format!(
+            "{}?{}",
+            super::landing::landing(),
+            query.query().unwrap_or_default()
+        );
         return found(&location, cookie_attributes("", 0));
     }
     // The CLI's loopback hears why, stops waiting, and sends the browser to the Hub page.
@@ -1097,7 +1097,7 @@ async fn callback_inner(
             .await
             .map_err(super::workspace::api_error)?;
         let mut response = found(
-            &format!("{}#workspace", super::ui::landing()),
+            &format!("{}#workspace", super::landing::landing()),
             cookie_attributes("", 0),
         )?;
         response.headers_mut().append(
@@ -2074,7 +2074,7 @@ mod tests {
 
     #[test]
     fn web_sign_in_returns_only_to_a_same_origin_page() {
-        for ok in ["/ui/", "/next/", "/a/b-c_d.e~f/"] {
+        for ok in ["/next/", "/a/b-c_d.e~f/"] {
             assert_eq!(web_return_path(ok), Some(ok), "{ok}");
         }
         for bad in [

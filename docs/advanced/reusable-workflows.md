@@ -222,7 +222,7 @@ its output retains `"admission":"not_assessed"`.
 
 `agentscm serve` returns the same inspect and handoff JSON from
 `GET /v1/local/skill-workflow-library?change=CHANGE&library=PATH` and
-`GET /v1/local/skill-workflows/RUN_ID/handoff`, so a local status page can show them. Configure,
+`GET /v1/local/skill-workflows/RUN_ID/handoff`. Configure,
 check and the other mutations are not available over HTTP. See
 [local template and timeline reads](../api.md#local-template-and-timeline-reads).
 

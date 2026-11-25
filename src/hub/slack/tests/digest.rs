@@ -266,15 +266,7 @@ async fn the_digest_is_off_by_default_weekly_and_only_for_bound_people_with_some
     );
     assert_eq!(
         ids(&row(&body["blocks"], "<!channel> Ship the exporter")),
-        [COMPLETE, RELEASE, OPEN]
-    );
-    let open = button(&body["blocks"], "Tidy the parser", OPEN);
-    assert!(
-        open["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://hub.example.test/ui/#work/wrk_"),
-        "{open}"
+        [COMPLETE, RELEASE]
     );
     assert!(has_stop(&body["blocks"]));
 
@@ -327,7 +319,7 @@ async fn a_person_who_switched_it_off_gets_none_and_the_stop_button_switches_it_
     assert!(!has_stop(&update["blocks"]));
     assert_eq!(
         ids(&row(&update["blocks"], "Ship the exporter")),
-        [COMPLETE, RELEASE, OPEN]
+        [COMPLETE, RELEASE]
     );
     assert!(text_of(&update["blocks"]).ends_with(outcome));
     let settings = tokio::task::block_in_place(|| {
@@ -400,10 +392,10 @@ async fn buttons_change_only_the_clicking_persons_own_work_as_that_person() {
         update["text"],
         "Marked 'Ship &lt;the&gt; exporter' complete."
     );
-    assert_eq!(ids(&row(&update["blocks"], "Ship <the> exporter")), [OPEN]);
+    assert!(row(&update["blocks"], "Ship <the> exporter").is_empty());
     assert_eq!(
         ids(&row(&update["blocks"], "Tidy the parser")),
-        [COMPLETE, RELEASE, OPEN]
+        [COMPLETE, RELEASE]
     );
     assert!(has_stop(&update["blocks"]));
     assert!(text_of(&update["blocks"]).contains("Release frees the files"));

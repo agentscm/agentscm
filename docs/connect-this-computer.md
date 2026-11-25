@@ -4,23 +4,24 @@ title: "Manage connections on this computer"
 
 # Manage connections on this computer
 
-The installed native engine connects your coding agents to a Hub without running a local dashboard.
+The installed native engine connects your coding agents to a Hub.
 Use the existing setup command to connect to your team's Hub:
 
 ```sh
 npx agentscm --hub-url https://hub.example.com
 ```
 
-The Hub is the authority for shared Work, repository access and coordination. Its separately hosted
-web interface remains available when enabled. Removing the local page does not remove native
-source/workflow commands, local capture data or an explicitly hosted Hub's API and database.
+The Hub is the authority for shared Work, repository access and coordination. AgentSCM has no web interface; native source/workflow commands, local capture data
+and an explicitly hosted Hub's API and database are unaffected by that.
 
 ## Sign in once per computer
 
-`agentscm hub login` signs this computer in to
-the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser lands on the Hub's page saying which computer signed in, or why not, and the terminal reports the signed-in account and computer. The terminal says it is waiting, every
-30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
-display (or with `--device`, or `AGENTSCM_NO_BROWSER=1`) it shows a code to enter on another
+`agentscm hub login` signs you and this computer in to the Hub. On a desktop it opens your
+browser to authorize sign-in. The browser then opens the Hub's sign-in result page. The terminal
+reports the signed-in account and computer or explains why sign-in failed. While waiting, the
+terminal gives a progress update every 30 seconds and explains what to do if sign-in times out
+after 3 minutes. Over SSH or without a display (or with `--device` or `AGENTSCM_NO_BROWSER=1`),
+it shows a code to enter on another
 device instead; when the Hub's GitHub App does not allow that, it says so and uses the browser
 sign-in. Every failed step names what failed, for example that the sign-in link expired or that
 the forge did not accept the code. What signing in gives you:
@@ -62,7 +63,7 @@ stops coordination (the token was refused, or access ended), that reason replace
   (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label until
   the token is replaced, and Work records that already copied it keep it. Hook and MCP text,
   `agentscm intent`, Slack and pull-request text mask it; structured JSON fields such as `agent.name`
-  and `lead_agent`, the Hub page's `title` attribute and your own `agentscm hub token list` listing still
+  and `lead_agent` and your own `agentscm hub token list` listing still
   show it.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
   and allowed on the Hub and still have the repository role (on a public repository Triage or
@@ -85,7 +86,7 @@ renewal fails. A token file given to `client setup` is never renewed.
 
 Your computers: `agentscm hub devices list` shows each one with its name, last use and the
 repositories connected through it, live ones first; `agentscm hub devices rename NAME` renames
-this one; `agentscm hub devices revoke dev_…` signs one out (from any of your computers). A UI-enabled team Hub can list and revoke them too. Revoking a computer revokes every
+this one; `agentscm hub devices revoke dev_…` signs one out (from any of your computers). Revoking a computer revokes every
 agent token minted through it, so its agents stop at their next call, and ends the session that
 signed it in. `agentscm hub logout` signs this computer out the same way and warns if the Hub could
 not be told. Hub administrators can revoke any computer. See
@@ -112,7 +113,7 @@ agentscm hub logout --hub https://hub.example.com
 
 `client status` distinguishes configured connections from observed native integration coverage.
 `client doctor` reports the Hub binding and native onboarding evidence; missing hooks or trust are
-not a successful connection test. Neither command needs a dashboard.
+not a successful connection test.
 
 On macOS, the verified installer/setup flow configures a per-user launchd resident from the same
 versioned native executable. It retries retained reports, observes only qualified native host exits
@@ -169,6 +170,4 @@ unreachable instance is left unchanged with a recovery diagnostic. Existing priv
   inactivity. Keep the config directory private and revoke a lost computer.
 - Losing repository access is checked at token renewal; revoking the computer or disabling the
   account revokes its agent tokens immediately.
-- Native installation, CLI/API behavior and a team's UI deployment are separate capabilities.
-  A build without `ui` has no dashboard assets/routes; the container and explicit `--features ui`
-  builds retain the Hub UI and its own authorization.
+- AgentSCM serves no web interface; setup, controls and diagnostics use the CLI, MCP and HTTP APIs.

@@ -215,7 +215,7 @@ Informational notes remain visible. A model cannot submit an approval or its own
 model identity are observations, not independent provider attestations or a hard monetary cap.
 Safe/restricted mode still trusts installed CLI software and managed policy.
 
-The legacy [hub dashboard](skill-workflow-hub.md) remains repository-scoped and read-only. It shows recent runs,
+The legacy [hub read mapping](skill-workflow-hub.md) remains repository-scoped and read-only. It returns recent runs,
 command outcomes, structured review findings, and separate source and landing-binding
 freshness. Historical success and current applicability are not admission decisions.
 The opt-in [Community workspace](community-workspace.md) adds members, permissions,

@@ -16,8 +16,7 @@ npx agentscm demo
 ## What you'll see
 
 The command starts a temporary Hub on this computer and prints each scripted step and result in
-your terminal. Native installations do not open a local dashboard. A server built with the `ui`
-feature can additionally open its demonstration page; `--no-open` suppresses that browser launch.
+your terminal.
 
 Three simulated agents start work on files from your repository. When one of them goes to edit a
 file another agent is already working on, AgentSCM refuses that edit once and says who holds the

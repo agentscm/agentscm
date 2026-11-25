@@ -77,8 +77,7 @@ npx agentscm client status --check
 npx agentscm client doctor
 ```
 
-Native installations run without a local dashboard. Your team's Hub can still serve its web
-interface. The CLI retains setup, sharing controls, sign-out, diagnostics and recovery; see
+AgentSCM has no web interface. The CLI retains setup, sharing controls, sign-out, diagnostics and recovery; see
 [this computer](docs/connect-this-computer.md).
 
 See [install options](docs/install.md) for platform/runtime requirements, `--only`, `--dry-run`,
@@ -96,7 +95,6 @@ Silicon macOS; Docker is an explicit fallback. Server deployment is
 | Inspect what an agent changed and checked | Source-bound action records with separate outcome, coverage, freshness and evidence availability | [Change capture](docs/change-capture.md) |
 | Connect code and context | Read-only committed Git files, history and diffs beside available local conversations and recorded actions | [Repository explorer](docs/repository-explorer.md) · [Open this computer](docs/connect-this-computer.md) |
 | Make a team's PR process visible | Experimental `pr-gate` v1: adopted steps, head-bound evidence, findings and next actions; opt-in Claude Code/Codex Stop hooks | [Supported skills](docs/design/supported-skills.md) |
-| Reuse skills and workflow definitions | Local versioned authoring, pinned imports, simulation and an explicit export path to native execution | [Workflow library](docs/advanced/workflow-library.md) |
 | Continue a managed task with another agent | Experimental local Claude Code/Codex continuation of enrolled Work, with bounded source edits, artifacts and retained context | [Portable responsibility](docs/advanced/portable-responsibility.md) |
 | Run reviewed team rules | Experimental owner-reviewed contracts, rehearsal and guarded post-merge artifact workflows | [Operating policy](docs/advanced/operating-policy.md) |
 | Retain an owner's commitment | Living Promises keep versioned requests, criteria and constraints; agent proposals and reports remain advisory | [Living Promises](docs/advanced/living-promises.md) |
@@ -111,8 +109,7 @@ same-file overlap is not proof of conflict. See [support boundaries](docs/agents
 
 `pr-gate` evidence is **self-reported**. A recorded test, independent review or approval is
 not proof that it happened. Its opt-in Stop hook gates session completion; it does not own
-GitHub merge permissions or replace branch protection. Other workflow-library declarations
-can be authored or simulated without being runnable; export reports unmet bindings explicitly.
+GitHub merge permissions or replace branch protection.
 
 ## Source and evidence you can inspect
 
@@ -145,7 +142,7 @@ stores; see [Hub data](docs/hub.md#data-the-hub-stores).
 
 The optional repository explorer API reads local source and retained evidence. It does not run an
 agent, execute checks, fetch or check out branches. Native CLI source and workflow tools remain
-available; removing the local dashboard does not remove those facilities.
+available.
 
 ## Git, forge checks and native workflows
 

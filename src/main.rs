@@ -83,8 +83,6 @@ mod hook_report;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;
-#[cfg(all(unix, feature = "ui"))]
-mod hub_read_token;
 mod init_cli;
 mod intent_cli;
 #[cfg(unix)]
@@ -694,9 +692,6 @@ enum Command {
         /// Allow a non-loopback bind address.
         #[arg(long)]
         public: bool,
-        /// Serve the legacy local dashboard in UI-enabled builds. Takes no source flags.
-        #[arg(long, hide = true)]
-        front_door: bool,
     },
 }
 
@@ -1517,7 +1512,6 @@ async fn run(cli: Cli) -> Result<RunExit> {
             explorer_spool,
             browser_origin,
             public,
-            front_door,
         } => {
             server::serve(server::ServeOptions {
                 data_dir: cli.data_dir,
@@ -1530,7 +1524,6 @@ async fn run(cli: Cli) -> Result<RunExit> {
                 explorer_repo,
                 explorer_repository,
                 explorer_spool,
-                front_door,
             })
             .await?;
         }

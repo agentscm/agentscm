@@ -44,7 +44,6 @@ pub fn routes() -> Router<HubState> {
         // The path load balancers and `agentscm serve` use.
         .route("/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
-        .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
         .merge(super::owner_notice_http::routes())
@@ -561,18 +560,6 @@ async fn health(State(state): State<HubState>) -> Response {
             .with_field("status", json!("unavailable"))
             .into_response(),
     }
-}
-
-async fn view_settings(
-    State(state): State<HubState>,
-    Reader(principal): Reader,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let report = blocking(&state, move || {
-        super::view_settings::ViewSettings::report(&*store, &principal.owner.id)
-    })
-    .await?;
-    Ok(Json(report))
 }
 
 async fn whoami(

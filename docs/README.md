@@ -30,7 +30,7 @@ attention next, alongside your existing Git repositories and GitHub or GitLab.
 ## Coordinate work
 
 - [Supported agents](agents.md): client support levels, setup and hook behavior.
-- [Messages to your own agent session](agent-messages.md): sending from the Hub page to a running session, the Auto, Manual and Ignore modes, and how each client receives them.
+- [Messages to your own agent session](agent-messages.md): sending through the Hub's browser-session routes to a running session, the Auto, Manual and Ignore modes, and how each client receives them.
 - [Context source](context-source.md): one HTTP endpoint a Hub operator registers, which adds a few lines of context when a session starts and when it starts Work.
 - [Repository memory](memory.md) (experimental): short notes agents write for later agents in the same repository, read on request, promoted only by a person other than the note's owner, and up to 5 promoted notes delivered at session start unless the operator sets `AGENTSCM_MEMORY_DELIVERY=off`.
 - [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
@@ -59,9 +59,7 @@ observed actions and source; they are not independent verification or human appr
 
 - [Work outcomes and scope reservations](design/work-lifecycle.md): design for separating why Work ended from whether it still holds its scope.
 - [Supported skills](design/supported-skills.md): experimental `pr-gate` v1 and its self-reported evidence.
-- [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
-- [Work reconciliation](design/work-reconciliation.md): durable exact-head prerequisite conditions, preserved reports, reassessment and scope disposition through HTTP, CLI, MCP and Work detail.
-- [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
+- [Work reconciliation](design/work-reconciliation.md): durable exact-head prerequisite conditions, preserved reports, reassessment and scope disposition through HTTP, CLI and MCP.
 - [Hub local-validation summaries](advanced/hub-local-validation.md): opt-in durable evidence, one GitHub summary, explicit migration and standalone fallback.
 - [Immutable local CI plans](advanced/local-ci-plans.md): experimental command-first requirements, exact source bindings and independent coverage checks; execution adapters remain separate.
 - [Trusted local CI devices](advanced/local-ci-devices.md): experimental administrator enrollment of device keys and the current-authorization check; no result submission or execution.

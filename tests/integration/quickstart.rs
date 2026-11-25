@@ -1278,28 +1278,6 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
         }
     };
     wait_for_health();
-    let (ui_status, ui) = managed_http(port, "/ui/").expect("embedded UI response");
-    assert_eq!(ui_status, 200);
-    assert!(
-        ui.contains("<title>AgentSCM Hub</title>")
-            && ui.contains("<div id=\"root\"></div>")
-            && ui.contains("src=\"./app.js\"")
-            && ui.contains("href=\"./app.css\""),
-        "embedded application shell was not served"
-    );
-    let (script_status, script) = managed_http(port, "/ui/app.js").expect("embedded script");
-    assert_eq!(script_status, 200);
-    assert!(
-        script.contains("/v1/hub/health") && script.contains("AgentSCM"),
-        "embedded application script markers were absent"
-    );
-    let (style_status, style) = managed_http(port, "/ui/app.css").expect("embedded stylesheet");
-    assert_eq!(style_status, 200);
-    assert!(
-        style.contains(".app-shell"),
-        "embedded application stylesheet marker was absent"
-    );
-
     let mut container = compose_command();
     container.args(["ps", "-q", "hub"]);
     let container = managed_output(

@@ -44,7 +44,7 @@ flowchart LR
   A[Explicit local CLI call] --> B[Compile source and skill package]
   B --> C[Run ordered check or command steps]
   C --> D[Retain run and command results]
-  D --> E[CLI, API, MCP and dashboard inspection]
+  D --> E[CLI, API and MCP inspection]
 ```
 
 `SKILL.md` describes the skill; it is packaged input. A command step also needs the strict recipe
@@ -224,8 +224,7 @@ the current source and policy bindings.
 The native service exposes a [read-only run projection](skill-workflow-service.md) with historical
 state separate from present source applicability.
 
-For authenticated team access, configure the [hub/MCP read mapping](skill-workflow-hub.md) and use
-the [dashboard run lookup](skill-workflow-ui.md). Execution and recovery remain local CLI operations.
+For authenticated team access, configure the [hub/MCP read mapping](skill-workflow-hub.md). Execution and recovery remain local CLI operations.
 
 Read-only access makes no workflow-row, execution, approval or integration changes and does not
 initialize an absent journal or native store. SQLite may create or update WAL/SHM sidecars for

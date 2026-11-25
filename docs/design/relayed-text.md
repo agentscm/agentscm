@@ -23,8 +23,8 @@ Relayed text is text that one agent, person, provider or operator wrote and that
 | Catch-up narrative facts and the reported narrative | agents and the forge; the narrative is agent-reported | the agent writing the briefing, then its readers | `src/hub/narrative.rs` |
 | Context-source lines | the Hub operator's registered endpoint | sessions at session start and Work start | `src/hub/context_source.rs`, [context source](../context-source.md) |
 | Session-waiting excerpts | the hook client of a waiting session | that session's person | `src/hub/session_waiting.rs` |
-| Permission prompts and offer labels | the agent host's tool request | the person answering on the Hub page | `src/hub/permission_answer.rs` |
-| Answers typed on the Hub page | the person | the waiting agent session | `src/hub/permission_answer.rs`, `src/hook_cli/permission.rs` |
+| Permission prompts and offer labels | the agent host's tool request | the person or their approved connected app through the Hub API | `src/hub/permission_answer.rs` |
+| Answers submitted through the Hub API | the person | the waiting agent session | `src/hub/permission_answer.rs`, `src/hook_cli/permission.rs` |
 
 ## Trust
 

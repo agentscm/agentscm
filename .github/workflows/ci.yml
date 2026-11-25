@@ -51,15 +51,6 @@ jobs:
           rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
           "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-      - name: Build the retained Hub UI
-        run: npm ci --ignore-scripts && npm run build
-        working-directory: ui
-      - name: Check the UI-enabled server
-        run: cargo check --locked --features ui
 
   # The one cache pull request and merge batch jobs restore. A merge batch's own ref is thrown away after
   # the run and pull request refs cannot share with each other, so only main's cache is readable by both.
@@ -199,7 +190,7 @@ jobs:
   # Clippy and release builds for the musl and macOS targets, so a target-specific lint (for example a libc
   # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
   # nightly, manual and release-branch dispatch runs before release.yml. windows.yml builds the Windows target.
-  # Without `--features ui`, which needs the UI build. Runs on scheduled and manual runs, like the `windows` job in windows.yml.
+  # Runs on scheduled and manual runs, like the `windows` job in windows.yml.
   release-targets:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     permissions:

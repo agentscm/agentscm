@@ -70,9 +70,9 @@ fn plural(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// The buttons of one stale Work row: the transitions its owner may make now, and its Hub page.
+/// The transitions the owner of a stale Work item may make now.
 /// The value carries the fences the digest read, so a click on Work that changed since is refused.
-fn row_buttons(item: &StaleItem, link: &str) -> Vec<Value> {
+fn row_buttons(item: &StaleItem) -> Vec<Value> {
     let value = json!({"w": item.work_id, "g": item.generation, "u": item.updated_seq}).to_string();
     let mut elements = Vec::new();
     // Both transitions look alike: neither is the better choice for every task.
@@ -81,7 +81,6 @@ fn row_buttons(item: &StaleItem, link: &str) -> Vec<Value> {
             elements.push(button(action_id, label, Some(&value)));
         }
     }
-    elements.push(open_button(link));
     elements
 }
 
@@ -106,7 +105,9 @@ impl Slack {
                 stale.quiet_days, stale.total
             );
             if stale.total > shown as u64 {
-                heading.push_str(&format!(" ({shown} shown; the rest are in the Hub)"));
+                heading.push_str(&format!(
+                    " ({shown} shown; run agentscm work status for the rest)"
+                ));
             }
             if !stale.complete {
                 heading.push_str("\nYou have more unfinished work than one digest reads; this list may miss some.");
@@ -118,8 +119,10 @@ impl Slack {
                     item.title,
                     digest::stale_detail(item, digest.until)
                 )));
-                let buttons = row_buttons(item, &self.work_link(&item.work_id));
-                blocks.push(json!({"type":"actions","elements":buttons}));
+                let buttons = row_buttons(item);
+                if !buttons.is_empty() {
+                    blocks.push(json!({"type":"actions","elements":buttons}));
+                }
             }
         }
         if !collisions.hot_paths.is_empty() {
@@ -342,7 +345,7 @@ impl Slack {
         let title = ThirdPartyText::new(&item.title, TEXT_CHARS).to_string();
         if item.generation != generation || item.updated_seq != updated_seq {
             return Ok(format!(
-                "Nothing changed. '{title}' changed after this digest was sent; open the Hub to see where it stands."
+                "Nothing changed. '{title}' changed after this digest was sent; run agentscm work status to see where it stands."
             ));
         }
         let (reason, outcome) = match transition {
@@ -385,8 +388,8 @@ impl Slack {
 
 /// A clicked digest rebuilt as plain text for its update. Every block stays except the buttons of
 /// the row that was clicked: the other rows keep theirs, so one message settles several tasks.
-/// Only the digest's own buttons and links into this Hub are kept.
-fn rebuilt(blocks: &[Value], clicked: (&str, Option<&str>), hub_url: &str) -> Vec<Value> {
+/// Only the digest's own buttons are kept.
+fn rebuilt(blocks: &[Value], clicked: (&str, Option<&str>)) -> Vec<Value> {
     blocks
         .iter()
         .take(MAX_BLOCKS)
@@ -400,12 +403,6 @@ fn rebuilt(blocks: &[Value], clicked: (&str, Option<&str>), hub_url: &str) -> Ve
                     .iter()
                     .filter_map(|element| {
                         let id = element["action_id"].as_str()?;
-                        if id == OPEN {
-                            let url = element["url"]
-                                .as_str()
-                                .filter(|url| url.starts_with(hub_url));
-                            return Some(open_button(url.unwrap_or(hub_url)));
-                        }
                         let value = element["value"].as_str().filter(|v| v.len() <= 2000);
                         button_label(id)
                             .filter(|_| !is_clicked)
@@ -426,7 +423,7 @@ fn rebuilt(blocks: &[Value], clicked: (&str, Option<&str>), hub_url: &str) -> Ve
             }
             // The parent's rebuild puts a section on one line; a digest section is a list.
             "section" => block["text"]["text"].as_str().map(section),
-            _ => kept(block, hub_url),
+            _ => kept(block),
         })
         .collect()
 }
@@ -462,9 +459,7 @@ pub(super) fn prepare_click(
     let original = payload
         .pointer("/message/blocks")
         .and_then(Value::as_array)
-        .map_or_else(Vec::new, |blocks| {
-            rebuilt(blocks, (action_id, value), &slack.hub_url)
-        });
+        .map_or_else(Vec::new, |blocks| rebuilt(blocks, (action_id, value)));
     Ok(Prepared::Update {
         channel: channel.to_owned(),
         ts: ts.to_owned(),

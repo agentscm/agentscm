@@ -95,11 +95,7 @@ fn run() -> Result<(), String> {
     let version = version(&read("Cargo.toml")?)?;
     // Validate every input before writing any output. A failed write remains an error.
     let mut updates = Vec::new();
-    for path in [
-        "Cargo.lock",
-        "ui/dev-seed/mint/Cargo.lock",
-        "packages/npm/package.json",
-    ] {
+    for path in ["Cargo.lock", "packages/npm/package.json"] {
         let old = read(path)?;
         let new = if path.ends_with(".json") {
             npm(&old, &version)?

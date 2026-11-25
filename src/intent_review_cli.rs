@@ -17,7 +17,7 @@ pub struct IntentReviewArgs {
     /// This trusted-local capability is not independent proof of a human identity.
     #[arg(long)]
     human_authority: bool,
-    /// Local intent and workflow-library store; defaults to the store used by agentscm open.
+    /// Local intent and workflow-library store; defaults to the existing local store.
     #[arg(long)]
     store: Option<PathBuf>,
 }

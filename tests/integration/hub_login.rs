@@ -2015,17 +2015,22 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     let loopback = headers[header::LOCATION].to_str().unwrap();
     assert!(loopback.starts_with("http://127.0.0.1:"));
     // The CLI trades the code first, then sends the browser to the Hub's own result page.
-    let response = no_redirect().get(loopback).send().await.unwrap();
+    let browser = no_redirect();
+    let response = browser.get(loopback).send().await.unwrap();
     assert_eq!(response.status(), 303);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let page = response.headers()[header::LOCATION].to_str().unwrap();
-    let prefix = format!(
-        "{}/#/signed-in?status=signed_in&login=bob&provider=gitlab&computer=",
-        env.url()
-    );
     assert!(
-        page.starts_with(&prefix) && page.ends_with("&from=cli"),
-        "{page}"
+        page == format!("{}/auth/complete/", env.url()),
+        "expected the plain Hub sign-in landing URL"
+    );
+    let page = browser.get(page).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(
+        page.text()
+            .await
+            .unwrap()
+            .contains("Return to your terminal or application")
     );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
@@ -2112,15 +2117,24 @@ async fn a_refused_browser_sign_in_ends_the_cli_wait_with_the_reason() {
         "{loopback}"
     );
     // A refusal goes to the same page with its reason code only; the diagnostic stays in the terminal.
-    let response = no_redirect().get(loopback).send().await.unwrap();
+    let browser = no_redirect();
+    let response = browser.get(loopback).send().await.unwrap();
     assert_eq!(response.status(), 303);
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
     assert_eq!(
-        response.headers()[header::LOCATION],
+        page,
         format!(
-            "{}/#/signed-in?status=refused&reason=not_allowed&from=cli",
+            "{}/auth/complete/?status=refused&reason=not_allowed",
             env.url()
         )
-        .as_str()
+    );
+    let page = browser.get(page).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    let body = page.text().await.unwrap();
+    assert!(body.contains("Sign-in refused"), "{body}");
+    assert!(
+        body.contains("Ask a Hub admin or a repository owner"),
+        "{body}"
     );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();

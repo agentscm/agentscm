@@ -66,10 +66,7 @@ trust prompts. See the [guided setup](setup-guide.md) for the full flow.
 
 When you run quickstart in a checkout whose GitHub origin belongs to an organization, quickstart asks GitHub to confirm the organization and suggests it as the App owner. A configured App owner takes precedence, and you can change the owner on the setup page. If GitHub cannot confirm the organization, the page uses its configured or personal default.
 
-The managed native Hub serves setup, sign-in and coordination APIs without a dashboard.
-Browser controls for sending human messages and choosing their consent mode require a
-UI-enabled Hub, such as the container or an explicit `--features ui` source build. Connecting
-to an existing team Hub keeps that Hub's web interface.
+The managed native Hub serves setup, sign-in and coordination APIs; AgentSCM has no web interface.
 
 To join a Hub that already runs, give its URL. The command signs you in through your browser:
 
@@ -188,7 +185,7 @@ pooling; see [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for 
 
 On macOS, verified installer setup also manages a deterministic resident using the same native
 executable and launchd. It retries native reports, observes qualified exits and refreshes declared
-dependencies, without running a model, starting agents or serving a dashboard. Native hook waiters
+dependencies, without running a model or starting agents. Native hook waiters
 remain responsible for delivery. `agentscm client service stop` persists a stopped choice;
 `start` enables it explicitly, and `status` reports installed/running version differences and recovery.
 An npx version change alone does not replace an already running resident: rerun setup/quickstart
@@ -274,9 +271,8 @@ with empty `.lock` files and a `connections.json` that lists no connections. The
 purpose: AgentSCM commands coordinate through them, and removing one while another command runs
 could let two commands change the same files at once. The folder can also keep `telemetry.json`
 (your telemetry choice and an installation id), `hook-notes/` markers, an empty `tokens/` folder
-and, after an older `agentscm open`, `front-door/` (run `agentscm open --stop` first). Native
-release binaries no longer serve or start a local dashboard. Setup, authentication, sharing
-controls and recovery remain in the CLI; a separately hosted Hub/container can retain its UI.
+and, after an older `agentscm open`, `front-door/` (run `agentscm open --stop` first). Setup, authentication, sharing
+controls and recovery are in the CLI.
 To remove everything,
 delete the folder when no AgentSCM command is running.
 

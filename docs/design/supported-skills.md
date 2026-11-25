@@ -5,8 +5,9 @@ title: "Design: AgentSCM supported skills"
 # Design: AgentSCM supported skills
 
 > **Status: design, with phase 2 built.** The phase 2 slice in section 6 (`pr-gate` v1, the lock
-> file, `agentscm skill`, the Hub runs API and MCP tools, the `agentscm skill stop` Stop hook and the
-> Hub Skills page) is implemented and **Experimental** in the [roadmap](../roadmap.md). Not built:
+> file, `agentscm skill`, the Hub runs API and MCP tools, and the `agentscm skill stop` Stop hook) is implemented and **Experimental** in the
+> [roadmap](../roadmap.md). The Hub Skills page that phase 2 also built was removed with the Hub web
+> interface; section 5 is retained as historical design. Not built:
 > the `SessionStart` recap line (2.4), the `abandoned` run state, and everything section 6 lists
 > under "Not in phase 2", which stays **Proposed**. The inventory in section 1 describes the code at
 > commit `325f862`.
@@ -81,12 +82,6 @@ proceed. **Advises** means it tells an agent or a person, who may ignore it.
 | Collisions (`docs/collisions.md`) | Read-only snapshot of branches and worktrees touching the same files. | Advises. Runs only when someone invokes it (CLI, an operator's own hook, `GET /v1/collisions`). Nothing runs it automatically. |
 | Stand-up work (`docs/standup.md`) | Claims, checkpoints, blockers and handovers per work item. | Advises; check-ins are self-reports. |
 | External CI and deployment outcomes (`docs/hub.md`) | GitHub Actions push runs and deployments for a landed publication's merge commit. | Observes; GitHub only, polled, fake-tested. |
-| Hub UI | Now, Work, Activity, Workflows (skill-workflow runs), Change record, Landed, Templates, Timeline, Workspace, Setup, Health. | Read-only. |
-
-The unmerged branch `feat/hub-ui-new-feature-pages` is one commit (`45b8b1e`) that already landed
-on `main` as #72 and #73; `Landed.tsx`, `Templates.tsx` and `Timeline.tsx` are byte-identical. It
-adds nothing `main` lacks and can be closed. Its worktree holds uncommitted `ui-next/` design
-experiments that this design does not depend on.
 
 ### What this means for the PR gate
 
@@ -209,10 +204,9 @@ manifest version can then raise those gates' `min_assurance` to `observed`.
 ### 2.3 Adoption and pinning
 
 A repository browses the catalog (`agentscm skill list`, `agentscm skill show NAME`, MCP
-`agentscm_skill_list`, the Hub Skills page) and adopts a skill with `agentscm skill add NAME
+`agentscm_skill_list`) and adopts a skill with `agentscm skill add NAME
 [--param k=v]`, which writes a pin into a committed lock file reviewed like any other change.
-`agentscm skill remove NAME` deletes the pin. The Hub page stays read-only: it shows the exact
-command to copy. The lock lives at the repository root as `agentscm-skills.lock.json`, not under
+`agentscm skill remove NAME` deletes the pin. The lock lives at the repository root as `agentscm-skills.lock.json`, not under
 `.agentscm/`, because that directory is AgentSCM's ignored local data directory and Git snapshot
 capture excludes it.
 
@@ -280,7 +274,7 @@ Each gate's `enforce` field names one of four choke points. No new blocking mech
 | `stop` | The opt-in local Stop hook (`src/agent_stop.rs` shape, `agentscm skill stop`; it blocks only where the user installed it) | Blocks the author session from finishing while the run sits at an **agent-actionable** gate (tests, review, fix) without sufficient evidence for the current head. The block reason is the next action from `agentscm_skill_status`. Gates that wait on others (CI, approval) never block; the hook lets the session stop with a handover note. The 8-continuation cap applies unchanged. |
 | `forge_status` | A Hub-posted commit status `agentscm/skill/<name>` on the pull request head (section 2.7), opt-in per repository | `success` once every gate before the merge gate has sufficient evidence for the exact head SHA; `failure` while a Stop-enforced gate the agent can do (tests, review, fix) is open; `pending` otherwise. The description is the next action. A new push resets it. It blocks merging only when the repository requires the context in a ruleset; AgentSCM never edits protections. |
 | `native` | Installed target requirement → `approve` / `integrate` | **Planned.** For `native_change` subjects, gates that cite `workflow_receipt` would compile to an ordinary template instantiation and requirement, which the existing native path already enforces; nothing compiles skill gates to it yet. |
-| `advise`, `signal` | Instruction files, MCP status, Hub UI; `signal` also notifies other sessions (section 4.2) | Shown and recorded, never blocking. |
+| `advise`, `signal` | Instruction files, MCP status; `signal` also notifies other sessions (section 4.2) | Shown and recorded, never blocking. |
 
 What stays advice in every version of this design, and the docs will say so: branch per task,
 the merge method (a forge repository setting AgentSCM can read and flag, not change), retargeting
@@ -368,7 +362,7 @@ required label is not the observed fact, whatever a report says about the label.
 `hub_settings` like conversation sharing (keyed by the forge's repository id), turns it on. A
 repository admin or a Hub admin changes it from a signed-in web session through the API
 (`GET`/`PUT /v1/hub/session/skill-forge-status`, with the page's CSRF token); there is no
-control in the Hub UI yet. Agent and read-only tokens cannot change it; they read it at
+other control. Agent and read-only tokens cannot change it; they read it at
 `GET /v1/hub/repos/{repo}/skills/forge-status`. Then the Hub posts `agentscm/skill/<name>` on each
 open pull request head after reading it, with the state in the `forge_status` row of section 2.5.
 `success` needs, for every gate before merge that the forge can show (CI and approval), accepted
@@ -488,6 +482,8 @@ of the Hub.
 
 ## 5. Hub UI
 
+> Historical: the Hub web interface, including the Skills pages below, has been removed.
+
 New section **Skills** in the rail's *Verify* group, next to Workflows and Landed. Hash routes:
 `#skills` (library), `#skills/runs` (runs), `#skills/runs/<repo>/<pr>` (one run). It reuses `Box`,
 `Pill`, `Empty`, `Notice`, `Path`, `Ago` and `Landed.tsx`'s `Track` step component, follows the
@@ -595,7 +591,7 @@ AgentSCM's own pull requests use:
    session at tests, review or fix without evidence for the current head; never blocks on CI or
    approval; keeps the 8-continuation cap. Tests with fixture hook payloads, matching the existing
    Stop tests.
-5. **Hub UI.** The Skills library page (browse with applicability, copyable adopt and remove
+5. **Historical Hub UI plan, retired.** The Skills library page (browse with applicability, copyable adopt and remove
    commands, effective parameters) and the runs list and run detail, mock endpoints in
    `ui/dev/mock.ts`, vitest unit tests, and Playwright specs for both pages (desktop and mobile).
 6. **Dogfood.** Adopt `pr-gate` v1 in this repository's lock file and run AgentSCM's next pull
@@ -616,7 +612,7 @@ The maintainer settled the open questions on 2026-10-24 before phase 2:
 
 1. **Review evidence.** A self-reported independent review passes the `review` gate in v1. Every
    gate that passed on self-reported evidence carries a visible `self-reported` assurance label in
-   the CLI, the MCP output and the Hub UI. A `claude_code_review` receipt remains the stronger
+   the CLI and the MCP output. A `claude_code_review` receipt remains the stronger
    form when it exists.
 2. **Enforcement order.** The Stop hook (`skill-stop`) is the first enforcement point. The
    `agentscm/skill/<name>` forge status comes next; #91 already posts the workflow status on

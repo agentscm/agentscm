@@ -66,10 +66,8 @@ fn check_demo(busiest: &str) {
         .unwrap_or_else(|| panic!("no refusal in {stdout}"));
     assert!(refusal.contains(busiest), "{refusal}");
     assert!(stdout.contains("let through"), "{stdout}");
-    if !cfg!(feature = "ui") {
-        assert!(!stdout.contains("Status page:"), "{stdout}");
-        assert!(!stdout.contains("/ui/"), "{stdout}");
-    }
+    assert!(!stdout.contains("Status page:"), "{stdout}");
+    assert!(!stdout.contains("/ui/"), "{stdout}");
     assert!(
         stdout
             .lines()

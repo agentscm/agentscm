@@ -101,14 +101,14 @@ jobs:
           # Only these release files may enter the bot commit.
           while IFS= read -r path; do
             case "$path" in
-              Cargo.toml|Cargo.lock|CHANGELOG.md|packages/npm/package.json|ui/dev-seed/mint/Cargo.lock) ;;
+              Cargo.toml|Cargo.lock|CHANGELOG.md|packages/npm/package.json) ;;
               *) echo "Unexpected changed release path: $path" >&2; exit 1 ;;
             esac
           done < <(git diff --name-only)
           git diff --quiet --cached
           branch="release-plz-prepare-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           printf '[]\n' > "$RUNNER_TEMP/release-additions.json"
-          for path in Cargo.toml Cargo.lock CHANGELOG.md packages/npm/package.json ui/dev-seed/mint/Cargo.lock; do
+          for path in Cargo.toml Cargo.lock CHANGELOG.md packages/npm/package.json; do
             base64 -w 0 "$path" > "$RUNNER_TEMP/release-file.base64"
             jq --arg path "$path" --rawfile contents "$RUNNER_TEMP/release-file.base64" \
               '. + [{path: $path, contents: $contents}]' "$RUNNER_TEMP/release-additions.json" > "$RUNNER_TEMP/release-additions-next.json"

@@ -26,7 +26,7 @@ The native engine is a local alpha: immutable blobs, persistent manifest trie, i
 
 The multi-user [coordination hub](hub.md) has its own database (SQLite or PostgreSQL), forge sign-in, agent tokens, intents and an event log. General Hub events are append-only; [stand-up work events](standup.md#storage-maintenance) support compaction with retained-history boundaries, automatically for history older than seven days and explicitly by an operator for anything newer. The opt-in [Community workspace](advanced/community-workspace.md) adds SQLite membership, settings and a durable execution queue. Operator-owned profiles join permitted Hub repositories to selected native stores and installed workflow requirements. This is a single-server trusted-team pilot, not a general multi-tenant native API.
 
-## Git work, local evidence and the connected page
+## Git work and local evidence
 
 The everyday coordination path leaves Git and GitHub or GitLab in charge of source and merge
 authority. Durable Work records retain ownership, reported progress and handovers. Configured
@@ -39,15 +39,11 @@ conversation bodies are uploaded with best-effort redaction, readable by anyone 
 repository, and kept for a bounded retention period; while it is off, they stay in the local spool.
 It does not complete the wider privacy and recovery lifecycle.
 
-Native release binaries have no local dashboard or detached presentation startup. The existing
+AgentSCM has no web interface or detached presentation startup. The existing
 CLI provides [this computer's setup and controls](connect-this-computer.md). Explicit optional
-Hub hosting retains its API/authentication and data, while container/UI-enabled builds retain
-the web interface. The [repository explorer](repository-explorer.md) can still serve committed
+Hub hosting retains its API/authentication and data. The [repository explorer](repository-explorer.md) can still serve committed
 Git source, history and diffs alongside available local evidence through its separately configured
 read-only API. A read-only Hub token is not local write authority.
-The [local workflow library](advanced/workflow-library.md) retains immutable skills
-and workflow versions, simulates declarations and exports reviewed setup to the separate
-operator-local pipeline. It does not execute a deployment or install a native landing requirement.
 
 ## Review context
 A stable Change stores identity and a Change-version-checked current-context pointer. Immutable ReviewContext records alone own intent, acceptance criteria, scope, exclusions, omissions and declared evidence boundaries. Source revisions do not include review context. Registration permits structurally valid incomplete contexts for inspection; approval and integration reject them. Both operations transactionally check repository, current change/context, target/base and policy bindings. New operations use context semantics version 2; migrated historical events remain version 1.
@@ -86,7 +82,7 @@ the finite review controller with durable dispatch reservations and no candidate
 remains an observation; an installed target requirement additionally needs a controller-finalized
 exact-subject receipt in the authority database before approval or native landing.
 
-The native API and operator-mapped hub/MCP/dashboard inspect retained status and current binding.
+The native API and operator-mapped hub/MCP inspect retained status and current binding.
 The Unix `agent-task` CLI uses that same authenticated facade for typed task operations and uses
 the existing trusted-local collector for an exact server-derived descriptor. It requires the
 authoritative immutable native source and context in its selected local data directory; task-only

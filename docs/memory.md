@@ -109,8 +109,8 @@ agentscm hub memory remove mem_… --repo acme/widgets
   only in repositories on the forge host they signed in with; a repository this Hub does not know
   there is 404.
 
-The Hub's own web pages can use the same routes with the cookie sign-in and its CSRF token; the
-bundled status page has no memory view.
+The same routes accept [browser sign-in cookies](hub.md#browser-sign-in-sessions). Requests
+that change a note also need the session's CSRF token.
 
 ## How notes are shown
 
@@ -142,8 +142,9 @@ Agent token (`Authorization: Bearer <token>`), always the token's own repository
 - `DELETE /v1/hub/memory/{id}`: 200 `{"id", "removed": true}`, 403 for another owner's note, 404
   when the repository has no such note.
 
-A signed-in person (a CLI or script session, or the web page's cookie with its CSRF token on a
-change). Agent tokens, read-only tokens and computer credentials get 401:
+The following routes accept a signed-in person's CLI or script session or browser sign-in
+cookie. Changes made with a cookie also need its CSRF token. Agent tokens, read-only tokens
+and computer credentials get 401.
 
 - `GET /v1/hub/memory-review?repository=OWNER/NAME&q=&after=&limit=`: the same page; list access
   (see [for people](#for-people)).

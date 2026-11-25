@@ -1065,7 +1065,7 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
     let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
     assert_eq!(
         recipe.sha256().unwrap(),
-        "e0d6b6b2dfd0350c7a0b1a745d4901248a9a8441a09f3cc9335f81c4369657cc"
+        "689657fe61964bc6380322c2cd5fec465b4e0f635f43b06a1e35bb8075a90c67"
     );
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(
@@ -1482,7 +1482,6 @@ mod scoped {
         ))
         .unwrap();
         const RUST: &[&str] = &["fmt", "clippy", "nextest", "doctest"];
-        const UI: &[&str] = &["ui-install", "ui-lint", "ui-build", "ui-notices"];
         const DOCS: &[&str] = &["docs-install", "docs-audit", "docs-build", "docs-check"];
         const RELEASE: &[&str] = &[
             "release-fmt",
@@ -1494,26 +1493,9 @@ mod scoped {
         ];
         let cases: &[(&[&str], &[&str])] = &[
             (&["src/a.rs"], RUST),
-            (&["ui/src/example.tsx"], UI),
-            (&["ui/tests/unit/x.test.tsx"], UI),
-            (&["ui/tests/integration/x.test.tsx"], UI),
-            (&["ui/tests/e2e/x.spec.ts"], UI),
-            (&["ui/public/x.png"], UI),
             (&["DESIGN.md"], &[]),
-            (
-                &["ui/tests/fixtures/workflow-library-router.json"],
-                &[RUST, UI].concat(),
-            ),
-            (&["THIRD_PARTY_NOTICES.md"], &[RUST, UI].concat()),
+            (&["THIRD_PARTY_NOTICES.md"], RUST),
             (&["docs/openapi-work-insights.json"], &[RUST, DOCS].concat()),
-            (
-                &["ui/dev-seed/mint/Cargo.lock"],
-                &[RUST, UI, RELEASE].concat(),
-            ),
-            (&["ui/newfile"], &[RUST, UI].concat()),
-            (&["ui/package.json"], &[RUST, UI].concat()),
-            (&["ui/src/x.tsx", "src/a.rs"], &[RUST, UI].concat()),
-            (&["DESIGN.md", "ui/src/x.tsx"], UI),
             (
                 &["install.sh"],
                 &[RUST, &["shellcheck", "npm-installer"]].concat(),

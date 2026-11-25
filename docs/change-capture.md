@@ -227,7 +227,7 @@ Linked worktrees each get their own binding and private spool. A checkout counts
 limit of 128 capture bindings; at the limit, followed bindings of worktrees that no longer exist
 are dropped to make room (their spools stay on disk). `unconfigure` and `forget` remove a
 followed binding like any other, and a disabled one is never re-created by the plugin hook;
-re-enabling it from the local page gives it hooks of its own.
+re-enabling it with `configure` gives it hooks of its own.
 
 From the plugin hook, local capture has a bounded budget: 2.5 seconds (4 at session start).
 Blocking local spool and Git work runs separately so it cannot starve the coordination deadline.
@@ -257,75 +257,21 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 `repository_shares` (null when the Hub did not answer or has no sharing setting),
 `effective_mode` (the mode a session starting now captures in; `off` when no hook captures for
 this binding, null when the Hub did not answer) and `session_start`, the sentence that session
-would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps sharing off. The
-Hub page opened from this computer (**Settings → Conversation sharing**) has the same switch per
-checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
-`configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
+would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps sharing off. The capture config is written as version 6 only while
 some checkout is in `shared-conversation` mode or a binding records a non-default Claude settings
 path (see below); an older binary refuses a version 6 file instead of silently dropping a field,
 and the file returns to version 5 when neither applies. Downgrading the client after this release is
 unsupported: older binaries cannot read the new session association records.
 
-### One-step setup from the local page
-
-Turning sharing on from the page calls one library function, `enable_capture`, for a
-checkout that has a current client connection; turning it off calls `set_capture_mode`. The page
-and `client status` read the setting through one function, `capture_setting` (configured, enabled, mode, and
-`lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
-copy of it. The page shows the distinct states Not set up (no binding), Off (disabled binding),
-Metadata only, Local only and Shared with Hub.
-
-**Consent is bound to what was shown.** The page passes the repository and Hub
-it displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
-checkout's connection (connections lock, then the capture config lock) and refuse with `this checkout is now connected
-to <repository> on <hub>; refresh and confirm again` if it is not that one, so a checkout
-reconnected to another Hub between the consequences and the click is never shared there. Turning
-sharing off and the `set-mode` and `configure` commands (where you typed the command) pass no
-expectation. Whether to create the binding, re-enable it or only change the mode is decided from
-the bindings read under that same lock, so a concurrent `configure` is not overwritten.
-
-The page asks before it acts: it shows the consequences in a confirmation panel, and only the
-confirmation turns sharing on. Turning sharing off needs no confirmation.
-
-- With an enabled binding it only changes the mode, exactly like `set-mode`.
-- With a disabled binding (after `unconfigure`) it re-enables through the `configure` code path with
-  everything the binding saved (spool, worktree id, base ref, setup digest, rules, recipes, limits)
-  and reinstalls the hooks in the Claude settings file the binding recorded (below), else the
-  default `ROOT/.claude/settings.local.json`.
-- With no binding it builds one through the same code path as `configure` with these defaults:
-  the private spool `<config>/agentscm/capture-spools/<random>` (mode 0700, 16 random bytes in
-  hex, recorded in the binding); worktree id `checkout_<32 random hex characters>`; setup digest 32
-  random bytes in hex; base ref the checkout's default branch from `origin/HEAD` as `origin/<name>`
-  when that resolves to a commit, else `origin/main`; one action rule,
-  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root of its own, so
-  usage is read from Claude Code's projects directory (see below); default spool
-  limits; hooks in `ROOT/.claude/settings.local.json`. The ids are random, not derived from the
-  path, so they cannot be recomputed offline from Hub records by guessing paths and two computers
-  with the same path never share one; the saved binding is what keeps them stable across
-  re-enables. The setup digest is a caller assertion that identifies this default, not a
-  measurement of the agent setup.
-
-A Claude settings file that one-step setup creates, and the transaction files saved beside it, are
-added to the repository's local exclude unless Git already ignores them, so they never appear as
-untracked files. This is done only after the binding is installed, creates `.git/info` if the
-repository was cloned without it, and never fails the enable: if the exclude cannot be written the
-result carries a `warning` instead. A file that already existed is not touched and the tracked
-`.gitignore` is never edited. The exclude (`git rev-parse --git-path info/exclude`) is shared by
-every worktree of the repository, so the line applies to all of them. It stays after `unconfigure`;
-`forget` removes only the lines setup added for that checkout's settings file (recorded beside the
-exclude), and keeps them while another binding in the same repository still uses the same relative
-settings path. `forget` of a deleted checkout cannot reach its repository and leaves the exclude as
-it is.
+### Mode changes and reconnection
 
 A binding records its Claude settings path (`claude_settings`) only when it is not the default, and
 `unconfigure` and re-enabling use the recorded file. A file that records it is version 6, which
 older binaries refuse rather than ignore the field; bindings at the default path keep the config
 readable by them.
 
-A checkout without a current client connection gets the error `no client connection for this
-checkout` and nothing is changed. Only an explicit request for `shared-conversation` selects that
-mode; setting up capture in `metadata-only` mode never uploads a conversation body. Use
-`change-capture configure` for anything else (other rules, recipes, a history root, a chosen spool).
+Only an explicit request for `shared-conversation` selects that mode; capture in `metadata-only`
+mode never uploads a conversation body.
 
 A disabled binding keeps the repository and Hub it was saved for, because its private spool keeps
 that history apart. If the checkout is now connected to another repository or Hub, turning sharing
@@ -346,9 +292,8 @@ another repository or Hub) also lowers a `shared-conversation` binding for that 
 confirmation. This includes a binding that follows the Hub; its session-start context then names
 `unconfigure` and `forget`, which let the next session follow the repository again. Capture hooks
 and delivery do nothing for a binding whose connection is absent.
-The page then says "Sharing was set for <hub>; this checkout is now connected to
-<other>" and offers only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
-`export` or delete it yourself. The next enable creates a new spool and new random ids.
+`forget` never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
+`export` or delete it yourself.
 
 What leaves the machine, and when:
 
@@ -390,7 +335,7 @@ What leaves the machine, and when:
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
-Who can read a shared body: while the repository shares agent conversations and its author has not opted out, anyone who can read the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages); otherwise only the human who shared it (any of that person's tokens for the repository) and Hub admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
+Who can read a shared body: while the repository shares agent conversations and its author has not opted out, anyone who can read the repository on the Hub (any of their tokens, including read-only ones); otherwise only the human who shared it (any of that person's tokens for the repository) and Hub admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
 the Work has no extra access to a helper's or reviewer's shared bodies. Each human's declaration of
 a body is its own row, so two people sharing identical content each read and delete their own. A
 listing shows a caller every author's entries while the repository shares, else only their own
@@ -414,13 +359,8 @@ The Hub keeps an uploaded body for 30 days by default; the operator changes this
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
 number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
 A program that embeds the Hub may set it per repository instead, from 0 to 3650; at 0 the Hub keeps no
-bodies for that repository, asks for no uploads and the page says nothing is uploaded.
-`client status --check` carries it in the connection's `hub_check` (when the check is valid), and the
-local page's `GET /v1/local/capture` lists it per
-checkout (looked up with the checkout's own agent token and reused for a minute). The page
-then says "kept N days on <hub>". When the number is unknown (an older Hub, an unreachable or slow
-Hub, or no Hub check yet) it says "kept for as long as the Hub operator sets (30 days unless
-changed)" and never names a number it was not given. The deadline is set when the body
+bodies for that repository and asks for no uploads.
+`client status --check` carries it in the connection's `hub_check` (when the check is valid). The deadline is set when the body
 is uploaded. A sweep every ten minutes expires due bodies and deletes their objects, in batches of
 100 until none are due or 30 seconds are spent (the rest waits for the next pass); an object whose
 removal fails is retried after 1 hour, doubling to at most a day, without holding up others. The author
@@ -824,7 +764,7 @@ agentscm change-capture show --root /absolute/repository --work-id wrk_example
 
 The bounded response also joins the retained Work intent and latest relevant decision with the latest action's exact captured source. Its `review` field names masked captured agent/session attribution, a native revision or Git base/head/worktree reference, dirty and untracked facts, omissions, explicit concerns and stable detail-link identities. Declared scope remains separate from `review.actual_scope`: the Hub cannot inspect current checkout bytes, so actual changed paths stay `unknown` until a source-aware client follows the diff reference. Execution outcome, check result, assurance, coverage, applicability and evidence availability remain separate typed facts. A completed Work, proposed decision or passing check does not establish human approval or merge readiness, and missing capture remains an explicit gap rather than evidence that nothing happened.
 
-The Hub UI presents that projection as a compact review summary before the detailed receipt fields. For a Git capture it can offer a local Explorer comparison only when the selected Hub repository matches and both base and head are full object IDs. The comparison is committed base-to-head source only: dirty files, untracked files, captured snapshots and omissions are labelled but are not folded into the diff. The local Explorer cannot prove that its selected checkout is the captured worktree, so that association remains explicit and unknown. Native revisions do not fabricate a Git link. The bounded `detail_links` values are existing authenticated Hub API paths for the change record, its explicitly opened conversation listing and shared actionable status; they do not claim a separate history route.
+The bounded `detail_links` values are existing authenticated Hub API paths for the change record, its explicitly opened conversation listing and shared actionable status; they do not claim a separate history route.
 
 HTTP, MCP and the CLI path through HTTP enrich the capture projection with shared actionable status only when the status row matches the Work id, generation and `updated_seq`. That non-atomic read supplies the deterministic supported action and its actual recipient while keeping the Work's reported `next_action` separate. A missing, failed or mismatched status read stays explicitly unknown and cannot make retained evidence fresh. Captured attribution is resolved by the action's retained author token together with its session; if that exact participant is unavailable, attribution is unknown rather than assigned to the Work lead.
 

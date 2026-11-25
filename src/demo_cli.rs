@@ -23,8 +23,6 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "ui")]
-use crate::hub_cli::open_url;
 use crate::hub_cli::{clean, map_hub_error};
 
 const NOT_A_REPOSITORY: &str =
@@ -47,8 +45,9 @@ const NEXT_STEP: &str = "To set it up for real, run agentscm quickstart (or npx 
 
 #[derive(Debug, Args)]
 pub struct DemoArgs {
-    /// Do not open a browser in UI-enabled server builds; native builds use the terminal.
-    #[arg(long)]
+    /// Accepted and ignored so scripts written for builds that opened a browser keep working.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     no_open: bool,
     /// Run the scripted steps, print, and exit.
     #[arg(long, hide = true)]
@@ -390,8 +389,6 @@ async fn scenario(
         format!("Add tests for {}", name(riley_file)),
         std::slice::from_ref(riley_file),
     )?;
-    #[cfg(feature = "ui")]
-    let reader = mint(4, "demo-viewer", "status-page", true)?;
 
     let mut driver = Driver {
         client: Client::builder()
@@ -450,8 +447,6 @@ async fn scenario(
     let health: Value = serde_json::from_str(&health).unwrap_or(Value::Null);
     let mut latencies = driver.latencies.take().unwrap_or_default();
 
-    #[cfg(feature = "ui")]
-    let page = format!("{base}/ui/");
     println!("Simulated agents, real hub, your file names.");
     println!("Repository: {}", clean(repository));
     println!("Hub: {base} (throwaway, this process only)");
@@ -482,17 +477,10 @@ async fn scenario(
         );
     }
     println!("{}", latency_line(&mut latencies, &health));
-    #[cfg(feature = "ui")]
-    println!("Status page: {page}#token={reader}");
     if args.once {
         println!("Done; nothing was written to your repository.");
         println!("{NEXT_STEP}");
         return Ok(());
-    }
-    #[cfg(feature = "ui")]
-    if !args.no_open {
-        open_url(&format!("{page}#token={reader}"));
-        println!("Opened in your browser; if it did not open, use the link above.");
     }
     println!("Press Ctrl-C to stop; nothing was written to your repository.");
     println!("{NEXT_STEP}");

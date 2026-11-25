@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for a built image: runtime identity, native dependencies, collisions, persistent serve, and Hub UI.
+# Smoke test for a built image: runtime identity, native dependencies, collisions, persistent serve, and the Hub.
 # Usage: .github/docker-smoke.sh IMAGE
 set -euo pipefail
 image=${1:?usage: docker-smoke.sh IMAGE}
@@ -126,17 +126,5 @@ done
 if ! grep -q '"status":"ok"' <<<"$body"; then
   docker logs "$hub" >&2
   echo "hub did not answer on /v1/hub/health" >&2
-  exit 1
-fi
-
-# The status page is built into the image and is served with a content security policy.
-headers=$(curl -fsS -D - -o /dev/null "http://$hub_address/ui/")
-grep -qi '^content-security-policy:' <<<"$headers" || {
-  echo "hub did not serve /ui/ with a Content-Security-Policy" >&2
-  exit 1
-}
-body=$(curl -fsS "http://$hub_address/ui/")
-if grep -q 'built without the status page' <<<"$body"; then
-  echo "image was built without the status page" >&2
   exit 1
 fi

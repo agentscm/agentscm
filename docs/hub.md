@@ -133,8 +133,7 @@ from a flag. A half-configured provider stops startup.
 - A token is either an agent token or a read-only token. A read-only token is
   made with `--read-only` (or `"read_only": true` on `POST /v1/hub/tokens`) and
   can only call the [read routes](#read-only-tokens); the hub refuses it on
-  every write, so the [status page](#status-page) never holds a token that can
-  change anything. The kind is fixed when the token is created.
+  every write, so a reader that holds one can never change anything. The kind is fixed when the token is created.
 - Tokens live at most 30 days. Only an enabled user can be given a new token.
 - Disabling a user stops all of their tokens immediately, and re-enabling the
   user restores the unexpired, unrevoked ones.
@@ -186,17 +185,20 @@ The browser flow sets the cookie `__Host-agentscm_login` (`Secure`, `HttpOnly`,
 cookies on plain-HTTP loopback; use an `https://` public URL for browser
 sign-in there.
 
-### Signing in to the Hub's web pages
+### Browser sign-in sessions
 
 `GET /v1/hub/login/{provider}?web=1` signs the browser itself in, with the same allow-list and
-repository checks as any sign-in. On success it redirects to `/ui/#home` and sets
+repository checks as any sign-in. On success it redirects to `/auth/complete/`, a static page
+that tells the person to return to their terminal or application, and sets
 `__Host-agentscm_session` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`); a refusal
-redirects to `/ui/#/signed-in?status=refused&reason=<kind>`. Another page served on the Hub's
-origin can ask to come back to itself with `&return_to=<path>`: a path of plain segments
-(letters, digits, `-._~`) that starts and ends with `/` and is not under `/v1/`, such as
-`/next/`. Both redirects then use that path instead of `/ui/`; any other value is refused with
-400 `invalid_request` before the forge is asked, so the sign-in never redirects off the Hub.
-This is the Hub API; the bundled web UI does not use it yet and still asks for a pasted token.
+redirects to `/auth/complete/?status=refused&reason=<kind>`, where the page states the reason in
+a fixed sentence for a known code and a generic one for anything else, never echoing the link.
+Another page served on the Hub's origin can ask to come back to itself with `&return_to=<path>`:
+a path of plain segments (letters, digits, `-._~`) that starts and ends with `/` and is not under
+`/v1/`, such as `/next/`. A successful sign-in then uses that path instead of `/auth/complete/`,
+while a refusal still goes to `/auth/complete/`; any other value is
+refused with 400 `invalid_request` before the forge is asked, so the sign-in never redirects off
+the Hub. The Hub serves no web interface of its own.
 
 - The Hub keeps only a domain-separated digest of the cookie, in the database (named migration
   `browser_sessions`), so a restart or deploy keeps people signed in. It ends 8 hours after the
@@ -211,17 +213,16 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   cannot mint agent tokens (`POST /v1/hub/tokens` answers 403) or enroll a computer
   (`POST /v1/hub/devices` answers 403): those come from `hub login`. `DELETE /v1/hub/session` with the cookie and the CSRF token ends it and
   clears the cookie.
-- `POST /v1/hub/session/read-token` (`{"repository"}`, cookie and CSRF token only) gives the web
-  pages a [read-only token](#read-only-tokens) for 30 minutes, 201 `{"token", "expires_at"}`, so
-  the dashboard can read without a pasted token. It runs the checks of a computer's
+- `POST /v1/hub/session/read-token` (`{"repository"}`, cookie and CSRF token only) gives the signed-in
+  browser a [read-only token](#read-only-tokens) for 30 minutes, 201 `{"token", "expires_at"}`. It runs the checks of a computer's
   `POST /v1/hub/device/tokens` (the allow list, a connected repository and the person's role
   through that repository's connection credential) and refuses in the same shape; role and
   access refusals are recorded as `via` `web_read_token`. A `hub login` session gets 403
   `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
   token in memory and asks again only near `expires_at`. Signing out does not end a token
   already handed out; it lasts until it expires.
-- <a id="people-answering-for-their-own-agent"></a>**People answering for their own agent** (experimental). The Inbox page offers five routes
-  that need the web sign-in's cookie, and the CSRF token for a change; a `hub login` session or a
+- <a id="people-answering-for-their-own-agent"></a>**People answering for their own agent** (experimental). Five routes
+  need the web sign-in's cookie, and the CSRF token for a change; a `hub login` session or a
   computer credential is refused (403 `forbidden`, 401) and a cookie alone answers 403 `csrf`.
   Each names the person's own agent by its token id (`token`). The Hub requires that token to be
   an active, writable agent token owned by the signed-in person; anything else (another person's
@@ -276,7 +277,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     lists the person's 50 newest. A start with a conflict does not pick a hand-off up. See
     [Hand-off pickups](api.md#hand-off-pickups) for the record.
   There is no withdrawal of a reply or a file request: the store has no way to retract either, so
-  the page offers none. The one close it offers is for a coordination request whose requesting
+  there is no route for either. The one close offered is for a coordination request whose requesting
   agent is gone (see `POST /v1/hub/session/coordination/withdraw` below); a requester that can
   still act withdraws its own request, as an agent.
   These routes use the store permits of the agent routes (503 `busy` when saturated) and no extra
@@ -307,7 +308,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     the same service as `agentscm_work_recovery`: the owner's Work and, for a Hub administrator,
     anyone's. A batch item another person may not apply is `refused` with code `unauthorized`.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
-  on the person's forge host that they can read now, for the web pages' All repositories list.
+  on the person's forge host that they can read now.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
   through that repository's connection credential, at most 8 at a time and for at most 10
   seconds; no token is stored. A Hub admin gets the same check, not every repository. The reply is
@@ -320,13 +321,13 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each
   person's forge answer (readable or not) for a repository for 90 seconds and reuses it for every
-  repository list (this one, the device list, the agent list and value metrics) and for the web
-  pages' polls of dismissals and agent messages, so a granted or lost access shows there within 90
+  repository list (this one, the device list, the agent list and value metrics) and for reads
+  of dismissals and agent messages, so a granted or lost access shows there within 90
   seconds (about two minutes for the agent list, which also reuses its whole answer for 30 seconds
   per token); minting a token, a read token and every change always ask the forge, except a
   person's own dismissals, which change nothing anyone else sees. Answers are never shared between people, a forge that could not answer is never kept,
   at most 1,024 answers are held, and signing out forgets that person's. A call past those 90
-  seconds makes one forge request per repository, so the page asks every two minutes.
+  seconds makes one forge request per repository.
 - `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list check
   on every call, and the same forge-role check with the web list's 90-second role cache, for the
   macOS work panel. It returns the same bounded repository
@@ -375,7 +376,7 @@ status shown; clients show `message` as is.
   an older client can still send one. Stored labels stay, masked in hook and MCP text, `agentscm
   intent`, Slack and pull-request text, and, for other owners, in structured JSON such as `agent.name`
   and `lead_agent` (see [other owners' agents](standup.md#other-owners-agents)); the owner's own
-  replies, the Hub page's `title` attribute and `agentscm hub tokens` show them as stored),
+  replies and `agentscm hub tokens` show them as stored),
   and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
   `AGENTSCM_ALLOWED_USERS` when set (else 403 `not_allowed`; administrators pass), the repository
   is connected on the owner's host (else 403 `not_connected`), and the owner has the role
@@ -421,9 +422,9 @@ status shown; clients show `message` as is.
 - Sign-in failures carry a `message` naming the step: an expired or foreign sign-in link, a
   sign-in cancelled or refused at the forge (with the forge's error code when it is a plain
   word), a code the forge did not accept, an account the forge did not return, or a code that
-  expired before the CLI used it. A browser sign-in that fails redirects to
-  `/ui/#/signed-in?status=refused&reason=<kind>` instead of answering JSON; the page words the
-  reason itself, since anyone can forge that link.
+  expired before the CLI used it. A web sign-in that fails redirects to
+  `/auth/complete/?status=refused&reason=<kind>` instead of answering JSON; the
+  reason is a code only, since anyone can forge that link.
 - `GET /v1/hub/login` also lists `browser_only`: providers whose forge app refused device
   sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
   set; the setup page links to the checkbox), so clients go straight to the browser.
@@ -441,7 +442,7 @@ After those lines, the start context also carries up to 5 promoted
 ## Connected apps
 
 An operator can register an external app, such as a chat integration, that people connect to
-their own Hub account. A person signs in to the Hub's web pages and approves the app; the Hub then
+their own Hub account. A person signs in to the Hub in a browser and approves the app; the Hub then
 gives the app a revocable credential bound to that person. With it the app can read the person's
 repositories and work the way their own computer can, mint short read-only tokens for the
 repositories they can read now (the forge role is checked at every mint), and answer coordination
@@ -655,7 +656,7 @@ on no others:
   event, though it may store catch-up backfill and merge-observation rows
 - `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
   [weekly digest](#weekly-digest))
-- `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
+- `GET /v1/hub/onboarding`
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
@@ -672,8 +673,8 @@ on no others:
 - `GET /v1/hub/standup/dependency-notices` and `GET /v1/hub/standup/overlap/consents`
 - `GET /v1/hub/memory` ([repository memory](memory.md))
 - `GET /v1/hub/repos/{repo}/deploy-workflow`
-- MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
-  `agentscm_work_status`, `agentscm_work_briefing`, `agentscm_work_overview`, `agentscm_show_overview`,
+- MCP `initialize`, `ping`, `tools/list`, and the tools
+  `agentscm_work_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_catchup`, `agentscm_work_catchup_ack`, `agentscm_briefing_read`, `agentscm_briefing_pending`,
   `agentscm_work_preflight`, `agentscm_work_intent`, `agentscm_work_recovery`, `agentscm_work_recovery_preview`,
   `agentscm_work_dependency_notices`, `agentscm_work_overlap_consents`, `agentscm_work_declarations`,
@@ -804,7 +805,6 @@ body or query string is a 400 with a fixed body.
   `duplicate_start`;
   `agent` and `owner` are the token's that the event is about (for a notice,
   its recipient's), and `data` is the event's JSON without its `session` field.
-  It is what the [status page](#status-page) reads.
 - `I` is `{id, repository, task, branch, base, machine, paths, expires_at,
   created_at, agent: {token, name}, owner: {id, provider, host, user_id, login},
   via, session}`. `session` is `{key, name, kind, started_at}` for the session holding the intent
@@ -1012,8 +1012,7 @@ counter-offer.
 
 Events `handoff_request` (by the requester), `handoff_grant` and
 `handoff_decline` (by the holder) are recorded, carry the path, note (or the decline's reason) and the
-other agent, and appear on the status page's activity feed and contested-files
-card. The other side is `to` (the asked holder) or `from` (the requester), each with
+other agent, and appear in the activity route. The other side is `to` (the asked holder) or `from` (the requester), each with
 `session: {key, kind}`: the session key described under [intents and notices](#intents-and-notices)
 and the brand of its first `hook:` connection (null when unknown), never the session id. The event's
 top-level `session` is the id and is removed from the activity route; the nested key is not.
@@ -1026,8 +1025,8 @@ files, different sessions), its text keeps the generic "asked the holder"; when 
 one, it says `AgentSCM asked bob's Claude Code session 3f2a1b9c to hand it over`. Each side
 is named in the other's lines the same way (`bob's Claude Code session 3f2a1b9c asks to take
 over src/a.rs`; `agent session 3f2a1b9c` when the kind is unknown, for example after the
-requester's session ended). A request or answer made by a person from the Hub's pages or
-Slack keeps its wording. The status page's handoff list carries `session_key`, `session_name`
+requester's session ended). A request or answer made by a person through the HTTP API or
+Slack keeps its wording. The handoff list carries `session_key`, `session_name`
 (as `name` in `S`) and `session_kind` for both sides, for any reader; the raw `session` stays for the person's own
 agent only.
 
@@ -1129,7 +1128,7 @@ forge host that the token's person can read now, redacted as other Work reads ar
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
-lists up to 16 newest-created retained runs for selection in the status page. `?before=<next_cursor>`
+lists up to 16 newest-created retained runs. `?before=<next_cursor>`
 pages older runs and `?q=TEXT` (200 bytes, case-insensitive) keeps runs whose id, workflow name, source
 revision or state contains it. A search reads at most 256 runs below the cursor, so a page can hold fewer
 than 16 runs while `next_cursor` is set because older runs may still match; follow it until it is null. With `q` the reply also has `searched_to`, the oldest run sequence examined, so a
@@ -1215,7 +1214,7 @@ references contain identities and availability, while selected prompt, tool and 
 in the private local spool.
 
 `GET /v1/hub/repos/{repo}/change-records/{work_id}`, the read-only MCP tool
-`agentscm_change_record`, `agentscm change-capture show`, and the Hub UI Change records page all read
+`agentscm_change_record`, and `agentscm change-capture show` all read
 the same projection. It exposes bounded Work intent/scope, inspectable Git or native source facts,
 session gaps, action facts, a retained Work decision, next action, completeness and unknowns. An
 agent-authored decision remains a proposal rather than human approval. Reads do not acknowledge or
@@ -1232,8 +1231,7 @@ HTTP and MCP use the same non-atomic enrichment step. Shared actionable status s
 
 Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares
 agent conversations (see [conversation sharing](#conversation-sharing)) and their author has not
-opted out, by anyone who can read the repository: any of their tokens, read-only ones included, so
-the Hub's web pages read them with their read token. Opting out takes effect on what the person
+opted out, by anyone who can read the repository: any of their tokens, read-only ones included. Opting out takes effect on what the person
 shared before as well: their entries leave other readers' listings and their bodies answer as a
 digest nobody declared, until they opt in again. Otherwise only the human who declared them (any of that person's tokens for the
 repository) and Hub admins (`AGENTSCM_ADMINS`) read them, which also holds for bodies uploaded
@@ -1275,10 +1273,7 @@ the person who shared it (older clients, which refuse unknown fields, need upgra
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.
 - `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
-  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries only after the reader explicitly opens the conversation section, and shows a
-  shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
-  on an older record; it has no delete control because the status page only holds read-only
-  tokens.
+  prints, or deletes (through the `DELETE` route).
 
 ### Conversation sharing
 
@@ -1403,21 +1398,7 @@ that release or complete that Work as its owner through the ordinary fenced Work
 is never posted to a channel. Without the Slack adapter nothing is sent, and the route and the
 command still answer.
 
-## Status page
-
-`/ui/` is a read-only page of what the hub knows about one repository. On a web sign-in that can
-read several repositories it first opens All repositories (`#repositories`, also in the repository
-menu and behind the logo): one row per readable repository with what needs you, unfinished work,
-live agents and the last activity, worst first; a row opens that repository's Dashboard. See
-[the design](design/all-repositories.md). Its rail has six items, each
-with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
-`GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
-overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)),
-History (Finished, Changes, Change records, and Files from this computer), Timeline,
-Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub, Access and Preferences).
-Files, Timeline and Recipes read an explicit local `agentscm serve`, not the hub: see
-[local template and timeline reads](api.md#local-template-and-timeline-reads).
+## Directed request delivery
 
 A directed request is addressed to its target's current lead. Supported hooks and MCP calls can
 offer its pointer; a qualified native waiter can attempt idle delivery. Neither proves that the
@@ -1429,47 +1410,17 @@ condition; a lease renewal or checkpoint does not. See
 native capability limits. Read `agentscm_work_status` and `agentscm_coordination_inbox` for current
 hold and reply state; a deadline grants no takeover authority.
 
-The page comes in light and dark, and in Spacious and Condensed densities, chosen in the top bar
-and kept in the browser. The container image and explicit builds with `--features ui` serve it;
-`/` and `/ui` redirect to it. Native release binaries omit the dashboard, and a build without the
-feature returns not found for `/ui/`. Its setup and authentication endpoints remain available.
-
-The page signs in with a [read-only token](#read-only-tokens) for the repository, sent as
-`Authorization: Bearer`, and refuses an agent token, so the browser never holds a token that can
-write. The token is kept in the browser's session storage, or in its local storage if "keep me
-signed in" is ticked. The token path uses no cookies. The workspace section is separate: it signs in through the hub's
-browser login and keeps a cookie session. The page polls every few seconds and reads `whoami`,
-`work`, `activity`, `health` and `/v1/hub/onboarding` (the Setup › Agents page); the workflow panel also reads the
-bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
-can be revoked on its own:
-
-```sh
-agentscm hub token create --read-only --name status-page --repo owner/name
-```
-
-History › Change records and each task page can open `#change-record/{work_id}`. That page performs one
-bounded read of the concise change-record projection and refreshes only on request. A missing record,
-authorization denial, unavailable service and incomplete evidence remain distinct states. The
-filled browser path still needs integrated qualification with a current captured record.
-
-Every `/ui/` response carries a `Content-Security-Policy` that allows scripts only from the hub
-itself, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control:
-no-cache`. Styles may be inline, because the page sets inline `style` attributes; fonts and images are
-inlined into the stylesheet as `data:` URIs.
-
-### Try it locally: `agentscm demo`
+## Try it locally: `agentscm demo`
 
 `agentscm demo`, run inside any Git repository, starts a throwaway hub in the same process on a
 loopback port with a temporary SQLite database, and simulates three agents (two Claude Code, one
 Codex) making real calls to `POST /v1/hub/hook/{agent}` with file names taken from the repository's
 recent history. One agent is refused once on a file another holds and passes on repeating the edit;
-the command prints the refusal text as the hub returned it and the hook latency, then opens the
-status page signed in with a read-only token (the link, with its throwaway read-only token, is also printed; `--no-open` skips the browser).
+the command prints the refusal text as the hub returned it and the hook latency.
 It needs no account, Docker or forge. It only reads the repository, with `git rev-parse`, `git remote
 get-url`, `git log` and `git ls-files`; the hub's database lives in a private temporary directory
 that is removed after the hub stops, on exit, Ctrl-C, SIGTERM or SIGHUP. The tokens it mints are
-valid for seven days but die with the process. A binary built without the `ui` feature shows the
-notice page instead. Its last line, and the status page banner, point to
+valid for seven days but die with the process. Its last line points to
 `agentscm quickstart` (or `npx agentscm`) for the guided setup.
 
 What the demo shows is scripted. The agents are simulated, and so are their decisions. When the
@@ -2396,8 +2347,7 @@ What the hub keeps, in its database and object store:
   the account is disabled, and when it was created. No name, email address,
   avatar or IP address is stored.
 - Agent tokens: owner, token name, repository (its name and the forge's id),
-  expiry, revocation status and whether the token is read-only (`read_only`;
-  the status page uses one). Only a one-way digest of each token is kept; the
+  expiry, revocation status and whether the token is read-only (`read_only`). Only a one-way digest of each token is kept; the
   token itself is shown once.
 - Intents and notices: which agent, on which machine label, is working on
   which paths, branch and base for what task (up to 500 bytes), and when.
@@ -2416,7 +2366,7 @@ What the hub keeps, in its database and object store:
 - The task from a hook payload. A prompt in a `SessionStart` payload
   (`initial_prompt`, or `initialPrompt` in a Copilot CLI one) is not stored:
   a prompt would otherwise become the session's task and its intent's task,
-  which teammates' warnings, the intents API and the status page show. A
+  which teammates' warnings and the intents API show. A
   generic hook's `task` field is still stored (control characters replaced
   with spaces, cut to 500 bytes), and the task can come from `agentscm_start`
   or `agentscm intent`. An agent's hook sends the hub its whole hook JSON,
@@ -2459,8 +2409,7 @@ What the hub keeps, in its database and object store:
   repeats and expired holds), handoff requests and answers, observations,
   outbound posts and publications. Events carry the same paths, notes and reasons as the rows
   above, and the session id the agent sent.
-- The status page reads this data and stores nothing of its own:
-  `GET /v1/hub/repos/{repo}/activity` returns live sessions and recent events,
+- `GET /v1/hub/repos/{repo}/activity` reads this data and stores nothing of its own: it returns live sessions and recent events,
   leaves session ids out of its reply, and writes no row or event.
 - Sign-in sessions are kept in memory only and end when the hub restarts.
   GitHub App credentials are files in the secrets directory, not in the

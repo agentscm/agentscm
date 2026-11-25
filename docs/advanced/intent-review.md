@@ -16,9 +16,8 @@ The procedure keeps human requests and explicit amendments separate from the age
 2. Give the implementing agent the published workflow version, step ID and existing Work ID. It extracts a compact contract from the human messages already accessible to it. Preserve exact excerpts and their provenance; label reconstructed or unavailable context explicitly. Keep the agent's plan separate.
 3. The agent sends JSON to `agentscm intent-review`, claims the returned task, reads its pinned skill package, and uses its existing tools to inspect files and run relevant checks.
 4. It reports every scoped criterion as `supported`, `mismatch` or `unknown`. A mismatch includes the required corrective outcome and recheck. The agent reserves a correction before editing, reports the changed candidate, then claims a fresh assessment.
-5. Open the Work in the local page launched by `agentscm open` to inspect intent, coverage, findings and attempts. A browser user can record a scoped dispute or exception with a reason; neither becomes an evaluator pass.
 
-The CLI reads one bounded JSON request from standard input and prints one JSON response. It defaults to the same private store used by `agentscm open`; `--store PATH` selects a different local store and `--root PATH` selects the Git checkout. A store inside the checkout must be ignored by Git. The checkout must have a supported Git origin. No provider account or tool permissions are provisioned.
+The CLI reads one bounded JSON request from standard input and prints one JSON response. It defaults to a private store in AgentSCM's local configuration directory; `--store PATH` selects a different local store and `--root PATH` selects the Git checkout. A store inside the checkout must be ignored by Git. The checkout must have a supported Git origin. No provider account or tool permissions are provisioned.
 
 ```sh
 agentscm intent-review < intent-request.json
@@ -40,7 +39,7 @@ Retrieved or generated evidence is supplied as bounded text with an ID, origin a
 
 Evidence investigation after an unknown can supply new evidence with the next assessment claim. A heartbeat extends the live lease using the same attempt/session/fence; it does not reset the root budget. Cancellation, expired leases, ambiguous delivery and repeated unsuccessful fixes remain visible.
 
-Recovery, amendment and disposition require a cited human authorization and the CLI's `--human-authority` option, or the selected-checkout browser grant. These are trusted-local operations: the option and supplied author label are not independent proof that a human approved them. An agent must have actual user authorization before invoking them. Disposition also supplies the displayed `expected_subject_digest`; a changed candidate is rejected.
+Recovery, amendment and disposition require a cited human authorization and the CLI's `--human-authority` option. These are trusted-local operations: the option and supplied author label are not independent proof that a human approved them. An agent must have actual user authorization before invoking them. Disposition also supplies the displayed `expected_subject_digest`; a changed candidate is rejected.
 
 An amendment replay can conflict after the first request succeeded because its contract binding has changed. Inspect `status` and compare the retained contract/version before continuing; do not invent another operation ID to repeat an uncertain amendment.
 
@@ -64,4 +63,4 @@ These are synthetic inputs and expected outcomes for later host qualification. T
 
 ## Import boundary
 
-Importing a skill does not launch an agent. Parsing an `npx skills add` descriptor locates pinned source bytes; it does not execute `npx` or grant imported instructions authority. The existing productive prompt adapter retains its no-tool restrictions, and native qualification remains a separate path. See [workflow library](workflow-library.md) and [agent-owned workflow tasks](agent-workflow-tasks.md).
+Importing a skill does not launch an agent. Parsing an `npx skills add` descriptor locates pinned source bytes; it does not execute `npx` or grant imported instructions authority. The existing productive prompt adapter retains its no-tool restrictions, and native qualification remains a separate path. See [agent-owned workflow tasks](agent-workflow-tasks.md).

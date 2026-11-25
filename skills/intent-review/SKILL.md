@@ -17,7 +17,7 @@ The root Work retains the complete contract. A child or checkpoint uses its expl
 
 ## Start and claim through the local host
 
-Use `agentscm intent-review` with a JSON request on stdin, from the selected Git checkout or with `--root PATH`. Its default store is the same local store used by `agentscm open`; an explicit `--store PATH` selects another existing library. Select a published standalone skill workflow in that library and substitute its exact version and step IDs below. Importing a skill alone does not execute it.
+Use `agentscm intent-review` with a JSON request on stdin, from the selected Git checkout or with `--root PATH`. Its default store is a private store in AgentSCM's local configuration directory; an explicit `--store PATH` selects another existing library. Select a published standalone skill workflow in that library and substitute its exact version and step IDs below. Importing a skill alone does not execute it.
 
 Use new operation request IDs for new operations. After uncertain delivery, replay the identical request ID and payload to inspect the retained result; do not invent another attempt. The host owns current time, source capture, evaluator configuration identity, skill pins and artifact hashes. Do not send a source binding, candidate digest, evaluator digest or host clock. Excerpt `sha256` is derived from its exact `text`; an empty placeholder below is replaced by the host. Historical reference times remain caller provenance, so use observed metadata and mark unavailable metadata/context honestly.
 

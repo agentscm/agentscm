@@ -6,11 +6,11 @@ title: "Messages and continuation notices"
 
 AgentSCM delivers a bounded pointer to a session that already exists. Supported hooks and MCP calls can carry it on the session's next ordinary call. A qualified native background waiter can attempt idle delivery; installing a plugin or creating Work does not establish that the host can wake a chat. Delivery, a queued native turn, recipient acknowledgement and task completion are separate facts.
 
-The local engine does not start replacement conversations, run a model, resume an ordinary closed chat or take over its Work automatically. Closed Work remains available through the existing recovery commands. Optional remote or explicitly self-hosted Hub pages retain human message controls; the local release does not include a dashboard.
+The local engine does not start replacement conversations, run a model, resume an ordinary closed chat or take over its Work automatically. Closed Work remains available through the existing recovery commands. Human message controls are the Hub's browser-session HTTP routes (`/v1/hub/session/agent-messages`); AgentSCM serves no web interface for them.
 
 ## Human messages and consent
 
-Only the Hub's own signed-in browser session can send a human message, with its CSRF protection. Agent tokens and script bearer sessions cannot send one. The recipient must be the person's own live writing token and named session; a Work-specific message must name its lead.
+Only a signed-in Hub browser session can send a human message, with its CSRF protection. Agent tokens and script bearer sessions cannot send one. The recipient must be the person's own live writing token and named session; a Work-specific message must name its lead.
 
 A message notice is not authority. Call `agentscm_hub_message` with the **source message id**, `session` and `status: accepted` before acting. Its authenticated reply supplies the stored note and current consent mode:
 

@@ -1136,7 +1136,6 @@ async fn protocol_basics() {
             "agentscm_handoff",
             "agentscm_work_status",
             "agentscm_work_overview",
-            "agentscm_show_overview",
             "agentscm_work_briefing",
             "agentscm_work_catchup",
             "agentscm_work_catchup_ack",
@@ -1193,7 +1192,6 @@ async fn protocol_basics() {
             "agentscm_promise_report",
             "agentscm_hub_message",
             "agentscm_work_dependency_ack",
-            "agentscm_view_settings",
             "agentscm_coordination_ack",
             "agentscm_coordination_reply",
             "agentscm_coordination_resolve",
@@ -3017,435 +3015,6 @@ fn rpc_body(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 }
 
-fn ui_init() -> Value {
-    rpc_body(
-        "initialize",
-        json!({"protocolVersion": "2025-06-18",
-            "capabilities": {"extensions": {"io.modelcontextprotocol/ui": {}}}}),
-    )
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
-    let hub = Hub::start().await;
-    let secret = hub.secret(1, "writer");
-    let plain = hub
-        .rpc(
-            &secret,
-            &rpc_body("initialize", json!({"protocolVersion": "2025-06-18"})),
-        )
-        .await
-        .json();
-    assert_eq!(
-        plain["result"]["capabilities"],
-        json!({"tools": {"listChanged": false}})
-    );
-    let ui = hub.rpc(&secret, &ui_init()).await.json();
-    assert_eq!(
-        ui["result"]["capabilities"]["resources"],
-        json!({"listChanged": false})
-    );
-
-    let tools = hub
-        .rpc(&secret, &rpc_body("tools/list", json!({})))
-        .await
-        .json();
-    let with_meta: Vec<_> = tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t.get("_meta").is_some())
-        .map(|t| {
-            (
-                t["name"].as_str().unwrap(),
-                t["_meta"]["ui"]["resourceUri"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        with_meta,
-        [
-            ("agentscm_show_overview", "ui://agentscm/work-overview"),
-            ("agentscm_value_metrics", "ui://agentscm/value-metrics")
-        ]
-    );
-
-    let list = hub
-        .rpc(&secret, &rpc_body("resources/list", json!({})))
-        .await
-        .json();
-    let uris: Vec<_> = list["result"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["uri"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        uris,
-        ["ui://agentscm/work-overview", "ui://agentscm/value-metrics"]
-    );
-    let read = hub
-        .rpc(
-            &secret,
-            &rpc_body(
-                "resources/read",
-                json!({"uri": "ui://agentscm/work-overview"}),
-            ),
-        )
-        .await
-        .json();
-    let content = &read["result"]["contents"][0];
-    assert_eq!(content["mimeType"], "text/html;profile=mcp-app");
-    assert!(
-        content["text"].as_str().unwrap().contains("<html")
-            || content["text"].as_str().unwrap().contains("<!doctype")
-    );
-
-    let gone = hub
-        .rpc(
-            &secret,
-            &rpc_body(
-                "resources/read",
-                json!({"uri":"ui://agentscm/coordination-inbox"}),
-            ),
-        )
-        .await
-        .json();
-    assert_eq!(gone["error"]["code"], -32602);
-    for route in ["/mcp", "/mcp?tools=all"] {
-        let list = hub
-            .rpc_at(route, &secret, &rpc_body("tools/list", json!({})))
-            .await
-            .json();
-        for name in ["agentscm_work_overview", "agentscm_coordination_inbox"] {
-            let tool = list["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .unwrap();
-            assert!(tool.get("_meta").is_none(), "{name} mounts no view");
-        }
-    }
-    let shown = hub
-        .tool_result(&secret, "agentscm_show_overview", json!({}))
-        .await;
-    assert_eq!(shown["isError"], false);
-    assert!(shown["structuredContent"]["current"].is_array());
-    assert!(shown["structuredContent"]["actionable_status"]["work"].is_array());
-    assert!(shown["structuredContent"].get("agent_briefing").is_none());
-    let overview = hub
-        .tool_result(&secret, "agentscm_work_overview", json!({}))
-        .await;
-    let hints: Vec<_> = overview["content"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|c| {
-            c["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("Inline views: on (your setting).")
-        })
-        .collect();
-    assert_eq!(hints.len(), 1);
-
-    let http = hub
-        .send(
-            reqwest::Method::GET,
-            "/v1/hub/view-settings",
-            Some(&secret),
-            "",
-        )
-        .await;
-    assert_eq!(http.status, 200);
-    assert_eq!(
-        http.json(),
-        json!({
-            "effective": {"enabled": true, "work_overview": true},
-            "hub_default": {"enabled": true, "work_overview": true},
-            "override": null
-        })
-    );
-
-    // Read-only tokens read resources but cannot change the hub-wide setting.
-    let user = hub
-        .store
-        .upsert_user(
-            &ForgeIdentity {
-                provider: "github".into(),
-                host: "github.com".into(),
-                user_id: 2,
-            },
-            "reader",
-        )
-        .unwrap();
-    let (_, reader, _) =
-        mint_bound_agent_token(&*hub.store, &user.id, "reader", REPO, 1, 600, true).unwrap();
-    let reader = reader.expose().to_owned();
-    let tools = hub
-        .rpc(&reader, &rpc_body("tools/list", json!({})))
-        .await
-        .json();
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["name"] == "agentscm_show_overview"
-                && tool["_meta"]["ui"]["resourceUri"] == "ui://agentscm/work-overview")
-    );
-    for name in ["agentscm_work_overview", "agentscm_coordination_inbox"] {
-        let tool = tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap();
-        assert!(tool.get("_meta").is_none());
-    }
-    let shown = hub
-        .tool_result(&reader, "agentscm_show_overview", json!({}))
-        .await;
-    assert_eq!(shown["isError"], false);
-    assert!(shown["structuredContent"]["actionable_status"]["work"].is_array());
-    let read = hub
-        .rpc(&reader, &rpc_body("resources/list", json!({})))
-        .await;
-    assert_eq!(read.status, 200);
-    let denied = hub
-        .send(
-            reqwest::Method::POST,
-            "/mcp",
-            Some(&reader),
-            &rpc_body(
-                "tools/call",
-                json!({"name": "agentscm_view_settings", "arguments": {}}),
-            )
-            .to_string(),
-        )
-        .await;
-    assert_eq!(denied.status, 403);
-
-    // Toggle one view off, then everything.
-    let changed = hub
-        .tool_result(
-            &secret,
-            "agentscm_view_settings",
-            json!({"work_overview": false}),
-        )
-        .await;
-    assert_eq!(
-        changed["structuredContent"]["effective"]["work_overview"],
-        false
-    );
-    let list = hub
-        .rpc(&secret, &rpc_body("resources/list", json!({})))
-        .await
-        .json();
-    let remaining_uris: Vec<_> = list["result"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|resource| resource["uri"].as_str().unwrap())
-        .collect();
-    assert!(remaining_uris.is_empty());
-    let tools = hub
-        .rpc(&secret, &rpc_body("tools/list", json!({})))
-        .await
-        .json();
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|tool| tool.get("_meta").is_none())
-    );
-    let off = hub
-        .tool_result(&secret, "agentscm_view_settings", json!({"enabled": false}))
-        .await;
-    assert_eq!(off["structuredContent"]["effective"]["enabled"], false);
-    let tools = hub
-        .rpc(&secret, &rpc_body("tools/list", json!({})))
-        .await
-        .json();
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|t| t.get("_meta").is_none())
-    );
-    let ui = hub.rpc(&secret, &ui_init()).await.json();
-    assert_eq!(
-        ui["result"]["capabilities"],
-        plain["result"]["capabilities"]
-    );
-    let list = hub
-        .rpc(&secret, &rpc_body("resources/list", json!({})))
-        .await
-        .json();
-    assert!(list["result"]["resources"].as_array().unwrap().is_empty());
-    let gone = hub
-        .rpc(
-            &secret,
-            &rpc_body(
-                "resources/read",
-                json!({"uri": "ui://agentscm/work-overview"}),
-            ),
-        )
-        .await
-        .json();
-    assert_eq!(gone["error"]["code"], -32602);
-    let (hint, _) = (
-        hub.tool_result(&secret, "agentscm_coordination_inbox", json!({}))
-            .await["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| {
-                c["text"].as_str().unwrap()
-                    == "Inline views: off (your setting). Change with agentscm_view_settings."
-            }),
-        (),
-    );
-    assert!(hint);
-}
-
-async fn resources(hub: &Hub, secret: &str) -> usize {
-    let list = hub
-        .rpc(secret, &rpc_body("resources/list", json!({})))
-        .await
-        .json();
-    list["result"]["resources"].as_array().unwrap().len()
-}
-
-#[tokio::test]
-async fn legacy_inbox_view_settings_preserve_other_switches() {
-    use agentscm::hub::view_settings::{ViewOverride, ViewSettings};
-    let hub = Hub::start().await;
-    let owner = hub
-        .store
-        .upsert_user(
-            &ForgeIdentity {
-                provider: "github".into(),
-                host: "github.com".into(),
-                user_id: 23,
-            },
-            "settings-owner",
-        )
-        .unwrap();
-    for inbox in [json!(false), json!(true), Value::Null] {
-        hub.store
-            .set_setting(
-                "mcp_views",
-                &json!({
-                    "enabled": false, "work_overview": false, "coordination_inbox": inbox
-                })
-                .to_string(),
-                "test",
-            )
-            .unwrap();
-        let base = ViewSettings::load(&*hub.store).unwrap();
-        assert!(!base.enabled);
-        assert!(!base.work_overview);
-        ViewSettings::save(&*hub.store, &base, "test").unwrap();
-        let saved: Value =
-            serde_json::from_str(&hub.store.get_setting("mcp_views").unwrap().unwrap()).unwrap();
-        assert_eq!(saved, json!({"enabled":false,"work_overview":false}));
-
-        let key = format!("mcp_views:{}", owner.id);
-        hub.store
-            .set_setting(
-                &key,
-                &json!({
-                    "enabled": false, "work_overview": null, "coordination_inbox": inbox
-                })
-                .to_string(),
-                "test",
-            )
-            .unwrap();
-        let choices = ViewSettings::load_override(&*hub.store, &owner.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            choices,
-            ViewOverride {
-                enabled: Some(false),
-                work_overview: None
-            }
-        );
-        assert!(
-            !ViewSettings::effective(&*hub.store, &owner.id)
-                .unwrap()
-                .enabled
-        );
-        ViewSettings::save_override(&*hub.store, &owner.id, &choices).unwrap();
-        let saved: Value =
-            serde_json::from_str(&hub.store.get_setting(&key).unwrap().unwrap()).unwrap();
-        assert_eq!(saved, json!({"enabled":false,"work_overview":null}));
-    }
-    // Retiring one known field must not relax active API decoding or unrelated fields.
-    assert!(
-        serde_json::from_value::<ViewSettings>(
-            json!({"enabled":false,"work_overview":false,"coordination_inbox":true})
-        )
-        .is_err()
-    );
-    assert!(serde_json::from_value::<ViewOverride>(json!({"unknown":false})).is_err());
-}
-
-#[tokio::test]
-async fn view_settings_are_per_user_over_a_hub_default() {
-    use agentscm::hub::view_settings::ViewSettings;
-    let hub = Hub::start().await;
-    let (a, b) = (hub.secret(10, "a"), hub.secret(11, "b"));
-    let off = ViewSettings {
-        enabled: false,
-        ..ViewSettings::default()
-    };
-    ViewSettings::save(&*hub.store, &off, "test").unwrap();
-    assert_eq!(resources(&hub, &a).await, 0);
-
-    // A's choice beats a hub default that is off; B is unaffected.
-    let on = hub
-        .tool_result(&a, "agentscm_view_settings", json!({"enabled": true}))
-        .await;
-    assert_eq!(on["structuredContent"]["effective"]["enabled"], true);
-    assert_eq!(on["structuredContent"]["hub_default"]["enabled"], false);
-    assert_eq!(on["structuredContent"]["override"]["enabled"], true);
-    assert_eq!(resources(&hub, &a).await, 2);
-    assert_eq!(resources(&hub, &b).await, 0);
-
-    // Partial updates merge; a user's off beats a default that is on.
-    ViewSettings::save(&*hub.store, &ViewSettings::default(), "test").unwrap();
-    let merged = hub
-        .tool_result(
-            &a,
-            "agentscm_view_settings",
-            json!({"work_overview": false}),
-        )
-        .await;
-    assert_eq!(merged["structuredContent"]["override"]["enabled"], true);
-    assert_eq!(resources(&hub, &a).await, 0);
-    assert_eq!(resources(&hub, &b).await, 2);
-    let tools = hub.rpc(&b, &rpc_body("tools/list", json!({}))).await.json();
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t.get("_meta").is_some())
-    );
-
-    // Reset follows the hub default again.
-    let reset = hub
-        .tool_result(&a, "agentscm_view_settings", json!({"reset": true}))
-        .await;
-    assert_eq!(reset["structuredContent"]["override"], Value::Null);
-    assert_eq!(resources(&hub, &a).await, 2);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_that_reads_like_live_work_lists_it_for_the_agent_to_decide() {
     let hub = Hub::start().await;
@@ -3818,7 +3387,7 @@ async fn default_tool_list_cost() {
     eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
     // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
     // A tool joins every session's default list only by being named here.
-    const CORE: [&str; 51] = [
+    const CORE: [&str; 49] = [
         "agentscm_ask",
         "agentscm_briefing_pending",
         "agentscm_briefing_prepare",
@@ -3839,11 +3408,9 @@ async fn default_tool_list_cost() {
         "agentscm_owner_notice_status",
         "agentscm_pr_context",
         "agentscm_setup_status",
-        "agentscm_show_overview",
         "agentscm_start",
         "agentscm_status",
         "agentscm_value_metrics",
-        "agentscm_view_settings",
         "agentscm_why",
         "agentscm_work_ack",
         "agentscm_work_briefing",
@@ -3885,7 +3452,7 @@ async fn default_tool_list_cost() {
     );
 }
 
-/// Every tool the shipped skills, instruction files, hook context, advice, views, replies, client
+/// Every tool the shipped skills, instruction files, hook context, advice, replies, client
 /// code, server instructions and default tool descriptions name is in the default list, so the
 /// two cannot drift apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3940,8 +3507,6 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         include_str!("../../src/hub/advice.rs"),
         include_str!("../../src/hub/onboarding.rs"),
         include_str!("../../src/hub/narrative.rs"),
-        include_str!("../../src/hub/mcp_views/work-overview.html"),
-        include_str!("../../src/hub/mcp_views/value-metrics.html"),
         include_str!("../../skills/intent-review/SKILL.md"),
         include_str!("../../skills/native-workflow/SKILL.md"),
         &instructions,
