@@ -37,7 +37,7 @@ tool lists are unchanged. They are callable either way.
 
 | Tool | What it does |
 |---|---|
-| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose stored text contains it (at most 200 bytes, case-insensitive for ASCII letters, `%` and `_` taken literally). Stored and shown text differ only where the shown text has `'` for `"` and "Hub note" for "Hub message". An empty `q` or `after` is ignored. `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
+| `agentscm_memory_list` | One page of the repository's notes: promoted notes first, then newest first. `q` keeps notes whose stored text contains it (at most 200 bytes, case-insensitive for ASCII letters, `%` and `_` taken literally). Stored and shown text differ only where the shown text has `'` for `"`, "Hub note" for "Hub message" and "AgentSCM coordination note" for "AgentSCM coordination request", and drops variation selectors and other characters that draw nothing or blank space. An empty `q` or `after` is ignored. `limit` is 1 to 50 (default 20). `after` is the `next_after` of the previous page. Read-only tokens may call it. |
 | `agentscm_memory_write` | Stores one note of 1 to 500 characters, signed with the token, its owner and the call's `session`. Invisible characters are dropped and each run of spaces, line breaks, tabs and other control characters becomes one space first, and the bound applies to that text. |
 | `agentscm_memory_remove` | Removes one note by `id` (`mem_…`). Any writing token of the note's owner may remove it. |
 

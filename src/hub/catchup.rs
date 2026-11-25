@@ -485,9 +485,9 @@ impl NewCatchupMerge {
         if self.title.as_ref().is_some_and(|title| {
             title.is_empty()
                 || title.len() > 256
-                || title
-                    .chars()
-                    .any(|character| character.is_control() || super::advice::invisible(character))
+                || title.chars().any(|character| {
+                    character.is_control() || crate::third_party::invisible(character)
+                })
         }) {
             return Err(invalid("invalid catch-up merge title"));
         }
@@ -547,7 +547,7 @@ pub(super) fn bounded_title(value: &str) -> Option<String> {
     let mut title = String::new();
     for character in value
         .chars()
-        .filter(|character| !character.is_control() && !super::advice::invisible(*character))
+        .filter(|character| !character.is_control() && !crate::third_party::invisible(*character))
     {
         if title.len() + character.len_utf8() > 256 {
             break;
@@ -601,7 +601,7 @@ pub(super) fn agent_subscriber(session: &str) -> Result<String> {
     if session.is_empty()
         || session
             .chars()
-            .any(|character| character.is_control() || super::advice::invisible(character))
+            .any(|character| character.is_control() || crate::third_party::invisible(character))
     {
         return Err(invalid("agent catch-up session is invalid"));
     }
@@ -661,7 +661,7 @@ fn valid_hex(value: &str, lengths: &[usize]) -> bool {
 }
 
 fn valid_catchup_ref(value: &str) -> bool {
-    valid_ref_name(value) && !value.chars().any(super::advice::invisible)
+    valid_ref_name(value) && !value.chars().any(crate::third_party::invisible)
 }
 
 fn invalid(message: &str) -> HubError {
@@ -673,7 +673,7 @@ fn catchup_label(name: &str, value: &str) -> Result<()> {
         || value.len() > 200
         || value
             .chars()
-            .any(|character| character.is_control() || super::advice::invisible(character))
+            .any(|character| character.is_control() || crate::third_party::invisible(character))
     {
         Err(HubError::Invalid(format!(
             "{name} must be 1 to 200 bytes without control characters"

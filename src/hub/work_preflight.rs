@@ -117,10 +117,9 @@ impl WorkPreflightRequest {
         for checked in &self.checked_merges {
             if checked.source_id.is_empty()
                 || checked.source_id.len() > 255
-                || checked
-                    .source_id
-                    .chars()
-                    .any(|character| character.is_control() || super::advice::invisible(character))
+                || checked.source_id.chars().any(|character| {
+                    character.is_control() || crate::third_party::invisible(character)
+                })
                 || checked.pull_number < 1
                 || !valid_hex(&checked.merge_commit, &[40, 64])
                 || !identities.insert((checked.pull_number, checked.merge_commit.as_str()))

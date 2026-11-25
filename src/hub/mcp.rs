@@ -54,6 +54,7 @@ use super::work_transition::{
 #[cfg(not(unix))]
 use super::workspace::PromiseExecution;
 use super::{HubError, HubState, Result};
+use crate::third_party::ThirdPartyText;
 
 const VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const MAX_CHECK_PATHS: usize = super::session::MAX_SESSION_PATHS;
@@ -2093,7 +2094,7 @@ async fn call(
             let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
                 .map(|request| {
-                    let mut notice = json!({"request_id":request.id,"title":super::advice::sanitize(&request.proposal.title, 120),
+                    let mut notice = json!({"request_id":request.id,"title":ThirdPartyText::new(&request.proposal.title, 120),
                     "status":request.status,"updated_seq":request.updated_seq,
                     "affected_agent_count":request.targets.len(),
                     "affected_agents_complete":request.targets.len() <= 3,
@@ -2104,7 +2105,7 @@ async fn call(
                         notice["replies"] = json!(request.responses.iter().take(3).map(|reply| {
                             let mut shown = json!({
                                 "kind":reply.kind,
-                                "note":reply.note.as_deref().map(|note| super::advice::sanitize(note, 200)),
+                                "note":reply.note.as_deref().map(|note| ThirdPartyText::new(note, 200)),
                                 "responder_agent":reply.responder.agent});
                             if !reply.released_paths.is_empty() {
                                 shown["released_paths"] = json!(&reply.released_paths[..reply.released_paths.len().min(5)]);
@@ -4146,7 +4147,7 @@ pub(super) fn bounded_paths(keys: &[String]) -> String {
     let mut shown: Vec<String> = keys
         .iter()
         .take(5)
-        .map(|key| super::advice::sanitize(&super::intent::display(key), 120))
+        .map(|key| ThirdPartyText::name(&super::intent::display(key), 120).to_string())
         .collect();
     if keys.len() > 5 {
         shown.push(format!("and {} more", keys.len() - 5));
@@ -4518,7 +4519,7 @@ async fn done(
         Some(Err(error)) => return Err(error),
         Some(Ok(Some(title))) => format!(
             "AgentSCM: completed “{}”; {tail} Before editing again, start new Work with agentscm_start.",
-            crate::hub::advice::sanitize(&title, 120)
+            ThirdPartyText::new(&title, 120)
         ),
         Some(Ok(None)) => {
             format!("AgentSCM: nothing to complete: this session leads no unfinished Work; {tail}")
@@ -4527,13 +4528,13 @@ async fn done(
 }
 
 /// The `summary` as a transition reason: one line, within 500 bytes, never empty.
-fn done_reason(summary: Option<String>) -> String {
+pub(super) fn done_reason(summary: Option<String>) -> String {
     let line = summary
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let mut line = crate::hub::advice::sanitize(&line, 500);
+    let mut line = ThirdPartyText::new(&line, 500).to_string();
     while line.len() > 500 {
         line.pop();
     }
@@ -5137,7 +5138,7 @@ fn resolve_existing(
         text.push_str(&format!(
             "\n- {} \"{}\": {} Resume: agentscm_start with work_id {}, takeover_generation {} and your session.",
             work.work_id,
-            super::advice::sanitize(&work.title, 120),
+            ThirdPartyText::new(&work.title, 120),
             work.why,
             work.work_id,
             work.operational.generation
@@ -5364,7 +5365,7 @@ fn start_result(
             } else if request.requester.owner == target.lead.owner {
                 text.push_str(&format!("\nThe agent leading {} is your person's too, so the request is not raised in the AgentSCM Hub's Needs you: if it stays unanswered, ask your person in this session.", target.work_id));
             } else {
-                text.push_str(&format!("\nIf the agent leading {} has not acknowledged it within {} minutes of this request, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, super::coordination::ACK_BOUND_SECS / 60, super::advice::sanitize(&target.lead.login, 64)));
+                text.push_str(&format!("\nIf the agent leading {} has not acknowledged it within {} minutes of this request, it is raised to its person, {}, in the AgentSCM Hub's Needs you; agentscm_work_status says where it stands.", target.work_id, super::coordination::ACK_BOUND_SECS / 60, ThirdPartyText::name(&target.lead.login, 64)));
             }
         }
         text.push_str(

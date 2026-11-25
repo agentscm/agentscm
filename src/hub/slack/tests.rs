@@ -1337,11 +1337,20 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
     let long = format!("src/{}.rs", "a/".repeat(3000));
     let paths: Vec<String> = (0..12).map(|n| format!("{long}{n}")).collect();
     let who = label(&hostile, &hostile);
-    let shown: Vec<String> = paths.iter().map(|p| sanitize(p, TEXT_CHARS)).collect();
+    let shown: Vec<String> = paths
+        .iter()
+        .map(|p| ThirdPartyText::name(p, TEXT_CHARS).to_string())
+        .collect();
     let fields = [
         ("Files", listed(&shown)),
-        ("Repository", sanitize(&hostile, TEXT_CHARS)),
-        ("Your agent", sanitize(&hostile, NAME_CHARS)),
+        (
+            "Repository",
+            ThirdPartyText::name(&hostile, TEXT_CHARS).to_string(),
+        ),
+        (
+            "Your agent",
+            ThirdPartyText::name(&hostile, NAME_CHARS).to_string(),
+        ),
         ("Their agent", who.clone()),
     ];
     let headline = format!("Another agent edited {hostile}");

@@ -12,10 +12,10 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use super::advice::sanitize;
 use super::session::SESSION_TTL_SECONDS;
 use super::store::Principal;
 use super::work_lifecycle::IN_FLIGHT_CAP_SECONDS;
+use crate::third_party::ThirdPartyText;
 
 const MAX_SESSIONS: usize = 1024;
 /// The most sessions of one agent token, which is one person's agent in one repository.
@@ -117,7 +117,7 @@ impl Subagents {
         });
         let key = (principal.token_id.clone(), native.to_owned());
         let kind = kind
-            .map(|kind| sanitize(kind.trim(), MAX_TYPE_CHARS))
+            .map(|kind| ThirdPartyText::name(kind.trim(), MAX_TYPE_CHARS).to_string())
             .filter(|kind| !kind.is_empty());
         if !sessions.contains_key(&key) {
             if kind.is_none() {
@@ -216,7 +216,8 @@ impl Subagents {
         does: &str,
         now: i64,
     ) {
-        let does = Some(sanitize(does.trim(), MAX_DOES_CHARS)).filter(|does| !does.is_empty());
+        let does = Some(ThirdPartyText::new(does.trim(), MAX_DOES_CHARS).to_string())
+            .filter(|does| !does.is_empty());
         self.with(principal, native, id, running, now, |row| row.does = does);
     }
 

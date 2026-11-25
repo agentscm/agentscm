@@ -8,8 +8,8 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscm::autopsy::{self, NearMiss};
-use agentscm::hub::advice::sanitize;
 use agentscm::hub::session::{HOLD_CAP_SECONDS, SESSION_TTL_SECONDS};
+use agentscm::third_party::ThirdPartyText;
 use agentscm::{Error, Result};
 use clap::Args;
 
@@ -351,7 +351,7 @@ pub fn run(args: AutopsyArgs) -> Result<()> {
         if args.no_paths {
             "<file>".to_owned()
         } else {
-            sanitize(path, 200)
+            ThirdPartyText::name(path, 200).to_string()
         }
     };
     let checked = if near.is_empty() {

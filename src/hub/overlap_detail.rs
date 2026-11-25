@@ -286,7 +286,7 @@ mod tests {
         assert!(
             !text
                 .chars()
-                .any(|c| c.is_control() || super::super::advice::invisible(c))
+                .any(|c| c.is_control() || crate::third_party::invisible(c))
         );
         // Only the template's own quotes remain: two per title.
         assert_eq!(text.matches('"').count(), 4, "{text}");

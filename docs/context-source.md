@@ -66,7 +66,8 @@ The Hub ignores other fields. It then bounds and cleans the lines:
 - It drops empty lines and keeps the first 8 of the rest.
 - It cuts each line to 200 characters and ends a cut line with `…`.
 - It removes control and invisible characters, so each line stays on one line, and turns `"` into `'`.
-- It rewrites "Hub message" to "Hub note" and "coordination request" to "coordination note", in any letter case and with spaces, `-` or `_` between the words. A line can then never open with the words of the Hub's own messages.
+- It removes variation selectors and other characters that draw nothing or blank space, such as the Hangul fillers and the blank braille pattern.
+- It rewrites "Hub message" to "Hub note" and "AgentSCM coordination request" to "AgentSCM coordination note", in any letter case and with spaces, `-` or `_` between the words, as whole words judged on ASCII letters and digits ("Hub messages" becomes "Hub notes"; "GitHub message" stays). A line can then never open with the words of the Hub's own messages.
 
 When no line is left, the Hub adds nothing.
 
