@@ -47,8 +47,9 @@ its hook returns, after the operator's [context source](context-source.md) lines
 - **Every start, every agent.** Each start hook of a supported agent gets it, including a resumed,
   cleared or compacted Claude Code session.
 - **Not elsewhere.** Not for a subagent's session, not when a session starts Work, and not in
-  tool replies or edit refusals. A read that fails or takes longer than half a second adds
-  nothing.
+  tool replies or edit refusals. The notes are read after the actionable status, so they never
+  take its store slot; a read that fails or takes longer than half a second adds nothing, and so
+  does a start whose coordination is unknown.
 - **Operator switch.** Set `AGENTSCM_MEMORY_DELIVERY=off` for `agentscm hub serve` to stop it;
   unset, empty or `on` delivers, and any other value stops the Hub from starting. A program that
   embeds the Hub sets `HubState::memory_delivery` instead. The Hub reads it
