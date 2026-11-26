@@ -2,6 +2,20 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.10.0](https://github.com/agentscm/agentscm/compare/v0.9.0...v0.10.0) - 2026-11-26
+
+### Added
+
+- Remove the web UI ([#672](https://github.com/agentscm/agentscm/pull/672))
+
+### Fixed
+
+- Diagnose Git pinning refusals and select eligible test Git ([#692](https://github.com/agentscm/agentscm/pull/692))
+
+### Other
+
+- Prepare releases and changes outside this repository
+
 ## [0.9.0](https://github.com/agentscm/agentscm/compare/v0.8.0...v0.9.0) - 2026-11-25
 
 ### Added
